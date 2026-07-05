@@ -65,12 +65,38 @@ class SafetyConfig(StrictModel):
     prod_limits_configured: bool = False
 
 
+class FiltersConfig(StrictModel):
+    """Quote/no-quote gates. Every rejection carries a ReasonCode and is logged."""
+
+    # Whitelist of mve_collection_ticker prefixes. Empty = observe everything
+    # (observe/paper only — quote mode refuses to run with an empty whitelist).
+    collection_whitelist: list[str] = []
+    combos_only: bool = True          # skip single-market RFQs
+    min_legs: int = 2
+    max_legs: int = 6
+    min_contracts: float = 1.0        # whole contracts
+    max_contracts: float = 10_000.0
+    min_target_cost_dollars: float = 1.0
+    max_target_cost_dollars: float = 50_000.0
+    max_leg_spread_cc: int = 800      # widest acceptable leg spread ($0.08)
+    min_leg_depth_contracts: float = 1.0   # min size behind BOTH best bids
+    min_time_to_close_s: float = 3600.0    # pregame-only default (1h before close)
+
+
+class ObserveConfig(StrictModel):
+    rfq_poll_s: float = 30.0          # REST reconciliation cadence (no seq on WS)
+    would_quote_width_cc: int = 600   # stub half-spread total ($0.06) for logging only
+    db_filename: str = "combomaker.sqlite3"
+
+
 class AppConfig(StrictModel):
     env: Env = Env.DEMO
     mode: Mode = Mode.OBSERVE
     endpoints: EndpointsConfig
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
+    filters: FiltersConfig = Field(default_factory=FiltersConfig)
+    observe: ObserveConfig = Field(default_factory=ObserveConfig)
     data_dir: Path = Path("data")
     kill_file: Path = Path("KILL")
     # confirm_live comes only from the CLI flag --confirm-live, never from YAML:

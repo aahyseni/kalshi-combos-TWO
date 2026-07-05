@@ -131,6 +131,15 @@ class WsManager:
         self._stopping = False
         self._run_task = asyncio.create_task(self._run(), name=f"{self._name}-run")
 
+    async def force_reconnect(self) -> None:
+        """Close the socket; the run loop reconnects and resubscribes.
+
+        For terminal channel errors (codes 10/17/25) where the subscription is
+        dead but the connection may look healthy.
+        """
+        if self._ws is not None and not self._ws.closed:
+            await self._ws.close()
+
     async def stop(self) -> None:
         self._stopping = True
         if self._ws is not None and not self._ws.closed:

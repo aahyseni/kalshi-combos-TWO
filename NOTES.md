@@ -96,3 +96,19 @@ is parked by design until Phase 2.5.)
 contract), B7 (combo grid structure).** Both are on the Phase 2.5 empirical
 list and both fail safe (gap ⇒ invalidate + cancel-all; unknown grid ⇒
 no-quote).
+
+### Phase 2 — observe mode (2026-07-05)
+
+| # | Assumption embedded in code | Where | Tag |
+|---|---|---|---|
+| C1 | rfq_created required fields: `id`, `market_ticker`, `created_ts`; sizing = `contracts_fp` XOR `target_cost_dollars`; combos carry `mve_collection_ticker` + `mve_selected_legs[{event_ticker, market_ticker, side, yes_settlement_value_dollars}]` | `rfq/models.py` | doc:asyncapi communications schemas |
+| C2 | `mve_selected_legs[].side` values are "yes"/"no" (schema has NO enum) — anything else parses as UNKNOWN and cannot pass filters | `rfq/models.py`, `rfq/filters.py` | doc:asyncapi + defensive UNKNOWN branch (enum queued for empirical confirm) |
+| C3 | Communications channel has NO seq field ⇒ no on-stream gap detection; completeness via `GET /communications/rfqs?status=open` polling; injected RFQs counted as `rfq.ws_missed` | `rfq/intake.py`, `ops/app.py` | doc:asyncapi (envelope type/sid/msg only); `status=open` param value **UNVERIFIED** (queued: confirm exact GetRFQs filter values on demo) |
+| C4 | WS error codes 10/17/25 are terminal (must resubscribe); 25 = messages LOST | `rfq/intake.py` | doc:communications-ws error table |
+| C5 | Combo semantics for the stub: combo settles YES iff every selected leg settles on its selected side (leg "no" side contributes 1−p) | `pricing/stub.py` | doc:rfqs.md/multivariate (product-of-legs settlement) — **direction-to-wire mapping deliberately NOT coded; Phase 2.5** |
+| C6 | RFQ deletions don't repeat combo fields; correlate by `id`; open-RFQ registry rebuilt from REST after reconnect (no WS replay) | `rfq/intake.py` | doc:asyncapi rfq_deleted schema |
+| C7 | Local store is the durable record (exchange retains closed RFQs ~7 days) | `ops/persistence.py` | doc:rfq-flow retention note |
+| C8 | `creator_id` empty on rfq_created ⇒ no creator-based filtering at quote time | (no code depends on it) | doc:communications-ws |
+
+**UNVERIFIED rows for human review: C3 (GetRFQs status param), C2 (side enum).**
+Both fail safe.
