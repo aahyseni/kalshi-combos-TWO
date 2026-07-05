@@ -153,6 +153,9 @@ class KalshiRestClient:
     async def get_multivariate_collection(self, ticker: str) -> JsonDict:
         return await self._request("GET", f"/multivariate_event_collections/{ticker}", auth=False)
 
+    async def get_event(self, ticker: str) -> JsonDict:
+        return await self._request("GET", f"/events/{ticker}", auth=False)
+
     async def get_series(self, ticker: str) -> JsonDict:
         return await self._request("GET", f"/series/{ticker}", auth=False)
 

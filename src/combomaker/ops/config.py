@@ -83,6 +83,48 @@ class FiltersConfig(StrictModel):
     min_time_to_close_s: float = 3600.0    # pregame-only default (1h before close)
 
 
+class FeeConfig(StrictModel):
+    """Coefficients as decimal strings (exact Fractions downstream). The
+    authoritative fee-schedule PDF is bot-blocked; these defaults come from
+    corroborated secondary sources and MUST be reconciled against real fills
+    (quiet-failure defense #3) before production."""
+
+    taker_coef: str = "0.07"
+    maker_coef: str = "0.0175"
+    # fee_type per combo series until fetched from GET /series: conservative
+    # default; overrides keyed by series/collection ticker prefix.
+    default_fee_type: str = "quadratic"
+    default_multiplier: str = "1.0"
+
+
+class CorrelationConfig(StrictModel):
+    """Conservative priors; empirical calibration (with sample-size gates)
+    updates these, never code."""
+
+    same_event_rho: float = 0.6
+    cross_event_rho: float = 0.0
+    rho_uncertainty: float = 0.25
+
+
+class QuoteConfig(StrictModel):
+    base_width_cc: int = 200
+    per_leg_width_cc: int = 100
+    uncertainty_width_scale: float = 1.0
+    size_width_cc_per_100: int = 50
+    time_wide_threshold_s: float = 21_600.0
+    time_width_cc: int = 200
+    in_play_extra_cc: int = 800
+    min_capture_cc: int = 100
+    free_money_margin_cc: int = 100
+
+
+class PricingConfig(StrictModel):
+    fee: FeeConfig = Field(default_factory=FeeConfig)
+    correlation: CorrelationConfig = Field(default_factory=CorrelationConfig)
+    quote: QuoteConfig = Field(default_factory=QuoteConfig)
+    max_source_disagreement: float = 0.08
+
+
 class ObserveConfig(StrictModel):
     rfq_poll_s: float = 30.0          # REST reconciliation cadence (no seq on WS)
     would_quote_width_cc: int = 600   # stub half-spread total ($0.06) for logging only
@@ -96,6 +138,7 @@ class AppConfig(StrictModel):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
     filters: FiltersConfig = Field(default_factory=FiltersConfig)
+    pricing: PricingConfig = Field(default_factory=PricingConfig)
     observe: ObserveConfig = Field(default_factory=ObserveConfig)
     data_dir: Path = Path("data")
     kill_file: Path = Path("KILL")

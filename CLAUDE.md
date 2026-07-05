@@ -83,8 +83,12 @@ way in the code and in its tests, so everything passes while losing money.
 execution blocked on demo credentials (two accounts).** Conventions are
 DOC_ASSUMED/unverified until the fixture is recorded and promoted.
 
-Next: **Phase 3 — pricing** (convention-dependent parts coded against the
-`Conventions` interface; UNKNOWN⇒no-quote throughout).
+**Phase 3 — pricing: COMPLETE** (fees w/ fail-safe taker attribution, leg
+beliefs + OddsSource interface, relationship classifier w/ UNKNOWN/IMPOSSIBLE
+branches, copula joint w/ priced rho-uncertainty, quote construction w/
+maker-favorable rounding + free-money caps; 432 tests green).
+
+Next: **Phase 4 — risk + last look + markouts/EV ledger wiring.**
 
 ## Architecture decisions
 

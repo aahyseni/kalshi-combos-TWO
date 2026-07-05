@@ -30,6 +30,8 @@ JsonDict = dict[str, Any]
 class RestLike(Protocol):
     async def get_market(self, ticker: str) -> JsonDict: ...
 
+    async def get_event(self, ticker: str) -> JsonDict: ...
+
     async def get_multivariate_collections(self, **params: str | int) -> JsonDict: ...
 
 
@@ -57,12 +59,22 @@ def _parse_time(value: object) -> datetime | None:
         return None
 
 
+@dataclass(frozen=True, slots=True)
+class EventMeta:
+    event_ticker: str
+    # None = the payload didn't say — callers must treat as UNKNOWN, not False.
+    mutually_exclusive: bool | None
+    raw: JsonDict
+    fetched_mono_ns: int
+
+
 class MetadataCache:
     def __init__(self, rest: RestLike, clock: Clock, *, ttl_s: float = 300.0) -> None:
         self._rest = rest
         self._clock = clock
         self._ttl_s = ttl_s
         self._markets: dict[str, MarketMeta] = {}
+        self._events: dict[str, EventMeta] = {}
 
     def peek(self, ticker: str) -> MarketMeta | None:
         """In-memory lookup only — hot-path safe, no network ever."""
@@ -97,4 +109,34 @@ class MetadataCache:
         self._markets[meta.ticker] = meta
         if meta.ticker != ticker:  # be forgiving about alias lookups
             self._markets[ticker] = meta
+        return meta
+
+    # --- events ---
+
+    def event_mutually_exclusive(self, event_ticker: str) -> bool | None:
+        """EventInfoProvider implementation. Peek-only (hot-path safe):
+        uncached or flag-less events return None ⇒ UNKNOWN upstream."""
+        cached = self._events.get(event_ticker)
+        return None if cached is None else cached.mutually_exclusive
+
+    def peek_event(self, event_ticker: str) -> EventMeta | None:
+        return self._events.get(event_ticker)
+
+    async def event(self, event_ticker: str, *, max_age_s: float | None = None) -> EventMeta:
+        cached = self._events.get(event_ticker)
+        budget = self._ttl_s if max_age_s is None else max_age_s
+        if cached is not None:
+            age_s = (self._clock.monotonic_ns() - cached.fetched_mono_ns) / 1e9
+            if age_s <= budget:
+                return cached
+        payload = await self._rest.get_event(event_ticker)
+        event = payload.get("event", payload)
+        flag = event.get("mutually_exclusive")
+        meta = EventMeta(
+            event_ticker=str(event.get("event_ticker", event_ticker)),
+            mutually_exclusive=bool(flag) if isinstance(flag, bool) else None,
+            raw=event,
+            fetched_mono_ns=self._clock.monotonic_ns(),
+        )
+        self._events[event_ticker] = meta
         return meta

@@ -129,3 +129,25 @@ combo market for HVM timing + product settlement).
 Architecture guard: `accepted_side` / `is_taker` / `outcome_side` tokens are
 forbidden under `pricing/` and `risk/` — those layers consume a `Conventions`
 instance only.
+
+### Phase 3 — pricing engine + fees (2026-07-05)
+
+| # | Assumption embedded in code | Where | Tag |
+|---|---|---|---|
+| D1 | Quadratic fee = ceil_to_centicent(coef × mult × C × P × (1−P)); trade fee always rounds UP | `pricing/fees.py` | doc:fee_rounding (rounding); **UNVERIFIED** coefficients (taker 0.07 / maker 0.0175 from secondary sources; PDF blocked — human download + fill reconciliation) |
+| D2 | Fee attribution unknown ⇒ price with TAKER coefficient (fail-safe: overestimates cost) | `pricing/fees.py` | design rule (resolves via Phase 2.5 `maker_is_taker_on_fill`) |
+| D3 | `quadratic` series charge no maker fee; `quadratic_with_maker_fees` adds maker coef; `flat`/unknown fee types ⇒ FeeUnknownError ⇒ no-quote | `pricing/fees.py` | doc:get-series fee_type enum + **UNVERIFIED** (PDF tables) |
+| D4 | Combo series fee_type comes from config default ("quadratic"), not fetched per-series yet | `pricing/engine.py` | **UNVERIFIED** — Phase 5 should fetch GET /series fee fields for the target collections |
+| D5 | Event mutual-exclusivity from `GET /events/{ticker}.mutually_exclusive`; missing flag = UNKNOWN (never False) | `marketdata/metadata.py`, `pricing/relationships.py` | doc:get-event schema |
+| D6 | Two YES legs of a mutually exclusive event = impossible ⇒ NO-QUOTE (not arbed); same market both sides ⇒ impossible; any unknown side/event ⇒ UNKNOWN ⇒ no-quote | `pricing/relationships.py` | design rule (defense #2) |
+| D7 | Implication/nesting within same-event groups NOT explicitly modeled in v1 — approximated by block rho + correlation-uncertainty width | `pricing/joint.py` | modeling choice — revisit in Phase 8 |
+| D8 | NO-side legs handled by sign conjugation (diag(±1)·R·diag(±1), marginal 1−p) | `pricing/joint.py` | mathematical identity |
+| D9 | Leg-uncertainty propagation via linear-sum product gradient (∂P/∂mᵢ ≈ P/mᵢ, clamped at mᵢ≥0.01) | `pricing/joint.py` | approximation, conservative direction |
+| D10 | Free-money caps: yes_bid ≤ min executable selected-leg ask − margin; no_bid ≤ Σ executable complement asks − margin; caps computed at 1.00 contract (top-of-book = tightest bound); unavailable caps ⇒ no-quote | `pricing/quote.py` | dominance argument (combo YES ≤ each leg; combo NO ≤ Σ complements) |
+| D11 | Bids snap DOWN onto the grid; a rounded-away side declines ("0"); yes+no ≤ $1 − min_capture enforced | `pricing/quote.py` | design rule (defense #4), property-tested |
+| D12 | Fee subtracted per side = max(fee@fair, fee@nearest-to-$0.50 in plausible fill range) — covers the quadratic peak | `pricing/quote.py` | design rule (fix from test sweep), regression-tested |
+| D13 | Target-cost qty estimate (cost/fair, rounded UP) feeds ONLY the size-width adder, never money math | `pricing/engine.py` | **UNVERIFIED** conversion formula (Phase 2.5 regression item) |
+
+**UNVERIFIED rows for human review before Phase 5: D1/D3 (fee coefficients +
+tables — needs the PDF and fill reconciliation), D4 (per-series fee fetch),
+D13 (target-cost conversion).** All fail toward wider/no-quote.

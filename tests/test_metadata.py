@@ -26,6 +26,10 @@ class FakeRest:
         self.calls.append(ticker)
         return self.payload
 
+    async def get_event(self, ticker: str) -> JsonDict:
+        self.calls.append(f"event:{ticker}")
+        return {"event": {"event_ticker": ticker, "mutually_exclusive": True}}
+
     async def get_multivariate_collections(self, **params: str | int) -> JsonDict:
         return {"multivariate_contracts": []}
 
@@ -67,3 +71,28 @@ async def test_missing_grid_yields_none_not_default() -> None:
     cache = MetadataCache(rest, FakeClock())
     meta = await cache.market("X")
     assert meta.grid is None  # quoting layer must treat as no-quote
+
+
+async def test_event_fetch_and_peek_discipline() -> None:
+    rest = FakeRest()
+    cache = MetadataCache(rest, FakeClock())
+    # peek before fetch: UNKNOWN, no network
+    assert cache.event_mutually_exclusive("EV1") is None
+    assert rest.calls == []
+    meta = await cache.event("EV1")
+    assert meta.mutually_exclusive is True
+    assert cache.event_mutually_exclusive("EV1") is True
+    # cached: second call doesn't refetch
+    await cache.event("EV1")
+    assert rest.calls == ["event:EV1"]
+
+
+async def test_event_without_flag_is_unknown_not_false() -> None:
+    class NoFlagRest(FakeRest):
+        async def get_event(self, ticker: str) -> JsonDict:
+            return {"event": {"event_ticker": ticker}}
+
+    cache = MetadataCache(NoFlagRest(), FakeClock())
+    meta = await cache.event("EV2")
+    assert meta.mutually_exclusive is None
+    assert cache.event_mutually_exclusive("EV2") is None

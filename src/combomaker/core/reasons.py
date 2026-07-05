@@ -36,6 +36,9 @@ class ReasonCode(StrEnum):
     # A classifier (leg relationship, settlement rules, market family) returned
     # UNKNOWN. UNKNOWN always means widen-or-no-quote, never a convenient default.
     SKIP_CLASSIFIER_UNKNOWN = "skip_classifier_unknown"
+    # The combo is logically impossible (e.g. two YES legs of a mutually
+    # exclusive event). v1 policy: no-quote, don't try to arb it.
+    SKIP_LOGICALLY_IMPOSSIBLE = "skip_logically_impossible"
 
     # --- Quote lifecycle ---
     QUOTE_SENT = "quote_sent"
