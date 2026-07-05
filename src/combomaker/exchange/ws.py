@@ -37,10 +37,14 @@ LifecycleHandler = Callable[[], Awaitable[None]]
 _WS_HANDSHAKE_PATH = "/trade-api/ws/v2"
 
 
+SubscribedHandler = Callable[[int], Awaitable[None]]  # receives the new sid
+
+
 @dataclass
 class _Subscription:
     channels: list[str]
     params_extra: dict[str, Any] = field(default_factory=dict)
+    on_subscribed: SubscribedHandler | None = None
 
 
 class WsManager:
@@ -69,6 +73,7 @@ class WsManager:
         self._on_disconnect: list[LifecycleHandler] = []
         self._on_connect: list[LifecycleHandler] = []
         self._subscriptions: list[_Subscription] = []
+        self._pending_sub_acks: dict[int, _Subscription] = {}
         self._cmd_id = 0
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._last_rx_mono_ns: int | None = None
@@ -88,9 +93,21 @@ class WsManager:
         """Fires after (re)connect, BEFORE subscriptions are re-sent."""
         self._on_connect.append(handler)
 
-    def add_subscription(self, channels: list[str], **params_extra: Any) -> None:
-        """Declare a desired subscription; (re)sent on every (re)connect."""
-        self._subscriptions.append(_Subscription(list(channels), dict(params_extra)))
+    def add_subscription(
+        self,
+        channels: list[str],
+        *,
+        on_subscribed: SubscribedHandler | None = None,
+        **params_extra: Any,
+    ) -> None:
+        """Declare a desired subscription; (re)sent on every (re)connect.
+
+        ``on_subscribed`` fires with the server-assigned sid on every (re)ack —
+        sids change across reconnects, so consumers must re-key their state.
+        """
+        self._subscriptions.append(
+            _Subscription(list(channels), dict(params_extra), on_subscribed)
+        )
 
     # --- health ---
 
@@ -184,15 +201,35 @@ class WsManager:
         self._metrics.inc(f"{self._name}.msg.{msg_type}")
         if msg_type == "error":
             log.warning("ws_server_error", name=self._name, message=message)
+        if msg_type == "subscribed":
+            await self._resolve_subscribed(message)
         for handler in self._handlers.get(msg_type, []) + self._handlers.get("*", []):
             try:
                 await handler(message)
             except Exception:
                 log.exception("ws_handler_failed", name=self._name, msg_type=msg_type)
 
+    async def _resolve_subscribed(self, message: JsonDict) -> None:
+        sub = self._pending_sub_acks.pop(int(message.get("id", 0)), None)
+        if sub is None or sub.on_subscribed is None:
+            return
+        msg = message.get("msg", {})
+        sid = int(msg.get("sid", 0))
+        if sid < 1:
+            log.warning("ws_subscribed_without_sid", name=self._name, message=message)
+            return
+        try:
+            await sub.on_subscribed(sid)
+        except Exception:
+            log.exception("ws_subscribed_handler_failed", name=self._name)
+
     async def _send_subscriptions(self) -> None:
+        self._pending_sub_acks.clear()  # stale acks from a previous connection
         for sub in self._subscriptions:
-            await self.send_command("subscribe", {"channels": sub.channels, **sub.params_extra})
+            cmd_id = await self.send_command(
+                "subscribe", {"channels": sub.channels, **sub.params_extra}
+            )
+            self._pending_sub_acks[cmd_id] = sub
 
     async def send_command(self, cmd: str, params: dict[str, Any]) -> int:
         if self._ws is None or self._ws.closed:

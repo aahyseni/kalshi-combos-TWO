@@ -1,0 +1,100 @@
+"""Market/collection metadata cache.
+
+Two access styles with different guarantees:
+
+- ``market(ticker)`` — async, may hit REST, respects a TTL. Used by intake and
+  reconciliation paths.
+- ``peek(ticker)`` — sync, in-memory only, never touches the network. The ONLY
+  style permitted on the hot path (pricing at rfq_created, last look).
+
+An unknown or grid-less market never gets a guessed default: ``MarketMeta.grid``
+is None when ``price_ranges`` was absent/malformed and the quoting layer must
+treat that as no-quote (quiet-failure defense #2).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Protocol
+
+from combomaker.core.clock import Clock
+from combomaker.marketdata.grid import GridError, PriceGrid
+from combomaker.ops.logging import get_logger
+
+log = get_logger(__name__)
+
+JsonDict = dict[str, Any]
+
+
+class RestLike(Protocol):
+    async def get_market(self, ticker: str) -> JsonDict: ...
+
+    async def get_multivariate_collections(self, **params: str | int) -> JsonDict: ...
+
+
+@dataclass(frozen=True, slots=True)
+class MarketMeta:
+    ticker: str
+    status: str
+    grid: PriceGrid | None            # None ⇒ unquotable (unknown grid)
+    event_ticker: str | None
+    close_time: datetime | None       # exchange-reported close, if parseable
+    expected_expiration_time: datetime | None
+    raw: JsonDict                     # full payload for fields we don't model yet
+    fetched_mono_ns: int
+
+    def age_s(self, clock: Clock) -> float:
+        return (clock.monotonic_ns() - self.fetched_mono_ns) / 1e9
+
+
+def _parse_time(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+class MetadataCache:
+    def __init__(self, rest: RestLike, clock: Clock, *, ttl_s: float = 300.0) -> None:
+        self._rest = rest
+        self._clock = clock
+        self._ttl_s = ttl_s
+        self._markets: dict[str, MarketMeta] = {}
+
+    def peek(self, ticker: str) -> MarketMeta | None:
+        """In-memory lookup only — hot-path safe, no network ever."""
+        return self._markets.get(ticker)
+
+    async def market(self, ticker: str, *, max_age_s: float | None = None) -> MarketMeta:
+        cached = self._markets.get(ticker)
+        budget = self._ttl_s if max_age_s is None else max_age_s
+        if cached is not None and cached.age_s(self._clock) <= budget:
+            return cached
+        return await self.refresh(ticker)
+
+    async def refresh(self, ticker: str) -> MarketMeta:
+        payload = await self._rest.get_market(ticker)
+        market = payload.get("market", payload)  # endpoint wraps in {"market": {...}}
+        grid: PriceGrid | None
+        try:
+            grid = PriceGrid.from_market_payload(market)
+        except GridError as exc:
+            log.warning("market_grid_unusable", ticker=ticker, error=str(exc))
+            grid = None
+        meta = MarketMeta(
+            ticker=str(market.get("ticker", ticker)),
+            status=str(market.get("status", "")),
+            grid=grid,
+            event_ticker=market.get("event_ticker"),
+            close_time=_parse_time(market.get("close_time")),
+            expected_expiration_time=_parse_time(market.get("expected_expiration_time")),
+            raw=market,
+            fetched_mono_ns=self._clock.monotonic_ns(),
+        )
+        self._markets[meta.ticker] = meta
+        if meta.ticker != ticker:  # be forgiving about alias lookups
+            self._markets[ticker] = meta
+        return meta

@@ -76,3 +76,23 @@ embedded domain assumptions here. Tags: `doc:<page>` (verified against docs),
 
 **UNVERIFIED rows for human review before Phase 3: A11.** (A12's dangerous half
 is parked by design until Phase 2.5.)
+
+### Phase 1 — market data (2026-07-05)
+
+| # | Assumption embedded in code | Where | Tag |
+|---|---|---|---|
+| B1 | Book is bids-only both sides; YES ask = $1 − best NO bid; best bid = highest price (arrays ascending) | `marketdata/orderbook.py` | doc:orderbook_responses |
+| B2 | WS snapshot sides are `yes_dollars_fp`/`no_dollars_fp` (absent = empty side); REST uses `yes_dollars`/`no_dollars` — different names, same shape | `marketdata/feed.py` | doc:orderbook-updates vs get-market-orderbook |
+| B3 | Delta semantics: `new_count = old + delta_fp` at `price_dollars` on `side`; count 0 removes the level; negative count = missed message ⇒ treated as gap | `marketdata/orderbook.py` | doc:orderbook-updates (zero-removal itself queued for empirical check) |
+| B4 | `seq` is per-`sid` and control acks (`ok`/`unsubscribed`) consume seq slots; after a detected gap we re-adopt the next observed seq as baseline (exact contract around `get_snapshot` undocumented) | `marketdata/feed.py` | doc:orderbook-updates + **UNVERIFIED** (baseline re-adoption is defensive design pending demo verification) |
+| B5 | `update_subscription {action: get_snapshot}` returns fresh snapshots without changing the subscription — used as the resync primitive | `marketdata/feed.py` | doc:orderbook-updates |
+| B6 | `use_yes_price=false` pinned in subscribe params (server default will flip) | `marketdata/feed.py` | doc:websockets subscribe schema |
+| B7 | Grid lattice = `start + k·step` per range, endpoints inclusive; multi-range (tapered) supported; boundary semantics at range joins | `marketdata/grid.py` | **UNVERIFIED** — queued: read real KXMVE `price_ranges` + probe an off-grid quote on demo |
+| B8 | Counts are 2-dp fixed-point ("13.00"); held as integer centi-contracts; centi-contracts × centi-cents = micro-dollars | `core/quantity.py` | doc:orderbook_responses (internal unit identity) |
+| B9 | Quiet book ≠ stale feed: freshness gate = feed health (WS traffic ≤30s + seq continuity) AND book validity; per-book change age feeds velocity/in-play logic only | `marketdata/feed.py`, `orderbook.py` | internal design |
+| B10 | Market metadata: `GET /markets/{ticker}` wraps payload in `{"market": ...}`; `close_time`/`expected_expiration_time` RFC3339 | `marketdata/metadata.py` | doc:get-market |
+
+**UNVERIFIED rows for human review before Phase 3: B4 (gap-recovery seq
+contract), B7 (combo grid structure).** Both are on the Phase 2.5 empirical
+list and both fail safe (gap ⇒ invalidate + cancel-all; unknown grid ⇒
+no-quote).
