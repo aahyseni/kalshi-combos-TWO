@@ -1,0 +1,39 @@
+# Secrets — never commit credentials or key material
+.env
+.env.*
+*.pem
+*.key
+*.p8
+secrets/
+config/secrets*.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.python-version.local
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Runtime artifacts
+*.sqlite3
+*.db
+data/
+logs/
+*.log
+KILL
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
