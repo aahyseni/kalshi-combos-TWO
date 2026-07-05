@@ -74,6 +74,7 @@ class WsManager:
         self._on_connect: list[LifecycleHandler] = []
         self._subscriptions: list[_Subscription] = []
         self._pending_sub_acks: dict[int, _Subscription] = {}
+        self._live_sub_tasks: set[asyncio.Task[None]] = set()
         self._cmd_id = 0
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._last_rx_mono_ns: int | None = None
@@ -100,14 +101,20 @@ class WsManager:
         on_subscribed: SubscribedHandler | None = None,
         **params_extra: Any,
     ) -> None:
-        """Declare a desired subscription; (re)sent on every (re)connect.
+        """Declare a desired subscription; sent NOW if connected and re-sent
+        on every (re)connect (lazily watched RFQ legs arrive mid-session).
 
         ``on_subscribed`` fires with the server-assigned sid on every (re)ack —
         sids change across reconnects, so consumers must re-key their state.
         """
-        self._subscriptions.append(
-            _Subscription(list(channels), dict(params_extra), on_subscribed)
-        )
+        sub = _Subscription(list(channels), dict(params_extra), on_subscribed)
+        self._subscriptions.append(sub)
+        if self.connected:
+            task = asyncio.create_task(
+                self._send_subscription_now(sub), name=f"{self._name}-live-subscribe"
+            )
+            self._live_sub_tasks.add(task)
+            task.add_done_callback(self._live_sub_tasks.discard)
 
     # --- health ---
 
@@ -239,9 +246,20 @@ class WsManager:
         except Exception:
             log.exception("ws_subscribed_handler_failed", name=self._name)
 
+    async def _send_subscription_now(self, sub: _Subscription) -> None:
+        try:
+            cmd_id = await self.send_command(
+                "subscribe", {"channels": sub.channels, **sub.params_extra}
+            )
+            self._pending_sub_acks[cmd_id] = sub
+        except Exception as exc:
+            # Reconnect resends everything; downstream stays invalid until the
+            # subscribe ack + snapshot arrive, so nothing quotes off this gap.
+            log.warning("live_subscribe_failed", name=self._name, error=repr(exc))
+
     async def _send_subscriptions(self) -> None:
         self._pending_sub_acks.clear()  # stale acks from a previous connection
-        for sub in self._subscriptions:
+        for sub in list(self._subscriptions):
             cmd_id = await self.send_command(
                 "subscribe", {"channels": sub.channels, **sub.params_extra}
             )

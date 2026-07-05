@@ -89,6 +89,8 @@ class OpenQuoteState:
     leg_mids_cc: dict[str, int]
     created_mono_ns: int
     accepted: bool = False
+    # Conservative full-RFQ size the risk system uses for this quote.
+    risk_qty: CentiContracts = CentiContracts(0)
     # (side accepted, our bid on that side, accepted quantity) once confirmed
     pending_fill: tuple[Side, CentiCents, CentiContracts] | None = None
 
@@ -132,6 +134,8 @@ class QuoteLifecycle:
         self._open: dict[str, OpenQuoteState] = {}       # quote_id → state
         self._by_rfq: dict[str, str] = {}                # rfq_id → quote_id
         self._executed_states: dict[str, OpenQuoteState] = {}
+        self._realized_pnl_cc = 0
+        self._confirm_failures = 0
         self.daily_pnl = DailyPnl()
         self.exchange_active = config.exchange_active
 
@@ -147,7 +151,18 @@ class QuoteLifecycle:
             await self._record_skip(rfq, [result.reason], {"detail": result.detail})
             return
 
-        quote_risk = self._quote_risk(rfq, result, quote_id="pending")
+        # Risk-side size: a quote implicitly covers the RFQ's FULL size (no
+        # size field on the wire). Target-cost RFQs convert at the accepted
+        # side's price — the cheapest quoted side buys the most contracts, so
+        # that ceil is the conservative bound the limits must see.
+        risk_qty = self._risk_qty(rfq, result)
+        if risk_qty is None:
+            await self._record_skip(
+                rfq, [ReasonCode.SKIP_CLASSIFIER_UNKNOWN], {"detail": "unresolvable risk size"}
+            )
+            return
+
+        quote_risk = self._quote_risk(rfq, result, quote_id="pending", qty=risk_qty)
         breaches = self._limits.check(
             self._exposure,
             self._marginals,
@@ -176,6 +191,7 @@ class QuoteLifecycle:
             constructed=result,
             leg_mids_cc=self._current_leg_mids(rfq),
             created_mono_ns=self._clock.monotonic_ns(),
+            risk_qty=risk_qty,
         )
         # Replacement semantics: a new quote on the same RFQ replaces ours.
         old_quote_id = self._by_rfq.get(rfq.rfq_id)
@@ -183,7 +199,9 @@ class QuoteLifecycle:
             self._drop_quote(old_quote_id)
         self._open[quote_id] = state
         self._by_rfq[rfq.rfq_id] = quote_id
-        self._exposure.upsert_quote(self._quote_risk(rfq, result, quote_id=quote_id))
+        self._exposure.upsert_quote(
+            self._quote_risk(rfq, result, quote_id=quote_id, qty=risk_qty)
+        )
         self._metrics.inc("quote.sent")
         await self._store.record_decision(
             "quote_sent",
@@ -225,6 +243,29 @@ class QuoteLifecycle:
             else state.constructed.no_bid_cc
         )
         qty = self._accepted_qty(state, msg)
+        if qty is None:
+            # Unknown accepted size (defense #2): never confirm a fill we
+            # cannot size — deliberate lapse.
+            await self._record_confirm_decision(
+                state, confirm=False, reason=ReasonCode.DECLINE_SIZE_UNKNOWN,
+                detail=f"contracts_accepted_fp unreadable: {msg.get('contracts_accepted_fp')!r}",
+                decision_ms=(self._clock.monotonic_ns() - t0) / 1e6,
+            )
+            self._metrics.inc(f"confirm.declined.{ReasonCode.DECLINE_SIZE_UNKNOWN}")
+            self._drop_quote(quote_id)
+            return
+        our_side = self._conventions.maker_position_side(accepted_side)
+        if our_side is Side.NO and self._conventions.combo_no_pays_complement is None:
+            # NO-side settlement semantics unverified (Phase 2.5): refusing is
+            # the only honest option until ground truth fills the fixture.
+            await self._record_confirm_decision(
+                state, confirm=False, reason=ReasonCode.DECLINE_CONVENTION_UNKNOWN,
+                detail="combo_no_pays_complement unverified",
+                decision_ms=(self._clock.monotonic_ns() - t0) / 1e6,
+            )
+            self._metrics.inc(f"confirm.declined.{ReasonCode.DECLINE_CONVENTION_UNKNOWN}")
+            self._drop_quote(quote_id)
+            return
 
         inputs = self._last_look_inputs(state, accepted_side, bid, qty)
         decision = decide_confirm(inputs, self._policy)
@@ -232,6 +273,11 @@ class QuoteLifecycle:
         self._metrics.observe_ms("confirm.decision_ms", decision_ms)
 
         if decision.confirm:
+            # Park state BEFORE the network call: if the confirm times out
+            # client-side it may still have landed server-side, and the
+            # eventual quote_executed must find this state and book the fill.
+            state.pending_fill = (accepted_side, bid, qty)
+            self._executed_states[quote_id] = state
             rtt0 = self._clock.monotonic_ns()
             try:
                 await self._sender.confirm_quote(quote_id)
@@ -239,11 +285,19 @@ class QuoteLifecycle:
                     "confirm.rtt_ms", (self._clock.monotonic_ns() - rtt0) / 1e6
                 )
                 self._metrics.inc("confirm.sent")
-                state.pending_fill = (accepted_side, bid, qty)
-                self._executed_states[quote_id] = state
+                # Once confirmed neither party can withdraw: the position is
+                # REAL now — book it immediately, not at quote_executed
+                # (execution is ~1s later and the channel has no replay).
+                self._book_position(quote_id, state)
             except Exception as exc:
                 self._metrics.inc("confirm.failed")
+                self._confirm_failures += 1
                 log.error("confirm_failed", quote_id=quote_id, error=repr(exc))
+                if self._confirm_failures >= 3:
+                    await self._killswitch.halt(
+                        ReasonCode.HALT_CONFIRM_TIMEOUTS,
+                        f"{self._confirm_failures} consecutive confirm failures",
+                    )
         else:
             self._metrics.inc(f"confirm.declined.{decision.reason}")
             self._track_markout(f"declined:{quote_id}", state)
@@ -257,6 +311,25 @@ class QuoteLifecycle:
         # Accepted quotes are no longer open either way.
         self._drop_quote(quote_id)
 
+    def _book_position(self, quote_id: str, state: OpenQuoteState) -> None:
+        """Idempotent: adds the confirmed fill's position to the exposure book."""
+        assert state.pending_fill is not None
+        accepted_side, bid, qty = state.pending_fill
+        position_id = f"fill:{quote_id}"
+        if position_id in self._exposure.positions:
+            return
+        self._exposure.add_position(
+            OpenPosition(
+                position_id=position_id,
+                combo_ticker=state.rfq.market_ticker,
+                collection=state.rfq.mve_collection_ticker,
+                our_side=self._conventions.maker_position_side(accepted_side),
+                contracts=qty,
+                entry_price_cc=bid,
+                legs=self._leg_refs(state.rfq),
+            )
+        )
+
     async def on_quote_executed(self, msg: JsonDict) -> None:
         quote_id = str(msg.get("quote_id", ""))
         state = self._executed_states.get(quote_id) or self._open.get(quote_id)
@@ -267,23 +340,18 @@ class QuoteLifecycle:
             log.warning("execution_without_pending_fill", quote_id=quote_id)
             return
         accepted_side, bid, qty = state.pending_fill
+        self._book_position(quote_id, state)  # no-op if booked at confirm
         our_side = self._conventions.maker_position_side(accepted_side)
-        position = OpenPosition(
-            position_id=f"fill:{quote_id}",
-            combo_ticker=state.rfq.market_ticker,
-            collection=state.rfq.mve_collection_ticker,
-            our_side=our_side,
-            contracts=qty,
-            entry_price_cc=bid,
-            legs=self._leg_refs(state.rfq),
-        )
-        self._exposure.add_position(position)
-        side_fair = (
-            int(state.constructed.fair_cc)
-            if our_side is Side.YES
-            else CC_PER_DOLLAR - int(state.constructed.fair_cc)
-        )
-        expected_edge_cc = (side_fair - int(bid)) * int(qty) // 100
+        expected_edge_cc: int | None
+        if our_side is Side.YES:
+            expected_edge_cc = (int(state.constructed.fair_cc) - int(bid)) * int(qty) // 100
+        elif self._conventions.combo_no_pays_complement:
+            side_fair = CC_PER_DOLLAR - int(state.constructed.fair_cc)
+            expected_edge_cc = (side_fair - int(bid)) * int(qty) // 100
+        else:
+            # NO payout semantics unverified — an honest ledger records
+            # UNKNOWN, never an assumed complement (defense #5).
+            expected_edge_cc = None
         await self._store.record_fill(
             f"fill:{quote_id}",
             order_id=str(msg.get("order_id")) if msg.get("order_id") else None,
@@ -308,8 +376,45 @@ class QuoteLifecycle:
         if state is not None and not state.accepted:
             await self._delete_quote(quote_id, ReasonCode.DELETE_RFQ_GONE)
 
+    def record_realized_pnl(self, delta_cc: int) -> None:
+        """Settlement/fee reconciliation feeds realized P&L here (Phase 6)."""
+        self._realized_pnl_cc += delta_cc
+
+    def _refresh_daily_pnl(self) -> None:
+        """Mark open positions at current leg mids so the daily-loss limit
+        actually binds. Any unmarkable position keeps the previous mark
+        (limits also see UNKNOWN marginals as a breach on their own)."""
+        unrealized = 0
+        for position in self._exposure.positions.values():
+            fair = 1.0
+            failed = False
+            for leg in position.legs:
+                p = self._marginals(leg.market_ticker)
+                if p is None:
+                    failed = True
+                    break
+                fair *= p if leg.side == "yes" else 1.0 - p
+            if failed:
+                return  # keep last daily_pnl rather than mark with holes
+            if position.our_side is Side.YES:
+                payout_prob = fair
+            elif self._conventions.combo_no_pays_complement:
+                payout_prob = 1.0 - fair
+            else:
+                return  # unverified NO payout: don't fabricate a mark
+            value = int(payout_prob * CC_PER_DOLLAR) * int(position.contracts) // 100
+            unrealized += value - position.max_loss_cc
+        self.daily_pnl = DailyPnl(realized_cc=self._realized_pnl_cc, unrealized_cc=unrealized)
+
     async def maintenance_tick(self) -> None:
-        """TTL expiry + reprice pass. Call every few hundred ms."""
+        """TTL expiry + reprice + P&L mark + daily-loss halt. Every few 100ms."""
+        self._refresh_daily_pnl()
+        if not self._killswitch.halted:
+            breaches = self._limits.check(self._exposure, self._marginals, self.daily_pnl)
+            for breach in breaches:
+                if breach.reason == ReasonCode.HALT_DAILY_LOSS:
+                    await self._killswitch.halt(ReasonCode.HALT_DAILY_LOSS, breach.detail)
+                    return  # halt callbacks (cancel-all) already ran
         now = self._clock.monotonic_ns()
         for quote_id, state in list(self._open.items()):
             if state.accepted:
@@ -394,10 +499,27 @@ class QuoteLifecycle:
             LegRef(leg.market_ticker, leg.event_ticker, leg.side) for leg in rfq.legs
         )
 
+    def _risk_qty(self, rfq: Rfq, constructed: ConstructedQuote) -> CentiContracts | None:
+        """Full-RFQ size for the risk system. Target-cost RFQs convert at the
+        CHEAPEST quoted side (most contracts) — the conservative ceiling.
+        None = unresolvable = no-quote (never a placeholder)."""
+        if rfq.contracts is not None:
+            return rfq.contracts
+        if rfq.target_cost_cc is not None:
+            bids = [
+                int(bid)
+                for bid in (constructed.yes_bid_cc, constructed.no_bid_cc)
+                if bid > 0
+            ]
+            if not bids:
+                return None
+            denom = max(100, min(bids))
+            return CentiContracts(-(-int(rfq.target_cost_cc) * 100 // denom))
+        return None
+
     def _quote_risk(
-        self, rfq: Rfq, constructed: ConstructedQuote, *, quote_id: str
+        self, rfq: Rfq, constructed: ConstructedQuote, *, quote_id: str, qty: CentiContracts
     ) -> OpenQuoteRisk:
-        qty = rfq.contracts or CentiContracts(100)
         return OpenQuoteRisk(
             quote_id=quote_id,
             rfq_id=rfq.rfq_id,
@@ -409,14 +531,20 @@ class QuoteLifecycle:
             legs=self._leg_refs(rfq),
         )
 
-    def _accepted_qty(self, state: OpenQuoteState, msg: JsonDict) -> CentiContracts:
+    def _accepted_qty(self, state: OpenQuoteState, msg: JsonDict) -> CentiContracts | None:
+        """Accepted size; None = unknowable = deliberate lapse (defense #2).
+
+        Missing ``contracts_accepted_fp`` on a contracts-mode RFQ falls back
+        to the RFQ's own full size (a quote covers the full size by wire
+        contract); on a target-cost RFQ there is nothing safe to assume.
+        """
         raw = msg.get("contracts_accepted_fp")
         if raw is not None:
             try:
                 return qty_from_fp_str(str(raw))
             except ValueError:
-                pass
-        return state.rfq.contracts or CentiContracts(100)
+                return None
+        return state.rfq.contracts
 
     def _last_look_inputs(
         self,

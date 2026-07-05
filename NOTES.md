@@ -181,3 +181,16 @@ D13 (target-cost conversion).** All fail toward wider/no-quote.
 | F8 | Report portfolio MC uses independence corr + complement pseudo-legs for NO-side legs (risk view, not pricing) | `ops/report.py` | approximation, documented |
 
 **UNVERIFIED rows: F1, F6 — both resolve in the first live demo run.**
+
+### Final adversarial review (2026-07-05) — 5 lenses, 43 agents, 7 confirmed defects, all fixed
+
+| Finding (confirmed by 2-skeptic verification) | Fix | Regression test |
+|---|---|---|
+| **CRITICAL:** target-cost RFQs entered the entire risk system as 1 contract (`rfq.contracts or CentiContracts(100)`) — per-quote caps, mass acceptance, gross notional, event worst-case all blind to ~71% of real flow | `_risk_qty`: target ÷ cheapest quoted side, ceil (conservative full-size); unresolvable ⇒ no-quote | `tests/test_review_fixes.py` |
+| Unknown/unparseable `contracts_accepted_fp` was guessed (1 contract) then confirmed | `_accepted_qty` returns None ⇒ deliberate lapse (`DECLINE_SIZE_UNKNOWN`); contracts-mode missing-field falls back to the RFQ's own full size (doc-anchored) | ″ |
+| Daily-loss halt structurally dead (frozen zero `DailyPnl` never written) | `_refresh_daily_pnl` marks positions at current mids each maintenance tick; `record_realized_pnl` hook; HALT_DAILY_LOSS breach now fires the kill switch | ″ |
+| Confirm-exception path lost the fill (state never parked ⇒ quote_executed unmatchable) | pending_fill parked BEFORE the confirm call; 3 consecutive confirm failures ⇒ `HALT_CONFIRM_TIMEOUTS` | ″ |
+| Exposure gap between confirm and quote_executed (irrevocable fill invisible to limits) | position booked at confirm success (idempotent re-book at execution) | ″ |
+| Subscriptions added while connected never sent (lazy leg-watching silently dead) | `add_subscription` sends immediately when connected | ws behavior covered via lifecycle tests |
+| Batch orderbooks wire params wrong (`market_tickers` comma-join vs repeated `tickers`); api-limits path wrong (`/account/api_limits` vs `/account/limits`) | both corrected to the doc-verified contract | (wire-format tests) |
+| `combo_no_pays_complement` convention had zero consumers while the complement was hardcoded | NO-side accepts decline while the convention is unverified (`DECLINE_CONVENTION_UNKNOWN`); NO-side expected edge recorded as NULL (not assumed) when convention isn't True; MTM refresh skips rather than fabricates | ″ |

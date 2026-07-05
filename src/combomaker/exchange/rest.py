@@ -79,7 +79,7 @@ class KalshiRestClient:
         method: str,
         path: str,
         *,
-        params: dict[str, str | int] | None = None,
+        params: dict[str, str | int] | list[tuple[str, str]] | None = None,
         json_body: JsonDict | None = None,
         auth: bool = True,
     ) -> JsonDict:
@@ -121,7 +121,7 @@ class KalshiRestClient:
         return await self._request("GET", "/portfolio/balance")
 
     async def get_api_limits(self) -> JsonDict:
-        return await self._request("GET", "/account/api_limits")
+        return await self._request("GET", "/account/limits")
 
     async def get_endpoint_costs(self) -> JsonDict:
         return await self._request("GET", "/account/endpoint_costs")
@@ -141,8 +141,10 @@ class KalshiRestClient:
         return await self._request("GET", f"/markets/{ticker}/orderbook", params=params)
 
     async def get_multiple_orderbooks(self, tickers: list[str]) -> JsonDict:
+        # Wire contract: query param is named `tickers`, repeated form/explode
+        # (?tickers=A&tickers=B), 1-100 items (docs/api-notes/orderbooks.md).
         return await self._request(
-            "GET", "/markets/orderbooks", params={"market_tickers": ",".join(tickers)}
+            "GET", "/markets/orderbooks", params=[("tickers", t) for t in tickers]
         )
 
     async def get_multivariate_collections(self, **params: str | int) -> JsonDict:

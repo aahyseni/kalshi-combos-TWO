@@ -99,6 +99,10 @@ QuoteApp paper+quote modes with hard gates — verified conventions + whitelist
 + prod guard; cancel-all + report CLI; hedging scaffold phase-gated off;
 543 tests green).
 
+**Final adversarial review: DONE** — 5-lens multi-agent review + 2-skeptic
+verification per finding; 7 confirmed defects (1 critical: target-cost risk
+sizing) all fixed with regression tests. 556 tests green.
+
 **STOPPED FOR THE HUMAN.** Everything runnable without credentials is built
 and tested. Blocked on: (1) demo credentials ×2 accounts → run Phase 2.5
 ground truth, (2) fee-schedule PDF download, (3) live demo observe run,

@@ -64,6 +64,10 @@ class ReasonCode(StrEnum):
     DECLINE_MASS_ACCEPTANCE = "decline_mass_acceptance"
     DECLINE_KILL_SWITCH = "decline_kill_switch"
     DECLINE_EXCHANGE_INACTIVE = "decline_exchange_inactive"
+    # Accepted quantity or settlement convention unknowable at confirm time —
+    # confirming a fill of unknown size/payout is never an option.
+    DECLINE_SIZE_UNKNOWN = "decline_size_unknown"
+    DECLINE_CONVENTION_UNKNOWN = "decline_convention_unknown"
 
     # --- Kill switches / halts ---
     HALT_DAILY_LOSS = "halt_daily_loss"
