@@ -151,3 +151,18 @@ instance only.
 **UNVERIFIED rows for human review before Phase 5: D1/D3 (fee coefficients +
 tables — needs the PDF and fill reconciliation), D4 (per-series fee fetch),
 D13 (target-cost conversion).** All fail toward wider/no-quote.
+
+### Phase 4 — risk engine (2026-07-05)
+
+| # | Assumption embedded in code | Where | Tag |
+|---|---|---|---|
+| E1 | Per-leg delta (hot path) = independence product formula, signed by our side and each leg's selected side; missing marginal ⇒ UNKNOWN (never zero); conditional-MC deltas (`sim.leg_deltas`) reserved for slow full-book refresh | `risk/exposure.py` | approximation under correlation — direction documented; MC refresh wired in Phase 5 |
+| E2 | Mass-acceptance worst case: every open quote fills NOW on its per-aggregate worse side (sign-aligned magnitude bound); dominance over every realizable fill combination property-tested (triangle-inequality argument in tests/test_exposure.py) | `risk/exposure.py`, `risk/limits.py` | design rule (+ PreferBetterQuote makes "instantly executable" literal) |
+| E3 | Our max loss per position = entry price × contracts (we always PAY our bid to open — both sides of a quote are bids) | `risk/exposure.py` | follows from A5/D11; re-check against ground-truth fills (Phase 2.5) |
+| E4 | Last-look severity order: kill switch > exchange > WS > in-play > velocity > stale leg > leg move > joint move > risk; every None input fails closed | `risk/lastlook.py` | design rule, pinned by tests |
+| E5 | HVM confirm clock starts at LOCAL receipt of quote_accepted (message carries no timestamp) | (Phase 5 wiring) | doc:asyncapi quote_accepted — timer measured server-side, budget = 3s − latency (Phase 2.5 measures) |
+| E6 | In-play market trigger: mid range > threshold OR update count > N within window ⇒ anomalous for cooldown; schedule-based gate lives in filters | `risk/inplay.py` | design rule (courtside defense = width/size/refusal) |
+| E7 | Markouts recorded vs BOTH model fair and raw Kalshi mid product; declined confirms tracked with fill_ref `declined:<quote_id>` | `risk/markouts.py` | defense #5 |
+| E8 | Daily-loss halt at ≥ limit on realized+unrealized | `risk/limits.py` | design rule |
+
+**UNVERIFIED rows: E3 (re-check vs ground truth), E5 (latency budget measurement).**

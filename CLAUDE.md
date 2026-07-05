@@ -88,7 +88,13 @@ beliefs + OddsSource interface, relationship classifier w/ UNKNOWN/IMPOSSIBLE
 branches, copula joint w/ priced rho-uncertainty, quote construction w/
 maker-favorable rounding + free-money caps; 432 tests green).
 
-Next: **Phase 4 — risk + last look + markouts/EV ledger wiring.**
+**Phase 4 — risk engine: COMPLETE** (exposure book w/ mass-acceptance
+dominance property, limits, last-look pure function, in-play detector,
+markout tracker + fills/markouts/ev_ledger persistence, UNKNOWN-never-quotes
+mutation sweep; 525 tests green). MC engine was built in Phase 0 (sim/engine.py).
+
+Next: **Phase 5 — hot path wiring (quote lifecycle, accept→confirm), paper
+mode, cancel-all, daily report — then STOP for the human (creds + Phase 2.5).**
 
 ## Architecture decisions
 

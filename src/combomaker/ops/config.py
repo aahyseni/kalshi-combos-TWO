@@ -125,6 +125,28 @@ class PricingConfig(StrictModel):
     max_source_disagreement: float = 0.08
 
 
+class RiskConfig(StrictModel):
+    """Limits + last-look + in-play policies. Enforced pre-quote AND pre-confirm."""
+
+    max_contracts_per_quote: float = 100.0
+    max_notional_per_quote_dollars: float = 500.0
+    max_market_delta_contracts: float = 300.0
+    max_event_delta_contracts: float = 500.0
+    max_gross_notional_dollars: float = 5_000.0
+    max_open_quotes: int = 20
+    max_daily_loss_dollars: float = 500.0
+    max_event_worst_case_loss_dollars: float = 1_000.0
+    # last look
+    leg_move_tolerance_cc: int = 150
+    joint_move_tolerance_cc: int = 200
+    max_leg_age_s: float = 2.0
+    # in-play detection
+    velocity_window_s: float = 5.0
+    velocity_threshold_cc: int = 300
+    update_count_threshold: int = 25
+    in_play_cooldown_s: float = 30.0
+
+
 class ObserveConfig(StrictModel):
     rfq_poll_s: float = 30.0          # REST reconciliation cadence (no seq on WS)
     would_quote_width_cc: int = 600   # stub half-spread total ($0.06) for logging only
@@ -139,6 +161,7 @@ class AppConfig(StrictModel):
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
     filters: FiltersConfig = Field(default_factory=FiltersConfig)
     pricing: PricingConfig = Field(default_factory=PricingConfig)
+    risk: RiskConfig = Field(default_factory=RiskConfig)
     observe: ObserveConfig = Field(default_factory=ObserveConfig)
     data_dir: Path = Path("data")
     kill_file: Path = Path("KILL")

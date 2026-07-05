@@ -68,6 +68,42 @@ CREATE TABLE IF NOT EXISTS would_quotes (
     context_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_would_quotes_rfq ON would_quotes (rfq_id);
+
+CREATE TABLE IF NOT EXISTS fills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    fill_ref TEXT NOT NULL,
+    order_id TEXT,
+    combo_ticker TEXT NOT NULL,
+    our_side TEXT NOT NULL,
+    contracts_centi INTEGER NOT NULL,
+    price_cc INTEGER NOT NULL,
+    fee_cc INTEGER,
+    expected_edge_cc INTEGER,
+    raw_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fills_ref ON fills (fill_ref);
+
+CREATE TABLE IF NOT EXISTS markouts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    fill_ref TEXT NOT NULL,
+    horizon_s REAL NOT NULL,
+    fair_at_fill_cc INTEGER,
+    fair_now_cc INTEGER,
+    raw_mid_at_fill_cc INTEGER,
+    raw_mid_now_cc INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_markouts_ref ON markouts (fill_ref);
+
+CREATE TABLE IF NOT EXISTS ev_ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    fill_ref TEXT NOT NULL,
+    expected_edge_cc INTEGER NOT NULL,
+    realized_pnl_cc INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_ev_ref ON ev_ledger (fill_ref);
 """
 
 
@@ -161,10 +197,88 @@ class Store:
         )
         await self._db.commit()
 
+    async def record_fill(
+        self,
+        fill_ref: str,
+        *,
+        order_id: str | None,
+        combo_ticker: str,
+        our_side: str,
+        contracts_centi: int,
+        price_cc: int,
+        fee_cc: int | None,
+        expected_edge_cc: int | None,
+        raw: JsonDict,
+    ) -> None:
+        await self._db.execute(
+            "INSERT INTO fills (at, fill_ref, order_id, combo_ticker, our_side,"
+            " contracts_centi, price_cc, fee_cc, expected_edge_cc, raw_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                self._now(),
+                fill_ref,
+                order_id,
+                combo_ticker,
+                our_side,
+                contracts_centi,
+                price_cc,
+                fee_cc,
+                expected_edge_cc,
+                json.dumps(raw),
+            ),
+        )
+        if expected_edge_cc is not None:
+            await self._db.execute(
+                "INSERT INTO ev_ledger (at, fill_ref, expected_edge_cc, realized_pnl_cc)"
+                " VALUES (?, ?, ?, NULL)",
+                (self._now(), fill_ref, expected_edge_cc),
+            )
+        await self._db.commit()
+
+    async def record_markout(
+        self,
+        fill_ref: str,
+        *,
+        horizon_s: float,
+        fair_at_fill_cc: int | None,
+        fair_now_cc: int | None,
+        raw_mid_at_fill_cc: int | None,
+        raw_mid_now_cc: int | None,
+    ) -> None:
+        await self._db.execute(
+            "INSERT INTO markouts (at, fill_ref, horizon_s, fair_at_fill_cc, fair_now_cc,"
+            " raw_mid_at_fill_cc, raw_mid_now_cc) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                self._now(),
+                fill_ref,
+                horizon_s,
+                fair_at_fill_cc,
+                fair_now_cc,
+                raw_mid_at_fill_cc,
+                raw_mid_now_cc,
+            ),
+        )
+        await self._db.commit()
+
+    async def settle_ev_entry(self, fill_ref: str, realized_pnl_cc: int) -> None:
+        await self._db.execute(
+            "UPDATE ev_ledger SET realized_pnl_cc = ? WHERE fill_ref = ?",
+            (realized_pnl_cc, fill_ref),
+        )
+        await self._db.commit()
+
     # --- simple readers for reports/tests ---
 
     async def count(self, table: str) -> int:
-        if table not in {"rfqs", "rfq_deletions", "decisions", "would_quotes"}:
+        if table not in {
+            "rfqs",
+            "rfq_deletions",
+            "decisions",
+            "would_quotes",
+            "fills",
+            "markouts",
+            "ev_ledger",
+        }:
             raise ValueError(f"unknown table {table!r}")
         async with self._db.execute(f"SELECT COUNT(*) FROM {table}") as cursor:  # noqa: S608
             row = await cursor.fetchone()
