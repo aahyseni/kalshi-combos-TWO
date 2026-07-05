@@ -112,3 +112,20 @@ no-quote).
 
 **UNVERIFIED rows for human review: C3 (GetRFQs status param), C2 (side enum).**
 Both fail safe.
+
+### Phase 2.5 infrastructure (2026-07-05) — harness built, fixture PENDING
+
+`core/conventions.py` + `combomaker ground-truth` harness are in place.
+**No ground-truth fixture exists yet** — conventions are DOC_ASSUMED with
+`verified=False`, and `require_verified()` blocks any real quoting until the
+harness has run and a human has promoted `conventions.derived.json` →
+`conventions.json`. Blocked on: demo credentials for TWO accounts
+(`KALSHI_API_KEY_ID`/`KALSHI_PRIVATE_KEY_PATH` +
+`KALSHI_REQUESTER_API_KEY_ID`/`KALSHI_REQUESTER_PRIVATE_KEY_PATH`) and a
+liquid standard demo market ticker. Run:
+`uv run combomaker ground-truth --market <TICKER>` (then a second pass on a
+combo market for HVM timing + product settlement).
+
+Architecture guard: `accepted_side` / `is_taker` / `outcome_side` tokens are
+forbidden under `pricing/` and `risk/` — those layers consume a `Conventions`
+instance only.

@@ -78,7 +78,13 @@ way in the code and in its tests, so everything passes while losing money.
 - [x] Doc-independent math built early: devig (external-only), normalize,
       copula, Monte Carlo engine — all convention-independent by design
 
-Next: **Phase 1 — market data.**
+**Phase 1 — market data: COMPLETE.** **Phase 2 — observe mode: COMPLETE**
+(code; live demo run pending credentials). **Phase 2.5 — harness BUILT,
+execution blocked on demo credentials (two accounts).** Conventions are
+DOC_ASSUMED/unverified until the fixture is recorded and promoted.
+
+Next: **Phase 3 — pricing** (convention-dependent parts coded against the
+`Conventions` interface; UNKNOWN⇒no-quote throughout).
 
 ## Architecture decisions
 

@@ -34,6 +34,17 @@ def build_parser() -> argparse.ArgumentParser:
     halt = sub.add_parser("halt", help="drop the KILL file (global halt)")
     halt.add_argument("--kill-file", type=Path, default=Path("KILL"))
 
+    gt = sub.add_parser(
+        "ground-truth",
+        help="Phase 2.5: record real RFQ round trips on DEMO into the "
+        "ground-truth fixture (needs maker + requester demo credentials)",
+    )
+    gt.add_argument("--market", required=True, help="liquid open demo market ticker")
+    gt.add_argument("--contracts", default="1.00", help="contracts_fp per RFQ")
+    gt.add_argument(
+        "--out", type=Path, default=Path("tests") / "fixtures" / "ground_truth"
+    )
+
     sub.add_parser("cancel-all", help="cancel all open quotes (Phase 5)")
     sub.add_parser("report", help="daily report (Phase 5)")
     return parser
@@ -56,6 +67,29 @@ def main(argv: list[str] | None = None) -> int:
     if args.command in ("cancel-all", "report"):
         print(f"{args.command}: not implemented until Phase 5")
         return 2
+
+    if args.command == "ground-truth":
+        from combomaker.ops.ground_truth import GroundTruthError, run_ground_truth
+
+        config = load_config(_config_path(Env.DEMO, None), env=Env.DEMO)
+        try:
+            derived = asyncio.run(
+                run_ground_truth(
+                    rest_base_url=config.endpoints.rest_base_url,
+                    market_ticker=args.market,
+                    contracts_fp=args.contracts,
+                    out_dir=args.out,
+                )
+            )
+        except (GroundTruthError, CredentialsError) as exc:
+            print(f"ground-truth aborted: {exc}", file=sys.stderr)
+            return 2
+        print(
+            f"recordings + {derived} written.\n"
+            "REVIEW the evidence, then promote conventions.derived.json to "
+            "conventions.json in the same directory to mark conventions verified."
+        )
+        return 0
 
     env = Env(args.env)
     mode = Mode(args.mode)

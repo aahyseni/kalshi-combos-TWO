@@ -86,3 +86,29 @@ def test_devig_only_importable_from_external_odds_adapters() -> None:
 def test_normalize_module_does_not_depend_on_devig() -> None:
     imports = _imported_targets(PACKAGE_ROOT / "pricing" / "normalize.py")
     assert not any(t.startswith(DEVIG_MODULE) for t in imports)
+
+
+# --- Conventions quarantine (quiet-failure defense #1) -----------------------
+#
+# Direction/sign/fee-side semantics live ONLY in core/conventions.py, written
+# against the Phase 2.5 ground-truth fixture. pricing/ and risk/ consume a
+# Conventions instance; they must never interpret the wire themselves. The
+# tokens below are the wire-semantic fingerprints that would indicate a module
+# is doing its own interpretation.
+
+_CONVENTION_TOKENS = ("accepted_side", "is_taker", "outcome_side")
+_CONVENTION_QUARANTINED_DIRS = ("pricing", "risk")
+
+
+def test_pricing_and_risk_never_interpret_wire_conventions() -> None:
+    offenders: list[str] = []
+    for directory in _CONVENTION_QUARANTINED_DIRS:
+        for path in (PACKAGE_ROOT / directory).rglob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            hits = [token for token in _CONVENTION_TOKENS if token in text]
+            if hits:
+                offenders.append(f"{path.name}: {hits}")
+    assert not offenders, (
+        f"convention tokens found outside core/conventions.py: {offenders}. "
+        "Consume a Conventions instance instead (CLAUDE.md quiet-failure defense #1)."
+    )

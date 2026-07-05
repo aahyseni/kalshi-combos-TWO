@@ -202,6 +202,41 @@ class KalshiRestClient:
     async def delete_quote(self, quote_id: str) -> JsonDict:
         return await self._request("DELETE", f"/communications/quotes/{quote_id}")
 
+    # Requester-side endpoints — used ONLY by the Phase 2.5 ground-truth
+    # harness and demo integration tests; the maker never creates RFQs.
+
+    async def create_rfq(
+        self,
+        market_ticker: str,
+        *,
+        contracts_fp: str | None = None,
+        target_cost_dollars: str | None = None,
+        rest_remainder: bool = False,
+        replace_existing: bool = False,
+    ) -> JsonDict:
+        body: JsonDict = {
+            "market_ticker": market_ticker,
+            "rest_remainder": rest_remainder,
+            "replace_existing": replace_existing,
+        }
+        if contracts_fp is not None:
+            body["contracts_fp"] = contracts_fp
+        if target_cost_dollars is not None:
+            body["target_cost_dollars"] = target_cost_dollars
+        return await self._request("POST", "/communications/rfqs", json_body=body)
+
+    async def delete_rfq(self, rfq_id: str) -> JsonDict:
+        return await self._request("DELETE", f"/communications/rfqs/{rfq_id}")
+
+    async def accept_quote(self, quote_id: str, *, accepted_side: str) -> JsonDict:
+        if accepted_side not in ("yes", "no"):
+            raise ValueError(f"accepted_side must be yes|no, got {accepted_side!r}")
+        return await self._request(
+            "PUT",
+            f"/communications/quotes/{quote_id}/accept",
+            json_body={"accepted_side": accepted_side},
+        )
+
     async def confirm_quote(self, quote_id: str) -> JsonDict:
         """Confirm an accepted quote. 204 on success; starts the execution timer."""
         return await self._request("PUT", f"/communications/quotes/{quote_id}/confirm")

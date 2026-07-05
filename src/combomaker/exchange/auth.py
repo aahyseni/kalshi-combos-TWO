@@ -45,17 +45,21 @@ class Credentials:
 
     @classmethod
     def from_env(cls) -> Credentials:
-        api_key_id = os.environ.get(ENV_API_KEY_ID, "").strip()
-        if not api_key_id:
-            raise CredentialsError(f"{ENV_API_KEY_ID} is not set")
+        return cls.from_env_names(ENV_API_KEY_ID, ENV_PRIVATE_KEY_PATH, ENV_PRIVATE_KEY_PEM)
 
-        pem = os.environ.get(ENV_PRIVATE_KEY_PEM, "")
+    @classmethod
+    def from_env_names(cls, key_id_env: str, path_env: str, pem_env: str) -> Credentials:
+        """Load from custom env var names (e.g. the ground-truth harness's
+        second, requester-side demo account: KALSHI_REQUESTER_*)."""
+        api_key_id = os.environ.get(key_id_env, "").strip()
+        if not api_key_id:
+            raise CredentialsError(f"{key_id_env} is not set")
+
+        pem = os.environ.get(pem_env, "")
         if not pem:
-            key_path = os.environ.get(ENV_PRIVATE_KEY_PATH, "").strip()
+            key_path = os.environ.get(path_env, "").strip()
             if not key_path:
-                raise CredentialsError(
-                    f"set {ENV_PRIVATE_KEY_PATH} (path to PEM) or {ENV_PRIVATE_KEY_PEM}"
-                )
+                raise CredentialsError(f"set {path_env} (path to PEM) or {pem_env}")
             try:
                 with open(key_path, "rb") as f:
                     pem_bytes = f.read()
