@@ -59,6 +59,9 @@ class WsLike(Protocol):
     @property
     def healthy(self) -> bool: ...
 
+    @property
+    def last_rx_age_s(self) -> float | None: ...
+
 
 class OrderbookFeed:
     def __init__(self, ws: WsLike, clock: Clock, metrics: Metrics | None = None) -> None:
@@ -116,6 +119,11 @@ class OrderbookFeed:
     @property
     def feed_healthy(self) -> bool:
         return self._ws.healthy
+
+    @property
+    def rx_age_s(self) -> float | None:
+        """Seconds since server traffic — the freshness proof for last look."""
+        return self._ws.last_rx_age_s
 
     def all_valid(self, tickers: Sequence[str]) -> bool:
         return self.feed_healthy and all(

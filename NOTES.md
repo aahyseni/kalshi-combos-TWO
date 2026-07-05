@@ -166,3 +166,18 @@ D13 (target-cost conversion).** All fail toward wider/no-quote.
 | E8 | Daily-loss halt at ≥ limit on realized+unrealized | `risk/limits.py` | design rule |
 
 **UNVERIFIED rows: E3 (re-check vs ground truth), E5 (latency budget measurement).**
+
+### Phase 5 prep — hot path wiring (2026-07-05)
+
+| # | Assumption embedded in code | Where | Tag |
+|---|---|---|---|
+| F1 | Create-quote response carries the quote id as `id` (fallback `quote_id`) | `rfq/lifecycle.py` | doc:create-quote (201 → {"id"}) |
+| F2 | Replacement = just send a new quote on the same RFQ (server auto-cancels ours); if a replacement attempt is refused by filter/risk, we explicitly DELETE the stale quote | `rfq/lifecycle.py` | doc:rfqs.md + defensive rule |
+| F3 | Unreadable `accepted_side` ⇒ deliberate lapse (never guess a side) | `rfq/lifecycle.py` | defense #2 |
+| F4 | Expected edge at fill = (side fair − our bid) × qty, fees reconciled later from the exchange ledger (`fee_cc` NULL until then) | `rfq/lifecycle.py` | defense #3 — fee never predicted into the ledger |
+| F5 | Freshness input to last look = feed traffic age (server pings @10s) gated by book validity — a quiet book on a live seq-continuous stream is current | `rfq/lifecycle.py`, `marketdata/feed.py` | design rule (B9) |
+| F6 | `GET /communications/quotes?status=open` lists our open quotes for cancel-all/startup reconcile | `ops/cli.py`, `ops/quote_app.py` | **UNVERIFIED** param value (queued with C3) |
+| F7 | quote mode gates: verified conventions + non-empty whitelist + prod guard; startup cancels leftovers; existing positions WARN (exposure book starts empty — manual reconcile) | `ops/quote_app.py` | design rule |
+| F8 | Report portfolio MC uses independence corr + complement pseudo-legs for NO-side legs (risk view, not pricing) | `ops/report.py` | approximation, documented |
+
+**UNVERIFIED rows: F1, F6 — both resolve in the first live demo run.**

@@ -72,7 +72,10 @@ class KalshiBookSource:
             return None
         top = book.top()
         micro = top.microprice()
-        if micro is None or top.spread_cc is None:
+        if micro is None or top.spread_cc is None or top.spread_cc < 0:
+            # Crossed derived book (yes bid above $1 − no bid): either a
+            # transient mirror state or something is deeply wrong. Either way
+            # it is not a price — decline, don't crash the hot path.
             return None
         half_spread_prob = top.spread_cc / 2 / CC_PER_DOLLAR
         thin = (top.yes_bid_qty or CentiContracts(0)) < self._thin_depth_centi or (

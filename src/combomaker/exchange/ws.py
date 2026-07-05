@@ -118,10 +118,17 @@ class WsManager:
     @property
     def healthy(self) -> bool:
         """Connected with traffic inside the silence budget (server pings @10s)."""
+        age = self.last_rx_age_s
+        return age is not None and age <= self._max_silence_s
+
+    @property
+    def last_rx_age_s(self) -> float | None:
+        """Seconds since ANY server traffic; the freshness proof for mirrored
+        state (a live seq-continuous stream means books are current NOW even
+        when quiet). None when disconnected."""
         if not self.connected or self._last_rx_mono_ns is None:
-            return False
-        age_s = (self._clock.monotonic_ns() - self._last_rx_mono_ns) / 1e9
-        return age_s <= self._max_silence_s
+            return None
+        return (self._clock.monotonic_ns() - self._last_rx_mono_ns) / 1e9
 
     # --- lifecycle ---
 

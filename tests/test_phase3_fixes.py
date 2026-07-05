@@ -1,4 +1,4 @@
-"""Regression tests for the two source fixes from the Phase 3 test sweep."""
+"""Regression tests for source fixes surfaced by the Phase 3/5 test sweeps."""
 
 from fractions import Fraction
 
@@ -51,6 +51,22 @@ def _quote(fair_prob: float) -> ConstructedQuote:
     )
     assert isinstance(result, ConstructedQuote)
     return result
+
+
+async def test_crossed_book_yields_no_belief_not_a_crash() -> None:
+    """A crossed derived book (yes bid > $1 − no bid) must decline, not raise
+    — it reaches the hot path via last-look repricing."""
+    from combomaker.core.money import CentiCents
+    from combomaker.core.quantity import CentiContracts
+    from combomaker.pricing.legs import KalshiBookSource
+    from tests.test_filters import Harness
+
+    h = Harness()
+    await h.with_books(["M1"])
+    book = h.feed.book("M1")
+    # push yes bid to $0.90 while best no bid stays $0.51 (yes ask $0.49)
+    assert book.apply_delta("yes", CentiCents(9_000), CentiContracts(50_000), ts_ms=1)
+    assert KalshiBookSource(h.feed).marginal("M1") is None
 
 
 def test_fee_subtraction_covers_fee_at_the_actual_bid() -> None:

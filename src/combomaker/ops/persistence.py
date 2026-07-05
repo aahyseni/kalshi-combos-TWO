@@ -291,3 +291,50 @@ class Store:
                 for reason in json.loads(row[0]):
                     counts[reason] = counts.get(reason, 0) + 1
         return counts
+
+    async def decision_kind_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        async with self._db.execute(
+            "SELECT kind, COUNT(*) FROM decisions GROUP BY kind"
+        ) as cursor:
+            async for row in cursor:
+                counts[str(row[0])] = int(row[1])
+        return counts
+
+    async def ev_summary(self) -> dict[str, object]:
+        async with self._db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(expected_edge_cc), 0),"
+            " COUNT(realized_pnl_cc), COALESCE(SUM(realized_pnl_cc), 0) FROM ev_ledger"
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        return {
+            "fills": int(row[0]),
+            "expected_edge_cc": int(row[1]),
+            "settled": int(row[2]),
+            "realized_pnl_cc": int(row[3]),
+        }
+
+    async def markout_summary(self) -> list[dict[str, object]]:
+        """Mean fair/raw-mid drift per horizon WITH sample counts — markout
+        stats without an n are noise dressed up as signal."""
+        out: list[dict[str, object]] = []
+        async with self._db.execute(
+            "SELECT horizon_s,"
+            " COUNT(*),"
+            " AVG(fair_now_cc - fair_at_fill_cc),"
+            " AVG(raw_mid_now_cc - raw_mid_at_fill_cc)"
+            " FROM markouts"
+            " WHERE fair_now_cc IS NOT NULL AND fair_at_fill_cc IS NOT NULL"
+            " GROUP BY horizon_s ORDER BY horizon_s"
+        ) as cursor:
+            async for row in cursor:
+                out.append(
+                    {
+                        "horizon_s": float(row[0]),
+                        "n": int(row[1]),
+                        "mean_fair_drift_cc": None if row[2] is None else float(row[2]),
+                        "mean_raw_mid_drift_cc": None if row[3] is None else float(row[3]),
+                    }
+                )
+        return out

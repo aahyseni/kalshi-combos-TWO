@@ -93,8 +93,16 @@ dominance property, limits, last-look pure function, in-play detector,
 markout tracker + fills/markouts/ev_ledger persistence, UNKNOWN-never-quotes
 mutation sweep; 525 tests green). MC engine was built in Phase 0 (sim/engine.py).
 
-Next: **Phase 5 — hot path wiring (quote lifecycle, accept→confirm), paper
-mode, cancel-all, daily report — then STOP for the human (creds + Phase 2.5).**
+**Phase 5 prep — hot path wiring: COMPLETE** (QuoteLifecycle: quote → accept →
+last look → confirm/lapse → executed → position; TTL/reprice/cancel-all;
+QuoteApp paper+quote modes with hard gates — verified conventions + whitelist
++ prod guard; cancel-all + report CLI; hedging scaffold phase-gated off;
+543 tests green).
+
+**STOPPED FOR THE HUMAN.** Everything runnable without credentials is built
+and tested. Blocked on: (1) demo credentials ×2 accounts → run Phase 2.5
+ground truth, (2) fee-schedule PDF download, (3) live demo observe run,
+(4) then Phase 5 demo end-to-end. See NOTES.md verification queue.
 
 ## Architecture decisions
 

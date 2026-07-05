@@ -45,6 +45,10 @@ class FakeWs:
     def healthy(self) -> bool:
         return self._healthy
 
+    @property
+    def last_rx_age_s(self) -> float | None:
+        return 0.1 if self._healthy else None
+
     # test drivers
     async def ack_subscription(self, index: int, sid: int) -> None:
         callback = self.subscriptions[index]["on_subscribed"]
