@@ -1,0 +1,15 @@
+# PRODUCTION config. Quoting here additionally requires the --confirm-live CLI
+# flag AND safety.prod_limits_configured: true (set only after the human has
+# reviewed the limits). Until Phase 7 this stays false.
+env: prod
+mode: observe
+
+logging:
+  json_output: true
+  level: INFO
+
+safety:
+  prod_limits_configured: false
+
+data_dir: data
+kill_file: KILL

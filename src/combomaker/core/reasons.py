@@ -33,6 +33,9 @@ class ReasonCode(StrEnum):
     SKIP_SOURCES_DISAGREE = "skip_sources_disagree"
     SKIP_NO_FREE_MONEY_CHECK = "skip_no_free_money_check"
     SKIP_WS_UNHEALTHY = "skip_ws_unhealthy"
+    # A classifier (leg relationship, settlement rules, market family) returned
+    # UNKNOWN. UNKNOWN always means widen-or-no-quote, never a convenient default.
+    SKIP_CLASSIFIER_UNKNOWN = "skip_classifier_unknown"
 
     # --- Quote lifecycle ---
     QUOTE_SENT = "quote_sent"
@@ -68,3 +71,7 @@ class ReasonCode(StrEnum):
     HALT_WS_UNHEALTHY = "halt_ws_unhealthy"
     HALT_KILL_FILE = "halt_kill_file"
     HALT_MANUAL = "halt_manual"
+    # Predicted vs exchange-ledger mismatch (fees, position signs, balance,
+    # settlement values). The ledger is ground truth; a mismatch means our model
+    # of the exchange is wrong somewhere — stop quoting, don't just log.
+    HALT_RECONCILIATION_MISMATCH = "halt_reconciliation_mismatch"
