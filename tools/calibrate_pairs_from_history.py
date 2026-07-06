@@ -180,7 +180,9 @@ NBA_PAIRS = [
 ]
 
 
-def load_intl(*, min_year: int = 2000, competitive_only: bool = True) -> list[dict[str, bool | None]]:
+def load_intl(
+    *, min_year: int = 2000, competitive_only: bool = True
+) -> list[dict[str, bool | None]]:
     """martj42 international results — the structurally-right data for WORLD
     CUP combos (internationals != club soccer). Competitive matches only."""
     matches: list[dict[str, bool | None]] = []
@@ -248,10 +250,8 @@ def load_nba_modern() -> list[dict[str, bool | None]]:
 
     raw: list[tuple[int, int, bool]] = []  # (season, total, home_win)
     for path in sorted(HISTORY.glob("nba_team_box_*.parquet")):
-        table = pq.read_table(
-            path,
-            columns=["season", "team_home_away", "team_score", "opponent_team_score", "team_winner"],
-        ).to_pylist()
+        columns = ["season", "team_home_away", "team_score", "opponent_team_score", "team_winner"]
+        table = pq.read_table(path, columns=columns).to_pylist()
         for row in table:
             if row.get("team_home_away") != "home":
                 continue
