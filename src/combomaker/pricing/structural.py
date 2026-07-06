@@ -37,7 +37,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from combomaker.ops.config import MarginTotalConfig, StructuralConfig
+from combomaker.ops.config import MarginTotalConfig, MlbRunsConfig, StructuralConfig
 from combomaker.pricing.copula import clamp_to_frechet, frechet_bounds
 from combomaker.pricing.dixon_coles import (
     Advance,
@@ -62,10 +62,13 @@ from combomaker.pricing.margin_total import (
     GameTotalOver,
     MTLegSpec,
     SportShape,
+    SpreadCover,
     TeamWins,
     invert_means,
     region_probability,
 )
+from combomaker.pricing.mlb_runs import MlbShape, invert_runs
+from combomaker.pricing.mlb_runs import joint_probability as mlb_joint
 from combomaker.rfq.models import RfqLeg
 
 _MT_SPORTS = (Sport.NFL, Sport.NBA, Sport.WNBA)
@@ -77,8 +80,12 @@ _DRAW_SUFFIXES = ("TIE", "DRAW")
 
 @dataclass(frozen=True, slots=True)
 class _Match:
-    team_a: str
-    team_b: str
+    """The concatenated team-code blob from the game code. Team codes vary in
+    length (PHIKC = PHI+KC, CONNMIN = CONN+MIN, ENGNOR = ENG+NOR), so teams
+    are resolved by anchoring at the ends: a code that prefixes the blob is
+    team A, one that suffixes it is team B — ambiguity refuses."""
+
+    code: str
 
 
 def _parse_match(game_code: str) -> _Match | None:
@@ -86,17 +93,28 @@ def _parse_match(game_code: str) -> _Match | None:
     if m is None:
         return None
     codes = m.group(1)
-    if len(codes) % 2 != 0 or len(codes) < 4:
-        return None  # can't split unambiguously -> not our problem to guess
-    half = len(codes) // 2
-    return _Match(team_a=codes[:half], team_b=codes[half:])
+    if len(codes) < 4:
+        return None
+    return _Match(code=codes)
 
 
 def _team_of(code: str, match: _Match) -> Team | None:
-    if code == match.team_a:
-        return Team.A
-    if code == match.team_b:
-        return Team.B
+    if len(code) < 2 or len(code) >= len(match.code):
+        return None
+    is_a = match.code.startswith(code)
+    is_b = match.code.endswith(code)
+    if is_a == is_b:  # neither, or both (pathological palindrome): refuse
+        return None
+    return Team.A if is_a else Team.B
+
+
+def _player_team(player_code: str, match: _Match) -> Team | None:
+    """Player codes prefix their team code (ENGHKANE9, KCBWITT7): try the
+    longest leading fragment that anchors to either end of the game code."""
+    for length in range(min(4, len(player_code) - 1), 1, -1):
+        team = _team_of(player_code[:length], match)
+        if team is not None:
+            return team
     return None
 
 
@@ -142,11 +160,7 @@ def _parse_leg(ticker: str, match: _Match, *, fmt: MatchFormat) -> LegSpec | str
         if len(parts) < 4:
             return "player ticker too short to carry a team code"
         player_code, goals_raw = parts[-2], parts[-1]
-        team = None
-        for code, side in ((match.team_a, Team.A), (match.team_b, Team.B)):
-            if player_code.startswith(code):
-                team = side
-                break
+        team = _player_team(player_code, match)
         if team is None:
             return f"player code {player_code!r} matches neither team"
         if not re.fullmatch(r"\d+", goals_raw):
@@ -158,10 +172,14 @@ def _parse_leg(ticker: str, match: _Match, *, fmt: MatchFormat) -> LegSpec | str
 
 class StructuralPricer:
     def __init__(
-        self, config: StructuralConfig, mt_config: MarginTotalConfig | None = None
+        self,
+        config: StructuralConfig,
+        mt_config: MarginTotalConfig | None = None,
+        mlb_config: MlbRunsConfig | None = None,
     ) -> None:
         self._cfg = config
         self._mt = mt_config or MarginTotalConfig()
+        self._mlb = mlb_config or MlbRunsConfig()
 
     def _match_format(self, ticker: str) -> MatchFormat:
         series = ticker.split("-", 1)[0].upper()
@@ -190,6 +208,10 @@ class StructuralPricer:
                 if str(sport) not in self._mt.enabled_sports:
                     raise StructuralError(f"{sport} margin-total pricer not gated on")
                 return self._price_margin_total(sport, legs, beliefs, sides), None
+            if sport is Sport.MLB:
+                if not self._mlb.enabled:
+                    raise StructuralError("mlb runs pricer not gated on")
+                return self._price_mlb(legs, beliefs, sides), None
             raise StructuralError(f"no structural model for sport {sport}")
         except StructuralError as exc:
             return None, str(exc)
@@ -326,17 +348,26 @@ class StructuralPricer:
             return TeamWins(team=team)
         if leg_type is LegType.TOTAL:
             raw = parts[-1]
+            # DOC-VERIFIED (live market metadata 2026-07-06): integer suffix N
+            # means "over N-0.5" (KXMLBTOTAL-...-5 = 'Over 4.5 runs scored',
+            # KXWNBATOTAL-...-175 = 'Over 174.5 points scored').
             if re.fullmatch(r"\d+", raw):
-                # "N or more" style integer line: T >= N, continuity-corrected.
                 return GameTotalOver(threshold=float(int(raw)) - 0.5)
             if re.fullmatch(r"\d+\.5", raw):
                 return GameTotalOver(threshold=float(raw))
             return f"unparseable total line {raw!r}"
         if leg_type is LegType.SPREAD:
-            # The ticker does not carry the line's SIGN convention; guessing
-            # it wrong silently mirrors every spread quote. Blocked until
-            # real spread tickers + rules are observed in season.
-            return "spread line sign convention unverified — copula fallback"
+            # DOC-VERIFIED (live market metadata 2026-07-06): suffix TEAMn
+            # means "TEAM wins by over n-0.5" (KXMLBSPREAD-...-BOS4 = 'Boston
+            # wins by over 3.5 runs') — team-anchored, always positive, no
+            # sign ambiguity.
+            m = re.fullmatch(r"([A-Z]+?)(\d+)", parts[-1])
+            if m is None:
+                return f"unparseable spread suffix {parts[-1]!r}"
+            team = _team_of(m.group(1), match)
+            if team is None:
+                return f"spread team {m.group(1)!r} matches neither team"
+            return SpreadCover(team=team, line=float(int(m.group(2))) - 0.5)
         return f"leg type {leg_type} not representable in the margin/total model"
 
     def _price_margin_total(
@@ -451,6 +482,94 @@ class StructuralPricer:
         )
 
 
+    # --- MLB (NegBin runs grid) --------------------------------------------
+
+    def _price_mlb(
+        self, legs: list[RfqLeg], beliefs: list[LegBelief], sides: list[str]
+    ) -> JointEstimate:
+        cfg = self._mlb
+        shape = MlbShape(dispersion_k=cfg.dispersion_k)
+
+        matches = []
+        for leg in legs:
+            parts = leg.market_ticker.split("-")
+            if len(parts) < 2:
+                raise StructuralError(f"malformed ticker {leg.market_ticker!r}")
+            match = _parse_match(parts[1])
+            if match is None:
+                raise StructuralError(f"unparseable game code {parts[1]!r}")
+            matches.append(match)
+        match = matches[0]
+        if any(m != match for m in matches):
+            raise StructuralError("legs reference different games")
+
+        specs: list[MTLegSpec] = []
+        for leg in legs:
+            spec = self._parse_mt_leg(leg.market_ticker, match)
+            if isinstance(spec, str):
+                raise StructuralError(f"{leg.market_ticker}: {spec}")
+            specs.append(spec)
+
+        constraints = [(spec, b.p) for spec, b in zip(specs, beliefs, strict=True)]
+        selected = [(spec, side == "yes") for spec, side in zip(specs, sides, strict=True)]
+
+        warm: tuple[float, float] | None = None
+
+        def solve(
+            targets: list[tuple[MTLegSpec, float]], k: float
+        ) -> tuple[float, float]:
+            inv = invert_runs(targets, MlbShape(dispersion_k=k), warm_start=warm)
+            return (
+                mlb_joint(inv.mu_a, inv.mu_b, MlbShape(dispersion_k=k), selected),
+                inv.residual,
+            )
+
+        base = invert_runs(constraints, shape)
+        p = mlb_joint(base.mu_a, base.mu_b, shape, selected)
+        warm = (base.mu_a, base.mu_b)
+
+        leg_unc = 0.0
+        for i, belief in enumerate(beliefs):
+            deltas = []
+            for shifted in (belief.p + belief.uncertainty, belief.p - belief.uncertainty):
+                bumped = list(constraints)
+                bumped[i] = (specs[i], min(0.999, max(0.001, shifted)))
+                try:
+                    deltas.append(abs(solve(bumped, cfg.dispersion_k)[0] - p))
+                except StructuralError:
+                    continue
+            if not deltas:
+                raise StructuralError(f"marginal band of leg {i} leaves invertible range")
+            leg_unc += max(deltas)
+
+        form_probes: list[float] = []
+        for k in (cfg.dispersion_k - cfg.k_band, cfg.dispersion_k + cfg.k_band):
+            try:
+                form_probes.append(solve(constraints, k)[0])
+            except StructuralError:
+                continue
+        form_unc = max((abs(fp - p) for fp in form_probes), default=0.0)
+        misfit_unc = base.residual * cfg.misfit_uncertainty_scale
+        uncertainty = leg_unc + form_unc + misfit_unc
+
+        marginals = [
+            b.p if yes else 1.0 - b.p
+            for b, (_, yes) in zip(beliefs, selected, strict=True)
+        ]
+        lo, hi = frechet_bounds(marginals)
+        return JointEstimate(
+            p=clamp_to_frechet(p, marginals),
+            uncertainty=uncertainty,
+            frechet_lo=lo,
+            frechet_hi=hi,
+            notes=(
+                *base.notes,
+                f"structural-mlb: legs={len(legs)} "
+                f"unc(leg={leg_unc:.4f} form={form_unc:.4f} misfit={misfit_unc:.4f})",
+            ),
+        )
+
+
 def structural_applicable(
     legs: list[RfqLeg], same_event_groups: Sequence[Sequence[int]]
 ) -> bool:
@@ -459,7 +578,7 @@ def structural_applicable(
     if not legs:
         return False
     sports = {classify_sport(leg.market_ticker) for leg in legs}
-    if len(sports) != 1 or sports.pop() not in (Sport.SOCCER, *_MT_SPORTS):
+    if len(sports) != 1 or sports.pop() not in (Sport.SOCCER, Sport.MLB, *_MT_SPORTS):
         return False
     groups = [g for g in same_event_groups if len(g) > 1] if same_event_groups else []
     covered = set(groups[0]) if len(groups) == 1 else set()

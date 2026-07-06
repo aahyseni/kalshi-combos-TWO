@@ -24,6 +24,8 @@ from combomaker.pricing.structural import (
     StructuralPricer,
     _parse_leg,
     _parse_match,
+    _player_team,
+    _team_of,
     structural_applicable,
 )
 from combomaker.rfq.models import RfqLeg
@@ -56,16 +58,32 @@ class TestParsing:
     def test_match_teams(self) -> None:
         match = _parse_match(GAME)
         assert match is not None
-        assert (match.team_a, match.team_b) == ("ENG", "NOR")
+        assert _team_of("ENG", match) is Team.A
+        assert _team_of("NOR", match) is Team.B
+        assert _team_of("BRA", match) is None
 
     def test_match_with_start_time(self) -> None:
         match = _parse_match("26JUL081840MEXENG")  # optional HHMM start time
         assert match is not None
-        assert (match.team_a, match.team_b) == ("MEX", "ENG")
+        assert _team_of("MEX", match) is Team.A
 
-    def test_odd_length_team_codes_refuse(self) -> None:
-        assert _parse_match("26JUL10ENGNORX") is None  # 7 chars: no clean split
-        assert _parse_match("26JUL10AB") is None       # too short
+    def test_variable_length_team_codes_resolve(self) -> None:
+        """Live-tape shapes: team codes vary in length (PHI+KC, CONN+MIN,
+        SEA+LA) — resolution anchors at the ends of the code blob."""
+        wnba = _parse_match("26JUL06CONNMIN")
+        assert wnba is not None
+        assert _team_of("CONN", wnba) is Team.A and _team_of("MIN", wnba) is Team.B
+        mlb = _parse_match("26JUL061410PHIKC")
+        assert mlb is not None
+        assert _team_of("PHI", mlb) is Team.A and _team_of("KC", mlb) is Team.B
+        assert _player_team("KCBWITT7", mlb) is Team.B      # KXMLBHIT shape
+        sea = _parse_match("26JUL06SEALA")
+        assert sea is not None
+        assert _team_of("LA", sea) is Team.B and _team_of("SEA", sea) is Team.A
+        por = _parse_match("26JUL06PORESP")
+        assert por is not None
+        assert _player_team("ESPLYAMAL10", por) is Team.B   # live WC shape
+        assert _parse_match("26JUL10AB") is None            # too short
 
     def test_knockout_leg_specs_follow_rule_book_windows(self) -> None:
         """Kalshi rules text + live tape: ADVANCE series = ET+pens; GAME
@@ -244,13 +262,48 @@ class TestMarginTotalDispatch:
         )
         assert est is None and reason is not None and "not gated" in reason
 
-    def test_spread_leg_falls_back_sign_unverified(self) -> None:
+    def test_spread_leg_comonotone_with_moneyline(self) -> None:
+        """DOC-VERIFIED spread convention (TEAMn = wins by over n-0.5):
+        win-and-cover collapses to the cover marginal, exactly."""
+        # ML 0.62 implies mu_M = 4.19; the consistent 3.5-line cover prob is
+        # norm.cdf((4.19-3.5)/13.71) = 0.520 (inconsistent inputs would be
+        # least-squares compromised and priced with misfit width instead).
         est, reason = self.mt_pricer(["nba"]).try_price(
-            [leg(self.NBA_ML), leg("KXNBASPREAD-26OCT10LALBOS-LAL35")],
-            [belief(0.62), belief(0.50)],
+            [leg(self.NBA_ML), leg("KXNBASPREAD-26OCT10LALBOS-LAL4"),
+             leg(self.NBA_TOTAL)],
+            [belief(0.62), belief(0.52), belief(0.55)],
+            ["yes", "yes", "yes"],
+        )
+        assert reason is None and est is not None
+        # joint = P(cover) x P(over) at rho=0 (win is implied by covering)
+        assert est.p == pytest.approx(0.52 * 0.55, abs=0.005)
+
+    def test_mlb_ml_total_prices_via_runs_grid(self) -> None:
+        from combomaker.ops.config import MlbRunsConfig
+
+        p = StructuralPricer(
+            StructuralConfig(enabled=True),
+            None,
+            MlbRunsConfig(enabled=True),
+        )
+        est, reason = p.try_price(
+            [leg("KXMLBGAME-26JUL061410PHIKC-PHI"),
+             leg("KXMLBTOTAL-26JUL061410PHIKC-9")],
+            [belief(0.55), belief(0.48)],
             ["yes", "yes"],
         )
-        assert est is None and reason is not None and "sign convention" in reason
+        assert reason is None and est is not None
+        assert 0.0 < est.p < 0.55
+        assert any("structural-mlb" in n for n in est.notes)
+
+    def test_mlb_ungated_falls_back(self) -> None:
+        est, reason = pricer().try_price(
+            [leg("KXMLBGAME-26JUL061410PHIKC-PHI"),
+             leg("KXMLBTOTAL-26JUL061410PHIKC-9")],
+            [belief(0.55), belief(0.48)],
+            ["yes", "yes"],
+        )
+        assert est is None and reason is not None and "not gated" in reason
 
     def test_no_side_total_is_complement(self) -> None:
         p = self.mt_pricer(["nba"])

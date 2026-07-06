@@ -326,11 +326,17 @@ class MarginTotalConfig(StrictModel):
     2015-2023, test 2024-2025 n=562): structural beats the shipped v1 copula
     on all three OOS metrics — hw×over 1.29275 vs 1.29293, hw×cover 0.96260
     vs 0.99940 (exact comonotone geometry vs the 0.88 approximation), triple
-    1.65544 vs 1.69217. NBA/WNBA stay disabled: no local odds history to
-    gate them; gate from prod-shadow settlements or an odds source before
-    their seasons."""
+    1.65544 vs 1.69217.
 
-    enabled_sports: list[str] = ["nfl"]
+    WNBA enabled 2026-07-06 by OPERATOR REQUEST (season live now): the
+    geometry is the NFL-gated one, the WNBA shape is calibrated on 1,338
+    recent games through 2026-07-05, and its rho≈0 means ml×total prices
+    within noise of the incumbent v1 — the upgrade is coherent spread/
+    team-total joints. Confirmation gate from prod-shadow settlements as
+    data accrues. NBA stays disabled until its season approaches (odds
+    source or shadow gate)."""
+
+    enabled_sports: list[str] = ["nfl", "wnba"]
     params: dict[str, dict[str, float]] = {
         "nfl": {"sigma_margin": 12.66, "sigma_total": 13.06, "rho": 0.026},
         "nba": {"sigma_margin": 13.71, "sigma_total": 18.42, "rho": 0.000},
@@ -344,12 +350,28 @@ class MarginTotalConfig(StrictModel):
     misfit_uncertainty_scale: float = 1.0
 
 
+class MlbRunsConfig(StrictModel):
+    """NegBin runs model for MLB SGPs (pricing/mlb_runs.py). Dispersion k
+    calibrated from Retrosheet final scores (tools/calibrate_mlb_runs.py,
+    2026-07-06): k=3.62 on 2021-2024, k=3.63 on 2015-2019 — era-stable; the
+    band covers the unmodeled home/away asymmetry (k 3.37 away / 3.91 home —
+    tickers don't reveal the home side). ``enabled`` flips only via an OOS
+    gate; the gate path is prod-shadow leg prices + settlements (no MLB
+    odds history is locally available)."""
+
+    enabled: bool = False
+    dispersion_k: float = 3.62
+    k_band: float = 0.30
+    misfit_uncertainty_scale: float = 1.0
+
+
 class PricingConfig(StrictModel):
     fee: FeeConfig = Field(default_factory=FeeConfig)
     correlation: CorrelationConfig = Field(default_factory=CorrelationConfig)
     quote: QuoteConfig = Field(default_factory=QuoteConfig)
     structural: StructuralConfig = Field(default_factory=StructuralConfig)
     margin_total: MarginTotalConfig = Field(default_factory=MarginTotalConfig)
+    mlb_runs: MlbRunsConfig = Field(default_factory=MlbRunsConfig)
     external_odds: ExternalOddsConfig = Field(default_factory=ExternalOddsConfig)
     max_source_disagreement: float = 0.08
 
