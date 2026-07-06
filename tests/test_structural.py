@@ -32,9 +32,10 @@ from tests.test_filters import Harness
 from tests.test_pricing_engine import seed_event
 
 GAME = "26JUL10ENGNOR"
-ML = f"KXWCGAME-{GAME}-ENG"
-ML_B = f"KXWCGAME-{GAME}-NOR"
-BTTS = f"KXWCBTTS-{GAME}"
+ML = f"KXWCADVANCE-{GAME}-ENG"       # advance market: ET + pens (rules text)
+ML_B = f"KXWCADVANCE-{GAME}-NOR"
+REG_ML = f"KXWCGAME-{GAME}-ENG"      # regulation moneyline: 90' only
+BTTS = f"KXWCBTTS-{GAME}-BTTS"
 GOAL = f"KXWCGOAL-{GAME}-ENGHKANE9-1"
 TOTAL = f"KXWCTOTAL-{GAME}-3"
 
@@ -67,29 +68,41 @@ class TestParsing:
         assert _parse_match("26JUL10AB") is None       # too short
 
     def test_knockout_leg_specs_follow_rule_book_windows(self) -> None:
-        """Kalshi rules text: game market = ADVANCE (ET+pens); BTTS/totals =
-        regulation only; player props = full game (ET, no pens)."""
+        """Kalshi rules text + live tape: ADVANCE series = ET+pens; GAME
+        series (coexists on the same knockout matches) = Regulation Time
+        Moneyline; BTTS/totals = regulation only; player props = full game
+        (ET, no pens)."""
         match = _parse_match(GAME)
         assert match is not None
         ko = MatchFormat.KNOCKOUT
         assert _parse_leg(ML, match, fmt=ko) == Advance(Team.A)
         assert _parse_leg(ML_B, match, fmt=ko) == Advance(Team.B)
+        assert _parse_leg(REG_ML, match, fmt=ko) == TeamWin(Team.A, include_et=False)
         assert _parse_leg(f"KXWCGAME-{GAME}-TIE", match, fmt=ko) == Draw()
         assert _parse_leg(BTTS, match, fmt=ko) == Btts(include_et=False)
         assert _parse_leg(TOTAL, match, fmt=ko) == TotalOver(3, include_et=False)
         assert _parse_leg(GOAL, match, fmt=ko) == PlayerScores(
             Team.A, min_goals=1, include_et=True
         )
+        # live-tape shapes (2026-07-06): Messi 2+ and integer total lines
+        assert _parse_leg(
+            "KXWCGOAL-26JUL07ARGEGY-ARGLMESSI10-2", _parse_match("26JUL07ARGEGY"), fmt=ko
+        ) == PlayerScores(Team.A, min_goals=2, include_et=True)
+        assert _parse_leg(
+            "KXWCADVANCE-26JUL06PORESP-POR", _parse_match("26JUL06PORESP"), fmt=ko
+        ) == Advance(Team.A)
 
     def test_group_leg_specs(self) -> None:
         match = _parse_match(GAME)
         assert match is not None
         gr = MatchFormat.GROUP
-        assert _parse_leg(ML, match, fmt=gr) == TeamWin(Team.A, include_et=False)
+        assert _parse_leg(REG_ML, match, fmt=gr) == TeamWin(Team.A, include_et=False)
         assert _parse_leg(BTTS, match, fmt=gr) == Btts(include_et=False)
         assert _parse_leg(GOAL, match, fmt=gr) == PlayerScores(
             Team.A, min_goals=1, include_et=False
         )
+        out = _parse_leg(ML, match, fmt=gr)  # advance ticker, group match
+        assert isinstance(out, str) and "non-knockout" in out
 
     def test_unmatched_team_suffix_is_reason(self) -> None:
         match = _parse_match(GAME)

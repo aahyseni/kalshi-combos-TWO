@@ -122,13 +122,15 @@ def _parse_leg(ticker: str, match: _Match, *, fmt: MatchFormat) -> LegSpec | str
         team = _team_of(suffix, match)
         if team is None:
             return f"moneyline suffix {suffix!r} matches neither team"
-        if knockout:
-            # Kalshi's knockout game market settles on ADVANCING — ET and
-            # penalty shootouts included (rules text).
-            return Advance(team=team)
         if leg_type is LegType.ADVANCE:
-            return "advance market on a non-knockout match"
-        return TeamWin(team=team, include_et=False)  # regulation moneyline
+            # KXWCADVANCE: which team advances — ET AND pens included.
+            if not knockout:
+                return "advance market on a non-knockout match"
+            return Advance(team=team)
+        # KXWCGAME coexists with KXWCADVANCE on the same knockout matches
+        # (live tape 2026-07-06), so GAME is the Regulation Time Moneyline
+        # family: settles at the end of regulation in BOTH formats.
+        return TeamWin(team=team, include_et=False)
     if leg_type is LegType.BTTS:
         return Btts(include_et=False)  # regulation-time market by rule
     if leg_type is LegType.TOTAL:
