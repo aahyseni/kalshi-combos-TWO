@@ -1,6 +1,8 @@
 # Secrets — never commit credentials or key material
 .env
 .env.*
+# the placeholder template is documentation, not a secret
+!.env.example
 *.pem
 *.key
 *.p8

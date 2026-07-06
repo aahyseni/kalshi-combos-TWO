@@ -12,14 +12,25 @@ OpenAPI spec exists at `sportsgameodds.com/SportsGameOdds_OpenAPI_Spec.json`
   keys don't belong in URLs/logs)
 - Usage endpoint: `GET /account/usage`
 
-## Free tier ("Amateur")
+## Free tier ("Amateur") — CONFIRMED by user's plan + live probe 2026-07-05
 
-- **2,500 objects/month**, 8 leagues, 9 bookmakers, **no historical data**.
-  (Marketing text said "settlement included in responses across all tiers".)
-- An "object" ≈ a returned entity — every polled event costs budget. At
-  2,500/month the poll budget is ~80 objects/day: poll ONE league's pregame
-  slate a few times a day, not a loop.
-- Rate-limit response behavior undocumented — handle 429 defensively.
+- **2,500 objects/month**, **10 requests/minute**, 10-min update frequency,
+  **no historical data** (user-confirmed).
+- Leagues (8): NFL, NBA, MLB, NHL, College Football, College Basketball,
+  Champions League, MLS — good overlap with Kalshi sports combos.
+- Bookmakers (9): FanDuel, DraftKings, BetMGM, Caesars, ESPN BET, Bovada,
+  Unibet, PointsBet, William Hill.
+- Data on plan: pregame AND live odds, spreads/moneylines/over-unders,
+  partials (1st half etc.), player/team props, alt lines, **fairOdds** +
+  **bookOdds** consensus, results/live scores/box scores.
+- Live-probe facts: `GET /account/usage` works (tier "amateur",
+  per-minute max-requests 10 visible in `rateLimits`); events envelope is
+  `{"success": true, "data": [...]}`; a real MLB event carries ~1,000–1,300
+  odds entries (~16 moneyline entries across periods).
+- An "object" ≈ a returned entity — every polled event costs budget
+  (~80/day at 2,500/month). Poller floor: 10-minute interval (matches their
+  update frequency); ≤1 request per league per cycle keeps us far under
+  10 req/min.
 
 ## Events endpoint
 

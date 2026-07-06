@@ -188,13 +188,16 @@ D13 (target-cost conversion).** All fail toward wider/no-quote.
 |---|---|---|---|
 | G1 | Base `https://api.sportsgameodds.com/v2`, header `x-api-key`; events via `GET /events?leagueID=&oddsAvailable=true&limit=`; response `{data: [event]}`; odds keyed by `oddID` = statID-statEntityID-periodID-betTypeID-sideID; American odds strings | `pricing/sources/sportsgameodds.py` | doc:sportsgameodds.md (their docs) |
 | G2 | We devig their juiced `bookOdds` pair ourselves (configured method); their opaque `fairOdds` only feeds uncertainty via disagreement distance | ″ | design rule (decision #8) |
-| G3 | Opposing side derived by flipping entity+side in the oddID (home↔away, over↔under) | ″ | **UNVERIFIED** — verify against a real payload's `opposingOddID` field on first live pull |
-| G4 | Free tier 2,500 objects/month ⇒ poller floor 10-min interval, per-league event cap, budget counter; NO historical on free tier | ″ | doc:sportsgameodds.md (quota accounting granularity UNVERIFIED) |
+| G3 | Opposing side derived by flipping entity+side in the oddID (home↔away, over↔under) | ″ | **VERIFIED 2026-07-05** — live probe: our flip == their `opposingOddID` on real MLB payloads, both directions |
+| G4 | Free tier 2,500 objects/month + 10 req/min ⇒ poller floor 10-min interval, per-league event cap, budget counter; NO historical on free tier | ″ | user-confirmed plan + live `GET /account/usage` (monthly object accounting granularity still to observe over time) |
 | G5 | Kalshi ticker → (eventID, oddID) mapping is an explicit config table; unmapped ⇒ None (Kalshi-book-only), never fuzzy-matched | ″ + `ops/config.py` | design rule (defense #2) |
 | G6 | Engine blends book (w=1.0) + external (w=cfg); sources disagreeing >0.08 ⇒ `SKIP_SOURCES_DISAGREE` no-quote; adapter OFF by default | `pricing/engine.py` | design rule |
 
-**UNVERIFIED rows: G3 (oddID flip), G4 (object accounting) — resolve on the
-first live pull with the user's key; check `GET /account/usage` after.**
+**G3/G4 resolved by the 2026-07-05 live probe (2 MLB events, ~2 objects
+spent); adapter ingested 450 marginals end-to-end. Envelope `{success, data}`
+confirmed. Kalshi demo-credential attempt the same day: 401 on demo REST+WS
+with a production-site key — confirms credentials are strictly
+per-environment (auth-env.md); a demo-site key is required.**
 
 ### Final adversarial review (2026-07-05) — 5 lenses, 43 agents, 7 confirmed defects, all fixed
 
