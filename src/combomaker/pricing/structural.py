@@ -2,16 +2,26 @@
 
 Owns everything the pure model must not know about: ticker parsing (game
 codes, team codes, player-to-team attachment, totals lines), settlement-window
-assumptions per series, and the honest-failure contract — ANY leg this module
-cannot classify with certainty makes it decline (return a reason), sending the
-engine down the v1 copula path. UNKNOWN never silently prices (quiet-failure
-defense #2).
+mapping per market family, and the honest-failure contract — ANY leg this
+module cannot classify with certainty makes it decline (return a reason),
+sending the engine down the v1 copula path. UNKNOWN never silently prices
+(quiet-failure defense #2).
+
+Settlement windows (doc: Kalshi rules text, operator-provided 2026-07-06):
+  - knockout GAME market = which team ADVANCES: ET and penalty shootouts
+    included -> Advance spec (pens as a fractional factor, prob banded);
+  - Regulation-Time Moneyline / Spread / Total / BTTS / Team Total / Correct
+    Score settle at the END OF REGULATION (90' + stoppage) -> include_et=False
+    ALWAYS for BTTS and totals, and for group-stage moneylines;
+  - all other props (player goals) settle on the FULL GAME including ET,
+    pens excluded -> include_et=True in knockouts (our ET stage has no pens,
+    matching the rule exactly).
 
 Uncertainty is priced by perturbation, all through re-inversion so the model
 keeps hitting the (perturbed) market marginals:
   - each leg's marginal band  -> re-invert at p +/- unc, sum |d joint|
   - model form (DC rho, ET intensity) -> re-invert at the band edges
-  - settlement windows (knockout only) -> re-price with 90'-only windows
+  - shootout probability (Advance legs only) -> re-invert at 0.5 +/- band
   - over-identification residual -> misfit scaled straight into width
 
 Ticker shapes handled (grounded in observed KXWC/KXUCL/KXEPL series):
@@ -25,11 +35,12 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from combomaker.ops.config import StructuralConfig
 from combomaker.pricing.copula import clamp_to_frechet, frechet_bounds
 from combomaker.pricing.dixon_coles import (
+    Advance,
     Btts,
     Draw,
     InvertedModel,
@@ -88,27 +99,33 @@ def _parse_total_line(raw: str) -> int | None:
     return None
 
 
-def _parse_leg(
-    ticker: str, match: _Match, *, include_et: bool
-) -> LegSpec | str:
-    """One leg's spec, or a reason string when we cannot be certain."""
+def _parse_leg(ticker: str, match: _Match, *, fmt: MatchFormat) -> LegSpec | str:
+    """One leg's spec (with its rule-book settlement window), or a reason
+    string when we cannot be certain."""
     parts = ticker.split("-")
     leg_type = classify_leg(ticker)
-    if leg_type is LegType.MONEYLINE:
+    knockout = fmt is MatchFormat.KNOCKOUT
+    if leg_type in (LegType.MONEYLINE, LegType.ADVANCE):
         suffix = parts[-1]
         if suffix in _DRAW_SUFFIXES:
-            return Draw()
+            return Draw()  # regulation 3-way draw — same window either format
         team = _team_of(suffix, match)
         if team is None:
             return f"moneyline suffix {suffix!r} matches neither team"
-        return TeamWin(team=team, include_et=include_et)
+        if knockout:
+            # Kalshi's knockout game market settles on ADVANCING — ET and
+            # penalty shootouts included (rules text).
+            return Advance(team=team)
+        if leg_type is LegType.ADVANCE:
+            return "advance market on a non-knockout match"
+        return TeamWin(team=team, include_et=False)  # regulation moneyline
     if leg_type is LegType.BTTS:
-        return Btts(include_et=include_et)
+        return Btts(include_et=False)  # regulation-time market by rule
     if leg_type is LegType.TOTAL:
         line = _parse_total_line(parts[-1])
         if line is None:
             return f"unparseable total line {parts[-1]!r}"
-        return TotalOver(min_total=line, include_et=include_et)
+        return TotalOver(min_total=line, include_et=False)  # regulation by rule
     if leg_type is LegType.PLAYER_GOAL:
         if len(parts) < 4:
             return "player ticker too short to carry a team code"
@@ -122,16 +139,9 @@ def _parse_leg(
             return f"player code {player_code!r} matches neither team"
         if not re.fullmatch(r"\d+", goals_raw):
             return f"unparseable goal count {goals_raw!r}"
-        return PlayerScores(team=team, min_goals=int(goals_raw), include_et=include_et)
+        # Props settle on the full game incl. ET (pens excluded) by rule.
+        return PlayerScores(team=team, min_goals=int(goals_raw), include_et=knockout)
     return f"leg type {leg_type} not representable in the scoreline model"
-
-
-def _flip_windows(spec: LegSpec) -> LegSpec:
-    """90'-only variant for the settlement-window band. The moneyline keeps
-    ET — its market name says '90+ET' — the ambiguous windows are the rest."""
-    if isinstance(spec, (Btts, TotalOver, PlayerScores)):
-        return replace(spec, include_et=False)
-    return spec
 
 
 class StructuralPricer:
@@ -178,10 +188,9 @@ class StructuralPricer:
             raise StructuralError("legs reference different matches")
 
         fmt = self._match_format(legs[0].market_ticker)
-        include_et = fmt is MatchFormat.KNOCKOUT
         specs: list[LegSpec] = []
         for leg in legs:
-            spec = _parse_leg(leg.market_ticker, match, include_et=include_et)
+            spec = _parse_leg(leg.market_ticker, match, fmt=fmt)
             if isinstance(spec, str):
                 raise StructuralError(f"{leg.market_ticker}: {spec}")
             specs.append(spec)
@@ -196,6 +205,7 @@ class StructuralPricer:
             *,
             dc_rho: float | None = None,
             et_factor: float | None = None,
+            pens: float | None = None,
         ) -> tuple[InvertedModel, float]:
             model = invert(
                 targets,
@@ -203,6 +213,7 @@ class StructuralPricer:
                 et_factor=cfg.et_factor if et_factor is None else et_factor,
                 match_format=fmt,
                 max_goals=cfg.max_goals,
+                pens_win_a=cfg.pens_win_prob if pens is None else pens,
                 warm_start=warm,  # perturbation solves start at the base fit
             )
             return model, joint_probability(model.params, selected, model.shares)
@@ -243,32 +254,21 @@ class StructuralPricer:
                     continue
         form_unc = max((abs(fp - p) for fp in form_probes), default=0.0)
 
-        # 3. Settlement windows: the incl-ET assumption for goal-flavored legs
-        #    is DOC_ASSUMED — price the 90'-only reading and widen by the gap.
-        window_unc = 0.0
-        if fmt is MatchFormat.KNOCKOUT and any(
-            not isinstance(s, (TeamWin, Draw)) for s in specs
-        ):
-            alt_constraints = [
-                (_flip_windows(spec), target) for spec, target in constraints
-            ]
-            alt_selected = [(_flip_windows(spec), yes) for spec, yes in selected]
-            try:
-                alt_model = invert(
-                    alt_constraints,
-                    dc_rho=cfg.dc_rho,
-                    et_factor=cfg.et_factor,
-                    match_format=fmt,
-                    max_goals=cfg.max_goals,
-                    warm_start=warm,
-                )
-                alt_p = joint_probability(alt_model.params, alt_selected, alt_model.shares)
-                window_unc = abs(alt_p - p)
-            except StructuralError:
-                window_unc = 0.02  # cannot even price the alternative: be wide
+        # 3. Shootout probability: only Advance legs depend on it; 0.5 is the
+        #    prior (slight first-kicker/keeper effects exist) — re-invert at
+        #    the band edges so the advance marginal keeps its market price.
+        pens_unc = 0.0
+        if any(isinstance(s, Advance) for s in specs):
+            probes = []
+            for pw in (cfg.pens_win_prob - cfg.pens_band, cfg.pens_win_prob + cfg.pens_band):
+                try:
+                    probes.append(solve(constraints, pens=pw)[1])
+                except StructuralError:
+                    continue
+            pens_unc = max((abs(pp - p) for pp in probes), default=0.0)
 
         misfit_unc = base_model.residual * cfg.misfit_uncertainty_scale
-        uncertainty = leg_unc + form_unc + window_unc + misfit_unc
+        uncertainty = leg_unc + form_unc + pens_unc + misfit_unc
 
         marginals = [
             b.p if yes else 1.0 - b.p
@@ -284,7 +284,7 @@ class StructuralPricer:
                 *base_model.notes,
                 f"structural: format={fmt} legs={len(legs)} "
                 f"unc(leg={leg_unc:.4f} form={form_unc:.4f} "
-                f"window={window_unc:.4f} misfit={misfit_unc:.4f})",
+                f"pens={pens_unc:.4f} misfit={misfit_unc:.4f})",
             ),
         )
 

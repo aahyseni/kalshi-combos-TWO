@@ -297,10 +297,19 @@ class StructuralConfig(StrictModel):
     et_factor: float = 0.3333
     et_factor_low: float = 0.25
     et_factor_high: float = 0.40
+    # P(named team wins a shootout | level after ET) for Advance legs.
+    # Kalshi's knockout game market includes pens (rules text 2026-07-06);
+    # 0.5 prior with a band covering first-kicker/keeper effects.
+    pens_win_prob: float = 0.5
+    pens_band: float = 0.10
     misfit_uncertainty_scale: float = 1.0
-    # Series prefixes whose matches can reach extra time (knockout formats).
-    # DOC_ASSUMED: WC knockout markets settle goal-flavored legs over 90+ET —
-    # the window band in the adapter prices the 90'-only alternative.
+    # Series prefixes whose matches are knockout format (ET+pens possible).
+    # Settlement windows per family are RULE-BOOK (operator-provided Kalshi
+    # rules text 2026-07-06): knockout game market = advance incl pens;
+    # BTTS/totals = regulation; player props = full game excl pens.
+    # Remaining assumption: this maps SERIES, not match phase — a group-stage
+    # KXWC match would be misclassified (fine for the current knockout
+    # rounds; revisit for the next tournament's group stage).
     knockout_series: list[str] = ["KXWC"]
 
 

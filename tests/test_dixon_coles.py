@@ -14,6 +14,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from combomaker.pricing.dixon_coles import (
+    Advance,
     Btts,
     Draw,
     MatchFormat,
@@ -159,6 +160,30 @@ class TestJoint:
         incl = marginal_probability(params, TeamWin(Team.A, include_et=True))
         only90 = marginal_probability(params, TeamWin(Team.A, include_et=False))
         assert incl == pytest.approx(only90, abs=1e-12)
+
+    def test_advance_partitions_the_match(self) -> None:
+        """Exactly one team advances: P(adv A) + P(adv B) = 1, and advancing
+        strictly exceeds winning inside 90+ET (pens paths are extra)."""
+        params, _ = self.make()
+        adv_a = marginal_probability(params, Advance(Team.A))
+        adv_b = marginal_probability(params, Advance(Team.B))
+        assert adv_a + adv_b == pytest.approx(1.0, abs=1e-9)
+        assert adv_a > marginal_probability(params, TeamWin(Team.A, include_et=True))
+
+    def test_advance_pens_probability_moves_the_marginal(self) -> None:
+        from dataclasses import replace
+
+        params, _ = self.make()
+        hi = marginal_probability(replace(params, pens_win_a=0.6), Advance(Team.A))
+        lo = marginal_probability(replace(params, pens_win_a=0.4), Advance(Team.A))
+        assert hi > lo
+
+    def test_advance_in_group_format_refuses(self) -> None:
+        params = ModelParams(
+            lam_a=1.5, lam_b=1.1, dc_rho=0.0, et_factor=ET, match_format=MatchFormat.GROUP
+        )
+        with pytest.raises(StructuralError, match="non-knockout"):
+            marginal_probability(params, Advance(Team.A))
 
     def test_two_players_same_team_inclusion_exclusion(self) -> None:
         params, _ = self.make()

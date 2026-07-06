@@ -8,8 +8,10 @@ import pytest
 from combomaker.core.conventions import DOC_ASSUMED
 from combomaker.ops.config import PricingConfig, StructuralConfig
 from combomaker.pricing.dixon_coles import (
+    Advance,
     Btts,
     Draw,
+    MatchFormat,
     PlayerScores,
     Team,
     TeamWin,
@@ -64,32 +66,48 @@ class TestParsing:
         assert _parse_match("26JUL10ENGNORX") is None  # 7 chars: no clean split
         assert _parse_match("26JUL10AB") is None       # too short
 
-    def test_leg_specs(self) -> None:
+    def test_knockout_leg_specs_follow_rule_book_windows(self) -> None:
+        """Kalshi rules text: game market = ADVANCE (ET+pens); BTTS/totals =
+        regulation only; player props = full game (ET, no pens)."""
         match = _parse_match(GAME)
         assert match is not None
-        assert _parse_leg(ML, match, include_et=True) == TeamWin(Team.A, include_et=True)
-        assert _parse_leg(ML_B, match, include_et=True) == TeamWin(Team.B, include_et=True)
-        assert _parse_leg(f"KXWCGAME-{GAME}-TIE", match, include_et=True) == Draw()
-        assert _parse_leg(BTTS, match, include_et=True) == Btts(include_et=True)
-        assert _parse_leg(TOTAL, match, include_et=True) == TotalOver(3, include_et=True)
-        assert _parse_leg(GOAL, match, include_et=True) == PlayerScores(
+        ko = MatchFormat.KNOCKOUT
+        assert _parse_leg(ML, match, fmt=ko) == Advance(Team.A)
+        assert _parse_leg(ML_B, match, fmt=ko) == Advance(Team.B)
+        assert _parse_leg(f"KXWCGAME-{GAME}-TIE", match, fmt=ko) == Draw()
+        assert _parse_leg(BTTS, match, fmt=ko) == Btts(include_et=False)
+        assert _parse_leg(TOTAL, match, fmt=ko) == TotalOver(3, include_et=False)
+        assert _parse_leg(GOAL, match, fmt=ko) == PlayerScores(
             Team.A, min_goals=1, include_et=True
+        )
+
+    def test_group_leg_specs(self) -> None:
+        match = _parse_match(GAME)
+        assert match is not None
+        gr = MatchFormat.GROUP
+        assert _parse_leg(ML, match, fmt=gr) == TeamWin(Team.A, include_et=False)
+        assert _parse_leg(BTTS, match, fmt=gr) == Btts(include_et=False)
+        assert _parse_leg(GOAL, match, fmt=gr) == PlayerScores(
+            Team.A, min_goals=1, include_et=False
         )
 
     def test_unmatched_team_suffix_is_reason(self) -> None:
         match = _parse_match(GAME)
         assert match is not None
-        out = _parse_leg(f"KXWCGAME-{GAME}-BRA", match, include_et=True)
+        out = _parse_leg(f"KXWCGAME-{GAME}-BRA", match, fmt=MatchFormat.KNOCKOUT)
         assert isinstance(out, str) and "neither team" in out
 
     def test_player_on_team_b(self) -> None:
         match = _parse_match(GAME)
         assert match is not None
-        spec = _parse_leg(f"KXWCGOAL-{GAME}-NORHAALAND9-1", match, include_et=True)
+        spec = _parse_leg(f"KXWCGOAL-{GAME}-NORHAALAND9-1", match, fmt=MatchFormat.KNOCKOUT)
         assert spec == PlayerScores(Team.B, min_goals=1, include_et=True)
 
 
 class TestPricing:
+    # Anchors from an independent 2M-path Monte Carlo under the RULE-BOOK
+    # windows (advance incl pens 0.5 / regulation BTTS / full-game goals):
+    # scratchpad anchor_rules_windows.py, 2026-07-06.
     def test_eng_nor_prices_near_structural_fair(self) -> None:
         est, reason = pricer(dc_rho=0.0).try_price(
             [leg(ML), leg(GOAL), leg(BTTS)],
@@ -97,7 +115,7 @@ class TestPricing:
             ["yes", "yes", "yes"],
         )
         assert reason is None and est is not None
-        assert est.p == pytest.approx(0.2282, abs=0.002)
+        assert est.p == pytest.approx(0.2401, abs=0.002)
         assert est.uncertainty > 0.0
         assert any("dc inversion" in n for n in est.notes)
 
@@ -108,7 +126,7 @@ class TestPricing:
             ["yes", "yes", "yes"],
         )
         assert reason is None and est is not None
-        assert est.p == pytest.approx(0.1088, abs=0.002)
+        assert est.p == pytest.approx(0.1153, abs=0.002)
 
     def test_unparseable_leg_falls_back_with_reason(self) -> None:
         est, reason = pricer().try_price(
@@ -134,14 +152,20 @@ class TestPricing:
         )
         assert est is None and reason is not None and "different matches" in reason
 
-    def test_window_band_widens_knockout_goal_legs(self) -> None:
-        est, _ = pricer(dc_rho=0.0).try_price(
+    def test_pens_band_widens_advance_legs_only(self) -> None:
+        def pens_component(est_notes: tuple[str, ...]) -> float:
+            note = next(n for n in est_notes if "pens=" in n)
+            return float(note.split("pens=")[1].split(" ")[0].rstrip(")"))
+
+        with_adv, _ = pricer(dc_rho=0.0).try_price(
             [leg(ML), leg(BTTS)], [belief(0.65), belief(0.55)], ["yes", "yes"]
         )
-        assert est is not None
-        note = next(n for n in est.notes if "window=" in n)
-        window = float(note.split("window=")[1].split(" ")[0].rstrip(")"))
-        assert window > 0.0  # incl-ET vs 90'-only actually differ
+        without_adv, _ = pricer(dc_rho=0.0).try_price(
+            [leg(TOTAL), leg(BTTS)], [belief(0.55), belief(0.55)], ["yes", "yes"]
+        )
+        assert with_adv is not None and without_adv is not None
+        assert pens_component(with_adv.notes) > 0.0   # shootout prob matters
+        assert pens_component(without_adv.notes) == 0.0  # no advance leg
 
     def test_wider_marginal_bands_widen_joint(self) -> None:
         tight, _ = pricer(dc_rho=0.0).try_price(

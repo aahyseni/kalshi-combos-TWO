@@ -68,6 +68,16 @@ class TeamWin:
 
 
 @dataclass(frozen=True, slots=True)
+class Advance:
+    """YES = the team advances: win in 90', in ET, or on penalties. Kalshi's
+    knockout game market settles this way (rules text 2026-07-06). The
+    shootout is not part of the scoreline state — states that stay level
+    through ET contribute fractionally via ``ModelParams.pens_win_a``."""
+
+    team: Team
+
+
+@dataclass(frozen=True, slots=True)
 class Draw:
     """Match level after regulation (the 3-way TIE market)."""
 
@@ -95,9 +105,9 @@ class PlayerScores:
     include_et: bool = True
 
 
-LegSpec = TeamWin | Draw | Btts | TotalOver | PlayerScores
+LegSpec = TeamWin | Advance | Draw | Btts | TotalOver | PlayerScores
 
-_TEAM_LEVEL = (TeamWin, Draw, Btts, TotalOver)
+_TEAM_LEVEL = (TeamWin, Advance, Draw, Btts, TotalOver)
 
 
 class StructuralError(ValueError):
@@ -116,6 +126,9 @@ class ModelParams:
     et_factor: float
     match_format: MatchFormat
     max_goals: int = 12
+    # P(team A wins a shootout | still level after ET). Advance legs only;
+    # penalties never contribute goals to any other market (Kalshi rules).
+    pens_win_a: float = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,17 +215,30 @@ def _team_goals(states: _States, team: Team, include_et: bool) -> NDArray[np.int
     return g90 + (states.a_et if team is Team.A else states.b_et)
 
 
-def _team_indicator(states: _States, spec: TeamWin | Draw | Btts | TotalOver) -> _FloatArray:
-    if isinstance(spec, TeamWin):
+def _team_indicator(
+    states: _States, spec: TeamWin | Advance | Draw | Btts | TotalOver, params: ModelParams
+) -> _FloatArray:
+    if isinstance(spec, (TeamWin, Advance)):
         us, them = (
             (states.a90, states.b90) if spec.team is Team.A else (states.b90, states.a90)
         )
         win90 = us > them
-        if not spec.include_et:
+        if isinstance(spec, TeamWin) and not spec.include_et:
             return np.asarray(win90, dtype=np.float64)
         us_et = states.a_et if spec.team is Team.A else states.b_et
         them_et = states.b_et if spec.team is Team.A else states.a_et
-        return np.asarray(win90 | ((us == them) & (us_et > them_et)), dtype=np.float64)
+        win_et = (us == them) & (us_et > them_et)
+        if isinstance(spec, TeamWin):
+            return np.asarray(win90 | win_et, dtype=np.float64)
+        if params.match_format is not MatchFormat.KNOCKOUT:
+            raise StructuralError("advance leg in a non-knockout format")
+        pens = params.pens_win_a if spec.team is Team.A else 1.0 - params.pens_win_a
+        out = np.asarray(win90 | win_et, dtype=np.float64)
+        # Level after ET: the shootout decides, fractionally — pens outcomes
+        # are independent of every other market by rule, so a probability
+        # factor per state is exact.
+        out[(us == them) & (us_et == them_et)] = pens
+        return out
     if isinstance(spec, Draw):
         return np.asarray(states.a90 == states.b90, dtype=np.float64)
     if isinstance(spec, Btts):
@@ -278,7 +304,7 @@ def joint_probability(
         if isinstance(spec, PlayerScores):
             by_team.setdefault(spec.team, []).append((spec, shares[i], yes))
             continue
-        ind = _team_indicator(states, spec)
+        ind = _team_indicator(states, spec, params)
         factor *= ind if yes else 1.0 - ind
     for team, players in by_team.items():
         factor *= _player_group_factor(states, players, team)
@@ -314,6 +340,7 @@ def invert(
     et_factor: float,
     match_format: MatchFormat,
     max_goals: int = 12,
+    pens_win_a: float = 0.5,
     warm_start: tuple[float, float] | None = None,  # (lam_a, lam_b) guess
 ) -> InvertedModel:
     """Solve (lam_a, lam_b) from the team-level legs, then one thinning share
@@ -342,6 +369,7 @@ def invert(
             et_factor=et_factor,
             match_format=match_format,
             max_goals=max_goals,
+            pens_win_a=pens_win_a,
         )
 
     def residuals(x: NDArray[np.float64]) -> NDArray[np.float64]:
