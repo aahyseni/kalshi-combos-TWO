@@ -24,6 +24,8 @@ log = get_logger(__name__)
 def load_dotenv(path: Path | None = None) -> list[str]:
     """Load ``path`` (default ``./.env``) into os.environ; returns the names
     actually set (existing variables are never overwritten)."""
+    if os.environ.get("COMBOMAKER_NO_DOTENV"):
+        return []  # hermetic-test guard: unit tests must never see real creds
     env_path = path or Path(".env")
     if not env_path.is_file():
         return []

@@ -11,6 +11,13 @@ def write_env(tmp_path: Path, body: str) -> Path:
     return path
 
 
+@pytest.fixture(autouse=True)
+def allow_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These tests exercise the loader itself with harmless CM_TEST_* vars and
+    # explicit tmp paths — lift the suite-wide hermetic guard locally.
+    monkeypatch.delenv("COMBOMAKER_NO_DOTENV", raising=False)
+
+
 def test_loads_missing_vars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CM_TEST_A", raising=False)
     path = write_env(tmp_path, "CM_TEST_A=hello\n# comment\n\nCM_TEST_B='quoted'\n")

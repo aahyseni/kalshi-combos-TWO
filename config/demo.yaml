@@ -10,5 +10,15 @@ logging:
 safety:
   prod_limits_configured: false
 
+filters:
+  # Sports combos only (mission scope). Prefixes match mve_collection_ticker.
+  collection_whitelist:
+    - KXMVESPORTS
+    - KXMVECROSSCATEGORY
+    - KXMVENBA
+    - KXMVEMLB
+    - KXMVENFL
+    - KXMVENHL
+
 data_dir: data
 kill_file: KILL

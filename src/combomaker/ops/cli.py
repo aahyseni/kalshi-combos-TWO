@@ -89,7 +89,9 @@ async def _cancel_all(env: Env) -> int:
     signer = RequestSigner(Credentials.from_env(), SystemClock())
     cancelled = failed = 0
     async with KalshiRestClient(config.endpoints.rest_base_url, signer) as rest:
-        payload = await rest.get_quotes(status="open")
+        # Ground truth: listing quotes REQUIRES a creator filter (bare list
+        # → 403); user_filter=self scopes to our own quotes.
+        payload = await rest.get_quotes(user_filter="self", status="open")
         quotes = payload.get("quotes", []) or []
         for quote in quotes:
             quote_id = str(quote.get("id") or quote.get("quote_id") or "")

@@ -14,12 +14,28 @@ def test_prod_quote_with_flag_still_blocked_by_limits(capsys) -> None:  # type: 
     assert "limits" in capsys.readouterr().err
 
 
-def test_quote_mode_blocked_while_conventions_unverified(capsys) -> None:  # type: ignore[no-untyped-def]
-    # Even on DEMO: quote mode requires the Phase 2.5 ground-truth fixture.
+def test_quote_mode_blocked_when_conventions_unverified(  # type: ignore[no-untyped-def]
+    capsys, monkeypatch, tmp_path
+) -> None:
+    # Pin the gate under test: force the fixture path somewhere empty so this
+    # test stays a refusal test even though the repo's real fixture is
+    # promoted. (Its old form went LIVE when the real gates opened.)
+    import combomaker.core.conventions as conventions
+
+    monkeypatch.setattr(conventions, "DEFAULT_FIXTURE_PATH", tmp_path / "absent.json")
     code = main(["run", "--env", "demo", "--mode", "quote"])
     assert code == 3
-    err = capsys.readouterr().err
-    assert "ground-truth" in err or "whitelist" in err
+    assert "ground-truth" in capsys.readouterr().err
+
+
+def test_quote_mode_blocked_without_whitelist(capsys, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # Conventions verified (real promoted fixture) but no whitelist ⇒ refuse
+    # at construction, before any credentials or network.
+    config = tmp_path / "demo.yaml"
+    config.write_text("env: demo\nmode: quote\n", encoding="utf-8")
+    code = main(["run", "--env", "demo", "--mode", "quote", "--config", str(config)])
+    assert code == 3
+    assert "whitelist" in capsys.readouterr().err
 
 
 def test_report_without_store_exits_2(capsys) -> None:  # type: ignore[no-untyped-def]

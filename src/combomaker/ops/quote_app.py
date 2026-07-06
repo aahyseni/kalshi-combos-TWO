@@ -280,7 +280,7 @@ class QuoteApp:
 
     async def _startup_reconcile(self, rest: KalshiRestClient) -> None:
         try:
-            payload = await rest.get_quotes(status="open")
+            payload = await rest.get_quotes(user_filter="self", status="open")
             leftover = payload.get("quotes", []) or []
             for quote in leftover:
                 quote_id = str(quote.get("id") or quote.get("quote_id") or "")
@@ -304,17 +304,21 @@ class QuoteApp:
         self, rfq: Rfq, feed: OrderbookFeed, metadata: MetadataCache
     ) -> None:
         new = [t for t in rfq.leg_tickers if t not in self._watched]
-        if not new:
-            return
-        self._watched.update(new)
-        feed.watch(new)
-        for ticker in new:
+        if new:
+            self._watched.update(new)
+            feed.watch(new)
+        # The COMBO market's metadata carries the price grid the quote must
+        # land on — without it the engine (correctly) refuses to price.
+        to_fetch = list(new)
+        if metadata.peek(rfq.market_ticker) is None:
+            to_fetch.append(rfq.market_ticker)
+        for ticker in to_fetch:
             try:
                 meta = await metadata.market(ticker)
                 if meta.event_ticker:
                     await metadata.event(meta.event_ticker)
             except KalshiApiError as exc:
-                log.warning("leg_metadata_fetch_failed", ticker=ticker, error=str(exc))
+                log.warning("metadata_fetch_failed", ticker=ticker, error=str(exc))
 
     async def _maintenance_loop(self, lifecycle: QuoteLifecycle) -> None:
         while True:
