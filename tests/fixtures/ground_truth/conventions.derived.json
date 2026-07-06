@@ -1,0 +1,47 @@
+{
+  "maker_side_on_yes_accept": "yes",
+  "maker_side_on_no_accept": "no",
+  "maker_pays_own_bid": null,
+  "maker_is_taker_on_fill": false,
+  "combo_no_pays_complement": null,
+  "evidence": {
+    "accept_yes_maker_fill": {
+      "action": "buy",
+      "book_side": "bid",
+      "count_fp": "1.00",
+      "created_time": "2026-07-06T01:55:17.343948Z",
+      "fee_cost": "0.000000",
+      "fill_id": "28922612-dc97-5b62-f960-7a6324b5d255",
+      "is_taker": false,
+      "market_ticker": "KXMLBGAME-26JUL081840NYYTB-NYY",
+      "no_price_dollars": "0.5200",
+      "order_id": "8aac570a-f59a-4728-8edd-5e9d6568571d",
+      "outcome_side": "yes",
+      "side": "yes",
+      "subaccount_number": 0,
+      "ticker": "KXMLBGAME-26JUL081840NYYTB-NYY",
+      "trade_id": "28922612-dc97-5b62-f960-7a6324b5d255",
+      "ts": 1783302917,
+      "yes_price_dollars": "0.4800"
+    },
+    "accept_no_maker_fill": {
+      "action": "buy",
+      "book_side": "ask",
+      "count_fp": "1.00",
+      "created_time": "2026-07-06T01:55:45.344003Z",
+      "fee_cost": "0.000000",
+      "fill_id": "9f168dd1-c049-4196-83f5-108880463c98",
+      "is_taker": false,
+      "market_ticker": "KXMLBGAME-26JUL081840NYYTB-NYY",
+      "no_price_dollars": "0.4800",
+      "order_id": "47fa7174-05b0-4cd8-bc60-d5e3efabac6c",
+      "outcome_side": "no",
+      "side": "no",
+      "subaccount_number": 0,
+      "ticker": "KXMLBGAME-26JUL081840NYYTB-NYY",
+      "trade_id": "9f168dd1-c049-4196-83f5-108880463c98",
+      "ts": 1783302945,
+      "yes_price_dollars": "0.5200"
+    }
+  }
+}

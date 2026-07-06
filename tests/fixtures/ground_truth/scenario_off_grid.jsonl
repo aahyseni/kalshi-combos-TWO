@@ -1,0 +1,3 @@
+{"at": "2026-07-06T01:58:00.548947+00:00", "step": "scenario", "data": {"name": "off_grid_probe"}}
+{"at": "2026-07-06T01:58:00.925939+00:00", "step": "rfq_created", "data": {"id": "1d9d2827-3779-4506-b7c2-13e5ec22e3f0"}}
+{"at": "2026-07-06T01:58:01.029641+00:00", "step": "off_grid_quote_unexpectedly_accepted", "data": {"id": "9ccee93c-66c9-4613-b744-c43c9ea6c1f6"}}

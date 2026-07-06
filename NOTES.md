@@ -20,6 +20,30 @@ gap-check results).
 | "implement fee module from the published fee schedule" | The authoritative fee-schedule PDF is behind a bot-checkpoint (fetch returns 429). Secondary sources: taker `ceil(0.07·C·P·(1−P))`, maker `ceil(0.0175·C·P·(1−P))` on maker-fee series; per-series `fee_type` ∈ {quadratic, quadratic_with_maker_fees, flat} + `fee_multiplier` | **human must download the PDF manually**; RFQ fee side attribution (is the confirming maker `is_taker=false`?) is queued for Phase 2.5 ground truth |
 | (not in prompt) | `GET /portfolio/balance` returns **cents**, not centi-cents | wire-boundary conversion must use `cc_from_cents` |
 
+## Phase 2.5 ground truth — EXECUTED 2026-07-05 (single-market pass)
+
+Full RFQ round trips on demo (`KXMLBGAME-26JUL081840NYYTB-NYY`, two accounts,
+1.00 contract; recordings in `tests/fixtures/ground_truth/`):
+
+| Fact | Evidence |
+|---|---|
+| `accepted_side="yes"` ⇒ maker LONG YES at `yes_bid` | maker fill `outcome_side=yes, yes_price=0.4800, book_side=bid`; maker balance −$0.48; position_fp +1.00 |
+| `accepted_side="no"` ⇒ maker LONG NO at `no_bid` | maker fill `outcome_side=no, no_price=0.4800`; netted the +1 YES position to 0 (**positions are SIGNED per market and NET across yes/no**) |
+| Maker pays own bid | balance debit exactly bid × qty |
+| **Maker fee = $0 on RFQ fills** (`is_taker=false`, `fee_cost=0.000000`) | both fills; requester (taker) paid $0.0175 = ceil(0.07·1·0.48·0.52) — the quadratic taker formula verified to the centicent |
+| Confirm needs JSON content type (`{}` body); bare PUT ⇒ 400 `invalid_content_type` | first harness run |
+| Late confirm (after 30s std window) ⇒ 400 `{code: "expired", service: "midland"}`; quote status REMAINS `accepted` (no cancelled transition, no cancellation_reason) | lapse scenario |
+| DELETE quote after accept ⇒ **404 not_found** — no explicit decline exists; lapse is the only out | delete-after-accept scenario |
+| **Off-grid quote prices are ACCEPTED at creation** (0.3550 on a `linear_cent` market) — the "must land on the grid" doc rule is NOT enforced at quote-create | off-grid probe; never rely on server validation to catch grid bugs; our maker-favorable snapping stays mandatory |
+| `contracts_accepted_fp` is None on the executed quote for contracts-mode RFQs | terminal quote objects — the contracts-mode fallback to RFQ size is REQUIRED, not defensive |
+| Endpoint costs: default 10; communications create/delete/get quote = 2 | GET /account/endpoint_costs |
+| `GET /account/limits` works (basic tier: read 200/s refill, 400 bucket; write 100/s, 100 bucket) | api_limits step (path fix verified live) |
+
+**Still unverified (needs a combo-market pass / settlement):** combo NO payout
+= $1 − product (`combo_no_pays_complement` stays null ⇒ NO-side accepts
+decline in quote mode); HVM 3s/1s timing; combo grid structure on KXMVE
+markets; `yes_bid + no_bid > $1` rejection.
+
 ## Empirical verification queue (demo / Phase 2.5 ground truth)
 
 **Resolved live 2026-07-05 (demo, real credentials):** communications WS
@@ -73,7 +97,7 @@ embedded domain assumptions here. Tags: `doc:<page>` (verified against docs),
 | A4 | Base URLs: demo `external-api.demo.kalshi.co`, prod `external-api.kalshi.com` (+ ws hosts) | `ops/config.py` | doc:api_environments |
 | A5 | Quote wire fields: `rfq_id`, `yes_bid`, `no_bid` (fixed-point dollar strings), required `rest_remainder`; `"0"` declines a side; both-zero invalid | `exchange/rest.py` | doc:create-quote |
 | A6 | 4-decimal dollar strings (centi-cent precision) are valid wire values (docs allow up to 6dp) | `core/money.py`, `exchange/rest.py` | doc:create-quote |
-| A7 | Confirm = `PUT /communications/quotes/{id}/confirm`, empty body, 204, starts execution timer | `exchange/rest.py` | doc:confirm-quote |
+| A7 | Confirm = `PUT /communications/quotes/{id}/confirm`, 204, starts execution timer — **ground truth 2026-07-05: a truly bodyless PUT gets 400 `invalid_content_type`; must send `{}` with JSON content type** (docs said body optional) | `exchange/rest.py` | fixture:ground_truth (live demo) |
 | A8 | WS message envelope `{"type", "sid", "seq", "msg"}`; commands `{"id", "cmd", "params"}`; server pings every 10s | `exchange/ws.py` | doc:asyncapi + websocket-connection |
 | A9 | $1 = 10,000 centi-cents internal representation | `core/money.py` | internal convention (not an exchange fact) |
 | A10 | Combo YES contract pays **product of leg settlement values** (values in [0,1]), capped at $1 | `sim/engine.py` | doc:rfqs.md + get-market (MveSelectedLeg settlement value) |

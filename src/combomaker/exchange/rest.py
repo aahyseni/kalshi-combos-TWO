@@ -243,8 +243,15 @@ class KalshiRestClient:
         )
 
     async def confirm_quote(self, quote_id: str) -> JsonDict:
-        """Confirm an accepted quote. 204 on success; starts the execution timer."""
-        return await self._request("PUT", f"/communications/quotes/{quote_id}/confirm")
+        """Confirm an accepted quote. 204 on success; starts the execution timer.
+
+        Ground truth (2026-07-05): the docs say no body is required, but a
+        bodyless PUT gets 400 invalid_content_type — the server wants
+        Content-Type: application/json, so we send an empty JSON object.
+        """
+        return await self._request(
+            "PUT", f"/communications/quotes/{quote_id}/confirm", json_body={}
+        )
 
     # --- portfolio ---
 
