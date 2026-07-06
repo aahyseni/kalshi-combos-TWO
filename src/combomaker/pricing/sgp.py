@@ -13,7 +13,7 @@ joint can be re-priced across the band and the spread priced into width.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from numpy.typing import NDArray
@@ -30,6 +30,8 @@ class SgpParams:
     cross_event_rho: float
     typed_uncertainty: float          # rho band half-width for typed pairs
     untyped_uncertainty: float        # wider band when we didn't understand the pair
+    # Per-pair band overrides (calibrated pairs earn tighter bands).
+    pair_uncertainty: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +88,8 @@ def build_sgp_correlation(
                 untyped += 1
                 notes.append(f"untyped pair {key}: flat prior {rho}")
             elif key in params.pair_rho:
-                rho, band = params.pair_rho[key], params.typed_uncertainty
+                rho = params.pair_rho[key]
+                band = params.pair_uncertainty.get(key, params.typed_uncertainty)
                 typed += 1
             else:
                 rho, band = params.default_rho, params.untyped_uncertainty

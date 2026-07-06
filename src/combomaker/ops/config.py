@@ -105,23 +105,39 @@ class CorrelationConfig(StrictModel):
     cross_event_rho: float = 0.0
     rho_uncertainty: float = 0.25
     # SGP structure: signed YES-YES priors per typed pair (legtypes.pair_key).
-    # Signs are theory-solid; magnitudes are deliberately modest and carry
-    # their own uncertainty band until co-settlement calibration replaces them.
+    # CALIBRATED 2026-07-06 from 8,982 matches (top-5 EU leagues 20/21-24/25,
+    # tools/calibrate_pairs_from_history.py — implied rho solved through OUR
+    # copula). Notable corrections vs the original hand priors: btts|moneyline
+    # flipped SIGN (+0.05 → −0.17: decisive wins are clean-sheet-ish); both
+    # corners pairs measured ≈ 0 (folk wisdom busted). player_goal and extras
+    # pairs remain hand priors (no match-level data) with the wide band.
     pair_rho: dict[str, float] = {
-        "moneyline|moneyline": -0.85,      # two winners of the SAME game ≈ exclusive
-        "btts|total": 0.60,
-        "player_goal|total": 0.40,
-        "btts|player_goal": 0.35,
-        "moneyline|player_goal": 0.25,
-        "btts|moneyline": 0.05,
-        "moneyline|total": 0.15,
-        "total|total": 0.85,               # nested thresholds are near-implications
-        "corners|total": 0.30,
-        "btts|corners": 0.25,
-        "extras|total": 0.50,
+        "moneyline|moneyline": -0.95,      # measured −0.99: P(both win) = 0 exactly
+        "btts|total": 0.75,                # measured +0.746, n=8982
+        "player_goal|total": 0.40,         # hand prior (uncalibrated)
+        "btts|player_goal": 0.35,          # hand prior (uncalibrated)
+        "moneyline|player_goal": 0.25,     # hand prior (uncalibrated)
+        "btts|moneyline": -0.17,           # measured −0.20/−0.14 (home/away pooled)
+        "moneyline|total": 0.23,           # measured +0.28/+0.18 (side asymmetry)
+        "total|total": 0.95,               # nested thresholds: measured at the cap
+        "corners|total": 0.00,             # measured −0.04 ≈ 0
+        "btts|corners": 0.00,              # measured +0.01 ≈ 0
+        "extras|total": 0.50,              # hand prior (MLB, uncalibrated)
     }
     typed_rho_uncertainty: float = 0.15
     untyped_rho_uncertainty: float = 0.30
+    # Tighter bands for pairs backed by the n≈9k calibration; ml|total's band
+    # also covers its measured home/away asymmetry. Uncalibrated pairs keep
+    # the defaults above.
+    pair_rho_uncertainty: dict[str, float] = {
+        "moneyline|moneyline": 0.04,
+        "btts|total": 0.08,
+        "btts|moneyline": 0.08,
+        "moneyline|total": 0.10,
+        "total|total": 0.04,
+        "corners|total": 0.08,
+        "btts|corners": 0.08,
+    }
 
 
 class QuoteConfig(StrictModel):

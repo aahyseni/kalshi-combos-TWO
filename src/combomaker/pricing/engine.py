@@ -71,6 +71,7 @@ class PricingEngine:
             cross_event_rho=config.correlation.cross_event_rho,
             typed_uncertainty=config.correlation.typed_rho_uncertainty,
             untyped_uncertainty=config.correlation.untyped_rho_uncertainty,
+            pair_uncertainty=dict(config.correlation.pair_rho_uncertainty),
         )
         quote_fields = {
             k: v
