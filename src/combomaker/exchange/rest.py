@@ -134,6 +134,27 @@ class KalshiRestClient:
     async def get_markets(self, **filters: str | int) -> JsonDict:
         return await self._request("GET", "/markets", params=dict(filters), auth=False)
 
+    async def get_candlesticks(
+        self,
+        series_ticker: str,
+        market_ticker: str,
+        *,
+        start_ts: int,
+        end_ts: int,
+        period_interval: int = 60,
+    ) -> JsonDict:
+        """OHLC price history for a market (public; period_interval minutes)."""
+        return await self._request(
+            "GET",
+            f"/series/{series_ticker}/markets/{market_ticker}/candlesticks",
+            params={
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "period_interval": period_interval,
+            },
+            auth=False,
+        )
+
     async def get_orderbook(self, ticker: str, *, depth: int | None = None) -> JsonDict:
         params: dict[str, str | int] = {}
         if depth is not None:

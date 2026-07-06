@@ -51,6 +51,7 @@ def report(name: str, years: range) -> None:
 
 def main() -> None:
     print("MLB NegBin dispersion (Retrosheet final scores):")
+    report("2021-2025", range(2021, 2026))
     report("2021-2024", range(2021, 2025))
     report("2015-2019", range(2015, 2020))
 

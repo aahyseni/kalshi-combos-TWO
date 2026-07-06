@@ -368,7 +368,9 @@ class MlbRunsConfig(StrictModel):
     prod-shadow settlements as they accrue."""
 
     enabled: bool = True
-    dispersion_k: float = 3.62
+    # 2021-2025 window (Retrosheet gl2025 fetched 2026-07-06); was 3.62 on
+    # 2021-2024, 3.63 on 2015-2019 — drift well inside the band.
+    dispersion_k: float = 3.54
     k_band: float = 0.30
     misfit_uncertainty_scale: float = 1.0
 
