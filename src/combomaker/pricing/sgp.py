@@ -51,16 +51,74 @@ def _clamp(rho: float) -> float:
     return max(-0.95, min(0.95, rho))
 
 
+# Orientation blend zone for moneyline-involving pairs: below DOG_MAX the ML
+# leg's YES team is priced a clear underdog, above FAV_MIN a clear favorite;
+# in between the two priors are linearly blended so fair value has no cliff
+# as a leg mid crosses 50c.
+_ORIENT_DOG_MAX = 0.45
+_ORIENT_FAV_MIN = 0.55
+
+
+@dataclass(frozen=True, slots=True)
+class _PairPrior:
+    rho: float
+    band: float
+    source: str
+
+
+def _lookup_pair(key: str, sport: str, params: SgpParams) -> _PairPrior | None:
+    sport_table = params.pair_rho_by_sport.get(sport, {})
+    if key in sport_table:
+        band = params.pair_uncertainty.get(f"{sport}:{key}", params.typed_uncertainty)
+        return _PairPrior(sport_table[key], band, f"{sport}:{key}")
+    if key in params.pair_rho:
+        band = params.pair_uncertainty.get(key, params.typed_uncertainty)
+        return _PairPrior(params.pair_rho[key], band, key)
+    return None
+
+
+def _oriented_prior(
+    key: str, sport: str, params: SgpParams, ml_marginal: float
+) -> _PairPrior | None:
+    """Favorite/dog-conditional prior for a pair containing one MONEYLINE leg.
+
+    Some pair correlations flip with which side of the moneyline the YES team
+    sits on (btts|moneyline: winners keep clean sheets — but only favorites;
+    a dog can only win by scoring). Config expresses this as ``key:fav`` /
+    ``key:dog`` entries; orientation comes from the ML leg's YES-side
+    marginal, blended across the coin-flip zone.
+    """
+    fav = _lookup_pair(f"{key}:fav", sport, params)
+    dog = _lookup_pair(f"{key}:dog", sport, params)
+    if fav is None and dog is None:
+        return None
+    base = _lookup_pair(key, sport, params)
+    fav = fav or base
+    dog = dog or base
+    if fav is None or dog is None:
+        return None  # half-specified orientation: fall back to plain lookup
+    w = min(1.0, max(0.0, (ml_marginal - _ORIENT_DOG_MAX) / (_ORIENT_FAV_MIN - _ORIENT_DOG_MAX)))
+    return _PairPrior(
+        rho=dog.rho + w * (fav.rho - dog.rho),
+        band=max(fav.band, dog.band),
+        source=f"{fav.source if w >= 0.5 else dog.source} (ml_p={ml_marginal:.2f} w={w:.2f})",
+    )
+
+
 def build_sgp_correlation(
     legs: Sequence[RfqLeg],
     same_event_groups: Sequence[Sequence[int]],
     params: SgpParams,
+    marginals: Sequence[float] | None = None,
 ) -> SgpCorrelation:
     """Pairwise YES–YES correlation matrices for the whole combo.
 
     Cross-event pairs get ``cross_event_rho``; same-event pairs get the typed
     prior (or the flat default when either leg types UNKNOWN). Each matrix in
     the (low, point, high) triplet is independently repaired to PSD.
+
+    ``marginals`` (YES-side probs, leg order) enables orientation-aware
+    priors for moneyline pairs; without them plain entries apply.
     """
     n = len(legs)
     types = [classify_leg(leg.market_ticker) for leg in legs]
@@ -87,24 +145,28 @@ def build_sgp_correlation(
                 continue
             key = pair_key(types[i], types[j])
             sport = str(classify_sport(legs[i].market_ticker))
-            sport_table = params.pair_rho_by_sport.get(sport, {})
+            prior: _PairPrior | None = None
             if types[i] is LegType.UNKNOWN or types[j] is LegType.UNKNOWN:
                 rho, band = params.default_rho, params.untyped_uncertainty
                 untyped += 1
                 notes.append(f"untyped pair {key}: flat prior {rho}")
-            elif key in sport_table:
-                rho = sport_table[key]
-                band = params.pair_uncertainty.get(f"{sport}:{key}", params.typed_uncertainty)
-                typed += 1
-                notes.append(f"sport-specific {sport}:{key}={rho}")
-            elif key in params.pair_rho:
-                rho = params.pair_rho[key]
-                band = params.pair_uncertainty.get(key, params.typed_uncertainty)
-                typed += 1
             else:
-                rho, band = params.default_rho, params.untyped_uncertainty
-                untyped += 1
-                notes.append(f"no prior for pair {key}: flat prior {rho}")
+                one_moneyline = (types[i] is LegType.MONEYLINE) != (
+                    types[j] is LegType.MONEYLINE
+                )
+                if one_moneyline and marginals is not None:
+                    ml_index = i if types[i] is LegType.MONEYLINE else j
+                    prior = _oriented_prior(key, sport, params, marginals[ml_index])
+                prior = prior or _lookup_pair(key, sport, params)
+                if prior is not None:
+                    rho, band = prior.rho, prior.band
+                    typed += 1
+                    if prior.source != key:  # plain global hits stay silent
+                        notes.append(f"pair {prior.source}={rho:+.3f}")
+                else:
+                    rho, band = params.default_rho, params.untyped_uncertainty
+                    untyped += 1
+                    notes.append(f"no prior for pair {key}: flat prior {rho}")
             point[i, j] = point[j, i] = _clamp(rho)
             low[i, j] = low[j, i] = _clamp(rho - band)
             high[i, j] = high[j, i] = _clamp(rho + band)

@@ -69,8 +69,14 @@ def same_event_combo(tickers: list[str]) -> Rfq:
 
 
 def rho_zero(pair: str) -> PricingConfig:
-    """Config whose ONLY typed pair prior is `pair` at rho 0.0 (independence)."""
-    return PricingConfig(correlation=CorrelationConfig(pair_rho={pair: 0.0}))
+    """Config whose ONLY typed pair prior is `pair` at rho 0.0 (independence).
+
+    Sport tables are blanked too — they outrank the global table now that the
+    engine actually forwards them (dead-config bug fixed 2026-07-06).
+    """
+    return PricingConfig(
+        correlation=CorrelationConfig(pair_rho={pair: 0.0}, pair_rho_by_sport={})
+    )
 
 
 def independence_fair_cc(h: Harness, tickers: list[str]) -> int:
@@ -230,3 +236,66 @@ async def test_default_config_regression_two_sided_quote() -> None:
     assert 0 < result.fair_cc < 10_000
     # no 'time' (TTC beyond threshold), no 'in_play', no 'scaled' collapse
     assert set(result.width_components_cc) == {"base", "legs", "uncertainty", "size"}
+
+
+# --- 6. Sport tables + orientation reach the live engine -------------------------
+
+
+def test_engine_forwards_sport_tables() -> None:
+    """Dead-config regression: PricingEngine must forward pair_rho_by_sport
+    into SgpParams — before 2026-07-06 the calibrated sport tables (soccer
+    ml|total 0.28, nfl 0.00, mlb −0.05) silently never reached the hot path."""
+    h = Harness()
+    engine = PricingEngine(h.feed, h.metadata, DOC_ASSUMED, PricingConfig())
+    tables = engine._sgp_params.pair_rho_by_sport  # noqa: SLF001 (test seam)
+    assert tables, "sport tables missing from engine SgpParams"
+    assert tables["soccer"]["moneyline|total"] == 0.28
+    assert tables["nfl"]["moneyline|total"] == 0.00
+
+
+async def dog_ml_btts_harness(config: PricingConfig | None = None) -> PricingEngine:
+    """ML leg priced a clear dog (~0.245), BTTS ~0.605 — the SPA/POR shape."""
+    from tests.test_feed import snapshot_env
+
+    h = Harness()
+    tickers = [ML_LEG_A, BTTS_LEG]
+    books = {
+        ML_LEG_A: ([["0.2200", "50.00"], ["0.2400", "20.00"]],
+                   [["0.7400", "60.00"], ["0.7500", "25.00"]]),
+        BTTS_LEG: ([["0.5800", "50.00"], ["0.6000", "20.00"]],
+                   [["0.3800", "60.00"], ["0.3900", "25.00"]]),
+    }
+    h.feed.watch(tickers)
+    await h.ws.ack_subscription(0, 5)
+    for i, ticker in enumerate(tickers):
+        env = snapshot_env(5, i + 1, ticker)
+        env["msg"]["yes_dollars_fp"], env["msg"]["no_dollars_fp"] = books[ticker]
+        await h.ws.deliver(env)
+    h.with_meta("KXMVE-C1")
+    seed_event(h, SGP_EVENT, exclusive=False)
+    return PricingEngine(h.feed, h.metadata, DOC_ASSUMED, config or PricingConfig())
+
+
+async def test_dog_moneyline_btts_prices_above_favorite_prior() -> None:
+    """Orientation end to end: with the ML leg a clear dog, the default config
+    (dog rho 0.0) must price the joint ABOVE a config that applies the
+    favorites prior (−0.19) to dogs too — same books, same marginals."""
+    rfq = same_event_combo([ML_LEG_A, BTTS_LEG])
+
+    engine_oriented = await dog_ml_btts_harness()
+    base = CorrelationConfig()
+    soccer_flat = dict(base.pair_rho_by_sport["soccer"])
+    soccer_flat["btts|moneyline:dog"] = soccer_flat["btts|moneyline:fav"]  # −0.19 everywhere
+    flat_cfg = PricingConfig(
+        correlation=CorrelationConfig(
+            pair_rho_by_sport={**base.pair_rho_by_sport, "soccer": soccer_flat}
+        )
+    )
+    engine_flat = await dog_ml_btts_harness(flat_cfg)
+
+    oriented = engine_oriented.price(rfq, time_to_close_s=TTC)
+    flat = engine_flat.price(rfq, time_to_close_s=TTC)
+    assert isinstance(oriented, ConstructedQuote), oriented
+    assert isinstance(flat, ConstructedQuote), flat
+    # rho 0.0 vs −0.19 on ~0.245×0.605 marginals is worth a real gap (>50cc).
+    assert oriented.fair_cc > flat.fair_cc + 50

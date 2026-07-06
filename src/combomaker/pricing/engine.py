@@ -72,6 +72,10 @@ class PricingEngine:
             typed_uncertainty=config.correlation.typed_rho_uncertainty,
             untyped_uncertainty=config.correlation.untyped_rho_uncertainty,
             pair_uncertainty=dict(config.correlation.pair_rho_uncertainty),
+            pair_rho_by_sport={
+                sport: dict(table)
+                for sport, table in config.correlation.pair_rho_by_sport.items()
+            },
         )
         quote_fields = {
             k: v
@@ -129,7 +133,10 @@ class PricingEngine:
         sides = [leg.side for leg in rfq.legs]
 
         sgp = build_sgp_correlation(
-            list(rfq.legs), relationship.same_event_groups, self._sgp_params
+            list(rfq.legs),
+            relationship.same_event_groups,
+            self._sgp_params,
+            marginals=[b.p for b in beliefs],
         )
         joint = price_joint_matrices(
             beliefs, sides, sgp.corr, sgp.corr_low, sgp.corr_high, extra_notes=sgp.notes

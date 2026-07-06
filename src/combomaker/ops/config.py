@@ -116,7 +116,11 @@ class CorrelationConfig(StrictModel):
         "btts|total": 0.75,                # measured +0.746, n=8982
         "player_goal|total": 0.40,         # hand prior (uncalibrated)
         "btts|player_goal": 0.35,          # hand prior (uncalibrated)
-        "moneyline|player_goal": 0.25,     # hand prior (uncalibrated)
+        # Structurally implied ~+0.51 in BOTH scoreline-inversion worked
+        # examples (fav ENG/Kane and dog POR/Ronaldo, 2026-07-06) — a star
+        # scorer's goals ARE his team's goals. Global kept below the soccer
+        # value (other sports unmeasured), wide band.
+        "moneyline|player_goal": 0.40,
         "btts|moneyline": -0.17,           # measured −0.20/−0.14 (home/away pooled)
         "moneyline|total": 0.23,           # measured +0.28/+0.18 (side asymmetry)
         "total|total": 0.95,               # nested thresholds: measured at the cap
@@ -138,10 +142,25 @@ class CorrelationConfig(StrictModel):
         # remain POOLED-method (no closing BTTS odds in the dataset) with
         # widened bands until a conditional/structural refit; btts|ml at least
         # measured identically in club and international data (−0.197 both).
+        # btts|moneyline is ORIENTATION-CONDITIONAL (":fav"/":dog" resolved by
+        # the ML leg's YES-side marginal, blended across 45–55c): the −0.19
+        # calibration pooled favorites and dogs, but "winners keep clean
+        # sheets" is a favorites-only effect — a dog can only win by scoring,
+        # so dog-win×btts is ~0 (scoreline-model implied +0.04 on the live
+        # SPA/POR example that the market priced at exactly our structural
+        # fair). Plain entry retained for marginal-less callers.
+        # moneyline|player_goal: structurally implied +0.51/+0.52 on both
+        # worked examples (fav and dog) — orientation-insensitive, so a single
+        # entry; replaces the 0.25 hand prior that made us auto-lose striker
+        # SGP auctions.
         "soccer": {
             "moneyline|total": 0.28,
             "btts|total": 0.70,
             "btts|moneyline": -0.19,
+            "btts|moneyline:fav": -0.19,
+            "btts|moneyline:dog": 0.00,
+            "moneyline|player_goal": 0.50,
+            "btts|player_goal": 0.35,
             "total|total": 0.95,
             "corners|total": 0.00,
             "btts|corners": 0.00,
@@ -188,6 +207,11 @@ class CorrelationConfig(StrictModel):
         "soccer:moneyline|total": 0.10,     # conditional-MLE SE .019; band covers asymmetry
         "soccer:btts|total": 0.12,          # pooled-method: widened pending conditional refit
         "soccer:btts|moneyline": 0.10,      # pooled-method (but club==intl)
+        "soccer:btts|moneyline:fav": 0.10,
+        "soccer:btts|moneyline:dog": 0.10,  # structural implication, 1 live validation
+        "soccer:moneyline|player_goal": 0.12,   # structural implication ×2 examples
+        "soccer:btts|player_goal": 0.20,    # implied 0.31 (fav) ↔ 0.68 (dog): band must span
+        "moneyline|player_goal": 0.20,      # global fallback: non-soccer scorers unmeasured
         "soccer:total|total": 0.04,
         "soccer:corners|total": 0.08,
         "soccer:btts|corners": 0.08,
