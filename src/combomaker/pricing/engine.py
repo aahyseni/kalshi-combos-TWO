@@ -92,7 +92,9 @@ class PricingEngine:
         self._quote_params = QuoteParams(**quote_fields)
         self._archetype = config.quote
         self._structural = (
-            StructuralPricer(config.structural) if config.structural.enabled else None
+            StructuralPricer(config.structural, config.margin_total)
+            if config.structural.enabled or config.margin_total.enabled_sports
+            else None
         )
 
     def price(

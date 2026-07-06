@@ -37,7 +37,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from combomaker.ops.config import StructuralConfig
+from combomaker.ops.config import MarginTotalConfig, StructuralConfig
 from combomaker.pricing.copula import clamp_to_frechet, frechet_bounds
 from combomaker.pricing.dixon_coles import (
     Advance,
@@ -58,7 +58,17 @@ from combomaker.pricing.dixon_coles import (
 from combomaker.pricing.joint import JointEstimate
 from combomaker.pricing.legs import LegBelief
 from combomaker.pricing.legtypes import LegType, Sport, classify_leg, classify_sport
+from combomaker.pricing.margin_total import (
+    GameTotalOver,
+    MTLegSpec,
+    SportShape,
+    TeamWins,
+    invert_means,
+    region_probability,
+)
 from combomaker.rfq.models import RfqLeg
+
+_MT_SPORTS = (Sport.NFL, Sport.NBA, Sport.WNBA)
 
 # 26JUL06 (+ optional 4-digit start time) then the concatenated team codes.
 _GAME_CODE = re.compile(r"^\d{2}[A-Z]{3}\d{2}(?:\d{4})?([A-Z0-9]{4,})$")
@@ -145,8 +155,11 @@ def _parse_leg(ticker: str, match: _Match, *, fmt: MatchFormat) -> LegSpec | str
 
 
 class StructuralPricer:
-    def __init__(self, config: StructuralConfig) -> None:
+    def __init__(
+        self, config: StructuralConfig, mt_config: MarginTotalConfig | None = None
+    ) -> None:
         self._cfg = config
+        self._mt = mt_config or MarginTotalConfig()
 
     def _match_format(self, ticker: str) -> MatchFormat:
         series = ticker.split("-", 1)[0].upper()
@@ -163,7 +176,19 @@ class StructuralPricer:
     ) -> tuple[JointEstimate | None, str | None]:
         """(estimate, None) on success; (None, reason) -> copula fallback."""
         try:
-            return self._price(legs, beliefs, sides), None
+            sports = {classify_sport(leg.market_ticker) for leg in legs}
+            if len(sports) != 1:
+                raise StructuralError("legs span multiple sports")
+            sport = sports.pop()
+            if sport is Sport.SOCCER:
+                if not self._cfg.enabled:
+                    raise StructuralError("soccer structural pricer disabled")
+                return self._price(legs, beliefs, sides), None
+            if sport in _MT_SPORTS:
+                if str(sport) not in self._mt.enabled_sports:
+                    raise StructuralError(f"{sport} margin-total pricer not gated on")
+                return self._price_margin_total(sport, legs, beliefs, sides), None
+            raise StructuralError(f"no structural model for sport {sport}")
         except StructuralError as exc:
             return None, str(exc)
 
@@ -171,8 +196,6 @@ class StructuralPricer:
         self, legs: list[RfqLeg], beliefs: list[LegBelief], sides: list[str]
     ) -> JointEstimate:
         cfg = self._cfg
-        if any(classify_sport(leg.market_ticker) is not Sport.SOCCER for leg in legs):
-            raise StructuralError("structural model is soccer-only")
 
         matches = []
         for leg in legs:
@@ -289,13 +312,152 @@ class StructuralPricer:
         )
 
 
+    # --- margin/total sports (NFL, NBA, WNBA) ------------------------------
+
+    def _parse_mt_leg(self, ticker: str, match: _Match) -> MTLegSpec | str:
+        parts = ticker.split("-")
+        leg_type = classify_leg(ticker)
+        if leg_type is LegType.MONEYLINE:
+            team = _team_of(parts[-1], match)
+            if team is None:
+                return f"moneyline suffix {parts[-1]!r} matches neither team"
+            return TeamWins(team=team)
+        if leg_type is LegType.TOTAL:
+            raw = parts[-1]
+            if re.fullmatch(r"\d+", raw):
+                # "N or more" style integer line: T >= N, continuity-corrected.
+                return GameTotalOver(threshold=float(int(raw)) - 0.5)
+            if re.fullmatch(r"\d+\.5", raw):
+                return GameTotalOver(threshold=float(raw))
+            return f"unparseable total line {raw!r}"
+        if leg_type is LegType.SPREAD:
+            # The ticker does not carry the line's SIGN convention; guessing
+            # it wrong silently mirrors every spread quote. Blocked until
+            # real spread tickers + rules are observed in season.
+            return "spread line sign convention unverified — copula fallback"
+        return f"leg type {leg_type} not representable in the margin/total model"
+
+    def _price_margin_total(
+        self,
+        sport: Sport,
+        legs: list[RfqLeg],
+        beliefs: list[LegBelief],
+        sides: list[str],
+    ) -> JointEstimate:
+        mt = self._mt
+        raw = mt.params.get(str(sport))
+        if raw is None:
+            raise StructuralError(f"no calibrated shape for {sport}")
+        shape = SportShape(
+            sigma_margin=raw["sigma_margin"],
+            sigma_total=raw["sigma_total"],
+            rho=raw["rho"],
+        )
+
+        matches = []
+        for leg in legs:
+            parts = leg.market_ticker.split("-")
+            if len(parts) < 2:
+                raise StructuralError(f"malformed ticker {leg.market_ticker!r}")
+            match = _parse_match(parts[1])
+            if match is None:
+                raise StructuralError(f"unparseable game code {parts[1]!r}")
+            matches.append(match)
+        match = matches[0]
+        if any(m != match for m in matches):
+            raise StructuralError("legs reference different games")
+
+        specs: list[MTLegSpec] = []
+        for leg in legs:
+            spec = self._parse_mt_leg(leg.market_ticker, match)
+            if isinstance(spec, str):
+                raise StructuralError(f"{leg.market_ticker}: {spec}")
+            specs.append(spec)
+
+        constraints = [(spec, b.p) for spec, b in zip(specs, beliefs, strict=True)]
+        selected = [(spec, side == "yes") for spec, side in zip(specs, sides, strict=True)]
+
+        def solve(
+            targets: list[tuple[MTLegSpec, float]],
+            use_shape: SportShape,
+            warm: tuple[float, float] | None,
+        ) -> tuple[float, float]:
+            inv = invert_means(targets, use_shape, warm_start=warm)
+            return (
+                region_probability(inv.mu_m, inv.mu_t, use_shape, selected),
+                inv.residual,
+            )
+
+        base_inv = invert_means(constraints, shape)
+        p = region_probability(base_inv.mu_m, base_inv.mu_t, shape, selected)
+        warm = (base_inv.mu_m, base_inv.mu_t)
+
+        leg_unc = 0.0
+        for i, belief in enumerate(beliefs):
+            deltas = []
+            for shifted in (belief.p + belief.uncertainty, belief.p - belief.uncertainty):
+                bumped = list(constraints)
+                bumped[i] = (specs[i], min(0.999, max(0.001, shifted)))
+                try:
+                    deltas.append(abs(solve(bumped, shape, warm)[0] - p))
+                except StructuralError:
+                    continue
+            if not deltas:
+                raise StructuralError(f"marginal band of leg {i} leaves invertible range")
+            leg_unc += max(deltas)
+
+        form_probes: list[float] = []
+        f = mt.sigma_band_frac
+        for probe_shape in (
+            SportShape(shape.sigma_margin * (1 + f), shape.sigma_total, shape.rho),
+            SportShape(shape.sigma_margin * (1 - f), shape.sigma_total, shape.rho),
+            SportShape(shape.sigma_margin, shape.sigma_total * (1 + f), shape.rho),
+            SportShape(shape.sigma_margin, shape.sigma_total * (1 - f), shape.rho),
+            SportShape(shape.sigma_margin, shape.sigma_total, min(0.99, shape.rho + mt.rho_band)),
+            SportShape(shape.sigma_margin, shape.sigma_total, max(-0.99, shape.rho - mt.rho_band)),
+        ):
+            try:
+                form_probes.append(solve(constraints, probe_shape, warm)[0])
+            except StructuralError:
+                continue
+        form_unc = max((abs(fp - p) for fp in form_probes), default=0.0)
+
+        disc_unc = (
+            mt.discreteness_unc.get(str(sport), 0.01)
+            if any(isinstance(s, TeamWins) for s in specs)
+            else 0.0
+        )
+        misfit_unc = base_inv.residual * mt.misfit_uncertainty_scale
+        uncertainty = leg_unc + form_unc + disc_unc + misfit_unc
+
+        marginals = [
+            b.p if yes else 1.0 - b.p
+            for b, (_, yes) in zip(beliefs, selected, strict=True)
+        ]
+        lo, hi = frechet_bounds(marginals)
+        return JointEstimate(
+            p=clamp_to_frechet(p, marginals),
+            uncertainty=uncertainty,
+            frechet_lo=lo,
+            frechet_hi=hi,
+            notes=(
+                *base_inv.notes,
+                f"structural-mt: sport={sport} legs={len(legs)} "
+                f"unc(leg={leg_unc:.4f} form={form_unc:.4f} "
+                f"disc={disc_unc:.4f} misfit={misfit_unc:.4f})",
+            ),
+        )
+
+
 def structural_applicable(
     legs: list[RfqLeg], same_event_groups: Sequence[Sequence[int]]
 ) -> bool:
-    """Cheap pre-check: soccer legs, all in ONE same-event group."""
+    """Cheap pre-check: a structurally-modeled sport, all legs in ONE
+    same-event group."""
     if not legs:
         return False
-    if any(classify_sport(leg.market_ticker) is not Sport.SOCCER for leg in legs):
+    sports = {classify_sport(leg.market_ticker) for leg in legs}
+    if len(sports) != 1 or sports.pop() not in (Sport.SOCCER, *_MT_SPORTS):
         return False
     groups = [g for g in same_event_groups if len(g) > 1] if same_event_groups else []
     covered = set(groups[0]) if len(groups) == 1 else set()

@@ -136,13 +136,22 @@ class TestPricing:
         )
         assert est is None and reason is not None and "neither team" in reason
 
-    def test_non_soccer_refuses(self) -> None:
+    def test_ungated_mt_sport_refuses(self) -> None:
+        # default MarginTotalConfig gates every sport off
         est, reason = pricer().try_price(
             [leg("KXNBAGAME-26JUL10LALBOS-LAL"), leg("KXNBATOTAL-26JUL10LALBOS-200")],
             [belief(0.5), belief(0.5)],
             ["yes", "yes"],
         )
-        assert est is None and reason is not None and "soccer-only" in reason
+        assert est is None and reason is not None and "not gated" in reason
+
+    def test_mixed_sport_legs_refuse(self) -> None:
+        est, reason = pricer().try_price(
+            [leg(ML), leg("KXNBATOTAL-26JUL10LALBOS-200")],
+            [belief(0.5), belief(0.5)],
+            ["yes", "yes"],
+        )
+        assert est is None and reason is not None and "multiple sports" in reason
 
     def test_cross_match_legs_refuse(self) -> None:
         est, reason = pricer().try_price(
@@ -189,6 +198,63 @@ class TestPricing:
         assert both.p + a_not_b.p == pytest.approx(0.65, abs=1e-6)
 
 
+class TestMarginTotalDispatch:
+    NBA_ML = "KXNBAGAME-26OCT10LALBOS-LAL"
+    NBA_TOTAL = "KXNBATOTAL-26OCT10LALBOS-225"
+
+    def mt_pricer(self, sports: list[str]) -> StructuralPricer:
+        from combomaker.ops.config import MarginTotalConfig
+
+        return StructuralPricer(
+            StructuralConfig(enabled=True),
+            MarginTotalConfig(enabled_sports=sports),
+        )
+
+    def test_nba_ml_total_prices_near_product(self) -> None:
+        est, reason = self.mt_pricer(["nba"]).try_price(
+            [leg(self.NBA_ML), leg(self.NBA_TOTAL)],
+            [belief(0.62), belief(0.55)],
+            ["yes", "yes"],
+        )
+        assert reason is None and est is not None
+        # calibrated NBA rho(M,T) = 0.000: the structural joint is the
+        # product of the marginals (that's the finding, not an assumption).
+        assert est.p == pytest.approx(0.62 * 0.55, abs=0.002)
+        assert est.uncertainty > 0.004  # discreteness band present
+        assert any("structural-mt" in n for n in est.notes)
+
+    def test_ungated_sport_falls_back(self) -> None:
+        est, reason = self.mt_pricer([]).try_price(
+            [leg(self.NBA_ML), leg(self.NBA_TOTAL)],
+            [belief(0.62), belief(0.55)],
+            ["yes", "yes"],
+        )
+        assert est is None and reason is not None and "not gated" in reason
+
+    def test_spread_leg_falls_back_sign_unverified(self) -> None:
+        est, reason = self.mt_pricer(["nba"]).try_price(
+            [leg(self.NBA_ML), leg("KXNBASPREAD-26OCT10LALBOS-LAL35")],
+            [belief(0.62), belief(0.50)],
+            ["yes", "yes"],
+        )
+        assert est is None and reason is not None and "sign convention" in reason
+
+    def test_no_side_total_is_complement(self) -> None:
+        p = self.mt_pricer(["nba"])
+        over, _ = p.try_price(
+            [leg(self.NBA_ML), leg(self.NBA_TOTAL)],
+            [belief(0.62), belief(0.55)],
+            ["yes", "yes"],
+        )
+        under, _ = p.try_price(
+            [leg(self.NBA_ML), leg(self.NBA_TOTAL, side="no")],
+            [belief(0.62), belief(0.55)],
+            ["yes", "no"],
+        )
+        assert over is not None and under is not None
+        assert over.p + under.p == pytest.approx(0.62, abs=1e-4)
+
+
 class TestApplicability:
     def test_single_soccer_group_applies(self) -> None:
         assert structural_applicable([leg(ML), leg(BTTS)], [(0, 1)])
@@ -199,8 +265,12 @@ class TestApplicability:
             [leg(ML), leg(BTTS), leg("KXWCBTTS-26JUL10SPAPOR")], [(0, 1)]
         )
 
-    def test_non_soccer_does_not_apply(self) -> None:
+    def test_margin_total_sports_apply(self) -> None:
         legs = [leg("KXNBAGAME-26JUL10LALBOS-LAL"), leg("KXNBATOTAL-26JUL10LALBOS-200")]
+        assert structural_applicable(legs, [(0, 1)])
+
+    def test_unmodeled_sport_does_not_apply(self) -> None:
+        legs = [leg("KXUFCFIGHT-26JUL11MCGHOL-HOL"), leg("KXUFCFIGHT-26JUL11ABCDEF-ABC")]
         assert not structural_applicable(legs, [(0, 1)])
 
 

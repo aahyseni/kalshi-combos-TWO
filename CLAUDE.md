@@ -122,7 +122,20 @@ exactly our structural fair) and **OOS-gated vs the shipped v1 copula on
 metrics, by the most on 3-leg triples** (NOTES.md audit I1–I10 + gate table).
 dc_ρ = −0.05 fitted on train scorelines. Same day: orientation-aware
 btts|moneyline (fav/dog), ml|player_goal 0.50, and the dead-config fix
-forwarding sport tables into the engine.
+forwarding sport tables into the engine. Settlement windows RULE-BOOK
+verified (operator-provided Kalshi rules): knockout game market = advance
+incl pens (Advance spec, pens 0.5 banded), BTTS/totals regulation-only,
+props full-game — worth ~1¢ of fair (NOTES I8).
+
+**Margin/total structural pricer — NFL/NBA/WNBA (2026-07-06): BUILT;
+NFL ENABLED** (`pricing/margin_total.py` + adapter dispatch in
+`pricing/structural.py`): (margin, total) bivariate normal, means inverted
+per game from live prices, shapes calibrated on recent seasons (data
+refreshed through NFL 2025 / NBA 2025-26 / WNBA 2026-07-05). NFL OOS gate
+passed (biggest win: hw×cover — exact comonotone geometry vs copula 0.88).
+Spread legs blocked until in-season tickers verify the line sign convention;
+NBA/WNBA calibrated but gated off pending an odds source or prod-shadow
+settlements (NOTES audit J1–J6).
 
 ## Architecture decisions
 

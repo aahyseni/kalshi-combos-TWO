@@ -313,11 +313,43 @@ class StructuralConfig(StrictModel):
     knockout_series: list[str] = ["KXWC"]
 
 
+class MarginTotalConfig(StrictModel):
+    """Bivariate-normal (margin, total) structural pricer for NFL/NBA/WNBA
+    (pricing/margin_total.py). Per-game means invert from live prices; the
+    sport shapes below are calibrated from RECENT seasons
+    (tools/calibrate_margin_total.py, 2026-07-06 — NFL 2020-2025 closing-line
+    residuals; NBA 2022-2026 & WNBA 2021-2026 team-fixed-effects residuals,
+    the FE method validated against NFL's line residuals). A sport enters
+    ``enabled_sports`` ONLY via an OOS gate (directive point 4).
+
+    NFL GATE PASSED 2026-07-06 (tools/validate_margin_total_oos.py; train
+    2015-2023, test 2024-2025 n=562): structural beats the shipped v1 copula
+    on all three OOS metrics — hw×over 1.29275 vs 1.29293, hw×cover 0.96260
+    vs 0.99940 (exact comonotone geometry vs the 0.88 approximation), triple
+    1.65544 vs 1.69217. NBA/WNBA stay disabled: no local odds history to
+    gate them; gate from prod-shadow settlements or an odds source before
+    their seasons."""
+
+    enabled_sports: list[str] = ["nfl"]
+    params: dict[str, dict[str, float]] = {
+        "nfl": {"sigma_margin": 12.66, "sigma_total": 13.06, "rho": 0.026},
+        "nba": {"sigma_margin": 13.71, "sigma_total": 18.42, "rho": 0.000},
+        "wnba": {"sigma_margin": 12.04, "sigma_total": 16.55, "rho": -0.019},
+    }
+    sigma_band_frac: float = 0.05   # FE-vs-line method gap on NFL was ~3%
+    rho_band: float = 0.05
+    # Normal approximation of discrete scores (NFL key numbers worst):
+    # flat probability adder when any margin-flavored leg is present.
+    discreteness_unc: dict[str, float] = {"nfl": 0.010, "nba": 0.004, "wnba": 0.005}
+    misfit_uncertainty_scale: float = 1.0
+
+
 class PricingConfig(StrictModel):
     fee: FeeConfig = Field(default_factory=FeeConfig)
     correlation: CorrelationConfig = Field(default_factory=CorrelationConfig)
     quote: QuoteConfig = Field(default_factory=QuoteConfig)
     structural: StructuralConfig = Field(default_factory=StructuralConfig)
+    margin_total: MarginTotalConfig = Field(default_factory=MarginTotalConfig)
     external_odds: ExternalOddsConfig = Field(default_factory=ExternalOddsConfig)
     max_source_disagreement: float = 0.08
 

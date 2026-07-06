@@ -366,6 +366,24 @@ coherent cells (structural marginals carry inversion misfit); settlement
 windows (I8) remain the open UNVERIFIED assumption — the window band prices
 it, verify rules text before Phase 7.
 
+### Margin/total structural pricer — NFL/NBA/WNBA (2026-07-06)
+
+Game state X = (margin, total) bivariate normal; per-game means inverted from
+live prices, sport shapes calibrated offline. Every ML/spread/total/team-total
+leg is a halfplane in (M,T); joints are exact region probabilities (1D
+conditional quadrature). The geometry prices what v1 hand-encodes: ML×spread
+comonotone (v1 says ρ 0.88), ML×total ≈ independent (v1 says 0.00), team
+totals coherent with both.
+
+| # | Assumption embedded in code | Where | Tag |
+|---|---|---|---|
+| J1 | Sport shapes from RECENT windows (operator directive — sports drift): NFL 2020-25 **closing-line residuals** σ_M 12.66 σ_T 13.06 ρ +0.026; NBA 2022-26 σ_M 13.71 σ_T 18.42 ρ 0.000; WNBA 2021-26 σ_M 12.04 σ_T 16.55 ρ −0.019 (**team-fixed-effects residuals — method validated on NFL: FE vs line-residual σ within 3%**). Era checks: NFL ρ stable +0.027→+0.026 over a decade; NBA σ_M ROSE 12.85→13.71 (3PT-era variance — recency mattered); WNBA data through 2026-07-05 (yesterday) | `ops/config.py` MarginTotalConfig, `tools/calibrate_margin_total.py` | fixture:historical (nflverse/hoopR/wehoop, refreshed 2026-07-06 incl. NFL 2025 + NBA 2025-26 + WNBA current) |
+| J2 | Normal approximation of discrete scores: flat discreteness band when any margin leg present (NFL 0.010 — key numbers 3/7; NBA 0.004; WNBA 0.005) + σ bands ±5%, ρ band ±0.05, all re-inverted | `pricing/margin_total.py`, config | model form — banded |
+| J3 | Identification: leg directions must span the needed means (rank check) else refuse; exact systems refuse at residual >0.005; ANY system refuses at >0.05 (legs mutually inconsistent — e.g. ML and spread implying opposite favorites); intermediate misfit → width | `pricing/margin_total.py` | mathematical construction, tested |
+| J4 | **Spread legs BLOCKED in the adapter**: the ticker does not carry the line's sign convention, and guessing wrong silently mirrors every spread quote — copula fallback until real in-season spread tickers + rules are observed. ML + totals ship | `pricing/structural.py` `_parse_mt_leg` | fail-safe by construction (quiet-failure defense #2) |
+| J5 | Integer total lines ("225") read as ≥N with continuity correction (N−0.5); ".5" lines as-is. Game-code team split requires equal-length codes (2-letter NFL codes vs 3-letter mixed, e.g. "KCDET", refuse ⇒ fallback) | ″ | observed ticker patterns; verify against live NFL/NBA tickers in season |
+| J6 | `enabled_sports=["nfl"]` — **OOS GATE PASSED** (train 2015-23, test 2024-25 n=562, lower better): pair hw×over 1.29275 vs v1 1.29293; pair hw×cover **0.96260 vs 0.99940**; triple **1.65544 vs 1.69217**. NBA/WNBA calibrated but DISABLED: no local odds history to gate; gate via prod-shadow would-quotes+settlements or an odds source before their seasons (NBA opens ~Oct 2026) | config + `tools/validate_margin_total_oos.py` | gate evidence (directive point 4) |
+
 ### Final adversarial review (2026-07-05) — 5 lenses, 43 agents, 7 confirmed defects, all fixed
 
 | Finding (confirmed by 2-skeptic verification) | Fix | Regression test |
