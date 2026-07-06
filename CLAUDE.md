@@ -112,15 +112,17 @@ Next: **Phase 6 — shadow on prod data** (read-only; would-quotes + markouts +
 executed-trade comparisons + calibration), combo-settlement pass to fill
 `combo_no_pays_complement`, Kalshi→SGO mapping table.
 
-**Structural pricer v2 (2026-07-06): BUILT** — Dixon-Coles scoreline model for
-soccer SGPs (`pricing/dixon_coles.py` math, `pricing/structural.py` adapter),
-inverted from live leg prices behind the JointEstimate interface; any parse or
-identification doubt falls back to the v1 copula. Validated against the live
-market (SPA/POR parlay priced at exactly our structural fair). Gated OFF
-(`structural.enabled`) until the OOS gate vs the v1 copula passes — see
-NOTES.md audit I1–I10. Same day: orientation-aware btts|moneyline (fav/dog),
-ml|player_goal 0.50, and the dead-config fix forwarding sport tables into the
-engine.
+**Structural pricer v2 (2026-07-06): SHIPPED, ENABLED** — Dixon-Coles
+scoreline model for soccer SGPs (`pricing/dixon_coles.py` math,
+`pricing/structural.py` adapter), inverted from live leg prices behind the
+JointEstimate interface; any parse or identification doubt falls back to the
+v1 copula. Validated against the live market (SPA/POR parlay priced at
+exactly our structural fair) and **OOS-gated vs the shipped v1 copula on
+8,980 held-out-season club games — structural wins all three joint-log-loss
+metrics, by the most on 3-leg triples** (NOTES.md audit I1–I10 + gate table).
+dc_ρ = −0.05 fitted on train scorelines. Same day: orientation-aware
+btts|moneyline (fav/dog), ml|player_goal 0.50, and the dead-config fix
+forwarding sport tables into the engine.
 
 ## Architecture decisions
 

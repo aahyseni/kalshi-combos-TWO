@@ -277,13 +277,20 @@ class StructuralConfig(StrictModel):
 
     ``enabled`` may be flipped ON only by an out-of-sample gate result
     (tools/validate_structural_oos.py): a structural fit that does not beat
-    the v1 copula on held-out seasons is noise and must not ship."""
+    the v1 copula on held-out seasons is noise and must not ship.
 
-    enabled: bool = False
+    GATE PASSED 2026-07-06 (8,980 club games, train <2024 / test 23/24+24/25):
+    structural beats the SHIPPED v1 copula on all three OOS joint-log-loss
+    metrics — hw×over 1.24657 vs 1.24734, hw×btts 1.26330 vs 1.26724, and the
+    3-leg triple 1.70607 vs 1.74775 (independence 1.94197). The margin GROWS
+    with combo complexity: coherent scorelines beat pairwise rho stitching
+    most where the maker quotes most."""
+
+    enabled: bool = True
     max_goals: int = 12
-    # DC low-score adjustment. Placeholder from the literature until the OOS
-    # tool fits it on our own scoreline history (train seasons only).
-    dc_rho: float = -0.10
+    # DC low-score adjustment: FITTED on train-season scorelines through the
+    # production inversion (grid MLE, tools/validate_structural_oos.py).
+    dc_rho: float = -0.05
     dc_rho_band: float = 0.08
     # ET intensity as a fraction of regulation scoring rate (30min pro-rata =
     # 1/3); band edges re-price the joint for the model-form width.

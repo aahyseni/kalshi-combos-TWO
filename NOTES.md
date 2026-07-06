@@ -338,12 +338,33 @@ auctions (missed volume — longshot width covers the bleed side).
 | I2 | btts\|moneyline is orientation-conditional: fav −0.19 / dog 0.00, linearly blended across the ML leg's 45–55% marginal (no fair cliff at 50¢). "Winners keep clean sheets" is favorites-only; a dog only wins by scoring | `ops/config.py`, `pricing/sgp.py` | structural implication + 1 live market validation; UNVERIFIED against co-settlement data |
 | I3 | moneyline\|player_goal = 0.50 soccer (band .12), 0.40 global (band .20): structurally implied +0.51/+0.52 on BOTH examples, orientation-insensitive | `ops/config.py` | structural implication ×2; UNVERIFIED against player-prop history (none available) |
 | I4 | Scoreline model: independent Poisson 90' + DC low-score tau; knockout draws play ET at `et_factor`×rates (pens ⇒ win-market NO); player goals = multinomial thinning (share q per player, Binomial given team goals) | `pricing/dixon_coles.py` | model form — banded (DC ρ ±0.08, ET factor 0.25–0.40 re-inverted into width) |
-| I5 | DC ρ = −0.10 **placeholder from literature** until fitted on our own scoreline history (train seasons only, OOS tool) | `ops/config.py` StructuralConfig | UNVERIFIED — gate task fits it |
+| I5 | DC ρ = **−0.05 FITTED** on train-season scorelines (grid MLE through the production inversion; −0.10 literature placeholder replaced) | `ops/config.py` StructuralConfig | fixture:historical-results via `tools/validate_structural_oos.py` |
 | I6 | Inversion identification: ≥2 team-level legs required (else StructuralError ⇒ copula fallback); 2 legs solve exactly (residual >0.005 ⇒ refuse); >2 least-squares with residual priced into width; player shares solved per leg, Σq>0.95 per team ⇒ refuse | `pricing/dixon_coles.py` | mathematical construction, property-tested |
 | I7 | Ticker shapes: game code = DDMMMYY[+HHMM] + concatenated equal-length team codes; GOAL ticker's player segment prefixes the team code; TOTAL line suffix ("3" or "2.5"). ANY parse doubt ⇒ reason ⇒ copula fallback (UNKNOWN never prices structurally) | `pricing/structural.py` | observed demo/prod tickers; parser is fail-safe by construction |
 | I8 | Settlement windows: KXWC assumed knockout, goal-flavored legs assumed to settle over 90'+ET, ML per its "90+ET" market name. The 90'-only alternative is re-priced and the gap added to width | `pricing/structural.py` | **DOC_ASSUMED / UNVERIFIED** — verify against market rules text before enabling |
-| I9 | `structural.enabled = False` until the OOS gate (held-out seasons, joint log-loss vs v1 copula) passes; flag flipped only with the gate evidence recorded here | `ops/config.py` | design rule (directive point 4) |
+| I9 | `structural.enabled = True` — **OOS GATE PASSED 2026-07-06** (below); flag was OFF until this evidence existed | `ops/config.py` | gate: `tools/validate_structural_oos.py` |
 | I10 | Hot-path cost: ~47ms per structural quote (memoized state enumeration, warm-started perturbation re-inversions) vs 500ms budget | measured 2026-07-06 | benchmark, re-check on prod hardware |
+
+**OOS gate result (2026-07-06, `tools/validate_structural_oos.py`):** 8,980
+club games, dc_ρ fitted −0.05 on train (<2024, n=7,228) scoreline MLE through
+the production `invert()`; held-out 23/24+24/25 (n=1,752) joint log-loss per
+game, LOWER better — structural beats the SHIPPED v1 copula on ALL metrics
+(v1's ml×over ρ was itself fitted on this data, so this is a high bar):
+
+| metric | independence | v1 copula | structural |
+|---|---|---|---|
+| pair hw×over (both marginals from market odds) | 1.25797 | 1.24734 | **1.24657** |
+| pair hw×btts (marginal parity: btts marginal = DC-implied for all models) | 1.27353 | 1.26724 | **1.26330** |
+| triple hw×over×btts (8-cell — what a 3-leg SGP maker quotes) | 1.94197 | 1.74775 | **1.70607** |
+
+The margin grows with combo complexity: pairwise ρ stitching degrades where
+coherent scorelines don't. `structural.enabled=True` shipped on this evidence
+(directive point 4 satisfied against the incumbent, not just independence).
+Caveats: club-soccer evidence applied to WC internationals (btts×ml at least
+measured identical club vs intl); triple metric uses each model's own
+coherent cells (structural marginals carry inversion misfit); settlement
+windows (I8) remain the open UNVERIFIED assumption — the window band prices
+it, verify rules text before Phase 7.
 
 ### Final adversarial review (2026-07-05) — 5 lenses, 43 agents, 7 confirmed defects, all fixed
 

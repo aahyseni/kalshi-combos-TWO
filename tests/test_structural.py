@@ -206,8 +206,8 @@ async def wc_engine(config: PricingConfig) -> PricingEngine:
 
 async def test_engine_uses_structural_when_enabled() -> None:
     rfq = same_event_combo([ML, BTTS, GOAL])
-    on = await wc_engine(PricingConfig(structural=StructuralConfig(enabled=True)))
-    off = await wc_engine(PricingConfig())
+    on = await wc_engine(PricingConfig())  # enabled by default since OOS gate pass
+    off = await wc_engine(PricingConfig(structural=StructuralConfig(enabled=False)))
     structural = on.price(rfq, time_to_close_s=TTC)
     copula = off.price(rfq, time_to_close_s=TTC)
     assert isinstance(structural, ConstructedQuote), structural
@@ -222,8 +222,8 @@ async def test_engine_falls_back_on_unparseable_combo() -> None:
     # codes: structural refuses, engine must price via the copula instead.
     tickers = ["KXWCGAME-26JUL10AB-AB", "KXWCBTTS-26JUL10AB"]
     rfq = same_event_combo(tickers)
-    on = await wc_engine_for(tickers, PricingConfig(structural=StructuralConfig(enabled=True)))
-    off = await wc_engine_for(tickers, PricingConfig())
+    on = await wc_engine_for(tickers, PricingConfig())  # structural on by default
+    off = await wc_engine_for(tickers, PricingConfig(structural=StructuralConfig(enabled=False)))
     with_structural = on.price(rfq, time_to_close_s=TTC)
     without = off.price(rfq, time_to_close_s=TTC)
     assert isinstance(with_structural, ConstructedQuote), with_structural
