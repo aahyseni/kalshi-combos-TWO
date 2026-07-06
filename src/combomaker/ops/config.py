@@ -126,17 +126,56 @@ class CorrelationConfig(StrictModel):
     }
     typed_rho_uncertainty: float = 0.15
     untyped_rho_uncertainty: float = 0.30
-    # Tighter bands for pairs backed by the n≈9k calibration; ml|total's band
-    # also covers its measured home/away asymmetry. Uncalibrated pairs keep
-    # the defaults above.
+    # Sport-specific tables (calibrated 2026-07-06; the same pair correlates
+    # DIFFERENTLY per sport: winner×over is +0.23 in soccer, 0.00 in NFL/NBA).
+    # Sports absent here fall back to the global table above with wider bands.
+    # WNBA inherits NBA's numbers (transfer assumption, wider band).
+    pair_rho_by_sport: dict[str, dict[str, float]] = {
+        "soccer": {
+            "moneyline|total": 0.23,
+            "btts|total": 0.75,
+            "btts|moneyline": -0.17,
+            "total|total": 0.95,
+            "corners|total": 0.00,
+            "btts|corners": 0.00,
+            "moneyline|moneyline": -0.95,
+        },
+        "nfl": {
+            "moneyline|total": 0.00,
+            "spread|total": 0.03,
+            "moneyline|spread": 0.88,
+            "extras|total": 0.20,
+            "moneyline|moneyline": -0.95,
+        },
+        "nba": {
+            "moneyline|total": 0.00,
+            "moneyline|moneyline": -0.95,
+        },
+        "wnba": {
+            "moneyline|total": 0.00,
+            "moneyline|moneyline": -0.95,
+        },
+    }
+    # Band overrides: sport-prefixed keys ("nfl:moneyline|total") for
+    # calibrated sport entries; unprefixed keys for the global table.
     pair_rho_uncertainty: dict[str, float] = {
         "moneyline|moneyline": 0.04,
-        "btts|total": 0.08,
-        "btts|moneyline": 0.08,
-        "moneyline|total": 0.10,
-        "total|total": 0.04,
-        "corners|total": 0.08,
-        "btts|corners": 0.08,
+        "soccer:moneyline|total": 0.10,     # covers home/away asymmetry .18/.28
+        "soccer:btts|total": 0.08,
+        "soccer:btts|moneyline": 0.08,
+        "soccer:total|total": 0.04,
+        "soccer:corners|total": 0.08,
+        "soccer:btts|corners": 0.08,
+        "soccer:moneyline|moneyline": 0.04,
+        "nfl:moneyline|total": 0.05,
+        "nfl:spread|total": 0.05,
+        "nfl:moneyline|spread": 0.05,
+        "nfl:extras|total": 0.10,
+        "nfl:moneyline|moneyline": 0.04,
+        "nba:moneyline|total": 0.05,
+        "nba:moneyline|moneyline": 0.04,
+        "wnba:moneyline|total": 0.12,       # NBA transfer: wider until measured
+        "wnba:moneyline|moneyline": 0.04,
     }
 
 

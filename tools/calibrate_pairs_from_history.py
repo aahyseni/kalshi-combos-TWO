@@ -83,26 +83,115 @@ def measure(
     return n, p_a, p_b, p_ab, implied_rho(p_a, p_b, p_ab)
 
 
-PAIRS = [
-    ("ml|total  (home win × over2.5)", "home_win", "over25"),
-    ("ml|total  (away win × over2.5)", "away_win", "over25"),
-    ("btts|total (btts × over2.5)", "btts", "over25"),
-    ("btts|ml   (btts × home win)", "btts", "home_win"),
-    ("btts|ml   (btts × away win)", "btts", "away_win"),
-    ("total|total (over2.5 × over3.5)", "over25", "over35"),
+def load_nfl() -> list[dict[str, bool | None]]:
+    """nflverse games.csv: scores + Vegas closing lines + overtime flag.
+    Over/under measured RELATIVE TO THE MARKET LINE (removes era drift);
+    pushes are excluded (None)."""
+    games: list[dict[str, bool | None]] = []
+    with open(HISTORY / "nfl_games.csv", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                home = int(row["home_score"])
+                away = int(row["away_score"])
+                total = home + away
+                margin = home - away
+            except (KeyError, ValueError):
+                continue
+            over: bool | None = None
+            home_cover: bool | None = None
+            try:
+                line = float(row["total_line"])
+                over = None if total == line else total > line
+            except (KeyError, ValueError, TypeError):
+                pass
+            try:
+                spread = float(row["spread_line"])  # positive = home favored
+                home_cover = None if margin == spread else margin > spread
+            except (KeyError, ValueError, TypeError):
+                pass
+            games.append(
+                {
+                    "home_win": margin > 0,
+                    "away_win": margin < 0,
+                    "over": over,
+                    "home_cover": home_cover,
+                    "overtime": row.get("overtime") in ("1", "True", "TRUE"),
+                }
+            )
+    return games
+
+
+def load_nba() -> list[dict[str, bool | None]]:
+    """538 nbaallelo.csv (1946-2015, team-game rows). Seasons >= 2000 only;
+    over = total points above that season's median (self-normalizing)."""
+    rows: list[tuple[int, int, int, bool]] = []  # (season, total, margin>0 home?, home_win)
+    with open(HISTORY / "nba_elo.csv", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            if row.get("_iscopy") != "0" or row.get("game_location") != "H":
+                continue
+            try:
+                season = int(row["year_id"])
+                pts = int(row["pts"])
+                opp = int(row["opp_pts"])
+            except (KeyError, ValueError):
+                continue
+            if season < 2000:
+                continue
+            rows.append((season, pts + opp, pts - opp, row.get("game_result") == "W"))
+    medians: dict[int, float] = {}
+    for season in {r[0] for r in rows}:
+        totals = sorted(t for s, t, _, _ in rows if s == season)
+        medians[season] = totals[len(totals) // 2]
+    return [
+        {
+            "home_win": home_win,
+            "away_win": (not home_win),
+            "over": None if total == medians[season] else total > medians[season],
+        }
+        for season, total, _, home_win in rows
+    ]
+
+
+SOCCER_PAIRS = [
+    ("ml|total  (home win x over2.5)", "home_win", "over25"),
+    ("ml|total  (away win x over2.5)", "away_win", "over25"),
+    ("btts|total (btts x over2.5)", "btts", "over25"),
+    ("btts|ml   (btts x home win)", "btts", "home_win"),
+    ("btts|ml   (btts x away win)", "btts", "away_win"),
+    ("total|total (over2.5 x over3.5)", "over25", "over35"),
     ("corners|total (corners>=10 x over2.5)", "corners95", "over25"),
     ("btts|corners", "btts", "corners95"),
-    ("ml|ml SAME GAME (home win × away win)", "home_win", "away_win"),
+    ("ml|ml SAME GAME (home win x away win)", "home_win", "away_win"),
+]
+
+NFL_PAIRS = [
+    ("ml|total (home win x over LINE)", "home_win", "over"),
+    ("ml|total (away win x over LINE)", "away_win", "over"),
+    ("spread|total (home cover x over)", "home_cover", "over"),
+    ("ml|spread (home win x home cover)", "home_win", "home_cover"),
+    ("extras|total (overtime x over)", "overtime", "over"),
+    ("ml|ml SAME GAME", "home_win", "away_win"),
+]
+
+NBA_PAIRS = [
+    ("ml|total (home win x over median)", "home_win", "over"),
+    ("ml|total (away win x over median)", "away_win", "over"),
+    ("ml|ml SAME GAME", "home_win", "away_win"),
 ]
 
 
-def main() -> None:
-    matches = load_matches()
-    print(f"matches loaded: {len(matches)}\n")
+def report(title: str, matches: list[dict[str, bool | None]], pairs: list) -> None:
+    print(f"\n=== {title}: {len(matches)} games ===")
     print(f"{'pair':44} {'n':>6} {'P(A)':>7} {'P(B)':>7} {'P(AB)':>8} {'rho':>8}")
-    for label, a, b in PAIRS:
+    for label, a, b in pairs:
         n, p_a, p_b, p_ab, rho = measure(matches, a, b)
         print(f"{label:44} {n:>6} {p_a:>7.3f} {p_b:>7.3f} {p_ab:>8.3f} {rho:>8.3f}")
+
+
+def main() -> None:
+    report("SOCCER (top-5 EU, 20/21-24/25)", load_matches(), SOCCER_PAIRS)
+    report("NFL (nflverse, vs Vegas lines)", load_nfl(), NFL_PAIRS)
+    report("NBA (538, seasons 2000-2015)", load_nba(), NBA_PAIRS)
 
 
 if __name__ == "__main__":

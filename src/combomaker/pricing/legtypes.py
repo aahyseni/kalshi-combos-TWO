@@ -51,3 +51,42 @@ def classify_leg(market_ticker: str) -> LegType:
 def pair_key(a: LegType, b: LegType) -> str:
     """Order-independent lookup key: pair_key(TOTAL, BTTS) == 'btts|total'."""
     return "|".join(sorted((str(a), str(b))))
+
+
+class Sport(StrEnum):
+    SOCCER = "soccer"
+    MLB = "mlb"
+    NBA = "nba"
+    WNBA = "wnba"
+    NFL = "nfl"
+    NHL = "nhl"
+    UFC = "ufc"
+    UNKNOWN = "unknown"
+
+
+# Order matters: WNBA before NBA (substring), CFB-style prefixes unmapped stay
+# UNKNOWN and inherit the global pair table.
+_SPORT_KEYWORDS: tuple[tuple[str, Sport], ...] = (
+    ("WNBA", Sport.WNBA),
+    ("NBA", Sport.NBA),
+    ("MLB", Sport.MLB),
+    ("NFL", Sport.NFL),
+    ("NHL", Sport.NHL),
+    ("UFC", Sport.UFC),
+    ("WC", Sport.SOCCER),
+    ("UCL", Sport.SOCCER),
+    ("MLS", Sport.SOCCER),
+    ("EPL", Sport.SOCCER),
+    ("BRASILEIRO", Sport.SOCCER),
+    ("LALIGA", Sport.SOCCER),
+    ("SERIEA", Sport.SOCCER),
+    ("BUNDESLIGA", Sport.SOCCER),
+)
+
+
+def classify_sport(market_ticker: str) -> Sport:
+    series = market_ticker.split("-", 1)[0].upper()
+    for keyword, sport in _SPORT_KEYWORDS:
+        if keyword in series:
+            return sport
+    return Sport.UNKNOWN

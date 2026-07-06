@@ -19,7 +19,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from combomaker.pricing.copula import is_psd, nearest_psd
-from combomaker.pricing.legtypes import LegType, classify_leg, pair_key
+from combomaker.pricing.legtypes import LegType, classify_leg, classify_sport, pair_key
 from combomaker.rfq.models import RfqLeg
 
 
@@ -32,6 +32,9 @@ class SgpParams:
     untyped_uncertainty: float        # wider band when we didn't understand the pair
     # Per-pair band overrides (calibrated pairs earn tighter bands).
     pair_uncertainty: dict[str, float] = field(default_factory=dict)
+    # Sport-specific pair tables ("nba" -> {"moneyline|total": ...}); the same
+    # pair correlates differently per sport. Falls back to pair_rho.
+    pair_rho_by_sport: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,10 +86,17 @@ def build_sgp_correlation(
             if not same_event:
                 continue
             key = pair_key(types[i], types[j])
+            sport = str(classify_sport(legs[i].market_ticker))
+            sport_table = params.pair_rho_by_sport.get(sport, {})
             if types[i] is LegType.UNKNOWN or types[j] is LegType.UNKNOWN:
                 rho, band = params.default_rho, params.untyped_uncertainty
                 untyped += 1
                 notes.append(f"untyped pair {key}: flat prior {rho}")
+            elif key in sport_table:
+                rho = sport_table[key]
+                band = params.pair_uncertainty.get(f"{sport}:{key}", params.typed_uncertainty)
+                typed += 1
+                notes.append(f"sport-specific {sport}:{key}={rho}")
             elif key in params.pair_rho:
                 rho = params.pair_rho[key]
                 band = params.pair_uncertainty.get(key, params.typed_uncertainty)

@@ -264,6 +264,23 @@ per-environment (auth-env.md); a demo-site key is required.**
 | H6 | Leg-count width convexity: mechanism shipped, default 1.0 (linear = old behavior); raise via YAML once markup-by-n data exists | ″ | ″ |
 | H7 | Interest: Kalshi pays variable interest on positions AND cash above a $250 monthly-average gate (operator-confirmed from Kalshi's wording) ⇒ NO carry-cost width adder; early small accounts may not qualify — treat as bonus, never as pricing input | (pricing unchanged) | operator-provided; verify the accrual line item once live |
 
+### Multi-sport SGP calibration (2026-07-06)
+
+| Sport | Data | n | Key measured ρ |
+|---|---|---|---|
+| Soccer | football-data.co.uk, top-5 EU ×5 seasons | 8,982 | ml×over +0.23; btts×over +0.75; btts×ml **−0.17**; corners ≈ 0 |
+| NFL | nflverse (vs Vegas closing lines — era-drift-free) | 7,170 | ml×over **0.00**; spread×over +0.03; ml×spread +0.88; OT×over +0.20 |
+| NBA | 538 archive, seasons 2000–2015 | 20,126 | ml×over **0.00** |
+
+**Structural finding: winner×over correlation is a SOCCER phenomenon (+0.23),
+absent in NFL and NBA (0.00)** — a single global table would overprice every
+basketball/football "winner + over" SGP. Config now carries per-sport tables
+(`pair_rho_by_sport`) with sport-prefixed bands; WNBA inherits NBA (transfer
+assumption, wider band); unknown sports fall back to the global table at the
+default band. Pending: MLB extras (Retrosheet), NHL, player-prop pairs
+(needs player-level data), college sports; sportsbook-published SGP research
+as cross-reference; prod trade-tape markup surface as the live cross-check.
+
 ### Final adversarial review (2026-07-05) — 5 lenses, 43 agents, 7 confirmed defects, all fixed
 
 | Finding (confirmed by 2-skeptic verification) | Fix | Regression test |
