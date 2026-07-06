@@ -38,6 +38,7 @@ _CAP_PROBE_QTY = CentiContracts(100)  # 1 contract: tightest executable bound
 class QuoteParams:
     base_width_cc: int = 200
     per_leg_width_cc: int = 100
+    leg_count_convexity: float = 1.0
     uncertainty_width_scale: float = 1.0     # × uncertainty(prob) × $1
     size_width_cc_per_100: int = 50          # per 100 contracts of RFQ size
     time_wide_threshold_s: float = 6 * 3600.0
@@ -104,6 +105,7 @@ def construct_quote(
     yes_cap_cc: CentiCents | None,
     no_cap_cc: CentiCents | None,
     inventory_skew_cc: int = 0,
+    width_multiplier: float = 1.0,
     params: QuoteParams | None = None,
 ) -> ConstructedQuote | NoQuote:
     p = params or QuoteParams()
@@ -111,7 +113,7 @@ def construct_quote(
 
     width: dict[str, int] = {
         "base": p.base_width_cc,
-        "legs": p.per_leg_width_cc * n_legs,
+        "legs": int(p.per_leg_width_cc * (n_legs**p.leg_count_convexity)),
         "uncertainty": int(joint.uncertainty * CC_PER_DOLLAR * p.uncertainty_width_scale),
         "size": p.size_width_cc_per_100 * int(qty) // 10_000,
     }
@@ -120,6 +122,11 @@ def construct_quote(
         width["time"] = int(p.time_width_cc * closeness)
     if in_play:
         width["in_play"] = p.in_play_extra_cc
+    if width_multiplier != 1.0:
+        # Archetype adjustment (e.g. favorites-stack tightening). Never below
+        # half the base spread — a multiplier is a tilt, not an override.
+        scaled = max(int(sum(width.values()) * width_multiplier), p.base_width_cc // 2)
+        width = {"scaled": scaled}
     half = sum(width.values()) // 2
 
     # The fill happens at the BID, not at fair, and the quadratic fee peaks at

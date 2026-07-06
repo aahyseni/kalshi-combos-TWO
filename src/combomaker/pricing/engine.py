@@ -15,6 +15,7 @@ UNVERIFIED (Phase 2.5 list); the estimate here feeds only the size-width adder
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 from fractions import Fraction
 
@@ -26,7 +27,7 @@ from combomaker.marketdata.feed import OrderbookFeed
 from combomaker.marketdata.metadata import MetadataCache
 from combomaker.ops.config import PricingConfig
 from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
-from combomaker.pricing.joint import CorrelationParams, price_joint
+from combomaker.pricing.joint import JointEstimate, price_joint_matrices
 from combomaker.pricing.legs import KalshiBookSource, LegBelief, OddsSource, blend_beliefs
 from combomaker.pricing.quote import (
     ConstructedQuote,
@@ -36,6 +37,7 @@ from combomaker.pricing.quote import (
     free_money_caps,
 )
 from combomaker.pricing.relationships import RelationshipKind, classify_legs
+from combomaker.pricing.sgp import SgpParams, build_sgp_correlation
 from combomaker.rfq.models import Rfq
 
 
@@ -63,12 +65,26 @@ class PricingEngine:
         )
         self._fee_type = FeeType.parse(config.fee.default_fee_type)
         self._fee_multiplier = Fraction(Decimal(config.fee.default_multiplier))
-        self._corr_params = CorrelationParams(
-            same_event_rho=config.correlation.same_event_rho,
+        self._sgp_params = SgpParams(
+            pair_rho=dict(config.correlation.pair_rho),
+            default_rho=config.correlation.same_event_rho,
             cross_event_rho=config.correlation.cross_event_rho,
-            rho_uncertainty=config.correlation.rho_uncertainty,
+            typed_uncertainty=config.correlation.typed_rho_uncertainty,
+            untyped_uncertainty=config.correlation.untyped_rho_uncertainty,
         )
-        self._quote_params = QuoteParams(**config.quote.model_dump())
+        quote_fields = {
+            k: v
+            for k, v in config.quote.model_dump().items()
+            if k
+            not in (
+                "longshot_fair_threshold",
+                "longshot_min_rel_uncertainty",
+                "favorite_leg_threshold",
+                "favorite_width_multiplier",
+            )
+        }
+        self._quote_params = QuoteParams(**quote_fields)
+        self._archetype = config.quote
 
     def price(
         self,
@@ -111,7 +127,13 @@ class PricingEngine:
             beliefs.append(blended)
         sides = [leg.side for leg in rfq.legs]
 
-        joint = price_joint(beliefs, sides, relationship.same_event_groups, self._corr_params)
+        sgp = build_sgp_correlation(
+            list(rfq.legs), relationship.same_event_groups, self._sgp_params
+        )
+        joint = price_joint_matrices(
+            beliefs, sides, sgp.corr, sgp.corr_low, sgp.corr_high, extra_notes=sgp.notes
+        )
+        joint = self._apply_longshot_floor(joint)
 
         combo_meta = self._metadata.peek(rfq.market_ticker)
         if combo_meta is None or combo_meta.grid is None:
@@ -140,8 +162,36 @@ class PricingEngine:
             yes_cap_cc=yes_cap,
             no_cap_cc=no_cap,
             inventory_skew_cc=inventory_skew_cc,
+            width_multiplier=self._width_multiplier(beliefs, sides),
             params=self._quote_params,
         )
+
+    def _apply_longshot_floor(self, joint: JointEstimate) -> JointEstimate:
+        """Below the longshot threshold, absolute uncertainty must not shrink
+        with P (the gradient does) — floor it relative to fair, protecting
+        whoever ends up short the longshot side."""
+        cfg = self._archetype
+        if joint.p >= cfg.longshot_fair_threshold:
+            return joint
+        floor = joint.p * cfg.longshot_min_rel_uncertainty
+        if joint.uncertainty >= floor:
+            return joint
+        return replace(
+            joint,
+            uncertainty=floor,
+            notes=(*joint.notes, f"longshot uncertainty floor {floor:.4f}"),
+        )
+
+    def _width_multiplier(self, beliefs: list[LegBelief], sides: list[str]) -> float:
+        """Favorites-stack tightening: every selected side comfortably likely
+        ⇒ a well-estimated product and price-insensitive flow."""
+        cfg = self._archetype
+        if cfg.favorite_width_multiplier >= 1.0:
+            return 1.0
+        selected = [b.p if s == "yes" else 1.0 - b.p for b, s in zip(beliefs, sides, strict=True)]
+        if all(p >= cfg.favorite_leg_threshold for p in selected):
+            return cfg.favorite_width_multiplier
+        return 1.0
 
     def _resolve_qty(self, rfq: Rfq, *, fair_prob: float) -> CentiContracts | None:
         if rfq.contracts is not None:

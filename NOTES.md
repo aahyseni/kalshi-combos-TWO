@@ -252,6 +252,18 @@ confirmed. Kalshi demo-credential attempt the same day: 401 on demo REST+WS
 with a production-site key — confirms credentials are strictly
 per-environment (auth-env.md); a demo-site key is required.**
 
+### SGP structure model + archetype rules (2026-07-06)
+
+| # | Assumption embedded in code | Where | Tag |
+|---|---|---|---|
+| H1 | Leg structure is derivable from the ticker's series prefix (GOAL/BTTS/TOTAL/CORNERS/ADVANCE/EXTRAS/FIGHT/GAME keywords); unrecognized ⇒ UNKNOWN ⇒ flat prior + WIDER band (never blocks alone) | `pricing/legtypes.py` | live-observed ticker patterns |
+| H2 | Signed typed-pair ρ priors (ml\|ml −0.85, btts\|total +0.60, total\|total +0.85, …): SIGNS are theory-solid, MAGNITUDES are modest placeholders with ±0.15 bands (±0.30 untyped) | `ops/config.py` CorrelationConfig | **UNVERIFIED magnitudes** — co-settlement calibration replaces them; the band is priced into width meanwhile |
+| H3 | Joint repriced at per-pair (low, high) matrices; each repaired to PSD independently | `pricing/sgp.py`, `joint.price_joint_matrices` | mathematical construction, property-tested |
+| H4 | Longshot rule: below fair 15%, uncertainty floored at 25% of fair (absolute gradient shrinks with P — anti-conservative for the shorting side otherwise) | `pricing/engine.py` | design rule |
+| H5 | Favorites-stack multiplier: OFF by default (1.0); enable only after markouts prove the flow benign | `ops/config.py` QuoteConfig | design rule — validation-gated |
+| H6 | Leg-count width convexity: mechanism shipped, default 1.0 (linear = old behavior); raise via YAML once markup-by-n data exists | ″ | ″ |
+| H7 | Interest: Kalshi pays variable interest on positions AND cash above a $250 monthly-average gate (operator-confirmed from Kalshi's wording) ⇒ NO carry-cost width adder; early small accounts may not qualify — treat as bonus, never as pricing input | (pricing unchanged) | operator-provided; verify the accrual line item once live |
+
 ### Final adversarial review (2026-07-05) — 5 lenses, 43 agents, 7 confirmed defects, all fixed
 
 | Finding (confirmed by 2-skeptic verification) | Fix | Regression test |

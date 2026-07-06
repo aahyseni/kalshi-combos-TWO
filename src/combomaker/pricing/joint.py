@@ -63,6 +63,46 @@ def _signed_corr(
     return np.asarray(base * np.outer(signs, signs), dtype=np.float64)
 
 
+def price_joint_matrices(
+    beliefs: Sequence[LegBelief],
+    sides: Sequence[str],
+    corr: NDArray[np.float64],
+    corr_low: NDArray[np.float64],
+    corr_high: NDArray[np.float64],
+    *,
+    extra_notes: Sequence[str] = (),
+) -> JointEstimate:
+    """Joint from explicit YES–YES correlation matrices (SGP structured path).
+
+    The (low, high) matrices bound the correlation uncertainty; the joint is
+    re-priced at both bounds and the spread priced into width, exactly like
+    the flat-ρ sensitivity but per-pair.
+    """
+    if len(beliefs) != len(sides) or not beliefs:
+        raise ValueError("beliefs and sides must be same nonempty length")
+    marginals = [b.p if s == "yes" else 1.0 - b.p for b, s in zip(beliefs, sides, strict=True)]
+    signs = np.array([1.0 if side == "yes" else -1.0 for side in sides])
+    flip = np.outer(signs, signs)
+
+    p = gaussian_copula_joint_prob(marginals, np.asarray(corr * flip, dtype=np.float64))
+    p_lo = gaussian_copula_joint_prob(marginals, np.asarray(corr_low * flip, dtype=np.float64))
+    p_hi = gaussian_copula_joint_prob(marginals, np.asarray(corr_high * flip, dtype=np.float64))
+    corr_unc = max(abs(p_hi - p), abs(p - p_lo), abs(p_hi - p_lo) / 2)
+
+    leg_unc = p * sum(
+        b.uncertainty / max(m, _MIN_MARGINAL_FOR_GRADIENT)
+        for b, m in zip(beliefs, marginals, strict=True)
+    )
+    lo, hi = frechet_bounds(marginals)
+    return JointEstimate(
+        p=clamp_to_frechet(p, marginals),
+        uncertainty=leg_unc + corr_unc,
+        frechet_lo=lo,
+        frechet_hi=hi,
+        notes=(*extra_notes, f"corr band: p_lo={p_lo:.4f} p_hi={p_hi:.4f}"),
+    )
+
+
 def price_joint(
     beliefs: Sequence[LegBelief],
     sides: Sequence[str],

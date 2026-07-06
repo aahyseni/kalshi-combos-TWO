@@ -104,11 +104,32 @@ class CorrelationConfig(StrictModel):
     same_event_rho: float = 0.6
     cross_event_rho: float = 0.0
     rho_uncertainty: float = 0.25
+    # SGP structure: signed YES-YES priors per typed pair (legtypes.pair_key).
+    # Signs are theory-solid; magnitudes are deliberately modest and carry
+    # their own uncertainty band until co-settlement calibration replaces them.
+    pair_rho: dict[str, float] = {
+        "moneyline|moneyline": -0.85,      # two winners of the SAME game ≈ exclusive
+        "btts|total": 0.60,
+        "player_goal|total": 0.40,
+        "btts|player_goal": 0.35,
+        "moneyline|player_goal": 0.25,
+        "btts|moneyline": 0.05,
+        "moneyline|total": 0.15,
+        "total|total": 0.85,               # nested thresholds are near-implications
+        "corners|total": 0.30,
+        "btts|corners": 0.25,
+        "extras|total": 0.50,
+    }
+    typed_rho_uncertainty: float = 0.15
+    untyped_rho_uncertainty: float = 0.30
 
 
 class QuoteConfig(StrictModel):
     base_width_cc: int = 200
     per_leg_width_cc: int = 100
+    # legs component = per_leg × n^convexity — model error compounds
+    # multiplicatively with leg count, so width should too (1.0 = linear).
+    leg_count_convexity: float = 1.0
     uncertainty_width_scale: float = 1.0
     size_width_cc_per_100: int = 50
     time_wide_threshold_s: float = 21_600.0
@@ -116,6 +137,15 @@ class QuoteConfig(StrictModel):
     in_play_extra_cc: int = 800
     min_capture_cc: int = 100
     free_money_margin_cc: int = 100
+    # Longshots: absolute uncertainty shrinks with tiny fairs (gradient ∝ P),
+    # which is anti-conservative in RELATIVE terms for whoever shorts the
+    # longshot — floor it as a fraction of fair below the threshold.
+    longshot_fair_threshold: float = 0.15
+    longshot_min_rel_uncertainty: float = 0.25
+    # Favorites stacks: well-estimated products, price-insensitive flow —
+    # tighten to win it (1.0 = off; validate via markouts before lowering).
+    favorite_leg_threshold: float = 0.65
+    favorite_width_multiplier: float = 1.0
 
 
 class ExternalOddsConfig(StrictModel):
