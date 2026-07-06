@@ -173,12 +173,35 @@ class QuoteApp:
             if config.mode is Mode.QUOTE:
                 await self._startup_reconcile(rest)
 
+            # RFQs skipped for transient reasons (books warming up on first
+            # sighting) get retried until quoted, dead, or out of attempts —
+            # a one-shot RFQ must not be starved by lazy subscriptions.
+            pending: dict[str, tuple[Rfq, int]] = {}
+
             async def handle_rfq(rfq: Rfq) -> None:
                 await store.record_rfq(rfq, source="ws")
                 if not rfq.is_combo:
                     return
                 await self._ensure_watched(rfq, feed, metadata)
                 await lifecycle.handle_rfq(rfq)
+                if not lifecycle.has_open_quote(rfq.rfq_id):
+                    pending[rfq.rfq_id] = (rfq, 0)
+
+            async def retry_pending() -> None:
+                while True:
+                    await asyncio.sleep(1.0)
+                    for rfq_id, (rfq, attempts) in list(pending.items()):
+                        if lifecycle.has_open_quote(rfq_id) or attempts >= 10:
+                            pending.pop(rfq_id, None)
+                            continue
+                        try:
+                            await lifecycle.handle_rfq(rfq)
+                        except Exception:
+                            log.exception("pending_retry_failed", rfq_id=rfq_id)
+                        pending[rfq_id] = (rfq, attempts + 1)
+
+            async def on_rfq_deleted_cleanup(rfq_id: str, msg: JsonDict) -> None:
+                pending.pop(rfq_id, None)
 
             async def on_quote_event(kind: str, msg: JsonDict) -> None:
                 if kind == "quote_accepted":
@@ -188,6 +211,7 @@ class QuoteApp:
 
             intake.on_rfq(handle_rfq)
             intake.on_rfq_deleted(lifecycle.on_rfq_deleted)
+            intake.on_rfq_deleted(on_rfq_deleted_cleanup)
             intake.on_quote_event(on_quote_event)
 
             async def on_invalidate(reason: str) -> None:
@@ -210,6 +234,7 @@ class QuoteApp:
 
             ws.start()
             tasks = [
+                asyncio.create_task(retry_pending(), name="rfq-retry"),
                 asyncio.create_task(self._maintenance_loop(lifecycle), name="maintenance"),
                 asyncio.create_task(
                     self._status_loop(rest, lifecycle, killswitch), name="exchange-status"

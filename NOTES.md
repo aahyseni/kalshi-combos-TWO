@@ -44,6 +44,26 @@ Full RFQ round trips on demo (`KXMLBGAME-26JUL081840NYYTB-NYY`, two accounts,
 decline in quote mode); HVM 3s/1s timing; combo grid structure on KXMVE
 markets; `yes_bid + no_bid > $1` rejection.
 
+## Phase 5 — demo quote mode end-to-end: EXECUTED 2026-07-05
+
+Live session (quote mode, both accounts): **30 real quotes** sent to live demo
+combo RFQs; one full round trip on a KXMVECROSSCATEGORY combo:
+
+| Measurement | Value |
+|---|---|
+| accept → our confirm (server timestamps) | **117 ms** of the 3s HVM window |
+| last-look local decision | **0.89 ms** (budget <200ms) |
+| confirm → executed | 1.29 s (the 1s HVM execution timer + latency) |
+| quote | yes 0.1100 / no 0.8460 (deci-cent grid, fair 1318cc, ρ=0.6 same-event block) |
+| fill booked | 2.00 YES @ $0.11, expected_edge_cc=436 in the EV ledger; +10s markout recorded |
+| lifecycle hygiene | 26 TTL expiries deleted; cancel-all cleaned 3 open quotes on halt; 414 skips all reasoned |
+
+Additional live facts: quotes list requires a scope (`user_filter=self` /
+`rfq_user_filter=self`; bare or wrong scope ⇒ 403); a competitor maker bot
+exists on demo (quotes ~sum-1.00 prices within ~1s and lets accepts lapse);
+transiently-skipped RFQs need the warmup retry loop (books subscribe lazily on
+first sighting). E5 (HVM latency budget) RESOLVED: 117ms total vs 3,000ms.
+
 ## Empirical verification queue (demo / Phase 2.5 ground truth)
 
 **Resolved live 2026-07-05 (demo, real credentials):** communications WS

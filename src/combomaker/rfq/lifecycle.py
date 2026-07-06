@@ -456,6 +456,9 @@ class QuoteLifecycle:
     def open_quote_count(self) -> int:
         return len(self._open)
 
+    def has_open_quote(self, rfq_id: str) -> bool:
+        return rfq_id in self._by_rfq
+
     # ---------------------------------------------------------------- helpers
 
     def _price(self, rfq: Rfq) -> ConstructedQuote | NoQuote:

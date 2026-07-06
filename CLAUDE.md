@@ -103,10 +103,14 @@ QuoteApp paper+quote modes with hard gates — verified conventions + whitelist
 verification per finding; 7 confirmed defects (1 critical: target-cost risk
 sizing) all fixed with regression tests. 556 tests green.
 
-**STOPPED FOR THE HUMAN.** Everything runnable without credentials is built
-and tested. Blocked on: (1) demo credentials ×2 accounts → run Phase 2.5
-ground truth, (2) fee-schedule PDF download, (3) live demo observe run,
-(4) then Phase 5 demo end-to-end. See NOTES.md verification queue.
+**Phase 2.5: EXECUTED + conventions promoted (operator sign-off).**
+**Phase 5 — demo quote mode e2e: COMPLETE 2026-07-05** — 30 live quotes,
+full accept→confirm(117ms of 3s)→execute round trip, fill/EV/markout records,
+cancel-all on halt (NOTES.md Phase 5 table). Definition-of-done met on demo.
+
+Next: **Phase 6 — shadow on prod data** (read-only; would-quotes + markouts +
+executed-trade comparisons + calibration), combo-settlement pass to fill
+`combo_no_pays_complement`, Kalshi→SGO mapping table.
 
 ## Architecture decisions
 
