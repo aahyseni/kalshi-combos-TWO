@@ -38,6 +38,7 @@ from combomaker.pricing.quote import (
 )
 from combomaker.pricing.relationships import RelationshipKind, classify_legs
 from combomaker.pricing.sgp import SgpParams, build_sgp_correlation
+from combomaker.pricing.structural import StructuralPricer, structural_applicable
 from combomaker.rfq.models import Rfq
 
 
@@ -90,6 +91,9 @@ class PricingEngine:
         }
         self._quote_params = QuoteParams(**quote_fields)
         self._archetype = config.quote
+        self._structural = (
+            StructuralPricer(config.structural) if config.structural.enabled else None
+        )
 
     def price(
         self,
@@ -132,15 +136,25 @@ class PricingEngine:
             beliefs.append(blended)
         sides = [leg.side for leg in rfq.legs]
 
-        sgp = build_sgp_correlation(
-            list(rfq.legs),
-            relationship.same_event_groups,
-            self._sgp_params,
-            marginals=[b.p for b in beliefs],
-        )
-        joint = price_joint_matrices(
-            beliefs, sides, sgp.corr, sgp.corr_low, sgp.corr_high, extra_notes=sgp.notes
-        )
+        joint: JointEstimate | None = None
+        fallback_note: str | None = None
+        if self._structural is not None and structural_applicable(
+            list(rfq.legs), relationship.same_event_groups
+        ):
+            joint, reason = self._structural.try_price(list(rfq.legs), beliefs, sides)
+            if joint is None:
+                fallback_note = f"structural fallback: {reason}"
+        if joint is None:
+            sgp = build_sgp_correlation(
+                list(rfq.legs),
+                relationship.same_event_groups,
+                self._sgp_params,
+                marginals=[b.p for b in beliefs],
+            )
+            notes = (*sgp.notes, fallback_note) if fallback_note else sgp.notes
+            joint = price_joint_matrices(
+                beliefs, sides, sgp.corr, sgp.corr_low, sgp.corr_high, extra_notes=notes
+            )
         joint = self._apply_longshot_floor(joint)
 
         combo_meta = self._metadata.peek(rfq.market_ticker)

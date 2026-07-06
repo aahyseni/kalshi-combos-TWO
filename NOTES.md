@@ -323,6 +323,28 @@ Operator directive (from spec review) adopted; status per point:
    www.retrosheet.org."** Data cached under data/ (gitignored), fetched by
    the tools on demand.
 
+### Structural pricer v2 (Dixon-Coles) + orientation-aware priors (2026-07-06)
+
+Trigger: two scoreline-inversion worked examples (ENG/Kane/BTTS fav-side,
+POR/Ronaldo/BTTS dog-side) + LIVE validation — the Kalshi parlay UI priced the
+SPA/POR combo at $46–48 payout on $5 (taker 10.4–10.9¢), exactly our
+structural fair 10.9¢ (independence $91, v1 copula $65). Winning combo makers
+price structurally; v1's dog-side errors meant we'd never win underdog SGP
+auctions (missed volume — longshot width covers the bleed side).
+
+| # | Assumption embedded in code | Where | Tag |
+|---|---|---|---|
+| I1 | **Engine bug fixed**: `pair_rho_by_sport` was never forwarded into `SgpParams` — every calibrated sport table was dead config on the hot path | `pricing/engine.py` | regression test `test_engine_forwards_sport_tables` |
+| I2 | btts\|moneyline is orientation-conditional: fav −0.19 / dog 0.00, linearly blended across the ML leg's 45–55% marginal (no fair cliff at 50¢). "Winners keep clean sheets" is favorites-only; a dog only wins by scoring | `ops/config.py`, `pricing/sgp.py` | structural implication + 1 live market validation; UNVERIFIED against co-settlement data |
+| I3 | moneyline\|player_goal = 0.50 soccer (band .12), 0.40 global (band .20): structurally implied +0.51/+0.52 on BOTH examples, orientation-insensitive | `ops/config.py` | structural implication ×2; UNVERIFIED against player-prop history (none available) |
+| I4 | Scoreline model: independent Poisson 90' + DC low-score tau; knockout draws play ET at `et_factor`×rates (pens ⇒ win-market NO); player goals = multinomial thinning (share q per player, Binomial given team goals) | `pricing/dixon_coles.py` | model form — banded (DC ρ ±0.08, ET factor 0.25–0.40 re-inverted into width) |
+| I5 | DC ρ = −0.10 **placeholder from literature** until fitted on our own scoreline history (train seasons only, OOS tool) | `ops/config.py` StructuralConfig | UNVERIFIED — gate task fits it |
+| I6 | Inversion identification: ≥2 team-level legs required (else StructuralError ⇒ copula fallback); 2 legs solve exactly (residual >0.005 ⇒ refuse); >2 least-squares with residual priced into width; player shares solved per leg, Σq>0.95 per team ⇒ refuse | `pricing/dixon_coles.py` | mathematical construction, property-tested |
+| I7 | Ticker shapes: game code = DDMMMYY[+HHMM] + concatenated equal-length team codes; GOAL ticker's player segment prefixes the team code; TOTAL line suffix ("3" or "2.5"). ANY parse doubt ⇒ reason ⇒ copula fallback (UNKNOWN never prices structurally) | `pricing/structural.py` | observed demo/prod tickers; parser is fail-safe by construction |
+| I8 | Settlement windows: KXWC assumed knockout, goal-flavored legs assumed to settle over 90'+ET, ML per its "90+ET" market name. The 90'-only alternative is re-priced and the gap added to width | `pricing/structural.py` | **DOC_ASSUMED / UNVERIFIED** — verify against market rules text before enabling |
+| I9 | `structural.enabled = False` until the OOS gate (held-out seasons, joint log-loss vs v1 copula) passes; flag flipped only with the gate evidence recorded here | `ops/config.py` | design rule (directive point 4) |
+| I10 | Hot-path cost: ~47ms per structural quote (memoized state enumeration, warm-started perturbation re-inversions) vs 500ms budget | measured 2026-07-06 | benchmark, re-check on prod hardware |
+
 ### Final adversarial review (2026-07-05) — 5 lenses, 43 agents, 7 confirmed defects, all fixed
 
 | Finding (confirmed by 2-skeptic verification) | Fix | Regression test |

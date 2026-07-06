@@ -272,10 +272,36 @@ class ExternalOddsConfig(StrictModel):
     mapping: dict[str, str] = {}
 
 
+class StructuralConfig(StrictModel):
+    """Dixon-Coles scoreline pricer for soccer SGPs (pricing/dixon_coles.py).
+
+    ``enabled`` may be flipped ON only by an out-of-sample gate result
+    (tools/validate_structural_oos.py): a structural fit that does not beat
+    the v1 copula on held-out seasons is noise and must not ship."""
+
+    enabled: bool = False
+    max_goals: int = 12
+    # DC low-score adjustment. Placeholder from the literature until the OOS
+    # tool fits it on our own scoreline history (train seasons only).
+    dc_rho: float = -0.10
+    dc_rho_band: float = 0.08
+    # ET intensity as a fraction of regulation scoring rate (30min pro-rata =
+    # 1/3); band edges re-price the joint for the model-form width.
+    et_factor: float = 0.3333
+    et_factor_low: float = 0.25
+    et_factor_high: float = 0.40
+    misfit_uncertainty_scale: float = 1.0
+    # Series prefixes whose matches can reach extra time (knockout formats).
+    # DOC_ASSUMED: WC knockout markets settle goal-flavored legs over 90+ET —
+    # the window band in the adapter prices the 90'-only alternative.
+    knockout_series: list[str] = ["KXWC"]
+
+
 class PricingConfig(StrictModel):
     fee: FeeConfig = Field(default_factory=FeeConfig)
     correlation: CorrelationConfig = Field(default_factory=CorrelationConfig)
     quote: QuoteConfig = Field(default_factory=QuoteConfig)
+    structural: StructuralConfig = Field(default_factory=StructuralConfig)
     external_odds: ExternalOddsConfig = Field(default_factory=ExternalOddsConfig)
     max_source_disagreement: float = 0.08
 
