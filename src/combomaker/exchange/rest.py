@@ -147,6 +147,10 @@ class KalshiRestClient:
             "GET", "/markets/orderbooks", params=[("tickers", t) for t in tickers]
         )
 
+    async def get_trades(self, **params: str | int) -> JsonDict:
+        """Public trade tape (GET /markets/trades; filter with ticker/min_ts)."""
+        return await self._request("GET", "/markets/trades", params=dict(params))
+
     async def get_multivariate_collections(self, **params: str | int) -> JsonDict:
         return await self._request(
             "GET", "/multivariate_event_collections", params=dict(params), auth=False

@@ -42,6 +42,7 @@ class ObserveApp:
         self._clock = SystemClock()
         self._metrics = Metrics()
         self._watched: set[str] = set()
+        self._combo_tickers_seen: set[str] = set()
         self._stop = asyncio.Event()
 
     async def run(self) -> None:
@@ -78,6 +79,7 @@ class ObserveApp:
                     target_cost_cc=rfq.target_cost_cc,
                 )
                 if rfq.is_combo:
+                    self._combo_tickers_seen.add(rfq.market_ticker)
                     await self._ensure_watched(rfq, feed, metadata)
                 reasons = rfq_filter.evaluate(rfq)
                 if reasons:
@@ -145,11 +147,15 @@ class ObserveApp:
                 self._reconcile_loop(rest, intake), name="rfq-reconcile"
             )
             report_task = asyncio.create_task(self._report_loop(), name="metrics-report")
+            trades_task = asyncio.create_task(
+                self._combo_trades_loop(rest, store), name="combo-trades"
+            )
             try:
                 await self._stop.wait()
             finally:
                 poll_task.cancel()
                 report_task.cancel()
+                trades_task.cancel()
                 await ws.stop()
                 await killswitch.stop()
                 await store.close()
@@ -224,3 +230,30 @@ class ObserveApp:
         while True:
             await asyncio.sleep(interval_s)
             log.info("observe_metrics", **{"snapshot": self._metrics.snapshot()})
+
+    async def _combo_trades_loop(
+        self, rest: KalshiRestClient, store: Store, interval_s: float = 90.0
+    ) -> None:
+        """Poll the public tape of every COMBO market we've seen an RFQ on.
+
+        Executed RFQs post to the book — each print is the WINNING maker's
+        price. (exec price − our shadow fair) per archetype is the
+        implied-markup dataset for reverse-engineering competitor pricing.
+        Budget: ≤20 tickers/cycle at default 10 read tokens each.
+        """
+        while True:
+            await asyncio.sleep(interval_s)
+            batch = sorted(self._combo_tickers_seen)[-20:]
+            stored = 0
+            for ticker in batch:
+                try:
+                    payload = await rest.get_trades(ticker=ticker, limit=50)
+                except Exception as exc:
+                    log.warning("combo_trades_poll_failed", ticker=ticker, error=repr(exc))
+                    continue
+                trades = payload.get("trades", []) or []
+                if trades:
+                    stored += await store.record_combo_trades(ticker, trades)
+            if stored:
+                self._metrics.inc("combo_trades.stored", stored)
+                log.info("combo_trades_captured", new=stored, tickers=len(batch))

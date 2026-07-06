@@ -96,6 +96,19 @@ CREATE TABLE IF NOT EXISTS markouts (
 );
 CREATE INDEX IF NOT EXISTS idx_markouts_ref ON markouts (fill_ref);
 
+CREATE TABLE IF NOT EXISTS combo_trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id TEXT NOT NULL UNIQUE,
+    seen_at TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    created_time TEXT,
+    yes_price_cc INTEGER,
+    count_centi INTEGER,
+    taker_side TEXT,
+    raw_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_combo_trades_ticker ON combo_trades (ticker);
+
 CREATE TABLE IF NOT EXISTS ev_ledger (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     at TEXT NOT NULL,
@@ -259,6 +272,44 @@ class Store:
             ),
         )
         await self._db.commit()
+
+    async def record_combo_trades(self, ticker: str, trades: list[JsonDict]) -> int:
+        """Store public combo-market trades (deduped on trade_id). This is the
+        implied-markup dataset: executed RFQ prices vs our shadow fairs."""
+        stored = 0
+        for trade in trades:
+            trade_id = str(trade.get("trade_id") or trade.get("fill_id") or "")
+            if not trade_id:
+                continue
+            price_raw = trade.get("yes_price_dollars") or trade.get("yes_price")
+            try:
+                from combomaker.core.money import cc_from_dollars_str
+                from combomaker.core.quantity import qty_from_fp_str
+
+                price_cc = int(cc_from_dollars_str(str(price_raw))) if price_raw else None
+                count_raw = trade.get("count_fp") or trade.get("count")
+                count_centi = int(qty_from_fp_str(str(count_raw))) if count_raw else None
+            except ValueError:
+                price_cc = None
+                count_centi = None
+            cursor = await self._db.execute(
+                "INSERT OR IGNORE INTO combo_trades (trade_id, seen_at, ticker,"
+                " created_time, yes_price_cc, count_centi, taker_side, raw_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    trade_id,
+                    self._now(),
+                    ticker,
+                    trade.get("created_time"),
+                    price_cc,
+                    count_centi,
+                    trade.get("taker_side"),
+                    json.dumps(trade),
+                ),
+            )
+            stored += cursor.rowcount if cursor.rowcount > 0 else 0
+        await self._db.commit()
+        return stored
 
     async def settle_ev_entry(self, fill_ref: str, realized_pnl_cc: int) -> None:
         await self._db.execute(
