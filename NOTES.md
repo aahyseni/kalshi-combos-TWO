@@ -22,6 +22,15 @@ gap-check results).
 
 ## Empirical verification queue (demo / Phase 2.5 ground truth)
 
+**Resolved live 2026-07-05 (demo, real credentials):** communications WS
+channel subscribes fine on demo; REAL combo RFQ traffic exists there (3-leg
+KXMVECROSSCATEGORY, 2-leg KXMVESPORTSMULTIGAMEEXTENDED seen open);
+`GET /communications/rfqs?status=open` filter works as coded (C3 ✓); MVE
+collections list on demo (payload key `multivariate_contracts`); balance
+payload = `{balance (cents int), balance_dollars, balance_breakdown,
+portfolio_value, updated_ts}`; fresh demo accounts start at **$0.00** — RFQ
+execution scenarios need mock funding via the demo site UI first.
+
 From `docs/api-notes/SUMMARY.md` (gap check, unresolved):
 
 1. Combo (KXMVE) markets' actual `price_level_structure` / `price_ranges` grid.

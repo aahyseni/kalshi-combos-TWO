@@ -72,6 +72,13 @@ class Rfq:
                 contracts = qty_from_fp_str(str(msg["contracts_fp"]))
             except QuantityParseError as exc:
                 raise RfqParseError(f"bad contracts_fp: {exc}") from exc
+            if contracts == 0:
+                # Live demo wire fact (2026-07-05): target-cost RFQs arrive
+                # with contracts_fp "0.00" ALONGSIDE target_cost_dollars —
+                # zero means "not this sizing mode", not "zero contracts".
+                contracts = None
+            elif contracts < 0:
+                raise RfqParseError(f"negative contracts_fp: {msg['contracts_fp']!r}")
 
         target_cost: CentiCents | None = None
         if msg.get("target_cost_dollars") is not None:

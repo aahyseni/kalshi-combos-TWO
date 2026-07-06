@@ -80,3 +80,15 @@ class TestParsing:
         msg = {**COMBO_MSG, "contracts_fp": "10.005"}
         with pytest.raises(RfqParseError):
             Rfq.from_ws(msg)
+
+    def test_zero_contracts_fp_means_target_cost_mode(self) -> None:
+        # Live demo wire fact: target-cost RFQs carry contracts_fp "0.00"
+        msg = {**COMBO_MSG, "contracts_fp": "0.00", "target_cost_dollars": "5.00"}
+        rfq = Rfq.from_ws(msg)
+        assert rfq.contracts is None
+        assert rfq.target_cost_cc == 50_000
+
+    def test_negative_contracts_fp_fatal(self) -> None:
+        msg = {**COMBO_MSG, "contracts_fp": "-1.00"}
+        with pytest.raises(RfqParseError):
+            Rfq.from_ws(msg)
