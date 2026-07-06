@@ -297,7 +297,12 @@ class TestMarginTotalDispatch:
         assert any("structural-mlb" in n for n in est.notes)
 
     def test_mlb_ungated_falls_back(self) -> None:
-        est, reason = pricer().try_price(
+        from combomaker.ops.config import MlbRunsConfig
+
+        p = StructuralPricer(
+            StructuralConfig(enabled=True), None, MlbRunsConfig(enabled=False)
+        )
+        est, reason = p.try_price(
             [leg("KXMLBGAME-26JUL061410PHIKC-PHI"),
              leg("KXMLBTOTAL-26JUL061410PHIKC-9")],
             [belief(0.55), belief(0.48)],

@@ -355,11 +355,19 @@ class MlbRunsConfig(StrictModel):
     calibrated from Retrosheet final scores (tools/calibrate_mlb_runs.py,
     2026-07-06): k=3.62 on 2021-2024, k=3.63 on 2015-2019 — era-stable; the
     band covers the unmodeled home/away asymmetry (k 3.37 away / 3.91 home —
-    tickers don't reveal the home side). ``enabled`` flips only via an OOS
-    gate; the gate path is prod-shadow leg prices + settlements (no MLB
-    odds history is locally available)."""
+    tickers don't reveal the home side).
 
-    enabled: bool = False
+    GATE PASSED 2026-07-06 (tools/validate_mlb_runs_oos.py; SBR closing-odds
+    archive, k from the 2015-2019 train era, test = 2021 season n=2,351):
+    structural beats the shipped v1 copula on all three OOS joint-log-loss
+    metrics — hw×over 1.36134 vs 1.36300, hw×runline-cover 1.00824 vs
+    1.12151 (v1 has NO calibrated ml|spread for MLB and its flat 0.6 prior
+    is badly wrong), triple 1.71126 vs 1.88090. Also measured: v1's pooled
+    ml|total −0.05 LOSES to independence OOS (1.36300 vs 1.36209) — the
+    runs grid supersedes it for same-game combos. Confirmation re-gate on
+    prod-shadow settlements as they accrue."""
+
+    enabled: bool = True
     dispersion_k: float = 3.62
     k_band: float = 0.30
     misfit_uncertainty_scale: float = 1.0
