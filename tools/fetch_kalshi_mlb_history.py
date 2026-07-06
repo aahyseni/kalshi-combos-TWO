@@ -69,10 +69,15 @@ async def pregame_mid(
         return None
     candles = payload.get("candlesticks") or []
     for candle in reversed(candles):
-        bid = ((candle.get("yes_bid") or {}).get("close"))
-        ask = ((candle.get("yes_ask") or {}).get("close"))
-        if bid and ask and 0 < bid < 100 and 0 < ask <= 100:
-            return (float(bid) + float(ask)) / 200.0
+        # wire format: dollar STRINGS ("0.4100"), key suffix _dollars
+        bid_raw = (candle.get("yes_bid") or {}).get("close_dollars")
+        ask_raw = (candle.get("yes_ask") or {}).get("close_dollars")
+        try:
+            bid, ask = float(bid_raw), float(ask_raw)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 < bid < 1.0 and 0.0 < ask <= 1.0 and ask - bid < 0.15:
+            return (bid + ask) / 2.0
     return None
 
 
