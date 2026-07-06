@@ -131,11 +131,15 @@ class CorrelationConfig(StrictModel):
     # Sports absent here fall back to the global table above with wider bands.
     # WNBA inherits NBA's numbers (transfer assumption, wider band).
     pair_rho_by_sport: dict[str, dict[str, float]] = {
-        # Soccer = blend of club (n=8,982) and INTERNATIONAL (n=16,985 —
-        # structurally right for the World Cup); btts|ml measured identical
-        # (−0.197) in both datasets; era drift ≤0.02 over two decades.
+        # Soccer: moneyline|total is CONDITIONAL-MLE on per-game closing-line
+        # marginals (directive-compliant; club n=7,228 train, rho +0.30 SE
+        # 0.019, BEATS independence out-of-sample on held-out 23/24+24/25) —
+        # band widened for home/away asymmetry + internationals. btts pairs
+        # remain POOLED-method (no closing BTTS odds in the dataset) with
+        # widened bands until a conditional/structural refit; btts|ml at least
+        # measured identically in club and international data (−0.197 both).
         "soccer": {
-            "moneyline|total": 0.25,
+            "moneyline|total": 0.28,
             "btts|total": 0.70,
             "btts|moneyline": -0.19,
             "total|total": 0.95,
@@ -143,6 +147,10 @@ class CorrelationConfig(StrictModel):
             "btts|corners": 0.00,
             "moneyline|moneyline": -0.95,
         },
+        # NFL moneyline|total = 0.00 DOUBLY confirmed: pooled-vs-Vegas-lines
+        # AND conditional-MLE (+0.02, SE 0.023) whose fit does NOT beat
+        # independence out of sample — per the directive, a dependence that
+        # loses to independence OOS is noise and must not ship.
         "nfl": {
             "moneyline|total": 0.00,
             "spread|total": 0.03,
@@ -177,9 +185,9 @@ class CorrelationConfig(StrictModel):
     # calibrated sport entries; unprefixed keys for the global table.
     pair_rho_uncertainty: dict[str, float] = {
         "moneyline|moneyline": 0.04,
-        "soccer:moneyline|total": 0.10,     # covers home/away asymmetry .18/.28
-        "soccer:btts|total": 0.08,
-        "soccer:btts|moneyline": 0.08,
+        "soccer:moneyline|total": 0.10,     # conditional-MLE SE .019; band covers asymmetry
+        "soccer:btts|total": 0.12,          # pooled-method: widened pending conditional refit
+        "soccer:btts|moneyline": 0.10,      # pooled-method (but club==intl)
         "soccer:total|total": 0.04,
         "soccer:corners|total": 0.08,
         "soccer:btts|corners": 0.08,

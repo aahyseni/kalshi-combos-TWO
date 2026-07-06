@@ -292,6 +292,37 @@ NBA-zero verified on modern data, wider band). Pending: NHL, direct WNBA
 measurement, player-prop pairs, college; trade-tape markup surface as live
 cross-check.
 
+### Dependence-fitting methodology (directive adopted 2026-07-06)
+
+Operator directive (from spec review) adopted; status per point:
+
+1. **No raw joint-lift constants** — compliant by construction (we fit copula
+   ρ, marginal-invariant, Fréchet-safe). The pooling critique WAS valid:
+   pooled frequencies conflate within-game dependence with between-game
+   team-strength heterogeneity that live marginals already price.
+2. **Conditional fitting** — implemented (`tools/fit_conditional_rho.py`):
+   per-game closing-line marginals (soccer: devigged B365 1X2 + O/U; NFL:
+   devigged moneylines, over vs line ≡ 0.5), one-parameter copula MLE via
+   vectorized Owen's-T BVN self-checked to 2e-16 against the pricer copula.
+   Soccer ml×over conditional ρ = +0.30 (SE .019) — pooled +0.28 was barely
+   confounded here. Pairs WITHOUT per-game odds (btts pairs, intl, MLB, NBA,
+   WNBA) remain pooled-method with widened bands, marked pending.
+3. **Structural market-implied models** (Dixon-Coles scoreline for soccer;
+   bivariate normal margin/total for NFL/NBA, inverted from live prices) —
+   ROADMAP v2 of the pricer; the pairwise-ρ copula is v1 with honesty bands.
+4. **OOS gate** — implemented: held-out-season log-loss vs independence.
+   Soccer ml×over BEATS independence OOS (1.2477 vs 1.2580) ⇒ ships.
+   NFL ml×over does NOT beat independence OOS ⇒ stays 0.00 (doubly confirmed).
+5. **Uncertainty per parameter → width; Fréchet clamp backstop** — already the
+   architecture (bands are quote width; clamp in copula.py).
+6. **Licensing/attribution** — football-data.co.uk (free-use terms),
+   martj42/international_results (open GitHub dataset), nflverse (open),
+   sportsdataverse hoopR data (open); **Retrosheet requires notice: "The
+   information used here was obtained free of charge from and is copyrighted
+   by Retrosheet. Interested parties may contact Retrosheet at
+   www.retrosheet.org."** Data cached under data/ (gitignored), fetched by
+   the tools on demand.
+
 ### Final adversarial review (2026-07-05) — 5 lenses, 43 agents, 7 confirmed defects, all fixed
 
 | Finding (confirmed by 2-skeptic verification) | Fix | Regression test |
