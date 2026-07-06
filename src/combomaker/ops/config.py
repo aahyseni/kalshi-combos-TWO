@@ -131,10 +131,13 @@ class CorrelationConfig(StrictModel):
     # Sports absent here fall back to the global table above with wider bands.
     # WNBA inherits NBA's numbers (transfer assumption, wider band).
     pair_rho_by_sport: dict[str, dict[str, float]] = {
+        # Soccer = blend of club (n=8,982) and INTERNATIONAL (n=16,985 —
+        # structurally right for the World Cup); btts|ml measured identical
+        # (−0.197) in both datasets; era drift ≤0.02 over two decades.
         "soccer": {
-            "moneyline|total": 0.23,
-            "btts|total": 0.75,
-            "btts|moneyline": -0.17,
+            "moneyline|total": 0.25,
+            "btts|total": 0.70,
+            "btts|moneyline": -0.19,
             "total|total": 0.95,
             "corners|total": 0.00,
             "btts|corners": 0.00,
@@ -147,12 +150,26 @@ class CorrelationConfig(StrictModel):
             "extras|total": 0.20,
             "moneyline|moneyline": -0.95,
         },
+        # NBA verified on MODERN data (hoopR/ESPN 2016-2025, n=12,567):
+        # ml|total +0.008, era-split 2016-20 vs 21-25 drift +0.008 — the zero
+        # correlation survived the 3PT revolution.
         "nba": {
-            "moneyline|total": 0.00,
+            "moneyline|total": 0.01,
             "moneyline|moneyline": -0.95,
         },
         "wnba": {
-            "moneyline|total": 0.00,
+            "moneyline|total": 0.01,
+            "moneyline|moneyline": -0.95,
+        },
+        # MLB (Retrosheet 2015-2024, n=20,642): home winner is slightly
+        # ANTI-correlated with over (−0.056: home wins often skip the bottom
+        # 9th ⇒ fewer runs). extras|total uses the POST-2020 value (+0.10):
+        # the ghost-runner rule structurally changed extras scoring
+        # (pre-2020 −0.04 → post +0.10) — a measured rule-change break.
+        "mlb": {
+            "moneyline|total": -0.05,
+            "extras|total": 0.10,
+            "extras|moneyline": -0.04,
             "moneyline|moneyline": -0.95,
         },
     }
@@ -176,6 +193,10 @@ class CorrelationConfig(StrictModel):
         "nba:moneyline|moneyline": 0.04,
         "wnba:moneyline|total": 0.12,       # NBA transfer: wider until measured
         "wnba:moneyline|moneyline": 0.04,
+        "mlb:moneyline|total": 0.06,
+        "mlb:extras|total": 0.10,           # post-rule-change sample is smaller
+        "mlb:extras|moneyline": 0.08,
+        "mlb:moneyline|moneyline": 0.04,
     }
 
 

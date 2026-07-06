@@ -264,22 +264,33 @@ per-environment (auth-env.md); a demo-site key is required.**
 | H6 | Leg-count width convexity: mechanism shipped, default 1.0 (linear = old behavior); raise via YAML once markup-by-n data exists | ″ | ″ |
 | H7 | Interest: Kalshi pays variable interest on positions AND cash above a $250 monthly-average gate (operator-confirmed from Kalshi's wording) ⇒ NO carry-cost width adder; early small accounts may not qualify — treat as bonus, never as pricing input | (pricing unchanged) | operator-provided; verify the accrual line item once live |
 
-### Multi-sport SGP calibration (2026-07-06)
+### Multi-sport SGP calibration (2026-07-06, extended same day)
 
-| Sport | Data | n | Key measured ρ |
+All ρ with 99% CIs (delta-method on the joint frequency through our copula):
+
+| Sport | Data | n | Key measured ρ [99% CI] |
 |---|---|---|---|
-| Soccer | football-data.co.uk, top-5 EU ×5 seasons | 8,982 | ml×over +0.23; btts×over +0.75; btts×ml **−0.17**; corners ≈ 0 |
-| NFL | nflverse (vs Vegas closing lines — era-drift-free) | 7,170 | ml×over **0.00**; spread×over +0.03; ml×spread +0.88; OT×over +0.20 |
-| NBA | 538 archive, seasons 2000–2015 | 20,126 | ml×over **0.00** |
+| Soccer CLUB | football-data.co.uk, top-5 EU ×5 seasons | 8,982 | btts×over +0.75 [.69,.80]; ml×over +0.28/+0.18 (home/away); btts×ml −0.20 [−.27,−.13]; corners ≈ 0 |
+| Soccer **INTERNATIONAL** (→ World Cup) | martj42, competitive 2000+ | 16,985 | btts×over +0.67 [.62,.71]; ml×over +0.31; btts×ml −0.197 (**identical to club**) |
+| NFL | nflverse vs Vegas closing lines | 7,170 | ml×over 0.00 [−.09,.09]; spread×over +0.03; ml×spread +0.88; OT×over +0.20 [.07,.33] |
+| NBA legacy | 538, 2000–2015 | 20,126 | ml×over +0.017 [−.04,.07] |
+| NBA **MODERN** | hoopR/ESPN, 2016–2025 | 12,567 | ml×over **+0.008** [−.06,.07] — zero survived the 3PT era |
+| MLB | Retrosheet 2015–2024 | 20,642 | ml×over **−0.056** [−.11,−.01] (home wins skip the bottom 9th ⇒ fewer runs); extras×over pre-2020 −0.04 → **post-2020 +0.10 (ghost-runner RULE CHANGE)** |
 
-**Structural finding: winner×over correlation is a SOCCER phenomenon (+0.23),
-absent in NFL and NBA (0.00)** — a single global table would overprice every
-basketball/football "winner + over" SGP. Config now carries per-sport tables
-(`pair_rho_by_sport`) with sport-prefixed bands; WNBA inherits NBA (transfer
-assumption, wider band); unknown sports fall back to the global table at the
-default band. Pending: MLB extras (Retrosheet), NHL, player-prop pairs
-(needs player-level data), college sports; sportsbook-published SGP research
-as cross-reference; prod trade-tape markup surface as the live cross-check.
+**Era-stability (the "does past data predict the future" answer):** intl
+btts×over drifted −0.017 over ~25 years; intl ml×over −0.020; NBA ml×over
++0.008 across the 3PT revolution; MLB ml×over +0.005. Outcome co-movement is
+a structural property of scoring dynamics and is empirically near-constant —
+**except across explicit rule changes** (MLB extras +0.138 jump at the 2020
+ghost-runner rule), so: calibrate on recent windows, re-run after rule
+changes, and let the bands cover residual drift. Marginals (who wins) are
+NEVER taken from history — always from live market prices.
+
+Config: per-sport tables cover today's volume — WC (international-informed
+soccer table), MLB (fresh incl. post-rule-change extras), WNBA (NBA-transfer,
+NBA-zero verified on modern data, wider band). Pending: NHL, direct WNBA
+measurement, player-prop pairs, college; trade-tape markup surface as live
+cross-check.
 
 ### Final adversarial review (2026-07-05) — 5 lenses, 43 agents, 7 confirmed defects, all fixed
 

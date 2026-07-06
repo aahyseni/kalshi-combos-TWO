@@ -180,18 +180,175 @@ NBA_PAIRS = [
 ]
 
 
+def load_intl(*, min_year: int = 2000, competitive_only: bool = True) -> list[dict[str, bool | None]]:
+    """martj42 international results — the structurally-right data for WORLD
+    CUP combos (internationals != club soccer). Competitive matches only."""
+    matches: list[dict[str, bool | None]] = []
+    with open(HISTORY / "intl_results.csv", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                year = int(row["date"][:4])
+                home_goals = int(row["home_score"])
+                away_goals = int(row["away_score"])
+            except (KeyError, ValueError):
+                continue
+            if year < min_year:
+                continue
+            if competitive_only and row.get("tournament", "").strip() == "Friendly":
+                continue
+            total = home_goals + away_goals
+            matches.append(
+                {
+                    "home_win": home_goals > away_goals,
+                    "away_win": away_goals > home_goals,
+                    "over25": total >= 3,
+                    "over35": total >= 4,
+                    "btts": home_goals >= 1 and away_goals >= 1,
+                    "year": year,  # type: ignore[dict-item]
+                }
+            )
+    return matches
+
+
+def load_mlb() -> list[dict[str, bool | None]]:
+    """Retrosheet game logs 2015-2024: scores + game length in outs.
+    Extras = more than 54 outs; over = total runs above season median."""
+    raw: list[tuple[int, int, bool, bool]] = []  # (year, total, home_win, extras)
+    for path in sorted(HISTORY.glob("GL*.TXT")):
+        with open(path, encoding="utf-8", errors="replace", newline="") as f:
+            for fields in csv.reader(f):
+                try:
+                    year = int(fields[0][:4])
+                    visitor = int(fields[9])
+                    home = int(fields[10])
+                    outs = int(fields[11])
+                except (IndexError, ValueError):
+                    continue
+                raw.append((year, visitor + home, home > visitor, outs > 54))
+    medians: dict[int, float] = {}
+    for year in {r[0] for r in raw}:
+        totals = sorted(t for y, t, _, _ in raw if y == year)
+        medians[year] = totals[len(totals) // 2]
+    return [
+        {
+            "home_win": home_win,
+            "away_win": not home_win,
+            "over": None if total == medians[year] else total > medians[year],
+            "extras": extras,
+            "year": year,  # type: ignore[dict-item]
+        }
+        for year, total, home_win, extras in raw
+    ]
+
+
+def load_nba_modern() -> list[dict[str, bool | None]]:
+    """hoopR (ESPN) team box scores 2016-2025 — the post-3PT-revolution era.
+    Two rows per game (team perspective); keep home rows; over = season-median."""
+    import pyarrow.parquet as pq
+
+    raw: list[tuple[int, int, bool]] = []  # (season, total, home_win)
+    for path in sorted(HISTORY.glob("nba_team_box_*.parquet")):
+        table = pq.read_table(
+            path,
+            columns=["season", "team_home_away", "team_score", "opponent_team_score", "team_winner"],
+        ).to_pylist()
+        for row in table:
+            if row.get("team_home_away") != "home":
+                continue
+            try:
+                season = int(row["season"])
+                score = int(row["team_score"])
+                opp = int(row["opponent_team_score"])
+            except (TypeError, ValueError):
+                continue
+            raw.append((season, score + opp, bool(row.get("team_winner"))))
+    medians: dict[int, float] = {}
+    for season in {r[0] for r in raw}:
+        totals = sorted(t for s, t, _ in raw if s == season)
+        medians[season] = totals[len(totals) // 2]
+    return [
+        {
+            "home_win": home_win,
+            "away_win": not home_win,
+            "over": None if total == medians[season] else total > medians[season],
+            "year": season,  # type: ignore[dict-item]
+        }
+        for season, total, home_win in raw
+    ]
+
+
+INTL_PAIRS = [
+    ("ml|total (home win x over2.5)", "home_win", "over25"),
+    ("btts|total (btts x over2.5)", "btts", "over25"),
+    ("btts|ml (btts x home win)", "btts", "home_win"),
+    ("total|total (over2.5 x over3.5)", "over25", "over35"),
+]
+
+MLB_PAIRS = [
+    ("ml|total (home win x over median)", "home_win", "over"),
+    ("extras|total (extra innings x over)", "extras", "over"),
+    ("extras|ml (extra innings x home win)", "extras", "home_win"),
+    ("ml|ml SAME GAME", "home_win", "away_win"),
+]
+
+_Z99 = 2.576
+
+
+def rho_ci99(matches: list[dict[str, bool | None]], a: str, b: str) -> tuple[float, float]:
+    """99% CI on implied rho: binomial SE on P(A∩B) pushed through the
+    (monotone) rho solver. First-order/delta-method — honest for these n."""
+    import math
+
+    n, p_a, p_b, p_ab, _ = measure(matches, a, b)
+    se = math.sqrt(max(p_ab * (1 - p_ab), 1e-12) / n)
+    lo = implied_rho(p_a, p_b, max(0.0, p_ab - _Z99 * se))
+    hi = implied_rho(p_a, p_b, min(1.0, p_ab + _Z99 * se))
+    return lo, hi
+
+
 def report(title: str, matches: list[dict[str, bool | None]], pairs: list) -> None:
     print(f"\n=== {title}: {len(matches)} games ===")
-    print(f"{'pair':44} {'n':>6} {'P(A)':>7} {'P(B)':>7} {'P(AB)':>8} {'rho':>8}")
+    print(f"{'pair':44} {'n':>6} {'P(A)':>7} {'P(B)':>7} {'P(AB)':>8} {'rho':>8}  {'99% CI':>16}")
     for label, a, b in pairs:
         n, p_a, p_b, p_ab, rho = measure(matches, a, b)
-        print(f"{label:44} {n:>6} {p_a:>7.3f} {p_b:>7.3f} {p_ab:>8.3f} {rho:>8.3f}")
+        lo, hi = rho_ci99(matches, a, b)
+        print(
+            f"{label:44} {n:>6} {p_a:>7.3f} {p_b:>7.3f} {p_ab:>8.3f} {rho:>8.3f}"
+            f"  [{lo:>6.3f},{hi:>6.3f}]"
+        )
+
+
+def era_split(
+    title: str, matches: list[dict[str, bool | None]], a: str, b: str, year_key: str, cut: int
+) -> None:
+    early = [m for m in matches if int(m[year_key]) < cut]  # type: ignore[arg-type]
+    late = [m for m in matches if int(m[year_key]) >= cut]  # type: ignore[arg-type]
+    _, _, _, _, rho_early = measure(early, a, b)
+    _, _, _, _, rho_late = measure(late, a, b)
+    print(
+        f"  era-stability {title}: <{cut} rho={rho_early:+.3f} (n={len(early)})"
+        f"  >={cut} rho={rho_late:+.3f} (n={len(late)})  drift={rho_late - rho_early:+.3f}"
+    )
 
 
 def main() -> None:
-    report("SOCCER (top-5 EU, 20/21-24/25)", load_matches(), SOCCER_PAIRS)
-    report("NFL (nflverse, vs Vegas lines)", load_nfl(), NFL_PAIRS)
-    report("NBA (538, seasons 2000-2015)", load_nba(), NBA_PAIRS)
+    club = load_matches()
+    report("SOCCER CLUB (top-5 EU, 20/21-24/25)", club, SOCCER_PAIRS)
+    intl = load_intl()
+    report("SOCCER INTERNATIONAL (competitive, 2000+)", intl, INTL_PAIRS)
+    era_split("intl btts|total", intl, "btts", "over25", "year", 2015)
+    era_split("intl ml|total  ", intl, "home_win", "over25", "year", 2015)
+    nfl = load_nfl()
+    report("NFL (nflverse, vs Vegas lines)", nfl, NFL_PAIRS)
+    nba = load_nba()
+    report("NBA legacy (538, seasons 2000-2015)", nba, NBA_PAIRS)
+    nba_modern = load_nba_modern()
+    report("NBA MODERN (hoopR/ESPN, 2016-2025)", nba_modern, NBA_PAIRS)
+    era_split("nba modern ml|total", nba_modern, "home_win", "over", "year", 2021)
+    mlb = load_mlb()
+    report("MLB (Retrosheet 2015-2024)", mlb, MLB_PAIRS)
+    era_split("mlb extras|total", mlb, "extras", "over", "year", 2020)
+    era_split("mlb ml|total    ", mlb, "home_win", "over", "year", 2020)
 
 
 if __name__ == "__main__":
