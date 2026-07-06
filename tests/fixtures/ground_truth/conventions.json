@@ -1,0 +1,8 @@
+{
+  "_promoted": "2026-07-05 by operator sign-off after reviewing the recorded demo round trips (see scenario_*.jsonl and NOTES.md Phase 2.5 table)",
+  "maker_side_on_yes_accept": "yes",
+  "maker_side_on_no_accept": "no",
+  "maker_pays_own_bid": true,
+  "maker_is_taker_on_fill": false,
+  "combo_no_pays_complement": null
+}
