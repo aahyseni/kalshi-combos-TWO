@@ -51,10 +51,10 @@ class ObserveApp:
         )
         log.info("observe_starting", env=str(config.env))
 
-        signer = RequestSigner(Credentials.from_env(), self._clock)
+        signer = RequestSigner(Credentials.for_env(str(config.env)), self._clock)
         killswitch = KillSwitch(self._clock, kill_file=config.kill_file)
         store = await Store.open(
-            config.data_dir / config.observe.db_filename, self._clock
+            config.data_dir / config.observe.db_name_for(config.env), self._clock
         )
         ws = WsManager(config.endpoints.ws_url, signer, self._clock, self._metrics)
         feed = OrderbookFeed(ws, self._clock, self._metrics)
@@ -110,6 +110,10 @@ class ObserveApp:
                     leg_probs=would.leg_probs,
                     context={"collection": rfq.mve_collection_ticker},
                 )
+                # Shadow markouts (defense #5 / Phase 6): how does the raw mid
+                # product drift AFTER we would have quoted? Sustained adverse
+                # drift = this flow would have picked us off.
+                self._track_would_markout(rfq, store, feed, int(would.fair_cc))
                 log.info(
                     "rfq_would_quote",
                     rfq_id=rfq.rfq_id,
@@ -153,6 +157,30 @@ class ObserveApp:
 
     def request_stop(self) -> None:
         self._stop.set()
+
+    def _track_would_markout(
+        self, rfq: Rfq, store: Store, feed: OrderbookFeed, fair_cc: int
+    ) -> None:
+        from combomaker.risk.markouts import MarkoutSubject, MarkoutTracker
+
+        if not hasattr(self, "_markouts"):
+            self._markouts = MarkoutTracker(store.record_markout)
+
+        def provider() -> tuple[int | None, int | None]:
+            would = independence_would_quote(
+                rfq, feed, width_cc=self._config.observe.would_quote_width_cc
+            )
+            now = int(would.fair_cc) if would else None
+            return now, now  # observe-mode fair IS the raw mid product
+
+        self._markouts.track(
+            MarkoutSubject(
+                fill_ref=f"would:{rfq.rfq_id}",
+                fair_at_event_cc=fair_cc,
+                raw_mid_at_event_cc=fair_cc,
+            ),
+            provider,
+        )
 
     async def _ensure_watched(
         self, rfq: Rfq, feed: OrderbookFeed, metadata: MetadataCache

@@ -106,9 +106,11 @@ class QuoteApp:
             conventions=conventions.source,
         )
 
-        signer = RequestSigner(Credentials.from_env(), self._clock)
+        signer = RequestSigner(Credentials.for_env(str(config.env)), self._clock)
         killswitch = KillSwitch(self._clock, kill_file=config.kill_file)
-        store = await Store.open(config.data_dir / config.observe.db_filename, self._clock)
+        store = await Store.open(
+            config.data_dir / config.observe.db_name_for(config.env), self._clock
+        )
         ws = WsManager(config.endpoints.ws_url, signer, self._clock, self._metrics)
         feed = OrderbookFeed(ws, self._clock, self._metrics)
         intake = RfqIntake(ws, self._metrics)

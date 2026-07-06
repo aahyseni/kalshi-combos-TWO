@@ -67,7 +67,7 @@ async def _report(env: Env, db_override: Path | None) -> int:
     from combomaker.ops.report import build_report, format_report
 
     config = load_config(_config_path(env, None), env=env)
-    db_path = db_override or (config.data_dir / config.observe.db_filename)
+    db_path = db_override or (config.data_dir / config.observe.db_name_for(env))
     if not db_path.exists():
         print(f"no store at {db_path} — run observe/paper first", file=sys.stderr)
         return 2

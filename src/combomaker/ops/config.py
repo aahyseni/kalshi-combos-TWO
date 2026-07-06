@@ -167,7 +167,12 @@ class RiskConfig(StrictModel):
 class ObserveConfig(StrictModel):
     rfq_poll_s: float = 30.0          # REST reconciliation cadence (no seq on WS)
     would_quote_width_cc: int = 600   # stub half-spread total ($0.06) for logging only
-    db_filename: str = "combomaker.sqlite3"
+    db_filename: str = ""             # "" = auto: combomaker-{env}.sqlite3
+
+    def db_name_for(self, env: Env) -> str:
+        # Demo and prod data must never share a store — shadow analytics on
+        # prod flow would silently blend with demo bot noise.
+        return self.db_filename or f"combomaker-{env.value}.sqlite3"
 
 
 class AppConfig(StrictModel):

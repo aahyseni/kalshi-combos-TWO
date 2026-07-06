@@ -48,6 +48,19 @@ class Credentials:
         return cls.from_env_names(ENV_API_KEY_ID, ENV_PRIVATE_KEY_PATH, ENV_PRIVATE_KEY_PEM)
 
     @classmethod
+    def for_env(cls, env: str) -> Credentials:
+        """Environment-scoped credentials. Kalshi keys are strictly
+        per-environment (ground truth: demo 401s prod keys), so prod REQUIRES
+        the KALSHI_PROD_* variables — no silent fallback to demo keys."""
+        if env == "prod":
+            return cls.from_env_names(
+                "KALSHI_PROD_API_KEY_ID",
+                "KALSHI_PROD_PRIVATE_KEY_PATH",
+                "KALSHI_PROD_PRIVATE_KEY_PEM",
+            )
+        return cls.from_env()
+
+    @classmethod
     def from_env_names(cls, key_id_env: str, path_env: str, pem_env: str) -> Credentials:
         """Load from custom env var names (e.g. the ground-truth harness's
         second, requester-side demo account: KALSHI_REQUESTER_*)."""
