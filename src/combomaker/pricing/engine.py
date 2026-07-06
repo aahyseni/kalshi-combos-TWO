@@ -27,7 +27,7 @@ from combomaker.marketdata.metadata import MetadataCache
 from combomaker.ops.config import PricingConfig
 from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
 from combomaker.pricing.joint import CorrelationParams, price_joint
-from combomaker.pricing.legs import KalshiBookSource, LegBelief
+from combomaker.pricing.legs import KalshiBookSource, LegBelief, OddsSource, blend_beliefs
 from combomaker.pricing.quote import (
     ConstructedQuote,
     NoQuote,
@@ -46,11 +46,17 @@ class PricingEngine:
         metadata: MetadataCache,
         conventions: Conventions,
         config: PricingConfig,
+        *,
+        extra_sources: list[tuple[OddsSource, float]] | None = None,
     ) -> None:
         self._feed = feed
         self._metadata = metadata
         self._config = config
         self._book_source = KalshiBookSource(feed)
+        # External providers (devig quarantined inside their adapters) blended
+        # against the Kalshi book at weight 1.0. A source returning None just
+        # drops out; sources DISAGREEING beyond threshold is a no-quote.
+        self._extra_sources = list(extra_sources or [])
         self._fee_model = FeeModel(
             FeeSchedule.from_strings(config.fee.taker_coef, config.fee.maker_coef),
             conventions,
@@ -83,12 +89,26 @@ class PricingEngine:
 
         beliefs: list[LegBelief] = []
         for leg in rfq.legs:
-            belief = self._book_source.marginal(leg.market_ticker)
-            if belief is None:
+            book_belief = self._book_source.marginal(leg.market_ticker)
+            if book_belief is None:
                 return NoQuote(
                     ReasonCode.SKIP_PRICING_FAILED, f"no belief for leg {leg.market_ticker}"
                 )
-            beliefs.append(belief)
+            weighted: list[tuple[LegBelief, float]] = [(book_belief, 1.0)]
+            for source, weight in self._extra_sources:
+                extra = source.marginal(leg.market_ticker)
+                if extra is not None:
+                    weighted.append((extra, weight))
+            blended = blend_beliefs(
+                weighted, max_disagreement=self._config.max_source_disagreement
+            )
+            if blended is None:
+                return NoQuote(
+                    ReasonCode.SKIP_SOURCES_DISAGREE,
+                    f"sources disagree on {leg.market_ticker}: "
+                    + ", ".join(f"{b.source}={b.p:.3f}" for b, _ in weighted),
+                )
+            beliefs.append(blended)
         sides = [leg.side for leg in rfq.legs]
 
         joint = price_joint(beliefs, sides, relationship.same_event_groups, self._corr_params)

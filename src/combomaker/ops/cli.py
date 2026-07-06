@@ -106,6 +106,9 @@ async def _cancel_all(env: Env) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from combomaker.ops.dotenv import load_dotenv
+
+    load_dotenv()  # fills missing env vars from ./.env (never overrides)
     args = build_parser().parse_args(argv)
 
     if args.command == "halt":

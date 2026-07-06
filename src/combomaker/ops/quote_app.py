@@ -114,9 +114,18 @@ class QuoteApp:
         intake = RfqIntake(ws, self._metrics)
         inplay = InPlayDetector(self._clock)
 
+        external = self._build_external_odds()
         async with KalshiRestClient(config.endpoints.rest_base_url, signer) as rest:
             metadata = MetadataCache(rest, self._clock)
-            engine = PricingEngine(feed, metadata, conventions, config.pricing)
+            engine = PricingEngine(
+                feed,
+                metadata,
+                conventions,
+                config.pricing,
+                extra_sources=(
+                    [(external[0], config.pricing.external_odds.weight)] if external else []
+                ),
+            )
             exposure = ExposureBook(conventions)
             risk_cfg = config.risk
             limits = LimitChecker(
@@ -209,6 +218,10 @@ class QuoteApp:
                     self._report_loop(store, exposure, lifecycle), name="report"
                 ),
             ]
+            if external is not None:
+                _, poller, sgo_client = external
+                await sgo_client.__aenter__()
+                tasks.append(asyncio.create_task(poller.run(), name="sgo-poller"))
             try:
                 await self._stop.wait()
             finally:
@@ -226,6 +239,44 @@ class QuoteApp:
 
     def request_stop(self) -> None:
         self._stop.set()
+
+    def _build_external_odds(self) -> tuple[Any, Any, Any] | None:
+        """(source, poller, client) when enabled + key present, else None."""
+        cfg = self._config.pricing.external_odds
+        if not cfg.enabled:
+            return None
+        import os
+
+        api_key = os.environ.get("SPORTSGAMEODDS_API_KEY", "").strip()
+        if not api_key:
+            log.warning("external_odds_enabled_but_no_key", var="SPORTSGAMEODDS_API_KEY")
+            return None
+        from combomaker.pricing.sources.sportsgameodds import (
+            MappedLeg,
+            SgoClient,
+            SgoPoller,
+            SportsGameOddsSource,
+            StaticMarketMapping,
+        )
+
+        entries: dict[str, MappedLeg] = {}
+        for ticker, spec in cfg.mapping.items():
+            event_id, _, odd_id = spec.partition("|")
+            if event_id and odd_id:
+                entries[ticker] = MappedLeg(event_id=event_id, odd_id=odd_id)
+        source = SportsGameOddsSource(
+            StaticMarketMapping(entries), self._clock, max_age_s=cfg.max_age_s
+        )
+        client = SgoClient(api_key)
+        poller = SgoPoller(
+            client,
+            source,
+            leagues=cfg.leagues,
+            poll_interval_s=cfg.poll_interval_s,
+            max_events_per_league=cfg.max_events_per_league,
+            devig_method=cfg.devig_method,
+        )
+        return source, poller, client
 
     async def _startup_reconcile(self, rest: KalshiRestClient) -> None:
         try:

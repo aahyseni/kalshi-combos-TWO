@@ -16,6 +16,16 @@ and runs a Monte Carlo simulator over the whole book.
   `KALSHI_PRIVATE_KEY_PATH` or `KALSHI_PRIVATE_KEY_PEM`). Nothing secret is ever
   committed or logged.
 
+## Credentials setup
+
+1. Create a **demo** account + API key at the Kalshi demo site (the key's
+   private half is shown exactly once — save the `.pem`). For the Phase 2.5
+   ground-truth harness you need a **second** demo account (requester side).
+2. Put the `.pem` files somewhere outside the repo, e.g. `C:\Users\you\.kalshi\`.
+3. `copy .env.example .env` in the repo root and fill in the key IDs + pem
+   paths. `.env` is gitignored and loaded automatically by the CLI (existing
+   environment variables always win over the file).
+
 ## Quick start
 
 ```sh

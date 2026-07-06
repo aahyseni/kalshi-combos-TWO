@@ -118,10 +118,27 @@ class QuoteConfig(StrictModel):
     free_money_margin_cc: int = 100
 
 
+class ExternalOddsConfig(StrictModel):
+    """SportsGameOdds adapter (docs/api-notes/sportsgameodds.md). OFF by
+    default; free tier is 2,500 objects/month so the poller is budget-gated."""
+
+    enabled: bool = False
+    leagues: list[str] = []               # e.g. ["NBA", "NFL"]
+    weight: float = 0.3                   # blend weight vs Kalshi book's 1.0
+    poll_interval_s: float = 3_600.0
+    max_events_per_league: int = 10
+    max_age_s: float = 900.0              # cached marginal expiry
+    devig_method: str = "power"
+    base_uncertainty: float = 0.01
+    # Explicit Kalshi ticker → "eventID|oddID" table; unmapped = Kalshi-only.
+    mapping: dict[str, str] = {}
+
+
 class PricingConfig(StrictModel):
     fee: FeeConfig = Field(default_factory=FeeConfig)
     correlation: CorrelationConfig = Field(default_factory=CorrelationConfig)
     quote: QuoteConfig = Field(default_factory=QuoteConfig)
+    external_odds: ExternalOddsConfig = Field(default_factory=ExternalOddsConfig)
     max_source_disagreement: float = 0.08
 
 
