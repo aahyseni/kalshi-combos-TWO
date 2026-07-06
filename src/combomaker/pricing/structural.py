@@ -66,6 +66,7 @@ from combomaker.pricing.margin_total import (
     TeamWins,
     invert_means,
     region_probability,
+    shape_in_leg_frame,
 )
 from combomaker.pricing.mlb_runs import MlbShape, invert_runs
 from combomaker.pricing.mlb_runs import joint_probability as mlb_joint
@@ -381,10 +382,11 @@ class StructuralPricer:
         raw = mt.params.get(str(sport))
         if raw is None:
             raise StructuralError(f"no calibrated shape for {sport}")
-        shape = SportShape(
-            sigma_margin=raw["sigma_margin"],
-            sigma_total=raw["sigma_total"],
-            rho=raw["rho"],
+        # config rho is CALIBRATION-frame (home - away); the leg specs put
+        # Team.A = blob prefix = away, so the shape is built in the leg frame
+        # (rho negated). See margin_total.shape_in_leg_frame.
+        shape = shape_in_leg_frame(
+            raw["sigma_margin"], raw["sigma_total"], raw["rho"]
         )
 
         matches = []

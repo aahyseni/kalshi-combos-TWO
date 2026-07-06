@@ -54,6 +54,35 @@ class SportShape:
     rho: float
 
 
+def shape_in_leg_frame(
+    sigma_margin: float, sigma_total: float, calibrated_rho: float
+) -> SportShape:
+    """Build the model shape in the LEG frame from a CALIBRATION-frame rho.
+
+    The leg specs (TeamWins/SpreadCover) use ``Team.A`` = the game-code blob
+    PREFIX. That blob is AWAY+HOME (verified against live Kalshi metadata
+    2026-07-06: NBA ticker ``26MAY23NYKCLE`` titles "New York AT Cleveland";
+    MLB ``SFCOL`` is SF @ Coors, ``BOSLAA`` is BOS @ a 9:30pm-EDT Anaheim
+    game). So the leg frame has M = team_a - team_b = away - home.
+
+    ``calibrate_margin_total.py`` estimates rho as corr(home - away, total)
+    (line residuals: ``(hs - as_) - spread``; FE: home=+1, away=-1). That is
+    the NEGATIVE of the leg-frame margin, and corr(M, T) flips sign under the
+    team relabeling M -> -M, so the leg frame takes ``-calibrated_rho``. The
+    sigmas are frame-invariant. Equivalently, this makes the away-frame model
+    the exact mirror of the home-frame model the OOS gate validated
+    (validate_margin_total_oos.py prices with Team.A = home, +rho) — identical
+    joint probability for every real (team-specific) event, because the
+    per-game means are inverted from the market in whichever frame.
+
+    Centralised here so the frame convention lives in ONE place, imported by
+    both the production adapter and the validators (quiet-failure defense #1).
+    """
+    return SportShape(
+        sigma_margin=sigma_margin, sigma_total=sigma_total, rho=-calibrated_rho
+    )
+
+
 # --- leg specs (YES-side events, team frame explicit) ---------------------------
 
 

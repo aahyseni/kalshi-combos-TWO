@@ -135,7 +135,12 @@ refreshed through NFL 2025 / NBA 2025-26 / WNBA 2026-07-05). NFL OOS gate
 passed (biggest win: hw×cover — exact comonotone geometry vs copula 0.88).
 Spread legs blocked until in-season tickers verify the line sign convention;
 NBA/WNBA calibrated but gated off pending an odds source or prod-shadow
-settlements (NOTES audit J1–J6).
+settlements (NOTES audit J1–J6). **Frame convention (NOTES L1, fixed
+2026-07-06):** config ρ is calibrated as corr(home−away, total), but the leg
+specs put `Team.A` = game-code blob prefix = AWAY team, so the adapter builds
+its shape via `margin_total.shape_in_leg_frame` (ρ negated) — the single place
+the frame lives. This makes the shipped pricer the exact mirror of the
+home-frame model the OOS gate validates.
 
 ## Architecture decisions
 

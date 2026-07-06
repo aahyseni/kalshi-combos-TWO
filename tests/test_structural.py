@@ -19,6 +19,13 @@ from combomaker.pricing.dixon_coles import (
 )
 from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.legs import LegBelief
+from combomaker.pricing.margin_total import (
+    GameTotalOver,
+    SportShape,
+    TeamWins,
+    invert_means,
+    region_probability,
+)
 from combomaker.pricing.quote import ConstructedQuote
 from combomaker.pricing.structural import (
     StructuralPricer,
@@ -324,6 +331,38 @@ class TestMarginTotalDispatch:
         )
         assert over is not None and under is not None
         assert over.p + under.p == pytest.approx(0.62, abs=1e-4)
+
+    def test_prices_in_leg_frame_not_calibration_frame(self) -> None:
+        """Regression for the away/home frame fix: WNBA has nonzero rho, its
+        moneyline market is on the HOME team (blob suffix = Team.B), and the
+        adapter must price in the leg frame (rho negated) so the joint equals
+        the home-frame reference the OOS gate validated — NOT the sign-confused
+        value the pre-fix adapter produced."""
+        from combomaker.ops.config import MarginTotalConfig
+        from combomaker.pricing.margin_total import shape_in_leg_frame
+
+        # 26JUL05INDLV: IND away (Team.A), LV home (Team.B). ML on LV.
+        p = StructuralPricer(
+            StructuralConfig(enabled=True),
+            MarginTotalConfig(enabled_sports=["wnba"]),
+        )
+        est, reason = p.try_price(
+            [leg("KXWNBAGAME-26JUL05INDLV-LV"), leg("KXWNBATOTAL-26JUL05INDLV-186")],
+            [belief(0.575), belief(0.55)],
+            ["yes", "yes"],
+        )
+        assert reason is None and est is not None
+
+        cal = SportShape(12.04, 16.55, -0.019)   # calibration frame, Team.A=home
+        total = GameTotalOver(185.5)             # suffix 186 -> over 185.5
+        inv = invert_means([(TeamWins(Team.A), 0.575), (total, 0.55)], cal)
+        ref = region_probability(
+            inv.mu_m, inv.mu_t, cal, [(TeamWins(Team.A), True), (total, True)]
+        )
+        assert est.p == pytest.approx(ref, abs=1e-6)
+        # The sign-confused frame (leg specs + un-negated cal rho) differs —
+        # proves the adapter actually applies shape_in_leg_frame.
+        assert shape_in_leg_frame(12.04, 16.55, -0.019).rho == pytest.approx(0.019)
 
 
 class TestApplicability:

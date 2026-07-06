@@ -1,41 +1,68 @@
-"""Current-era MLB gate on Kalshi's OWN prices (2025-2026 settled markets).
+"""Current-era WNBA/NBA check on Kalshi's OWN prices (settled markets).
 
-Complements the SBR-archive gate (test=2021): same NegBin runs model, but
-marginals are pre-game mids from Kalshi's settled KXMLBGAME/KXMLBTOTAL/
-KXMLBSPREAD markets (data/history/kalshi_mlb_{history,spreads}.csv via
-fetch_kalshi_history.py) — the exact venue and era we quote. Metrics:
+Same (margin, total) bivariate-normal model that ships in
+pricing/margin_total.py, evaluated on pre-game mids from Kalshi's settled
+KX{WNBA,NBA}{GAME,TOTAL,SPREAD} markets (data/history/kalshi_{sport}_*.csv
+via fetch_kalshi_history.py) — the exact venue and era we quote. Metrics:
 team-win x main-total pair on every game, plus team-win x spread-cover
 pair and the triple where a main spread line was captured.
 
-Entirely out-of-sample: k is Retrosheet-fitted (scores only, no prices) and
-the model has never seen these games' prices. v1 copula uses the SHIPPED
-config exactly: mlb ml|total -0.05; ml|spread and spread|total have no
-calibrated entry and fall back to the flat same-event prior 0.6.
+Faithful to production BY CONSTRUCTION: teams are resolved with the shipped
+adapter's ``_parse_match``/``_team_of`` (Team.A = game-code blob prefix =
+away), and the shape is built with ``shape_in_leg_frame`` — the SAME leg
+frame the production pricer uses — so the reported structural score is the
+one the live pricer would earn, not a re-implementation that can silently
+drift (the earlier version pinned Team.A to whichever moneyline market the
+fetcher listed first, a coin flip that made the razor-thin win-over metric a
+frame artifact).
 
-Run:  uv run python tools/validate_mlb_runs_kalshi.py
+Out-of-sample: shapes are the SHIPPED per-sport calibrations (score data
+only, no Kalshi prices; means inverted per game exactly as production does).
+v1 copula uses the SHIPPED config exactly: ml|total 0.01 for both sports;
+ml|spread and spread|total have no calibrated entry and fall back to the flat
+same-event prior 0.6.
+
+Context: WNBA is ENABLED on operator request (NFL-gated geometry) — this
+is its first native-venue evidence; NBA is gated OFF, and the settled
+listing only reaches back ~2 months, so NBA rows are June playoff games
+(small n, playoff-only sample — directional evidence, not a gate).
+
+Run:  uv run python tools/validate_margin_total_kalshi.py --sport wnba
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import math
-import re
 import sys
 from pathlib import Path
 
 import numpy as np
 
 from combomaker.pricing.copula import gaussian_copula_joint_prob
-from combomaker.pricing.dixon_coles import StructuralError, Team
-from combomaker.pricing.margin_total import GameTotalOver, SpreadCover, TeamWins
-from combomaker.pricing.mlb_runs import MlbShape, invert_runs, joint_probability
+from combomaker.pricing.dixon_coles import StructuralError
+from combomaker.pricing.margin_total import (
+    GameTotalOver,
+    SportShape,
+    SpreadCover,
+    TeamWins,
+    invert_means,
+    region_probability,
+    shape_in_leg_frame,
+)
+from combomaker.pricing.structural import _parse_match, _team_of
 
 HISTORY = Path(__file__).resolve().parent.parent / "data" / "history"
-K = 3.54                 # Retrosheet 2021-2025 (fitted on scores, not prices)
-RHO_ML_OVER = -0.05      # shipped v1 mlb ml|total
+# CALIBRATION-frame (M = home - away) shapes, exactly as ops/config.py stores
+# them; converted to the production leg frame via shape_in_leg_frame below.
+SHAPES = {
+    "wnba": SportShape(sigma_margin=12.04, sigma_total=16.55, rho=-0.019),
+    "nba": SportShape(sigma_margin=13.71, sigma_total=18.42, rho=0.000),
+}
+RHO_ML_OVER = 0.01       # shipped v1 ml|total (both sports)
 RHO_FLAT = 0.6           # shipped same_event_rho: what v1 uses for uncal. pairs
 
-_CODE = re.compile(r"^(\d{2})([A-Z]{3})(\d{2})(\d{4})?([A-Z0-9]+)$")
 MODELS = ("independence", "v1 copula", "structural")
 
 
@@ -61,30 +88,21 @@ def copula_cell3(marg: tuple[float, float, float], corr: np.ndarray,
     return gaussian_copula_joint_prob(m, corr * np.outer(flip, flip))
 
 
-def spread_team_side(game_code: str, game_team: str, spread_team: str) -> Team | None:
-    """Team frame: Team.A == the game-market team. None = unresolvable."""
-    if spread_team == game_team:
-        return Team.A
-    m = _CODE.match(game_code)
-    if m is None:
-        return None
-    pair = m.group(5)
-    if pair in (spread_team + game_team, game_team + spread_team):
-        return Team.B
-    return None
-
-
-def load_spreads() -> dict[str, dict[str, str]]:
-    path = HISTORY / "kalshi_mlb_spreads.csv"
-    if not path.exists():
-        return {}
-    with open(path, encoding="utf-8", newline="") as f:
-        return {row["game_code"]: row for row in csv.DictReader(f)}
-
-
 def main() -> None:
-    shape = MlbShape(dispersion_k=K)
-    spreads = load_spreads()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sport", choices=list(SHAPES), required=True)
+    args = parser.parse_args()
+    # Leg frame (Team.A = blob prefix = away): the exact shape production prices
+    # with. Any calibration-frame rho is negated here, in one place.
+    cal = SHAPES[args.sport]
+    shape = shape_in_leg_frame(cal.sigma_margin, cal.sigma_total, cal.rho)
+
+    spreads_path = HISTORY / f"kalshi_{args.sport}_spreads.csv"
+    spreads: dict[str, dict[str, str]] = {}
+    if spreads_path.exists():
+        with open(spreads_path, encoding="utf-8", newline="") as f:
+            spreads = {row["game_code"]: row for row in csv.DictReader(f)}
+
     corr3 = np.array(
         [
             [1.0, RHO_FLAT, RHO_ML_OVER],
@@ -99,7 +117,9 @@ def main() -> None:
     }
     counts = dict.fromkeys(sums, 0)
     skipped = 0
-    with open(HISTORY / "kalshi_mlb_history.csv", encoding="utf-8", newline="") as f:
+    with open(
+        HISTORY / f"kalshi_{args.sport}_history.csv", encoding="utf-8", newline=""
+    ) as f:
         for row in csv.DictReader(f):
             p_team = float(row["p_team_close"])
             p_over = float(row["p_over_close"])
@@ -109,16 +129,24 @@ def main() -> None:
             if not (0.02 < p_team < 0.98 and 0.02 < p_over < 0.98):
                 skipped += 1
                 continue
+            # Resolve the moneyline team into the production leg frame; the
+            # game-code blob prefix is Team.A (away), suffix is Team.B (home).
+            match = _parse_match(row["game_code"])
+            ml_team = _team_of(row["team"], match) if match is not None else None
+            if ml_team is None:
+                skipped += 1
+                continue
             try:
-                inv = invert_runs(
-                    [(TeamWins(Team.A), p_team), (GameTotalOver(line), p_over)], shape
+                inv = invert_means(
+                    [(TeamWins(ml_team), p_team), (GameTotalOver(line), p_over)],
+                    shape,
                 )
             except StructuralError:
                 skipped += 1
                 continue
 
             def joint(*legs: tuple, _inv=inv) -> float:  # type: ignore[type-arg, no-untyped-def]
-                return joint_probability(_inv.mu_a, _inv.mu_b, shape, list(legs))
+                return region_probability(_inv.mu_m, _inv.mu_t, shape, list(legs))
 
             counts["pair team-win x over"] += 1
             sums["pair team-win x over"]["independence"] += cell_ll2(
@@ -129,19 +157,19 @@ def main() -> None:
             )
             sums["pair team-win x over"]["structural"] += cell_ll2(
                 p_team, p_over,
-                joint((TeamWins(Team.A), True), (GameTotalOver(line), True)),
+                joint((TeamWins(ml_team), True), (GameTotalOver(line), True)),
                 won, over,
             )
 
             sp = spreads.get(row["game_code"])
             if sp is None:
                 continue
-            side = spread_team_side(row["game_code"], row["team"], sp["spread_team"])
+            sp_team = _team_of(sp["spread_team"], match)
             p_cover = float(sp["p_spread_close"])
-            if side is None or not (0.02 < p_cover < 0.98):
+            if sp_team is None or not (0.02 < p_cover < 0.98):
                 continue
             covered = sp["covered"] == "1"
-            cover_spec = SpreadCover(side, float(sp["spread_line"]))
+            cover_spec = SpreadCover(sp_team, float(sp["spread_line"]))
 
             counts["pair team-win x cover"] += 1
             sums["pair team-win x cover"]["independence"] += cell_ll2(
@@ -152,7 +180,7 @@ def main() -> None:
             )
             sums["pair team-win x cover"]["structural"] += cell_ll2(
                 p_team, p_cover,
-                joint((TeamWins(Team.A), True), (cover_spec, True)), won, covered,
+                joint((TeamWins(ml_team), True), (cover_spec, True)), won, covered,
             )
 
             counts["triple win x cover x over"] += 1
@@ -168,7 +196,7 @@ def main() -> None:
                 max(copula_cell3(marg, corr3, observed), 1e-12)
             )
             p_struct = joint(
-                (TeamWins(Team.A), observed[0]),
+                (TeamWins(ml_team), observed[0]),
                 (cover_spec, observed[1]),
                 (GameTotalOver(line), observed[2]),
             )
@@ -176,15 +204,15 @@ def main() -> None:
                 max(p_struct, 1e-12)
             )
 
-    print(f"Kalshi-native MLB games ({skipped} skipped)")
+    print(f"Kalshi-native {args.sport.upper()} games ({skipped} skipped)")
     gate_pass = True
     complete = True
     for metric, models in sums.items():
         n = counts[metric]
         if n == 0:
-            # Fail-closed: no spread capture => cover/triple absent, and the
-            # verdict must NOT then rest on the no-power win-over metric alone
-            # (CLAUDE.md hard rule 6: missing data => no pass).
+            # Fail-closed: a metric with no data can never be a pass (missing
+            # spread capture must not let the no-power win-over metric alone
+            # print BEATS — CLAUDE.md hard rule 6).
             print(f"  {metric:26s}: NO DATA — gate INCOMPLETE (fail-closed)")
             complete = False
             continue
@@ -198,7 +226,7 @@ def main() -> None:
     if not complete:
         print("  gate INCOMPLETE — a required metric had no data; not a pass")
     print("structural " + ("BEATS" if verdict else "does NOT beat")
-          + " v1 on Kalshi-era data")
+          + f" v1 on Kalshi-era {args.sport.upper()} data")
     sys.exit(0 if verdict else 1)
 
 

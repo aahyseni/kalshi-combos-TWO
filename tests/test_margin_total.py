@@ -17,10 +17,53 @@ from combomaker.pricing.margin_total import (
     invert_means,
     marginal_probability,
     region_probability,
+    shape_in_leg_frame,
 )
 
 NFL = SportShape(sigma_margin=12.66, sigma_total=13.06, rho=0.026)
 NBA = SportShape(sigma_margin=13.71, sigma_total=18.42, rho=0.0)
+
+
+class TestLegFrame:
+    """The away/home frame fix: config rho is calibrated as corr(home-away,
+    total), but the leg specs put Team.A = game-code blob prefix = away, so the
+    production shape negates rho. Prices must be identical to the home-frame
+    reference the OOS gate validated — that is the invariant these pin."""
+
+    def test_shape_in_leg_frame_negates_rho_only(self) -> None:
+        leg = shape_in_leg_frame(12.04, 16.55, -0.019)
+        assert leg.sigma_margin == 12.04
+        assert leg.sigma_total == 16.55
+        assert leg.rho == pytest.approx(0.019)
+
+    def test_leg_frame_mirrors_calibration_frame(self) -> None:
+        # WNBA shape (nonzero rho so the frame matters). Home team is a 0.62
+        # favorite; total over 160.5 priced at 0.55.
+        cal = SportShape(12.04, 16.55, -0.019)      # Team.A = home (calibration)
+        leg = shape_in_leg_frame(12.04, 16.55, -0.019)  # Team.A = away (leg)
+        p_home, p_over = 0.62, 0.55
+        total = GameTotalOver(160.5)
+
+        # Reference: price P(home wins AND over) with Team.A = home, +cal rho.
+        inv_c = invert_means([(TeamWins(Team.A), p_home), (total, p_over)], cal)
+        ref = region_probability(
+            inv_c.mu_m, inv_c.mu_t, cal, [(TeamWins(Team.A), True), (total, True)]
+        )
+        # Leg frame: home is Team.B (blob suffix). Same physical event, means
+        # inverted from the SAME marginals -> must give the identical joint.
+        inv_l = invert_means([(TeamWins(Team.B), p_home), (total, p_over)], leg)
+        got = region_probability(
+            inv_l.mu_m, inv_l.mu_t, leg, [(TeamWins(Team.B), True), (total, True)]
+        )
+        assert got == pytest.approx(ref, abs=1e-9)
+        # and the two frames disagree with the SIGN-CONFUSED model (leg specs
+        # but +cal rho) — i.e. the fix is not a no-op.
+        wrong = SportShape(12.04, 16.55, -0.019)
+        inv_w = invert_means([(TeamWins(Team.B), p_home), (total, p_over)], wrong)
+        confused = region_probability(
+            inv_w.mu_m, inv_w.mu_t, wrong, [(TeamWins(Team.B), True), (total, True)]
+        )
+        assert abs(confused - ref) > 1e-4
 
 
 class TestRegionMath:
