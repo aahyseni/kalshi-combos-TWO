@@ -223,6 +223,21 @@ class CorrelationConfig(StrictModel):
             "first_half_moneyline|moneyline:same": 0.71,
             "first_half_moneyline|moneyline:opp": -0.67,
             "first_half_total|total": 0.73,
+            # 1H-winner x 1H-total, WITHIN the first half. The sign FLIPS HARD on
+            # whether the 1H-moneyline leg names a TEAM or the TIE — resolved in
+            # sgp.py to ":team" / ":tie" (same hard sign-flip as the 1H x FT
+            # ":same"/":opp" winner pair). Both are near-DETERMINISTIC structural
+            # containments MEASURED on 8,981 club matches (football-data HT
+            # scores, tools/calibrate_soccer_1h_winner_total.py):
+            #   :team  a 1H lead REQUIRES a goal => 1H-lead subset of 1H-over0.5,
+            #          all 5,401 lead matches over -> implied rho +0.99 (clamp +0.95).
+            #   :tie   1H under0.5 (0-0) is a subset of 1H-TIE, all 2,518 under
+            #          matches are ties -> tie x over implied rho -0.99 (clamp -0.95).
+            # Without these the pair fell to the flat same_event_rho +0.6, which
+            # is the WRONG SIGN for a TIE leg (it priced tie x under as strongly
+            # mutually exclusive when 0-0 IS a tie) — the SUICOL pick-off.
+            "first_half_moneyline|first_half_total:team": 0.95,
+            "first_half_moneyline|first_half_total:tie": -0.95,
         },
         # NFL moneyline|total = 0.00 DOUBLY confirmed: pooled-vs-Vegas-lines
         # AND conditional-MLE (+0.02, SE 0.023) whose fit does NOT beat
@@ -291,6 +306,10 @@ class CorrelationConfig(StrictModel):
         "soccer:first_half_moneyline|moneyline:same": 0.08,
         "soccer:first_half_moneyline|moneyline:opp": 0.08,
         "soccer:first_half_total|total": 0.12,
+        # Near-deterministic containment (tight 99% CI, both hitting the clamp);
+        # modest band consistent with the 1H family (no live 1H book to gate on).
+        "soccer:first_half_moneyline|first_half_total:team": 0.10,
+        "soccer:first_half_moneyline|first_half_total:tie": 0.10,
         "nfl:moneyline|total": 0.05,
         "nfl:spread|total": 0.05,
         "nfl:moneyline|spread": 0.05,

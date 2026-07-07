@@ -217,6 +217,26 @@ def _winner_period_prior(
     return _lookup_pair(f"{key}:{orient}", sport, params)
 
 
+def _period_total_prior(
+    key: str, sport: str, params: SgpParams, ml_ticker: str
+) -> _PairPrior | None:
+    """1H-winner × 1H-total prior (WITHIN the first half), resolved to ``:team``
+    or ``:tie`` by whether the 1H-moneyline leg names a team or the draw. The
+    sign flips HARD: a 1H lead REQUIRES a goal (lead ⊂ over ⇒ strong +ρ), whereas
+    a 1H tie CONTAINS the goalless 0-0 (under ⊂ tie ⇒ tie×over strong −ρ). Same
+    same/opposite analogue as ``_winner_period_prior`` but oriented team-vs-tie.
+    A team suffix → ``:team``; an explicit TIE/DRAW suffix → ``:tie``; anything
+    else (empty/garbage) → None so the caller falls back — never guess a sign."""
+    if _winner_team(ml_ticker) is not None:
+        orient = "team"
+    else:
+        suffix = ml_ticker.rsplit("-", 1)[-1].upper()
+        if suffix not in _DRAW_SUFFIXES:
+            return None  # unparseable winner suffix: do not invent an orientation
+        orient = "tie"
+    return _lookup_pair(f"{key}:{orient}", sport, params)
+
+
 def build_sgp_correlation(
     legs: Sequence[RfqLeg],
     same_event_groups: Sequence[Sequence[int]],
@@ -278,6 +298,18 @@ def build_sgp_correlation(
                     # 1H-winner × FT-winner: sign flips on same-vs-opposite team.
                     prior = _winner_period_prior(
                         key, sport, params, legs[i].market_ticker, legs[j].market_ticker
+                    )
+                elif pair_types == {
+                    LegType.FIRST_HALF_MONEYLINE,
+                    LegType.FIRST_HALF_TOTAL,
+                }:
+                    # 1H-winner × 1H-total: sign flips HARD on team-vs-tie
+                    # (lead⊂over ⇒ +ρ; under⊂tie ⇒ tie×over −ρ).
+                    fhm_index = (
+                        i if types[i] is LegType.FIRST_HALF_MONEYLINE else j
+                    )
+                    prior = _period_total_prior(
+                        key, sport, params, legs[fhm_index].market_ticker
                     )
                 elif (
                     types[i] is LegType.CORNERS_TEAM and types[j] is LegType.CORNERS_TEAM
