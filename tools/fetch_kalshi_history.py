@@ -45,6 +45,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import aiohttp
+
 from combomaker.exchange.rest import (
     KalshiApiError,
     KalshiRestClient,
@@ -69,10 +71,20 @@ _RETRY_BACKOFF_S = 0.5
 
 
 class _ProbeError(RuntimeError):
-    """A candle probe failed with an API error that survived retries — as
-    opposed to a legitimate empty candle window (which is a plain ``None``).
-    The distinction lets the caller skip-and-retry the WHOLE game rather than
-    crown a wrong main line from the rungs that happened to resolve."""
+    """A probe failed with an error that survived retries — as opposed to a
+    legitimate empty candle window (a plain ``None``). The distinction lets the
+    caller skip-and-retry the WHOLE game rather than crown a wrong main line
+    from the rungs that happened to resolve."""
+
+
+def _is_transient(exc: Exception) -> bool:
+    """Retryable: rate-limit (429), server (5xx), and TRANSPORT-level errors
+    (connection resets / timeouts under load, which aiohttp raises as
+    ClientError / OSError, NOT KalshiApiError — an uncaught one of these crashed
+    a full-disk run)."""
+    if isinstance(exc, KalshiApiError):
+        return isinstance(exc, RateLimitedError) or getattr(exc, "status", 0) >= 500
+    return isinstance(exc, (aiohttp.ClientError, OSError))
 
 
 def start_ts_of(game_code: str) -> int | None:
@@ -106,12 +118,11 @@ async def pregame_mid(
                 series, ticker, start_ts=start_ts - 6 * 3600, end_ts=start_ts,
                 period_interval=60,
             )
-        except KalshiApiError as exc:
-            transient = isinstance(exc, RateLimitedError) or getattr(exc, "status", 0) >= 500
-            if transient and attempt < _RETRY_ATTEMPTS - 1:
+        except (KalshiApiError, aiohttp.ClientError, OSError) as exc:
+            if _is_transient(exc) and attempt < _RETRY_ATTEMPTS - 1:
                 await asyncio.sleep(_RETRY_BACKOFF_S * (2 ** attempt))
                 continue
-            raise _ProbeError(f"{series} {ticker}: {exc}") from exc
+            raise _ProbeError(f"{series} {ticker}: {exc!r}") from exc
         candles = payload.get("candlesticks") or []
         for candle in reversed(candles):
             # wire format: dollar STRINGS ("0.4100"), key suffix _dollars
@@ -133,13 +144,21 @@ async def list_settled(rest: KalshiRestClient, series: str) -> list[dict[str, An
     markets: list[dict[str, Any]] = []
     cursor: str | None = None
     while True:
-        await asyncio.sleep(_THROTTLE_S)
         params: dict[str, str | int] = {
             "series_ticker": series, "status": "settled", "limit": 1000,
         }
         if cursor:
             params["cursor"] = cursor
-        payload = await rest.get_markets(**params)
+        for attempt in range(_RETRY_ATTEMPTS):
+            await asyncio.sleep(_THROTTLE_S)
+            try:
+                payload = await rest.get_markets(**params)
+                break
+            except (KalshiApiError, aiohttp.ClientError, OSError) as exc:
+                if _is_transient(exc) and attempt < _RETRY_ATTEMPTS - 1:
+                    await asyncio.sleep(_RETRY_BACKOFF_S * (2 ** attempt))
+                    continue
+                raise _ProbeError(f"list_settled {series}: {exc!r}") from exc
         markets.extend(payload.get("markets") or [])
         cursor = payload.get("cursor")
         if not cursor:
@@ -339,8 +358,13 @@ async def main() -> None:
 
     async with KalshiRestClient(BASE, None) as rest:
         for sport in sports:
-            await fetch_main(rest, sport)
-            await fetch_spreads(rest, sport)
+            # A persistent probe/list failure aborts THIS sport (resumable on a
+            # later run) without killing the others.
+            try:
+                await fetch_main(rest, sport)
+                await fetch_spreads(rest, sport)
+            except _ProbeError as exc:
+                print(f"[{sport}] aborted (retry later): {exc}")
 
 
 if __name__ == "__main__":

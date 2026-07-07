@@ -86,6 +86,29 @@ class TestPregameMid:
             asyncio.run(fetch.pregame_mid(rest, "S", "T", 1000))
         assert rest.calls == fetch._RETRY_ATTEMPTS
 
+    def test_transport_error_is_retried(self) -> None:
+        # aiohttp connection resets under load are OSError/ClientError, NOT
+        # KalshiApiError — an uncaught one crashed a heavy run. Must be retried.
+        import aiohttp
+
+        def boom(i: int) -> dict:
+            raise aiohttp.ClientConnectionError("connection reset by peer")
+
+        rest = _FakeRest(boom)
+        with pytest.raises(fetch._ProbeError):
+            asyncio.run(fetch.pregame_mid(rest, "S", "T", 1000))
+        assert rest.calls == fetch._RETRY_ATTEMPTS
+
+    def test_transport_error_then_success_recovers(self) -> None:
+        def flaky(i: int) -> dict:
+            if i < 1:
+                raise OSError("connection reset")
+            return {"candlesticks": [_candle("0.49", "0.51")]}
+
+        rest = _FakeRest(flaky)
+        assert asyncio.run(fetch.pregame_mid(rest, "S", "T", 1000)) == pytest.approx(0.50)
+        assert rest.calls == 2
+
 
 class TestFileSafety:
     def test_need_header_on_missing_and_empty(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
