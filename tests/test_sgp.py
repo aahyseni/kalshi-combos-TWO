@@ -20,6 +20,8 @@ ML_NYY_TICKER = "KXMLBGAME-26JUL081840NYYTB-NYY"
 ML_TB_TICKER = "KXMLBGAME-26JUL081840NYYTB-TB"
 ML_WNBA_TICKER = "KXWNBAGAME-26JUL06NYLLVA-NYL"
 WEIRD_TICKER = "KXHIGHNY-26JUL06-B90"  # classifies UNKNOWN
+GOAL2_TICKER = "KXWCGOAL-26JUL05MEXENG-ENGHSMITH8-1"  # a 2nd scorer, same game
+ML_SOCCER_TICKER = "KXWCGAME-26JUL05MEXENG-MEX"
 
 
 def leg(market: str, event: str | None = None) -> RfqLeg:
@@ -274,3 +276,32 @@ def test_mixed_same_event_pair_plus_cross_event_leg() -> None:
     assert out.notes == ()
     for m in (out.corr, out.corr_low, out.corr_high):
         assert is_psd(m)
+
+
+class TestScorerAndCornerPairs:
+    """The corners+scorer wiring (2026-07-07): every pair below previously fell
+    to the flat same-event default (0.6) — now it resolves a typed soccer ρ."""
+
+    def _rho(self, t1: str, t2: str) -> tuple[float, int]:
+        sgp = build_sgp_correlation([leg(t1), leg(t2)], [(0, 1)], soccer_params())
+        return float(sgp.corr[0, 1]), sgp.typed_pairs
+
+    def test_player_goal_player_goal_resolves(self) -> None:
+        # teammates ~0 (Poisson-splitting) / opposing +0.05 -> single +0.03,
+        # NOT the flat 0.6 that over-stated two-scorer joints by ~60%.
+        rho, typed = self._rho(GOAL_TICKER, GOAL2_TICKER)
+        assert typed == 1 and rho == pytest.approx(0.03)
+
+    def test_player_goal_total_resolves(self) -> None:
+        rho, typed = self._rho(GOAL_TICKER, TOTAL_TICKER)
+        assert typed == 1 and rho == pytest.approx(0.46)
+
+    def test_btts_player_goal_resolves(self) -> None:
+        rho, typed = self._rho(BTTS_TICKER, GOAL_TICKER)
+        assert typed == 1 and rho == pytest.approx(0.45)
+
+    def test_corners_moneyline_no_longer_flat_default(self) -> None:
+        # The blind 0.6 same-event default is dead: corners|moneyline is a typed
+        # 0.00 (the only-seen corner market is TOTAL corners, indep of result).
+        rho, typed = self._rho(CORNERS_TICKER, ML_SOCCER_TICKER)
+        assert typed == 1 and rho == pytest.approx(0.00)

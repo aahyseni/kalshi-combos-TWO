@@ -161,9 +161,12 @@ class CorrelationConfig(StrictModel):
             "btts|moneyline:fav": -0.19,
             "btts|moneyline:dog": 0.00,
             "moneyline|player_goal": 0.50,
-            "btts|player_goal": 0.35,
+            "btts|player_goal": 0.45,        # 0.35->0.45: a scorer guarantees one BTTS leg
+            "player_goal|total": 0.46,       # measured +0.46 (Understat 3,652); was global 0.40
+            "player_goal|player_goal": 0.03,  # teammates ~0 (Poisson-split, exact) / opp +0.05
             "total|total": 0.95,
             "corners|total": 0.00,
+            "corners|moneyline": 0.00,       # only-seen corner mkt = TOTAL corners, ⊥ result
             "btts|corners": 0.00,
             "moneyline|moneyline": -0.95,
             # Period (1st-half) × full-time, CALIBRATED 2026-07-07 on 8,981 club
@@ -228,6 +231,9 @@ class CorrelationConfig(StrictModel):
         "soccer:total|total": 0.04,
         "soccer:corners|total": 0.08,
         "soccer:btts|corners": 0.08,
+        "soccer:corners|moneyline": 0.15,        # spans total(0) -> team(-0.15) regimes
+        "soccer:player_goal|total": 0.15,        # hand-prior width around measured +0.46
+        "soccer:player_goal|player_goal": 0.10,  # teammate(0)/opponent(+0.05) blend band
         "soccer:moneyline|moneyline": 0.04,
         # Period × full-time bands (results_soccer.md §1: era-stability proxy,
         # not the conditional-MLE gate — no live 1H book yet — so kept modest).
