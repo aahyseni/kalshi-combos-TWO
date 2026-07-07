@@ -148,11 +148,11 @@ def test_two_games_two_legs_each_form_two_blocks() -> None:
     assert rel.same_event_groups == ((0, 1), (2, 3))  # per-game blocks
 
 
-def test_period_market_stays_out_of_full_game_block() -> None:
-    """A first-half total shares a game code with the full-game markets but is
-    NOT yet modeled for correlation — it must stay OUT of the same-game block
-    (else the classifier mis-types it as a full-game total). The full-game
-    GAME+TOTAL still group; the 1H leg is left independent."""
+def test_period_market_now_rejoins_full_game_block() -> None:
+    """A first-half total shares a game code with the full-game markets and now
+    REJOINS the same-game block so the copula can correlate the (modeled) 1H×FT
+    pair — it no longer prices at independence. It is kept off the full-game
+    STRUCTURAL inverter by a guard in structural.py, not by grouping it out."""
     legs = (
         leg("KXWCGAME-26JUL05MEXENG-MEX", "KXWCGAME-26JUL05MEXENG", "yes"),
         leg("KXWCTOTAL-26JUL05MEXENG-3", "KXWCTOTAL-26JUL05MEXENG", "yes"),
@@ -160,7 +160,54 @@ def test_period_market_stays_out_of_full_game_block() -> None:
     )
     rel = classify_legs(legs, ExplodingProvider())
     assert rel.kind is RelationshipKind.OK
-    assert rel.same_event_groups == ((0, 1),)  # 1H leg excluded from the block
+    assert rel.same_event_groups == ((0, 1, 2),)  # 1H leg joins the block
+
+
+# --- period × full-time BTTS containment -----------------------------------------
+
+
+FH_BTTS = "KXWC1HBTTS-26JUL05MEXENG-BTTS"
+FH_BTTS_EV = "KXWC1HBTTS-26JUL05MEXENG"
+FT_BTTS = "KXWCBTTS-26JUL05MEXENG-BTTS"
+FT_BTTS_EV = "KXWCBTTS-26JUL05MEXENG"
+
+
+def test_1h_btts_yes_ft_btts_yes_is_containment() -> None:
+    """1H-BTTS yes ⟹ FT-BTTS yes: the joint is exactly P(1H-BTTS), so the pair
+    classifies CONTAINMENT with the subset (1H) → superset (FT) indices."""
+    legs = (leg(FH_BTTS, FH_BTTS_EV, "yes"), leg(FT_BTTS, FT_BTTS_EV, "yes"))
+    rel = classify_legs(legs, ExplodingProvider())  # single-leg events: no lookup
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containment == (0, 1)
+
+
+def test_1h_btts_yes_ft_btts_no_is_impossible() -> None:
+    legs = (leg(FH_BTTS, FH_BTTS_EV, "yes"), leg(FT_BTTS, FT_BTTS_EV, "no"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.IMPOSSIBLE
+    assert rel.containment is None
+
+
+def test_containment_pair_in_larger_combo_is_unknown() -> None:
+    """A containment pair mixed with other correlated legs is not yet priced
+    coherently — widen-or-no-quote, never a copula guess (defense #2)."""
+    legs = (
+        leg(FH_BTTS, FH_BTTS_EV, "yes"),
+        leg(FT_BTTS, FT_BTTS_EV, "yes"),
+        leg("KXWCTOTAL-26JUL05MEXENG-3", "KXWCTOTAL-26JUL05MEXENG", "yes"),
+    )
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.UNKNOWN
+
+
+def test_1h_btts_different_game_is_not_containment() -> None:
+    """1H-BTTS and FT-BTTS of DIFFERENT games carry no logical relation."""
+    legs = (
+        leg(FH_BTTS, FH_BTTS_EV, "yes"),
+        leg("KXWCBTTS-26JUL06ARGEGY-BTTS", "KXWCBTTS-26JUL06ARGEGY", "no"),
+    )
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK  # cross-game: no containment/impossible
 
 
 def test_mutual_exclusion_still_caught_within_a_game() -> None:

@@ -133,3 +133,31 @@ async def test_no_sizing_mode_is_unknown() -> None:
     result = engine.price(rfq, time_to_close_s=100_000)
     assert isinstance(result, NoQuote)
     assert result.reason == ReasonCode.SKIP_CLASSIFIER_UNKNOWN
+
+
+async def test_btts_containment_prices_at_subset_marginal_not_independence() -> None:
+    from combomaker.core.money import cc_from_prob
+    from combomaker.pricing.legs import KalshiBookSource
+
+    fh_btts = "KXWC1HBTTS-26JUL05MEXENG-BTTS"
+    ft_btts = "KXWCBTTS-26JUL05MEXENG-BTTS"
+    h = Harness()
+    await h.with_books([fh_btts, ft_btts])  # identical books => equal marginals
+    h.with_meta("KXMVE-C1")
+    seed_event(h, "KXWC1HBTTS-26JUL05MEXENG", exclusive=None)
+    seed_event(h, "KXWCBTTS-26JUL05MEXENG", exclusive=None)
+    engine = PricingEngine(h.feed, h.metadata, DOC_ASSUMED, PricingConfig())
+    rfq = combo(
+        [
+            {"market_ticker": fh_btts, "side": "yes", "event_ticker": "KXWC1HBTTS-26JUL05MEXENG"},
+            {"market_ticker": ft_btts, "side": "yes", "event_ticker": "KXWCBTTS-26JUL05MEXENG"},
+        ]
+    )
+    result = engine.price(rfq, time_to_close_s=100_000)
+    assert isinstance(result, ConstructedQuote), result
+    p = KalshiBookSource(h.feed).marginal(fh_btts)
+    assert p is not None
+    # Containment pins the fair at P(1H-BTTS) exactly, well above the
+    # independence product P(1H-BTTS)*P(FT-BTTS) the copula would have produced.
+    assert result.fair_cc == cc_from_prob(p.p)
+    assert result.fair_cc > cc_from_prob(p.p * p.p)

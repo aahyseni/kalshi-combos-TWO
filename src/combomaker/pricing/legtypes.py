@@ -10,6 +10,7 @@ by itself — it falls back to the flat same-event prior with WIDER uncertainty
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 
 
@@ -22,6 +23,16 @@ class LegType(StrEnum):
     ADVANCE = "advance"            # team advances / series outcome
     EXTRAS = "extras"              # extra innings / overtime style props
     SPREAD = "spread"
+    # First-half (period) soccer families. A period market settles on a
+    # DIFFERENT window (half-time, not full-time), so it must never share a
+    # LegType with its full-game sibling — a 1H total reported as a full-game
+    # TOTAL is a wrong-settlement-window bug (it would price on the full-game
+    # scoreline grid and correlate as full-game total|total). Only the 1st
+    # half is modeled today (period × full-time correlations); other periods
+    # (2H, quarters) classify UNKNOWN so they never masquerade as full-game.
+    FIRST_HALF_MONEYLINE = "first_half_moneyline"
+    FIRST_HALF_TOTAL = "first_half_total"
+    FIRST_HALF_BTTS = "first_half_btts"
     UNKNOWN = "unknown"
 
 
@@ -39,13 +50,43 @@ _KEYWORDS: tuple[tuple[str, LegType], ...] = (
     ("GAME", LegType.MONEYLINE),
 )
 
+# Period / derived market families (first/second half, quarters). Matched
+# against the SERIES prefix only (KXWC1HTOTAL, KXWC2H, KX…FHTOTAL). These
+# settle on a different window than the full game and are structurally
+# unmodelable in the full-game inverter.
+_PERIOD_SERIES = re.compile(r"(?:1H|2H|H1|H2|FH|SH|[1-4]Q|Q[1-4]|QTR|HALF|PERIOD)")
+# First-half specifically: the only period we have measured correlations for.
+_FIRST_HALF_SERIES = re.compile(r"(?:1H|H1|FH)")
+# Full-game family → its first-half member. A first-half leg whose base family
+# is anything else (player goal, corners, spread, …) is left UNKNOWN: those
+# 1H × FT pairs are not measured yet, so they must widen, never guess.
+_FIRST_HALF_MAP: dict[LegType, LegType] = {
+    LegType.MONEYLINE: LegType.FIRST_HALF_MONEYLINE,
+    LegType.TOTAL: LegType.FIRST_HALF_TOTAL,
+    LegType.BTTS: LegType.FIRST_HALF_BTTS,
+}
+
+
+def is_period_leg(market_ticker: str) -> bool:
+    """True for a period/derived market (first/second half, quarter). Gates the
+    structural inverter (no half-time scoreline window) and the same-game
+    regroup — matched on the SERIES prefix only."""
+    series = market_ticker.split("-", 1)[0].upper()
+    return _PERIOD_SERIES.search(series) is not None
+
 
 def classify_leg(market_ticker: str) -> LegType:
     series = market_ticker.split("-", 1)[0].upper()
+    base = LegType.UNKNOWN
     for keyword, leg_type in _KEYWORDS:
         if keyword in series:
-            return leg_type
-    return LegType.UNKNOWN
+            base = leg_type
+            break
+    if _PERIOD_SERIES.search(series):
+        if _FIRST_HALF_SERIES.search(series):
+            return _FIRST_HALF_MAP.get(base, LegType.UNKNOWN)
+        return LegType.UNKNOWN  # unmodeled period (2H/quarter): never full-game
+    return base
 
 
 def pair_key(a: LegType, b: LegType) -> str:

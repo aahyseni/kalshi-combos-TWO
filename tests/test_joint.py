@@ -4,7 +4,12 @@ import math
 
 import pytest
 
-from combomaker.pricing.joint import CorrelationParams, JointEstimate, price_joint
+from combomaker.pricing.joint import (
+    CorrelationParams,
+    JointEstimate,
+    price_containment,
+    price_joint,
+)
 from combomaker.pricing.legs import LegBelief
 
 INDEPENDENT = CorrelationParams(same_event_rho=0.0, cross_event_rho=0.0, rho_uncertainty=0.0)
@@ -75,6 +80,27 @@ class TestUncertainty:
         assert est.frechet_lo == pytest.approx(frechet_lo)
         assert est.frechet_hi == pytest.approx(frechet_hi)
         assert frechet_lo <= est.p <= frechet_hi  # estimate is Frechet-clamped
+
+
+class TestContainment:
+    def test_joint_is_exactly_the_subset_marginal(self) -> None:
+        # 1H-BTTS (subset) ⟹ FT-BTTS (superset): joint == P(1H-BTTS), NOT the
+        # independence product 0.30*0.55.
+        est = price_containment([belief(0.30, 0.02), belief(0.55, 0.04)], ["yes", "yes"], (0, 1))
+        assert est.p == pytest.approx(0.30)
+        assert est.p != pytest.approx(0.30 * 0.55)
+        assert est.uncertainty == pytest.approx(0.02)  # tracks the subset leg
+        assert any("containment" in n for n in est.notes)
+
+    def test_inconsistent_market_clamps_to_frechet_upper(self) -> None:
+        # If the book misprices the subset above the superset, the joint can't
+        # exceed the smaller marginal (Fréchet upper bound).
+        est = price_containment([belief(0.60), belief(0.55)], ["yes", "yes"], (0, 1))
+        assert est.p == pytest.approx(0.55)
+
+    def test_mismatched_lengths_raise(self) -> None:
+        with pytest.raises(ValueError):
+            price_containment([belief(0.5)], ["yes", "yes"], (0, 1))
 
 
 class TestValidation:

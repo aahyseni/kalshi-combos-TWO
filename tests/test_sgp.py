@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from combomaker.ops.config import CorrelationConfig
 from combomaker.pricing.copula import is_psd
 from combomaker.pricing.sgp import SgpParams, build_sgp_correlation
 from combomaker.rfq.models import RfqLeg
@@ -42,6 +43,74 @@ def params(
         typed_uncertainty=typed_uncertainty,
         untyped_uncertainty=untyped_uncertainty,
     )
+
+
+def soccer_params() -> SgpParams:
+    """SgpParams built from the SHIPPED soccer config, so the 1H×FT tests
+    exercise the real calibrated numbers (mirrors PricingEngine wiring)."""
+    c = CorrelationConfig()
+    return SgpParams(
+        pair_rho=dict(c.pair_rho),
+        default_rho=c.same_event_rho,
+        cross_event_rho=c.cross_event_rho,
+        typed_uncertainty=c.typed_rho_uncertainty,
+        untyped_uncertainty=c.untyped_rho_uncertainty,
+        pair_uncertainty=dict(c.pair_rho_uncertainty),
+        pair_rho_by_sport={s: dict(t) for s, t in c.pair_rho_by_sport.items()},
+    )
+
+
+# 1H × full-time soccer tickers (same MEX/ENG game).
+FH_ML_MEX = "KXWC1HGAME-26JUL05MEXENG-MEX"
+FT_ML_MEX = "KXWCGAME-26JUL05MEXENG-MEX"
+FT_ML_ENG = "KXWCGAME-26JUL05MEXENG-ENG"
+FH_TOTAL = "KXWC1HTOTAL-26JUL05MEXENG-1"
+FT_TOTAL = "KXWCTOTAL-26JUL05MEXENG-3"
+
+
+# --- period × full-time (1H×FT) pairs ---------------------------------------------
+
+
+def test_first_half_winner_same_team_gets_positive_prior() -> None:
+    # [1H-winner-MEX, FT-winner-MEX] -> :same = +0.71, band 0.08. NOT independence.
+    out = build_sgp_correlation(
+        (leg(FH_ML_MEX, "EV"), leg(FT_ML_MEX, "EV")), [(0, 1)], soccer_params()
+    )
+    assert out.corr[0, 1] == pytest.approx(0.71)
+    assert out.corr_low[0, 1] == pytest.approx(0.63)
+    assert out.corr_high[0, 1] == pytest.approx(0.79)
+    assert out.typed_pairs == 1 and out.untyped_pairs == 0
+
+
+def test_first_half_winner_opposite_team_gets_negative_prior() -> None:
+    # [1H-winner-MEX, FT-winner-ENG] -> :opp = -0.67. Sign flips vs :same.
+    out = build_sgp_correlation(
+        (leg(FH_ML_MEX, "EV"), leg(FT_ML_ENG, "EV")), [(0, 1)], soccer_params()
+    )
+    assert out.corr[0, 1] == pytest.approx(-0.67)
+    assert out.typed_pairs == 1 and out.untyped_pairs == 0
+
+
+def test_first_half_total_gets_positive_prior() -> None:
+    out = build_sgp_correlation(
+        (leg(FH_TOTAL, "EV"), leg(FT_TOTAL, "EV")), [(0, 1)], soccer_params()
+    )
+    assert out.corr[0, 1] == pytest.approx(0.73)
+    assert out.corr_low[0, 1] == pytest.approx(0.61)
+    assert out.corr_high[0, 1] == pytest.approx(0.85)
+    assert out.typed_pairs == 1 and out.untyped_pairs == 0
+
+
+def test_first_half_winner_with_draw_leg_falls_back_to_flat() -> None:
+    # A draw-involving 1H winner pair is UNMEASURED -> untyped flat prior, not a
+    # guessed number.
+    out = build_sgp_correlation(
+        (leg("KXWC1HGAME-26JUL05MEXENG-TIE", "EV"), leg(FT_ML_MEX, "EV")),
+        [(0, 1)],
+        soccer_params(),
+    )
+    assert out.untyped_pairs == 1 and out.typed_pairs == 0
+    assert out.corr[0, 1] == pytest.approx(soccer_params().default_rho)
 
 
 # --- cross-event pairs --------------------------------------------------------

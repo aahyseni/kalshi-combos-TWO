@@ -58,7 +58,13 @@ from combomaker.pricing.dixon_coles import (
 )
 from combomaker.pricing.joint import JointEstimate
 from combomaker.pricing.legs import LegBelief
-from combomaker.pricing.legtypes import LegType, Sport, classify_leg, classify_sport
+from combomaker.pricing.legtypes import (
+    LegType,
+    Sport,
+    classify_leg,
+    classify_sport,
+    is_period_leg,
+)
 from combomaker.pricing.margin_total import (
     GameTotalOver,
     MTLegSpec,
@@ -213,6 +219,15 @@ class StructuralPricer:
     ) -> tuple[JointEstimate | None, str | None]:
         """(estimate, None) on success; (None, reason) -> copula fallback."""
         try:
+            # Period legs (1H/2H/quarter) now rejoin the same-game copula group
+            # (relationships._game_key), which makes this path REACHABLE for a
+            # combo carrying one. The full-game inverter has no half-time
+            # scoreline window, so a period leg here is a wrong-settlement-window
+            # bug — fail closed to the copula.
+            if any(is_period_leg(leg.market_ticker) for leg in legs):
+                raise StructuralError(
+                    "combo contains a period leg (no half-time scoreline window)"
+                )
             sports = {classify_sport(leg.market_ticker) for leg in legs}
             if len(sports) != 1:
                 raise StructuralError("legs span multiple sports")
@@ -596,8 +611,11 @@ def structural_applicable(
     legs: list[RfqLeg], same_event_groups: Sequence[Sequence[int]]
 ) -> bool:
     """Cheap pre-check: a structurally-modeled sport, all legs in ONE
-    same-event group."""
+    same-event group, and NO period leg (the inverter has no half-time
+    window — period legs correlate in the copula but must never reach it)."""
     if not legs:
+        return False
+    if any(is_period_leg(leg.market_ticker) for leg in legs):
         return False
     sports = {classify_sport(leg.market_ticker) for leg in legs}
     if len(sports) != 1 or sports.pop() not in (Sport.SOCCER, Sport.MLB, *_MT_SPORTS):

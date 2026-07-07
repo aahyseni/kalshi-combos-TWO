@@ -429,6 +429,22 @@ class TestApplicability:
         legs = [leg("KXUFCFIGHT-26JUL11MCGHOL-HOL"), leg("KXUFCFIGHT-26JUL11ABCDEF-ABC")]
         assert not structural_applicable(legs, [(0, 1)])
 
+    def test_period_leg_declines_even_in_one_soccer_group(self) -> None:
+        # Period legs now rejoin the same-game copula group, so this guard is
+        # the reachable barrier keeping a 1H leg off the full-game inverter.
+        legs = [leg(f"KXWC1HTOTAL-{GAME}-2"), leg(TOTAL)]
+        assert not structural_applicable(legs, [(0, 1)])
+
+
+class TestPeriodGuard:
+    def test_try_price_declines_a_period_leg(self) -> None:
+        est, reason = pricer(dc_rho=0.0).try_price(
+            [leg(f"KXWC1HTOTAL-{GAME}-2"), leg(TOTAL)],
+            [belief(0.40), belief(0.55)],
+            ["yes", "yes"],
+        )
+        assert est is None and reason is not None and "period leg" in reason
+
 
 async def wc_engine(config: PricingConfig) -> PricingEngine:
     from tests.test_feed import snapshot_env

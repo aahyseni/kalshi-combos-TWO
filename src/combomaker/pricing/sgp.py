@@ -58,6 +58,11 @@ def _clamp(rho: float) -> float:
 _ORIENT_DOG_MAX = 0.45
 _ORIENT_FAV_MIN = 0.55
 
+# A winner leg whose named side is a draw (not a team) — the 1H-winner ×
+# FT-winner correlation is measured team-vs-team only, so a draw leg has no
+# calibrated orientation and must fall back to the flat prior.
+_DRAW_SUFFIXES = ("TIE", "DRAW")
+
 
 @dataclass(frozen=True, slots=True)
 class _PairPrior:
@@ -103,6 +108,34 @@ def _oriented_prior(
         band=max(fav.band, dog.band),
         source=f"{fav.source if w >= 0.5 else dog.source} (ml_p={ml_marginal:.2f} w={w:.2f})",
     )
+
+
+def _winner_team(ticker: str) -> str | None:
+    """The team code a (1H- or full-game) moneyline leg names — its ticker's
+    last hyphen segment. None for a draw side, which has no measured 1H×FT
+    orientation. Two same-game winner legs name the SAME team iff these strings
+    match (both are drawn from the one game's team-code vocabulary)."""
+    suffix = ticker.rsplit("-", 1)[-1].upper()
+    if not suffix or suffix in _DRAW_SUFFIXES:
+        return None
+    return suffix
+
+
+def _winner_period_prior(
+    key: str, sport: str, params: SgpParams, ticker_a: str, ticker_b: str
+) -> _PairPrior | None:
+    """1H-winner × FT-winner prior, resolved to ``:same`` / ``:opp`` by whether
+    the two winner legs name the same team (+ρ) or opposite teams (−ρ). This is
+    the same/opposite analogue of ``_oriented_prior``'s fav/dog blend, but the
+    choice is HARD (a sign flip), not a marginal-blended interpolation. A
+    draw-involving pair is unmeasured → None (caller falls back to the flat
+    prior; do not invent a number)."""
+    team_a = _winner_team(ticker_a)
+    team_b = _winner_team(ticker_b)
+    if team_a is None or team_b is None:
+        return None
+    orient = "same" if team_a == team_b else "opp"
+    return _lookup_pair(f"{key}:{orient}", sport, params)
 
 
 def build_sgp_correlation(
@@ -151,12 +184,19 @@ def build_sgp_correlation(
                 untyped += 1
                 notes.append(f"untyped pair {key}: flat prior {rho}")
             else:
-                one_moneyline = (types[i] is LegType.MONEYLINE) != (
-                    types[j] is LegType.MONEYLINE
-                )
-                if one_moneyline and marginals is not None:
-                    ml_index = i if types[i] is LegType.MONEYLINE else j
-                    prior = _oriented_prior(key, sport, params, marginals[ml_index])
+                pair_types = {types[i], types[j]}
+                if pair_types == {LegType.FIRST_HALF_MONEYLINE, LegType.MONEYLINE}:
+                    # 1H-winner × FT-winner: sign flips on same-vs-opposite team.
+                    prior = _winner_period_prior(
+                        key, sport, params, legs[i].market_ticker, legs[j].market_ticker
+                    )
+                else:
+                    one_moneyline = (types[i] is LegType.MONEYLINE) != (
+                        types[j] is LegType.MONEYLINE
+                    )
+                    if one_moneyline and marginals is not None:
+                        ml_index = i if types[i] is LegType.MONEYLINE else j
+                        prior = _oriented_prior(key, sport, params, marginals[ml_index])
                 prior = prior or _lookup_pair(key, sport, params)
                 if prior is not None:
                     rho, band = prior.rho, prior.band

@@ -103,6 +103,34 @@ def price_joint_matrices(
     )
 
 
+def price_containment(
+    beliefs: Sequence[LegBelief],
+    sides: Sequence[str],
+    containment: tuple[int, int],
+    *,
+    extra_notes: Sequence[str] = (),
+) -> JointEstimate:
+    """Joint of a logically-contained pair: YES(subset) ⟹ YES(superset), so
+    P(subset ∧ superset) = P(subset), exactly (the Fréchet upper bound). Used
+    for 1H-BTTS ⟹ FT-BTTS, which the copula's pairwise ρ cannot express. Only
+    the all-YES 2-leg case reaches here (relationships.py returns IMPOSSIBLE for
+    subset-yes × superset-no). ``clamp_to_frechet`` still guards the pathological
+    case of a market that misprices the subset above the superset."""
+    if len(beliefs) != len(sides) or not beliefs:
+        raise ValueError("beliefs and sides must be same nonempty length")
+    subset, _superset = containment
+    marginals = [b.p if s == "yes" else 1.0 - b.p for b, s in zip(beliefs, sides, strict=True)]
+    lo, hi = frechet_bounds(marginals)
+    # Joint tracks the subset marginal exactly, so its width is the subset leg's.
+    return JointEstimate(
+        p=clamp_to_frechet(marginals[subset], marginals),
+        uncertainty=beliefs[subset].uncertainty,
+        frechet_lo=lo,
+        frechet_hi=hi,
+        notes=(*extra_notes, f"containment: joint = P(leg {subset}) = {marginals[subset]:.4f}"),
+    )
+
+
 def price_joint(
     beliefs: Sequence[LegBelief],
     sides: Sequence[str],

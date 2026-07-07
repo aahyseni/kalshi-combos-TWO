@@ -27,7 +27,7 @@ from combomaker.marketdata.feed import OrderbookFeed
 from combomaker.marketdata.metadata import MetadataCache
 from combomaker.ops.config import PricingConfig
 from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
-from combomaker.pricing.joint import JointEstimate, price_joint_matrices
+from combomaker.pricing.joint import JointEstimate, price_containment, price_joint_matrices
 from combomaker.pricing.legs import KalshiBookSource, LegBelief, OddsSource, blend_beliefs
 from combomaker.pricing.quote import (
     ConstructedQuote,
@@ -144,7 +144,15 @@ class PricingEngine:
 
         joint: JointEstimate | None = None
         fallback_note: str | None = None
-        if self._structural is not None and structural_applicable(
+        if (
+            relationship.kind is RelationshipKind.CONTAINMENT
+            and relationship.containment is not None
+        ):
+            # Logical containment (1H-BTTS ⟹ FT-BTTS): joint = P(subset), pinned
+            # here so it never reaches the copula (which would price the pair at
+            # a pairwise ρ and under-quote the certain part).
+            joint = price_containment(beliefs, sides, relationship.containment)
+        elif self._structural is not None and structural_applicable(
             list(rfq.legs), relationship.same_event_groups
         ):
             joint, reason = self._structural.try_price(list(rfq.legs), beliefs, sides)

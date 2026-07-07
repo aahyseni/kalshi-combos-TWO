@@ -166,6 +166,18 @@ class CorrelationConfig(StrictModel):
             "corners|total": 0.00,
             "btts|corners": 0.00,
             "moneyline|moneyline": -0.95,
+            # Period (1st-half) × full-time, CALIBRATED 2026-07-07 on 8,981 club
+            # matches (football-data.co.uk HT/FT, era-stable across a 2023
+            # split; docs/calibration/results_soccer.md §1). The 1H-winner ×
+            # FT-winner sign FLIPS with team orientation — resolved by sgp.py to
+            # ":same" (both legs name one team) vs ":opp" (different teams);
+            # draw-involving winner pairs are unmeasured and fall to the flat
+            # prior. Matched-family only; cross-type (1H-winner × FT-total,
+            # 1H-spread) is DEFERRED. 1H-BTTS × FT-BTTS is not a rho — it is a
+            # logical CONTAINMENT handled in relationships.py, not here.
+            "first_half_moneyline|moneyline:same": 0.71,
+            "first_half_moneyline|moneyline:opp": -0.67,
+            "first_half_total|total": 0.73,
         },
         # NFL moneyline|total = 0.00 DOUBLY confirmed: pooled-vs-Vegas-lines
         # AND conditional-MLE (+0.02, SE 0.023) whose fit does NOT beat
@@ -217,6 +229,11 @@ class CorrelationConfig(StrictModel):
         "soccer:corners|total": 0.08,
         "soccer:btts|corners": 0.08,
         "soccer:moneyline|moneyline": 0.04,
+        # Period × full-time bands (results_soccer.md §1: era-stability proxy,
+        # not the conditional-MLE gate — no live 1H book yet — so kept modest).
+        "soccer:first_half_moneyline|moneyline:same": 0.08,
+        "soccer:first_half_moneyline|moneyline:opp": 0.08,
+        "soccer:first_half_total|total": 0.12,
         "nfl:moneyline|total": 0.05,
         "nfl:spread|total": 0.05,
         "nfl:moneyline|spread": 0.05,

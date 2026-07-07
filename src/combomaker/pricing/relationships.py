@@ -25,26 +25,19 @@ the caller must turn into widen-or-no-quote:
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
+from combomaker.pricing.legtypes import LegType, classify_leg
 from combomaker.rfq.models import RfqLeg
-
-# Period / derived market families (first/second half, quarters) — series
-# prefixes like KXWC1HTOTAL, KXWC2H, KX…FHTOTAL. These are NOT yet modeled for
-# correlation (no half-time scoreline model shipped), so they must be kept OUT
-# of a full-game same-game block, or the leg classifier mis-types e.g. a 1H
-# total as a FULL-GAME total and the structural model prices it on the wrong
-# settlement window. Matched against the SERIES prefix only.
-_PERIOD_SERIES = re.compile(r"(?:1H|2H|H1|H2|FH|SH|[1-4]Q|Q[1-4]|QTR|HALF|PERIOD)")
 
 
 class RelationshipKind(StrEnum):
     OK = "ok"                    # classified; groups usable for correlation
     IMPOSSIBLE = "impossible"    # logically zero payout — v1: no-quote
     UNKNOWN = "unknown"          # classification failed — widen-or-no-quote
+    CONTAINMENT = "containment"  # one leg logically implies another (joint pinned)
 
 
 class EventInfoProvider(Protocol):
@@ -63,6 +56,10 @@ class Relationship:
     # kept for compatibility; the key is the game code, not the event_ticker.
     same_event_groups: tuple[tuple[int, ...], ...]
     notes: tuple[str, ...]
+    # For CONTAINMENT only: (subset_index, superset_index) where a YES on the
+    # subset leg logically IMPLIES a YES on the superset leg, so the combo joint
+    # is exactly P(subset). None for every other kind.
+    containment: tuple[int, int] | None = None
 
 
 def _game_key(event_ticker: str) -> str:
@@ -73,17 +70,15 @@ def _game_key(event_ticker: str) -> str:
     same-game key. No hyphen (synthetic/degenerate ticker) ⇒ key on the whole
     string, so a leg whose event carries no game code never merges with another.
 
-    EXCEPTION: period/derived markets (first/second half, quarters — series like
-    KXWC1HTOTAL/KXWC2H) are NOT yet modeled for correlation, so they keep their
-    full series-specific event_ticker as the key and therefore never join a
-    full-game same-game block. Otherwise the classifier mis-types them as
-    full-game legs and the structural model prices them on the wrong settlement
-    window (NOTES L11). Revisit when the half-time scoreline model ships."""
-    series, sep, game = event_ticker.partition("-")
+    Period/derived markets (first/second half — series like KXWC1HTOTAL) DO now
+    key on the game code and rejoin the full-game same-game block, so the copula
+    can correlate a modeled 1H leg with its full-time siblings. They are kept
+    off the full-game STRUCTURAL inverter (no half-time scoreline window) by a
+    guard in structural.py — NOT by grouping them out here (which used to leave
+    a real 1H×FT combo pricing at independence)."""
+    _series, sep, game = event_ticker.partition("-")
     if not sep:
         return event_ticker
-    if _PERIOD_SERIES.search(series):
-        return event_ticker  # keep period markets out of the same-game block
     return game
 
 
@@ -138,6 +133,40 @@ def classify_legs(
         if exclusive and yes_count >= 2:
             notes.append(f"{yes_count} YES legs of mutually exclusive event {event_ticker}")
             return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
+
+    # Period × full-time BTTS is a LOGICAL CONTAINMENT, not a correlation: if
+    # both teams scored by half-time (1H-BTTS yes) they have both scored in the
+    # match (FT-BTTS yes). So within a game:
+    #   1H-BTTS yes × FT-BTTS no  → IMPOSSIBLE (v1 policy: no-quote)
+    #   1H-BTTS yes × FT-BTTS yes → CONTAINMENT, joint = P(1H-BTTS)
+    # Only the bare 2-leg containment combo is priced coherently; a containment
+    # pair buried in a larger combo (mixed with other correlated legs) is not
+    # yet modeled → UNKNOWN (widen-or-no-quote), never a copula guess. The
+    # subset-side "no" cases and other period families are DEFERRED (they fall
+    # to the normal grouped/copula path).
+    types = [classify_leg(leg.market_ticker) for leg in legs]
+    containment: tuple[int, int] | None = None
+    for sub in range(len(legs)):
+        if types[sub] is not LegType.FIRST_HALF_BTTS or legs[sub].side != "yes":
+            continue
+        for sup in range(len(legs)):
+            if types[sup] is not LegType.BTTS or game_keys[sup] != game_keys[sub]:
+                continue
+            if legs[sup].side == "no":
+                notes.append(
+                    f"1H-BTTS yes ({legs[sub].market_ticker}) implies FT-BTTS yes: "
+                    f"{legs[sup].market_ticker} no is impossible"
+                )
+                return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
+            containment = (sub, sup)
+    if containment is not None:
+        if len(legs) != 2:
+            notes.append("1H-BTTS containment pair inside a larger combo: not modeled")
+            return Relationship(RelationshipKind.UNKNOWN, (), tuple(notes))
+        notes.append(
+            f"1H-BTTS containment: joint = P({legs[containment[0]].market_ticker})"
+        )
+        return Relationship(RelationshipKind.CONTAINMENT, (), tuple(notes), containment)
 
     # Pass 2 — per-GAME: the correlation blocks. Same-game legs from DIFFERENT
     # market families share a game code but not an event_ticker, so they must be
