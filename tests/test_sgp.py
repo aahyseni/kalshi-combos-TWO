@@ -206,8 +206,12 @@ def test_unknown_leg_forces_flat_prior_even_when_a_prior_key_exists() -> None:
         params({"total|unknown": 0.9}, default_rho=0.2, untyped_uncertainty=0.3),
     )
     assert out.corr[0, 1] == pytest.approx(0.2)
-    assert out.corr_low[0, 1] == pytest.approx(-0.1)
-    assert out.corr_high[0, 1] == pytest.approx(0.5)
+    # Fail-safe widening: fall-through band = |default_rho| + untyped_uncertainty
+    # = 0.2 + 0.3 = 0.5, so the low bound spans zero (old floor was +0.1 = 0.2 -
+    # 0.3, a confident positive that could not admit an anti-correlated pair).
+    assert out.corr_low[0, 1] == pytest.approx(-0.3)
+    assert out.corr_low[0, 1] <= 0.0
+    assert out.corr_high[0, 1] == pytest.approx(0.7)
     assert out.typed_pairs == 0
     assert out.untyped_pairs == 1
     assert len(out.notes) == 1
@@ -223,12 +227,85 @@ def test_typed_pair_without_prior_entry_uses_default_rho_and_note() -> None:
         params({"btts|total": 0.6}, default_rho=0.25, untyped_uncertainty=0.3),
     )
     assert out.corr[0, 1] == pytest.approx(0.25)
-    assert out.corr_low[0, 1] == pytest.approx(-0.05)
-    assert out.corr_high[0, 1] == pytest.approx(0.55)
+    # Fail-safe widening: band = |default_rho| + untyped = 0.25 + 0.3 = 0.55, so
+    # the low bound reaches -0.30 (old floor was -0.05); high = clamp(0.8) = 0.8.
+    assert out.corr_low[0, 1] == pytest.approx(-0.30)
+    assert out.corr_low[0, 1] <= 0.0
+    assert out.corr_high[0, 1] == pytest.approx(0.80)
     assert out.typed_pairs == 0
     assert out.untyped_pairs == 1
     assert len(out.notes) == 1
     assert "no prior for pair advance|corners" in out.notes[0]
+
+
+# --- fail-safe: default_rho fall-through band spans zero (fix #1) ----------------
+#
+# Same-game pairs that fall to the flat default_rho are only a prior-MEAN
+# positive. An unmodeled pair (e.g. MLB pitcher-strikeouts x game-total ~ -0.2)
+# could be uncorrelated OR anti-correlated, so its low matrix MUST reach <= 0 --
+# a band that can't span zero is a confident positive that invites adverse
+# selection. This is a pure WIDENING: the point estimate stays default_rho and
+# calibrated/typed pairs keep their own (narrow) band untouched.
+
+
+def test_unknown_leg_fallthrough_low_spans_zero_point_is_default_rho() -> None:
+    # (1) UNKNOWN-leg branch: point == default_rho (0.6, still the right prior
+    # for the many typical POSITIVE same-game pairs) but the band is widened so
+    # corr_low reaches into the negative regime (<= 0, and here <= -0.2).
+    legs = (leg(WEIRD_TICKER, "EV"), leg(TOTAL_TICKER, "EV"))
+    out = build_sgp_correlation(
+        legs, [(0, 1)], params(default_rho=0.6, untyped_uncertainty=0.3)
+    )
+    assert out.corr[0, 1] == pytest.approx(0.6)  # point unchanged: flat prior
+    assert out.corr_low[0, 1] <= 0.0  # low spans zero (fail-safe)
+    assert out.corr_low[0, 1] <= -0.2  # ...and reaches the anti-correlated regime
+    # band = |0.6| + 0.3 = 0.9 -> clamp(0.6 - 0.9) = -0.3; high = clamp(1.5) = 0.95.
+    assert out.corr_low[0, 1] == pytest.approx(-0.3)
+    assert out.corr_high[0, 1] == pytest.approx(0.95)
+    assert out.untyped_pairs == 1 and out.typed_pairs == 0
+
+
+def test_typed_no_prior_fallthrough_low_spans_zero() -> None:
+    # (2) TYPED pair with NO config entry (advance|corners is absent from every
+    # table here) also falls through and must widen the same way.
+    legs = (leg(ADVANCE_TICKER, "EV"), leg(CORNERS_TICKER, "EV"))
+    out = build_sgp_correlation(
+        legs, [(0, 1)], params({"btts|total": 0.6}, default_rho=0.6, untyped_uncertainty=0.3)
+    )
+    assert out.corr[0, 1] == pytest.approx(0.6)  # point stays default_rho
+    assert out.corr_low[0, 1] <= 0.0  # low spans zero
+    assert out.corr_low[0, 1] <= -0.2
+    assert out.corr_low[0, 1] == pytest.approx(-0.3)
+    assert out.untyped_pairs == 1 and out.typed_pairs == 0
+
+
+def test_calibrated_pair_band_is_unchanged_and_tight() -> None:
+    # (3) A CALIBRATED pair keeps its own tight band -- the widening touches ONLY
+    # the default_rho fall-through. Soccer btts|total = 0.70 with band 0.12
+    # (soccer:btts|total): corr_low stays STRICTLY POSITIVE.
+    legs = (leg(BTTS_TICKER, "EV"), leg(TOTAL_TICKER, "EV"))
+    out = build_sgp_correlation(legs, [(0, 1)], soccer_params())
+    assert out.corr[0, 1] == pytest.approx(0.70)
+    assert out.corr_low[0, 1] == pytest.approx(0.58)  # 0.70 - 0.12, tight
+    assert out.corr_high[0, 1] == pytest.approx(0.82)  # 0.70 + 0.12
+    assert out.corr_low[0, 1] > 0.0  # calibrated pair does NOT widen to zero
+    assert out.typed_pairs == 1 and out.untyped_pairs == 0
+
+
+def test_property_fallthrough_widens_calibrated_does_not() -> None:
+    # Property: EVERY default_rho fall-through pair has corr_low <= 0; NO
+    # calibrated pair widens (its corr_low stays strictly positive). Assembled in
+    # one 3-leg combo: an UNKNOWN leg + a calibrated soccer btts|total pair.
+    legs = (leg(WEIRD_TICKER, "EV"), leg(BTTS_TICKER, "EV"), leg(TOTAL_TICKER, "EV"))
+    out = build_sgp_correlation(legs, [(0, 1, 2)], soccer_params())
+    # Fall-through pairs (either pair touching the UNKNOWN leg 0): low <= 0.
+    for j in (1, 2):
+        assert out.corr[0, j] == pytest.approx(soccer_params().default_rho)
+        assert out.corr_low[0, j] <= 0.0
+    # Calibrated btts|total pair (legs 1,2): unchanged tight positive band.
+    assert out.corr[1, 2] == pytest.approx(0.70)
+    assert out.corr_low[1, 2] > 0.0
+    assert out.untyped_pairs == 2 and out.typed_pairs == 1
 
 
 # --- PSD repair ------------------------------------------------------------------

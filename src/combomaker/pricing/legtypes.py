@@ -15,8 +15,14 @@ from enum import StrEnum
 
 
 class LegType(StrEnum):
-    MONEYLINE = "moneyline"        # game/match winner (…GAME, …FIGHT)
-    TOTAL = "total"                # over/under team-or-game totals
+    MONEYLINE = "moneyline"        # game/match winner (…GAME, …FIGHT, …MATCH)
+    TOTAL = "total"                # over/under GAME totals (both teams combined)
+    # A single TEAM's total (series KX<SPORT>TEAMTOTAL-…-<TEAM>N). "TEAMTOTAL"
+    # contains "TOTAL", so without a dedicated keyword (matched first) these
+    # mis-type as a game TOTAL and would price/correlate on the game-total grid.
+    # CLASSIFY-ONLY: no structural pricing yet — team-total pairs fall through to
+    # the copula default (intended), they just must not masquerade as game TOTAL.
+    TEAM_TOTAL = "team_total"
     BTTS = "btts"                  # both teams to score
     PLAYER_GOAL = "player_goal"    # player scoring props (…GOAL-…PLAYER…)
     CORNERS = "corners"            # TOTAL corners (series KXWCCORNERS-…-N)
@@ -42,6 +48,11 @@ class LegType(StrEnum):
 _KEYWORDS: tuple[tuple[str, LegType], ...] = (
     ("GOAL", LegType.PLAYER_GOAL),
     ("BTTS", LegType.BTTS),
+    # TEAMTOTAL must precede TOTAL (it contains it). SOURCE OF TRUTH (prod RFQ
+    # tape + Kalshi API): a single team's total is KX<SPORT>TEAMTOTAL-…-<TEAM>N
+    # (e.g. KXNFLTEAMTOTAL-…-SEA24), distinct from the game TOTAL (…-N). Same
+    # precede-the-superstring pattern as TCORNERS-before-CORNERS below.
+    ("TEAMTOTAL", LegType.TEAM_TOTAL),
     ("TOTAL", LegType.TOTAL),
     # TCORNERS must precede CORNERS (it contains it). SOURCE OF TRUTH (RFQ tape
     # 2026-07-07): team corners = KXWCTCORNERS, total corners = KXWCCORNERS.
@@ -52,6 +63,11 @@ _KEYWORDS: tuple[tuple[str, LegType], ...] = (
     ("SPREAD", LegType.SPREAD),
     ("FIGHT", LegType.MONEYLINE),
     ("GAME", LegType.MONEYLINE),
+    # Tennis match winner: KX{ATP,WTA}[CHALLENGER]MATCH-…-<PLAYER>. "MATCH" is
+    # not a substring of any other sport's series family (GOAL/BTTS/TOTAL/
+    # CORNERS/ADVANCE/EXTRAS/SPREAD/FIGHT/GAME), so no collision with the
+    # entries above; ordering among the MONEYLINE group is immaterial.
+    ("MATCH", LegType.MONEYLINE),
 )
 
 # Period / derived market families (first/second half, quarters). Matched
@@ -119,6 +135,7 @@ class Sport(StrEnum):
     NFL = "nfl"
     NHL = "nhl"
     UFC = "ufc"
+    TENNIS = "tennis"
     UNKNOWN = "unknown"
 
 
@@ -131,6 +148,12 @@ _SPORT_KEYWORDS: tuple[tuple[str, Sport], ...] = (
     ("NFL", Sport.NFL),
     ("NHL", Sport.NHL),
     ("UFC", Sport.UFC),
+    # Tennis: KX{ATP,WTA}[CHALLENGER]MATCH-…. "ATP"/"WTA" are not substrings of
+    # any existing series prefix above (WNBA/NBA/MLB/NFL/NHL/UFC/WC/UCL/MLS/EPL/
+    # BRASILEIRO/LALIGA/SERIEA/BUNDESLIGA), and none of those are substrings of
+    # the tennis prefixes — so first-match order is safe wherever these sit.
+    ("ATP", Sport.TENNIS),
+    ("WTA", Sport.TENNIS),
     ("WC", Sport.SOCCER),
     ("UCL", Sport.SOCCER),
     ("MLS", Sport.SOCCER),

@@ -3,8 +3,11 @@
 Replaces the flat same-event ρ with a SIGNED per-pair prior keyed by the two
 legs' structural types (YES–YES orientation; the copula sign-flips NO-side
 legs downstream). Every prior carries its own uncertainty band; untyped pairs
-fall back to the flat prior with a WIDER band. Calibration from co-settlement
-data updates the config table — never this code.
+fall back to the flat prior with a band WIDE ENOUGH TO SPAN ZERO — an unmodeled
+same-game pair is only a prior-mean positive and could be uncorrelated or
+anti-correlated, so its low matrix must reach the negative regime (fail-safe
+against adverse selection). Calibration from co-settlement data updates the
+config table — never this code.
 
 The output is three PSD correlation matrices (low / point / high) so the
 joint can be re-priced across the band and the spread priced into width.
@@ -169,6 +172,16 @@ def build_sgp_correlation(
 
     typed = untyped = 0
     notes: list[str] = []
+    # Fail-safe band for pairs that fall through to ``default_rho`` (a leg types
+    # UNKNOWN, or a typed pair has no calibrated prior). The flat prior is only a
+    # prior-MEAN positive: such a pair could be uncorrelated or truly negative
+    # (e.g. MLB pitcher-strikeouts × game-total ≈ −0.2). Widen the band to at
+    # least ``|default_rho| + untyped_uncertainty`` so ``corr_low =
+    # clamp(default_rho − band)`` reaches ≤ 0 into the negative regime — never a
+    # confident positive whose low bound can't span zero. This is a pure
+    # WIDENING: the point estimate stays ``default_rho`` and calibrated/typed
+    # pairs (which resolve their own tight band) are untouched.
+    fallback_band = abs(params.default_rho) + params.untyped_uncertainty
     for i in range(n):
         for j in range(i + 1, n):
             same_event = (
@@ -180,7 +193,7 @@ def build_sgp_correlation(
             sport = str(classify_sport(legs[i].market_ticker))
             prior: _PairPrior | None = None
             if types[i] is LegType.UNKNOWN or types[j] is LegType.UNKNOWN:
-                rho, band = params.default_rho, params.untyped_uncertainty
+                rho, band = params.default_rho, fallback_band
                 untyped += 1
                 notes.append(f"untyped pair {key}: flat prior {rho}")
             else:
@@ -204,7 +217,7 @@ def build_sgp_correlation(
                     if prior.source != key:  # plain global hits stay silent
                         notes.append(f"pair {prior.source}={rho:+.3f}")
                 else:
-                    rho, band = params.default_rho, params.untyped_uncertainty
+                    rho, band = params.default_rho, fallback_band
                     untyped += 1
                     notes.append(f"no prior for pair {key}: flat prior {rho}")
             point[i, j] = point[j, i] = _clamp(rho)

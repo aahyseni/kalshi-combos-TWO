@@ -85,6 +85,22 @@ _MT_SPORTS = (Sport.NFL, Sport.NBA, Sport.WNBA)
 _GAME_CODE = re.compile(r"^\d{2}[A-Z]{3}\d{2}(?:\d{4})?([A-Z0-9]{4,})$")
 _DRAW_SUFFIXES = ("TIE", "DRAW")
 
+# MLB doubleheaders append a game-number token to the team-code blob (prod RFQ
+# tape: KXMLBGAME-26JUL071835MILSTLG1-STL, blob "MILSTLG1" = MIL + STL + "G1").
+# Without stripping it the blob ends in "G1" not "STL", so _team_of anchors the
+# prefix team but NOT the suffix team → a leg naming the second team declines.
+# The token is "G" + a single digit; strip it ONLY when the remainder is a pure
+# ALPHA blob of >=4 chars (a valid two-team blob). Team codes are always
+# alphabetic, so the sole source of a digit in the blob is this doubleheader
+# suffix — the pure-alpha remainder guard means a legitimate alphanumeric code
+# can never be truncated, preserving the fail-closed contract for real shapes.
+_DOUBLEHEADER_SUFFIX = re.compile(r"([A-Z]{4,})G\d")
+
+
+def _strip_doubleheader_suffix(blob: str) -> str:
+    m = _DOUBLEHEADER_SUFFIX.fullmatch(blob)
+    return m.group(1) if m is not None else blob
+
 
 @dataclass(frozen=True, slots=True)
 class _Match:
@@ -100,7 +116,7 @@ def _parse_match(game_code: str) -> _Match | None:
     m = _GAME_CODE.match(game_code)
     if m is None:
         return None
-    codes = m.group(1)
+    codes = _strip_doubleheader_suffix(m.group(1))
     if len(codes) < 4:
         return None
     return _Match(code=codes)

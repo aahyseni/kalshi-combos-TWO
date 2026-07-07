@@ -141,6 +141,40 @@ class TestParsing:
         spec = _parse_leg(f"KXWCGOAL-{GAME}-NORHAALAND9-1", match, fmt=MatchFormat.KNOCKOUT)
         assert spec == PlayerScores(Team.B, min_goals=1, include_et=True)
 
+    def test_mlb_doubleheader_suffix_resolves_both_teams(self) -> None:
+        """SOURCE OF TRUTH (prod RFQ tape): MLB doubleheaders carry a trailing
+        game-number token (G1/G2) on the game code, e.g.
+        KXMLBGAME-26JUL071835MILSTLG1-STL where the blob is MIL+STL+G1. The
+        token is stripped before team anchoring so the SUFFIX team (STL — the
+        one that would otherwise sit before G1, not at the blob end) resolves."""
+        match = _parse_match("26JUL071835MILSTLG1")
+        assert match is not None
+        assert _team_of("MIL", match) is Team.A
+        assert _team_of("STL", match) is Team.B
+        # Game 2 of the same doubleheader strips identically.
+        match_g2 = _parse_match("26JUL072200MILSTLG2")
+        assert match_g2 is not None
+        assert _team_of("MIL", match_g2) is Team.A
+        assert _team_of("STL", match_g2) is Team.B
+
+    def test_non_doubleheader_code_unchanged(self) -> None:
+        """A NON-doubleheader game code (no trailing G-digit token) is not
+        touched — MIL/STL still resolve exactly as before."""
+        match = _parse_match("26JUL071835MILSTL")
+        assert match is not None
+        assert _team_of("MIL", match) is Team.A
+        assert _team_of("STL", match) is Team.B
+
+    def test_doubleheader_full_leg_resolves_second_team(self) -> None:
+        """A full _parse_leg on a real doubleheader ticker resolves the second
+        team rather than declining for 'neither team'."""
+        ticker = "KXMLBGAME-26JUL071835MILSTLG1-STL"
+        match = _parse_match(ticker.split("-")[1])
+        assert match is not None
+        spec = _parse_leg(ticker, match, fmt=MatchFormat.GROUP)
+        assert not isinstance(spec, str), spec
+        assert spec == TeamWin(Team.B, include_et=False)
+
 
 class TestPricing:
     # Anchors from an independent 2M-path Monte Carlo under the RULE-BOOK

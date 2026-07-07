@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from combomaker.pricing.legtypes import LegType, classify_leg, is_period_leg, pair_key
+from combomaker.pricing.legtypes import (
+    LegType,
+    Sport,
+    classify_leg,
+    classify_sport,
+    is_period_leg,
+    pair_key,
+)
 
 # --- classify_leg on real production tickers --------------------------------
 
@@ -57,6 +64,41 @@ def test_team_corners_sub_typed_from_total_corners() -> None:
     # TCORNERS keyword is matched before CORNERS (it contains it).
     assert classify_leg("KXWCTCORNERS-26JUL07SUICOL-COL5") is LegType.CORNERS_TEAM
     assert classify_leg("KXWCCORNERS-26JUL05MEXENG-10") is LegType.CORNERS
+
+
+def test_team_total_sub_typed_from_game_total() -> None:
+    # SOURCE OF TRUTH (prod RFQ tape + Kalshi API): a single team's total is a
+    # DISTINCT series KX<SPORT>TEAMTOTAL (…-<TEAM>N) vs the game TOTAL (…-N).
+    # "TEAMTOTAL" contains "TOTAL", so the keyword is matched first; without it
+    # these mis-type as a game TOTAL and would price on the game-total grid.
+    assert classify_leg("KXNFLTEAMTOTAL-26JUL08SEAKC-SEA24") is LegType.TEAM_TOTAL
+    assert classify_leg("KXNBATEAMTOTAL-26OCT10SASLAL-SAS124") is LegType.TEAM_TOTAL
+
+
+def test_game_total_still_types_total_not_team_total() -> None:
+    # Regression: adding TEAMTOTAL must not disturb plain game TOTAL markets.
+    assert classify_leg("KXWNBATOTAL-26JUL06NYLLVA-196") is LegType.TOTAL
+    assert classify_leg("KXMLBTOTAL-26JUL081840NYYTB-4") is LegType.TOTAL
+
+
+# --- tennis (match winner) ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "ticker",
+    [
+        "KXATPMATCH-26JUL08FRIZVE-ZVE",
+        "KXWTAMATCH-26JUL08SWIGAU-SWI",
+        "KXATPCHALLENGERMATCH-26JUL08FOOBAR-FOO",
+        "KXWTACHALLENGERMATCH-26JUL08FOOBAR-BAR",
+    ],
+)
+def test_tennis_match_is_sport_tennis_and_moneyline(ticker: str) -> None:
+    # Tennis match-winner series were UNKNOWN sport + UNKNOWN leg before. The
+    # match winner is a moneyline; typing it lets any FUTURE same-match tennis
+    # pair be detected instead of silently defaulting.
+    assert classify_sport(ticker) is Sport.TENNIS
+    assert classify_leg(ticker) is LegType.MONEYLINE
 
 
 # --- first-half (period) awareness -------------------------------------------
@@ -153,3 +195,42 @@ def test_pair_key_order_independent_for_every_type_pair() -> None:
     for a in LegType:
         for b in LegType:
             assert pair_key(a, b) == pair_key(b, a)
+
+
+# --- broad regression: the TEAMTOTAL/MATCH/ATP/WTA additions changed nothing --
+
+
+@pytest.mark.parametrize(
+    ("ticker", "expected"),
+    [
+        ("KXWCGAME-26JUL05MEXENG-MEX", LegType.MONEYLINE),
+        ("KXUFCFIGHT-26JUL11MCGHOL-HOL", LegType.MONEYLINE),
+        ("KXMLBGAME-26JUL081840NYYTB-NYY", LegType.MONEYLINE),
+        ("KXWNBAGAME-26JUL06NYLLVA-NYL", LegType.MONEYLINE),
+        ("KXWCTOTAL-26JUL05MEXENG-3", LegType.TOTAL),
+        ("KXWCTCORNERS-26JUL07SUICOL-COL5", LegType.CORNERS_TEAM),
+        ("KXWCCORNERS-26JUL05MEXENG-10", LegType.CORNERS),
+        ("KXWCGOAL-26JUL05MEXENG-ENGHKANE9-1", LegType.PLAYER_GOAL),
+        ("KXWCBTTS-26JUL05MEXENG-BTTS", LegType.BTTS),
+    ],
+)
+def test_existing_leg_classifications_unchanged(ticker: str, expected: LegType) -> None:
+    assert classify_leg(ticker) is expected
+
+
+@pytest.mark.parametrize(
+    ("ticker", "expected"),
+    [
+        ("KXWCGAME-26JUL05MEXENG-MEX", Sport.SOCCER),
+        ("KXMLBGAME-26JUL081840NYYTB-NYY", Sport.MLB),
+        ("KXWNBAGAME-26JUL06NYLLVA-NYL", Sport.WNBA),
+        ("KXNBATEAMTOTAL-26OCT10SASLAL-SAS124", Sport.NBA),
+        ("KXNFLTEAMTOTAL-26JUL08SEAKC-SEA24", Sport.NFL),
+        ("KXUFCFIGHT-26JUL11MCGHOL-HOL", Sport.UFC),
+        ("KXHIGHNY-26JUL06-B90", Sport.UNKNOWN),
+    ],
+)
+def test_existing_sport_classifications_unchanged(ticker: str, expected: Sport) -> None:
+    # The ATP/WTA keywords must not steal any existing sport's series (no
+    # "ATP"/"WTA" substring appears in WNBA/NBA/MLB/NFL/NHL/UFC/WC/… prefixes).
+    assert classify_sport(ticker) is expected
