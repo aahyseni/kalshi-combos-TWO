@@ -57,6 +57,10 @@ _KEYWORDS: tuple[tuple[str, LegType], ...] = (
 _PERIOD_SERIES = re.compile(r"(?:1H|2H|H1|H2|FH|SH|[1-4]Q|Q[1-4]|QTR|HALF|PERIOD)")
 # First-half specifically: the only period we have measured correlations for.
 _FIRST_HALF_SERIES = re.compile(r"(?:1H|H1|FH)")
+# The bare 1st-half WINNER series ends in the half token with no family suffix.
+# SOURCE OF TRUTH (prod RFQ tape 2026-07-07): the real series is ``KXWC1H``
+# (``KXWC1H-<game>-<TEAM|TIE>``) — NOT ``KXWC1HGAME`` (which does not exist).
+_FIRST_HALF_WINNER = re.compile(r"(?:1H|H1|FH)$")
 # Full-game family → its first-half member. A first-half leg whose base family
 # is anything else (player goal, corners, spread, …) is left UNKNOWN: those
 # 1H × FT pairs are not measured yet, so they must widen, never guess.
@@ -84,7 +88,16 @@ def classify_leg(market_ticker: str) -> LegType:
             break
     if _PERIOD_SERIES.search(series):
         if _FIRST_HALF_SERIES.search(series):
-            return _FIRST_HALF_MAP.get(base, LegType.UNKNOWN)
+            mapped = _FIRST_HALF_MAP.get(base)
+            if mapped is not None:
+                return mapped
+            # A bare 1st-half winner (series ends in the half token, no family
+            # keyword — the real KXWC1H moneyline) has base UNKNOWN. Anything
+            # else first-half-but-unmapped (1H spread, an unknown 1H family)
+            # stays UNKNOWN: unmeasured 1H×FT pairs must widen, never guess.
+            if base is LegType.UNKNOWN and _FIRST_HALF_WINNER.search(series):
+                return LegType.FIRST_HALF_MONEYLINE
+            return LegType.UNKNOWN
         return LegType.UNKNOWN  # unmodeled period (2H/quarter): never full-game
     return base
 

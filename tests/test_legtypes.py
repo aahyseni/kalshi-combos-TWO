@@ -57,10 +57,17 @@ def test_only_series_prefix_is_inspected() -> None:
 @pytest.mark.parametrize(
     ("ticker", "expected"),
     [
-        ("KXWC1HGAME-26JUL05MEXENG-MEX", LegType.FIRST_HALF_MONEYLINE),
+        # SOURCE OF TRUTH (prod RFQ tape 2026-07-07): the 1H winner series is the
+        # BARE ``KXWC1H`` (…-<TEAM|TIE>), NOT ``KXWC1HGAME`` (which does not
+        # exist). It carries no family keyword, so it's the 1H moneyline.
+        ("KXWC1H-26JUL07ARGEGY-ARG", LegType.FIRST_HALF_MONEYLINE),
+        ("KXWC1H-26JUL07ARGEGY-TIE", LegType.FIRST_HALF_MONEYLINE),
         ("KXWC1HTOTAL-26JUL05MEXENG-2", LegType.FIRST_HALF_TOTAL),
         ("KXWC1HBTTS-26JUL05MEXENG-BTTS", LegType.FIRST_HALF_BTTS),
         ("KXWCFHTOTAL-26JUL05MEXENG-1", LegType.FIRST_HALF_TOTAL),  # FH alias
+        # 1H spread is a real family (KXWC1HSPREAD) but unmeasured -> UNKNOWN,
+        # never guessed, never a full-game spread.
+        ("KXWC1HSPREAD-26JUL07ARGEGY-ARG2", LegType.UNKNOWN),
     ],
 )
 def test_first_half_families_get_their_own_type(ticker: str, expected: LegType) -> None:

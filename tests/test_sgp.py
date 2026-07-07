@@ -63,7 +63,7 @@ def soccer_params() -> SgpParams:
 
 
 # 1H × full-time soccer tickers (same MEX/ENG game).
-FH_ML_MEX = "KXWC1HGAME-26JUL05MEXENG-MEX"
+FH_ML_MEX = "KXWC1H-26JUL05MEXENG-MEX"  # SOURCE OF TRUTH: real 1H-winner series
 FT_ML_MEX = "KXWCGAME-26JUL05MEXENG-MEX"
 FT_ML_ENG = "KXWCGAME-26JUL05MEXENG-ENG"
 FH_TOTAL = "KXWC1HTOTAL-26JUL05MEXENG-1"
@@ -107,7 +107,7 @@ def test_first_half_winner_with_draw_leg_falls_back_to_flat() -> None:
     # A draw-involving 1H winner pair is UNMEASURED -> untyped flat prior, not a
     # guessed number.
     out = build_sgp_correlation(
-        (leg("KXWC1HGAME-26JUL05MEXENG-TIE", "EV"), leg(FT_ML_MEX, "EV")),
+        (leg("KXWC1H-26JUL05MEXENG-TIE", "EV"), leg(FT_ML_MEX, "EV")),
         [(0, 1)],
         soccer_params(),
     )
