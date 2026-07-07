@@ -84,10 +84,11 @@ class FiltersConfig(StrictModel):
 
 
 class FeeConfig(StrictModel):
-    """Coefficients as decimal strings (exact Fractions downstream). The
-    authoritative fee-schedule PDF is bot-blocked; these defaults come from
-    corroborated secondary sources and MUST be reconciled against real fills
-    (quiet-failure defense #3) before production."""
+    """Coefficients as decimal strings (exact Fractions downstream). VERIFIED
+    against the official Kalshi fee-schedule PDF (effective 2026-06-29): taker
+    0.07, maker 0.0175, quadratic. Maker fee applies only on markets in Kalshi's
+    maker-fee list (quadratic combo series charge $0 maker); monitor changes via
+    GET /series/fee_changes, and still reconcile vs real fills (defense #3)."""
 
     taker_coef: str = "0.07"
     maker_coef: str = "0.0175"

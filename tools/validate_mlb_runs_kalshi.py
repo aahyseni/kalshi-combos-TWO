@@ -177,28 +177,36 @@ def main() -> None:
             )
 
     print(f"Kalshi-native MLB games ({skipped} skipped)")
+    # team-win x over has NO discriminating power (MLB ml x total ~0; confirmed
+    # tie, z=+0.43) — print it as a DIAGNOSTIC, never let its coin flip gate the
+    # verdict (Decision A, 2026-07-06). Decisive metrics = run-line cover + triple;
+    # missing THOSE fails closed.
     gate_pass = True
     complete = True
     for metric, models in sums.items():
         n = counts[metric]
+        diagnostic = metric == "pair team-win x over"
         if n == 0:
-            # Fail-closed: no spread capture => cover/triple absent, and the
-            # verdict must NOT then rest on the no-power win-over metric alone
-            # (CLAUDE.md hard rule 6: missing data => no pass).
-            print(f"  {metric:26s}: NO DATA — gate INCOMPLETE (fail-closed)")
-            complete = False
+            if diagnostic:
+                print(f"  {metric:26s}: no data (diagnostic)")
+            else:
+                print(f"  {metric:26s}: NO DATA — gate INCOMPLETE (fail-closed)")
+                complete = False
             continue
         scores = {m: -ll / n for m, ll in models.items()}
         beats = scores["structural"] < scores["v1 copula"]
-        gate_pass = gate_pass and beats
         line_s = "  ".join(f"{m}={v:.5f}" for m, v in scores.items())
-        print(f"  {metric:26s} (n={n}): {line_s}   "
-              f"{'structural BEATS v1' if beats else 'structural does NOT beat v1'}")
+        if diagnostic:
+            tag = "diagnostic — no discriminating power, not gated"
+        else:
+            gate_pass = gate_pass and beats
+            tag = "structural BEATS v1" if beats else "structural does NOT beat v1"
+        print(f"  {metric:26s} (n={n}): {line_s}   {tag}")
     verdict = gate_pass and complete
-    if not complete:
-        print("  gate INCOMPLETE — a required metric had no data; not a pass")
-    print("structural " + ("BEATS" if verdict else "does NOT beat")
-          + " v1 on Kalshi-era data")
+    head = ("structural BEATS" if verdict
+            else "structural gate INCOMPLETE for" if not complete
+            else "structural does NOT beat")
+    print(f"{head} v1 on Kalshi-era MLB data (gated on cover+triple)")
     sys.exit(0 if verdict else 1)
 
 

@@ -2,12 +2,16 @@
 
 fee = ceil_to_centicent(coef × multiplier × C × P × (1−P))   [dollars]
 
-with C = contracts, P = price. The docs publish the ROUNDING rules
-(docs/api-notes/money-fees.md: trade fee rounds UP to the nearest $0.0001) but
-NOT the coefficients — the authoritative fee-schedule PDF is bot-blocked, so
-coefficients are config (defaults from corroborated secondary sources: taker
-7/100, maker 7/400) and MUST be verified against real fills before production
-(reconciliation gate, quiet-failure defense #3).
+with C = contracts, P = price. Coefficients VERIFIED against the official Kalshi
+fee-schedule PDF (effective 2026-06-29, operator-provided): general/taker 0.07,
+maker 0.0175 (= 7/100, 7/400), quadratic C·P·(1−P), rounded UP to a centi-cent
+(the PDF's "fee + positionCost rounded up to a centi-cent" is equivalent since
+positionCost — whole cents × whole contracts — is always a whole centi-cent).
+S&P/NASDAQ series use 0.035 (not sports; absent here). Maker fees apply ONLY to
+markets on Kalshi's maker-fee list — quadratic sports/combo series charge $0
+maker (Phase 2.5 ground truth + PDF), so a resting combo quote pays no fee. That
+list can change (GET /series/fee_changes) — monitor it, and still reconcile
+predicted vs actual to the cent on real fills (quiet-failure defense #3).
 
 Fail-safe attribution: whether our RFQ fill is charged maker or taker fees is
 unknown until Phase 2.5 ground truth. When ``Conventions.maker_is_taker_on_fill``
