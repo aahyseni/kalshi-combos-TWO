@@ -107,6 +107,58 @@ def test_group_indices_track_original_leg_positions() -> None:
     assert rel.same_event_groups == ((0, 2),)
 
 
+# --- same-GAME grouping (the event_ticker-is-per-series fix) ---------------------
+
+
+def test_same_game_cross_series_legs_form_one_group() -> None:
+    """A real SGP — BTTS + moneyline + total of ONE game — arrives as three
+    DIFFERENT per-series event_tickers but must correlate as one same-game block,
+    not price independent. (Each event has a single leg, so exclusivity is never
+    consulted — ExplodingProvider proves it.)"""
+    legs = (
+        leg("KXWCGAME-26JUL05MEXENG-MEX", "KXWCGAME-26JUL05MEXENG", "yes"),
+        leg("KXWCTOTAL-26JUL05MEXENG-3", "KXWCTOTAL-26JUL05MEXENG", "yes"),
+        leg("KXWCBTTS-26JUL05MEXENG-BTTS", "KXWCBTTS-26JUL05MEXENG", "yes"),
+    )
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+    assert rel.same_event_groups == ((0, 1, 2),)
+    assert any("same-game group 26JUL05MEXENG" in n for n in rel.notes)
+
+
+def test_cross_game_legs_stay_independent() -> None:
+    legs = (
+        leg("KXWCGAME-26JUL05MEXENG-MEX", "KXWCGAME-26JUL05MEXENG", "yes"),
+        leg("KXWCGAME-26JUL06ARGEGY-ARG", "KXWCGAME-26JUL06ARGEGY", "yes"),
+    )
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+    assert rel.same_event_groups == ()  # different games -> independent
+
+
+def test_two_games_two_legs_each_form_two_blocks() -> None:
+    legs = (
+        leg("KXWCGAME-G1-A", "KXWCGAME-G1", "yes"),
+        leg("KXWCTOTAL-G1-3", "KXWCTOTAL-G1", "yes"),
+        leg("KXWCGAME-G2-B", "KXWCGAME-G2", "yes"),
+        leg("KXWCBTTS-G2-BTTS", "KXWCBTTS-G2", "yes"),
+    )
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+    assert rel.same_event_groups == ((0, 1), (2, 3))  # per-game blocks
+
+
+def test_mutual_exclusion_still_caught_within_a_game() -> None:
+    """Two YES outcomes of the SAME moneyline event (win + tie) stay impossible
+    even though they share a game — exclusion is per-event, not per-game."""
+    legs = (
+        leg("KXWCGAME-26JUL05MEXENG-MEX", "KXWCGAME-26JUL05MEXENG", "yes"),
+        leg("KXWCGAME-26JUL05MEXENG-TIE", "KXWCGAME-26JUL05MEXENG", "yes"),
+    )
+    rel = classify_legs(legs, MappingProvider({"KXWCGAME-26JUL05MEXENG": True}))
+    assert rel.kind is RelationshipKind.IMPOSSIBLE
+
+
 @pytest.mark.parametrize(
     ("legs", "answers", "expected"),
     [

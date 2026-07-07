@@ -9,10 +9,15 @@ the caller must turn into widen-or-no-quote:
   "logically impossible" combo is exactly the trap takers hunt for. Scalar
   settlement (DNP etc.) can also make binary logic wrong — another reason not
   to be clever here.
-- SAME_EVENT groups: legs sharing an event_ticker form correlation blocks for
-  the copula; implication/nesting inside a group is NOT explicitly modeled in
-  v1 — it is approximated by the block correlation and must be paid for with
-  the correlation-uncertainty width adder.
+- SAME-GAME groups: legs of the same GAME form the correlation blocks. Kalshi's
+  event_ticker is per-market-SERIES (``KXWCGAME-26JUL05MEXENG`` and
+  ``KXWCTOTAL-26JUL05MEXENG`` of ONE game are different events), so the block key
+  is the GAME code (the event_ticker after its series prefix), NOT the raw
+  event_ticker — grouping on event_ticker silently splits a same-game SGP into
+  independent singletons (the fail-safe inversion SGP sharps farm). Nesting
+  inside a group is approximated by the block correlation + the
+  correlation-uncertainty width adder. Mutual-exclusivity stays per-EVENT
+  (home/draw/away of one moneyline event).
 - UNKNOWN: any leg whose event metadata (or mutual-exclusivity flag) we don't
   have. Never defaults to independence — that's the fail-safe inversion that
   gets farmed by same-game-parlay sharps.
@@ -45,9 +50,21 @@ class EventInfoProvider(Protocol):
 @dataclass(frozen=True, slots=True)
 class Relationship:
     kind: RelationshipKind
-    # Indices into the leg list, grouped by shared event (size >= 2 only).
+    # Indices into the leg list, grouped by shared GAME (size >= 2 only). Name
+    # kept for compatibility; the key is the game code, not the event_ticker.
     same_event_groups: tuple[tuple[int, ...], ...]
     notes: tuple[str, ...]
+
+
+def _game_key(event_ticker: str) -> str:
+    """The game a leg belongs to, for correlation grouping. Kalshi's
+    event_ticker is ``SERIES-GAMECODE`` (e.g. ``KXWCGAME-26JUL05MEXENG``); the
+    GAMECODE is shared across a game's market families (KXWCGAME/KXWCTOTAL/
+    KXWCBTTS of one game), so it — not the series-specific event_ticker — is the
+    same-game key. No hyphen (synthetic/degenerate ticker) ⇒ key on the whole
+    string, so a leg whose event carries no game code never merges with another."""
+    _series, sep, game = event_ticker.partition("-")
+    return game if sep else event_ticker
 
 
 def classify_legs(
@@ -78,15 +95,18 @@ def classify_legs(
             notes.append(f"duplicate leg: {market}")
             return Relationship(RelationshipKind.UNKNOWN, (), tuple(notes))
 
-    # Same-event grouping.
+    # Pass 1 — per-EVENT: require an event_ticker and enforce mutual-exclusion.
+    # Exclusivity is a property of a single Kalshi event's market family (the
+    # home/draw/away outcomes of one moneyline event, etc.), so it is checked
+    # per event_ticker, NOT per game.
     by_event: dict[str, list[int]] = {}
+    game_keys: list[str] = []
     for i, leg in enumerate(legs):
         if leg.event_ticker is None:
             notes.append(f"leg without event_ticker: {leg.market_ticker}")
             return Relationship(RelationshipKind.UNKNOWN, (), tuple(notes))
         by_event.setdefault(leg.event_ticker, []).append(i)
-
-    groups: list[tuple[int, ...]] = []
+        game_keys.append(_game_key(leg.event_ticker))
     for event_ticker, indices in by_event.items():
         if len(indices) < 2:
             continue
@@ -98,7 +118,18 @@ def classify_legs(
         if exclusive and yes_count >= 2:
             notes.append(f"{yes_count} YES legs of mutually exclusive event {event_ticker}")
             return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
+
+    # Pass 2 — per-GAME: the correlation blocks. Same-game legs from DIFFERENT
+    # market families share a game code but not an event_ticker, so they must be
+    # grouped here or they price independent (the bug this fixes).
+    by_game: dict[str, list[int]] = {}
+    for i, key in enumerate(game_keys):
+        by_game.setdefault(key, []).append(i)
+    groups: list[tuple[int, ...]] = []
+    for key, indices in by_game.items():
+        if len(indices) < 2:
+            continue
         groups.append(tuple(indices))
-        notes.append(f"same-event group {event_ticker}: {len(indices)} legs")
+        notes.append(f"same-game group {key}: {len(indices)} legs")
 
     return Relationship(RelationshipKind.OK, tuple(groups), tuple(notes))
