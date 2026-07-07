@@ -64,8 +64,15 @@ _MONTHS = {m: i + 1 for i, m in enumerate(
 _CODE = re.compile(r"^(\d{2})([A-Z]{3})(\d{2})(\d{4})?([A-Z0-9]+)$")
 _SPREAD_SUFFIX = re.compile(r"^([A-Z]+)(\d+)$")
 _THROTTLE_S = 0.125
-_RETRY_ATTEMPTS = 4        # bounded retry on 429 before giving up on a rung
+_RETRY_ATTEMPTS = 4        # bounded retry on transient (429/5xx) before giving up
 _RETRY_BACKOFF_S = 0.5
+
+
+class _ProbeError(RuntimeError):
+    """A candle probe failed with an API error that survived retries — as
+    opposed to a legitimate empty candle window (which is a plain ``None``).
+    The distinction lets the caller skip-and-retry the WHOLE game rather than
+    crown a wrong main line from the rungs that happened to resolve."""
 
 
 def start_ts_of(game_code: str) -> int | None:
@@ -87,7 +94,11 @@ def start_ts_of(game_code: str) -> int | None:
 async def pregame_mid(
     rest: KalshiRestClient, series: str, ticker: str, start_ts: int
 ) -> float | None:
-    payload: dict[str, Any] | None = None
+    """Pre-game mid, or None for a legitimate empty candle window. Raises
+    ``_ProbeError`` on an API failure that survives retries — transient
+    rate-limit (429) and server (5xx) errors are retried with backoff so they
+    are neither silently dropped as "no candle" (which could crown a wrong
+    main line) nor recorded as data."""
     for attempt in range(_RETRY_ATTEMPTS):
         await asyncio.sleep(_THROTTLE_S)
         try:
@@ -95,32 +106,27 @@ async def pregame_mid(
                 series, ticker, start_ts=start_ts - 6 * 3600, end_ts=start_ts,
                 period_interval=60,
             )
-            break
-        except RateLimitedError:
-            # Transient rate limit: back off and retry so a 429 is not
-            # silently recorded as "no candle" (which, combined with the
-            # full-ladder probe, could otherwise crown a wrong main line).
-            if attempt == _RETRY_ATTEMPTS - 1:
-                return None
-            await asyncio.sleep(_RETRY_BACKOFF_S * (2 ** attempt))
-        except KalshiApiError:
-            return None
-    if payload is None:
+        except KalshiApiError as exc:
+            transient = isinstance(exc, RateLimitedError) or getattr(exc, "status", 0) >= 500
+            if transient and attempt < _RETRY_ATTEMPTS - 1:
+                await asyncio.sleep(_RETRY_BACKOFF_S * (2 ** attempt))
+                continue
+            raise _ProbeError(f"{series} {ticker}: {exc}") from exc
+        candles = payload.get("candlesticks") or []
+        for candle in reversed(candles):
+            # wire format: dollar STRINGS ("0.4100"), key suffix _dollars
+            bid_raw = (candle.get("yes_bid") or {}).get("close_dollars")
+            ask_raw = (candle.get("yes_ask") or {}).get("close_dollars")
+            if not isinstance(bid_raw, str) or not isinstance(ask_raw, str):
+                continue
+            try:
+                bid, ask = float(bid_raw), float(ask_raw)
+            except ValueError:
+                continue
+            if 0.0 < bid < 1.0 and 0.0 < ask <= 1.0 and ask - bid < 0.15:
+                return (bid + ask) / 2.0
         return None
-    candles = payload.get("candlesticks") or []
-    for candle in reversed(candles):
-        # wire format: dollar STRINGS ("0.4100"), key suffix _dollars
-        bid_raw = (candle.get("yes_bid") or {}).get("close_dollars")
-        ask_raw = (candle.get("yes_ask") or {}).get("close_dollars")
-        if not isinstance(bid_raw, str) or not isinstance(ask_raw, str):
-            continue
-        try:
-            bid, ask = float(bid_raw), float(ask_raw)
-        except ValueError:
-            continue
-        if 0.0 < bid < 1.0 and 0.0 < ask <= 1.0 and ask - bid < 0.15:
-            return (bid + ask) / 2.0
-    return None
+    raise _ProbeError(f"{series} {ticker}: retries exhausted")  # unreachable
 
 
 async def list_settled(rest: KalshiRestClient, series: str) -> list[dict[str, Any]]:
@@ -141,10 +147,39 @@ async def list_settled(rest: KalshiRestClient, series: str) -> list[dict[str, An
 
 
 def done_codes(path: Path) -> set[str]:
-    if not path.exists():
+    if not path.exists() or path.stat().st_size == 0:
         return set()
     with open(path, encoding="utf-8", newline="") as f:
-        return {row["game_code"] for row in csv.DictReader(f)}
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None or "game_code" not in reader.fieldnames:
+            # Non-empty but headerless => a torn/crashed file. Fail LOUD rather
+            # than silently return set() (which would re-fetch + duplicate every
+            # game); a human should inspect or delete it.
+            raise ValueError(
+                f"{path} is non-empty but has no game_code header "
+                "(likely a killed-mid-write file); inspect or delete it"
+            )
+        return {row["game_code"] for row in reader}
+
+
+def _need_header(path: Path) -> bool:
+    """Header needed iff the file is missing OR empty. Keying on emptiness (not
+    mere existence) is the crash-safety fix: an ungraceful kill before the first
+    flush can leave a 0-byte file, and `not exists()` would then skip the header
+    and append headerless rows that break every later DictReader."""
+    return not path.exists() or path.stat().st_size == 0
+
+
+def _repair_trailing_newline(path: Path) -> None:
+    """If a prior run was killed mid-row the file can end without a newline;
+    appending would glue the next row onto the torn one. Close the line first."""
+    if path.exists() and path.stat().st_size > 0:
+        with open(path, "rb") as f:
+            f.seek(-1, 2)
+            last = f.read(1)
+        if last not in (b"\n", b"\r"):
+            with open(path, "ab") as f:
+                f.write(b"\r\n")
 
 
 def by_game_code(markets: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -174,7 +209,9 @@ async def fetch_main(rest: KalshiRestClient, sport: str) -> None:
     series = SPORTS[sport]
     out = HISTORY / f"kalshi_{sport}_history.csv"
     done = done_codes(out)
-    new_file = not out.exists()
+    need_header = _need_header(out)
+    if not need_header:
+        _repair_trailing_newline(out)
 
     games = await list_settled(rest, series["game"])
     totals = await list_settled(rest, series["total"])
@@ -185,19 +222,17 @@ async def fetch_main(rest: KalshiRestClient, sport: str) -> None:
     written = 0
     with open(out, "a", encoding="utf-8", newline="") as f:  # noqa: ASYNC230 (one-shot tool)
         writer = csv.writer(f)
-        if new_file:
+        if need_header:
             writer.writerow(
                 ["game_code", "team", "p_team_close", "team_won",
                  "total_line", "p_over_close", "went_over"]
             )
+            f.flush()  # durable header before any row (crash-safety)
         for code, gm in games_by_code.items():
             if code in done or code not in totals_by_game:
                 continue
             start_ts = start_ts_of(code)
             if start_ts is None:
-                continue
-            p_team = await pregame_mid(rest, series["game"], gm["ticker"], start_ts)
-            if p_team is None:
                 continue
             lined = sorted(
                 (
@@ -206,8 +241,16 @@ async def fetch_main(rest: KalshiRestClient, sport: str) -> None:
                 ),
                 key=lambda tm: float(tm["floor_strike"]),
             )
-            best = await best_mid(rest, series["total"], lined, start_ts)
-            if best is None:
+            try:
+                p_team = await pregame_mid(rest, series["game"], gm["ticker"], start_ts)
+                best = await best_mid(rest, series["total"], lined, start_ts)
+            except _ProbeError as exc:
+                # Transient API failure on some rung — skip the WHOLE game and
+                # leave it un-done so a later run retries it, rather than crown
+                # a wrong main line from the rungs that resolved.
+                print(f"[{sport}]   skip {code}: {exc}")
+                continue
+            if p_team is None or best is None:
                 continue
             tm, p_over = best
             writer.writerow(
@@ -221,9 +264,9 @@ async def fetch_main(rest: KalshiRestClient, sport: str) -> None:
                     1 if tm["result"] == "yes" else 0,
                 ]
             )
+            f.flush()  # every row durable: shrink the torn-line window to 1 row
             written += 1
             if written % 100 == 0:
-                f.flush()
                 print(f"[{sport}]   {written} games written")
     print(f"[{sport}] main done: +{written} games -> {out}")
 
@@ -232,7 +275,9 @@ async def fetch_spreads(rest: KalshiRestClient, sport: str) -> None:
     series = SPORTS[sport]
     out = HISTORY / f"kalshi_{sport}_spreads.csv"
     done = done_codes(out)
-    new_file = not out.exists()
+    need_header = _need_header(out)
+    if not need_header:
+        _repair_trailing_newline(out)
 
     spreads_by_game = by_game_code(await list_settled(rest, series["spread"]))
     print(f"[{sport}] games with settled spreads: {len(spreads_by_game)} "
@@ -241,10 +286,11 @@ async def fetch_spreads(rest: KalshiRestClient, sport: str) -> None:
     written = 0
     with open(out, "a", encoding="utf-8", newline="") as f:  # noqa: ASYNC230 (one-shot tool)
         writer = csv.writer(f)
-        if new_file:
+        if need_header:
             writer.writerow(
                 ["game_code", "spread_team", "spread_line", "p_spread_close", "covered"]
             )
+            f.flush()  # durable header before any row (crash-safety)
         for code, markets in spreads_by_game.items():
             if code in done:
                 continue
@@ -259,7 +305,11 @@ async def fetch_spreads(rest: KalshiRestClient, sport: str) -> None:
                 ),
                 key=lambda m: float(m["floor_strike"]),
             )
-            best = await best_mid(rest, series["spread"], lined, start_ts)
+            try:
+                best = await best_mid(rest, series["spread"], lined, start_ts)
+            except _ProbeError as exc:
+                print(f"[{sport}]   skip {code}: {exc}")
+                continue
             if best is None:
                 continue
             sm, p_spread = best
@@ -274,9 +324,9 @@ async def fetch_spreads(rest: KalshiRestClient, sport: str) -> None:
                     1 if sm["result"] == "yes" else 0,
                 ]
             )
+            f.flush()  # every row durable: shrink the torn-line window to 1 row
             written += 1
             if written % 100 == 0:
-                f.flush()
                 print(f"[{sport}]   {written} spreads written")
     print(f"[{sport}] spreads done: +{written} games -> {out}")
 
