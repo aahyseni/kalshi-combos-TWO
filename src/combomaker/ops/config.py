@@ -165,9 +165,24 @@ class CorrelationConfig(StrictModel):
             "player_goal|total": 0.46,       # measured +0.46 (Understat 3,652); was global 0.40
             "player_goal|player_goal": 0.03,  # teammates ~0 (Poisson-split, exact) / opp +0.05
             "total|total": 0.95,
+            # TOTAL corners (KXWCCORNERS) — measured ⊥ goals AND ⊥ result.
             "corners|total": 0.00,
-            "corners|moneyline": 0.00,       # only-seen corner mkt = TOTAL corners, ⊥ result
+            "corners|moneyline": 0.00,
             "btts|corners": 0.00,
+            # TEAM corners (KXWCTCORNERS), MEASURED conditional on 8,981 matches
+            # (team-strength + venue controlled, so the residual the copula needs
+            # after live marginals). Unlike TOTAL corners, a TEAM's corners are
+            # NEGATIVELY tied to that team winning / covering — the chasing team
+            # piles on corners (pooled sign is a Simpson's-paradox artifact).
+            # ⊥ goals (total/btts ≈ 0). player_goal / advance are LABELED PRIORS
+            # (no football-data coverage), wide-banded, not measured.
+            "corners_team|moneyline": -0.15,
+            "corners_team|spread": -0.13,
+            "corners_team|total": 0.00,
+            "btts|corners_team": 0.00,
+            "corners_team|corners_team": -0.21,   # opposite teams: territory zero-sum
+            "corners_team|player_goal": 0.05,     # prior (same-team attack), wide band
+            "advance|corners_team": -0.05,        # prior (diluted moneyline), wide band
             "moneyline|moneyline": -0.95,
             # Period (1st-half) × full-time, CALIBRATED 2026-07-07 on 8,981 club
             # matches (football-data.co.uk HT/FT, era-stable across a 2023
@@ -231,7 +246,14 @@ class CorrelationConfig(StrictModel):
         "soccer:total|total": 0.04,
         "soccer:corners|total": 0.08,
         "soccer:btts|corners": 0.08,
-        "soccer:corners|moneyline": 0.15,        # spans total(0) -> team(-0.15) regimes
+        "soccer:corners|moneyline": 0.08,        # total corners, measured ~0 (team is separate now)
+        "soccer:corners_team|moneyline": 0.10,
+        "soccer:corners_team|spread": 0.10,
+        "soccer:corners_team|total": 0.08,
+        "soccer:btts|corners_team": 0.08,
+        "soccer:corners_team|corners_team": 0.10,
+        "soccer:corners_team|player_goal": 0.20,  # labeled prior
+        "soccer:advance|corners_team": 0.15,      # labeled prior
         "soccer:player_goal|total": 0.15,        # hand-prior width around measured +0.46
         "soccer:player_goal|player_goal": 0.10,  # teammate(0)/opponent(+0.05) blend band
         "soccer:moneyline|moneyline": 0.04,

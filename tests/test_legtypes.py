@@ -51,6 +51,14 @@ def test_only_series_prefix_is_inspected() -> None:
     assert classify_leg("KXMYSTERY-26JUL05GAME-GOAL") is LegType.UNKNOWN
 
 
+def test_team_corners_sub_typed_from_total_corners() -> None:
+    # SOURCE OF TRUTH (prod RFQ tape 2026-07-07): team corners are a DISTINCT
+    # series KXWCTCORNERS (…-<TEAM>N) vs total corners KXWCCORNERS (…-N). The
+    # TCORNERS keyword is matched before CORNERS (it contains it).
+    assert classify_leg("KXWCTCORNERS-26JUL07SUICOL-COL5") is LegType.CORNERS_TEAM
+    assert classify_leg("KXWCCORNERS-26JUL05MEXENG-10") is LegType.CORNERS
+
+
 # --- first-half (period) awareness -------------------------------------------
 
 

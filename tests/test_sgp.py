@@ -302,6 +302,20 @@ class TestScorerAndCornerPairs:
 
     def test_corners_moneyline_no_longer_flat_default(self) -> None:
         # The blind 0.6 same-event default is dead: corners|moneyline is a typed
-        # 0.00 (the only-seen corner market is TOTAL corners, indep of result).
+        # 0.00 (TOTAL corners KXWCCORNERS, indep of result).
         rho, typed = self._rho(CORNERS_TICKER, ML_SOCCER_TICKER)
         assert typed == 1 and rho == pytest.approx(0.00)
+
+    def test_team_corners_are_sub_typed_from_total(self) -> None:
+        # SOURCE OF TRUTH (RFQ tape 2026-07-07): team corners = KXWCTCORNERS
+        # (distinct series) vs total corners = KXWCCORNERS. They must NOT share a
+        # type — team corners carry the measured -0.15 chasing-team signal vs the
+        # result, not the total-corner 0.00.
+        tc = "KXWCTCORNERS-26JUL07SUICOL-COL5"
+        rho, typed = self._rho(tc, "KXWCGAME-26JUL07SUICOL-COL")
+        assert typed == 1 and rho == pytest.approx(-0.15)  # team corners x that team wins
+        rho2, typed2 = self._rho(tc, "KXWCTCORNERS-26JUL07SUICOL-SUI5")
+        assert typed2 == 1 and rho2 == pytest.approx(-0.21)  # opposite teams, zero-sum
+        # and total corners still resolve their own (unchanged) 0.00.
+        rho3, typed3 = self._rho(CORNERS_TICKER, ML_SOCCER_TICKER)
+        assert typed3 == 1 and rho3 == pytest.approx(0.00)

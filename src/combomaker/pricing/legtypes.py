@@ -19,7 +19,8 @@ class LegType(StrEnum):
     TOTAL = "total"                # over/under team-or-game totals
     BTTS = "btts"                  # both teams to score
     PLAYER_GOAL = "player_goal"    # player scoring props (…GOAL-…PLAYER…)
-    CORNERS = "corners"
+    CORNERS = "corners"            # TOTAL corners (series KXWCCORNERS-…-N)
+    CORNERS_TEAM = "corners_team"  # a TEAM's corners (series KXWCTCORNERS-…-<TEAM>N)
     ADVANCE = "advance"            # team advances / series outcome
     EXTRAS = "extras"              # extra innings / overtime style props
     SPREAD = "spread"
@@ -42,6 +43,9 @@ _KEYWORDS: tuple[tuple[str, LegType], ...] = (
     ("GOAL", LegType.PLAYER_GOAL),
     ("BTTS", LegType.BTTS),
     ("TOTAL", LegType.TOTAL),
+    # TCORNERS must precede CORNERS (it contains it). SOURCE OF TRUTH (RFQ tape
+    # 2026-07-07): team corners = KXWCTCORNERS, total corners = KXWCCORNERS.
+    ("TCORNERS", LegType.CORNERS_TEAM),
     ("CORNERS", LegType.CORNERS),
     ("ADVANCE", LegType.ADVANCE),
     ("EXTRAS", LegType.EXTRAS),
