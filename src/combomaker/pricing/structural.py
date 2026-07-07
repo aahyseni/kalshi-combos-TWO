@@ -623,6 +623,36 @@ class StructuralPricer:
         )
 
 
+# Soccer leg types the Dixon-Coles scoreline model can REPRESENT (i.e. that
+# `_parse_leg` maps to a LegSpec: moneyline/advance/draw, BTTS, total, spread,
+# player goal). Any OTHER type in a same-game group is a "non-representable
+# remainder" — the tape shows this is ONLY total corners (KXWCCORNERS) and team
+# corners (KXWCTCORNERS); extras/team-total/unknown are covered for generality.
+# Used by the within-game hybrid to split a group into the DC-priceable subgroup
+# and the copula-attached remainder. NOT the arbiter of whether the subgroup can
+# actually price — that is `try_price` (orientation, ≥2 team legs, feasibility).
+_DC_REPRESENTABLE_SOCCER: frozenset[LegType] = frozenset(
+    {
+        LegType.MONEYLINE,
+        LegType.ADVANCE,
+        LegType.BTTS,
+        LegType.TOTAL,
+        LegType.PLAYER_GOAL,
+        LegType.SPREAD,
+    }
+)
+
+
+def soccer_representable(leg: RfqLeg) -> bool:
+    """True iff this leg's type can be represented in the soccer scoreline model.
+    A same-game leg for which this is False is the hybrid's non-representable
+    remainder (corners). Type-driven, so a parse-level failure on a representable
+    type (bad team code) still counts as representable and makes the subgroup's
+    ``try_price`` decline — collapsing the whole group to the copula (fail-safe),
+    never silently dropping a scoreline-relevant constraint."""
+    return classify_leg(leg.market_ticker) in _DC_REPRESENTABLE_SOCCER
+
+
 def structural_applicable(
     legs: list[RfqLeg], same_event_groups: Sequence[Sequence[int]]
 ) -> bool:
@@ -644,5 +674,6 @@ def structural_applicable(
 __all__ = [
     "ModelParams",
     "StructuralPricer",
+    "soccer_representable",
     "structural_applicable",
 ]

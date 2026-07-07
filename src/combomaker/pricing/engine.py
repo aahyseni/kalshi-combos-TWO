@@ -39,6 +39,7 @@ from combomaker.pricing.quote import (
 from combomaker.pricing.relationships import RelationshipKind, classify_legs
 from combomaker.pricing.sgp import SgpParams, build_sgp_correlation
 from combomaker.pricing.structural import StructuralPricer, structural_applicable
+from combomaker.pricing.within_game import price_within_game_hybrid
 from combomaker.rfq.models import Rfq
 
 
@@ -163,7 +164,17 @@ class PricingEngine:
         ):
             joint, reason = self._structural.try_price(list(rfq.legs), beliefs, sides)
             if joint is None:
-                fallback_note = f"structural fallback: {reason}"
+                # A non-representable leg (corners) declined the WHOLE group.
+                # Before the wholesale copula, try the within-game hybrid: price
+                # the DC-representable subgroup structurally and attach the
+                # remainder via the copula conditional. Fails closed to the
+                # copula (returns None) on any doubt, so it can only improve or
+                # equal today's price — never under-price a same-game combo.
+                joint = price_within_game_hybrid(
+                    list(rfq.legs), beliefs, sides, self._structural, self._sgp_params
+                )
+                if joint is None:
+                    fallback_note = f"structural fallback: {reason}"
         if joint is None:
             sgp = build_sgp_correlation(
                 list(rfq.legs),

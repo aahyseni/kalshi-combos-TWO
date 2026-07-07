@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 
 from combomaker.core.conventions import DOC_ASSUMED
-from combomaker.ops.config import PricingConfig, StructuralConfig
+from combomaker.ops.config import CorrelationConfig, PricingConfig, StructuralConfig
 from combomaker.pricing.dixon_coles import (
     Advance,
     Btts,
@@ -18,6 +18,7 @@ from combomaker.pricing.dixon_coles import (
     TotalOver,
 )
 from combomaker.pricing.engine import PricingEngine
+from combomaker.pricing.joint import JointEstimate, price_joint_matrices
 from combomaker.pricing.legs import LegBelief
 from combomaker.pricing.margin_total import (
     GameTotalOver,
@@ -27,6 +28,7 @@ from combomaker.pricing.margin_total import (
     region_probability,
 )
 from combomaker.pricing.quote import ConstructedQuote
+from combomaker.pricing.sgp import SgpParams, build_sgp_correlation
 from combomaker.pricing.structural import (
     StructuralPricer,
     _parse_leg,
@@ -35,6 +37,7 @@ from combomaker.pricing.structural import (
     _team_of,
     structural_applicable,
 )
+from combomaker.pricing.within_game import price_within_game_hybrid
 from combomaker.rfq.models import RfqLeg
 from tests.test_archetypes import SGP_EVENT, TTC, same_event_combo
 from tests.test_filters import Harness
@@ -537,3 +540,162 @@ async def wc_engine_for(tickers: list[str], config: PricingConfig) -> PricingEng
     h.with_meta("KXMVE-C1")
     seed_event(h, SGP_EVENT, exclusive=False)
     return PricingEngine(h.feed, h.metadata, DOC_ASSUMED, config)
+
+
+# --- within-game hybrid: structural subgroup × copula-attached remainder -------
+
+# The real 3,344-contract WC combo from the defect trace (job 24844262): all YES,
+# advance+BTTS+corners+2 scorers in one match. The copula over-states it; DC
+# prices the advance+BTTS+scorer subgroup, corners attaches near-independent.
+_HYB_GAME = "26JUL07ARGEGY"
+_HYB_LEGS = [
+    (f"KXWCADVANCE-{_HYB_GAME}-ARG", 0.84),
+    (f"KXWCBTTS-{_HYB_GAME}-BTTS", 0.40),
+    (f"KXWCCORNERS-{_HYB_GAME}-9", 0.70),          # non-representable remainder
+    (f"KXWCGOAL-{_HYB_GAME}-ARGLMESSI10-1", 0.60),
+    (f"KXWCGOAL-{_HYB_GAME}-EGYMSALAH11-1", 0.17),
+]
+_HYB_EVENT = f"KXWC-{_HYB_GAME}"
+
+
+def _sgp_params() -> SgpParams:
+    c = CorrelationConfig()
+    return SgpParams(
+        pair_rho=dict(c.pair_rho),
+        default_rho=c.same_event_rho,
+        cross_event_rho=c.cross_event_rho,
+        typed_uncertainty=c.typed_rho_uncertainty,
+        untyped_uncertainty=c.untyped_rho_uncertainty,
+        pair_uncertainty=dict(c.pair_rho_uncertainty),
+        pair_rho_by_sport={s: dict(t) for s, t in c.pair_rho_by_sport.items()},
+        oriented_curve={k: list(v) for k, v in c.oriented_curve.items()},
+        oriented_curve_uncertainty=dict(c.oriented_curve_uncertainty),
+    )
+
+
+def _hyb_case(
+    specs: list[tuple[str, float]], sides: list[str] | None = None
+) -> tuple[list[RfqLeg], list[LegBelief], list[str]]:
+    used_sides = sides if sides is not None else ["yes"] * len(specs)
+    legs = [RfqLeg(t, _HYB_EVENT, s, None) for (t, _), s in zip(specs, used_sides, strict=True)]
+    beliefs = [belief(p) for _, p in specs]
+    return legs, beliefs, used_sides
+
+
+def _copula_p(legs: list[RfqLeg], beliefs: list[LegBelief], sides: list[str]) -> JointEstimate:
+    params = _sgp_params()
+    corr = build_sgp_correlation(
+        legs, [tuple(range(len(legs)))], params, marginals=[b.p for b in beliefs]
+    )
+    return price_joint_matrices(beliefs, sides, corr.corr, corr.corr_low, corr.corr_high)
+
+
+class TestWithinGameHybrid:
+    def test_dense_corners_combo_drops_toward_structural_times_corners(self) -> None:
+        """The flagship defect combo: the hybrid must sit BELOW the pure copula
+        and NEAR (DC subgroup joint × corners marginal), lifted only slightly by
+        the small positive corners attach — not a magic cent, not independence."""
+        legs, beliefs, sides = _hyb_case(_HYB_LEGS)
+        params = _sgp_params()
+        hyb = price_within_game_hybrid(legs, beliefs, sides, pricer(), params)
+        assert hyb is not None
+        copula = _copula_p(legs, beliefs, sides)
+
+        # DC prices the representable subgroup (drop the corners leg, index 2).
+        sub_idx = [0, 1, 3, 4]
+        sub_est, _ = pricer().try_price(
+            [legs[i] for i in sub_idx],
+            [beliefs[i] for i in sub_idx],
+            [sides[i] for i in sub_idx],
+        )
+        assert sub_est is not None
+        corners_marginal = beliefs[2].p  # 0.70, all-YES
+
+        independence = 1.0
+        for b in beliefs:
+            independence *= b.p
+
+        # (1) fixes the over-pricing: strictly below the pure copula.
+        assert hyb.p < copula.p
+        # (2) grounded in DC × corners, honouring the small +corners attach:
+        #     structural×marginal ≤ hybrid ≤ structural×marginal + 1c.
+        assert sub_est.p * corners_marginal <= hyb.p <= sub_est.p * corners_marginal + 0.01
+        # (3) not collapsed to independence (structural lift is retained).
+        assert hyb.p > independence
+        # (4) lands in the operator-documented ~5.6c neighbourhood.
+        assert 0.050 <= hyb.p <= 0.065
+        # (5) maker-favorable width: never tighter than the copula it replaces.
+        assert hyb.uncertainty >= copula.uncertainty
+        # (6) inside the Fréchet bounds of the selected marginals.
+        assert hyb.frechet_lo <= hyb.p <= hyb.frechet_hi
+
+    def test_fail_closed_when_subgroup_too_small(self) -> None:
+        """One DC leg + two corners legs: the DC subgroup has <2 orienting legs,
+        so the hybrid declines (None) and the engine keeps today's copula."""
+        specs = [
+            (f"KXWCADVANCE-{_HYB_GAME}-ARG", 0.84),
+            (f"KXWCCORNERS-{_HYB_GAME}-9", 0.70),
+            (f"KXWCTCORNERS-{_HYB_GAME}-ARG5", 0.55),
+        ]
+        legs, beliefs, sides = _hyb_case(specs)
+        assert price_within_game_hybrid(legs, beliefs, sides, pricer(), _sgp_params()) is None
+
+    def test_fail_closed_when_no_remainder(self) -> None:
+        """No non-representable leg: the pure-structural case, which try_price
+        already handles — the hybrid must decline rather than double-price it."""
+        legs, beliefs, sides = _hyb_case([s for s in _HYB_LEGS if "CORNERS" not in s[0]])
+        assert price_within_game_hybrid(legs, beliefs, sides, pricer(), _sgp_params()) is None
+
+    def test_fail_closed_when_subgroup_declines(self) -> None:
+        """Scorers + corners but NO orienting team leg: the subgroup hits the
+        orientation guard (scorer with only symmetric constraints) and declines,
+        so the hybrid falls closed to the copula."""
+        specs = [
+            (f"KXWCBTTS-{_HYB_GAME}-BTTS", 0.40),
+            (f"KXWCTOTAL-{_HYB_GAME}-3", 0.45),
+            (f"KXWCCORNERS-{_HYB_GAME}-9", 0.70),
+            (f"KXWCGOAL-{_HYB_GAME}-ARGLMESSI10-1", 0.60),
+        ]
+        legs, beliefs, sides = _hyb_case(specs)
+        assert price_within_game_hybrid(legs, beliefs, sides, pricer(), _sgp_params()) is None
+
+    def test_non_soccer_never_hybridises(self) -> None:
+        """MLB (or any non-soccer) combo fails closed — the corners taxonomy is
+        soccer-specific, so other sports keep exactly today's behaviour."""
+        specs = [
+            ("KXMLBGAME-26JUL07PHIKC-PHI", 0.55),
+            ("KXMLBTOTAL-26JUL07PHIKC-9", 0.50),
+            ("KXMLBEXTRAS-26JUL07PHIKC-YES", 0.09),
+        ]
+        legs, beliefs, sides = _hyb_case(specs)
+        assert price_within_game_hybrid(legs, beliefs, sides, pricer(), _sgp_params()) is None
+
+    def test_team_corners_remainder_also_attaches(self) -> None:
+        """Soccer-general: a TEAM-corners remainder (measured −ρ to result) also
+        attaches through the copula and lands below the pure copula."""
+        specs = [
+            (f"KXWCADVANCE-{_HYB_GAME}-ARG", 0.84),
+            (f"KXWCBTTS-{_HYB_GAME}-BTTS", 0.40),
+            (f"KXWCTCORNERS-{_HYB_GAME}-ARG5", 0.55),
+            (f"KXWCGOAL-{_HYB_GAME}-ARGLMESSI10-1", 0.60),
+        ]
+        legs, beliefs, sides = _hyb_case(specs)
+        hyb = price_within_game_hybrid(legs, beliefs, sides, pricer(), _sgp_params())
+        assert hyb is not None
+        assert hyb.p < _copula_p(legs, beliefs, sides).p
+
+
+async def test_engine_hybridises_dense_corners_combo() -> None:
+    """End-to-end: with structural ON, a same-game corners combo prices via the
+    within-game hybrid (fair strictly below the copula-only engine's fair)."""
+    tickers = [t for t, _ in _HYB_LEGS]
+    on = await wc_engine_for(tickers, PricingConfig())
+    off = await wc_engine_for(tickers, PricingConfig(structural=StructuralConfig(enabled=False)))
+    rfq = same_event_combo(tickers)
+    hybrid = on.price(rfq, time_to_close_s=TTC)
+    copula = off.price(rfq, time_to_close_s=TTC)
+    assert isinstance(hybrid, ConstructedQuote), hybrid
+    assert isinstance(copula, ConstructedQuote), copula
+    # The hybrid keeps the DC subgroup joint (lower than the copula's compounded
+    # pairwise-ρ) and attaches corners near-independent ⇒ a lower fair.
+    assert hybrid.fair_cc < copula.fair_cc
