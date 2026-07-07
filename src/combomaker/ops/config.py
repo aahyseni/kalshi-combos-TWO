@@ -182,6 +182,19 @@ class CorrelationConfig(StrictModel):
             "corners|total": 0.00,
             "corners|moneyline": 0.00,
             "btts|corners": 0.00,
+            # advance|corners and corners|player_goal were UNLISTED, so a same-
+            # game combo mixing total corners with an ADVANCE or player-goal leg
+            # fell to the flat same_event_rho +0.6 fallback — a fail-safe-inversion
+            # that made corners look strongly comonotone with the result/scorer
+            # and drove the 3,344-contract WC combo to 8.76c vs the maker's 5.60c
+            # (job 24844262). ADVANCE is a diluted moneyline and corners|moneyline
+            # is a MEASURED 0.00 (corners ⊥ result), so advance|corners ≈ 0.00.
+            # corners × a player's goal mirrors the same-team-attack team-corners
+            # prior corners_team|player_goal +0.05. Both are LABELED PRIORS (wide,
+            # zero-spanning band): total corners is measured ⊥ goals/result, these
+            # just replace the WRONG +0.6 default with the grounded near-zero value.
+            "advance|corners": 0.00,
+            "corners|player_goal": 0.05,
             # TEAM corners (KXWCTCORNERS), MEASURED conditional on 8,981 matches
             # (team-strength + venue controlled, so the residual the copula needs
             # after live marginals). Unlike TOTAL corners, a TEAM's corners are
@@ -289,6 +302,8 @@ class CorrelationConfig(StrictModel):
         "soccer:corners|total": 0.08,
         "soccer:btts|corners": 0.08,
         "soccer:corners|moneyline": 0.08,        # total corners, measured ~0 (team is separate now)
+        "soccer:advance|corners": 0.15,          # labeled prior (corners ⊥ result)
+        "soccer:corners|player_goal": 0.20,      # labeled prior (~ corners_team|player_goal)
         "soccer:corners_team|moneyline": 0.10,
         "soccer:corners_team|spread": 0.10,
         "soccer:corners_team|total": 0.08,
