@@ -264,3 +264,45 @@ def test_notes_populated_for_every_non_ok_classification(
     assert rel.kind is not RelationshipKind.OK
     assert len(rel.notes) > 0
     assert all(isinstance(note, str) and note for note in rel.notes)
+
+
+# --- same-team nested TEAM-corner containment (over-M ⊆ over-N for M>N) ---------
+
+TC_EV = "KXWCTCORNERS-26JUL05MEXENG"
+TC_MEX4 = "KXWCTCORNERS-26JUL05MEXENG-MEX4"
+TC_MEX8 = "KXWCTCORNERS-26JUL05MEXENG-MEX8"
+TC_ENG4 = "KXWCTCORNERS-26JUL05MEXENG-ENG4"
+
+
+def test_same_team_corners_higher_yes_lower_no_is_impossible() -> None:
+    """Same team's nested corner lines are exact containment: over-8 ⊆ over-4, so
+    over-8 YES with over-4 NO can never both settle → IMPOSSIBLE (no-quote)."""
+    legs = (leg(TC_MEX8, TC_EV, "yes"), leg(TC_MEX4, TC_EV, "no"))
+    rel = classify_legs(legs, MappingProvider({TC_EV: False}))
+    assert rel.kind is RelationshipKind.IMPOSSIBLE
+    assert rel.same_event_groups == ()
+
+
+def test_same_team_corners_lower_yes_higher_no_is_possible() -> None:
+    """over-4 YES with over-8 NO is a normal band bet (4 < corners ≤ 8) — NOT
+    impossible; it groups for the copula."""
+    legs = (leg(TC_MEX4, TC_EV, "yes"), leg(TC_MEX8, TC_EV, "no"))
+    rel = classify_legs(legs, MappingProvider({TC_EV: False}))
+    assert rel.kind is RelationshipKind.OK
+    assert rel.same_event_groups == ((0, 1),)
+
+
+def test_opposite_team_corners_higher_yes_lower_no_is_not_impossible() -> None:
+    """Containment is SAME-team only: MEX over-8 yes × ENG over-4 no carries no
+    logical implication (different teams) → OK (copula prices the :opp rho)."""
+    legs = (leg(TC_MEX8, TC_EV, "yes"), leg(TC_ENG4, TC_EV, "no"))
+    rel = classify_legs(legs, MappingProvider({TC_EV: False}))
+    assert rel.kind is RelationshipKind.OK
+
+
+def test_same_team_corners_same_line_both_sides_is_caught_upstream() -> None:
+    """Same team, SAME line, opposite sides is the same market both sides — caught
+    by the duplicate-market IMPOSSIBLE guard, not the nested-line branch."""
+    legs = (leg(TC_MEX8, TC_EV, "yes"), leg(TC_MEX8, TC_EV, "no"))
+    rel = classify_legs(legs, MappingProvider({TC_EV: False}))
+    assert rel.kind is RelationshipKind.IMPOSSIBLE

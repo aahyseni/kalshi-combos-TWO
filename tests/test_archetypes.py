@@ -277,9 +277,11 @@ async def dog_ml_btts_harness(config: PricingConfig | None = None) -> PricingEng
 
 
 async def test_dog_moneyline_btts_prices_above_favorite_prior() -> None:
-    """Orientation end to end: with the ML leg a clear dog, the default config
-    (dog rho 0.0) must price the joint ABOVE a config that applies the
-    favorites prior (−0.19) to dogs too — same books, same marginals."""
+    """Orientation end to end: with the ML leg a clear dog (~0.245), the default
+    config (the win-prob CURVE -> rho ~-0.09 there) must price the joint ABOVE a
+    config that applies the favorites prior (-0.19) to dogs too — same books,
+    same marginals. (The curve supersedes the fav/dog plateau; the flat config
+    disables it via oriented_curve={}.)"""
     rfq = same_event_combo([ML_LEG_A, BTTS_LEG])
 
     engine_oriented = await dog_ml_btts_harness()
@@ -288,7 +290,8 @@ async def test_dog_moneyline_btts_prices_above_favorite_prior() -> None:
     soccer_flat["btts|moneyline:dog"] = soccer_flat["btts|moneyline:fav"]  # −0.19 everywhere
     flat_cfg = PricingConfig(
         correlation=CorrelationConfig(
-            pair_rho_by_sport={**base.pair_rho_by_sport, "soccer": soccer_flat}
+            pair_rho_by_sport={**base.pair_rho_by_sport, "soccer": soccer_flat},
+            oriented_curve={},  # disable the win-prob curve -> flat fav/dog path
         )
     )
     engine_flat = await dog_ml_btts_harness(flat_cfg)
@@ -297,5 +300,5 @@ async def test_dog_moneyline_btts_prices_above_favorite_prior() -> None:
     flat = engine_flat.price(rfq, time_to_close_s=TTC)
     assert isinstance(oriented, ConstructedQuote), oriented
     assert isinstance(flat, ConstructedQuote), flat
-    # rho 0.0 vs −0.19 on ~0.245×0.605 marginals is worth a real gap (>50cc).
+    # curve rho ~-0.09 vs flat -0.19 on ~0.245×0.605 marginals: a real gap (~127cc).
     assert oriented.fair_cc > flat.fair_cc + 50

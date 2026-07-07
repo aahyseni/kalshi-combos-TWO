@@ -157,11 +157,24 @@ class CorrelationConfig(StrictModel):
         "soccer": {
             "moneyline|total": 0.28,
             "btts|total": 0.70,
+            # btts|moneyline is now a WIN-PROB CURVE (oriented_curve below), not
+            # two flat fav/dog plateaus: the residual btts<->win rho is a monotone
+            # function of the ML leg's win-prob (RE-MEASURED 2026-07-07, 8,982
+            # matches — heavy longshot ~0, deepening to ~-0.36 for heavy favorites).
+            # The curve WINS whenever leg marginals are available; these plain /
+            # :fav / :dog entries are the marginal-less fallback (and the -0.19
+            # pooled value the curve reduces to at a mid-strength dog).
             "btts|moneyline": -0.19,
             "btts|moneyline:fav": -0.19,
             "btts|moneyline:dog": 0.00,
             "moneyline|player_goal": 0.50,
-            "btts|player_goal": 0.45,        # 0.35->0.45: a scorer guarantees one BTTS leg
+            # RE-MEASURED 2026-07-07 (Understat 3,652 matches, orientation-balanced
+            # top-xG scorer per team): implied rho +0.549, so 0.45->0.55. Must
+            # EXCEED player_goal|total (0.46) and it does. Strongly orientation-
+            # dependent (dog-scorer +0.81, fav-scorer +0.31) but there is no ML leg
+            # to orient on, so a single 0.55 ships with a wide band (0.30) spanning
+            # the fav/dog range.
+            "btts|player_goal": 0.55,
             "player_goal|total": 0.46,       # measured +0.46 (Understat 3,652); was global 0.40
             "player_goal|player_goal": 0.03,  # teammates ~0 (Poisson-split, exact) / opp +0.05
             "total|total": 0.95,
@@ -180,7 +193,21 @@ class CorrelationConfig(StrictModel):
             "corners_team|spread": -0.13,
             "corners_team|total": 0.00,
             "btts|corners_team": 0.00,
-            "corners_team|corners_team": -0.21,   # opposite teams: territory zero-sum
+            # Team corners nest ONLY for the SAME team (POR4 & POR8); game totals
+            # do NOT nest (0 in tape). Resolved in sgp.py to ":same"/":opp" by
+            # stripping the trailing line digits off the team suffix. OPPOSITE
+            # teams: territory is roughly zero-sum, RE-MEASURED 2026-07-07 on
+            # 8,981 matches (HC x AC over lines 4-7): implied rho -0.287 (grid) /
+            # -0.283 (matched lines), so -0.21 -> -0.28 (the shipped -0.21 was the
+            # opposite-team value, ~0.07 too shallow). SAME team, nested lines are
+            # EXACT CONTAINMENT (over-M subset of over-N, 0 violations) — when the
+            # pair is buried in a larger combo (not the bare-pair IMPOSSIBLE/OK case
+            # relationships.py resolves) the copula approximates it with a strong
+            # comonotone positive. Plain entry is the opposite-team value, used when
+            # the team suffix cannot be parsed.
+            "corners_team|corners_team": -0.28,
+            "corners_team|corners_team:opp": -0.28,
+            "corners_team|corners_team:same": 0.90,
             "corners_team|player_goal": 0.05,     # prior (same-team attack), wide band
             "advance|corners_team": -0.05,        # prior (diluted moneyline), wide band
             "moneyline|moneyline": -0.95,
@@ -241,7 +268,7 @@ class CorrelationConfig(StrictModel):
         "soccer:btts|moneyline:fav": 0.10,
         "soccer:btts|moneyline:dog": 0.10,  # structural implication, 1 live validation
         "soccer:moneyline|player_goal": 0.12,   # structural implication ×2 examples
-        "soccer:btts|player_goal": 0.20,    # implied 0.31 (fav) ↔ 0.68 (dog): band must span
+        "soccer:btts|player_goal": 0.30,    # 0.55 mid; band spans fav +0.31 ↔ dog +0.81
         "moneyline|player_goal": 0.20,      # global fallback: non-soccer scorers unmeasured
         "soccer:total|total": 0.04,
         "soccer:corners|total": 0.08,
@@ -252,6 +279,8 @@ class CorrelationConfig(StrictModel):
         "soccer:corners_team|total": 0.08,
         "soccer:btts|corners_team": 0.08,
         "soccer:corners_team|corners_team": 0.10,
+        "soccer:corners_team|corners_team:opp": 0.10,   # re-measured, tight
+        "soccer:corners_team|corners_team:same": 0.10,  # comonotone containment approx
         "soccer:corners_team|player_goal": 0.20,  # labeled prior
         "soccer:advance|corners_team": 0.15,      # labeled prior
         "soccer:player_goal|total": 0.15,        # hand-prior width around measured +0.46
@@ -275,6 +304,28 @@ class CorrelationConfig(StrictModel):
         "mlb:extras|total": 0.10,           # post-rule-change sample is smaller
         "mlb:extras|moneyline": 0.08,
         "mlb:moneyline|moneyline": 0.04,
+    }
+    # Orientation CURVES: a pair whose YES-YES rho is a monotone function of one
+    # leg's marginal (not a single scalar or a fav/dog step). Keyed
+    # "<sport>:<pair_key>" -> sorted (marginal, rho) knots, piecewise-linear
+    # interpolated in sgp.py with FLAT clamp outside the knot range; the curve
+    # WINS over the scalar / fav-dog entry whenever leg marginals are available.
+    # soccer:btts|moneyline RE-MEASURED 2026-07-07 (8,982 top-5-EU matches,
+    # btts x team-win implied rho binned across devigged closing win-prob): heavy
+    # longshot (~0.20) ~ 0 (NOT the -0.19 the old 2-anchor blend over-negated),
+    # deepening monotonically to ~-0.36 for heavy favorites ("winners keep clean
+    # sheets" is a favorites effect; a dog can only win by scoring).
+    oriented_curve: dict[str, list[tuple[float, float]]] = {
+        "soccer:btts|moneyline": [
+            (0.20, -0.05),
+            (0.35, -0.18),
+            (0.50, -0.28),
+            (0.65, -0.34),
+            (0.85, -0.36),
+        ],
+    }
+    oriented_curve_uncertainty: dict[str, float] = {
+        "soccer:btts|moneyline": 0.13,
     }
 
 

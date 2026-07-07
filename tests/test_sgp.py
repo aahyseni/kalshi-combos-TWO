@@ -59,6 +59,8 @@ def soccer_params() -> SgpParams:
         untyped_uncertainty=c.untyped_rho_uncertainty,
         pair_uncertainty=dict(c.pair_rho_uncertainty),
         pair_rho_by_sport={s: dict(t) for s, t in c.pair_rho_by_sport.items()},
+        oriented_curve={k: list(v) for k, v in c.oriented_curve.items()},
+        oriented_curve_uncertainty=dict(c.oriented_curve_uncertainty),
     )
 
 
@@ -374,8 +376,12 @@ class TestScorerAndCornerPairs:
         assert typed == 1 and rho == pytest.approx(0.46)
 
     def test_btts_player_goal_resolves(self) -> None:
+        # RE-MEASURED 2026-07-07 (Understat 3,652, orientation-balanced top-xG
+        # scorer): implied +0.549 -> ship 0.55 (was 0.45). Exceeds player_goal|
+        # total (0.46), as a scorer guaranteeing one BTTS leg must.
         rho, typed = self._rho(BTTS_TICKER, GOAL_TICKER)
-        assert typed == 1 and rho == pytest.approx(0.45)
+        assert typed == 1 and rho == pytest.approx(0.55)
+        assert rho > 0.46  # must exceed player_goal|total
 
     def test_corners_moneyline_no_longer_flat_default(self) -> None:
         # The blind 0.6 same-event default is dead: corners|moneyline is a typed
@@ -391,8 +397,129 @@ class TestScorerAndCornerPairs:
         tc = "KXWCTCORNERS-26JUL07SUICOL-COL5"
         rho, typed = self._rho(tc, "KXWCGAME-26JUL07SUICOL-COL")
         assert typed == 1 and rho == pytest.approx(-0.15)  # team corners x that team wins
+        # Opposite teams (COL vs SUI) resolve the :opp orientation. RE-MEASURED
+        # 2026-07-07 (HC x AC, lines 4-7): implied -0.287 -> ship -0.28 (was the
+        # ~0.07-too-shallow -0.21). Team parsed by stripping the line digits.
         rho2, typed2 = self._rho(tc, "KXWCTCORNERS-26JUL07SUICOL-SUI5")
-        assert typed2 == 1 and rho2 == pytest.approx(-0.21)  # opposite teams, zero-sum
+        assert typed2 == 1 and rho2 == pytest.approx(-0.28)  # opposite teams, zero-sum
         # and total corners still resolve their own (unchanged) 0.00.
         rho3, typed3 = self._rho(CORNERS_TICKER, ML_SOCCER_TICKER)
         assert typed3 == 1 and rho3 == pytest.approx(0.00)
+
+    def test_same_team_corners_strong_positive(self) -> None:
+        # SAME team's nested lines (COL4 & COL8, POR4/POR8 analog) resolve :same,
+        # a strong comonotone-approx positive — team parsed by stripping the line
+        # digits so COL4 and COL8 read as ONE team (COL), not two.
+        rho, typed = self._rho(
+            "KXWCTCORNERS-26JUL07SUICOL-COL4", "KXWCTCORNERS-26JUL07SUICOL-COL8"
+        )
+        assert typed == 1 and rho == pytest.approx(0.90)
+
+
+# --- FIX 1: btts|moneyline win-prob orientation CURVE ---------------------------
+
+BTTS_SOCCER = "KXWCBTTS-26JUL05MEXENG-BTTS"
+ML_SOCCER = "KXWCGAME-26JUL05MEXENG-MEX"
+
+
+def _btts_ml_curve(ml_marginal: float) -> np.ndarray:
+    """corr matrix for [ML(soccer), BTTS] of one game at a given ML YES-marginal,
+    using the SHIPPED soccer config (curve forwarded via soccer_params())."""
+    out = build_sgp_correlation(
+        (leg(ML_SOCCER, "EV"), leg(BTTS_SOCCER, "EV")),
+        [(0, 1)],
+        soccer_params(),
+        marginals=[ml_marginal, 0.55],
+    )
+    return out.corr
+
+
+def test_btts_moneyline_curve_heavy_longshot_prices_near_zero() -> None:
+    # THE headline fix: a heavy-longshot ML leg (win-prob 0.20) prices ~0, NOT the
+    # -0.19/-0.20 the old 2-anchor fav/dog blend over-negated.
+    rho = _btts_ml_curve(0.20)[0, 1]
+    assert rho == pytest.approx(-0.05, abs=1e-9)
+    assert rho > -0.10  # unmistakably ~0, not the old -0.20
+
+
+def test_btts_moneyline_curve_pickem() -> None:
+    assert _btts_ml_curve(0.50)[0, 1] == pytest.approx(-0.28, abs=1e-9)
+
+
+def test_btts_moneyline_curve_favorite() -> None:
+    assert _btts_ml_curve(0.65)[0, 1] == pytest.approx(-0.34, abs=1e-9)
+
+
+def test_btts_moneyline_curve_monotone_deepens_with_favoritism() -> None:
+    rhos = [_btts_ml_curve(p)[0, 1] for p in (0.20, 0.35, 0.50, 0.65, 0.85)]
+    assert all(a > b for a, b in zip(rhos, rhos[1:], strict=False))  # strictly deepening
+
+
+def test_btts_moneyline_curve_flat_clamp_outside_knot_range() -> None:
+    # Below the lowest knot (0.20) and above the highest (0.85) the curve clamps
+    # flat — never extrapolated past the measured range.
+    assert _btts_ml_curve(0.05)[0, 1] == pytest.approx(-0.05, abs=1e-9)
+    assert _btts_ml_curve(0.98)[0, 1] == pytest.approx(-0.36, abs=1e-9)
+
+
+def test_btts_moneyline_curve_band_from_config() -> None:
+    out = build_sgp_correlation(
+        (leg(ML_SOCCER, "EV"), leg(BTTS_SOCCER, "EV")),
+        [(0, 1)],
+        soccer_params(),
+        marginals=[0.50, 0.55],
+    )
+    # band 0.13 around the -0.28 pick-em knot -> low -0.41, high -0.15.
+    assert out.corr_low[0, 1] == pytest.approx(-0.41, abs=1e-9)
+    assert out.corr_high[0, 1] == pytest.approx(-0.15, abs=1e-9)
+
+
+def test_btts_moneyline_without_marginals_falls_to_plain() -> None:
+    # No marginals -> the curve cannot orient -> plain -0.19 pooled value.
+    out = build_sgp_correlation(
+        (leg(ML_SOCCER, "EV"), leg(BTTS_SOCCER, "EV")), [(0, 1)], soccer_params()
+    )
+    assert out.corr[0, 1] == pytest.approx(-0.19, abs=1e-9)
+
+
+def test_btts_moneyline_curve_wins_over_fav_dog() -> None:
+    # The shipped config carries BOTH the curve AND the legacy :fav/:dog scalars.
+    # The curve must WIN: at a clear favorite the fav scalar would give -0.19, but
+    # the curve gives -0.36; at a heavy longshot dog's ~0.0 would apply but the
+    # curve gives -0.05. Either way the resolved value is the CURVE's.
+    p = soccer_params()
+    assert p.pair_rho_by_sport["soccer"]["btts|moneyline:fav"] == -0.19  # present...
+    assert _btts_ml_curve(0.85)[0, 1] == pytest.approx(-0.36, abs=1e-9)   # ...but curve wins
+
+
+def test_shipped_config_carries_btts_moneyline_curve() -> None:
+    c = CorrelationConfig()
+    knots = c.oriented_curve["soccer:btts|moneyline"]
+    assert knots[0] == (0.20, -0.05) and knots[-1] == (0.85, -0.36)
+    assert c.oriented_curve_uncertainty["soccer:btts|moneyline"] == pytest.approx(0.13)
+
+
+def test_corners_team_unparseable_suffix_uses_plain_not_orientation() -> None:
+    # A suffix that isn't <team><digits> cannot orient -> the PLAIN entry, never a
+    # guessed :opp/:same. Distinct plain value proves the fallback path.
+    p = SgpParams(
+        pair_rho={},
+        default_rho=0.3,
+        cross_event_rho=0.0,
+        typed_uncertainty=0.15,
+        untyped_uncertainty=0.25,
+        pair_rho_by_sport={
+            "soccer": {
+                "corners_team|corners_team": -0.10,       # plain (distinct)
+                "corners_team|corners_team:opp": -0.28,
+                "corners_team|corners_team:same": 0.90,
+            }
+        },
+    )
+    out = build_sgp_correlation(
+        (leg("KXWCTCORNERS-26JUL05MEXENG-", "EV"),  # empty suffix -> unparseable
+         leg("KXWCTCORNERS-26JUL05MEXENG-ENG5", "EV")),
+        [(0, 1)],
+        p,
+    )
+    assert out.corr[0, 1] == pytest.approx(-0.10, abs=1e-9)  # plain, not :opp -0.28

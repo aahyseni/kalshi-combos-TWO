@@ -77,6 +77,12 @@ class PricingEngine:
                 sport: dict(table)
                 for sport, table in config.correlation.pair_rho_by_sport.items()
             },
+            oriented_curve={
+                k: list(v) for k, v in config.correlation.oriented_curve.items()
+            },
+            oriented_curve_uncertainty=dict(
+                config.correlation.oriented_curve_uncertainty
+            ),
         )
         quote_fields = {
             k: v

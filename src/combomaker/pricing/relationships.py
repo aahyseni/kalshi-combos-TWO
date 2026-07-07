@@ -25,6 +25,7 @@ the caller must turn into widen-or-no-quote:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
@@ -60,6 +61,21 @@ class Relationship:
     # subset leg logically IMPLIES a YES on the superset leg, so the combo joint
     # is exactly P(subset). None for every other kind.
     containment: tuple[int, int] | None = None
+
+
+# Team-corners ticker suffix = team code + the over-line digits (…-COL5 -> COL, 5).
+_CORNERS_TEAM_LINE = re.compile(r"^([A-Za-z]+)(\d+)$")
+
+
+def _corners_team_line(market_ticker: str) -> tuple[str, int] | None:
+    """(team, over-line) parsed from a team-corners ticker's suffix
+    (``…-POR8`` -> ``("POR", 8)``). None when the suffix isn't a team-code +
+    digits shape — never guess a line for the containment logic."""
+    suffix = market_ticker.rsplit("-", 1)[-1].upper()
+    m = _CORNERS_TEAM_LINE.match(suffix)
+    if m is None:
+        return None
+    return m.group(1), int(m.group(2))
 
 
 def _game_key(event_ticker: str) -> str:
@@ -145,6 +161,36 @@ def classify_legs(
     # subset-side "no" cases and other period families are DEFERRED (they fall
     # to the normal grouped/copula path).
     types = [classify_leg(leg.market_ticker) for leg in legs]
+
+    # Same-team TEAM-corner lines are EXACT CONTAINMENT (over-M ⊆ over-N for
+    # M>N: a team with more than M corners necessarily has more than N — 0
+    # violations in the tape). So within one game, for ONE team, a YES on the
+    # HIGHER line with a NO on the LOWER line is logically impossible (v1 policy:
+    # no-quote), mirroring the 1H-BTTS-yes × FT-BTTS-no branch below. Scoped to
+    # corners_team only (game-total corners do NOT nest); same-team lower-yes ×
+    # higher-no stays POSSIBLE and falls to the copula, as does the buried-in-
+    # combo same-team pair (approximated by the comonotone prior, not pinned).
+    corner_legs: list[tuple[int, str, int]] = []
+    for i, leg in enumerate(legs):
+        if types[i] is not LegType.CORNERS_TEAM:
+            continue
+        parsed = _corners_team_line(leg.market_ticker)
+        if parsed is not None:
+            corner_legs.append((i, parsed[0], parsed[1]))
+    for a_i, a_team, a_line in corner_legs:
+        if legs[a_i].side != "yes":
+            continue
+        for b_i, b_team, b_line in corner_legs:
+            if b_i == a_i or legs[b_i].side != "no":
+                continue
+            if a_team != b_team or game_keys[a_i] != game_keys[b_i] or a_line <= b_line:
+                continue
+            notes.append(
+                f"same-team corners over-{a_line} yes ({legs[a_i].market_ticker}) "
+                f"implies over-{b_line} yes: {legs[b_i].market_ticker} no is impossible"
+            )
+            return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
+
     containment: tuple[int, int] | None = None
     for sub in range(len(legs)):
         if types[sub] is not LegType.FIRST_HALF_BTTS or legs[sub].side != "yes":

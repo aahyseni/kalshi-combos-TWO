@@ -15,6 +15,7 @@ joint can be re-priced across the band and the spread priced into width.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -38,6 +39,11 @@ class SgpParams:
     # Sport-specific pair tables ("nba" -> {"moneyline|total": ...}); the same
     # pair correlates differently per sport. Falls back to pair_rho.
     pair_rho_by_sport: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Orientation CURVES: "<sport>:<pair_key>" -> sorted (marginal, rho) knots,
+    # piecewise-linear (flat outside the range). When present for a one-moneyline
+    # pair with known marginals, the curve WINS over the scalar / fav-dog prior.
+    oriented_curve: dict[str, list[tuple[float, float]]] = field(default_factory=dict)
+    oriented_curve_uncertainty: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +117,76 @@ def _oriented_prior(
         band=max(fav.band, dog.band),
         source=f"{fav.source if w >= 0.5 else dog.source} (ml_p={ml_marginal:.2f} w={w:.2f})",
     )
+
+
+def _interp_curve(x: float, knots: Sequence[tuple[float, float]]) -> float:
+    """Piecewise-linear interpolation of ``knots`` (sorted by first coord) at
+    ``x``, with a FLAT clamp outside the knot range (a marginal below the lowest
+    knot keeps the lowest knot's rho; above the highest, the highest's)."""
+    pts = sorted(knots)
+    if x <= pts[0][0]:
+        return pts[0][1]
+    if x >= pts[-1][0]:
+        return pts[-1][1]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:], strict=False):
+        if x0 <= x <= x1:
+            t = (x - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
+    return pts[-1][1]
+
+
+def _oriented_curve_prior(
+    key: str, sport: str, params: SgpParams, ml_marginal: float
+) -> _PairPrior | None:
+    """Win-prob CURVE prior for a pair containing one MONEYLINE leg, when the
+    residual rho is a monotone function of the ML leg's YES-side marginal rather
+    than two fav/dog plateaus (btts|moneyline). Config expresses it as sorted
+    ``(marginal, rho)`` knots under ``oriented_curve[<sport>:<key>]``; this wins
+    over ``_oriented_prior`` whenever the knots exist and marginals are known."""
+    curve_key = f"{sport}:{key}"
+    knots = params.oriented_curve.get(curve_key) or params.oriented_curve.get(key)
+    if not knots:
+        return None
+    rho = _interp_curve(ml_marginal, knots)
+    band = params.oriented_curve_uncertainty.get(
+        curve_key, params.oriented_curve_uncertainty.get(key, params.typed_uncertainty)
+    )
+    return _PairPrior(rho, band, f"{curve_key} curve (ml_p={ml_marginal:.2f})")
+
+
+# Team-corner ticker suffix: a team code followed by the (over-)line digits, e.g.
+# ``…-POR4`` / ``…-COL5``. The line digits must be STRIPPED before comparing team
+# identity — POR4 and POR8 are the SAME team's nested corner lines, which
+# ``_winner_team`` (whole-suffix) would read as two different teams.
+_CORNERS_TEAM_SUFFIX = re.compile(r"^([A-Za-z]+)\d*$")
+
+
+def _corners_team_name(ticker: str) -> str | None:
+    """The team a team-corners leg names — its ticker suffix with the trailing
+    line digits removed (``…-POR8`` -> ``POR``). None when the suffix isn't a
+    team-code + optional digits shape (don't guess)."""
+    suffix = ticker.rsplit("-", 1)[-1].upper()
+    m = _CORNERS_TEAM_SUFFIX.match(suffix)
+    if m is None:
+        return None
+    return m.group(1)
+
+
+def _corners_team_prior(
+    key: str, sport: str, params: SgpParams, ticker_a: str, ticker_b: str
+) -> _PairPrior | None:
+    """corners_team × corners_team prior, resolved to ``:same`` / ``:opp`` by
+    whether the two legs name the same team (nested lines on one team -> strong
+    positive comonotone approx) or opposite teams (territory zero-sum, -ρ). The
+    same/opposite analogue of ``_winner_period_prior``, but the team is parsed by
+    stripping the trailing line digits. Unparseable suffix -> None (caller falls
+    back to the plain entry; never invent an orientation)."""
+    team_a = _corners_team_name(ticker_a)
+    team_b = _corners_team_name(ticker_b)
+    if team_a is None or team_b is None:
+        return None
+    orient = "same" if team_a == team_b else "opp"
+    return _lookup_pair(f"{key}:{orient}", sport, params)
 
 
 def _winner_team(ticker: str) -> str | None:
@@ -203,13 +279,25 @@ def build_sgp_correlation(
                     prior = _winner_period_prior(
                         key, sport, params, legs[i].market_ticker, legs[j].market_ticker
                     )
+                elif (
+                    types[i] is LegType.CORNERS_TEAM and types[j] is LegType.CORNERS_TEAM
+                ):
+                    # Team corners × team corners: sign flips on same-vs-opposite
+                    # team (nested lines on one team vs opposing-team territory).
+                    prior = _corners_team_prior(
+                        key, sport, params, legs[i].market_ticker, legs[j].market_ticker
+                    )
                 else:
                     one_moneyline = (types[i] is LegType.MONEYLINE) != (
                         types[j] is LegType.MONEYLINE
                     )
                     if one_moneyline and marginals is not None:
                         ml_index = i if types[i] is LegType.MONEYLINE else j
-                        prior = _oriented_prior(key, sport, params, marginals[ml_index])
+                        # Curve first (monotone win-prob dependence), else the
+                        # fav/dog 2-anchor blend, else the plain lookup below.
+                        prior = _oriented_curve_prior(
+                            key, sport, params, marginals[ml_index]
+                        ) or _oriented_prior(key, sport, params, marginals[ml_index])
                 prior = prior or _lookup_pair(key, sport, params)
                 if prior is not None:
                     rho, band = prior.rho, prior.band
