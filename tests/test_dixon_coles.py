@@ -95,6 +95,51 @@ class TestInversion:
         with pytest.raises(StructuralError, match="cannot identify"):
             knockout_invert([(TeamWin(Team.A), 0.65), (PlayerScores(Team.A), 0.50)])
 
+    def test_scorer_with_symmetric_constraints_only_is_unoriented(self) -> None:
+        # BTTS + Over pin {lam_a, lam_b} only as an unordered pair (both are
+        # symmetric under team swap); a single-team scorer then attaches to an
+        # arbitrary mirror. Decline -> copula (audit #2).
+        with pytest.raises(StructuralError, match="orientation is unidentified"):
+            knockout_invert(
+                [(Btts(), 0.55), (TotalOver(3), 0.50), (PlayerScores(Team.A), 0.35)]
+            )
+
+    def test_draw_does_not_orient_a_scorer(self) -> None:
+        # Draw is a moneyline-family selection but is SYMMETRIC — it must not
+        # count as an orientation resolver.
+        with pytest.raises(StructuralError, match="orientation is unidentified"):
+            knockout_invert(
+                [(Btts(), 0.55), (Draw(), 0.25), (PlayerScores(Team.A), 0.35)]
+            )
+
+    def test_scorer_with_orienting_leg_still_prices(self) -> None:
+        # A TeamWin (or Advance) leg NAMES a team and pins orientation, so a
+        # scorer combo stays structural — the guard must not over-catch.
+        # (Targets are consistent with lam=(1.6, 1.1) so the exact solve holds.)
+        m1 = knockout_invert(
+            [(TeamWin(Team.A), 0.5674), (Btts(), 0.541), (PlayerScores(Team.A), 0.40)]
+        )
+        assert m1.shares  # priced, did not raise
+        m2 = knockout_invert(
+            [(Advance(Team.A), 0.6284), (Btts(), 0.541), (PlayerScores(Team.A), 0.40)]
+        )
+        assert m2.shares
+
+    def test_scorers_on_both_teams_stay_structural(self) -> None:
+        # Scorers on BOTH teams restore orientation-invariance of the joint
+        # (verified), so the combo is identified even with only symmetric team
+        # constraints — keep structural, do not decline. (Btts/Total targets are
+        # consistent with lam=(1.6, 1.1); scorer marginals are under both ceilings.)
+        model = knockout_invert(
+            [
+                (Btts(), 0.541),
+                (TotalOver(3), 0.5808),
+                (PlayerScores(Team.A), 0.35),
+                (PlayerScores(Team.B), 0.30),
+            ]
+        )
+        assert len(model.shares) == 2  # both player shares solved, no raise
+
     def test_contradictory_exact_system_refuses(self) -> None:
         # A 95% favorite in a game where both teams score 90% of the time is
         # not representable by any Poisson scoreline.

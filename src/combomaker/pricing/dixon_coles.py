@@ -361,6 +361,26 @@ def invert(
             f"{len(team_constraints)} team-level legs cannot identify (lam_a, lam_b)"
         )
 
+    # Orientation identifiability (audit #2, 2026-07-07). The team-level solve
+    # pins (lam_a, lam_b) only as an UNORDERED pair: Btts / Draw / TotalOver are
+    # all symmetric under swapping the two teams, so ONLY a TeamWin/Advance leg
+    # NAMES a team and fixes which lam is which. A PlayerScores leg's marginal
+    # re-fits at either orientation (its share is free), but its JOINT with the
+    # other legs reads the scoreline and differs by orientation — an arbitrary
+    # ~5c (up to ~10c) mispricing none of the width channels capture (false
+    # confidence). So with a scorer leg on a SINGLE team and no orienting leg,
+    # decline to the copula, which prices the pairs orientation-free. Scorers on
+    # BOTH teams restore orientation-invariance of the joint (verified) → keep
+    # structural.
+    scorer_teams = {spec.team for spec, _ in legs if isinstance(spec, PlayerScores)}
+    has_orienting = any(isinstance(spec, (TeamWin, Advance)) for spec, _ in legs)
+    if scorer_teams and not has_orienting and len(scorer_teams) < 2:
+        raise StructuralError(
+            "player-scorer leg with only symmetric team constraints (no TeamWin/"
+            "Advance): team orientation is unidentified — the scorer's rate would "
+            "attach to an arbitrary mirror"
+        )
+
     def make_params(x: NDArray[np.float64]) -> ModelParams:
         return ModelParams(
             lam_a=float(np.exp(x[0])),
