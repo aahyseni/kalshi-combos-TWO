@@ -47,11 +47,26 @@ class Sample:
     taker_side: str             # which side the taker bought
     legs: list[RfqLeg]
     sides: list[str]
-    probs: list[float]          # YES-side marginals at quote time
+    probs: list[float]          # per-leg P(SELECTED side), exactly as recorded
+                                # in would_quotes.leg_probs_json — stub.py stores
+                                # `p_yes if side=="yes" else 1-p_yes` (its
+                                # docstring: "per-leg P(selected side)")
     n_legs: int
-    our_fair: float             # shadow would-quote fair at the time
+    our_fair: float             # recorded stub (independence) fair_cc/1e4 —
+                                # legacy; competitiveness now uses the engine fair
     our_half_width: float       # shadow would-quote width/2
     sport: str                  # single sport label or "mixed"
+
+    @property
+    def yes_marginals(self) -> list[float]:
+        """YES-side marginals, the convention every pricer wants (LegBelief.p,
+        structural inversion targets, sgp orientation). The tape stores the
+        SELECTED-side prob, so flip NO legs back to YES here — the single
+        conversion point between tape convention and pricer convention."""
+        return [
+            p if side == "yes" else 1.0 - p
+            for p, side in zip(self.probs, self.sides, strict=True)
+        ]
 
 
 def game_key(ticker: str) -> str | None:
@@ -69,7 +84,10 @@ def sport_label(legs: list[RfqLeg]) -> str:
 
 
 def load_samples(db_path: str) -> list[Sample]:
-    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    # Read-only + timeout: the tape is being written live by the recorder, so a
+    # bare connect can hit "database is locked". mode=ro (never immutable=1,
+    # which corrupts reads on a live file); timeout waits out the writer.
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=60)
     rows = db.execute(
         """
         SELECT ct.trade_id, ct.yes_price_cc, ct.taker_side, r.legs_json,
@@ -127,10 +145,11 @@ def event_groups(legs: list[RfqLeg]) -> list[tuple[int, ...]]:
 
 
 def price_copula(sample: Sample, params: SgpParams) -> float:
+    yes = sample.yes_marginals
     corr = build_sgp_correlation(
-        sample.legs, event_groups(sample.legs), params, marginals=sample.probs
+        sample.legs, event_groups(sample.legs), params, marginals=yes
     )
-    beliefs = [LegBelief(p=p, uncertainty=0.005, source="db") for p in sample.probs]
+    beliefs = [LegBelief(p=p, uncertainty=0.005, source="db") for p in yes]
     est = price_joint_matrices(
         beliefs, sample.sides, corr.corr, corr.corr_low, corr.corr_high
     )
@@ -142,13 +161,14 @@ def price_hybrid_structural(
 ) -> tuple[float, bool]:
     """(joint, used_structural): structural per game, independent across
     games; per-game copula fallback when the group can't be priced."""
+    yes = sample.yes_marginals
     groups = {g: list(g) for g in event_groups(sample.legs)}
     grouped = {i for g in groups for i in g}
     joint = 1.0
     used = False
     for g in groups.values():
         legs = [sample.legs[i] for i in g]
-        beliefs = [LegBelief(sample.probs[i], 0.005, "db") for i in g]
+        beliefs = [LegBelief(yes[i], 0.005, "db") for i in g]
         sides = [sample.sides[i] for i in g]
         est, _reason = pricer.try_price(legs, beliefs, sides)
         if est is not None:
@@ -160,22 +180,33 @@ def price_hybrid_structural(
         joint *= price_joint_matrices(
             beliefs, sides, corr.corr, corr.corr_low, corr.corr_high
         ).p
-    for i, (p, side) in enumerate(zip(sample.probs, sample.sides, strict=True)):
+    for i in range(len(sample.probs)):
         if i not in grouped:
-            joint *= p if side == "yes" else 1.0 - p
+            joint *= sample.probs[i]  # ungrouped leg contributes P(selected side)
     return joint, used
 
 
 def independence(sample: Sample) -> float:
+    # sample.probs is already P(selected side); the independence joint is just
+    # their product (this reproduces the recorded stub fair_cc — see stub.py).
+    # Re-flipping NO legs here (`1-p`) would double-negate them — the H2 bug.
     joint = 1.0
-    for p, side in zip(sample.probs, sample.sides, strict=True):
-        joint *= p if side == "yes" else 1.0 - p
+    for p in sample.probs:
+        joint *= p
     return joint
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="data/combomaker-prod.sqlite3")
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="price only a random N-sample of the matched trades (demo speed); "
+        "default = all. Full-tape logic is unchanged.",
+    )
+    ap.add_argument("--seed", type=int, default=0, help="RNG seed for --limit")
     args = ap.parse_args()
 
     cfg = CorrelationConfig()
@@ -195,6 +226,11 @@ def main() -> None:
 
     samples = load_samples(args.db)
     print(f"matched executed trades: {len(samples)}")
+    if args.limit is not None and args.limit < len(samples):
+        import random
+
+        samples = random.Random(args.seed).sample(samples, args.limit)
+        print(f"--limit {args.limit}: random sample of {len(samples)} (seed={args.seed})")
 
     rows = []
     n_structural = 0
@@ -245,41 +281,40 @@ def main() -> None:
         report(f"sport: {sport}", [r for r in rows if r[0].sport == sport])
 
     # --- our shadow quote vs the actual winner ------------------------------
-    # Our taker-facing price on the side the taker took: YES ask = fair +
-    # width/2, NO ask = (1 - fair) + width/2 (maker fee $0, caps/skew
-    # ignored). We'd have WON the auction when our ask beats the executed
-    # price. Expected edge if won (structural fair as the truth proxy):
-    # our_ask - structural_fair on the sold side.
-    print("\n=== our shadow quote vs actual winning quote ===")
+    # "Our fair" here is the ENGINE fair this tool computes (structural when it
+    # applied, else the v1 copula) — NOT the recorded stub `fair_cc`, which is
+    # only the independence product of the selected-side marginals (stub.py) and
+    # so ignores every correlation the shipped engine prices. Taker-facing ask
+    # on the side the taker took: YES ask = fair + width/2, NO ask =
+    # (1 - fair) + width/2 (maker fee $0, caps/skew ignored; the half-width is
+    # still the recorded observe-mode shadow width). We'd have WON the auction
+    # when our ask beats the executed price; "undercut" = how far below the
+    # clearing price our quote sat. (Edge-if-won measured against our own fair is
+    # definitionally the half-width once the ask is built from that fair, so it
+    # is not reported; the winner's-curse caveat is that we win selectively when
+    # our fair sits low.)
+    print("\n=== our shadow quote (engine fair) vs actual winning quote ===")
 
     def competitiveness(subset: list) -> None:
         if not subset:
             return
-        won, edges, margins = 0, [], []
+        won, margins = 0, []
         for r in subset:
             s: Sample = r[0]
-            p_str = r[3]
+            engine_fair = r[3] if r[4] else r[2]  # structural if applied, else copula
             if s.taker_side == "yes":
-                our_ask = s.our_fair + s.our_half_width
+                our_ask = engine_fair + s.our_half_width
                 winner = s.trade_price
-                edge = our_ask - p_str
             else:
-                our_ask = (1.0 - s.our_fair) + s.our_half_width
+                our_ask = (1.0 - engine_fair) + s.our_half_width
                 winner = 1.0 - s.trade_price
-                edge = our_ask - (1.0 - p_str)
             if our_ask < winner - 1e-9:
                 won += 1
-                edges.append(edge)
                 margins.append(winner - our_ask)
         n = len(subset)
         print(
             f"  would-have-won {won}/{n} ({won/n*100:.0f}%)"
-            + (
-                f"  edge-at-win(mean vs structural fair)={statistics.mean(edges)*100:+.2f}c"
-                f"  undercut(mean)={statistics.mean(margins)*100:.2f}c"
-                if edges
-                else ""
-            )
+            + (f"  undercut(mean)={statistics.mean(margins)*100:.2f}c" if margins else "")
         )
 
     for sport in sorted({r[0].sport for r in rows}):
