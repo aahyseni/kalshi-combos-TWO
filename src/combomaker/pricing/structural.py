@@ -43,6 +43,7 @@ from combomaker.pricing.dixon_coles import (
     Advance,
     Btts,
     Draw,
+    GoalSpread,
     InvertedModel,
     LegSpec,
     MatchFormat,
@@ -168,6 +169,21 @@ def _parse_leg(ticker: str, match: _Match, *, fmt: MatchFormat) -> LegSpec | str
             return f"unparseable goal count {goals_raw!r}"
         # Props settle on the full game incl. ET (pens excluded) by rule.
         return PlayerScores(team=team, min_goals=int(goals_raw), include_et=knockout)
+    if leg_type is LegType.SPREAD:
+        # DOC-VERIFIED convention (live market metadata 2026-07-06, sister
+        # sports KXMLBSPREAD/KXNFLSPREAD): suffix TEAMn = "TEAM wins by over
+        # n-0.5" -> integer goal margin >= n (team-anchored, always positive,
+        # no sign ambiguity). Regulation-time (90') by rule -> include_et=False.
+        # A spread NAMES a team, so it also resolves DC orientation. Fail-closed
+        # on any format mismatch (-> copula), so an unverified soccer spread
+        # ticker shape can never mis-price -- it just declines.
+        m = re.fullmatch(r"([A-Z]+?)(\d+)", parts[-1])
+        if m is None:
+            return f"unparseable spread suffix {parts[-1]!r}"
+        team = _team_of(m.group(1), match)
+        if team is None:
+            return f"spread team {m.group(1)!r} matches neither team"
+        return GoalSpread(team=team, min_margin=int(m.group(2)), include_et=False)
     return f"leg type {leg_type} not representable in the scoreline model"
 
 

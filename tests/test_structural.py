@@ -268,6 +268,19 @@ class TestPricing:
             assert est is None and reason is not None, f"{blob} should decline"
             assert "orientation is unidentified" in reason
 
+    def test_spread_leg_prices_structurally_and_orients(self) -> None:
+        # KXWCSPREAD-<game>-<TEAM>n = "TEAM wins by over n-0.5" -> margin >= n.
+        # A spread NAMES a team, so [spread, total, scorer] prices structurally
+        # (the spread resolves orientation; no copula decline). Marginals are
+        # consistent with lam=(1.6, 1.1) so the exact 2-system solves.
+        est, reason = pricer(dc_rho=0.0).try_price(
+            [leg(f"KXWCSPREAD-{GAME}-ENG2"), leg(TOTAL), leg(GOAL)],
+            [belief(0.2552), belief(0.5064), belief(0.40)],
+            ["yes", "yes", "yes"],
+        )
+        assert reason is None and est is not None
+        assert 0.0 < est.p < 1.0
+
 
 class TestMarginTotalDispatch:
     NBA_ML = "KXNBAGAME-26OCT10LALBOS-LAL"

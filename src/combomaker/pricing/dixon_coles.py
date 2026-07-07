@@ -96,6 +96,19 @@ class TotalOver:
 
 
 @dataclass(frozen=True, slots=True)
+class GoalSpread:
+    """YES = ``team`` wins by a goal margin >= min_margin. Kalshi soccer spread
+    "wins by over 1.5" is min_margin=2 (integer margin > n-0.5). A 1-goal margin
+    IS a win, so min_margin=1 equals a regulation TeamWin at include_et=False.
+    Regulation-time market by rule -> include_et defaults False. Distinct name
+    from margin_total.SpreadCover (that's the NFL/NBA normal-model spec)."""
+
+    team: Team
+    min_margin: int
+    include_et: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class PlayerScores:
     """YES = the player scores >= min_goals. ``share_index`` links the leg to
     its thinning parameter (assigned by the inverter, in leg order)."""
@@ -105,9 +118,9 @@ class PlayerScores:
     include_et: bool = True
 
 
-LegSpec = TeamWin | Advance | Draw | Btts | TotalOver | PlayerScores
+LegSpec = TeamWin | Advance | Draw | Btts | TotalOver | GoalSpread | PlayerScores
 
-_TEAM_LEVEL = (TeamWin, Advance, Draw, Btts, TotalOver)
+_TEAM_LEVEL = (TeamWin, Advance, Draw, Btts, TotalOver, GoalSpread)
 
 
 class StructuralError(ValueError):
@@ -216,7 +229,9 @@ def _team_goals(states: _States, team: Team, include_et: bool) -> NDArray[np.int
 
 
 def _team_indicator(
-    states: _States, spec: TeamWin | Advance | Draw | Btts | TotalOver, params: ModelParams
+    states: _States,
+    spec: TeamWin | Advance | Draw | Btts | TotalOver | GoalSpread,
+    params: ModelParams,
 ) -> _FloatArray:
     if isinstance(spec, (TeamWin, Advance)):
         us, them = (
@@ -245,6 +260,12 @@ def _team_indicator(
         a = _team_goals(states, Team.A, spec.include_et)
         b = _team_goals(states, Team.B, spec.include_et)
         return np.asarray((a >= 1) & (b >= 1), dtype=np.float64)
+    if isinstance(spec, GoalSpread):
+        us = _team_goals(states, spec.team, spec.include_et)
+        them = _team_goals(
+            states, Team.B if spec.team is Team.A else Team.A, spec.include_et
+        )
+        return np.asarray((us - them) >= spec.min_margin, dtype=np.float64)
     a = _team_goals(states, Team.A, spec.include_et)
     b = _team_goals(states, Team.B, spec.include_et)
     return np.asarray((a + b) >= spec.min_total, dtype=np.float64)
@@ -377,7 +398,9 @@ def invert(
     # identical physical combo). We refuse to lean on that selection-dependent
     # cancellation.
     scorer_present = any(isinstance(spec, PlayerScores) for spec, _ in legs)
-    has_orienting = any(isinstance(spec, (TeamWin, Advance)) for spec, _ in legs)
+    has_orienting = any(
+        isinstance(spec, (TeamWin, Advance, GoalSpread)) for spec, _ in legs
+    )
     if scorer_present and not has_orienting:
         raise StructuralError(
             "player-scorer leg with only symmetric team constraints (no TeamWin/"

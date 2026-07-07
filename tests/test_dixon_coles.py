@@ -17,6 +17,7 @@ from combomaker.pricing.dixon_coles import (
     Advance,
     Btts,
     Draw,
+    GoalSpread,
     MatchFormat,
     ModelParams,
     PlayerScores,
@@ -94,6 +95,39 @@ class TestInversion:
     def test_one_team_constraint_is_unidentified(self) -> None:
         with pytest.raises(StructuralError, match="cannot identify"):
             knockout_invert([(TeamWin(Team.A), 0.65), (PlayerScores(Team.A), 0.50)])
+
+    def test_goal_spread_margin_one_equals_win_90(self) -> None:
+        # A 1-goal margin IS a win, so GoalSpread(min_margin=1) == 90' TeamWin.
+        params = ModelParams(
+            lam_a=1.6, lam_b=1.1, dc_rho=0.0, et_factor=ET, match_format=MatchFormat.GROUP
+        )
+        win90 = marginal_probability(params, TeamWin(Team.A, include_et=False))
+        margin1 = marginal_probability(params, GoalSpread(Team.A, min_margin=1))
+        assert margin1 == pytest.approx(win90, abs=1e-12)
+
+    def test_goal_spread_monotone_in_margin(self) -> None:
+        params = ModelParams(
+            lam_a=1.6, lam_b=1.1, dc_rho=0.0, et_factor=ET, match_format=MatchFormat.GROUP
+        )
+        p1 = marginal_probability(params, GoalSpread(Team.A, 1))
+        p2 = marginal_probability(params, GoalSpread(Team.A, 2))
+        p3 = marginal_probability(params, GoalSpread(Team.A, 3))
+        assert p1 > p2 > p3 > 0.0
+
+    def test_goal_spread_orients_a_scorer(self) -> None:
+        # A spread NAMES a team -> resolves orientation, so a scorer combo prices
+        # (does NOT raise the orientation guard). Marginals consistent w/ (1.6,1.1).
+        model = invert(
+            [
+                (GoalSpread(Team.A, 2), 0.2552),
+                (TotalOver(3), 0.5064),
+                (PlayerScores(Team.A), 0.40),
+            ],
+            dc_rho=0.0,
+            et_factor=ET,
+            match_format=MatchFormat.GROUP,
+        )
+        assert model.shares  # priced, did not raise the orientation StructuralError
 
     def test_scorer_with_symmetric_constraints_only_is_unoriented(self) -> None:
         # BTTS + Over pin {lam_a, lam_b} only as an unordered pair (both are
