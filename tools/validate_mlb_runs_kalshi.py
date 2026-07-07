@@ -101,6 +101,14 @@ def main() -> None:
     skipped = 0
     with open(HISTORY / "kalshi_mlb_history.csv", encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):
+            # Guard field-incomplete rows (a torn CSV row → None fields) so a
+            # crash artifact can't blow up float() on the whole run.
+            if any(row.get(k) in (None, "") for k in (
+                "game_code", "team", "p_team_close", "p_over_close",
+                "team_won", "went_over", "total_line",
+            )):
+                skipped += 1
+                continue
             p_team = float(row["p_team_close"])
             p_over = float(row["p_over_close"])
             won = row["team_won"] == "1"

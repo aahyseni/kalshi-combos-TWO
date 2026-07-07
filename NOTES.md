@@ -430,6 +430,19 @@ Fetch clean: MLB 877/883, WNBA 155/155, NBA 42/46 (main/spreads); 0 rows skipped
 1. **Gate verdict policy → DECIDED: demote win×over** (Decision A above, L8). Implemented.
 2. **WNBA enablement → DECIDED: keep enabled, keep in mind.** Rationale unchanged (NFL-gated geometry + verified spread convention); the ml×total edge is now ~noise so it no longer counts as evidence. TODO carried: build a WNBA shadow-settlement gate for real WNBA-specific evidence before any real money; we have WNBA SHAPE data (1,675 games) but NOT WNBA closing-odds history — the Kalshi-native fetcher is now that odds source. Pin the WNBA blob home/away order with one live "at"-title check.
 
+### Overnight adversarial review (2026-07-07) — 7 lenses, 48 agents, 4 confirmed / 16 refuted
+
+Read-only review of the whole session (2193d06..ce6aac4 + untracked calibration), 2-skeptic default-refute. **Both HIGH findings were consequences of the L10 grouping fix turning the structural path ON for real combos** — exactly the risk area it was pointed at.
+
+| # | finding | sev | status |
+|---|---|---|---|
+| L11 | **Period markets mis-typed as full-game.** L10 game-code grouping made 1H/2H legs (`KXWC1HTOTAL` shares the game code) group with full-game legs; `classify_leg` matches the "TOTAL" substring ⇒ structural inverts a FIRST-HALF price as a FULL-GAME total (wrong settlement window, false confidence). **FIX:** `_game_key` keeps period-series legs (regex `1H/2H/H1/FH/[1-4]Q/QTR/HALF`) on their per-series event_ticker so they never join a full-game block ⇒ structural declines ⇒ copula prices them independent (safe pre-fix behavior). The DC half-time design (`design_halftime_dc.md`) is the eventual correlation model — build it when half-legs actually enter combos | HIGH | **FIXED** |
+| — | **Soccer DC arbitrary team-orientation** on BTTS+Over+scorer: symmetric team constraints {Btts,Total,Draw} identify {λ_a,λ_b} UNORDERED, a scorer leg's contribution depends on which team is A ⇒ 2.7–9.3¢ mispricing on an arbitrary `least_squares` mirror, with near-zero reported uncertainty (violates defense #2). Fix designed (orientation guard: no TeamWin/Advance + a PlayerScores leg ⇒ raise StructuralError ⇒ v1 copula, which prices the pairs orientation-insensitively via calibrated ρ). v1 copula confirmed adequate; btts×over calibration re-verified sound (+0.746, 8,982 matches, tape +0.65–0.67). **PENDING operator go** | HIGH | pending |
+| L12 | **SpreadCover skipped the discreteness widener** (`disc_unc` gated on TeamWins only) ⇒ NFL/WNBA spread combos ~1¢ too tight near key numbers. **FIX:** gate is now `(TeamWins, SpreadCover)` | LOW | **FIXED** |
+| L13 | **Torn CSV row.** `done_codes` ran before repair, and `_repair` only newline-terminated a torn row ⇒ lost game + validator `float(None)` crash. **FIX:** `_repair_trailing_row` TRUNCATES the partial row; `done_codes` skips field-incomplete rows; validators skip None-field rows; `main()` isolates a corrupt file per-sport | LOW | **FIXED** |
+
+Refuted (16, cleared): frame-sign fix correct+complete; fee code matches the PDF; **player-goal legs DO group** (event_ticker is 2-segment, verified live); validators faithful; calibration method sound (the CI-clustering claim failed a block-bootstrap on real data); WNBA blob-order is a tracked TODO (~0.6¢, not a bug). 732 tests green.
+
 ### Final adversarial review (2026-07-05) — 5 lenses, 43 agents, 7 confirmed defects, all fixed
 
 | Finding (confirmed by 2-skeptic verification) | Fix | Regression test |

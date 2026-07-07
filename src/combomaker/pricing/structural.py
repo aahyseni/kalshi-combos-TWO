@@ -457,9 +457,13 @@ class StructuralPricer:
                 continue
         form_unc = max((abs(fp - p) for fp in form_probes), default=0.0)
 
+        # Discreteness band applies to any MARGIN-flavored leg (config comment:
+        # "when any margin-flavored leg is present"). A SpreadCover tests the
+        # margin crossing a specific line and is MORE key-number-sensitive than
+        # a moneyline (which only tests margin>0), so it must not be excluded.
         disc_unc = (
             mt.discreteness_unc.get(str(sport), 0.01)
-            if any(isinstance(s, TeamWins) for s in specs)
+            if any(isinstance(s, (TeamWins, SpreadCover)) for s in specs)
             else 0.0
         )
         misfit_unc = base_inv.residual * mt.misfit_uncertainty_scale

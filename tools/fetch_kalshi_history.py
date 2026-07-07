@@ -178,7 +178,15 @@ def done_codes(path: Path) -> set[str]:
                 f"{path} is non-empty but has no game_code header "
                 "(likely a killed-mid-write file); inspect or delete it"
             )
-        return {row["game_code"] for row in reader}
+        # Skip any FIELD-INCOMPLETE row (a torn row that slipped through): a
+        # partial row has None tail fields, and marking its game done would lose
+        # it forever + crash the validators on float(None). Drop it so the game
+        # re-fetches.
+        return {
+            row["game_code"]
+            for row in reader
+            if all(row.get(fn) not in (None, "") for fn in reader.fieldnames)
+        }
 
 
 def _need_header(path: Path) -> bool:
@@ -189,16 +197,19 @@ def _need_header(path: Path) -> bool:
     return not path.exists() or path.stat().st_size == 0
 
 
-def _repair_trailing_newline(path: Path) -> None:
-    """If a prior run was killed mid-row the file can end without a newline;
-    appending would glue the next row onto the torn one. Close the line first."""
-    if path.exists() and path.stat().st_size > 0:
-        with open(path, "rb") as f:
-            f.seek(-1, 2)
-            last = f.read(1)
-        if last not in (b"\n", b"\r"):
-            with open(path, "ab") as f:
-                f.write(b"\r\n")
+def _repair_trailing_row(path: Path) -> None:
+    """A run killed mid-write can leave a PARTIAL final row (no trailing
+    newline). TRUNCATE it entirely so the game re-fetches next run — rather than
+    just terminate the torn line (which would keep a field-incomplete row that
+    poisons done_codes and crashes the validators on float(None))."""
+    if not (path.exists() and path.stat().st_size > 0):
+        return
+    data = path.read_bytes()
+    if data.endswith((b"\n", b"\r")):
+        return  # ends clean — nothing to repair
+    cut = data.rfind(b"\n")
+    with open(path, "r+b") as f:
+        f.truncate(cut + 1 if cut >= 0 else 0)
 
 
 def by_game_code(markets: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -230,7 +241,7 @@ async def fetch_main(rest: KalshiRestClient, sport: str) -> None:
     done = done_codes(out)
     need_header = _need_header(out)
     if not need_header:
-        _repair_trailing_newline(out)
+        _repair_trailing_row(out)
 
     games = await list_settled(rest, series["game"])
     totals = await list_settled(rest, series["total"])
@@ -296,7 +307,7 @@ async def fetch_spreads(rest: KalshiRestClient, sport: str) -> None:
     done = done_codes(out)
     need_header = _need_header(out)
     if not need_header:
-        _repair_trailing_newline(out)
+        _repair_trailing_row(out)
 
     spreads_by_game = by_game_code(await list_settled(rest, series["spread"]))
     print(f"[{sport}] games with settled spreads: {len(spreads_by_game)} "
@@ -363,7 +374,10 @@ async def main() -> None:
             try:
                 await fetch_main(rest, sport)
                 await fetch_spreads(rest, sport)
-            except _ProbeError as exc:
+            except (_ProbeError, ValueError) as exc:
+                # _ProbeError = transient API failure; ValueError = a corrupt
+                # (headerless) CSV from done_codes. Isolate to THIS sport so one
+                # bad file doesn't abort the others.
                 print(f"[{sport}] aborted (retry later): {exc}")
 
 

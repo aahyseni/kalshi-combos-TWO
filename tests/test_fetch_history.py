@@ -119,16 +119,25 @@ class TestFileSafety:
         p.write_text(HEADER, encoding="utf-8")
         assert fetch._need_header(p) is False
 
-    def test_repair_trailing_newline_closes_torn_row(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    def test_repair_trailing_row_truncates_torn_row(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         p = tmp_path / "h.csv"
-        p.write_text(HEADER + "26JUL05INDLV,LV,0.57", encoding="utf-8")  # torn, no \n
-        fetch._repair_trailing_newline(p)
-        assert p.read_bytes().endswith(b"\r\n")
-        # a well-formed file is left untouched (idempotent)
-        good = HEADER
-        p.write_text(good, encoding="utf-8")
-        fetch._repair_trailing_newline(p)
-        assert p.read_text(encoding="utf-8") == good
+        p.write_bytes(HEADER.encode() + b"26JUL05INDLV,LV,0.57")  # torn, no newline
+        fetch._repair_trailing_row(p)
+        assert p.read_bytes() == HEADER.encode()  # torn row removed, header intact
+        assert fetch.done_codes(p) == set()       # torn game NOT marked done
+        # a well-formed file is idempotent
+        fetch._repair_trailing_row(p)
+        assert p.read_bytes() == HEADER.encode()
+
+    def test_done_codes_skips_field_incomplete_row(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        p = tmp_path / "h.csv"
+        p.write_text(
+            HEADER
+            + "26JUL05INDLV,LV,0.57,0,186.5,0.36,0\n"  # complete
+            + "26JUL06ARGEGY,ARG,0.72\n",               # short (torn) — missing fields
+            encoding="utf-8",
+        )
+        assert fetch.done_codes(p) == {"26JUL05INDLV"}  # short row's game re-fetches
 
     def test_done_codes_empty_and_missing_are_empty_sets(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
         p = tmp_path / "h.csv"

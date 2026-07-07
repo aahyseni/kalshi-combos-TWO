@@ -25,11 +25,20 @@ the caller must turn into widen-or-no-quote:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
 from combomaker.rfq.models import RfqLeg
+
+# Period / derived market families (first/second half, quarters) — series
+# prefixes like KXWC1HTOTAL, KXWC2H, KX…FHTOTAL. These are NOT yet modeled for
+# correlation (no half-time scoreline model shipped), so they must be kept OUT
+# of a full-game same-game block, or the leg classifier mis-types e.g. a 1H
+# total as a FULL-GAME total and the structural model prices it on the wrong
+# settlement window. Matched against the SERIES prefix only.
+_PERIOD_SERIES = re.compile(r"(?:1H|2H|H1|H2|FH|SH|[1-4]Q|Q[1-4]|QTR|HALF|PERIOD)")
 
 
 class RelationshipKind(StrEnum):
@@ -62,9 +71,20 @@ def _game_key(event_ticker: str) -> str:
     GAMECODE is shared across a game's market families (KXWCGAME/KXWCTOTAL/
     KXWCBTTS of one game), so it — not the series-specific event_ticker — is the
     same-game key. No hyphen (synthetic/degenerate ticker) ⇒ key on the whole
-    string, so a leg whose event carries no game code never merges with another."""
-    _series, sep, game = event_ticker.partition("-")
-    return game if sep else event_ticker
+    string, so a leg whose event carries no game code never merges with another.
+
+    EXCEPTION: period/derived markets (first/second half, quarters — series like
+    KXWC1HTOTAL/KXWC2H) are NOT yet modeled for correlation, so they keep their
+    full series-specific event_ticker as the key and therefore never join a
+    full-game same-game block. Otherwise the classifier mis-types them as
+    full-game legs and the structural model prices them on the wrong settlement
+    window (NOTES L11). Revisit when the half-time scoreline model ships."""
+    series, sep, game = event_ticker.partition("-")
+    if not sep:
+        return event_ticker
+    if _PERIOD_SERIES.search(series):
+        return event_ticker  # keep period markets out of the same-game block
+    return game
 
 
 def classify_legs(

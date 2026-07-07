@@ -148,6 +148,21 @@ def test_two_games_two_legs_each_form_two_blocks() -> None:
     assert rel.same_event_groups == ((0, 1), (2, 3))  # per-game blocks
 
 
+def test_period_market_stays_out_of_full_game_block() -> None:
+    """A first-half total shares a game code with the full-game markets but is
+    NOT yet modeled for correlation — it must stay OUT of the same-game block
+    (else the classifier mis-types it as a full-game total). The full-game
+    GAME+TOTAL still group; the 1H leg is left independent."""
+    legs = (
+        leg("KXWCGAME-26JUL05MEXENG-MEX", "KXWCGAME-26JUL05MEXENG", "yes"),
+        leg("KXWCTOTAL-26JUL05MEXENG-3", "KXWCTOTAL-26JUL05MEXENG", "yes"),
+        leg("KXWC1HTOTAL-26JUL05MEXENG-2", "KXWC1HTOTAL-26JUL05MEXENG", "yes"),
+    )
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+    assert rel.same_event_groups == ((0, 1),)  # 1H leg excluded from the block
+
+
 def test_mutual_exclusion_still_caught_within_a_game() -> None:
     """Two YES outcomes of the SAME moneyline event (win + tie) stay impossible
     even though they share a game — exclusion is per-event, not per-game."""
