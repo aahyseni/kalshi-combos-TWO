@@ -125,20 +125,22 @@ class TestInversion:
         )
         assert m2.shares
 
-    def test_scorers_on_both_teams_stay_structural(self) -> None:
-        # Scorers on BOTH teams restore orientation-invariance of the joint
-        # (verified), so the combo is identified even with only symmetric team
-        # constraints — keep structural, do not decline. (Btts/Total targets are
-        # consistent with lam=(1.6, 1.1); scorer marginals are under both ceilings.)
-        model = knockout_invert(
-            [
-                (Btts(), 0.541),
-                (TotalOver(3), 0.5808),
-                (PlayerScores(Team.A), 0.35),
-                (PlayerScores(Team.B), 0.30),
-            ]
-        )
-        assert len(model.shares) == 2  # both player shares solved, no raise
+    def test_scorers_on_both_teams_without_orienting_leg_is_unoriented(self) -> None:
+        # Two scorers on OPPOSITE teams do NOT rescue orientation. The selected
+        # joint is orientation-invariant only for all-YES / symmetric selections
+        # (a coincidence); a mixed-side / asymmetric selection diverges ~11c
+        # (adversarial audit: the identical combo priced 9.6c vs 20.2c under the
+        # two team-code orderings). So we decline the whole no-orienting-leg
+        # scorer class rather than lean on that selection-dependent cancellation.
+        with pytest.raises(StructuralError, match="orientation is unidentified"):
+            knockout_invert(
+                [
+                    (Btts(), 0.541),
+                    (TotalOver(3), 0.5808),
+                    (PlayerScores(Team.A), 0.35),
+                    (PlayerScores(Team.B), 0.30),
+                ]
+            )
 
     def test_contradictory_exact_system_refuses(self) -> None:
         # A 95% favorite in a game where both teams score 90% of the time is

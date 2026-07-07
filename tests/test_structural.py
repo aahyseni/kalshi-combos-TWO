@@ -235,6 +235,39 @@ class TestPricing:
         assert both is not None and a_not_b is not None
         assert both.p + a_not_b.p == pytest.approx(0.65, abs=1e-6)
 
+    def test_scorer_without_moneyline_declines_orientation(self) -> None:
+        # BTTS + Total + scorer, no orienting ML/Advance: orientation is
+        # unidentified -> decline to copula (audit #2).
+        est, reason = pricer(dc_rho=0.0).try_price(
+            [leg(BTTS), leg(TOTAL), leg(GOAL)],
+            [belief(0.55), belief(0.55), belief(0.40)],
+            ["yes", "yes", "yes"],
+        )
+        assert est is None and reason is not None
+        assert "orientation is unidentified" in reason
+
+    def test_both_team_scorers_mixed_side_orientation_stable(self) -> None:
+        # Adversarial under-catch (audit #2): two opposite-team scorers + a
+        # mixed-side selection priced ~11c apart under the two team-code
+        # orderings when left structural (9.6c ARSTOT vs 20.2c TOTARS). With no
+        # orienting leg the guard now declines BOTH orderings, so the copula
+        # (orientation-free) prices them identically — blob order can no longer
+        # move the quote.
+        for blob in ("ARSTOT", "TOTARS"):
+            g = f"26JUL05{blob}"
+            est, reason = pricer(dc_rho=0.0).try_price(
+                [
+                    leg(f"KXWCBTTS-{g}-BTTS"),
+                    leg(f"KXWCTOTAL-{g}-3"),
+                    leg(f"KXWCGOAL-{g}-ARSP9-1"),
+                    leg(f"KXWCGOAL-{g}-TOTP9-1", "no"),
+                ],
+                [belief(0.42), belief(0.60), belief(0.30), belief(0.10)],
+                ["yes", "yes", "yes", "no"],
+            )
+            assert est is None and reason is not None, f"{blob} should decline"
+            assert "orientation is unidentified" in reason
+
 
 class TestMarginTotalDispatch:
     NBA_ML = "KXNBAGAME-26OCT10LALBOS-LAL"

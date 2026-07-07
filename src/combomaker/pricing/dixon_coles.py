@@ -367,14 +367,18 @@ def invert(
     # NAMES a team and fixes which lam is which. A PlayerScores leg's marginal
     # re-fits at either orientation (its share is free), but its JOINT with the
     # other legs reads the scoreline and differs by orientation — an arbitrary
-    # ~5c (up to ~10c) mispricing none of the width channels capture (false
-    # confidence). So with a scorer leg on a SINGLE team and no orienting leg,
-    # decline to the copula, which prices the pairs orientation-free. Scorers on
-    # BOTH teams restore orientation-invariance of the joint (verified) → keep
-    # structural.
-    scorer_teams = {spec.team for spec, _ in legs if isinstance(spec, PlayerScores)}
+    # ~5-11c mispricing none of the width channels capture (false confidence).
+    # Without an orienting leg the orientation is genuinely unidentified, so
+    # decline ANY scorer combo to the copula (which prices the pairs orientation-
+    # free). NOTE: scorers on BOTH teams do NOT rescue this — the selected joint
+    # is orientation-invariant only for all-YES / symmetric selections (a
+    # coincidence); a mixed-side or asymmetric selection diverges ~11c
+    # (adversarial audit: 26JUL05 ARSTOT vs TOTARS priced 9.6c vs 20.2c on the
+    # identical physical combo). We refuse to lean on that selection-dependent
+    # cancellation.
+    scorer_present = any(isinstance(spec, PlayerScores) for spec, _ in legs)
     has_orienting = any(isinstance(spec, (TeamWin, Advance)) for spec, _ in legs)
-    if scorer_teams and not has_orienting and len(scorer_teams) < 2:
+    if scorer_present and not has_orienting:
         raise StructuralError(
             "player-scorer leg with only symmetric team constraints (no TeamWin/"
             "Advance): team orientation is unidentified — the scorer's rate would "
