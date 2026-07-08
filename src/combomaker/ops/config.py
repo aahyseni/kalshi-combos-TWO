@@ -234,6 +234,22 @@ class CorrelationConfig(StrictModel):
             "advance|player_goal:same": 0.45,
             "advance|player_goal:opp": -0.45,
             "advance|spread": 0.95,
+            # SPREAD (win-by-margin) × full-time markets — also UNLISTED → +0.6
+            # fallback. DERIVED 2026-07-07 from the DC model (GoalSpread min_margin=2
+            # = "wins by >=2"): spread is a STRONGER directional signal than a bare
+            # win. spread|total is LINE-DEPENDENT — a 2+ margin FORCES >=2 goals so
+            # spread⊂over-1.5 is a near-containment (rho~+0.999) BUT Kalshi blocks
+            # spread×total conflicts, so only the reachable over-2.5+ value ships:
+            # +0.31 (spread≥2 vs >=3 goals, range +0.22 even→+0.46 heavy-fav, wide
+            # band). spread|btts NEGATIVE (a clean 2-0 dominant win → not-btts, like
+            # a moneyline but stronger). spread|player_goal flips on team orientation
+            # (scorer on the spread-winning team vs opponent) — resolved in sgp.py
+            # to :same/:opp, same as advance|player_goal.
+            # (keys are pair_key-sorted alphabetically: btts<player_goal<spread<total)
+            "spread|total": 0.31,
+            "btts|spread": -0.30,
+            "player_goal|spread:same": 0.46,
+            "player_goal|spread:opp": -0.42,
             # TEAM corners (KXWCTCORNERS), MEASURED conditional on 8,981 matches
             # (team-strength + venue controlled, so the residual the copula needs
             # after live marginals). Unlike TOTAL corners, a TEAM's corners are
@@ -392,6 +408,12 @@ class CorrelationConfig(StrictModel):
         "soccer:advance|player_goal:same": 0.15,
         "soccer:advance|player_goal:opp": 0.15,
         "soccer:advance|spread": 0.10,          # near-containment, tight
+        # spread × full-time bands (DC-derived; spread|total wide for the line
+        # dependence, the rest span the matchup range):
+        "soccer:spread|total": 0.20,
+        "soccer:btts|spread": 0.13,
+        "soccer:player_goal|spread:same": 0.15,
+        "soccer:player_goal|spread:opp": 0.15,
         "soccer:corners|player_goal": 0.20,      # labeled prior (~ corners_team|player_goal)
         "soccer:corners_team|moneyline": 0.10,
         "soccer:corners_team|spread": 0.10,

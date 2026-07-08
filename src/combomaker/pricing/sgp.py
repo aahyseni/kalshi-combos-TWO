@@ -264,6 +264,26 @@ def _advance_player_prior(
     return _lookup_pair(f"{key}:{orient}", sport, params)
 
 
+def _spread_player_prior(
+    key: str, sport: str, params: SgpParams, spread_ticker: str, player_ticker: str
+) -> _PairPrior | None:
+    """SPREAD × player-scorer prior, resolved to ``:same`` / ``:opp`` by whether
+    the scorer plays for the team winning by the margin (+ρ — his goals build the
+    margin) or the opponent (−ρ). Same as ``_advance_player_prior`` but the spread
+    team is parsed with ``_spread_team`` (TEAM+line-digits suffix). Unparseable
+    (spread not TEAM+digits, short/empty player code) → None so the caller falls
+    back — never guess the sign."""
+    spread_team = _spread_team(spread_ticker)
+    parts = player_ticker.split("-")
+    if spread_team is None or len(parts) < 4:
+        return None
+    player_code = parts[-2].upper()
+    if not player_code:
+        return None
+    orient = "same" if player_code.startswith(spread_team) else "opp"
+    return _lookup_pair(f"{key}:{orient}", sport, params)
+
+
 def _winner_period_prior(
     key: str, sport: str, params: SgpParams, ticker_a: str, ticker_b: str
 ) -> _PairPrior | None:
@@ -409,6 +429,18 @@ def build_sgp_correlation(
                         sport,
                         params,
                         legs[adv_index].market_ticker,
+                        legs[pl_index].market_ticker,
+                    )
+                elif pair_types == {LegType.SPREAD, LegType.PLAYER_GOAL}:
+                    # spread × scorer: sign flips on whether the scorer plays for
+                    # the team winning by the margin (+ρ) or the opponent (−ρ).
+                    spr_index = i if types[i] is LegType.SPREAD else j
+                    pl_index = j if spr_index == i else i
+                    prior = _spread_player_prior(
+                        key,
+                        sport,
+                        params,
+                        legs[spr_index].market_ticker,
                         legs[pl_index].market_ticker,
                     )
                 else:
