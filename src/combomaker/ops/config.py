@@ -195,6 +195,31 @@ class CorrelationConfig(StrictModel):
             # just replace the WRONG +0.6 default with the grounded near-zero value.
             "advance|corners": 0.00,
             "corners|player_goal": 0.05,
+            # ADVANCE (knockout progress) × full-time markets. ADVANCE was
+            # UNLISTED against total/btts/scorer/spread → fell to the flat +0.6
+            # fallback (6× too high on totals, WRONG SIGN on btts/opp-scorer),
+            # and advance is the SINGLE most common soccer leg (1.02M tape legs).
+            # DERIVED 2026-07-07 from our own Dixon-Coles model (advance = win90 +
+            # ET + 0.5 shootout) and CROSS-CHECKED against 4 historical-knockout
+            # studies (WC/Euros n=247, Copa/AFCON/Asian/Gold n=185, UCL n=310,
+            # UEL/UECL n=78): the DC's implied k=P(advance|reg-draw) 0.50(even)→
+            # 0.64(fav) MATCHES the measured k, and the attenuation matches too.
+            # advance is a moneyline attenuated by the ~35% of ties that go to a
+            # scoreline-decoupled shootout: SYMMETRIC goal markets (total, btts)
+            # retain ~½ (btts stays NEGATIVE like btts|moneyline); DIRECTIONAL
+            # markets (scorer, spread) retain ~0.8. LINE-STABLE across total lines
+            # incl. over-0.5 (advance, unlike a win, does NOT imply a goal — a 0-0
+            # shootout advances). player_goal flips sign on team orientation
+            # (scorer on the advancing team vs the opponent) — resolved in sgp.py
+            # to :same/:opp. spread≥2 ⟹ win ⟹ advance is a near-containment
+            # (Kalshi blocks the conflict anyway). NOTE: this is the SINGLE-MATCH
+            # regime (KXWC*); two-legged UCL/UEL/UECL is a DIFFERENT regime
+            # (symmetric→0) — see memory, wire by ticker series when it lists.
+            "advance|total": 0.12,
+            "advance|btts": -0.07,
+            "advance|player_goal:same": 0.45,
+            "advance|player_goal:opp": -0.45,
+            "advance|spread": 0.95,
             # TEAM corners (KXWCTCORNERS), MEASURED conditional on 8,981 matches
             # (team-strength + venue controlled, so the residual the copula needs
             # after live marginals). Unlike TOTAL corners, a TEAM's corners are
@@ -337,6 +362,13 @@ class CorrelationConfig(StrictModel):
         "soccer:btts|corners": 0.08,
         "soccer:corners|moneyline": 0.08,        # total corners, measured ~0 (team is separate now)
         "soccer:advance|corners": 0.15,          # labeled prior (corners ⊥ result)
+        # advance × full-time bands (DC-derived + 4-study cross-check; the
+        # correlation swings 0→~0.22 with favorite strength, so a wide band):
+        "soccer:advance|total": 0.15,
+        "soccer:advance|btts": 0.13,
+        "soccer:advance|player_goal:same": 0.15,
+        "soccer:advance|player_goal:opp": 0.15,
+        "soccer:advance|spread": 0.10,          # near-containment, tight
         "soccer:corners|player_goal": 0.20,      # labeled prior (~ corners_team|player_goal)
         "soccer:corners_team|moneyline": 0.10,
         "soccer:corners_team|spread": 0.10,

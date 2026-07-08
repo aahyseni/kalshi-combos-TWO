@@ -243,6 +243,27 @@ def _winner_team(ticker: str) -> str | None:
     return suffix
 
 
+def _advance_player_prior(
+    key: str, sport: str, params: SgpParams, advance_ticker: str, player_ticker: str
+) -> _PairPrior | None:
+    """ADVANCE × player-scorer prior, resolved to ``:same`` / ``:opp`` by whether
+    the scorer plays for the ADVANCING team (+ρ — his goals push his team through)
+    or the OPPONENT (−ρ, mirror). The advance suffix IS the team code (advance is
+    never a draw); a player leg is ``SERIES-GAME-<TEAM+name+number>-<goals>``, so
+    the scorer is same-team iff his player code starts with the advance team code.
+    Unparseable (short player ticker / empty code) → None so the caller falls back
+    — never guess the sign of a scorer×advance pair."""
+    adv_team = _winner_team(advance_ticker)
+    parts = player_ticker.split("-")
+    if adv_team is None or len(parts) < 4:
+        return None
+    player_code = parts[-2].upper()
+    if not player_code:
+        return None
+    orient = "same" if player_code.startswith(adv_team) else "opp"
+    return _lookup_pair(f"{key}:{orient}", sport, params)
+
+
 def _winner_period_prior(
     key: str, sport: str, params: SgpParams, ticker_a: str, ticker_b: str
 ) -> _PairPrior | None:
@@ -377,6 +398,18 @@ def build_sgp_correlation(
                     # team (nested lines on one team vs opposing-team territory).
                     prior = _corners_team_prior(
                         key, sport, params, legs[i].market_ticker, legs[j].market_ticker
+                    )
+                elif pair_types == {LegType.ADVANCE, LegType.PLAYER_GOAL}:
+                    # advance × scorer: sign flips on whether the scorer plays for
+                    # the advancing team (+ρ) or the opponent (−ρ).
+                    adv_index = i if types[i] is LegType.ADVANCE else j
+                    pl_index = j if adv_index == i else i
+                    prior = _advance_player_prior(
+                        key,
+                        sport,
+                        params,
+                        legs[adv_index].market_ticker,
+                        legs[pl_index].market_ticker,
                     )
                 else:
                     one_moneyline = (types[i] is LegType.MONEYLINE) != (
