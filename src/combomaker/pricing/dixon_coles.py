@@ -29,7 +29,7 @@ rho, settlement windows) by re-pricing under perturbed assumptions.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from functools import lru_cache
 from itertools import combinations
@@ -118,9 +118,78 @@ class PlayerScores:
     include_et: bool = True
 
 
-LegSpec = TeamWin | Advance | Draw | Btts | TotalOver | GoalSpread | PlayerScores
+# --- first-half (1H) leg specs -------------------------------------------------
+# These read the FIRST-HALF sub-scoreline (goals through 45'), never the full or
+# ET scoreline. FT = 1H + 2H is one coherent grid (see ``_states_with_halves``),
+# so a mixed 1H+FT selection's joint is a single sum over that grid — every 1H×FT
+# correlation falls out of the structure, not a pairwise copula prior. 1H legs
+# settle at half-time and are untouched by extra time (ET is a 2H-and-beyond
+# increment, design_halftime_dc.md §3.4), so they carry no ``include_et``.
 
-_TEAM_LEVEL = (TeamWin, Advance, Draw, Btts, TotalOver, GoalSpread)
+
+@dataclass(frozen=True, slots=True)
+class HalfResult:
+    """YES = ``team`` LEADS at half-time (1H goals: a_1h > b_1h for A)."""
+
+    team: Team
+
+
+@dataclass(frozen=True, slots=True)
+class HalfDraw:
+    """YES = level at half-time (a_1h == b_1h) — the 1H three-way TIE."""
+
+
+@dataclass(frozen=True, slots=True)
+class HalfTotalOver:
+    """YES = combined 1H goals >= min_total (1H over-0.5 == min_total=1)."""
+
+    min_total: int
+
+
+@dataclass(frozen=True, slots=True)
+class HalfBtts:
+    """YES = both teams score in the first half (a_1h >= 1 and b_1h >= 1)."""
+
+
+@dataclass(frozen=True, slots=True)
+class HalfGoalSpread:
+    """YES = ``team`` leads at half by a 1H goal margin >= min_margin. Kalshi's
+    KXWC1HSPREAD ``…-<TEAM>2`` = "leads at half by over 1.5" -> min_margin=2."""
+
+    team: Team
+    min_margin: int
+
+
+LegSpec = (
+    TeamWin
+    | Advance
+    | Draw
+    | Btts
+    | TotalOver
+    | GoalSpread
+    | PlayerScores
+    | HalfResult
+    | HalfDraw
+    | HalfTotalOver
+    | HalfBtts
+    | HalfGoalSpread
+)
+
+# 1H team-level constraints. With ``half_share`` (h) a banded CONSTANT (never
+# inverted from a single leg — design §6), a 1H marginal is a deterministic
+# function of (lam_a, lam_b), so 1H legs are usable identification constraints
+# on (lam_a, lam_b) just like their FT siblings.
+_HALF_LEVEL = (HalfResult, HalfDraw, HalfTotalOver, HalfBtts, HalfGoalSpread)
+
+_TEAM_LEVEL = (
+    TeamWin,
+    Advance,
+    Draw,
+    Btts,
+    TotalOver,
+    GoalSpread,
+    *_HALF_LEVEL,
+)
 
 
 class StructuralError(ValueError):
@@ -142,6 +211,19 @@ class ModelParams:
     # P(team A wins a shootout | still level after ET). Advance legs only;
     # penalties never contribute goals to any other market (Kalshi rules).
     pens_win_a: float = 0.5
+    # First-half goal share h: goals_1H ~ Poisson(lam*h), goals_2H ~
+    # Poisson(lam*(1-h)) per team (design_halftime_dc.md §1-3). Banded CONSTANT,
+    # never inverted from a single 1H leg (§6). Only read when ``with_halves``.
+    half_share: float = 0.45
+    # Build the 4-D half-aware enumeration (FT = 1H + 2H). Lazy: set True only
+    # when a combo carries a 1H leg (joint_probability auto-upgrades). FT-only
+    # combos keep the untouched 2-D fast path — bit-for-bit unchanged (§9).
+    with_halves: bool = False
+
+
+# Sentinel for the FT-only enumeration: no 1H sub-state is populated, so any 1H
+# indicator that reads it MUST raise (honest failure, never a silent zero).
+_NO_HALF = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +235,11 @@ class _States:
     b90: NDArray[np.int64]
     a_et: NDArray[np.int64]  # zeros for group format / non-draw states
     b_et: NDArray[np.int64]
+    # First-half goals per team (design §4.1). Filled only in the 4-D half-aware
+    # enumeration; the FT-only path fills them with ``_NO_HALF`` sentinels so a
+    # stray 1H indicator fails closed rather than reading a wrong zero.
+    a_1h: NDArray[np.int64]
+    b_1h: NDArray[np.int64]
 
 
 def _dc_grid(lam_a: float, lam_b: float, dc_rho: float, max_goals: int) -> _FloatArray:
@@ -173,24 +260,45 @@ def _dc_grid(lam_a: float, lam_b: float, dc_rho: float, max_goals: int) -> _Floa
     return np.asarray(grid / total, dtype=np.float64)
 
 
+@lru_cache(maxsize=8)
+def _half_split_table(max_goals: int, half_share: float) -> _FloatArray:
+    """``B[m, k]`` = P(1H goals = k | 90' goals = m) = Binomial(k; m, h).
+
+    Poisson SPLITTING (design §1.2): with goals_1H ~ Poisson(lam·h) and
+    goals_2H ~ Poisson(lam·(1-h)) independent, then conditional on the 90'
+    total m, the 1H count is Binomial(m, h) — independent of lam, and the DC
+    tau (a per-cell constant) cancels in the conditional (§3.3). Lower
+    triangular (B[m, k] = 0 for k > m)."""
+    ks = np.arange(max_goals + 1)
+    rows = [np.asarray(binom.pmf(ks, m, half_share), dtype=np.float64)
+            for m in range(max_goals + 1)]
+    return np.array(rows, dtype=np.float64)
+
+
 # The hot path re-evaluates the same params many times (every constraint in a
 # least-squares iteration, every brentq step of a player-share solve, every
 # uncertainty probe): memoize the enumeration. Params are frozen/hashable and
 # distinct optimizer iterates simply miss — reuse WITHIN an iterate is the win.
 @lru_cache(maxsize=64)
 def _states(params: ModelParams) -> _States:
+    if params.with_halves:
+        return _states_with_halves(params)
     g = params.max_goals
     grid90 = _dc_grid(params.lam_a, params.lam_b, params.dc_rho, g)
     idx = np.arange(g + 1)
     a90, b90 = np.meshgrid(idx, idx, indexing="ij")
 
     if params.match_format is MatchFormat.GROUP:
+        size = (g + 1) ** 2
+        sentinel = np.full(size, _NO_HALF, dtype=np.int64)
         return _States(
             w=grid90.ravel(),
             a90=a90.ravel(),
             b90=b90.ravel(),
-            a_et=np.zeros((g + 1) ** 2, dtype=np.int64),
-            b_et=np.zeros((g + 1) ** 2, dtype=np.int64),
+            a_et=np.zeros(size, dtype=np.int64),
+            b_et=np.zeros(size, dtype=np.int64),
+            a_1h=sentinel,
+            b_1h=sentinel,
         )
 
     # Knockout: non-draw 90' states terminate; each drawn state fans out over
@@ -208,6 +316,8 @@ def _states(params: ModelParams) -> _States:
     draw_w = np.repeat(grid90[draws, draws], et_grid.size) * np.tile(
         et_grid.ravel(), g + 1
     )
+    size = int(nd_mask.sum()) + (g + 1) * et_grid.size
+    sentinel = np.full(size, _NO_HALF, dtype=np.int64)
     return _States(
         w=np.concatenate([grid90[nd_mask], draw_w]),
         a90=np.concatenate([a90[nd_mask], np.repeat(draws, et_grid.size)]),
@@ -218,6 +328,53 @@ def _states(params: ModelParams) -> _States:
         b_et=np.concatenate(
             [np.zeros(int(nd_mask.sum()), dtype=np.int64), np.tile(eb.ravel(), g + 1)]
         ),
+        a_1h=sentinel,
+        b_1h=sentinel,
+    )
+
+
+def _states_with_halves(params: ModelParams) -> _States:
+    """Half-aware enumeration in FACTORED form: the exact FT enumeration (reused
+    verbatim from the 2-D builder, incl. the knockout ET fan-out) EXPANDED over
+    each state's 1H split (i1, j1) ~ Binomial(a90, h) x Binomial(b90, h).
+
+    This is the design's 4-D joint written as P(FT cell)·P(1H split | cell) —
+    algebraically identical, but it (a) preserves every FT leg to float
+    precision (summing a state's 1H splits recovers its FT weight exactly) and
+    (b) needs no per-half goal cap (splits run [0..m] fully, so the FT
+    convolution is never truncated). ET is a 2H-and-beyond increment (§3.4): it
+    rides on the FT state and never touches the 1H counts."""
+    ft = _states(replace(params, with_halves=False))
+    g = params.max_goals
+    table = _half_split_table(g, params.half_share)  # B[m, k] = Binom(k; m, h)
+
+    w_parts: list[_FloatArray] = []
+    a90_parts: list[NDArray[np.int64]] = []
+    b90_parts: list[NDArray[np.int64]] = []
+    aet_parts: list[NDArray[np.int64]] = []
+    bet_parts: list[NDArray[np.int64]] = []
+    a1_parts: list[NDArray[np.int64]] = []
+    b1_parts: list[NDArray[np.int64]] = []
+    for s in range(ft.w.size):
+        m = int(ft.a90[s])
+        n = int(ft.b90[s])
+        split = np.outer(table[m, : m + 1], table[n, : n + 1]).ravel()
+        count = split.size
+        w_parts.append(ft.w[s] * split)
+        a90_parts.append(np.full(count, m, dtype=np.int64))
+        b90_parts.append(np.full(count, n, dtype=np.int64))
+        aet_parts.append(np.full(count, int(ft.a_et[s]), dtype=np.int64))
+        bet_parts.append(np.full(count, int(ft.b_et[s]), dtype=np.int64))
+        a1_parts.append(np.repeat(np.arange(m + 1, dtype=np.int64), n + 1))
+        b1_parts.append(np.tile(np.arange(n + 1, dtype=np.int64), m + 1))
+    return _States(
+        w=np.concatenate(w_parts),
+        a90=np.concatenate(a90_parts),
+        b90=np.concatenate(b90_parts),
+        a_et=np.concatenate(aet_parts),
+        b_et=np.concatenate(bet_parts),
+        a_1h=np.concatenate(a1_parts),
+        b_1h=np.concatenate(b1_parts),
     )
 
 
@@ -271,6 +428,29 @@ def _team_indicator(
     return np.asarray((a + b) >= spec.min_total, dtype=np.float64)
 
 
+def _half_indicator(
+    states: _States,
+    spec: HalfResult | HalfDraw | HalfTotalOver | HalfBtts | HalfGoalSpread,
+) -> _FloatArray:
+    """YES indicator for a 1H leg off the first-half sub-scoreline. Asserts the
+    half state is populated (never the FT-only sentinel) so a stray 1H leg on a
+    2-D enumeration fails closed instead of reading a wrong zero."""
+    if states.a_1h.size == 0 or states.a_1h[0] == _NO_HALF:
+        raise StructuralError("1H leg needs the half-time enumeration")
+    a1, b1 = states.a_1h, states.b_1h
+    if isinstance(spec, HalfResult):
+        us, them = (a1, b1) if spec.team is Team.A else (b1, a1)
+        return np.asarray(us > them, dtype=np.float64)
+    if isinstance(spec, HalfDraw):
+        return np.asarray(a1 == b1, dtype=np.float64)
+    if isinstance(spec, HalfBtts):
+        return np.asarray((a1 >= 1) & (b1 >= 1), dtype=np.float64)
+    if isinstance(spec, HalfGoalSpread):
+        us, them = (a1, b1) if spec.team is Team.A else (b1, a1)
+        return np.asarray((us - them) >= spec.min_margin, dtype=np.float64)
+    return np.asarray((a1 + b1) >= spec.min_total, dtype=np.float64)
+
+
 def _player_group_factor(
     states: _States,
     players: list[tuple[PlayerScores, float, bool]],  # (spec, share, selected_yes)
@@ -317,7 +497,14 @@ def joint_probability(
     legs: list[tuple[LegSpec, bool]],  # (spec, selected side is YES)
     shares: dict[int, float],  # leg index -> thinning share for PlayerScores legs
 ) -> float:
-    """P(every leg settles on its selected side) off the scoreline model."""
+    """P(every leg settles on its selected side) off the scoreline model.
+
+    Lazy half gating (design §9): a combo carrying any 1H leg builds the 4-D
+    half-aware enumeration; an FT-only combo keeps the untouched 2-D fast path.
+    The joint of a mixed 1H+FT selection is one sum over the shared grid, so
+    every 1H×FT correlation is exact (no pairwise rho)."""
+    if any(isinstance(spec, _HALF_LEVEL) for spec, _ in legs) and not params.with_halves:
+        params = replace(params, with_halves=True)
     states = _states(params)
     factor = states.w.copy()
     by_team: dict[Team, list[tuple[PlayerScores, float, bool]]] = {}
@@ -325,7 +512,10 @@ def joint_probability(
         if isinstance(spec, PlayerScores):
             by_team.setdefault(spec.team, []).append((spec, shares[i], yes))
             continue
-        ind = _team_indicator(states, spec, params)
+        if isinstance(spec, _HALF_LEVEL):
+            ind = _half_indicator(states, spec)
+        else:
+            ind = _team_indicator(states, spec, params)
         factor *= ind if yes else 1.0 - ind
     for team, players in by_team.items():
         factor *= _player_group_factor(states, players, team)
@@ -362,6 +552,7 @@ def invert(
     match_format: MatchFormat,
     max_goals: int = 12,
     pens_win_a: float = 0.5,
+    half_share: float = 0.45,  # first-half goal share h (banded constant, §6)
     warm_start: tuple[float, float] | None = None,  # (lam_a, lam_b) guess
 ) -> InvertedModel:
     """Solve (lam_a, lam_b) from the team-level legs, then one thinning share
@@ -397,9 +588,13 @@ def invert(
     # (adversarial audit: 26JUL05 ARSTOT vs TOTARS priced 9.6c vs 20.2c on the
     # identical physical combo). We refuse to lean on that selection-dependent
     # cancellation.
+    # A 1H leg that NAMES a team (HalfResult / HalfGoalSpread) fixes orientation
+    # exactly like its FT sibling; HalfDraw / HalfTotalOver / HalfBtts are
+    # team-symmetric and do NOT orient.
     scorer_present = any(isinstance(spec, PlayerScores) for spec, _ in legs)
     has_orienting = any(
-        isinstance(spec, (TeamWin, Advance, GoalSpread)) for spec, _ in legs
+        isinstance(spec, (TeamWin, Advance, GoalSpread, HalfResult, HalfGoalSpread))
+        for spec, _ in legs
     )
     if scorer_present and not has_orienting:
         raise StructuralError(
@@ -417,6 +612,7 @@ def invert(
             match_format=match_format,
             max_goals=max_goals,
             pens_win_a=pens_win_a,
+            half_share=half_share,
         )
 
     def residuals(x: NDArray[np.float64]) -> NDArray[np.float64]:

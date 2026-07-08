@@ -44,6 +44,11 @@ from combomaker.pricing.dixon_coles import (
     Btts,
     Draw,
     GoalSpread,
+    HalfBtts,
+    HalfDraw,
+    HalfGoalSpread,
+    HalfResult,
+    HalfTotalOver,
     InvertedModel,
     LegSpec,
     MatchFormat,
@@ -80,6 +85,39 @@ from combomaker.pricing.mlb_runs import joint_probability as mlb_joint
 from combomaker.rfq.models import RfqLeg
 
 _MT_SPORTS = (Sport.NFL, Sport.NBA, Sport.WNBA)
+
+# The 1H scoreline specs (adapter-side, for the has-half gate on the h-band).
+_HALF_SPECS = (HalfResult, HalfDraw, HalfTotalOver, HalfBtts, HalfGoalSpread)
+
+# Soccer first-half families we SHIP structurally: GOAL-TIMING legs (1H total,
+# 1H BTTS). The OOS gate (tools/validate_halftime_dc_oos.py) shows the DC half
+# split reproduces their held-out 1H×FT conditionals within tolerance
+# (P(FT-over|1H-over) diff ~0.01, base rates ~0.01).
+_MODELED_FIRST_HALF = frozenset(
+    {LegType.FIRST_HALF_TOTAL, LegType.FIRST_HALF_BTTS}
+)
+
+# 1H RESULT/MARGIN families (1H winner, 1H spread): representable, but the
+# independent-increment split OVER-states 1H→FT result persistence — OOS gate
+# P(FT-win|1H-lead) model 0.81 vs empirical 0.75 (~6pt), and NO first-half share
+# h fixes it (it's the missing negative inter-half serial correlation). The
+# copula carries the DIRECTLY-measured, era-stable first_half_moneyline|moneyline
+# (+0.71/−0.67) and first_half_spread priors (results_soccer.md), which price
+# that pathway better — so these legs DEFER to the copula (fail-closed).
+_DEFERRED_FIRST_HALF = frozenset(
+    {LegType.FIRST_HALF_MONEYLINE, LegType.FIRST_HALF_SPREAD}
+)
+
+
+def _is_modeled_first_half(ticker: str) -> bool:
+    """True iff ``ticker`` is a soccer first-half leg we price structurally (a
+    goal-timing 1H total / 1H BTTS that PASSES the OOS gate). A 1H result/spread
+    leg, a 2H/quarter leg, or a non-soccer half returns False so it stays on the
+    copula (fail-closed)."""
+    return (
+        classify_sport(ticker) is Sport.SOCCER
+        and classify_leg(ticker) in _MODELED_FIRST_HALF
+    )
 
 # 26JUL06 (+ optional 4-digit start time) then the concatenated team codes.
 _GAME_CODE = re.compile(r"^\d{2}[A-Z]{3}\d{2}(?:\d{4})?([A-Z0-9]{4,})$")
@@ -206,6 +244,36 @@ def _parse_leg(ticker: str, match: _Match, *, fmt: MatchFormat) -> LegSpec | str
         if team is None:
             return f"spread team {m.group(1)!r} matches neither team"
         return GoalSpread(team=team, min_margin=int(m.group(2)), include_et=False)
+    # --- first-half (1H) families: modeled on the half-time sub-scoreline (DC
+    # half split). Ground-truth ticker shapes (prod RFQ tape 2026-07-07):
+    #   KXWC1H-<game>-<TEAM|TIE>     1H moneyline / draw
+    #   KXWC1HTOTAL-<game>-<N>       1H goals >= N (…-1 = over 0.5, …-3 = over 2.5)
+    #   KXWC1HBTTS-<game>-BTTS       both teams score in the 1H
+    #   KXWC1HSPREAD-<game>-<TEAM>N  1H margin >= N (…-BEL2 = BEL leads by >1.5)
+    # 1H legs settle at 45' — no ET window (design §3.4), so no include_et.
+    if leg_type is LegType.FIRST_HALF_MONEYLINE:
+        suffix = parts[-1]
+        if suffix in _DRAW_SUFFIXES:
+            return HalfDraw()
+        team = _team_of(suffix, match)
+        if team is None:
+            return f"1H moneyline suffix {suffix!r} matches neither team"
+        return HalfResult(team=team)
+    if leg_type is LegType.FIRST_HALF_TOTAL:
+        line = _parse_total_line(parts[-1])
+        if line is None:
+            return f"unparseable 1H total line {parts[-1]!r}"
+        return HalfTotalOver(min_total=line)
+    if leg_type is LegType.FIRST_HALF_BTTS:
+        return HalfBtts()
+    if leg_type is LegType.FIRST_HALF_SPREAD:
+        m = re.fullmatch(r"([A-Z]+?)(\d+)", parts[-1])
+        if m is None:
+            return f"unparseable 1H spread suffix {parts[-1]!r}"
+        team = _team_of(m.group(1), match)
+        if team is None:
+            return f"1H spread team {m.group(1)!r} matches neither team"
+        return HalfGoalSpread(team=team, min_margin=int(m.group(2)))
     return f"leg type {leg_type} not representable in the scoreline model"
 
 
@@ -235,15 +303,28 @@ class StructuralPricer:
     ) -> tuple[JointEstimate | None, str | None]:
         """(estimate, None) on success; (None, reason) -> copula fallback."""
         try:
-            # Period legs (1H/2H/quarter) now rejoin the same-game copula group
+            # Period legs (1H/2H/quarter) rejoin the same-game copula group
             # (relationships._game_key), which makes this path REACHABLE for a
-            # combo carrying one. The full-game inverter has no half-time
-            # scoreline window, so a period leg here is a wrong-settlement-window
-            # bug — fail closed to the copula.
-            if any(is_period_leg(leg.market_ticker) for leg in legs):
-                raise StructuralError(
-                    "combo contains a period leg (no half-time scoreline window)"
-                )
+            # combo carrying one. Soccer GOAL-TIMING first-half legs (1H total /
+            # BTTS) are modeled on the DC half-split scoreline and price
+            # structurally; 1H result/spread legs DEFER to the copula's measured
+            # prior (persistence over-stated — OOS gate), and every other period
+            # leg (2H, quarters, non-soccer half) has no scoreline window.
+            for leg in legs:
+                ticker = leg.market_ticker
+                if is_period_leg(ticker) and not _is_modeled_first_half(ticker):
+                    if (
+                        classify_sport(ticker) is Sport.SOCCER
+                        and classify_leg(ticker) in _DEFERRED_FIRST_HALF
+                    ):
+                        raise StructuralError(
+                            f"1H result/spread leg {ticker}: independent-increment "
+                            "persistence over-stated (OOS gate) — copula carries "
+                            "the measured first_half prior"
+                        )
+                    raise StructuralError(
+                        f"unmodeled period leg ({ticker}): no scoreline window"
+                    )
             sports = {classify_sport(leg.market_ticker) for leg in legs}
             if len(sports) != 1:
                 raise StructuralError("legs span multiple sports")
@@ -295,12 +376,15 @@ class StructuralPricer:
 
         warm: tuple[float, float] | None = None
 
+        has_half = any(isinstance(s, _HALF_SPECS) for s in specs)
+
         def solve(
             targets: list[tuple[LegSpec, float]],
             *,
             dc_rho: float | None = None,
             et_factor: float | None = None,
             pens: float | None = None,
+            half_share: float | None = None,
         ) -> tuple[InvertedModel, float]:
             model = invert(
                 targets,
@@ -309,6 +393,7 @@ class StructuralPricer:
                 match_format=fmt,
                 max_goals=cfg.max_goals,
                 pens_win_a=cfg.pens_win_prob if pens is None else pens,
+                half_share=cfg.half_share if half_share is None else half_share,
                 warm_start=warm,  # perturbation solves start at the base fit
             )
             return model, joint_probability(model.params, selected, model.shares)
@@ -347,6 +432,20 @@ class StructuralPricer:
                     form_probes.append(solve(constraints, et_factor=et)[1])
                 except StructuralError:
                     continue
+        # First-half goal share h: a banded CONSTANT (never inverted, design §6);
+        # its ±band re-prices the joint so the priced width absorbs the share
+        # uncertainty PLUS the residual inter-half serial correlation the
+        # independent-increment split omits (§7). Only exercised when a 1H leg
+        # is present (FT-only combos never build the half grid).
+        if has_half:
+            for hh in (
+                cfg.half_share - cfg.half_share_band,
+                cfg.half_share + cfg.half_share_band,
+            ):
+                try:
+                    form_probes.append(solve(constraints, half_share=hh)[1])
+                except StructuralError:
+                    continue
         form_unc = max((abs(fp - p) for fp in form_probes), default=0.0)
 
         # 3. Shootout probability: only Advance legs depend on it; 0.5 is the
@@ -377,8 +476,9 @@ class StructuralPricer:
             frechet_hi=hi,
             notes=(
                 *base_model.notes,
-                f"structural: format={fmt} legs={len(legs)} "
-                f"unc(leg={leg_unc:.4f} form={form_unc:.4f} "
+                f"structural: format={fmt} legs={len(legs)}"
+                + (f" half_share={cfg.half_share}" if has_half else "")
+                + f" unc(leg={leg_unc:.4f} form={form_unc:.4f} "
                 f"pens={pens_unc:.4f} misfit={misfit_unc:.4f})",
             ),
         )
@@ -627,11 +727,16 @@ def structural_applicable(
     legs: list[RfqLeg], same_event_groups: Sequence[Sequence[int]]
 ) -> bool:
     """Cheap pre-check: a structurally-modeled sport, all legs in ONE
-    same-event group, and NO period leg (the inverter has no half-time
-    window — period legs correlate in the copula but must never reach it)."""
+    same-event group, and every period leg a MODELED soccer first-half leg (the
+    DC half split covers those; any other period — 2H, quarters, non-soccer
+    half — has no scoreline window and must stay in the copula)."""
     if not legs:
         return False
-    if any(is_period_leg(leg.market_ticker) for leg in legs):
+    if any(
+        is_period_leg(leg.market_ticker)
+        and not _is_modeled_first_half(leg.market_ticker)
+        for leg in legs
+    ):
         return False
     sports = {classify_sport(leg.market_ticker) for leg in legs}
     if len(sports) != 1 or sports.pop() not in (Sport.SOCCER, Sport.MLB, *_MT_SPORTS):

@@ -182,6 +182,20 @@ class CorrelationConfig(StrictModel):
             "corners|total": 0.00,
             "corners|moneyline": 0.00,
             "btts|corners": 0.00,
+            # CORNERS × FIRST-HALF markets. Corners are in NO scoreline model
+            # (structural declines a corners leg -> copula), and total corners
+            # are MEASURED ⊥ result/goals — same basis as corners|total/moneyline
+            # above — so a corners × 1H pair is ~0, NOT the flat +0.6 the engine
+            # used to hit (corners × 1H was UNTYPED, ~21k tape combos). 0.00 for
+            # every 1H family (winner/total/btts/spread), total AND team corners.
+            "corners|first_half_moneyline": 0.00,
+            "corners|first_half_total": 0.00,
+            "corners|first_half_btts": 0.00,
+            "corners|first_half_spread": 0.00,
+            "corners_team|first_half_moneyline": 0.00,
+            "corners_team|first_half_total": 0.00,
+            "corners_team|first_half_btts": 0.00,
+            "corners_team|first_half_spread": 0.00,
             # advance|corners and corners|player_goal were UNLISTED, so a same-
             # game combo mixing total corners with an ADVANCE or player-goal leg
             # fell to the flat same_event_rho +0.6 fallback — a fail-safe-inversion
@@ -361,6 +375,15 @@ class CorrelationConfig(StrictModel):
         "soccer:corners|total": 0.08,
         "soccer:btts|corners": 0.08,
         "soccer:corners|moneyline": 0.08,        # total corners, measured ~0 (team is separate now)
+        # corners × 1H: grounded near-zero (corners ⊥ result/goals), wide band.
+        "soccer:corners|first_half_moneyline": 0.10,
+        "soccer:corners|first_half_total": 0.10,
+        "soccer:corners|first_half_btts": 0.10,
+        "soccer:corners|first_half_spread": 0.10,
+        "soccer:corners_team|first_half_moneyline": 0.10,
+        "soccer:corners_team|first_half_total": 0.10,
+        "soccer:corners_team|first_half_btts": 0.10,
+        "soccer:corners_team|first_half_spread": 0.10,
         "soccer:advance|corners": 0.15,          # labeled prior (corners ⊥ result)
         # advance × full-time bands (DC-derived + 4-study cross-check; the
         # correlation swings 0→~0.22 with favorite strength, so a wide band):
@@ -520,6 +543,17 @@ class StructuralConfig(StrictModel):
     # 0.5 prior with a band covering first-kicker/keeper effects.
     pens_win_prob: float = 0.5
     pens_band: float = 0.10
+    # First-half goal share h: goals_1H ~ Poisson(lam*h) per team, so a 1H leg
+    # prices on the DC half-split scoreline and its correlations with FT (and
+    # other 1H) legs are DERIVED coherently instead of hitting the flat +0.6
+    # copula default. MEASURED 0.4507 on 8,981 football-data.co.uk HT/FT club
+    # matches (top-5 EU 20/21-24/25; per-league 0.440 Serie A .. 0.461 Bundes),
+    # matching the design's 0.45. A banded CONSTANT, never inverted from a single
+    # 1H leg (design_halftime_dc.md §6); the ±band re-prices the joint so the
+    # width absorbs the share uncertainty + the omitted inter-half serial corr.
+    # Only exercised on combos that actually carry a 1H leg.
+    half_share: float = 0.45
+    half_share_band: float = 0.03  # covers the 0.44-0.46 league spread (§7)
     misfit_uncertainty_scale: float = 1.0
     # Series prefixes whose matches are knockout format (ET+pens possible).
     # Settlement windows per family are RULE-BOOK (operator-provided Kalshi

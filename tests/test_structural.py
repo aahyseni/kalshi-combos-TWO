@@ -11,6 +11,11 @@ from combomaker.pricing.dixon_coles import (
     Advance,
     Btts,
     Draw,
+    HalfBtts,
+    HalfDraw,
+    HalfGoalSpread,
+    HalfResult,
+    HalfTotalOver,
     MatchFormat,
     PlayerScores,
     Team,
@@ -316,6 +321,121 @@ class TestPricing:
         assert 0.0 < est.p < 1.0
 
 
+class TestFirstHalf:
+    """1H legs parse to the half specs and price on the DC half-split scoreline
+    (source-of-truth ticker shapes: prod RFQ tape 2026-07-07)."""
+
+    def test_parse_first_half_families(self) -> None:
+        m = _parse_match(GAME)
+        assert m is not None
+        ko = MatchFormat.KNOCKOUT
+        assert _parse_leg(f"KXWC1H-{GAME}-ENG", m, fmt=ko) == HalfResult(Team.A)
+        assert _parse_leg(f"KXWC1H-{GAME}-NOR", m, fmt=ko) == HalfResult(Team.B)
+        assert _parse_leg(f"KXWC1H-{GAME}-TIE", m, fmt=ko) == HalfDraw()
+        assert _parse_leg(f"KXWC1HTOTAL-{GAME}-1", m, fmt=ko) == HalfTotalOver(1)
+        assert _parse_leg(f"KXWC1HTOTAL-{GAME}-3", m, fmt=ko) == HalfTotalOver(3)
+        assert _parse_leg(f"KXWC1HBTTS-{GAME}-BTTS", m, fmt=ko) == HalfBtts()
+        assert _parse_leg(f"KXWC1HSPREAD-{GAME}-ENG2", m, fmt=ko) == HalfGoalSpread(
+            Team.A, 2
+        )
+        # 2H is NOT modeled -> honest reason (never a full-game masquerade).
+        out = _parse_leg(f"KXWC2HTOTAL-{GAME}-1", m, fmt=ko)
+        assert isinstance(out, str) and "not representable" in out
+
+    def test_first_half_unmatched_team_is_reason(self) -> None:
+        m = _parse_match(GAME)
+        assert m is not None
+        out = _parse_leg(f"KXWC1H-{GAME}-BRA", m, fmt=MatchFormat.KNOCKOUT)
+        assert isinstance(out, str) and "neither team" in out
+
+    def test_advance_x_first_half_total_prices(self) -> None:
+        est, reason = pricer(dc_rho=0.0).try_price(
+            [leg(ML), leg(f"KXWC1HTOTAL-{GAME}-1")],
+            [belief(0.60), belief(0.70)],
+            ["yes", "yes"],
+        )
+        assert reason is None and est is not None
+        assert 0.0 < est.p < min(0.60, 0.70)
+        assert any("half_share=0.45" in n for n in est.notes)
+
+    def test_first_half_btts_prices_structurally(self) -> None:
+        # 1H BTTS is a goal-timing family (gate PASS) -> structural. Consistent
+        # marginals (FT-btts 0.53, 1H-btts 0.196 both imply lam~1.3). 1H-btts
+        # implies FT-btts, so the joint IS P(1H-btts) — the containment falls
+        # out of the shared scoreline (no rho).
+        est, reason = pricer(dc_rho=0.0).try_price(
+            [leg(BTTS), leg(f"KXWC1HBTTS-{GAME}-BTTS")],
+            [belief(0.53), belief(0.196)],
+            ["yes", "yes"],
+        )
+        assert reason is None and est is not None
+        assert est.p == pytest.approx(0.196, abs=5e-3)
+
+    def test_first_half_winner_defers_to_copula(self) -> None:
+        # 1H result persistence is over-stated by the independent-increment
+        # split (OOS gate) -> decline to the copula's measured first_half prior.
+        est, reason = pricer(dc_rho=0.0).try_price(
+            [leg(f"KXWC1H-{GAME}-ENG"), leg(REG_ML)],
+            [belief(0.34), belief(0.55)],
+            ["yes", "yes"],
+        )
+        assert est is None and reason is not None
+        assert "1H result/spread" in reason and "first_half prior" in reason
+
+    def test_first_half_spread_defers_to_copula(self) -> None:
+        est, reason = pricer(dc_rho=0.0).try_price(
+            [leg(f"KXWC1HSPREAD-{GAME}-ENG2"), leg(TOTAL)],
+            [belief(0.10), belief(0.55)],
+            ["yes", "yes"],
+        )
+        assert est is None and reason is not None and "1H result/spread" in reason
+
+    def test_first_half_total_x_full_time_total_prices(self) -> None:
+        # Consistent totals (P(1H>0.5)=0.70, P(FT>2.5)=0.50 both imply lam~1.34).
+        est, reason = pricer(dc_rho=0.0).try_price(
+            [leg(f"KXWC1HTOTAL-{GAME}-1"), leg(TOTAL)],
+            [belief(0.70), belief(0.50)],
+            ["yes", "yes"],
+        )
+        assert reason is None and est is not None
+        assert 0.0 < est.p < min(0.70, 0.50)
+
+    def test_first_half_total_x_full_time_ml_prices(self) -> None:
+        # 1H-total × FT-moneyline (advance) — goal-timing 1H leg, so structural.
+        est, reason = pricer(dc_rho=0.0).try_price(
+            [leg(f"KXWC1HTOTAL-{GAME}-1"), leg(ML)],
+            [belief(0.70), belief(0.60)],
+            ["yes", "yes"],
+        )
+        assert reason is None and est is not None
+        assert 0.0 < est.p < min(0.70, 0.60)
+
+    def test_first_half_no_side_is_complement(self) -> None:
+        p = pricer(dc_rho=0.0)
+        both, _ = p.try_price(
+            [leg(ML), leg(f"KXWC1HTOTAL-{GAME}-1")],
+            [belief(0.60), belief(0.70)],
+            ["yes", "yes"],
+        )
+        a_not_b, _ = p.try_price(
+            [leg(ML), leg(f"KXWC1HTOTAL-{GAME}-1", side="no")],
+            [belief(0.60), belief(0.70)],
+            ["yes", "no"],
+        )
+        assert both is not None and a_not_b is not None
+        assert both.p + a_not_b.p == pytest.approx(0.60, abs=1e-6)
+
+    def test_first_half_h_band_widens_joint(self) -> None:
+        # The h ±band re-prices the joint, so a 1H combo carries extra form
+        # width vs an otherwise-identical FT-only combo has none from h.
+        est, _ = pricer(dc_rho=0.0).try_price(
+            [leg(ML), leg(f"KXWC1HTOTAL-{GAME}-1")],
+            [belief(0.60, 0.002), belief(0.70, 0.002)],
+            ["yes", "yes"],
+        )
+        assert est is not None and est.uncertainty > 0.0
+
+
 class TestMarginTotalDispatch:
     NBA_ML = "KXNBAGAME-26OCT10LALBOS-LAL"
     NBA_TOTAL = "KXNBATOTAL-26OCT10LALBOS-225"
@@ -463,21 +583,62 @@ class TestApplicability:
         legs = [leg("KXUFCFIGHT-26JUL11MCGHOL-HOL"), leg("KXUFCFIGHT-26JUL11ABCDEF-ABC")]
         assert not structural_applicable(legs, [(0, 1)])
 
-    def test_period_leg_declines_even_in_one_soccer_group(self) -> None:
-        # Period legs now rejoin the same-game copula group, so this guard is
-        # the reachable barrier keeping a 1H leg off the full-game inverter.
-        legs = [leg(f"KXWC1HTOTAL-{GAME}-2"), leg(TOTAL)]
+    def test_modeled_first_half_leg_now_applies(self) -> None:
+        # Goal-timing 1H legs (total / BTTS) are modeled on the DC half-split
+        # scoreline, so a soccer 1H×FT combo in one same-event group DOES reach
+        # the structural pricer.
+        assert structural_applicable([leg(f"KXWC1HTOTAL-{GAME}-2"), leg(TOTAL)], [(0, 1)])
+        assert structural_applicable(
+            [leg(f"KXWC1HBTTS-{GAME}-BTTS"), leg(TOTAL)], [(0, 1)]
+        )
+
+    def test_unmodeled_period_leg_still_declines(self) -> None:
+        # A 2H leg has no scoreline window (only the FIRST half is modeled) —
+        # it must NOT reach the inverter; the copula prices it.
+        legs = [leg(f"KXWC2HTOTAL-{GAME}-2"), leg(TOTAL)]
         assert not structural_applicable(legs, [(0, 1)])
+
+    def test_first_half_result_leg_does_not_apply(self) -> None:
+        # 1H winner / spread defer to the copula's measured prior (persistence
+        # over-stated), so they must NOT reach the structural pricer.
+        assert not structural_applicable([leg(f"KXWC1H-{GAME}-ENG"), leg(TOTAL)], [(0, 1)])
+        assert not structural_applicable(
+            [leg(f"KXWC1HSPREAD-{GAME}-ENG2"), leg(TOTAL)], [(0, 1)]
+        )
 
 
 class TestPeriodGuard:
-    def test_try_price_declines_a_period_leg(self) -> None:
+    def test_try_price_prices_a_modeled_first_half_leg(self) -> None:
+        # A representable 1H×FT combo (consistent marginals) now prices
+        # structurally rather than declining to the copula.
+        est, reason = pricer(dc_rho=0.0).try_price(
+            [leg(f"KXWC1HTOTAL-{GAME}-1"), leg(TOTAL)],
+            [belief(0.70), belief(0.50)],
+            ["yes", "yes"],
+        )
+        assert reason is None and est is not None
+        assert 0.0 < est.p < min(0.70, 0.50)
+        assert any("half_share=" in n for n in est.notes)
+
+    def test_try_price_declines_an_unmodeled_period_leg(self) -> None:
+        # A 2H total has no scoreline window -> fail closed to the copula.
+        est, reason = pricer(dc_rho=0.0).try_price(
+            [leg(f"KXWC2HTOTAL-{GAME}-2"), leg(TOTAL)],
+            [belief(0.40), belief(0.55)],
+            ["yes", "yes"],
+        )
+        assert est is None and reason is not None and "period leg" in reason
+
+    def test_inconsistent_first_half_marginal_fails_closed(self) -> None:
+        # 1H-over-1.5 at 0.40 contradicts FT-over-2.5 at 0.55 under the Poisson
+        # half split (the implied 1H rate can't support both) -> exact-system
+        # residual decline -> copula, never a guessed joint.
         est, reason = pricer(dc_rho=0.0).try_price(
             [leg(f"KXWC1HTOTAL-{GAME}-2"), leg(TOTAL)],
             [belief(0.40), belief(0.55)],
             ["yes", "yes"],
         )
-        assert est is None and reason is not None and "period leg" in reason
+        assert est is None and reason is not None and "residual" in reason
 
 
 async def wc_engine(config: PricingConfig) -> PricingEngine:
@@ -514,6 +675,44 @@ async def test_engine_uses_structural_when_enabled() -> None:
     assert isinstance(copula, ConstructedQuote), copula
     # Different models, different fairs: the structural fair reads the whole
     # scoreline structure, the copula its pairwise-rho approximation.
+    assert structural.fair_cc != copula.fair_cc
+
+
+async def test_engine_prices_first_half_total_structurally() -> None:
+    from tests.test_feed import snapshot_env
+
+    # advance x 1H-over-0.5 — a goal-timing 1H combo routes through the
+    # structural pricer END TO END (not the copula), and its fair differs.
+    onehalf = f"KXWC1HTOTAL-{GAME}-1"
+    tickers = [ML, onehalf]
+    # Uncrossed two-sided books (yes-best + no-best < $1): advance ~0.60,
+    # 1H-over-0.5 ~0.70.
+    books = {
+        ML: ([["0.5900", "50.00"], ["0.6000", "20.00"]],
+             [["0.3800", "60.00"], ["0.3900", "25.00"]]),
+        onehalf: ([["0.6900", "50.00"], ["0.7000", "20.00"]],
+                  [["0.2800", "60.00"], ["0.2900", "25.00"]]),
+    }
+
+    async def build(config: PricingConfig) -> PricingEngine:
+        h = Harness()
+        h.feed.watch(tickers)
+        await h.ws.ack_subscription(0, 5)
+        for i, ticker in enumerate(tickers):
+            env = snapshot_env(5, i + 1, ticker)
+            env["msg"]["yes_dollars_fp"], env["msg"]["no_dollars_fp"] = books[ticker]
+            await h.ws.deliver(env)
+        h.with_meta("KXMVE-C1")
+        seed_event(h, SGP_EVENT, exclusive=False)
+        return PricingEngine(h.feed, h.metadata, DOC_ASSUMED, config)
+
+    rfq = same_event_combo(tickers)
+    on = await build(PricingConfig())
+    off = await build(PricingConfig(structural=StructuralConfig(enabled=False)))
+    structural = on.price(rfq, time_to_close_s=TTC)
+    copula = off.price(rfq, time_to_close_s=TTC)
+    assert isinstance(structural, ConstructedQuote), structural
+    assert isinstance(copula, ConstructedQuote), copula
     assert structural.fair_cc != copula.fair_cc
 
 
