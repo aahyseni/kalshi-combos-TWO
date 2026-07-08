@@ -328,6 +328,44 @@ def _corners_spread_prior(
     return _lookup_pair(f"{key}:{orient}", sport, params)
 
 
+def _oriented_team_prior(
+    key: str,
+    sport: str,
+    params: SgpParams,
+    team_a: str | None,
+    team_b: str | None,
+    *,
+    is_tie: bool,
+) -> _PairPrior | None:
+    """Emit ``:same`` / ``:opp`` by whether two parsed team codes match, or
+    ``:tie`` when a winner leg is a draw. None on unparseable (never guess a
+    sign). Shared by the 1H-winner/1H-spread × team-directional-FT resolvers."""
+    if is_tie:
+        return _lookup_pair(f"{key}:tie", sport, params)
+    if team_a is None or team_b is None:
+        return None
+    return _lookup_pair(f"{key}:{'same' if team_a == team_b else 'opp'}", sport, params)
+
+
+def _period_winner_player_prior(
+    key: str, sport: str, params: SgpParams, fhm_ticker: str, player_ticker: str
+) -> _PairPrior | None:
+    """1H-winner × scorer: ``:same`` / ``:opp`` by whether the scorer plays for
+    the 1H leader (his player code starts with the leader team code), ``:tie``
+    when the 1H is a draw. Mirrors ``_advance_player_prior`` with a tie branch."""
+    if fhm_ticker.rsplit("-", 1)[-1].upper() in _DRAW_SUFFIXES:
+        return _lookup_pair(f"{key}:tie", sport, params)
+    fhm_team = _winner_team(fhm_ticker)
+    parts = player_ticker.split("-")
+    if fhm_team is None or len(parts) < 4:
+        return None
+    player_code = parts[-2].upper()
+    if not player_code:
+        return None
+    orient = "same" if player_code.startswith(fhm_team) else "opp"
+    return _lookup_pair(f"{key}:{orient}", sport, params)
+
+
 def _winner_period_prior(
     key: str, sport: str, params: SgpParams, ticker_a: str, ticker_b: str
 ) -> _PairPrior | None:
@@ -514,6 +552,89 @@ def build_sgp_correlation(
                         legs[cts_index].market_ticker,
                         legs[spr2_index].market_ticker,
                     )
+                elif pair_types == {LegType.ADVANCE, LegType.FIRST_HALF_MONEYLINE}:
+                    # advance × 1H-winner: +ρ if the 1H leader advances, −ρ if the
+                    # opponent, ~0 on a 1H draw (direction-only vs symmetric).
+                    a_i = i if types[i] is LegType.ADVANCE else j
+                    f_i = j if a_i == i else i
+                    sfx = legs[f_i].market_ticker.rsplit("-", 1)[-1].upper()
+                    prior = _oriented_team_prior(
+                        key, sport, params,
+                        _winner_team(legs[a_i].market_ticker),
+                        _winner_team(legs[f_i].market_ticker),
+                        is_tie=sfx in _DRAW_SUFFIXES,
+                    )
+                elif pair_types == {LegType.FIRST_HALF_MONEYLINE, LegType.TOTAL}:
+                    # 1H-winner × FT-total: :team (a lead ⇒ goals) / :tie.
+                    f_i = i if types[i] is LegType.FIRST_HALF_MONEYLINE else j
+                    prior = _period_total_prior(key, sport, params, legs[f_i].market_ticker)
+                elif pair_types == {LegType.BTTS, LegType.FIRST_HALF_MONEYLINE}:
+                    # FT-btts × 1H-winner: :team (POSITIVE — a lead = a goal
+                    # already happened) / :tie (1H draw is 1-1 = btts).
+                    f_i = i if types[i] is LegType.FIRST_HALF_MONEYLINE else j
+                    prior = _period_total_prior(key, sport, params, legs[f_i].market_ticker)
+                elif pair_types == {LegType.FIRST_HALF_BTTS, LegType.FIRST_HALF_MONEYLINE}:
+                    # 1H-btts × 1H-winner: :team / :tie.
+                    f_i = i if types[i] is LegType.FIRST_HALF_MONEYLINE else j
+                    prior = _period_total_prior(key, sport, params, legs[f_i].market_ticker)
+                elif pair_types == {LegType.FIRST_HALF_MONEYLINE, LegType.PLAYER_GOAL}:
+                    # 1H-winner × scorer: :same/:opp by scorer's team / :tie.
+                    f_i = i if types[i] is LegType.FIRST_HALF_MONEYLINE else j
+                    p_i = j if f_i == i else i
+                    prior = _period_winner_player_prior(
+                        key, sport, params,
+                        legs[f_i].market_ticker, legs[p_i].market_ticker,
+                    )
+                elif pair_types == {LegType.FIRST_HALF_MONEYLINE, LegType.SPREAD}:
+                    # 1H-winner × FT-spread: :same/:opp by team / :tie.
+                    f_i = i if types[i] is LegType.FIRST_HALF_MONEYLINE else j
+                    s_i = j if f_i == i else i
+                    sfx = legs[f_i].market_ticker.rsplit("-", 1)[-1].upper()
+                    prior = _oriented_team_prior(
+                        key, sport, params,
+                        _winner_team(legs[f_i].market_ticker),
+                        _spread_team(legs[s_i].market_ticker),
+                        is_tie=sfx in _DRAW_SUFFIXES,
+                    )
+                elif pair_types == {LegType.FIRST_HALF_MONEYLINE, LegType.FIRST_HALF_SPREAD}:
+                    # 1H-winner × 1H-spread: same-team lead ⊃ lead-by-2 (+); opp or
+                    # tie EXCLUDES it (−). :same/:opp/:tie.
+                    f_i = i if types[i] is LegType.FIRST_HALF_MONEYLINE else j
+                    s_i = j if f_i == i else i
+                    sfx = legs[f_i].market_ticker.rsplit("-", 1)[-1].upper()
+                    prior = _oriented_team_prior(
+                        key, sport, params,
+                        _winner_team(legs[f_i].market_ticker),
+                        _spread_team(legs[s_i].market_ticker),
+                        is_tie=sfx in _DRAW_SUFFIXES,
+                    )
+                elif pair_types == {LegType.ADVANCE, LegType.FIRST_HALF_SPREAD}:
+                    # advance × 1H-spread: +ρ if the 1H lead-by-2 is the advancing
+                    # team, −ρ if the opponent (advance never draws).
+                    a_i = i if types[i] is LegType.ADVANCE else j
+                    s_i = j if a_i == i else i
+                    prior = _oriented_team_prior(
+                        key, sport, params,
+                        _winner_team(legs[a_i].market_ticker),
+                        _spread_team(legs[s_i].market_ticker),
+                        is_tie=False,
+                    )
+                elif pair_types == {LegType.FIRST_HALF_SPREAD, LegType.PLAYER_GOAL}:
+                    # 1H-spread × scorer: :same/:opp by scorer's team (reuse the FT
+                    # spread×scorer resolver; 1H-spread suffix is TEAM+digits too).
+                    s_i = i if types[i] is LegType.FIRST_HALF_SPREAD else j
+                    p_i = j if s_i == i else i
+                    prior = _spread_player_prior(
+                        key, sport, params,
+                        legs[s_i].market_ticker, legs[p_i].market_ticker,
+                    )
+                elif pair_types == {LegType.ADVANCE, LegType.MONEYLINE}:
+                    # FT advance × regulation moneyline. Team cases are logical
+                    # containment/impossible (relationships.py intercepts before the
+                    # copula); only advance × regulation-DRAW reaches here → :tie ~0.
+                    m_i = i if types[i] is LegType.MONEYLINE else j
+                    if legs[m_i].market_ticker.rsplit("-", 1)[-1].upper() in _DRAW_SUFFIXES:
+                        prior = _lookup_pair(f"{key}:tie", sport, params)
                 else:
                     one_moneyline = (types[i] is LegType.MONEYLINE) != (
                         types[j] is LegType.MONEYLINE

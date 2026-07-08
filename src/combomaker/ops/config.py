@@ -402,6 +402,56 @@ class CorrelationConfig(StrictModel):
             "first_half_spread|moneyline:same": 0.74,
             "first_half_spread|moneyline:opp": -0.66,
             "first_half_spread|total": 0.52,
+            # === 1H CROSS-TYPE CLUSTER (calibrated 2026-07-08, 3-agent batch:
+            # half-time Dixon-Coles + football-data HT/FT + Understat; every pair
+            # cross-validated structural vs empirical <=0.04, strength-controlled
+            # where a result leg confounds). Retires the +0.6 fallback on the
+            # ~700k same-game combos the audit flagged. Bands are the 1H-family
+            # era/structural proxy (no live 1H book to conditional-MLE gate yet).
+            # -- 1H-winner (first_half_moneyline) x FT, oriented :same/:opp/:tie --
+            "advance|first_half_moneyline:same": 0.64,
+            "advance|first_half_moneyline:opp": -0.64,
+            "advance|first_half_moneyline:tie": 0.00,
+            "first_half_moneyline|total:team": 0.24,
+            "first_half_moneyline|total:tie": -0.42,
+            "first_half_moneyline|player_goal:same": 0.45,
+            "first_half_moneyline|player_goal:opp": -0.20,
+            "first_half_moneyline|player_goal:tie": -0.22,
+            # btts x 1H-lead is POSITIVE (a 1H lead = a goal already happened +
+            # open game), UNLIKE FT btts|moneyline (negative = clean sheet).
+            "btts|first_half_moneyline:team": 0.10,
+            "btts|first_half_moneyline:tie": -0.17,
+            "first_half_moneyline|spread:same": 0.70,
+            "first_half_moneyline|spread:opp": -0.63,
+            "first_half_moneyline|spread:tie": -0.32,
+            # -- 1H-total / 1H-btts x FT, plain scalars (no team named) --
+            "advance|first_half_total": 0.09,
+            "first_half_total|moneyline": 0.14,
+            "first_half_total|spread": 0.27,
+            "first_half_total|player_goal": 0.33,
+            "advance|first_half_btts": -0.03,
+            "first_half_btts|total": 0.65,       # o2.5 anchor; o1.5 = exact containment
+            "first_half_btts|moneyline": -0.03,
+            "first_half_btts|spread": -0.08,
+            "first_half_btts|player_goal": 0.33,
+            # -- 1H x 1H (within-half; logical containments hit +-0.95) + 1H-spread x FT --
+            "first_half_spread|first_half_total": 0.95,   # 1H margin>=2 => 1H over1.5
+            "first_half_btts|first_half_moneyline:team": -0.18,
+            "first_half_btts|first_half_moneyline:tie": 0.30,
+            "first_half_moneyline|first_half_spread:same": 0.95,
+            "first_half_moneyline|first_half_spread:opp": -0.95,
+            "first_half_moneyline|first_half_spread:tie": -0.95,
+            "first_half_btts|first_half_spread": -0.22,
+            "first_half_btts|first_half_total": 0.95,      # 1H-btts => 1H over1.5
+            "advance|first_half_spread:same": 0.72,
+            "advance|first_half_spread:opp": -0.72,
+            "btts|first_half_spread": 0.00,      # VERIFIED ~0 (2H recovery cancels it)
+            "first_half_spread|player_goal:same": 0.45,
+            "first_half_spread|player_goal:opp": -0.22,
+            # FT advance x regulation-DRAW (the OBSERVED advance|moneyline flow; a
+            # draw is symmetric re: which team advances -> ~0. Team cases are
+            # logical containment/impossible, handled in relationships.py).
+            "advance|moneyline:tie": 0.00,
         },
         # NFL moneyline|total = 0.00 DOUBLY confirmed: pooled-vs-Vegas-lines
         # AND conditional-MLE (+0.02, SE 0.023) whose fit does NOT beat
@@ -518,6 +568,43 @@ class CorrelationConfig(StrictModel):
         "soccer:first_half_spread|moneyline:same": 0.12,
         "soccer:first_half_spread|moneyline:opp": 0.15,
         "soccer:first_half_spread|total": 0.15,
+        # 1H cross-type cluster bands (2026-07-08; 1H-family era/structural proxy)
+        "soccer:advance|first_half_moneyline:same": 0.12,
+        "soccer:advance|first_half_moneyline:opp": 0.12,
+        "soccer:advance|first_half_moneyline:tie": 0.10,
+        "soccer:first_half_moneyline|total:team": 0.08,
+        "soccer:first_half_moneyline|total:tie": 0.10,
+        "soccer:first_half_moneyline|player_goal:same": 0.15,
+        "soccer:first_half_moneyline|player_goal:opp": 0.18,
+        "soccer:first_half_moneyline|player_goal:tie": 0.12,
+        "soccer:btts|first_half_moneyline:team": 0.10,
+        "soccer:btts|first_half_moneyline:tie": 0.10,
+        "soccer:first_half_moneyline|spread:same": 0.10,
+        "soccer:first_half_moneyline|spread:opp": 0.12,
+        "soccer:first_half_moneyline|spread:tie": 0.12,
+        "soccer:advance|first_half_total": 0.16,
+        "soccer:first_half_total|moneyline": 0.13,
+        "soccer:first_half_total|spread": 0.14,
+        "soccer:first_half_total|player_goal": 0.17,
+        "soccer:advance|first_half_btts": 0.12,
+        "soccer:first_half_btts|total": 0.13,
+        "soccer:first_half_btts|moneyline": 0.10,
+        "soccer:first_half_btts|spread": 0.11,
+        "soccer:first_half_btts|player_goal": 0.18,
+        "soccer:first_half_spread|first_half_total": 0.10,
+        "soccer:first_half_btts|first_half_moneyline:team": 0.10,
+        "soccer:first_half_btts|first_half_moneyline:tie": 0.10,
+        "soccer:first_half_moneyline|first_half_spread:same": 0.10,
+        "soccer:first_half_moneyline|first_half_spread:opp": 0.10,
+        "soccer:first_half_moneyline|first_half_spread:tie": 0.10,
+        "soccer:first_half_btts|first_half_spread": 0.10,
+        "soccer:first_half_btts|first_half_total": 0.10,
+        "soccer:advance|first_half_spread:same": 0.13,
+        "soccer:advance|first_half_spread:opp": 0.15,
+        "soccer:btts|first_half_spread": 0.10,
+        "soccer:first_half_spread|player_goal:same": 0.15,
+        "soccer:first_half_spread|player_goal:opp": 0.15,
+        "soccer:advance|moneyline:tie": 0.10,
         "nfl:moneyline|total": 0.05,
         "nfl:spread|total": 0.05,
         "nfl:moneyline|spread": 0.05,
