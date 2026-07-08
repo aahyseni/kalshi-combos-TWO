@@ -310,6 +310,24 @@ def _corners_winner_prior(
     return _lookup_pair(f"{key}:{orient}", sport, params)
 
 
+def _corners_spread_prior(
+    key: str, sport: str, params: SgpParams, corners_ticker: str, spread_ticker: str
+) -> _PairPrior | None:
+    """team-corners × spread prior, resolved to ``:same`` / ``:opp`` by whether
+    the corners team is the one COVERING the margin (chasing/pressing team earns
+    corners → −ρ) or the opponent (+ρ). Sibling of ``_corners_winner_prior``;
+    both suffixes are TEAM+line-digits (``_corners_team_name`` / ``_spread_team``).
+    Sign is STRENGTH-CONTROLLED (the raw pooled corr is a Simpson trap, +0.07
+    wrong-signed). Unparseable suffix → None so the caller falls back — never
+    guess the sign."""
+    corners_team = _corners_team_name(corners_ticker)
+    spread_team = _spread_team(spread_ticker)
+    if corners_team is None or spread_team is None:
+        return None
+    orient = "same" if corners_team == spread_team else "opp"
+    return _lookup_pair(f"{key}:{orient}", sport, params)
+
+
 def _winner_period_prior(
     key: str, sport: str, params: SgpParams, ticker_a: str, ticker_b: str
 ) -> _PairPrior | None:
@@ -482,6 +500,19 @@ def build_sgp_correlation(
                         params,
                         legs[ct_index].market_ticker,
                         legs[ml_index].market_ticker,
+                    )
+                elif pair_types == {LegType.CORNERS_TEAM, LegType.SPREAD}:
+                    # team corners × spread: −ρ if the corners team COVERS the
+                    # margin (chasing team earns corners), +ρ if the OPPONENT
+                    # covers. Strength-controlled (raw pooled is the wrong sign).
+                    cts_index = i if types[i] is LegType.CORNERS_TEAM else j
+                    spr2_index = j if cts_index == i else i
+                    prior = _corners_spread_prior(
+                        key,
+                        sport,
+                        params,
+                        legs[cts_index].market_ticker,
+                        legs[spr2_index].market_ticker,
                     )
                 else:
                     one_moneyline = (types[i] is LegType.MONEYLINE) != (

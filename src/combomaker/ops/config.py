@@ -181,6 +181,7 @@ class CorrelationConfig(StrictModel):
             # TOTAL corners (KXWCCORNERS) — measured ⊥ goals AND ⊥ result.
             "corners|total": 0.00,
             "corners|moneyline": 0.00,
+            "corners|spread": 0.00,       # TOTAL corners ⊥ margin (measured +0.02)
             "btts|corners": 0.00,
             # CORNERS × FIRST-HALF markets. Corners are in NO scoreline model
             # (structural declines a corners leg -> copula), and total corners
@@ -281,7 +282,15 @@ class CorrelationConfig(StrictModel):
             "corners_team|moneyline:same": -0.15,
             "corners_team|moneyline:opp": 0.15,
             "corners_team|moneyline:tie": 0.00,
+            # team corners × spread — ORIENTED (:same/:opp), the sibling of
+            # corners_team|moneyline. −ρ if the corners team is the one covering
+            # the margin (chasing/pressing team earns corners), +ρ if the
+            # OPPONENT covers. STRENGTH-CONTROLLED (2026-07-08, 8,980 matches):
+            # raw pooled +0.07 (Simpson trap, wrong sign); conditional
+            # :same −0.114 / :opp +0.109. Plain entry = unparseable-orient fallback.
             "corners_team|spread": -0.13,
+            "corners_team|spread:same": -0.11,
+            "corners_team|spread:opp": 0.11,
             "corners_team|total": 0.00,
             "btts|corners_team": 0.00,
             # Team corners nest ONLY for the SAME team (POR4 & POR8); game totals
@@ -355,8 +364,11 @@ class CorrelationConfig(StrictModel):
             # traded line is 2 = "leads at half by over 1.5", i.e. 1H margin>=2)
             # x FULL-TIME legs, CALIBRATED 2026-07-07 on 8,981 club matches
             # (football-data HT/FT; tools/calibrate_soccer_1h_spread.py;
-            # results_soccer.md §2). Kalshi BLOCKS 1H-spread x 1H-total/1H-over,
-            # so only 1H-spread x full-time is reachable/measured. A 1H spread
+            # results_soccer.md §2). NOTE: the 1H-spread x 1H-total / 1H-btts /
+            # 1H-winner pairs ARE reachable (the prod tape has real same-game
+            # combos — an earlier "Kalshi blocks 1H×1H" assumption was wrong);
+            # they are DEFERRED (uncalibrated → +0.6 fallback), not blocked. Only
+            # 1H-spread x FULL-TIME is calibrated here. A 1H spread
             # NAMES a team, so spread|spread and spread|moneyline flip sign HARD
             # on team orientation — resolved in sgp.py to ":same" (both legs
             # name one team) / ":opp" (different teams) by stripping the trailing
@@ -436,6 +448,7 @@ class CorrelationConfig(StrictModel):
         "soccer:corners|total": 0.08,
         "soccer:btts|corners": 0.08,
         "soccer:corners|moneyline": 0.08,        # total corners, measured ~0 (team is separate now)
+        "soccer:corners|spread": 0.08,           # total corners ⊥ margin (measured +0.02)
         # corners × 1H: grounded near-zero (corners ⊥ result/goals), wide band.
         "soccer:corners|first_half_moneyline": 0.10,
         "soccer:corners|first_half_total": 0.10,
@@ -465,6 +478,8 @@ class CorrelationConfig(StrictModel):
         "soccer:corners_team|moneyline:opp": 0.10,
         "soccer:corners_team|moneyline:tie": 0.08,
         "soccer:corners_team|spread": 0.10,
+        "soccer:corners_team|spread:same": 0.10,
+        "soccer:corners_team|spread:opp": 0.10,
         "soccer:corners_team|total": 0.08,
         "soccer:btts|corners_team": 0.08,
         "soccer:corners|corners_team": 0.15,  # home/away split (0.57-0.65) + line drift

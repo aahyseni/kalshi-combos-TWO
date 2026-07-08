@@ -78,3 +78,26 @@ def test_config_carries_oriented_entries() -> None:
     for k in ("corners_team|moneyline:same", "corners_team|moneyline:opp",
               "corners_team|moneyline:tie"):
         assert k in soc, k
+
+
+# --- team-corners × SPREAD orientation (sibling of the moneyline pair) ---------
+
+
+def test_team_corners_spread_same_team_negative() -> None:
+    # POR's corners × POR covering the margin → chasing effect, −0.11
+    assert abs(_rho(f"KXWCTCORNERS-{_G}-POR6", f"KXWCSPREAD-{_G}-POR2") - (-0.11)) < 1e-9
+
+
+def test_team_corners_spread_opponent_flips_positive() -> None:
+    assert abs(_rho(f"KXWCTCORNERS-{_G}-POR6", f"KXWCSPREAD-{_G}-ESP2") - 0.11) < 1e-9
+
+
+def test_total_corners_spread_is_zero() -> None:
+    # TOTAL corners (team-agnostic) × spread → measured ⊥ margin, plain 0.00
+    assert abs(_rho(f"KXWCCORNERS-{_G}-9", f"KXWCSPREAD-{_G}-POR2") - 0.00) < 1e-9
+
+
+def test_config_carries_spread_oriented_entries() -> None:
+    soc = CorrelationConfig().pair_rho_by_sport["soccer"]
+    for k in ("corners_team|spread:same", "corners_team|spread:opp", "corners|spread"):
+        assert k in soc, k

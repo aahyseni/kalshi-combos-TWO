@@ -42,8 +42,9 @@ class LegType(StrEnum):
     FIRST_HALF_BTTS = "first_half_btts"
     # First-half spread = 1H goal margin (series KXWC1HSPREAD-…-<TEAM><line>,
     # e.g. …-FRA2 = France leads at half by over 1.5). Measured against FT
-    # spread/moneyline/total (results_soccer.md §2); the 1H×1H pairs it forms
-    # are BLOCKED by Kalshi, so only 1H-spread × full-time is calibrated.
+    # spread/moneyline/total (results_soccer.md §2). The 1H×1H pairs it forms
+    # ARE reachable (real same-game combos in the prod tape — the earlier
+    # "blocked by Kalshi" assumption was wrong); they're DEFERRED, not blocked.
     FIRST_HALF_SPREAD = "first_half_spread"
     UNKNOWN = "unknown"
 
