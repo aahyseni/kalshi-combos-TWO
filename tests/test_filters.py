@@ -195,3 +195,36 @@ async def test_multiple_reasons_all_reported() -> None:
     reasons = h.filter.evaluate(combo_rfq())
     assert ReasonCode.SKIP_TOO_MANY_LEGS in reasons
     assert ReasonCode.SKIP_SIZE_BELOW_MIN in reasons
+
+
+# --- two-legged-tie (UCL/UEL/UECL) regime gate --------------------------------
+
+
+def _regime_combo(tk: str) -> Rfq:
+    return combo_rfq(mve_selected_legs=[
+        {"market_ticker": tk, "side": "yes"},
+        {"market_ticker": "KXWCTOTAL-26JUL09FRAMAR-3", "side": "yes"},
+    ])
+
+
+def test_ucl_uel_uecl_legs_declined_as_unmodeled_regime() -> None:
+    h = Harness()
+    for tk in ("KXUCLGAME-26AUG12REALARS-REAL", "KXUELGAME-26AUG12ABCDEF-ABC",
+               "KXUECLGAME-26AUG12GHIJKL-GHI"):
+        assert ReasonCode.SKIP_UNMODELED_REGIME in h.filter.evaluate(_regime_combo(tk)), tk
+
+
+def test_pure_wc_combo_not_declined_for_regime() -> None:
+    h = Harness()
+    rfq = combo_rfq(mve_selected_legs=[
+        {"market_ticker": "KXWCADVANCE-26JUL09FRAMAR-FRA", "side": "yes"},
+        {"market_ticker": "KXWCTOTAL-26JUL09FRAMAR-3", "side": "yes"},
+    ])
+    assert ReasonCode.SKIP_UNMODELED_REGIME not in h.filter.evaluate(rfq)
+
+
+def test_regime_gate_can_be_disabled() -> None:
+    h = Harness(FiltersConfig(decline_two_legged_tie=False))
+    assert ReasonCode.SKIP_UNMODELED_REGIME not in h.filter.evaluate(
+        _regime_combo("KXUCLGAME-26AUG12REALARS-REAL")
+    )

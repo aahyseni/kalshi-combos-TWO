@@ -20,6 +20,16 @@ from combomaker.ops.config import FiltersConfig
 from combomaker.rfq.models import Rfq
 from combomaker.risk.killswitch import KillSwitch
 
+# Two-legged-tie European knockouts (Champions/Europa/Conference League): the
+# "advance" market is decided over TWO legs, so a single-match win does not imply
+# advancing and the single-match soccer priors mis-apply. Declined as an
+# unmodeled regime (config.decline_two_legged_tie) until its own model is built.
+_TWO_LEGGED_TIE_PREFIXES = ("KXUCL", "KXUEL", "KXUECL")
+
+
+def _is_two_legged_tie_leg(ticker: str) -> bool:
+    return ticker.upper().startswith(_TWO_LEGGED_TIE_PREFIXES)
+
 
 class RfqFilter:
     def __init__(
@@ -54,6 +64,11 @@ class RfqFilter:
         n_legs = len(rfq.legs)
         if rfq.is_combo and not (cfg.min_legs <= n_legs <= cfg.max_legs):
             reasons.append(ReasonCode.SKIP_TOO_MANY_LEGS)
+
+        if cfg.decline_two_legged_tie and any(
+            _is_two_legged_tie_leg(leg.market_ticker) for leg in rfq.legs
+        ):
+            reasons.append(ReasonCode.SKIP_UNMODELED_REGIME)
 
         reasons.extend(self._size_reasons(rfq))
 

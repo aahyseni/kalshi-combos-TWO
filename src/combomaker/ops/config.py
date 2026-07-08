@@ -81,6 +81,11 @@ class FiltersConfig(StrictModel):
     max_leg_spread_cc: int = 800      # widest acceptable leg spread ($0.08)
     min_leg_depth_contracts: float = 1.0   # min size behind BOTH best bids
     min_time_to_close_s: float = 3600.0    # pregame-only default (1h before close)
+    # Decline combos that carry a two-legged-tie knockout leg (UCL/UEL/UECL):
+    # "advance" there is decided over two legs, so a single-match win does NOT
+    # imply advancing and the single-match soccer priors mis-apply. Gated off
+    # until its own regime is built. Flip to false once that regime exists.
+    decline_two_legged_tie: bool = True
 
 
 class FeeConfig(StrictModel):

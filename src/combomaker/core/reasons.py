@@ -39,6 +39,11 @@ class ReasonCode(StrEnum):
     # The combo is logically impossible (e.g. two YES legs of a mutually
     # exclusive event). v1 policy: no-quote, don't try to arb it.
     SKIP_LOGICALLY_IMPOSSIBLE = "skip_logically_impossible"
+    # An unmodeled market regime we deliberately decline (e.g. two-legged-tie
+    # UCL/UEL/UECL knockouts, where "advance" != a single-match win and the
+    # single-match soccer priors do not apply). Gated off until its own regime
+    # is built, rather than mispriced on the wrong model.
+    SKIP_UNMODELED_REGIME = "skip_unmodeled_regime"
 
     # --- Quote lifecycle ---
     QUOTE_SENT = "quote_sent"
