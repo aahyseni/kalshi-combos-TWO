@@ -124,6 +124,53 @@ def _moneyline_is_team(market_ticker: str) -> bool:
     return bool(suffix) and suffix not in _DRAW_SUFFIXES
 
 
+def _team_suffix(market_ticker: str) -> str:
+    """Uppercased last-hyphen suffix (a team code, TIE, or a spread ``TEAMN``)."""
+    return market_ticker.rsplit("-", 1)[-1].upper()
+
+
+# --- single-match KXWC series gate (advance|moneyline, moneyline|spread) ---------
+# The advance/spread⟹moneyline logic below is a SINGLE-MATCH KNOCKOUT fact:
+#   reg-win(T) ⟹ advance(T)          (ahead at 90' ⇒ the single match is decided)
+#   advance(T) ⟹ NOT advance(opponent)     (exactly one of two advances)
+# A two-legged tie (UCL/UEL/UECL) breaks the FIRST implication — a regulation win
+# in ONE leg does NOT imply advancing the aggregate tie. So these families gate on
+# the EXACT single-match World-Cup series names; a ``KXUCLADVANCE`` / ``KXUELGAME``
+# / ``KXUECLSPREAD`` leg can never match (its series prefix differs), and the pair
+# falls through to the ordinary copula, never a containment/impossible/farm here.
+# SOURCE OF TRUTH (prod RFQ tape 2026-07-08): KXWCADVANCE is a head-to-head
+# per-game market (two team outcomes = the game's two teams) that only appears in
+# the knockout date window (26JUN29–26JUL11), and KXWCGAME is 3-way incl. a TIE
+# outcome (= regulation-time result). Both confirm the single-match knockout regime.
+_KXWC_ADVANCE_SERIES = "KXWCADVANCE"
+_KXWC_GAME_SERIES = "KXWCGAME"
+_KXWC_SPREAD_SERIES = "KXWCSPREAD"
+
+_SPREAD_TEAM_LINE = re.compile(r"^([A-Za-z]+)(\d+)$")
+
+
+def _series_prefix(market_ticker: str) -> str:
+    """The series prefix (text before the first hyphen), upper-cased — the exact
+    token the single-match gate matches against (never a LegType, which maps both
+    KXWC* and KXUCL* to the same value)."""
+    return market_ticker.split("-", 1)[0].upper()
+
+
+def _spread_team_line(market_ticker: str) -> tuple[str, int] | None:
+    """(team, margin line N) from a KXWCSPREAD suffix (``…-MEX2`` -> ``("MEX", 2)``).
+    N encodes "wins by REGULATION margin ≥ N"; that only implies a win when N ≥ 1,
+    so a suffix that isn't ``<team><positive-int>`` (a 0/handicap/decimal/garbage
+    line) returns None — never guess a win-implication for the containment logic."""
+    suffix = market_ticker.rsplit("-", 1)[-1].upper()
+    m = _SPREAD_TEAM_LINE.match(suffix)
+    if m is None:
+        return None
+    line = int(m.group(2))
+    if line < 1:
+        return None
+    return m.group(1), line
+
+
 def _containment_sign(
     sub_i: int, sup_i: int, sub_side: str, sup_side: str
 ) -> tuple[int, int] | Literal["impossible"] | None:
@@ -357,6 +404,108 @@ def classify_legs(
                 )
             if isinstance(verdict, tuple):
                 containment = verdict
+
+    # Family 4 — single-match ADVANCE (A) vs regulation MONEYLINE (B), KXWC only.
+    # KXWCGAME = regulation (90') result; KXWCADVANCE = wins the match (reg OR ET
+    # OR pens). SINGLE-MATCH KNOCKOUT: reg-win(T) ⟹ advance(T) and advance(T) ⟹
+    # ¬advance(opp). Gated EXACTLY to KXWCADVANCE/KXWCGAME (see the series-gate
+    # note) so a two-legged KXUCLADVANCE can never be classified here. Moneyline
+    # TIE (a reg draw) does NOT pin who advances → excluded; only TEAM moneylines
+    # fire. Kalshi blocks moneyline-NO legs in combos (tape 2026-07-08: 0 KXWCGAME
+    # legs on the NO side), so only ml-YES orientations are reachable and wired.
+    #   SAME team:  {ml-yes, adv-yes} → CONTAINMENT joint = P(reg-win)  (subset=ml)
+    #               {ml-yes, adv-no}  → IMPOSSIBLE, NON-farmable (win-but-not-
+    #                                   advance is impossible only in KNOCKOUT;
+    #                                   metadata-dependent ⇒ farm rule #2 forbids
+    #                                   farming ⇒ v1 no-quote until a knockout guard)
+    #   OPP team:   {adv-A-yes, ml-B-yes} → IMPOSSIBLE (reg-win-B ⟹ ¬advance-A);
+    #                                   NOT farmable (rests on the opponent +
+    #                                   exactly-one-advances inference, not a
+    #                                   same-leg tautology — v1 no-quote)
+    #               {adv-A-no, ml-B-yes} → CONTAINMENT joint = P(reg-win-B)
+    #                                   (ml-B ⊆ ¬advance-A; subset = ml-B leg)
+    for adv_i in range(len(legs)):
+        if _series_prefix(legs[adv_i].market_ticker) != _KXWC_ADVANCE_SERIES:
+            continue
+        if not _moneyline_is_team(legs[adv_i].market_ticker):
+            continue  # advance suffix must be a team code (fail-closed)
+        adv_team = _team_suffix(legs[adv_i].market_ticker)
+        for ml_i in range(len(legs)):
+            if _series_prefix(legs[ml_i].market_ticker) != _KXWC_GAME_SERIES:
+                continue
+            if game_keys[adv_i] != game_keys[ml_i] or legs[ml_i].side != "yes":
+                continue
+            if not _moneyline_is_team(legs[ml_i].market_ticker):
+                continue  # TIE (reg draw) does not pin advancing
+            if _team_suffix(legs[ml_i].market_ticker) == adv_team:
+                if legs[adv_i].side == "yes":
+                    containment = (ml_i, adv_i)  # joint = P(reg-win); subset = ml
+                else:  # adv "no": reg-win ⟹ advance, so this can never settle YES
+                    notes.append(
+                        f"same-team reg-win yes ({legs[ml_i].market_ticker}) implies "
+                        f"advance yes: {legs[adv_i].market_ticker} no is impossible"
+                    )
+                    # NOT farmable: reg-win⟹advance is airtight only for KNOCKOUT
+                    # (a group-stage team can win yet not advance), so the
+                    # impossibility is metadata-dependent — CLAUDE.md farming rule
+                    # #2 forbids farming it. v1 no-quote (safe, zero money risk);
+                    # enable a farm only behind a positive knockout-confirmation guard.
+                    return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
+            else:  # opposite team
+                if legs[adv_i].side == "yes":
+                    notes.append(
+                        f"opp-team reg-win yes ({legs[ml_i].market_ticker}) implies "
+                        f"advance no: {legs[adv_i].market_ticker} yes is impossible"
+                    )
+                    # NOT farmable: opponent + exactly-one-advances inference.
+                    return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
+                else:  # adv-A no, ml-B yes: reg-win-B ⊆ ¬advance-A
+                    containment = (ml_i, adv_i)  # joint = P(reg-win-B); subset = ml-B
+
+    # Family 5 — single-match regulation SPREAD (A) vs regulation MONEYLINE (B),
+    # KXWC only. KXWCSPREAD-…-<TEAM>N = the team wins in REGULATION by margin ≥ N
+    # (N ≥ 1), so a spread-YES pins the regulation result to "that team wins":
+    #   spread(S,N) ⟹ reg-win(S)                              [same team]
+    #   spread(S,N) ⟹ ¬reg-win(other team) and ⟹ ¬draw       [opp team / TIE]
+    # Both windows are regulation, so — unlike advance — this is a pure single-match
+    # RESULT contradiction (holds for knockout AND group), but is still gated to
+    # KXWCSPREAD/KXWCGAME per the single-match scoping. ml-NO unreachable (wired
+    # ml-YES only); spread must parse with N ≥ 1 (else it need not imply a win).
+    #   SAME team:  {spread-yes, ml-yes} → CONTAINMENT joint = P(spread) (subset=sp)
+    #               {spread-no,  ml-yes} → possible (won by < N) → copula
+    #   OPP team:   {spread-A-yes, ml-B-yes} → IMPOSSIBLE (both can't win reg)
+    #   TIE:        {spread-S-yes, ml-TIE-yes} → IMPOSSIBLE (a win-by-N is no draw)
+    # The opp/TIE impossibilities are NOT farmed (cross-outcome result pin) — v1
+    # no-quote, flagged for review before any promotion to FARM.
+    for sp_i in range(len(legs)):
+        if _series_prefix(legs[sp_i].market_ticker) != _KXWC_SPREAD_SERIES:
+            continue
+        parsed = _spread_team_line(legs[sp_i].market_ticker)
+        if parsed is None:
+            continue
+        sp_team, _line = parsed
+        for ml_i in range(len(legs)):
+            if _series_prefix(legs[ml_i].market_ticker) != _KXWC_GAME_SERIES:
+                continue
+            if game_keys[sp_i] != game_keys[ml_i] or legs[ml_i].side != "yes":
+                continue
+            ml_is_team = _moneyline_is_team(legs[ml_i].market_ticker)
+            if ml_is_team and _team_suffix(legs[ml_i].market_ticker) == sp_team:
+                # SAME team: spread ⊆ reg-win. {sp-yes,ml-yes}→containment(subset=sp);
+                # {sp-no,ml-yes}→possible (the OBSERVED game×spread cell) → copula.
+                verdict = _containment_sign(sp_i, ml_i, legs[sp_i].side, "yes")
+                if isinstance(verdict, tuple):
+                    containment = verdict
+            elif legs[sp_i].side == "yes":
+                # spread-yes pins the regulation winner, so an opponent win (opp
+                # team ml-yes) or a draw (TIE ml-yes) is impossible.
+                who = "opp-team" if ml_is_team else "tie"
+                notes.append(
+                    f"{who} reg spread yes ({legs[sp_i].market_ticker}) pins the "
+                    f"regulation winner: {legs[ml_i].market_ticker} yes is impossible"
+                )
+                # NOT farmable: cross-outcome result pin — v1 no-quote.
+                return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
 
     if containment is not None:
         if len(legs) != 2:
