@@ -65,6 +65,8 @@ async def event_flag_unknown(h: Harness) -> Rfq:
 
 
 async def impossible_pair(h: Harness) -> Rfq:
+    # Mutual-exclusion IMPOSSIBLE (two YES legs of exclusive E1): NOT farmable
+    # (metadata-dependent), so it always no-quotes — stays in this sweep.
     return combo(
         [
             {"market_ticker": "M1", "side": "yes", "event_ticker": "E1"},
@@ -73,13 +75,10 @@ async def impossible_pair(h: Harness) -> Rfq:
     )
 
 
-async def same_market_both_sides(h: Harness) -> Rfq:
-    return combo(
-        [
-            {"market_ticker": "M1", "side": "yes", "event_ticker": "E1"},
-            {"market_ticker": "M1", "side": "no", "event_ticker": "E1"},
-        ]
-    )
+# NOTE: same_market_both_sides is a LOGICALLY-CERTAIN (farmable) impossibility,
+# so with farm_impossible_combos ON it is deliberately QUOTED, not declined — it
+# is not an "under-understood" combo and lives in the farm tests
+# (test_pricing_engine.test_farm_*), not this UNKNOWN/no-quote sweep.
 
 
 async def missing_combo_grid(h: Harness) -> Rfq:
@@ -115,7 +114,6 @@ MUTATIONS: list[Mutation] = [
     unseen_event,
     event_flag_unknown,
     impossible_pair,
-    same_market_both_sides,
     missing_combo_grid,
     invalid_leg_book,
     unwatched_leg,

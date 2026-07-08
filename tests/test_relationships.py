@@ -54,6 +54,9 @@ def test_two_yes_legs_of_exclusive_event_impossible() -> None:
     rel = classify_legs(legs, MappingProvider({"E1": True}))
     assert rel.kind is RelationshipKind.IMPOSSIBLE
     assert rel.same_event_groups == ()
+    # Mutual exclusion rests on exchange METADATA, not a logical tautology —
+    # NOT farmable (a wrong flag would misclassify a possible combo).
+    assert rel.farmable is False
 
 
 def test_yes_and_no_legs_of_exclusive_event_ok_and_grouped() -> None:
@@ -75,6 +78,8 @@ def test_same_market_both_sides_impossible_without_provider() -> None:
     rel = classify_legs(legs, ExplodingProvider())  # decided before event lookup
     assert rel.kind is RelationshipKind.IMPOSSIBLE
     assert rel.same_event_groups == ()
+    # Airtight tautology (YES-and-NO of one market) ⇒ farmable.
+    assert rel.farmable is True
 
 
 def test_same_market_same_side_twice_is_degenerate_unknown() -> None:
@@ -186,6 +191,7 @@ def test_1h_btts_yes_ft_btts_no_is_impossible() -> None:
     rel = classify_legs(legs, ExplodingProvider())
     assert rel.kind is RelationshipKind.IMPOSSIBLE
     assert rel.containment is None
+    assert rel.farmable is True  # airtight scoring tautology
 
 
 def test_containment_pair_in_larger_combo_is_unknown() -> None:
@@ -219,6 +225,7 @@ def test_mutual_exclusion_still_caught_within_a_game() -> None:
     )
     rel = classify_legs(legs, MappingProvider({"KXWCGAME-26JUL05MEXENG": True}))
     assert rel.kind is RelationshipKind.IMPOSSIBLE
+    assert rel.farmable is False  # mutual exclusion is metadata-dependent
 
 
 @pytest.mark.parametrize(
@@ -281,6 +288,7 @@ def test_same_team_corners_higher_yes_lower_no_is_impossible() -> None:
     rel = classify_legs(legs, MappingProvider({TC_EV: False}))
     assert rel.kind is RelationshipKind.IMPOSSIBLE
     assert rel.same_event_groups == ()
+    assert rel.farmable is True  # nested-line containment tautology
 
 
 def test_same_team_corners_lower_yes_higher_no_is_possible() -> None:
@@ -306,6 +314,7 @@ def test_same_team_corners_same_line_both_sides_is_caught_upstream() -> None:
     legs = (leg(TC_MEX8, TC_EV, "yes"), leg(TC_MEX8, TC_EV, "no"))
     rel = classify_legs(legs, MappingProvider({TC_EV: False}))
     assert rel.kind is RelationshipKind.IMPOSSIBLE
+    assert rel.farmable is True  # same-market both sides tautology
 
 
 # --- Family 1: 1H-BTTS ⟹ FT-BTTS, the NO/NO containment added ---------------------
@@ -363,6 +372,7 @@ def test_win_yes_over05_no_is_impossible() -> None:
     legs = (leg(ML_MEX, ML_EV, "yes"), leg(TOT_OVER05, TOT_EV, "no"))
     rel = classify_legs(legs, ExplodingProvider())
     assert rel.kind is RelationshipKind.IMPOSSIBLE
+    assert rel.farmable is True  # airtight scoring tautology
 
 
 def test_win_yes_over05_yes_is_containment_subset_is_moneyline() -> None:
@@ -431,6 +441,7 @@ def test_1h_over_yes_ft_over_no_same_line_is_impossible() -> None:
     legs = (leg(FH_TOT2, FH_TOT_EV, "yes"), leg(FT_TOT2, FT_TOT2_EV, "no"))
     rel = classify_legs(legs, ExplodingProvider())
     assert rel.kind is RelationshipKind.IMPOSSIBLE
+    assert rel.farmable is True  # airtight scoring tautology
 
 
 def test_1h_over_yes_ft_over_yes_same_line_is_containment_subset_is_1h() -> None:

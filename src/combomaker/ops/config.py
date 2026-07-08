@@ -427,6 +427,19 @@ class QuoteConfig(StrictModel):
     # tighten to win it (1.0 = off; validate via markouts before lowering).
     favorite_leg_threshold: float = 0.65
     favorite_width_multiplier: float = 1.0
+    # --- Impossible-combo farming (see pricing/quote.construct_farm_quote) ---
+    # A logically-impossible combo (relationship.farmable) can only settle NO,
+    # so the maker who shorts YES / is long the certain-NO side collects the
+    # premium risk-free. We quote such combos instead of declining them.
+    farm_impossible_combos: bool = True
+    # Multiplier on the naive-independence YES value (the operator's chosen
+    # anchor). 1.0 = quote the impossible YES at exactly its independence price.
+    farm_markup: float = 1.0
+    # Conservative per-combo size cap (whole contracts). Farming a TRUE
+    # impossibility is riskless, but the only loss path is a misclassification,
+    # so we cap size well below max_contracts_per_quote (100) as defense in
+    # depth until live settlements confirm the classifier on farmed combos.
+    farm_max_contracts: int = 50
 
 
 class ExternalOddsConfig(StrictModel):

@@ -47,6 +47,11 @@ class OpenPosition:
     contracts: CentiContracts
     entry_price_cc: CentiCents   # what we paid per contract
     legs: tuple[LegRef, ...]
+    # True iff this position came from FARMING a logically-impossible combo
+    # (we are long the certain-NO side). Such a combo must settle NO; if it
+    # ever settles YES, that is a classification/settlement failure the
+    # settlement guard turns into HALT_RECONCILIATION_MISMATCH.
+    farmed: bool = False
 
     @property
     def max_loss_cc(self) -> int:

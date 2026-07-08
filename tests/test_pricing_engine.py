@@ -1,12 +1,19 @@
 from combomaker.core.conventions import DOC_ASSUMED
+from combomaker.core.money import cc_from_prob
 from combomaker.core.quantity import CentiContracts
 from combomaker.core.reasons import ReasonCode
 from combomaker.marketdata.metadata import EventMeta
-from combomaker.ops.config import PricingConfig
+from combomaker.ops.config import PricingConfig, QuoteConfig
 from combomaker.pricing.engine import PricingEngine
+from combomaker.pricing.legs import KalshiBookSource
 from combomaker.pricing.quote import ConstructedQuote, NoQuote
 from combomaker.rfq.models import Rfq
 from tests.test_filters import Harness
+
+SAME_MARKET_BOTH_SIDES = [
+    {"market_ticker": "M1", "side": "yes", "event_ticker": "E1"},
+    {"market_ticker": "M1", "side": "no", "event_ticker": "E1"},
+]
 
 
 def combo(legs: list[dict[str, str]], **overrides: object) -> Rfq:
@@ -133,6 +140,74 @@ async def test_no_sizing_mode_is_unknown() -> None:
     result = engine.price(rfq, time_to_close_s=100_000)
     assert isinstance(result, NoQuote)
     assert result.reason == ReasonCode.SKIP_CLASSIFIER_UNKNOWN
+
+
+async def test_farmable_impossible_is_farmed_not_declined() -> None:
+    """A LOGICALLY-CERTAIN impossibility (same market both sides) is FARMED:
+    we short the certain-NO side at the naive-independence YES value and never
+    touch the worthless YES."""
+    engine, h = await engine_harness()
+    result = engine.price(combo(SAME_MARKET_BOTH_SIDES), time_to_close_s=100_000)
+    assert isinstance(result, ConstructedQuote), result
+    assert result.farmed is True
+    assert result.yes_bid_cc == 0          # never long the worthless YES
+    assert result.fair_cc == 0             # true fair of an impossible combo
+    # M1 marginal 0.4789 ⇒ naive 0.4789*0.5211 = 0.2496 ⇒ ask 2495cc ⇒ bid NO
+    # at $1 - 0.2495 = 0.7505, snapped down to the cent grid.
+    assert result.no_bid_cc == 7_500
+    assert result.width_components_cc == {"farm_sell_price": 2_500}
+
+
+async def test_farm_ask_is_below_every_selected_leg_marginal() -> None:
+    """Arb-free: the naive YES value we sell at is strictly below each selected
+    leg's marginal (an impossible combo's YES is dominated by every leg)."""
+    engine, h = await engine_harness()
+    result = engine.price(combo(SAME_MARKET_BOTH_SIDES), time_to_close_s=100_000)
+    assert isinstance(result, ConstructedQuote)
+    p = KalshiBookSource(h.feed).marginal("M1")
+    assert p is not None
+    farm_ask = 10_000 - int(result.no_bid_cc)  # implied YES sell price = 1 - no_bid
+    # selected marginals: M1 yes = p, M1 no = 1 - p, both in cc
+    assert farm_ask < int(cc_from_prob(p.p))          # below the yes-leg marginal
+    assert farm_ask < int(cc_from_prob(1.0 - p.p))    # below the no-leg marginal
+
+
+async def test_farm_flag_off_declines_as_before() -> None:
+    engine, h = await engine_harness()
+    engine_off = PricingEngine(
+        h.feed,
+        h.metadata,
+        DOC_ASSUMED,
+        PricingConfig(quote=QuoteConfig(farm_impossible_combos=False)),
+    )
+    result = engine_off.price(combo(SAME_MARKET_BOTH_SIDES), time_to_close_s=100_000)
+    assert isinstance(result, NoQuote)
+    assert result.reason == ReasonCode.SKIP_LOGICALLY_IMPOSSIBLE
+
+
+async def test_non_farmable_impossible_still_declines_with_flag_on() -> None:
+    """Mutual-exclusion IMPOSSIBLE is metadata-dependent (NOT farmable): it must
+    keep declining even with farming enabled."""
+    engine, h = await engine_harness()
+    rfq = combo(
+        [
+            {"market_ticker": "M1", "side": "yes", "event_ticker": "E1"},
+            {"market_ticker": "M2", "side": "yes", "event_ticker": "E1"},
+        ]
+    )
+    result = engine.price(rfq, time_to_close_s=100_000)
+    assert isinstance(result, NoQuote)
+    assert result.reason == ReasonCode.SKIP_LOGICALLY_IMPOSSIBLE
+
+
+async def test_farm_without_beliefs_falls_back_to_no_quote() -> None:
+    """Never farm blind: a missing/invalid leg book ⇒ the ordinary
+    SKIP_LOGICALLY_IMPOSSIBLE no-quote, never a farm at an unknown price."""
+    engine, h = await engine_harness()
+    h.feed.book("M1").invalidate("test")
+    result = engine.price(combo(SAME_MARKET_BOTH_SIDES), time_to_close_s=100_000)
+    assert isinstance(result, NoQuote)
+    assert result.reason == ReasonCode.SKIP_LOGICALLY_IMPOSSIBLE
 
 
 async def test_btts_containment_prices_at_subset_marginal_not_independence() -> None:

@@ -60,6 +60,9 @@ class ConstructedQuote:
     no_bid_cc: CentiCents
     fair_cc: CentiCents
     width_components_cc: dict[str, int]
+    # True only for a FARMED impossible combo (construct_farm_quote): fair is 0,
+    # yes_bid is 0, and the position must be watched by the settlement guard.
+    farmed: bool = False
 
     @property
     def total_width_cc(self) -> int:
@@ -205,4 +208,73 @@ def construct_quote(
         no_bid_cc=no_bid,
         fair_cc=fair_cc,
         width_components_cc=width,
+    )
+
+
+def construct_farm_quote(
+    *,
+    farm_ask_cc: CentiCents,
+    n_legs: int,
+    qty: CentiContracts,
+    grid: PriceGrid,
+    no_cap_cc: CentiCents | None,
+    params: QuoteParams | None = None,
+    size_cap: CentiContracts,
+) -> ConstructedQuote | NoQuote:
+    """One-sided quote that FARMS a logically-impossible combo.
+
+    The combo's YES can never settle (a logical tautology), so its true fair is
+    $0 and the ONLY safe structure is: never buy the worthless YES, only ever
+    end up long the certain-NO side. Hard invariants (property-tested):
+
+    - ``yes_bid_cc = 0`` for EVERY input — we can never go long the YES.
+    - ``no_bid = grid.snap_bid_down($1 − farm_ask)`` (maker-favorable: rounding
+      the NO bid DOWN means we pay LESS for the certain winner), bounded by the
+      free-money ``no_cap`` exactly as ``construct_quote`` does.
+    - ``fair_cc = 0`` (the true fair of an impossible combo).
+
+    ``farm_ask_cc`` is the naive-independence value of the selected YES side
+    (computed by the caller, strictly below every selected leg's marginal). If
+    the ask is non-positive, the NO bid rounds away, the implied sell price
+    rounds to 0, or ``size_cap`` is 0, we return a ``NoQuote`` — there is
+    nothing to farm, never a degenerate quote.
+    """
+    p = params or QuoteParams()
+    if int(size_cap) <= 0:
+        return NoQuote(ReasonCode.SKIP_LOGICALLY_IMPOSSIBLE, "farm size caps to 0 contracts")
+    if int(farm_ask_cc) <= 0:
+        # A worthless YES priced at 0 leaves nothing to sell; and we must NEVER
+        # bid the YES ourselves, so there is no quote to make.
+        return NoQuote(
+            ReasonCode.SKIP_LOGICALLY_IMPOSSIBLE, "farm ask rounds to 0 — nothing to sell"
+        )
+    if no_cap_cc is None:
+        return NoQuote(
+            ReasonCode.SKIP_NO_FREE_MONEY_CHECK,
+            "executable leg prices unavailable — cannot prove the farm no-bid is arb-free",
+        )
+
+    # We offer YES at farm_ask ⇔ we BID NO at $1 − farm_ask, snapped DOWN.
+    no_raw = CC_PER_DOLLAR - int(farm_ask_cc)
+    if no_raw > int(no_cap_cc) - p.free_money_margin_cc:
+        no_raw = int(no_cap_cc) - p.free_money_margin_cc
+    if no_raw <= 0:
+        return NoQuote(ReasonCode.SKIP_LOGICALLY_IMPOSSIBLE, "farm no-bid non-positive after cap")
+    snapped = grid.snap_bid_down(CentiCents(min(no_raw, CC_PER_DOLLAR)))
+    no_bid = CentiCents(0) if snapped is None else snapped
+    if int(no_bid) <= 0:
+        return NoQuote(ReasonCode.SKIP_LOGICALLY_IMPOSSIBLE, "farm no-bid rounds away")
+    sell_price_cc = CC_PER_DOLLAR - int(no_bid)  # what the taker pays for YES
+    if sell_price_cc <= 0:
+        return NoQuote(ReasonCode.SKIP_LOGICALLY_IMPOSSIBLE, "farm sell price rounds to 0")
+    # width_components_cc holds ONLY cc values (total_width_cc sums them): the
+    # premium we collect per farmed YES contract. Leg count / size cap are
+    # audited by the engine's decision record, not smuggled into a money dict.
+    _ = (n_legs, qty)  # part of the interface; not needed for the farm price
+    return ConstructedQuote(
+        yes_bid_cc=CentiCents(0),  # HARD INVARIANT: never long the worthless YES
+        no_bid_cc=no_bid,
+        fair_cc=CentiCents(0),     # true fair of an impossible combo
+        width_components_cc={"farm_sell_price": sell_price_cc},
+        farmed=True,
     )

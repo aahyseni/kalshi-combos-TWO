@@ -20,12 +20,13 @@ from decimal import Decimal
 from fractions import Fraction
 
 from combomaker.core.conventions import Conventions
-from combomaker.core.money import CC_PER_DOLLAR
-from combomaker.core.quantity import CentiContracts
+from combomaker.core.money import CC_PER_DOLLAR, cc_from_prob
+from combomaker.core.quantity import CentiContracts, qty_from_contracts
 from combomaker.core.reasons import ReasonCode
 from combomaker.marketdata.feed import OrderbookFeed
 from combomaker.marketdata.metadata import MetadataCache
 from combomaker.ops.config import PricingConfig
+from combomaker.ops.logging import get_logger
 from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
 from combomaker.pricing.joint import JointEstimate, price_containment, price_joint_matrices
 from combomaker.pricing.legs import KalshiBookSource, LegBelief, OddsSource, blend_beliefs
@@ -33,13 +34,16 @@ from combomaker.pricing.quote import (
     ConstructedQuote,
     NoQuote,
     QuoteParams,
+    construct_farm_quote,
     construct_quote,
     free_money_caps,
 )
-from combomaker.pricing.relationships import RelationshipKind, classify_legs
+from combomaker.pricing.relationships import Relationship, RelationshipKind, classify_legs
 from combomaker.pricing.sgp import SgpParams, build_sgp_correlation
 from combomaker.pricing.structural import StructuralPricer, structural_applicable
 from combomaker.rfq.models import Rfq
+
+log = get_logger(__name__)
 
 
 class PricingEngine:
@@ -93,6 +97,12 @@ class PricingEngine:
                 "longshot_min_rel_uncertainty",
                 "favorite_leg_threshold",
                 "favorite_width_multiplier",
+                # Farming knobs live on QuoteConfig (read via self._archetype),
+                # not on QuoteParams — exclude or QuoteParams(**quote_fields)
+                # rejects them.
+                "farm_impossible_combos",
+                "farm_markup",
+                "farm_max_contracts",
             )
         }
         self._quote_params = QuoteParams(**quote_fields)
@@ -120,32 +130,21 @@ class PricingEngine:
 
         relationship = classify_legs(rfq.legs, self._metadata)
         if relationship.kind is RelationshipKind.IMPOSSIBLE:
+            # A LOGICALLY-CERTAIN impossibility (relationship.farmable) can only
+            # settle NO, so we FARM it — quote the certain-NO side — instead of
+            # declining. Metadata-dependent impossibilities (mutual exclusion)
+            # are NOT farmable and always fall through to the no-quote.
+            if relationship.farmable and self._archetype.farm_impossible_combos:
+                farmed = self._farm_impossible(rfq, relationship)
+                if farmed is not None:
+                    return farmed
             return NoQuote(ReasonCode.SKIP_LOGICALLY_IMPOSSIBLE, "; ".join(relationship.notes))
         if relationship.kind is RelationshipKind.UNKNOWN:
             return NoQuote(ReasonCode.SKIP_CLASSIFIER_UNKNOWN, "; ".join(relationship.notes))
 
-        beliefs: list[LegBelief] = []
-        for leg in rfq.legs:
-            book_belief = self._book_source.marginal(leg.market_ticker)
-            if book_belief is None:
-                return NoQuote(
-                    ReasonCode.SKIP_PRICING_FAILED, f"no belief for leg {leg.market_ticker}"
-                )
-            weighted: list[tuple[LegBelief, float]] = [(book_belief, 1.0)]
-            for source, weight in self._extra_sources:
-                extra = source.marginal(leg.market_ticker)
-                if extra is not None:
-                    weighted.append((extra, weight))
-            blended = blend_beliefs(
-                weighted, max_disagreement=self._config.max_source_disagreement
-            )
-            if blended is None:
-                return NoQuote(
-                    ReasonCode.SKIP_SOURCES_DISAGREE,
-                    f"sources disagree on {leg.market_ticker}: "
-                    + ", ".join(f"{b.source}={b.p:.3f}" for b, _ in weighted),
-                )
-            beliefs.append(blended)
+        beliefs = self._fetch_beliefs(rfq)
+        if isinstance(beliefs, NoQuote):
+            return beliefs
         sides = [leg.side for leg in rfq.legs]
 
         joint: JointEstimate | None = None
@@ -207,6 +206,91 @@ class PricingEngine:
             width_multiplier=self._width_multiplier(beliefs, sides),
             params=self._quote_params,
         )
+
+    def _fetch_beliefs(self, rfq: Rfq) -> list[LegBelief] | NoQuote:
+        """Per-leg blended marginal beliefs (Kalshi book + configured external
+        sources). Fail-closed: a missing book belief or sources disagreeing
+        beyond threshold returns a NoQuote — never a hole in the price."""
+        beliefs: list[LegBelief] = []
+        for leg in rfq.legs:
+            book_belief = self._book_source.marginal(leg.market_ticker)
+            if book_belief is None:
+                return NoQuote(
+                    ReasonCode.SKIP_PRICING_FAILED, f"no belief for leg {leg.market_ticker}"
+                )
+            weighted: list[tuple[LegBelief, float]] = [(book_belief, 1.0)]
+            for source, weight in self._extra_sources:
+                extra = source.marginal(leg.market_ticker)
+                if extra is not None:
+                    weighted.append((extra, weight))
+            blended = blend_beliefs(
+                weighted, max_disagreement=self._config.max_source_disagreement
+            )
+            if blended is None:
+                return NoQuote(
+                    ReasonCode.SKIP_SOURCES_DISAGREE,
+                    f"sources disagree on {leg.market_ticker}: "
+                    + ", ".join(f"{b.source}={b.p:.3f}" for b, _ in weighted),
+                )
+            beliefs.append(blended)
+        return beliefs
+
+    def _farm_impossible(self, rfq: Rfq, relationship: Relationship) -> ConstructedQuote | None:
+        """Quote a farmable-impossible combo by shorting the certain-NO side at
+        the naive-INDEPENDENCE YES value × ``farm_markup``.
+
+        Fail-closed: returns None (⇒ the caller keeps the ordinary
+        SKIP_LOGICALLY_IMPOSSIBLE no-quote) whenever we cannot farm SAFELY —
+        missing/absent leg beliefs or sources disagreeing (never farm blind),
+        no combo grid, no free-money cap, unresolvable size, or a degenerate
+        price. The farm quote's yes_bid is 0 by construction: we can only ever
+        end up long the certain-NO side, never the worthless YES."""
+        beliefs = self._fetch_beliefs(rfq)
+        if isinstance(beliefs, NoQuote):
+            return None  # no prices ⇒ never farm; fall back to the no-quote
+        sides = [leg.side for leg in rfq.legs]
+        # Naive independence of the SELECTED sides — the operator's chosen
+        # anchor. An impossible combo's YES is dominated by each leg, so this
+        # product is strictly below every selected-leg marginal (arb-free).
+        farm_prob = self._archetype.farm_markup
+        for belief, side in zip(beliefs, sides, strict=True):
+            farm_prob *= belief.p if side == "yes" else 1.0 - belief.p
+        farm_prob = min(max(farm_prob, 0.0), 1.0)
+        # Round the worthless YES value DOWN: never overstate it, keep it strictly
+        # below the leg marginals, and let a sub-tick value collapse to 0 (⇒
+        # construct_farm_quote returns "nothing to farm").
+        farm_ask_cc = cc_from_prob(farm_prob, rounding="down")
+
+        combo_meta = self._metadata.peek(rfq.market_ticker)
+        if combo_meta is None or combo_meta.grid is None:
+            return None
+        qty = self._resolve_qty(rfq, fair_prob=farm_prob)
+        if qty is None:
+            return None
+        leg_books = [self._feed.book(leg.market_ticker) for leg in rfq.legs]
+        _yes_cap, no_cap = free_money_caps(leg_books, sides)
+        farm_cap = qty_from_contracts(self._archetype.farm_max_contracts)
+        size_cap = CentiContracts(min(int(qty), int(farm_cap)))
+        result = construct_farm_quote(
+            farm_ask_cc=farm_ask_cc,
+            n_legs=len(rfq.legs),
+            qty=qty,
+            grid=combo_meta.grid,
+            no_cap_cc=no_cap,
+            params=self._quote_params,
+            size_cap=size_cap,
+        )
+        if isinstance(result, NoQuote):
+            return None  # degenerate farm ⇒ ordinary no-quote
+        log.info(
+            "farm_impossible_combo",
+            combo_ticker=rfq.market_ticker,
+            farm_ask_cc=int(farm_ask_cc),
+            no_bid_cc=int(result.no_bid_cc),
+            size_cap_centi=int(size_cap),
+            notes="; ".join(relationship.notes),
+        )
+        return result
 
     def _apply_longshot_floor(self, joint: JointEstimate) -> JointEstimate:
         """Below the longshot threshold, absolute uncertainty must not shrink

@@ -242,6 +242,19 @@ class QuoteLifecycle:
             if accepted_side is Side.YES
             else state.constructed.no_bid_cc
         )
+        if int(bid) <= 0:
+            # The accepted side was DECLINED (0 bid): a normal single-sided
+            # quote, or the YES side of a farmed impossible combo. We never
+            # priced this side, so we never confirm a fill on it — for a farm
+            # this is the hard guard that we can NEVER end up long the worthless
+            # YES. Deliberate lapse.
+            await self._record_confirm_decision(
+                state, confirm=False, reason=ReasonCode.DECLINE_SIDE_NOT_QUOTED,
+                detail=f"accept on declined side {accepted_side} (bid=0)", decision_ms=0.0,
+            )
+            self._metrics.inc(f"confirm.declined.{ReasonCode.DECLINE_SIDE_NOT_QUOTED}")
+            self._drop_quote(quote_id)
+            return
         qty = self._accepted_qty(state, msg)
         if qty is None:
             # Unknown accepted size (defense #2): never confirm a fill we
@@ -327,6 +340,7 @@ class QuoteLifecycle:
                 contracts=qty,
                 entry_price_cc=bid,
                 legs=self._leg_refs(state.rfq),
+                farmed=state.constructed.farmed,
             )
         )
 
@@ -379,6 +393,38 @@ class QuoteLifecycle:
     def record_realized_pnl(self, delta_cc: int) -> None:
         """Settlement/fee reconciliation feeds realized P&L here (Phase 6)."""
         self._realized_pnl_cc += delta_cc
+
+    async def reconcile_combo_settlement(self, combo_ticker: str, *, settled_yes: bool) -> None:
+        """Settlement guard for FARMED impossible combos (defense #3).
+
+        A combo we farmed is short-YES / long the certain-NO side: it can ONLY
+        settle NO. If it EVER settles YES, our impossibility classification (or
+        the settlement window we assumed) was wrong on a position — the exact
+        misclassification loss path farming is gated against. That is not a
+        loggable event: it HALTS with HALT_RECONCILIATION_MISMATCH, exactly like
+        any other predicted-vs-ledger mismatch.
+
+        TODO(farm-reconcile): this is the settlement seam, but the full
+        combo-settlement path is not built yet (Phase 6; conventions
+        .combo_no_pays_complement is still None / UNVERIFIED). When it lands,
+        (a) CALL this from the real settlement-message handler for every farmed
+        combo, and (b) extend the reconciliation to the cent — expected NO
+        payout ($1×contracts − cost) vs the exchange ledger — not just the
+        settle-YES tripwire below. See NOTES.md "Impossible-combo farming".
+        """
+        farmed = [
+            pos
+            for pos in self._exposure.positions.values()
+            if pos.farmed and pos.combo_ticker == combo_ticker
+        ]
+        if not farmed:
+            return
+        if settled_yes:
+            await self._killswitch.halt(
+                ReasonCode.HALT_RECONCILIATION_MISMATCH,
+                f"farmed impossible combo {combo_ticker} settled YES on "
+                f"{len(farmed)} position(s) — classification/settlement-window failure",
+            )
 
     def _refresh_daily_pnl(self) -> None:
         """Mark open positions at current leg mids so the daily-loss limit

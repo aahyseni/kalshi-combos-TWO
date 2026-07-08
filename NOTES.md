@@ -44,6 +44,35 @@ Full RFQ round trips on demo (`KXMLBGAME-26JUL081840NYYTB-NYY`, two accounts,
 decline in quote mode); HVM 3s/1s timing; combo grid structure on KXMVE
 markets; `yes_bid + no_bid > $1` rejection.
 
+## Impossible-combo farming (SHIPPED 2026-07-07)
+
+We now QUOTE (farm) logically-impossible combos instead of declining them. A
+combo whose legs are logically contradictory can only settle NO (empirically:
+Kalshi combos settle result yes/no $1/$0, they are NOT voided), so the maker who
+is short-YES / long the certain-NO side collects the premium risk-free. The ONLY
+loss path is misclassifying a POSSIBLE combo as impossible, so farming is gated
+to LOGICALLY-CERTAIN impossibilities only.
+
+| Piece | Where | Notes |
+|---|---|---|
+| `farmable` flag | `pricing/relationships.py` (`Relationship.farmable`) | True on the 5 tautological IMPOSSIBLE returns: same-market-both-sides, same-team-corners higher-yes×lower-no, and the 3 scoring families (1H-BTTS⟹FT-BTTS, ml-win⟹over-0.5, 1H-over-N⟹FT-over-N). **False on mutual-exclusion** (metadata-dependent, not a tautology) |
+| Config | `ops/config.py` `QuoteConfig` | `farm_impossible_combos=True`, `farm_markup=1.0` (× naive-independence anchor), `farm_max_contracts=50` (conservative cap, ½ of `max_contracts_per_quote`) |
+| Farm quote | `pricing/quote.py` `construct_farm_quote` | `yes_bid=0` ALWAYS (never long the worthless YES — property-tested), `no_bid = snap_bid_down($1 − farm_ask)` under the free-money `no_cap`, `fair=0`; degenerate ⇒ NoQuote |
+| Engine wiring | `pricing/engine.py` `_farm_impossible` | farm price = ∏(p or 1−p over selected sides) × markup; fail-closed to the SKIP_LOGICALLY_IMPOSSIBLE no-quote if beliefs/grid/cap/size missing |
+| Confirm guard | `rfq/lifecycle.py` `on_quote_accepted` | an accept on a 0-bid (declined) side ⇒ `DECLINE_SIDE_NOT_QUOTED`, never confirm — hard guard we can never be filled long the YES |
+
+**TODO(farm-reconcile) — OPEN, greppable in `rfq/lifecycle.py`.** A farmed
+position must be watched: if a combo we farmed ever settles YES, that is a
+classification/settlement-window failure and HALTS
+(`HALT_RECONCILIATION_MISMATCH`), not just logs. The guard logic lives in
+`QuoteLifecycle.reconcile_combo_settlement(...)` and is unit-tested, BUT the
+real combo-settlement message path is not built yet (Phase 6;
+`combo_no_pays_complement` is still null). When that lands: (1) CALL
+`reconcile_combo_settlement` from the settlement handler for every farmed combo,
+and (2) extend it from the settle-YES tripwire to a to-the-cent reconciliation
+(expected NO payout $1×contracts − cost vs the exchange ledger). Do NOT enable
+farming in a live quote run until this is wired.
+
 ## Phase 5 — demo quote mode end-to-end: EXECUTED 2026-07-05
 
 Live session (quote mode, both accounts): **30 real quotes** sent to live demo

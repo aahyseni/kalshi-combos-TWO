@@ -68,6 +68,10 @@ class ReasonCode(StrEnum):
     # confirming a fill of unknown size/payout is never an option.
     DECLINE_SIZE_UNKNOWN = "decline_size_unknown"
     DECLINE_CONVENTION_UNKNOWN = "decline_convention_unknown"
+    # An accept landed on a side we did NOT quote (bid = 0 = declined). For a
+    # farmed impossible combo this is the hard guard that we can never be filled
+    # long the worthless YES side. Deliberate lapse, never confirm.
+    DECLINE_SIDE_NOT_QUOTED = "decline_side_not_quoted"
 
     # --- Kill switches / halts ---
     HALT_DAILY_LOSS = "halt_daily_loss"

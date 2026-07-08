@@ -10,6 +10,7 @@ import pytest
 
 from combomaker.core.conventions import Conventions, Side
 from combomaker.core.money import CentiCents
+from combomaker.core.quantity import CentiContracts
 from combomaker.core.reasons import ReasonCode
 from combomaker.ops.config import FiltersConfig, PricingConfig
 from combomaker.ops.metrics import Metrics
@@ -18,12 +19,17 @@ from combomaker.pricing.engine import PricingEngine
 from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.lifecycle import LifecycleConfig, QuoteLifecycle
 from combomaker.rfq.models import Rfq
-from combomaker.risk.exposure import ExposureBook
+from combomaker.risk.exposure import ExposureBook, LegRef, OpenPosition
 from combomaker.risk.inplay import InPlayDetector
 from combomaker.risk.lastlook import LastLookPolicy
 from combomaker.risk.limits import LimitChecker, RiskLimits
 from tests.test_filters import Harness
-from tests.test_pricing_engine import CROSS_EVENT_LEGS, combo, seed_event
+from tests.test_pricing_engine import (
+    CROSS_EVENT_LEGS,
+    SAME_MARKET_BOTH_SIDES,
+    combo,
+    seed_event,
+)
 
 JsonDict = dict[str, Any]
 
@@ -275,3 +281,64 @@ async def test_confirm_failure_is_counted_not_raised(rig: Rig) -> None:
     rig.sender.fail_confirm = True
     await rig.lifecycle.on_quote_accepted(accepted_msg("q1"))
     assert rig.metrics.counter("confirm.failed") == 1
+
+
+# --- Impossible-combo farming: hot-path behavior + settlement guard --------------
+
+
+def farmed_position(combo_ticker: str = "KXMVE-C1", *, farmed: bool = True) -> OpenPosition:
+    return OpenPosition(
+        position_id=f"fill:{combo_ticker}",
+        combo_ticker=combo_ticker,
+        collection="KXMVESPORTS",
+        our_side=Side.NO,
+        contracts=CentiContracts(500),
+        entry_price_cc=CentiCents(9_000),
+        legs=(LegRef("M1", "E1", "yes"), LegRef("M1", "E1", "no")),
+        farmed=farmed,
+    )
+
+
+async def test_farm_yes_side_accept_never_confirms(rig: Rig) -> None:
+    """End-to-end #1 invariant: a farmed combo quotes YES at 0, and even if an
+    accept lands on that declined side we NEVER confirm — we can never end up
+    long the worthless YES."""
+    await rig.lifecycle.handle_rfq(combo(SAME_MARKET_BOTH_SIDES))
+    assert len(rig.sender.created) == 1
+    assert rig.sender.created[0]["yes"] == 0     # farm: YES side declined
+    assert rig.sender.created[0]["no"] > 0
+    await rig.lifecycle.on_quote_accepted(accepted_msg("q1", "yes"))
+    assert rig.sender.confirmed == []            # never confirmed the worthless YES
+    assert len(rig.exposure.positions) == 0
+    assert rig.metrics.counter(
+        f"confirm.declined.{ReasonCode.DECLINE_SIDE_NOT_QUOTED}"
+    ) == 1
+
+
+async def test_farm_no_side_accept_books_farmed_position(rig: Rig) -> None:
+    await rig.lifecycle.handle_rfq(combo(SAME_MARKET_BOTH_SIDES))
+    await rig.lifecycle.on_quote_accepted(accepted_msg("q1", "no"))
+    await rig.lifecycle.on_quote_executed({"quote_id": "q1"})
+    position = next(iter(rig.exposure.positions.values()))
+    assert position.farmed is True               # farmed flag threaded to the book
+    assert position.our_side is Side.NO          # long the certain-NO side
+
+
+async def test_farmed_combo_settling_yes_halts_reconciliation(rig: Rig) -> None:
+    rig.exposure.add_position(farmed_position())
+    await rig.lifecycle.reconcile_combo_settlement("KXMVE-C1", settled_yes=True)
+    assert rig.killswitch.halted
+    assert rig.killswitch.halt_event is not None
+    assert rig.killswitch.halt_event.reason is ReasonCode.HALT_RECONCILIATION_MISMATCH
+
+
+async def test_farmed_combo_settling_no_does_not_halt(rig: Rig) -> None:
+    rig.exposure.add_position(farmed_position())
+    await rig.lifecycle.reconcile_combo_settlement("KXMVE-C1", settled_yes=False)
+    assert not rig.killswitch.halted
+
+
+async def test_non_farmed_combo_settling_yes_does_not_halt(rig: Rig) -> None:
+    rig.exposure.add_position(farmed_position(farmed=False))
+    await rig.lifecycle.reconcile_combo_settlement("KXMVE-C1", settled_yes=True)
+    assert not rig.killswitch.halted

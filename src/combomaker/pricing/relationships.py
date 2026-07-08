@@ -61,6 +61,13 @@ class Relationship:
     # subset leg logically IMPLIES a YES on the superset leg, so the combo joint
     # is exactly P(subset). None for every other kind.
     containment: tuple[int, int] | None = None
+    # IMPOSSIBLE only: True iff the impossibility is a LOGICAL TAUTOLOGY (an
+    # airtight scoring/containment/same-market contradiction) whose YES can
+    # never settle — safe for the maker to FARM (short the certain-NO side). It
+    # is NEVER set on the mutual-exclusion IMPOSSIBLE branch, which depends on
+    # exchange METADATA (event_mutually_exclusive) and so is not logically
+    # certain. False everywhere except the tautological IMPOSSIBLE returns.
+    farmable: bool = False
 
 
 # Team-corners ticker suffix = team code + the over-line digits (…-COL5 -> COL, 5).
@@ -185,7 +192,11 @@ def classify_legs(
             sides = {legs[i].side for i in indices}
             if len(sides) > 1:
                 notes.append(f"same market both sides: {market}")
-                return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
+                # Airtight tautology: YES-and-NO of one market can never both
+                # settle YES ⇒ farmable.
+                return Relationship(
+                    RelationshipKind.IMPOSSIBLE, (), tuple(notes), farmable=True
+                )
             notes.append(f"duplicate leg: {market}")
             return Relationship(RelationshipKind.UNKNOWN, (), tuple(notes))
 
@@ -211,6 +222,9 @@ def classify_legs(
         yes_count = sum(1 for i in indices if legs[i].side == "yes")
         if exclusive and yes_count >= 2:
             notes.append(f"{yes_count} YES legs of mutually exclusive event {event_ticker}")
+            # NOT farmable: this rests on the exchange's mutual-exclusivity
+            # METADATA, not a logical tautology — a wrong flag would misclassify
+            # a POSSIBLE combo as impossible, the one loss path farming has.
             return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
 
     # LOGICAL CONTAINMENT families (A⟹B) — exact soccer-scoring facts the copula
@@ -245,7 +259,11 @@ def classify_legs(
                 f"same-team corners over-{a_line} yes ({legs[a_i].market_ticker}) "
                 f"implies over-{b_line} yes: {legs[b_i].market_ticker} no is impossible"
             )
-            return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
+            # Airtight nested-line containment (over-M ⊆ over-N, 0 tape
+            # violations) ⇒ farmable.
+            return Relationship(
+                RelationshipKind.IMPOSSIBLE, (), tuple(notes), farmable=True
+            )
 
     # Three period/line implications A⟹B are EXACT scoring facts (not
     # correlations). A Kalshi taker-API probe proved these three — and only these
@@ -274,7 +292,10 @@ def classify_legs(
                     f"1H-BTTS yes ({legs[a_i].market_ticker}) implies FT-BTTS yes: "
                     f"{legs[b_i].market_ticker} no is impossible"
                 )
-                return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
+                # Airtight scoring tautology ⇒ farmable.
+                return Relationship(
+                    RelationshipKind.IMPOSSIBLE, (), tuple(notes), farmable=True
+                )
             if isinstance(verdict, tuple):
                 containment = verdict
 
@@ -300,7 +321,11 @@ def classify_legs(
                     f"moneyline win yes ({legs[ml_i].market_ticker}) needs a goal: "
                     f"over-0.5 {legs[tot_i].market_ticker} no is impossible"
                 )
-                return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
+                # Airtight scoring tautology (a regulation win needs a goal)
+                # ⇒ farmable.
+                return Relationship(
+                    RelationshipKind.IMPOSSIBLE, (), tuple(notes), farmable=True
+                )
             if isinstance(verdict, tuple):
                 containment = verdict
 
@@ -326,7 +351,10 @@ def classify_legs(
                     f"1H-over-{fh_line} yes ({legs[fh_i].market_ticker}) implies "
                     f"FT-over-{ft_line} yes: {legs[ft_i].market_ticker} no is impossible"
                 )
-                return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
+                # Airtight scoring tautology (FT goals ≥ 1H goals) ⇒ farmable.
+                return Relationship(
+                    RelationshipKind.IMPOSSIBLE, (), tuple(notes), farmable=True
+                )
             if isinstance(verdict, tuple):
                 containment = verdict
 

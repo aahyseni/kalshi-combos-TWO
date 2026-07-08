@@ -24,6 +24,7 @@ from combomaker.pricing.quote import (
     ConstructedQuote,
     NoQuote,
     QuoteParams,
+    construct_farm_quote,
     construct_quote,
     free_money_caps,
 )
@@ -362,3 +363,107 @@ class TestCaptureInvariant:
         for bid in (q.yes_bid_cc, q.no_bid_cc):
             assert 0 <= bid <= CC_PER_DOLLAR
             assert bid == 0 or grid.is_on_grid(bid)
+
+
+class TestFarmQuote:
+    """construct_farm_quote invariants — the ONLY structure that makes farming
+    a logically-impossible combo safe. The single most important property: we
+    can NEVER end up long the worthless YES side (yes_bid is always 0)."""
+
+    def farm(self, **overrides: Any) -> ConstructedQuote | NoQuote:
+        kwargs: dict[str, Any] = {
+            "farm_ask_cc": CC(950),          # naive YES value ≈ 0.095
+            "n_legs": 2,
+            "qty": Q(10_000),                # 100 contracts
+            "grid": deci_grid(),             # 0.001 step so 0.905 is on-grid
+            "no_cap_cc": CC(CC_PER_DOLLAR),  # no binding complement bound
+            "size_cap": Q(5_000),            # 50 contracts
+        }
+        kwargs.update(overrides)
+        return construct_farm_quote(**kwargs)
+
+    def test_worked_example_screenshot_combo(self) -> None:
+        # {1H-BTTS yes ~0.19, FT-BTTS no ~0.50}: naive value 0.19*0.50 = 0.095,
+        # so we offer YES at 0.095 <=> bid NO at 0.905, and never touch YES.
+        q = self.farm()
+        assert isinstance(q, ConstructedQuote)
+        assert q.yes_bid_cc == 0             # never long the worthless YES
+        assert q.no_bid_cc == 9_050          # $1 - 0.095, on the 0.001 grid
+        assert q.fair_cc == 0                # true fair of an impossible combo
+        assert q.farmed is True
+        assert q.width_components_cc == {"farm_sell_price": 950}
+
+    @settings(derandomize=True, max_examples=300, deadline=None)
+    @given(
+        farm_ask_cc=st.integers(min_value=-500, max_value=CC_PER_DOLLAR),
+        no_cap=st.integers(min_value=0, max_value=CC_PER_DOLLAR),
+        size_cap=st.integers(min_value=-100, max_value=10_000),
+        n_legs=st.integers(min_value=2, max_value=6),
+        start_cents=st.integers(min_value=1, max_value=10),
+        end_cents=st.integers(min_value=90, max_value=99),
+    )
+    def test_yes_bid_is_always_zero_and_maker_favorable(
+        self,
+        farm_ask_cc: int,
+        no_cap: int,
+        size_cap: int,
+        n_legs: int,
+        start_cents: int,
+        end_cents: int,
+    ) -> None:
+        grid = cent_grid_between(start_cents, end_cents)
+        q = construct_farm_quote(
+            farm_ask_cc=CC(farm_ask_cc),
+            n_legs=n_legs,
+            qty=Q(10_000),
+            grid=grid,
+            no_cap_cc=CC(no_cap),
+            size_cap=Q(size_cap),
+        )
+        if isinstance(q, NoQuote):
+            return
+        # HARD INVARIANT: never long the YES side of a farmed combo, ever.
+        assert q.yes_bid_cc == 0
+        assert q.fair_cc == 0
+        assert q.farmed is True
+        # Maker-favorable: the NO bid is on the grid and never above the raw
+        # (rounded DOWN), and never above the free-money cap minus margin.
+        assert grid.is_on_grid(q.no_bid_cc)
+        no_raw = CC_PER_DOLLAR - farm_ask_cc
+        assert int(q.no_bid_cc) <= no_raw
+        assert int(q.no_bid_cc) <= no_cap - QuoteParams().free_money_margin_cc
+        # The implied sell price of the (worthless) YES is strictly positive —
+        # never a degenerate "sell for nothing" quote.
+        assert CC_PER_DOLLAR - int(q.no_bid_cc) > 0
+
+    def test_missing_no_cap_is_no_quote(self) -> None:
+        q = self.farm(no_cap_cc=None)
+        assert isinstance(q, NoQuote)
+        assert q.reason is ReasonCode.SKIP_NO_FREE_MONEY_CHECK
+
+    def test_zero_farm_ask_is_no_quote(self) -> None:
+        for ask in (0, -10):
+            q = self.farm(farm_ask_cc=CC(ask))
+            assert isinstance(q, NoQuote)
+            assert q.reason is ReasonCode.SKIP_LOGICALLY_IMPOSSIBLE
+
+    def test_zero_size_cap_is_no_quote(self) -> None:
+        for cap in (0, -1):
+            q = self.farm(size_cap=Q(cap))
+            assert isinstance(q, NoQuote)
+            assert q.reason is ReasonCode.SKIP_LOGICALLY_IMPOSSIBLE
+
+    def test_no_cap_clamps_the_no_bid(self) -> None:
+        # Complement basket only worth $0.60: we must not bid NO above
+        # 0.60 - margin, even though 1 - farm_ask is 0.905.
+        q = self.farm(no_cap_cc=CC(6_000))
+        assert isinstance(q, ConstructedQuote)
+        assert q.yes_bid_cc == 0
+        assert int(q.no_bid_cc) <= 6_000 - QuoteParams().free_money_margin_cc
+        assert q.no_bid_cc == 5_900
+
+    def test_no_bid_rounds_away_is_no_quote(self) -> None:
+        # A cap at/below the margin leaves no room to bid the NO side.
+        q = self.farm(no_cap_cc=CC(QuoteParams().free_money_margin_cc))
+        assert isinstance(q, NoQuote)
+        assert q.reason is ReasonCode.SKIP_LOGICALLY_IMPOSSIBLE
