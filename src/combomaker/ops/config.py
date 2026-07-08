@@ -270,7 +270,17 @@ class CorrelationConfig(StrictModel):
             # piles on corners (pooled sign is a Simpson's-paradox artifact).
             # ⊥ goals (total/btts ≈ 0). player_goal / advance are LABELED PRIORS
             # (no football-data coverage), wide-banded, not measured.
+            # team corners × match winner — ORIENTED (:same/:opp/:tie). A team's
+            # corners are anti-correlated with THAT team winning (chasing team
+            # earns corners) and positively with the OPPONENT winning; ~0 with a
+            # draw. STRENGTH-CONTROLLED (2026-07-08, 8,980 matches, binned by
+            # devigged win prob): raw pooled corr is a Simpson trap (+0.05, wrong
+            # sign); conditional :same −0.154 / :opp +0.152 / :tie +0.014. The
+            # plain entry is the marginal-less / unparseable-orientation fallback.
             "corners_team|moneyline": -0.15,
+            "corners_team|moneyline:same": -0.15,
+            "corners_team|moneyline:opp": 0.15,
+            "corners_team|moneyline:tie": 0.00,
             "corners_team|spread": -0.13,
             "corners_team|total": 0.00,
             "btts|corners_team": 0.00,
@@ -451,6 +461,9 @@ class CorrelationConfig(StrictModel):
         "soccer:player_goal|spread:opp": 0.15,
         "soccer:corners|player_goal": 0.20,      # labeled prior (~ corners_team|player_goal)
         "soccer:corners_team|moneyline": 0.10,
+        "soccer:corners_team|moneyline:same": 0.10,
+        "soccer:corners_team|moneyline:opp": 0.10,
+        "soccer:corners_team|moneyline:tie": 0.08,
         "soccer:corners_team|spread": 0.10,
         "soccer:corners_team|total": 0.08,
         "soccer:btts|corners_team": 0.08,

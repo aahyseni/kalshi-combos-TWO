@@ -284,6 +284,32 @@ def _spread_player_prior(
     return _lookup_pair(f"{key}:{orient}", sport, params)
 
 
+def _corners_winner_prior(
+    key: str, sport: str, params: SgpParams, corners_ticker: str, ml_ticker: str
+) -> _PairPrior | None:
+    """team-corners × match-winner prior, resolved to ``:same`` / ``:opp`` /
+    ``:tie``. A team's corners are anti-correlated with THAT team winning (a
+    chasing/pressing team earns corners, −ρ), positively with the OPPONENT
+    winning (mirror, +ρ), and ~0 with a draw. The sign is STRENGTH-CONTROLLED:
+    the raw pooled corr is a Simpson's-paradox trap (strong teams both win and
+    take corners → spuriously positive, the WRONG sign). corners suffix is
+    TEAM+line-digits (parsed by ``_corners_team_name``); the winner suffix is a
+    whole team code or a draw token. Unparseable corners team, or an
+    unrecognizable (non-draw) winner suffix → None so the caller falls back —
+    never guess the sign."""
+    corners_team = _corners_team_name(corners_ticker)
+    if corners_team is None:
+        return None
+    ml_team = _winner_team(ml_ticker)
+    if ml_team is None:
+        suffix = ml_ticker.rsplit("-", 1)[-1].upper()
+        if suffix not in _DRAW_SUFFIXES:
+            return None  # unparseable winner suffix: do not invent an orientation
+        return _lookup_pair(f"{key}:tie", sport, params)
+    orient = "same" if corners_team == ml_team else "opp"
+    return _lookup_pair(f"{key}:{orient}", sport, params)
+
+
 def _winner_period_prior(
     key: str, sport: str, params: SgpParams, ticker_a: str, ticker_b: str
 ) -> _PairPrior | None:
@@ -442,6 +468,20 @@ def build_sgp_correlation(
                         params,
                         legs[spr_index].market_ticker,
                         legs[pl_index].market_ticker,
+                    )
+                elif pair_types == {LegType.CORNERS_TEAM, LegType.MONEYLINE}:
+                    # team corners × match winner: −ρ if the corners team IS the
+                    # winner (chasing team earns corners), +ρ if the OPPONENT wins,
+                    # ~0 on a draw. Strength-controlled (raw pooled is a Simpson
+                    # trap with the wrong sign).
+                    ct_index = i if types[i] is LegType.CORNERS_TEAM else j
+                    ml_index = j if ct_index == i else i
+                    prior = _corners_winner_prior(
+                        key,
+                        sport,
+                        params,
+                        legs[ct_index].market_ticker,
+                        legs[ml_index].market_ticker,
                     )
                 else:
                     one_moneyline = (types[i] is LegType.MONEYLINE) != (
