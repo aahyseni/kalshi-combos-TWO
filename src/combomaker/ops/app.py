@@ -32,6 +32,15 @@ log = get_logger(__name__)
 
 JsonDict = dict[str, Any]
 
+# Combo-trade poller coverage. The seen set is RECENCY-ordered (newest last);
+# each cycle we poll the freshest few plus a rotating slice of the rest, so
+# coverage tracks whatever is actively RFQ'd right now (soccer/mlb/esports as
+# each goes live) instead of a fixed lexicographic slice that ossifies as the
+# set grows past the batch size.
+_COMBO_SEEN_CAP = 500       # cap the recency window (bounded memory)
+_COMBO_POLL_FRESH = 10      # always poll the N most-recently-seen combos
+_COMBO_POLL_ROTATE = 20     # + a rotating slice of the older recent window
+
 
 class ObserveApp:
     def __init__(self, config: AppConfig) -> None:
@@ -42,7 +51,9 @@ class ObserveApp:
         self._clock = SystemClock()
         self._metrics = Metrics()
         self._watched: set[str] = set()
-        self._combo_tickers_seen: set[str] = set()
+        # Recency-ordered (dict preserves insertion order; newest last).
+        self._combo_tickers_seen: dict[str, None] = {}
+        self._combo_poll_offset = 0
         self._stop = asyncio.Event()
 
     async def run(self) -> None:
@@ -79,7 +90,7 @@ class ObserveApp:
                     target_cost_cc=rfq.target_cost_cc,
                 )
                 if rfq.is_combo:
-                    self._combo_tickers_seen.add(rfq.market_ticker)
+                    self._mark_combo_seen(rfq.market_ticker)
                     await self._ensure_watched(rfq, feed, metadata)
                 reasons = rfq_filter.evaluate(rfq)
                 if reasons:
@@ -231,6 +242,35 @@ class ObserveApp:
             await asyncio.sleep(interval_s)
             log.info("observe_metrics", **{"snapshot": self._metrics.snapshot()})
 
+    def _mark_combo_seen(self, ticker: str) -> None:
+        """Record a combo ticker as recently seen (move-to-end recency, capped).
+
+        The poller reads the TAIL of this ordering, so an actively-RFQ'd combo
+        stays in the polled window while one-shot tickers age out of the cap."""
+        self._combo_tickers_seen.pop(ticker, None)
+        self._combo_tickers_seen[ticker] = None
+        while len(self._combo_tickers_seen) > _COMBO_SEEN_CAP:
+            oldest = next(iter(self._combo_tickers_seen))
+            del self._combo_tickers_seen[oldest]
+
+    def _combo_poll_batch(self) -> list[str]:
+        """Combo tickers to poll this cycle: the freshest few (always) plus a
+        rotating slice of the older recent window, so every recently-active
+        combo is polled within a few cycles no matter how large the seen set
+        grows. Replaces the old ``sorted(...)[-20:]``, which polled a FIXED
+        lexicographic slice and silently stopped covering fresh markets (e.g.
+        soccer/mlb) once the seen set grew past the batch size."""
+        recent = list(self._combo_tickers_seen)  # oldest -> newest
+        recent.reverse()                          # newest -> oldest
+        fresh = recent[:_COMBO_POLL_FRESH]
+        rest = recent[_COMBO_POLL_FRESH:]
+        rot: list[str] = []
+        if rest:
+            self._combo_poll_offset %= len(rest)
+            rot = rest[self._combo_poll_offset : self._combo_poll_offset + _COMBO_POLL_ROTATE]
+            self._combo_poll_offset += _COMBO_POLL_ROTATE
+        return list(dict.fromkeys(fresh + rot))  # dedup, preserve order
+
     async def _combo_trades_loop(
         self, rest: KalshiRestClient, store: Store, interval_s: float = 90.0
     ) -> None:
@@ -243,7 +283,7 @@ class ObserveApp:
         """
         while True:
             await asyncio.sleep(interval_s)
-            batch = sorted(self._combo_tickers_seen)[-20:]
+            batch = self._combo_poll_batch()
             stored = 0
             for ticker in batch:
                 try:
