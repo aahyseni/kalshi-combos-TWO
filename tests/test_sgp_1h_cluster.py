@@ -34,7 +34,9 @@ def _params() -> SgpParams:
 
 
 def _leg(mt: str) -> RfqLeg:
-    return RfqLeg(market_ticker=mt, event_ticker=f"KX-{_G}", side="yes", yes_settlement_value_cc=None)
+    return RfqLeg(
+        market_ticker=mt, event_ticker=f"KX-{_G}", side="yes", yes_settlement_value_cc=None
+    )
 
 
 def _rho(a: str, b: str) -> float:
