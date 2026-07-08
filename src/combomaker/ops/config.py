@@ -209,6 +209,19 @@ class CorrelationConfig(StrictModel):
             # just replace the WRONG +0.6 default with the grounded near-zero value.
             "advance|corners": 0.00,
             "corners|player_goal": 0.05,
+            # TOTAL corners × a TEAM's corners (same game). Unlike the other
+            # corners pairs (measured ~0), the total CONTAINS the team's corners
+            # as a large component, so they are strongly comonotone — the one
+            # pair where the old +0.6 fallback POINT was accidentally close, but
+            # its fail-safe band spanned zero (treating a structurally-certain-
+            # positive pair as maybe-negative → over-wide quotes on corners-heavy
+            # combos; RFQ test C24/C25/C26). MEASURED 2026-07-08 on 8,981 matches
+            # by two independent passes (football-data HC/AC; total=HC+AC): copula
+            # rho +0.61-0.66 at real tape lines (KXWCCORNERS 7-10 × KXWCTCORNERS
+            # 4-6), home +0.65 / away +0.57 (home corners a bigger share of the
+            # total). No :same/:opp — corners_team carries no home/away orient, so
+            # a single home/away blend ships with a wide band spanning the split.
+            "corners|corners_team": 0.62,
             # ADVANCE (knockout progress) × full-time markets. ADVANCE was
             # UNLISTED against total/btts/scorer/spread → fell to the flat +0.6
             # fallback (6× too high on totals, WRONG SIGN on btts/opp-scorer),
@@ -291,6 +304,28 @@ class CorrelationConfig(StrictModel):
             "first_half_moneyline|moneyline:same": 0.71,
             "first_half_moneyline|moneyline:opp": -0.67,
             "first_half_total|total": 0.73,
+            # FT-BTTS x 1H-TOTAL-over-N. UNLISTED -> the pair fell to the flat
+            # +0.6 same_event fallback whenever the DC pricer declined (live-RFQ
+            # combos C22/C27/C28 mispriced vs maker clearing). DERIVED 2026-07-08
+            # TWO independent ways on 8,981 club matches (football-data HT/FT,
+            # tools/calibrate_soccer_btts_1h_total.py):
+            #   STRUCTURAL (shipped half-time DC, inverted per game from the FT
+            #     1X2 + O/U-2.5 lines at h=0.45 / dc_rho=-0.05): pooled implied
+            #     rho +0.533 (N=1, over-0.5) / +0.544 (N=2, over-1.5).
+            #   EMPIRICAL (count P(FT-BTTS & 1H>=N), invert the shipped copula):
+            #     +0.570 [+0.482,+0.653] (N=1) / +0.552 [+0.477,+0.623] (N=2).
+            # Methods AGREE (|diff| <= 0.037) and the pair is LINE-STABLE (N=1 vs
+            # N=2 within 0.02 in BOTH methods) -> one entry, no line-specific key.
+            # +0.55 sits at the center of both methods and both lines. COHERENT
+            # with the anchors: BELOW first_half_total|total (+0.73 — 1H-total is
+            # a component of FT-total) and btts|total (+0.70), because FT-BTTS
+            # needs BOTH teams to score across the FULL 90' while a 1H goal is
+            # either team inside 45' — a looser, once-removed link (~0.70*0.73
+            # latent attenuation lands near +0.51, measured a touch higher for the
+            # direct 1H-goal path). Settlement: BTTS = regulation 90', 1H = 45'.
+            # Era-stability / structural proxy (no live 1H book to conditional-MLE
+            # gate yet), so the 1H-family band until a live 1H book tightens it.
+            "btts|first_half_total": 0.55,
             # 1H-winner x 1H-total, WITHIN the first half. The sign FLIPS HARD on
             # whether the 1H-moneyline leg names a TEAM or the TIE — resolved in
             # sgp.py to ":team" / ":tie" (same hard sign-flip as the 1H x FT
@@ -419,6 +454,7 @@ class CorrelationConfig(StrictModel):
         "soccer:corners_team|spread": 0.10,
         "soccer:corners_team|total": 0.08,
         "soccer:btts|corners_team": 0.08,
+        "soccer:corners|corners_team": 0.15,  # home/away split (0.57-0.65) + line drift
         "soccer:corners_team|corners_team": 0.10,
         "soccer:corners_team|corners_team:opp": 0.10,   # re-measured, tight
         "soccer:corners_team|corners_team:same": 0.10,  # comonotone containment approx
@@ -432,6 +468,11 @@ class CorrelationConfig(StrictModel):
         "soccer:first_half_moneyline|moneyline:same": 0.08,
         "soccer:first_half_moneyline|moneyline:opp": 0.08,
         "soccer:first_half_total|total": 0.12,
+        # FT-BTTS × 1H-total: two-method agreement (structural +0.53/+0.54,
+        # empirical +0.57/+0.55) + line-stability; 1H-family proxy band (no live
+        # 1H book to conditional-MLE gate). Spans both methods and the empirical
+        # 99% CI up to +0.65.
+        "soccer:btts|first_half_total": 0.13,
         # Near-deterministic containment (tight 99% CI, both hitting the clamp);
         # modest band consistent with the 1H family (no live 1H book to gate on).
         "soccer:first_half_moneyline|first_half_total:team": 0.10,
