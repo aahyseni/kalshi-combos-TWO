@@ -115,13 +115,56 @@ def test_tennis_match_is_sport_tennis_and_moneyline(ticker: str) -> None:
         ("KXWC1HTOTAL-26JUL05MEXENG-2", LegType.FIRST_HALF_TOTAL),
         ("KXWC1HBTTS-26JUL05MEXENG-BTTS", LegType.FIRST_HALF_BTTS),
         ("KXWCFHTOTAL-26JUL05MEXENG-1", LegType.FIRST_HALF_TOTAL),  # FH alias
-        # 1H spread is a real family (KXWC1HSPREAD) but unmeasured -> UNKNOWN,
-        # never guessed, never a full-game spread.
-        ("KXWC1HSPREAD-26JUL07ARGEGY-ARG2", LegType.UNKNOWN),
+        # 1H spread (KXWC1HSPREAD, …-<TEAM><line>) is now a calibrated family:
+        # its own type, never masquerading as a full-game SPREAD.
+        ("KXWC1HSPREAD-26JUL07ARGEGY-ARG2", LegType.FIRST_HALF_SPREAD),
     ],
 )
 def test_first_half_families_get_their_own_type(ticker: str, expected: LegType) -> None:
     assert classify_leg(ticker) is expected
+
+
+@pytest.mark.parametrize(
+    "ticker",
+    [
+        # SOURCE OF TRUTH (prod RFQ tape 2026-07-07): TEAM+line-digit suffix, only
+        # line 2 traded (…-<TEAM>2 = "leads at half by over 1.5", 1H margin>=2).
+        "KXWC1HSPREAD-26JUL09FRAMAR-FRA2",
+        "KXWC1HSPREAD-26JUL02ESPAUT-AUT2",
+    ],
+)
+def test_first_half_spread_types_and_is_period(ticker: str) -> None:
+    # A first-half market: its own type AND a period leg (the structural inverter
+    # must keep declining it, like every other 1H family).
+    assert classify_leg(ticker) is LegType.FIRST_HALF_SPREAD
+    assert is_period_leg(ticker)
+
+
+def test_full_game_spread_unchanged_by_first_half_spread() -> None:
+    # Regression: KXWC1HSPREAD must match the first-half-spread form BEFORE the
+    # full-game SPREAD; the full-game series (no 1H token) still types SPREAD and
+    # is NOT a period leg.
+    assert classify_leg("KXWCSPREAD-26JUL02ESPAUT-AUT2") is LegType.SPREAD
+    assert classify_leg("KXWCSPREAD-26JUL03ARGCPV-ARG3") is LegType.SPREAD
+    assert classify_leg("KXNFLSPREAD-26SEP10KCBAL-KC3") is LegType.SPREAD
+    assert not is_period_leg("KXWCSPREAD-26JUL02ESPAUT-AUT2")
+
+
+def test_second_half_spread_stays_unknown_never_full_game() -> None:
+    # Only the FIRST half is modeled; a 2H spread is a period leg we have not
+    # measured, so it must widen (UNKNOWN), never masquerade as a full-game
+    # SPREAD or the first-half spread.
+    assert classify_leg("KXWC2HSPREAD-26JUL05MEXENG-MEX2") is LegType.UNKNOWN
+
+
+def test_first_half_spread_pair_keys_match_config() -> None:
+    assert pair_key(LegType.FIRST_HALF_SPREAD, LegType.SPREAD) == (
+        "first_half_spread|spread"
+    )
+    assert pair_key(LegType.FIRST_HALF_SPREAD, LegType.MONEYLINE) == (
+        "first_half_spread|moneyline"
+    )
+    assert pair_key(LegType.FIRST_HALF_SPREAD, LegType.TOTAL) == "first_half_spread|total"
 
 
 def test_first_half_total_is_not_reported_as_full_game_total() -> None:

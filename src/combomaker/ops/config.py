@@ -251,6 +251,40 @@ class CorrelationConfig(StrictModel):
             # mutually exclusive when 0-0 IS a tie) — the SUICOL pick-off.
             "first_half_moneyline|first_half_total:team": 0.95,
             "first_half_moneyline|first_half_total:tie": -0.95,
+            # First-half SPREAD (1H goal margin, series KXWC1HSPREAD; the only
+            # traded line is 2 = "leads at half by over 1.5", i.e. 1H margin>=2)
+            # x FULL-TIME legs, CALIBRATED 2026-07-07 on 8,981 club matches
+            # (football-data HT/FT; tools/calibrate_soccer_1h_spread.py;
+            # results_soccer.md §2). Kalshi BLOCKS 1H-spread x 1H-total/1H-over,
+            # so only 1H-spread x full-time is reachable/measured. A 1H spread
+            # NAMES a team, so spread|spread and spread|moneyline flip sign HARD
+            # on team orientation — resolved in sgp.py to ":same" (both legs
+            # name one team) / ":opp" (different teams) by stripping the trailing
+            # line digits off the TEAM+digits suffix, the same/opposite analogue
+            # of the winner ":same"/":opp" prior. Measured pooled over both
+            # naming orientations:
+            #   spread|spread :same  1H margin>=2 x FT margin>=2, +0.777
+            #     [+0.726,+0.826] (home +0.773 / away +0.776; not deterministic
+            #     — a 2-0 half can end level).
+            #   spread|spread :opp   1H team-A>=2 x FT team-B>=2, measured -0.646
+            #     [-0.802,-0.591]; a >=4-goal swing, P(A|B)=0.002 (near-exclusion,
+            #     point estimate driven by 1-2 freak comebacks) — shipped as the
+            #     copula-fit -0.65 (reproduces the observed ~0.2% frequency), NOT
+            #     clamped to -0.95 (that sits outside the measured CI and would
+            #     over-state), with a wide band spanning the small-sample range.
+            #   spread|moneyline :same 1H margin>=2 x FT win, +0.739 [+0.652,+0.854].
+            #   spread|moneyline :opp  1H team-A>=2 x FT team-B win, -0.662
+            #     [-0.709,-0.624]; near-exclusion, shipped copula-fit -0.66.
+            # spread|total is orientation-FREE (total names no team): a 1H lead
+            # requires 1H goals => positive with FT total. Anchored at the modal
+            # FT line over 2.5 (>=3): +0.518 [+0.418,+0.635] (over3.5 +0.44;
+            # over1.5 is a structural containment +0.99, out of band — a rare
+            # pairing, noted). Wide band absorbs the FT-line dependence.
+            "first_half_spread|spread:same": 0.78,
+            "first_half_spread|spread:opp": -0.65,
+            "first_half_spread|moneyline:same": 0.74,
+            "first_half_spread|moneyline:opp": -0.66,
+            "first_half_spread|total": 0.52,
         },
         # NFL moneyline|total = 0.00 DOUBLY confirmed: pooled-vs-Vegas-lines
         # AND conditional-MLE (+0.02, SE 0.023) whose fit does NOT beat
@@ -325,6 +359,14 @@ class CorrelationConfig(StrictModel):
         # modest band consistent with the 1H family (no live 1H book to gate on).
         "soccer:first_half_moneyline|first_half_total:team": 0.10,
         "soccer:first_half_moneyline|first_half_total:tie": 0.10,
+        # 1H-spread × full-time bands (results_soccer.md §2; era-stability proxy,
+        # no live 1H book to conditional-MLE gate — kept in the 1H family's
+        # 0.10-0.15 range). :opp / total wider for small-sample / FT-line spread.
+        "soccer:first_half_spread|spread:same": 0.12,
+        "soccer:first_half_spread|spread:opp": 0.15,
+        "soccer:first_half_spread|moneyline:same": 0.12,
+        "soccer:first_half_spread|moneyline:opp": 0.15,
+        "soccer:first_half_spread|total": 0.15,
         "nfl:moneyline|total": 0.05,
         "nfl:spread|total": 0.05,
         "nfl:moneyline|spread": 0.05,

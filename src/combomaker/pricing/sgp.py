@@ -189,6 +189,49 @@ def _corners_team_prior(
     return _lookup_pair(f"{key}:{orient}", sport, params)
 
 
+def _spread_team(ticker: str) -> str | None:
+    """The team a (1H- or full-game) spread leg names — its ticker suffix with
+    the trailing line digits removed (``…-FRA2`` -> ``FRA``). Same TEAM+digits
+    shape as team-corners, so it reuses ``_CORNERS_TEAM_SUFFIX`` (whole-suffix
+    ``_winner_team`` would read the line digits as part of the team). None when
+    the suffix isn't a team-code + optional digits shape (don't guess)."""
+    return _corners_team_name(ticker)
+
+
+def _spread_pair_prior(
+    key: str, sport: str, params: SgpParams, ticker_a: str, ticker_b: str
+) -> _PairPrior | None:
+    """1H-spread × FT-spread prior, resolved to ``:same`` / ``:opp`` by whether
+    the two spread legs name the same team (a big 1H lead → a big FT lead, +ρ) or
+    opposite teams (a 1H lead for one is a >=4-goal-swing FT lead for the other,
+    near-mutually-exclusive, −ρ). Both suffixes are TEAM+line-digits, parsed by
+    stripping the digits. Unparseable suffix → None (caller falls back; never
+    invent an orientation)."""
+    team_a = _spread_team(ticker_a)
+    team_b = _spread_team(ticker_b)
+    if team_a is None or team_b is None:
+        return None
+    orient = "same" if team_a == team_b else "opp"
+    return _lookup_pair(f"{key}:{orient}", sport, params)
+
+
+def _spread_winner_prior(
+    key: str, sport: str, params: SgpParams, spread_ticker: str, ml_ticker: str
+) -> _PairPrior | None:
+    """1H-spread × FT-moneyline prior, resolved to ``:same`` / ``:opp`` by
+    whether the spread leg (TEAM+line-digits suffix) and the winner leg (whole
+    last segment) name the same team (a 1H lead → that team wins, +ρ) or opposite
+    teams (near-mutually-exclusive, −ρ). Either suffix unparseable (spread not
+    TEAM+digits, or a draw-side winner) → None so the caller falls back — never
+    guess a sign."""
+    team_s = _spread_team(spread_ticker)
+    team_m = _winner_team(ml_ticker)
+    if team_s is None or team_m is None:
+        return None
+    orient = "same" if team_s == team_m else "opp"
+    return _lookup_pair(f"{key}:{orient}", sport, params)
+
+
 def _winner_team(ticker: str) -> str | None:
     """The team code a (1H- or full-game) moneyline leg names — its ticker's
     last hyphen segment. None for a draw side, which has no measured 1H×FT
@@ -298,6 +341,22 @@ def build_sgp_correlation(
                     # 1H-winner × FT-winner: sign flips on same-vs-opposite team.
                     prior = _winner_period_prior(
                         key, sport, params, legs[i].market_ticker, legs[j].market_ticker
+                    )
+                elif pair_types == {LegType.FIRST_HALF_SPREAD, LegType.SPREAD}:
+                    # 1H-spread × FT-spread: sign flips on same-vs-opposite team.
+                    prior = _spread_pair_prior(
+                        key, sport, params, legs[i].market_ticker, legs[j].market_ticker
+                    )
+                elif pair_types == {LegType.FIRST_HALF_SPREAD, LegType.MONEYLINE}:
+                    # 1H-spread × FT-winner: sign flips on same-vs-opposite team.
+                    fhs_index = i if types[i] is LegType.FIRST_HALF_SPREAD else j
+                    ml_index = j if fhs_index == i else i
+                    prior = _spread_winner_prior(
+                        key,
+                        sport,
+                        params,
+                        legs[fhs_index].market_ticker,
+                        legs[ml_index].market_ticker,
                     )
                 elif pair_types == {
                     LegType.FIRST_HALF_MONEYLINE,

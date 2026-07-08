@@ -40,6 +40,11 @@ class LegType(StrEnum):
     FIRST_HALF_MONEYLINE = "first_half_moneyline"
     FIRST_HALF_TOTAL = "first_half_total"
     FIRST_HALF_BTTS = "first_half_btts"
+    # First-half spread = 1H goal margin (series KXWC1HSPREAD-…-<TEAM><line>,
+    # e.g. …-FRA2 = France leads at half by over 1.5). Measured against FT
+    # spread/moneyline/total (results_soccer.md §2); the 1H×1H pairs it forms
+    # are BLOCKED by Kalshi, so only 1H-spread × full-time is calibrated.
+    FIRST_HALF_SPREAD = "first_half_spread"
     UNKNOWN = "unknown"
 
 
@@ -82,12 +87,14 @@ _FIRST_HALF_SERIES = re.compile(r"(?:1H|H1|FH)")
 # (``KXWC1H-<game>-<TEAM|TIE>``) — NOT ``KXWC1HGAME`` (which does not exist).
 _FIRST_HALF_WINNER = re.compile(r"(?:1H|H1|FH)$")
 # Full-game family → its first-half member. A first-half leg whose base family
-# is anything else (player goal, corners, spread, …) is left UNKNOWN: those
-# 1H × FT pairs are not measured yet, so they must widen, never guess.
+# is anything else (player goal, corners, …) is left UNKNOWN: those 1H × FT
+# pairs are not measured yet, so they must widen, never guess. SPREAD is now
+# mapped (1H-spread × FT priors calibrated, results_soccer.md §2).
 _FIRST_HALF_MAP: dict[LegType, LegType] = {
     LegType.MONEYLINE: LegType.FIRST_HALF_MONEYLINE,
     LegType.TOTAL: LegType.FIRST_HALF_TOTAL,
     LegType.BTTS: LegType.FIRST_HALF_BTTS,
+    LegType.SPREAD: LegType.FIRST_HALF_SPREAD,
 }
 
 
@@ -113,8 +120,8 @@ def classify_leg(market_ticker: str) -> LegType:
                 return mapped
             # A bare 1st-half winner (series ends in the half token, no family
             # keyword — the real KXWC1H moneyline) has base UNKNOWN. Anything
-            # else first-half-but-unmapped (1H spread, an unknown 1H family)
-            # stays UNKNOWN: unmeasured 1H×FT pairs must widen, never guess.
+            # else first-half-but-unmapped (an unknown 1H family) stays UNKNOWN:
+            # unmeasured 1H×FT pairs must widen, never guess.
             if base is LegType.UNKNOWN and _FIRST_HALF_WINNER.search(series):
                 return LegType.FIRST_HALF_MONEYLINE
             return LegType.UNKNOWN
