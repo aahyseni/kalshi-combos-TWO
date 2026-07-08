@@ -306,3 +306,184 @@ def test_same_team_corners_same_line_both_sides_is_caught_upstream() -> None:
     legs = (leg(TC_MEX8, TC_EV, "yes"), leg(TC_MEX8, TC_EV, "no"))
     rel = classify_legs(legs, MappingProvider({TC_EV: False}))
     assert rel.kind is RelationshipKind.IMPOSSIBLE
+
+
+# --- Family 1: 1H-BTTS ⟹ FT-BTTS, the NO/NO containment added ---------------------
+# (yes/yes containment + yes/no impossible are covered above.)
+
+
+def test_1h_btts_no_ft_btts_no_is_containment_subset_is_ft_leg() -> None:
+    """{1H-BTTS no, FT-BTTS no}: ¬(FT-BTTS) ⟹ ¬(1H-BTTS), so the FT-BTTS-no leg is
+    the effective subset — joint = P(FT-BTTS no). containment points at the FT leg
+    (index 1) as subset, the 1H leg (index 0) as superset."""
+    legs = (leg(FH_BTTS, FH_BTTS_EV, "no"), leg(FT_BTTS, FT_BTTS_EV, "no"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containment == (1, 0)
+
+
+def test_1h_btts_no_ft_btts_yes_is_possible() -> None:
+    """{1H-BTTS no, FT-BTTS yes}: both teams scored, just not both by half-time —
+    a possible combo, no logical pin (groups for the copula)."""
+    legs = (leg(FH_BTTS, FH_BTTS_EV, "no"), leg(FT_BTTS, FT_BTTS_EV, "yes"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+    assert rel.same_event_groups == ((0, 1),)
+
+
+def test_1h_btts_no_ft_btts_no_in_larger_combo_is_unknown() -> None:
+    """The no/no containment obeys the same bare-2-leg policy: buried in a >2-leg
+    combo it is not modeled → UNKNOWN (widen-or-no-quote)."""
+    legs = (
+        leg(FH_BTTS, FH_BTTS_EV, "no"),
+        leg(FT_BTTS, FT_BTTS_EV, "no"),
+        leg("KXWCTOTAL-26JUL05MEXENG-3", "KXWCTOTAL-26JUL05MEXENG", "yes"),
+    )
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.UNKNOWN
+
+
+# --- Family 2: regulation moneyline team-WIN ⟹ FT Over-0.5 ------------------------
+# Encoding (structural.py: DOC-VERIFIED live metadata): KXWCTOTAL-…-N = "over
+# N-0.5", so suffix -1 = over 0.5. KXWCGAME = regulation moneyline (team win needs
+# a goal); KXWCADVANCE (advance incl pens) is a different LegType and excluded.
+
+ML_MEX = "KXWCGAME-26JUL05MEXENG-MEX"
+ML_TIE = "KXWCGAME-26JUL05MEXENG-TIE"
+ML_EV = "KXWCGAME-26JUL05MEXENG"
+ADV_MEX = "KXWCADVANCE-26JUL05MEXENG-MEX"
+ADV_EV = "KXWCADVANCE-26JUL05MEXENG"
+TOT_OVER05 = "KXWCTOTAL-26JUL05MEXENG-1"   # over 0.5 (>=1 goal)
+TOT_OVER15 = "KXWCTOTAL-26JUL05MEXENG-2"   # over 1.5 (>=2 goals)
+TOT_EV = "KXWCTOTAL-26JUL05MEXENG"
+
+
+def test_win_yes_over05_no_is_impossible() -> None:
+    """A regulation team win needs a goal, so win yes × over-0.5 no is impossible."""
+    legs = (leg(ML_MEX, ML_EV, "yes"), leg(TOT_OVER05, TOT_EV, "no"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.IMPOSSIBLE
+
+
+def test_win_yes_over05_yes_is_containment_subset_is_moneyline() -> None:
+    """win ⊂ over-0.5, so joint = P(win); subset points at the moneyline leg (0)."""
+    legs = (leg(ML_MEX, ML_EV, "yes"), leg(TOT_OVER05, TOT_EV, "yes"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containment == (0, 1)
+
+
+def test_win_yes_over15_no_is_possible_line_precision() -> None:
+    """LINE PRECISION: a win implies over-0.5, NOT over-1.5 (a 1-0 win is under
+    1.5). win yes × over-1.5 no stays a possible combo → OK."""
+    legs = (leg(ML_MEX, ML_EV, "yes"), leg(TOT_OVER15, TOT_EV, "no"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+    assert rel.same_event_groups == ((0, 1),)
+
+
+def test_tie_yes_over05_no_is_possible_not_a_team() -> None:
+    """A 0-0 draw is under-0.5, so a TIE leg does NOT imply a goal → OK, never
+    impossible."""
+    legs = (leg(ML_TIE, ML_EV, "yes"), leg(TOT_OVER05, TOT_EV, "no"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+
+
+def test_advance_yes_over05_no_is_possible_not_moneyline() -> None:
+    """ADVANCE (0-0 on penalties advances) does NOT imply a goal — it is a
+    different LegType and never triggers the win⟹over-0.5 pin → OK."""
+    legs = (leg(ADV_MEX, ADV_EV, "yes"), leg(TOT_OVER05, TOT_EV, "no"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+
+
+def test_win_no_over05_no_is_possible_moneyline_no_unreachable() -> None:
+    """Moneyline-NO legs are UNREACHABLE (Kalshi blocks them in combos) and are
+    NOT added — win no × over-0.5 no falls to the copula, never a pin."""
+    legs = (leg(ML_MEX, ML_EV, "no"), leg(TOT_OVER05, TOT_EV, "no"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+
+
+def test_win_yes_over05_yes_in_larger_combo_is_unknown() -> None:
+    """Family-2 containment buried in a >2-leg combo → UNKNOWN (bare-pair policy)."""
+    legs = (
+        leg(ML_MEX, ML_EV, "yes"),
+        leg(TOT_OVER05, TOT_EV, "yes"),
+        leg("KXWCBTTS-26JUL05MEXENG-BTTS", "KXWCBTTS-26JUL05MEXENG", "yes"),
+    )
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.UNKNOWN
+
+
+# --- Family 3: 1H Over-N ⟹ FT Over-N (SAME line N) --------------------------------
+
+FH_TOT2 = "KXWC1HTOTAL-26JUL05MEXENG-2"   # 1H over 1.5
+FH_TOT1 = "KXWC1HTOTAL-26JUL05MEXENG-1"   # 1H over 0.5
+FH_TOT_EV = "KXWC1HTOTAL-26JUL05MEXENG"
+FT_TOT2 = "KXWCTOTAL-26JUL05MEXENG-2"     # FT over 1.5
+FT_TOT2_EV = "KXWCTOTAL-26JUL05MEXENG"
+
+
+def test_1h_over_yes_ft_over_no_same_line_is_impossible() -> None:
+    """FT goals ≥ 1H goals, so 1H-over-N yes × FT-over-N no is impossible."""
+    legs = (leg(FH_TOT2, FH_TOT_EV, "yes"), leg(FT_TOT2, FT_TOT2_EV, "no"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.IMPOSSIBLE
+
+
+def test_1h_over_yes_ft_over_yes_same_line_is_containment_subset_is_1h() -> None:
+    """1H-over-N ⊂ FT-over-N, so joint = P(1H); subset points at the 1H leg (0)."""
+    legs = (leg(FH_TOT2, FH_TOT_EV, "yes"), leg(FT_TOT2, FT_TOT2_EV, "yes"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containment == (0, 1)
+
+
+def test_1h_over_no_ft_over_no_same_line_is_containment_subset_is_ft() -> None:
+    """{1H-over-N no, FT-over-N no}: ¬(FT-over-N) ⟹ ¬(1H-over-N), so joint =
+    P(FT-over-N no); subset points at the FT leg (1)."""
+    legs = (leg(FH_TOT2, FH_TOT_EV, "no"), leg(FT_TOT2, FT_TOT2_EV, "no"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containment == (1, 0)
+
+
+def test_1h_over_no_ft_over_yes_same_line_is_possible() -> None:
+    """{1H-over-N no, FT-over-N yes}: the goals came in the second half — possible,
+    no pin → OK."""
+    legs = (leg(FH_TOT2, FH_TOT_EV, "no"), leg(FT_TOT2, FT_TOT2_EV, "yes"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+    assert rel.same_event_groups == ((0, 1),)
+
+
+def test_1h_over_ft_over_cross_line_is_possible() -> None:
+    """CROSS-LINE: 1H-over-0.5 yes × FT-over-1.5 no is possible (1H had 1 goal, the
+    match ends 1-0, under 1.5). Different lines are UNREACHABLE + not directional
+    here → stays OK, never impossible."""
+    legs = (leg(FH_TOT1, FH_TOT_EV, "yes"), leg(FT_TOT2, FT_TOT2_EV, "no"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+
+
+def test_1h_over_ft_over_same_line_in_larger_combo_is_unknown() -> None:
+    """Family-3 containment buried in a >2-leg combo → UNKNOWN (bare-pair policy)."""
+    legs = (
+        leg(FH_TOT2, FH_TOT_EV, "yes"),
+        leg(FT_TOT2, FT_TOT2_EV, "yes"),
+        leg("KXWCBTTS-26JUL05MEXENG-BTTS", "KXWCBTTS-26JUL05MEXENG", "yes"),
+    )
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.UNKNOWN
+
+
+def test_1h_over_ft_over_different_game_is_possible() -> None:
+    """Same-line 1H × FT totals of DIFFERENT games carry no logical relation."""
+    legs = (
+        leg(FH_TOT2, FH_TOT_EV, "yes"),
+        leg("KXWCTOTAL-26JUL06ARGEGY-2", "KXWCTOTAL-26JUL06ARGEGY", "no"),
+    )
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK

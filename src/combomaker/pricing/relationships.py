@@ -28,7 +28,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Literal, Protocol
 
 from combomaker.pricing.legtypes import LegType, classify_leg
 from combomaker.rfq.models import RfqLeg
@@ -76,6 +76,69 @@ def _corners_team_line(market_ticker: str) -> tuple[str, int] | None:
     if m is None:
         return None
     return m.group(1), int(m.group(2))
+
+
+# --- Parsing + sign helpers for the logical-containment families ----------------
+# All fail-closed (None / False on anything unparseable): a doubt must fall to a
+# normal OK/copula, never a false IMPOSSIBLE/CONTAINMENT.
+
+_TOTAL_LINE = re.compile(r"^\d+$")
+
+# Kalshi TOTAL / FIRST_HALF_TOTAL suffix ``…-N`` encodes "over N-0.5" = "at least
+# N goals" (structural.py `_parse_total_line` + the margin/total suffix docs:
+# DOC-VERIFIED live metadata 2026-07-06, e.g. KXMLBTOTAL-…-5 = 'Over 4.5'). So
+# the over-0.5 line — the only total a team win implies (a 1-0 win is under 1.5)
+# — is exactly N == 1.
+_OVER_HALF_LINE = 1
+
+# A moneyline suffix in this set names the DRAW, not a team (mirrors the local
+# `_DRAW_SUFFIXES` in sgp.py/structural.py). A drawn result is 0-0-inclusive, so
+# it implies no goal — only a TEAM win does.
+_DRAW_SUFFIXES = frozenset({"TIE", "DRAW"})
+
+
+def _total_line(market_ticker: str) -> int | None:
+    """Integer line N from a TOTAL / FIRST_HALF_TOTAL ticker suffix (``…-3`` -> 3,
+    "over 2.5" = at least 3 goals; ``…-1`` -> 1 = "over 0.5"). None when the
+    suffix isn't a bare integer (a '2.5'-style decimal or garbage) — never guess
+    a line for the containment logic."""
+    suffix = market_ticker.rsplit("-", 1)[-1]
+    if _TOTAL_LINE.match(suffix):
+        return int(suffix)
+    return None
+
+
+def _moneyline_is_team(market_ticker: str) -> bool:
+    """True iff a MONEYLINE leg's suffix names a TEAM (not the TIE/DRAW side). A
+    team win requires outscoring the opponent in regulation (>=1 goal); a draw
+    settles on a 0-0-inclusive result and implies no goal. Fail-closed: an empty
+    suffix is not a team."""
+    suffix = market_ticker.rsplit("-", 1)[-1].upper()
+    return bool(suffix) and suffix not in _DRAW_SUFFIXES
+
+
+def _containment_sign(
+    sub_i: int, sup_i: int, sub_side: str, sup_side: str
+) -> tuple[int, int] | Literal["impossible"] | None:
+    """Map the YES/NO sides of a logical implication A⟹B (leg ``sub_i`` = A, leg
+    ``sup_i`` = B) to a verdict — the SAME matrix for every containment family:
+
+      {A yes, B no}  → "impossible"     (A cannot happen without B)
+      {A yes, B yes} → (sub_i, sup_i)   containment, subset = A  (joint = P(A))
+      {A no,  B no}  → (sup_i, sub_i)   containment, subset = B  (¬B⟹¬A, so the
+                                        B-no leg is the effective subset; its
+                                        marginal is P(B no))
+      {A no,  B yes} → None             possible (falls to the copula)
+
+    Fail-closed: any side not exactly yes/no returns None (side-known is enforced
+    upstream; never read an unknown side as an implication)."""
+    if sub_side == "yes" and sup_side == "yes":
+        return (sub_i, sup_i)
+    if sub_side == "yes" and sup_side == "no":
+        return "impossible"
+    if sub_side == "no" and sup_side == "no":
+        return (sup_i, sub_i)
+    return None
 
 
 def _game_key(event_ticker: str) -> str:
@@ -150,16 +213,9 @@ def classify_legs(
             notes.append(f"{yes_count} YES legs of mutually exclusive event {event_ticker}")
             return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
 
-    # Period × full-time BTTS is a LOGICAL CONTAINMENT, not a correlation: if
-    # both teams scored by half-time (1H-BTTS yes) they have both scored in the
-    # match (FT-BTTS yes). So within a game:
-    #   1H-BTTS yes × FT-BTTS no  → IMPOSSIBLE (v1 policy: no-quote)
-    #   1H-BTTS yes × FT-BTTS yes → CONTAINMENT, joint = P(1H-BTTS)
-    # Only the bare 2-leg containment combo is priced coherently; a containment
-    # pair buried in a larger combo (mixed with other correlated legs) is not
-    # yet modeled → UNKNOWN (widen-or-no-quote), never a copula guess. The
-    # subset-side "no" cases and other period families are DEFERRED (they fall
-    # to the normal grouped/copula path).
+    # LOGICAL CONTAINMENT families (A⟹B) — exact soccer-scoring facts the copula
+    # cannot express, handled in the same-game block just below the corners
+    # branch. See ``_containment_sign`` for the shared YES/NO sign matrix.
     types = [classify_leg(leg.market_ticker) for leg in legs]
 
     # Same-team TEAM-corner lines are EXACT CONTAINMENT (over-M ⊆ over-N for
@@ -191,26 +247,96 @@ def classify_legs(
             )
             return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
 
+    # Three period/line implications A⟹B are EXACT scoring facts (not
+    # correlations). A Kalshi taker-API probe proved these three — and only these
+    # — are reachable: a taker can actually build them; every other implication
+    # is blocked at build time. For each, ``_containment_sign`` gives:
+    #   {A yes, B no}  → IMPOSSIBLE (v1 no-quote; fires at ANY combo size)
+    #   {A yes, B yes} → CONTAINMENT joint = P(A)     (subset = A leg)
+    #   {A no,  B no}  → CONTAINMENT joint = P(B no)  (subset = B leg; ¬B⟹¬A)
+    #   {A no,  B yes} → possible (falls to the copula)
+    # A bare 2-leg containment is priced coherently; the SAME pair buried in a
+    # >2-leg combo is not modeled → UNKNOWN (widen-or-no-quote), never a copula
+    # guess. IMPOSSIBLE returns immediately, so it always beats a buried pair.
     containment: tuple[int, int] | None = None
-    for sub in range(len(legs)):
-        if types[sub] is not LegType.FIRST_HALF_BTTS or legs[sub].side != "yes":
+
+    # Family 1 — 1H-BTTS (A) ⟹ FT-BTTS (B): both teams scoring by half-time means
+    # both have scored in the match. All four sign cases reachable.
+    for a_i in range(len(legs)):
+        if types[a_i] is not LegType.FIRST_HALF_BTTS:
             continue
-        for sup in range(len(legs)):
-            if types[sup] is not LegType.BTTS or game_keys[sup] != game_keys[sub]:
+        for b_i in range(len(legs)):
+            if types[b_i] is not LegType.BTTS or game_keys[a_i] != game_keys[b_i]:
                 continue
-            if legs[sup].side == "no":
+            verdict = _containment_sign(a_i, b_i, legs[a_i].side, legs[b_i].side)
+            if verdict == "impossible":
                 notes.append(
-                    f"1H-BTTS yes ({legs[sub].market_ticker}) implies FT-BTTS yes: "
-                    f"{legs[sup].market_ticker} no is impossible"
+                    f"1H-BTTS yes ({legs[a_i].market_ticker}) implies FT-BTTS yes: "
+                    f"{legs[b_i].market_ticker} no is impossible"
                 )
                 return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
-            containment = (sub, sup)
+            if isinstance(verdict, tuple):
+                containment = verdict
+
+    # Family 2 — regulation moneyline team-WIN (A) ⟹ FT Over-0.5 (B): a win needs
+    # a goal. Kalshi blocks moneyline-NO legs in combos, so only the win-YES half
+    # is reachable (moneyline NO orientations are NOT added). The total must be
+    # the over-0.5 line (suffix -1); over-1.5+ is a possible combo (a 1-0 win is
+    # under 1.5). TIE (0-0 draw) and ADVANCE (0-0 on pens, a different LegType)
+    # do not imply a goal and are excluded.
+    for ml_i in range(len(legs)):
+        if types[ml_i] is not LegType.MONEYLINE or legs[ml_i].side != "yes":
+            continue
+        if not _moneyline_is_team(legs[ml_i].market_ticker):
+            continue
+        for tot_i in range(len(legs)):
+            if types[tot_i] is not LegType.TOTAL or game_keys[ml_i] != game_keys[tot_i]:
+                continue
+            if _total_line(legs[tot_i].market_ticker) != _OVER_HALF_LINE:
+                continue
+            verdict = _containment_sign(ml_i, tot_i, "yes", legs[tot_i].side)
+            if verdict == "impossible":
+                notes.append(
+                    f"moneyline win yes ({legs[ml_i].market_ticker}) needs a goal: "
+                    f"over-0.5 {legs[tot_i].market_ticker} no is impossible"
+                )
+                return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
+            if isinstance(verdict, tuple):
+                containment = verdict
+
+    # Family 3 — 1H Over-N (A) ⟹ FT Over-N (B), SAME line N: full-time goals ≥
+    # first-half goals. Only EQUAL lines are reachable AND logically directional
+    # (cross-line is blocked by Kalshi and its direction depends on which line is
+    # larger), so unequal/unparseable lines do nothing.
+    for fh_i in range(len(legs)):
+        if types[fh_i] is not LegType.FIRST_HALF_TOTAL:
+            continue
+        fh_line = _total_line(legs[fh_i].market_ticker)
+        if fh_line is None:
+            continue
+        for ft_i in range(len(legs)):
+            if types[ft_i] is not LegType.TOTAL or game_keys[fh_i] != game_keys[ft_i]:
+                continue
+            ft_line = _total_line(legs[ft_i].market_ticker)
+            if ft_line is None or ft_line != fh_line:
+                continue
+            verdict = _containment_sign(fh_i, ft_i, legs[fh_i].side, legs[ft_i].side)
+            if verdict == "impossible":
+                notes.append(
+                    f"1H-over-{fh_line} yes ({legs[fh_i].market_ticker}) implies "
+                    f"FT-over-{ft_line} yes: {legs[ft_i].market_ticker} no is impossible"
+                )
+                return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
+            if isinstance(verdict, tuple):
+                containment = verdict
+
     if containment is not None:
         if len(legs) != 2:
-            notes.append("1H-BTTS containment pair inside a larger combo: not modeled")
+            notes.append("logical containment pair inside a larger combo: not modeled")
             return Relationship(RelationshipKind.UNKNOWN, (), tuple(notes))
         notes.append(
-            f"1H-BTTS containment: joint = P({legs[containment[0]].market_ticker})"
+            f"logical containment: joint = P(leg {containment[0]} "
+            f"{legs[containment[0]].market_ticker})"
         )
         return Relationship(RelationshipKind.CONTAINMENT, (), tuple(notes), containment)
 
