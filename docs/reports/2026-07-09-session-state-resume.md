@@ -129,15 +129,25 @@ event ticker; relationships.py groups by event BEFORE the ρ table → gates ALL
 multi-player basket pricing); same-player cross-stat rungs are deterministic
 CONTAINMENTS (not ρ).
 
-**MEASUREMENT TRANCHE RUNNING (launched ~23:45 UTC, run wf_6e350a3f-b84):** 8
-agents — game-frame totals (HR/HIT/TB/RFI×game-total), basket pairs (KS×KS,
-HR×HR/HIT×HIT teammate-opponent splits + basket-level P(all-no) validation),
-HRR pairs, game-level (margin×total, win×cover containment, same-day
-independence), hit×KS facing splits, strike-ladder flatness (resolves the K-line
-convention question), event-metadata resolution, same-player rungs (tape) —
-then an xhigh judge emits the final recommended mlb table. Results report to
-follow. **Promotion gate:** tools/backtest_mlb_pairs.py (tape replay,
-staged-vs-live config, log-loss gate) → port + parity-check (rule 8).
+**MEASUREMENT TRANCHE DONE (~23:59 UTC)** — 8 agents + xhigh judge, **33
+verdicts, 0 refuted**. Full detail: `2026-07-09-mlb-measurement-tranche.md`;
+final judge-amended table appended to `docs/calibration/staged_mlb_props.md`.
+Headlines: **flat +0.6 overbids 8-16-leg all-NO HR baskets by +25-35¢/$1**
+(measured ρs reproduce the 16-leg joint to 0.0003 — the money finding);
+player_hr|game_total measured **+0.24**/0.10 (the phase-1 critical gap); K
+pairs are **ladder-FLAT** → operator's K-line convention question **RESOLVED**
+(self-median fine, one entry per K pair); batter HIT/HR rungs **drift** →
+per-rung entries (single 1+ ρ sells deep rungs cheap);
+**event_mutually_exclusive = false on all 6 prop families (baskets NOT gated,
+merely uncalibrated)**, true on KXMLBGAME (correct) — pin via fixture;
+same-player same-family rungs = ZERO flow; cross-family same-player (6.5%) =
+deterministic containment (HR⇒HRR≥3 exact 101,186/101,186). Remaining gaps:
+cross-family distinct-player batter pairs (hit|hr etc., labeled priors staged,
+hours to measure) + teammate hrr|ks + tb|ks.
+**Promotion path (in order):** (1) `tools/backtest_mlb_pairs.py` tape-replay
+gate (staged vs live flat-0.6) — THE gate; (2) ship legtypes + [A]/[B] entries +
+teammate/opponent routing + containment branches + event-flag fixture, port +
+parity-check; (3) ML-orientation resolver → flip [C] signed; (4) measure [D].
 
 ## OPERATOR DECISIONS (2026-07-09 evening)
 

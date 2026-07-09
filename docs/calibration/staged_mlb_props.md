@@ -197,3 +197,78 @@ exactly 11 diffs, all intended, ZERO false positives.
 
 - SCRATCH ARTIFACTS (all under C:/Users/aahys/.claude/jobs/24844262/tmp/mlb/, no repo files touched, no processes started/stopped, prod DB not opened by this agent): verify_classification.py (live classifier run + universe collision scan), scan_400k.json (tape pair matrix used here), results.json + era_stability.json (cluster-boot rho rederivation), series_raw.json (11,305-series universe), samples_raw.json / mlb_family_rules*.json (rules text), mvec.json (collection membership).
 
+
+---
+
+# FINAL RECOMMENDED TABLE (2026-07-09 measurement tranche, judge-amended)
+
+Source: 8-agent measurement pass (Retrosheet 2005-25, 49,486 games, fresh parses
+validated 100% vs official gamelogs) + xhigh adversarial judge (33 verdicts, 0
+refuted). All values are drop-in pair_rho in the pricer's own metric (20-tuple
+parity through shipped `gaussian_copula_joint_prob` ≤0.0014). **Still gated on
+the tape backtest per rule 8.**
+
+## [A] Orientation-free — stage now
+
+| pair | ρ | band | note |
+|---|---|---|---|
+| player_ks\|total | **−0.25** | 0.12 | ladder-FLAT across all posted K lines 3.5–8.5 → ONE entry serves every KS rung; **operator's K-line question RESOLVED: self-median convention validated, no posted-line re-measurement needed** |
+| player_hr\|total | **+0.24** | 0.10 | MEASURED +0.233 (was derived prior 0.25/0.20); game frame, below team-frame +0.367 as dilution requires |
+| player_hit\|total | **+0.25** | 0.12 | rung-monotone 0.19(1+)/0.25(2+)/0.30(3+); per-rung +0.21/+0.27/+0.31 band 0.10 if router line-keys |
+| player_tb\|total | **+0.27** | 0.10 | rungs 2+ 0.26 / 4+ 0.28 |
+| player_hrr\|total | **+0.40** | 0.08 | starters-only population; line-monotone 0.33/0.40/0.44 |
+| rfi\|total | **+0.37** | 0.10 | strongest + most era-stable pair measured |
+| moneyline\|rfi | 0.00 | 0.05 | team-symmetric → independence |
+| rfi\|player_ks | **−0.10** | 0.08 | orientation-free, shippable without resolver |
+| player_ks\|player_ks | **+0.04** | 0.08 | opposing starters, sign confirmed small-positive |
+| spread\|total | **+0.13** | 0.10 | copula fallback only (structural grid supersedes); parity coupling explains fixed-line oscillation |
+| moneyline\|spread | **CONTAINMENT routing** | — | exact, 0/98,980 violations; fallbacks :same +0.95 / :opp −0.95 (opp = mutual exclusion, p11=0.0 exact) |
+
+## [B] Same-family batter pairs — ship WITH teammate/opponent ticker-prefix routing (no ML resolver needed)
+
+| pair | teammate | opponent | unrouted fallback |
+|---|---|---|---|
+| player_hr\|player_hr | +0.04/0.06 | +0.02/0.05 | +0.03/0.06 |
+| player_hit\|player_hit | +0.07/0.06 | 0.00/0.06 | 0.00/0.08 |
+| player_tb\|player_tb | +0.06/0.05 | 0.00/0.06 | 0.00/0.08 |
+| player_hrr\|player_hrr | +0.17/0.06 | 0.00/0.05 | +0.08/0.12 |
+
+PLUS: +2–3¢ symmetric WIDTH (never ρ inflation) on same-family all-NO baskets ≥8 legs
+(pairwise-Gaussian understates the joint tail by ~2¢; shape-dependent sign).
+
+## [C] ML-orientation-resolver-gated (neutralized now → signed later)
+
+| pair | now | with resolver |
+|---|---|---|
+| moneyline\|player_ks | 0.00/0.30 | ±0.24/0.06 (ladder-flat) |
+| moneyline\|player_hr | 0.00/0.28 | ±0.23/0.08 (2+ rung +0.27) |
+| moneyline\|player_hit | 0.00/**0.26** (widened) | ±0.23/0.08 |
+| moneyline\|player_hrr | ADD 0.00/0.40 | ±0.37/0.08 |
+| player_hit\|player_ks | 0.00/**0.15** (tightened) | facing −0.13/0.10, teammate 0.00/0.05 |
+| player_hr\|player_ks | **ADD 0.00/0.12** (was missing; 11,628 pairs/10h sign-wrong at +0.6) | facing −0.075/0.05 |
+| player_hrr\|player_ks | ADD 0.00/0.20 | facing −0.18/0.06 (teammate unmeasured → measure) |
+| player_tb\|player_ks | ADD 0.00/0.15 | MEASURE |
+
+## [D] Cross-family batter-batter distinct-player — THE remaining measurement gap
+
+hit|hr, hit|hrr, hit|tb, hr|tb, hrr|tb (~31k same-game pairs/10h): labeled priors
+teammate +0.06/0.10, opponent 0.00/0.06 (unrouted +0.04/0.10) — bounded by
+measured same-family values; MEASURE from existing parsed npz (hours). Only
+player_hr|player_hrr is measured: teammate +0.05/0.06, opponent 0.00/0.05.
+
+## [E] Structural / routing (not ρ)
+
+- SAME-PLAYER cross-family = deterministic containment (HR-k ⇒ HIT≥k, TB≥4k;
+  HIT-k ⇒ TB≥k; HR ⇒ HRR≥3 EXACT 101,186/101,186; P(HRR≥5|HR)=0.529 conditional).
+  6.5% of cross-family flow (5,591 pairs/10h).
+- Same-family same-player rungs: ZERO observed flow (0/223,096) — generic
+  nested-threshold guard as free safety, no calibration.
+- Cross-game same-day: independence stands (+0.007, CI under 0.02 threshold);
+  doubleheader-spanning combos → UNKNOWN/wide.
+- **event_mutually_exclusive: RESOLVED, NOT a blocker** — live probe 24/24: all 6
+  prop families FALSE (baskets reachable today, merely uncalibrated); KXMLBGAME
+  TRUE (correctly IMPOSSIBLE's YES+YES). Ship a ground-truth fixture pinning
+  these flags.
+- HR/HIT rungs DRIFT (+0.04–0.08 per rung, CI excludes 0) → per-rung entries;
+  danger direction: single 1+ ρ UNDERSTATES deep-rung joints = sells cheap.
+  K pairs are ladder-FLAT → one entry each.
