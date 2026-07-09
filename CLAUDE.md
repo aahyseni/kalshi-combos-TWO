@@ -23,6 +23,33 @@ vs realized P&L — never on single outcomes.
 5. Money/prices are integers (centi-cents) outside the simulator. Binary floats
    for money are banned. Floats are fine in probability space.
 6. Missing or stale data ⇒ no-quote. Every decision logged with a reason code.
+7. **Reporting + handoff discipline (operator directive 2026-07-08, extended
+   2026-07-09).** Every crucial update, test, or finding gets a dated `.md` in
+   `docs/reports/` **as it happens** — one file per test/update, indexed
+   newest-first in `docs/reports/README.md`, each ending with a NEXT STEPS footer.
+   **AND** keep a live **RESUME STATE** current at all times (latest dated
+   `*-session-state-resume.md` + the operator resume memory) so that if the
+   terminal closes, the context compacts, or a new agent/model picks this up, it
+   knows **exactly what's been done, what's running (with restart commands +
+   watermarks), what's in flight, and what to do next** — without re-deriving.
+   Update it whenever state changes (a process started, a blocker moved, a
+   decision made). This is a standing rule, not a per-request ask.
+8. **Testing isolation (operator directive 2026-07-09).** Live pricing/engine
+   modules stay **PRISTINE**. Backtest/analysis scripts (`tools/`) may freely
+   **import and call** live pricing code + the shipped config (always the real
+   thing — never a reimplementation, never agents) but must **NEVER edit a live
+   module or add a test-only entry point to one** (e.g. no `fair_from_marginals`
+   bolted onto the engine). A change surfaced by a backtest is prototyped in the
+   test script (or a config override) **first**, validated there, and only THEN
+   ported to the live module — followed immediately by a **parity check**: the
+   live output must equal the test-validated output **to the cent on the same
+   inputs** before the port is trusted. Exceptions/notes: (a) unit tests under
+   `tests/` are exempt — they test live modules directly by design; (b) a pure
+   config-value promote (a ρ, a flag) needs only a re-run of the backtest against
+   the promoted config, since there's no code to drift; (c) if a test script must
+   duplicate any live logic (e.g. the harness copies the engine's ~15-line model
+   dispatch because `engine.price()` needs order books a backtest lacks), keep a
+   "keep in sync with <live location>" comment and cover it with the parity check.
 
 ## Quiet-failure defenses (operator directive 2026-07-05 — standing rules)
 

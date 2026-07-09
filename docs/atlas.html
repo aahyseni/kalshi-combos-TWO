@@ -1,0 +1,552 @@
+<style>
+  :root{
+    --bg:#080B10; --bg2:#0B0F16; --panel:#0F151D; --panel2:#131B25; --elev:#18212D;
+    --line:#1E2833; --line-soft:#182029; --glass:rgba(20,28,38,.6);
+    --ink:#EEF4F9; --muted:#93A2B1; --dim:#5B6975;
+    --teal:#2DD4BF; --teal-d:#0e3f3a; --violet:#9B8CFA; --gold:#F5C15A;
+    --ship:#45D488; --ship-d:#0f2c1d; --gate:#EBA53E; --gate-d:#2c210c;
+    --block:#FB6E83; --block-d:#2c1218; --off:#5B6975; --off-d:#161c23;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"Cascadia Code","JetBrains Mono","SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.62;
+    -webkit-font-smoothing:antialiased;
+    background-image:
+      radial-gradient(900px 460px at 88% -6%,rgba(45,212,191,.10),transparent 62%),
+      radial-gradient(760px 420px at -6% 8%,rgba(155,140,250,.08),transparent 60%),
+      radial-gradient(1000px 700px at 50% 118%,rgba(245,193,90,.05),transparent 60%);
+    background-attachment:fixed;}
+  .mono{font-family:var(--mono)} .num{font-variant-numeric:tabular-nums}
+  a{color:var(--teal);text-decoration:none}
+  ::selection{background:rgba(45,212,191,.28)}
+
+  .shell{display:grid;grid-template-columns:256px 1fr;min-height:100vh}
+  /* ---------- nav ---------- */
+  nav{position:sticky;top:0;height:100vh;overflow-y:auto;padding:24px 15px 30px;
+    border-right:1px solid var(--line);background:linear-gradient(180deg,rgba(18,26,36,.5),rgba(8,11,16,.2));
+    backdrop-filter:blur(8px)}
+  .brand{display:flex;gap:11px;align-items:center;padding:2px 8px 18px;margin-bottom:10px;border-bottom:1px solid var(--line)}
+  .brand .mk{width:30px;height:30px;border-radius:8px;flex:0 0 auto;position:relative;
+    background:linear-gradient(135deg,var(--teal),#1c8fa0);box-shadow:0 0 18px rgba(45,212,191,.45)}
+  .brand .mk::after{content:"";position:absolute;inset:8px;border-radius:3px;border:2px solid rgba(8,11,16,.7)}
+  .brand b{font-size:15.5px;letter-spacing:-.01em;display:block;line-height:1.1}
+  .brand small{font-family:var(--mono);font-size:9.5px;letter-spacing:.16em;color:var(--dim)}
+  .navlink{display:flex;align-items:center;gap:11px;width:100%;text-align:left;border:0;background:none;cursor:pointer;
+    color:var(--muted);font-size:13.5px;padding:9px 11px;border-radius:9px;margin:1px 0;transition:.16s;position:relative}
+  .navlink .ix{font-family:var(--mono);font-size:10px;color:var(--dim);min-width:14px}
+  .navlink:hover{background:var(--elev);color:var(--ink)}
+  .navlink.active{background:linear-gradient(90deg,rgba(45,212,191,.16),rgba(45,212,191,.03));color:var(--teal)}
+  .navlink.active::before{content:"";position:absolute;left:0;top:8px;bottom:8px;width:2.5px;border-radius:2px;background:var(--teal);box-shadow:0 0 8px var(--teal)}
+  .navlink.active .ix{color:var(--teal)}
+  .legend{margin-top:18px;padding-top:14px;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:7px}
+  .lg{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:10px;color:var(--muted)}
+  .lg .sw{width:9px;height:9px;border-radius:2px}
+  .live{display:flex;align-items:center;gap:7px;margin-top:14px;font-family:var(--mono);font-size:10px;color:var(--dim)}
+  .live .pulse{width:7px;height:7px;border-radius:50%;background:var(--ship);box-shadow:0 0 0 0 rgba(69,212,136,.6);animation:pulse 2.4s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(69,212,136,.5)}70%{box-shadow:0 0 0 7px rgba(69,212,136,0)}100%{box-shadow:0 0 0 0 rgba(69,212,136,0)}}
+
+  main{max-width:1120px;width:100%}
+  section[data-sec]{display:none;padding:46px 52px 100px}
+  section[data-sec].on{display:block;animation:rise .45s cubic-bezier(.2,.7,.2,1)}
+  @keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+  @media(prefers-reduced-motion:reduce){section[data-sec].on{animation:none}.pulse{animation:none}}
+
+  .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:var(--teal);margin:0 0 14px;display:flex;align-items:center;gap:10px}
+  .eyebrow::after{content:"";height:1px;flex:1;background:linear-gradient(90deg,rgba(45,212,191,.4),transparent)}
+  h1{font-weight:800;font-size:clamp(30px,4.4vw,50px);line-height:1.04;letter-spacing:-.025em;margin:0 0 16px;text-wrap:balance}
+  h1 .hl{background:linear-gradient(120deg,var(--teal),var(--violet));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+  h2{font-weight:700;font-size:23px;letter-spacing:-.015em;margin:44px 0 4px;display:flex;align-items:center;gap:12px}
+  h2 .tag{font-family:var(--mono);font-size:10.5px;color:var(--dim);font-weight:400;letter-spacing:.05em}
+  h3{font-size:14.5px;font-weight:650;margin:0 0 4px;letter-spacing:-.01em}
+  p{color:#C6D2DC;max-width:74ch} .lead{font-size:17.5px;line-height:1.55;color:var(--muted);max-width:70ch;font-weight:400}
+  .lead b{color:var(--ink);font-weight:650}
+  code{font-family:var(--mono);font-size:12px;background:rgba(45,212,191,.08);border:1px solid var(--teal-d);padding:1px 6px;border-radius:5px;color:var(--teal)}
+
+  .st{font-family:var(--mono);font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;padding:3px 8px;border-radius:6px;border:1px solid;white-space:nowrap;display:inline-flex;align-items:center;gap:5px}
+  .st::before{content:"";width:5px;height:5px;border-radius:50%;background:currentColor}
+  .st.ship{color:var(--ship);border-color:#1e4230;background:var(--ship-d)}
+  .st.gate{color:var(--gate);border-color:#4a3a12;background:var(--gate-d)}
+  .st.block{color:var(--block);border-color:#48222b;background:var(--block-d)}
+  .st.off{color:var(--off);border-color:#28323c;background:var(--off-d)}
+  .st.coded{color:#6FB2EE;border-color:#1d3850;background:#0c1926}
+  .callout.coded{border-left-color:#6FB2EE;background:linear-gradient(90deg,rgba(111,178,238,.07),transparent)}
+
+  .grid{display:grid;gap:15px}.g2{grid-template-columns:repeat(2,1fr)}.g3{grid-template-columns:repeat(3,1fr)}.g4{grid-template-columns:repeat(4,1fr)}
+  .card{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:14px;padding:17px 18px;transition:.2s;position:relative;overflow:hidden}
+  .card:hover{border-color:#2c3a47;transform:translateY(-2px);box-shadow:0 12px 30px -14px rgba(0,0,0,.7)}
+  .card .top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:6px}
+  .card p{font-size:13px;color:var(--muted);margin:0}
+  .card .meta{font-family:var(--mono);font-size:10.5px;color:var(--dim);margin-top:11px;display:flex;gap:8px;flex-wrap:wrap}
+  .card .meta span{background:var(--elev);padding:2px 7px;border-radius:5px}
+
+  .hero-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:30px 0 8px}
+  .hs{background:var(--glass);border:1px solid var(--line);border-radius:14px;padding:18px 18px;position:relative;overflow:hidden}
+  .hs::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--teal),transparent)}
+  .hs .v{font-family:var(--mono);font-size:30px;font-weight:700;letter-spacing:-.02em;line-height:1}
+  .hs .l{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);margin-top:8px}
+  .hs .v.teal{color:var(--teal)}.hs .v.green{color:var(--ship)}.hs .v.gold{color:var(--gold)}.hs .v.block{color:var(--block)}
+
+  .tw{overflow-x:auto;border:1px solid var(--line);border-radius:12px;margin-top:14px}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  th{text-align:left;font-family:var(--mono);font-size:9.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--dim);font-weight:500;padding:11px 13px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0}
+  td{padding:10px 13px;border-bottom:1px solid var(--line-soft);color:#C6D2DC;vertical-align:middle}
+  tr:last-child td{border-bottom:none} tbody tr:hover{background:rgba(45,212,191,.04)}
+  td.k{font-family:var(--mono);font-size:12px;color:var(--ink)} .num{text-align:right}
+  .rho{font-family:var(--mono);font-weight:600;text-align:center;border-radius:6px;padding:3px 8px;min-width:56px;display:inline-block;font-variant-numeric:tabular-nums}
+  .ci{font-family:var(--mono);font-size:11px;color:var(--dim)}
+
+  .callout{border:1px solid var(--line);border-left:3px solid var(--teal);background:linear-gradient(90deg,rgba(45,212,191,.06),transparent);border-radius:0 12px 12px 0;padding:14px 18px;margin:18px 0;font-size:14px;color:#C6D2DC}
+  .callout.gate{border-left-color:var(--gate);background:linear-gradient(90deg,rgba(235,165,62,.07),transparent)}
+  .callout.block{border-left-color:var(--block);background:linear-gradient(90deg,rgba(251,110,131,.06),transparent)}
+  .callout b{color:var(--ink)}
+
+  /* ---------- data-flow pipeline ---------- */
+  .pipe{display:flex;flex-wrap:wrap;gap:0;align-items:stretch;margin:22px 0;overflow-x:auto;padding-bottom:6px}
+  .stg{flex:1 1 120px;min-width:120px;background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:12px;padding:13px;cursor:pointer;transition:.18s}
+  .stg:hover{border-color:var(--teal);box-shadow:0 0 0 1px var(--teal-d),0 8px 24px -12px rgba(45,212,191,.5);transform:translateY(-3px)}
+  .stg .n{font-family:var(--mono);font-size:9px;letter-spacing:.12em;color:var(--dim)}
+  .stg .t{font-family:var(--mono);font-size:12.5px;font-weight:650;margin:5px 0 4px;color:var(--teal)}
+  .stg .s{font-size:11px;color:var(--muted);line-height:1.35}
+  .ar{display:flex;align-items:center;color:#33414d;font-size:15px;padding:0 4px}
+  @media(max-width:860px){.ar{transform:rotate(90deg)}}
+
+  /* ---------- flowchart ---------- */
+  .flow{max-width:640px;margin:20px auto 8px}
+  .fnode{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:12px;padding:13px 16px;position:relative}
+  .fnode .fl{font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.06em}
+  .fnode .ft{font-weight:650;font-size:14px;margin-top:2px}
+  .fnode .fs{font-size:12px;color:var(--muted);margin-top:2px}
+  .fnode.dec{border-color:var(--violet);background:linear-gradient(180deg,rgba(155,140,250,.09),var(--panel))}
+  .fnode.dec .fl{color:var(--violet)}
+  .fnode.term{border-color:var(--teal);background:linear-gradient(180deg,rgba(45,212,191,.12),var(--panel));box-shadow:0 0 30px -12px rgba(45,212,191,.6)}
+  .fnode.term .ft{color:var(--teal)}
+  .fconn{height:26px;width:2px;background:linear-gradient(180deg,var(--line),#33414d);margin:0 auto;position:relative}
+  .fconn::after{content:"▾";position:absolute;bottom:-4px;left:50%;transform:translateX(-50%);color:#33414d;font-size:11px}
+  .fbranch{display:flex;gap:10px;margin:10px 0;flex-wrap:wrap}
+  .fexit{flex:1;min-width:180px;border:1px dashed;border-radius:10px;padding:10px 13px;font-size:12px}
+  .fexit .el{font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;margin-bottom:3px}
+  .fexit.no{border-color:#48222b;background:var(--block-d);color:#e6a9b2}.fexit.no .el{color:var(--block)}
+  .fexit.alt{border-color:#4a3a12;background:var(--gate-d);color:#e8cd9a}.fexit.alt .el{color:var(--gate)}
+  .fexit.go{border-color:#1e4230;background:var(--ship-d);color:#a7e6c4}.fexit.go .el{color:var(--ship)}
+  .fexit code{background:rgba(0,0,0,.25);border-color:transparent}
+
+  /* ---------- sport tabs ---------- */
+  .tabs{display:flex;gap:8px;flex-wrap:wrap;margin:22px 0 20px}
+  .tab{font-family:var(--mono);font-size:12px;letter-spacing:.04em;padding:8px 14px;border-radius:9px;border:1px solid var(--line);background:var(--panel);color:var(--muted);cursor:pointer;transition:.16s;display:flex;align-items:center;gap:8px}
+  .tab .dot{width:6px;height:6px;border-radius:50%}
+  .tab:hover{border-color:#2c3a47;color:var(--ink)}
+  .tab.active{border-color:var(--teal);color:var(--teal);background:rgba(45,212,191,.08);box-shadow:0 0 20px -8px rgba(45,212,191,.6)}
+  .sport{display:none} .sport.on{display:block;animation:rise .35s ease}
+
+  .rail{list-style:none;padding:0;margin:16px 0}
+  .rail li{display:grid;grid-template-columns:44px 1fr;gap:16px;padding:16px 0;border-bottom:1px solid var(--line-soft)}
+  .rail .ph{font-family:var(--mono);font-size:15px;color:var(--teal);font-weight:700}
+  .rail .ph small{display:block;font-size:9px;color:var(--dim);letter-spacing:.1em;margin-top:3px}
+  footer{color:var(--dim);font-family:var(--mono);font-size:11px;padding:26px 52px 44px;border-top:1px solid var(--line)}
+
+  @media(max-width:860px){
+    .shell{grid-template-columns:1fr} nav{position:static;height:auto} .navlinks{display:flex;flex-wrap:wrap;gap:3px}
+    section[data-sec]{padding:30px 20px 70px} .hero-stats,.g2,.g3,.g4{grid-template-columns:1fr 1fr}
+  }
+</style>
+
+<div class="shell">
+  <nav>
+    <div class="brand"><div class="mk"></div><div><b>combomaker</b><small>KALSHI COMBO MM</small></div></div>
+    <div class="navlinks" id="nav"></div>
+    <div class="legend">
+      <div class="lg"><span class="sw" style="background:var(--ship)"></span>proven — seen it work</div>
+      <div class="lg"><span class="sw" style="background:#6FB2EE"></span>coded — not verified</div>
+      <div class="lg"><span class="sw" style="background:var(--gate)"></span>in progress</div>
+      <div class="lg"><span class="sw" style="background:var(--block)"></span>blocked</div>
+      <div class="lg"><span class="sw" style="background:var(--off)"></span>not built</div>
+    </div>
+    <div class="live"><span class="pulse"></span>recorder live · phase 6</div>
+  </nav>
+
+  <main>
+    <!-- ===== OVERVIEW ===== -->
+    <section data-sec="overview" data-title="Overview" class="on">
+      <p class="eyebrow">System atlas — living document</p>
+      <h1>We price the <span class="hl">correlation</span><br>nobody else models.</h1>
+      <p class="lead">combomaker is a maker-side pricer for Kalshi combo (parlay)
+        RFQs. Leg marginals come free from Kalshi's order books — the only thing we
+        build bottom-up is <b>how the legs move together</b>. That joint layer is the
+        moat; everything else is discipline.</p>
+
+      <div class="hero-stats">
+        <div class="hs"><div class="v teal num" data-count="54">54</div><div class="l">source modules · 13.5k LOC</div></div>
+        <div class="hs"><div class="v green num" data-count="984">984</div><div class="l">tests green · 61 files</div></div>
+        <div class="hs"><div class="v gold num" data-count="37">37</div><div class="l">soccer ρ pairs calibrated</div></div>
+        <div class="hs"><div class="v block num" data-count="1">1</div><div class="l">blocker to live fills</div></div>
+      </div>
+
+      <h2>The strategy <span class="tag">one line</span></h2>
+      <p><b>Sell parlays, never buy them.</b> We quote only the NO side of a combo
+        (<code>yes_bid=0</code>), so we can only ever land <b>long NO</b> and win when
+        a parlay busts — which it does ~93% of the time. Markup is deliberately thin
+        (~1¢): settlement data proved wider markup is <em>adversely selected</em>, not
+        safer.</p>
+
+      <div class="grid g3" style="margin-top:18px">
+        <div class="card"><div class="top"><h3>Where we are</h3><span class="st gate">building</span></div><p>Scaffold, market data, observe, and demo round-trips are <b>proven</b>. Pricing is in progress (correlations incomplete); risk + MC are <b>coded but unverified</b>. Now shadowing prod flow read-only.</p></div>
+        <div class="card"><div class="top"><h3>Just shipped</h3><span class="st ship">07-08</span></div><p>Sell-only parlay-seller mode — verified airtight by two independent agents. The engine can never emit a non-zero <code>yes_bid</code> on a combo.</p></div>
+        <div class="card"><div class="top"><h3>The one blocker</h3><span class="st block">pending</span></div><p>Combo NO-settlement convention unverified → sell-only fills are inert (fail-safe). A live demo NO position settles ~Jul 11 to confirm it.</p></div>
+      </div>
+      <div class="callout">Click into <b>Pricing</b> for the RFQ→quote flowchart, or
+        <b>Correlations → Soccer</b> for every calibrated ρ with its source and
+        confidence. This map is meant to grow as sports come online.</div>
+    </section>
+
+    <!-- ===== DATA FLOW ===== -->
+    <section data-sec="dataflow" data-title="Data flow">
+      <p class="eyebrow">Architecture</p>
+      <h1>Secrets to a filled quote.</h1>
+      <p class="lead">Every RFQ rides this pipeline, strictly in-memory on the hot
+        path — the pricer <b>peeks</b> at cached state, never fetches. Tap a stage.</p>
+      <div class="pipe">
+        <div class="stg" data-go="execution"><div class="n">00 SECRETS</div><div class="t">.env → config</div><div class="s">RSA keys · YAML per env · prod guard</div></div><div class="ar">→</div>
+        <div class="stg" data-go="execution"><div class="n">01 EXCHANGE</div><div class="t">auth · REST · WS</div><div class="s">signed client · comms channel</div></div><div class="ar">→</div>
+        <div class="stg" data-go="execution"><div class="n">02 MARKETDATA</div><div class="t">feed · book · grid</div><div class="s">live leg mids + metadata</div></div><div class="ar">→</div>
+        <div class="stg" data-go="execution"><div class="n">03 RFQ</div><div class="t">intake · filters</div><div class="s">whitelist · freshness · sport-only</div></div><div class="ar">→</div>
+        <div class="stg" data-go="pricing"><div class="n">04 PRICING</div><div class="t">engine → quote</div><div class="s">marginals × correlation</div></div><div class="ar">→</div>
+        <div class="stg" data-go="risk"><div class="n">05 RISK</div><div class="t">exposure · last-look</div><div class="s">caps · kill · in-play</div></div><div class="ar">→</div>
+        <div class="stg" data-go="execution"><div class="n">06 EXECUTE</div><div class="t">lifecycle</div><div class="s">quote→accept→confirm→fill</div></div>
+      </div>
+      <h2>The layers <span class="tag">by LOC</span></h2>
+      <div class="tw"><table>
+        <thead><tr><th>Layer</th><th>Modules</th><th class="num">LOC</th><th>Does</th><th>Status</th></tr></thead>
+        <tbody id="layers"></tbody>
+      </table></div>
+    </section>
+
+    <!-- ===== PRICING ===== -->
+    <section data-sec="pricing" data-title="Pricing engine">
+      <p class="eyebrow">Pricing · the spine</p>
+      <h1>From RFQ to maker bid.</h1>
+      <p class="lead">The engine is a <b>fail-closed</b> pipeline — every branch that
+        isn't provably safe exits to a reasoned no-quote, never a hole in the price.
+        Here's the actual control flow.</p>
+      <div class="callout gate"><b>Pricing is not done.</b> The spine below is coded and
+        produces quotes we've backtested — but the <b>correlation surface is far from
+        complete</b> (many pair types, player props, and sports still to build), and the
+        fairs aren't yet validated against real settlements. Treat this as a working
+        skeleton, not a finished pricer.</div>
+      <div class="flow" id="flow"></div>
+      <h2>Modules <span class="tag">pricing/</span></h2>
+      <div class="grid g2" id="pmods"></div>
+    </section>
+
+    <!-- ===== CORRELATIONS ===== -->
+    <section data-sec="correlations" data-title="Correlations">
+      <p class="eyebrow">Pricing · the moat</p>
+      <h1>Correlation, by sport.</h1>
+      <p class="lead">The joint layer is the only thing modeled bottom-up. Each sport
+        is its own calibration with its own out-of-sample gate — a model that doesn't
+        beat the copula on held-out data doesn't ship. Pick a sport.</p>
+      <div class="callout gate"><b>The correlation surface is far from complete.</b>
+        Soccer is the furthest along by a wide margin; MLB is partial, NBA gated, UFC &
+        Tennis unbuilt — and even within soccer, many pair types and player props remain.
+        This is the biggest open work in the whole system.</div>
+      <div class="tabs" id="sporttabs"></div>
+      <div id="sports"></div>
+    </section>
+
+    <!-- ===== RISK ===== -->
+    <section data-sec="risk" data-title="Risk engine">
+      <p class="eyebrow">Risk · the edge</p>
+      <h1>The book, the caps, the last look.</h1>
+      <p class="lead">Pricing is a commodity; discipline is the edge. Risk gates every
+        quote before it leaves and again at confirm, and flattens the book on a kill.</p>
+      <div class="callout coded"><b>Coded, not proven.</b> Every module below is written
+        and unit-tested, but <b>none of it has run against live flow</b> — the exposure
+        book, mass-acceptance worst case, and Monte-Carlo engine have never been
+        stress-tested in reality. "coded" here means the code exists and the tests pass,
+        not that we've seen it hold up.</div>
+      <div class="grid g3" id="riskmods"></div>
+      <div class="callout"><b>Self-grading defense.</b> Markouts are computed against
+        BOTH our fair and raw leg mids (a biased fair can't grade itself), and the EV
+        ledger is scored on aggregate expected-edge vs realized P&L — never single
+        outcomes. Settlements are the one ruler the model can't bend.</div>
+    </section>
+
+    <!-- ===== EXECUTION ===== -->
+    <section data-sec="execution" data-title="Execution & ops">
+      <p class="eyebrow">Execution · ops · plumbing</p>
+      <h1>The confirm handshake.</h1>
+      <div class="pipe">
+        <div class="stg"><div class="n">1</div><div class="t">quote</div><div class="s">two maker bids sent</div></div><div class="ar">→</div>
+        <div class="stg"><div class="n">2</div><div class="t">accept</div><div class="s">taker lifts a side</div></div><div class="ar">→</div>
+        <div class="stg"><div class="n">3</div><div class="t">last look</div><div class="s">re-check within 3s</div></div><div class="ar">→</div>
+        <div class="stg"><div class="n">4</div><div class="t">confirm</div><div class="s">or lapse (silent void)</div></div><div class="ar">→</div>
+        <div class="stg"><div class="n">5</div><div class="t">fill</div><div class="s">signed position booked</div></div>
+      </div>
+      <h2>Plumbing</h2>
+      <div class="grid g2" id="exmods"></div>
+    </section>
+
+    <!-- ===== PHASES ===== -->
+    <section data-sec="phases" data-title="Phase map">
+      <p class="eyebrow">Where we're heading</p>
+      <h1>Phase map.</h1>
+      <p class="lead">Each phase ends with passing tests, a demo, and an
+        assumption-audit table in <code>NOTES.md</code>. Through Phase 5, into 6.</p>
+      <ul class="rail" id="rail"></ul>
+    </section>
+
+    <!-- ===== TESTS ===== -->
+    <section data-sec="tests" data-title="Tests & proof">
+      <p class="eyebrow">Verification</p>
+      <h1>How we stay honest.</h1>
+      <p class="lead">The failure we defend against: an assumption wrong the same way
+        in the code <em>and</em> its test — so everything's green while it loses money.
+        The defenses are structural.</p>
+      <div class="hero-stats">
+        <div class="hs"><div class="v green num" data-count="984">984</div><div class="l">tests passing</div></div>
+        <div class="hs"><div class="v teal num" data-count="61">61</div><div class="l">test files · 11k LOC</div></div>
+        <div class="hs"><div class="v num">strict</div><div class="l">mypy · ruff clean</div></div>
+        <div class="hs"><div class="v gold num" data-count="3">3</div><div class="l">OOS model gates passed</div></div>
+      </div>
+      <h2>Structural defenses</h2>
+      <div class="grid g2" id="defenses"></div>
+      <h2>Backtests & live tests</h2>
+      <div class="tw"><table>
+        <thead><tr><th>Test</th><th>Scope</th><th>Result</th></tr></thead>
+        <tbody id="backtests"></tbody>
+      </table></div>
+    </section>
+
+    <!-- ===== REPORTS ===== -->
+    <section data-sec="reports" data-title="Reports">
+      <p class="eyebrow">The record</p>
+      <h1>Reports channel.</h1>
+      <p class="lead">A dated <code>.md</code> per crucial test, update, or finding
+        (<code>docs/reports/</code>) so any session is 100% informed without
+        re-deriving. Standing rule, CLAUDE.md #7.</p>
+      <div class="tw"><table>
+        <thead><tr><th>Date</th><th>Report</th><th>State</th></tr></thead>
+        <tbody id="reports"></tbody>
+      </table></div>
+    </section>
+
+    <footer>combomaker system atlas · v2 · 2026-07-09 — living document. Proven (seen it work): scaffold · market data · observe · demo round-trips. Coded but unverified: risk + MC. In progress: pricing (correlation surface far from complete). Phase 6 shadow recorder running; sell-only book inert pending the combo-settlement convention.</footer>
+  </main>
+</div>
+
+<script>
+(function(){
+  var $=function(id){return document.getElementById(id)};
+  /* ---- nav ---- */
+  var secs=[].slice.call(document.querySelectorAll('section[data-sec]'));
+  var nav=$('nav');
+  secs.forEach(function(s,i){var b=document.createElement('button');
+    b.className='navlink'+(s.classList.contains('on')?' active':'');
+    b.innerHTML='<span class="ix">'+String(i).padStart(2,'0')+'</span>'+s.getAttribute('data-title');
+    b.onclick=function(){show(s.getAttribute('data-sec'))};nav.appendChild(b);});
+  var links=[].slice.call(nav.children).filter(function(x){return x.className.indexOf('navlink')>=0});
+  function show(id){secs.forEach(function(s){s.classList.toggle('on',s.getAttribute('data-sec')===id)});
+    links.forEach(function(l,i){l.classList.toggle('active',secs[i].getAttribute('data-sec')===id)});
+    window.scrollTo(0,0);if(history.replaceState)history.replaceState(null,'','#'+id);
+    if(id==='overview'||id==='tests')counts();}
+  document.querySelectorAll('[data-go]').forEach(function(e){e.onclick=function(){show(e.getAttribute('data-go'))}});
+
+  /* ---- count-up ---- */
+  function counts(){document.querySelectorAll('[data-count]').forEach(function(el){
+    if(el.dataset.done)return;var t=+el.getAttribute('data-count'),d=900,s=performance.now();
+    (function tick(now){var p=Math.min(1,(now-s)/d);el.textContent=Math.round(t*(1-Math.pow(1-p,3)));
+      if(p<1)requestAnimationFrame(tick);else{el.textContent=t;el.dataset.done=1}})(s);});}
+  counts();
+
+  /* ---- rho color ---- */
+  function rhoCol(r){var a=Math.min(1,Math.abs(r));
+    if(Math.abs(r)<.06)return['rgba(120,132,145,.14)','#9aa6b2'];
+    if(r>0)return['rgba(245,140,80,'+(.12+a*.5)+')','#ffc9a6'];
+    return['rgba(120,150,245,'+(.12+a*.5)+')','#bcccff'];}
+  function rhoCell(r,txt){var c=rhoCol(r);return '<span class="rho" style="background:'+c[0]+';color:'+c[1]+'">'+(txt||(r>0?'+':'')+r.toFixed(2))+'</span>';}
+
+  /* ---- data ---- */
+  var layers=[
+    ['core','money · clock · reasons · quantity · conventions',424,'Centi-cent money, injectable clock, ground-truth conventions','ship'],
+    ['exchange','auth · rest · ws',673,'RSA-PSS signing, thin REST client, WS comms channel','ship'],
+    ['marketdata','feed · orderbook · grid · metadata',717,'Live leg books, price grid, combo metadata cache','ship'],
+    ['rfq','intake · filters · models · lifecycle',1148,'Parse, gate, and run the quote→confirm state machine','ship'],
+    ['pricing','engine · quote · joint · sgp · dixon_coles · structural · …',4515,'Marginals → relationship → correlation → maker bid. Spine works; correlations incomplete','gate'],
+    ['risk','exposure · limits · lastlook · inplay · killswitch · markouts',738,'Coded + unit-tested — NOT verified against live flow','coded'],
+    ['sim','engine',285,'Monte-Carlo joint settlement — coded, never run in anger','coded'],
+    ['ops','app · quote_app · cli · ground_truth · persistence · config',2935,'Wiring, SQLite store, CLIs, Phase-2.5 harness','ship'],
+    ['hedging','planner',44,'Residual correlation hedging','off']];
+  var stLbl={ship:'proven',coded:'coded',gate:'in progress',off:'not built',block:'blocked'};
+  $('layers').innerHTML=layers.map(function(r){return '<tr><td class="k">'+r[0]+'</td><td style="color:var(--muted);font-size:12px">'+r[1]+'</td><td class="k num">'+r[2].toLocaleString()+'</td><td style="font-size:12.5px">'+r[3]+'</td><td><span class="st '+r[4]+'">'+stLbl[r[4]]+'</span></td></tr>'}).join('');
+
+  /* flowchart */
+  var flow=[
+    {t:'RFQ arrives',s:'combo market ticker + size',l:'ENTRY'},
+    {dec:1,t:'is_combo & all leg sides known?',l:'GUARD',exits:[['no','no','no-quote','CLASSIFIER_UNKNOWN']]},
+    {t:'classify_legs → Relationship',s:'legtypes + mutual-exclusion + containment',l:'CLASSIFY'},
+    {dec:1,t:'relationship kind?',l:'BRANCH',exits:[
+      ['IMPOSSIBLE','alt','farmable? → farm the certain-NO (yes_bid=0)  ·  else no-quote','RELATIONSHIP'],
+      ['UNKNOWN','no','no-quote','CLASSIFIER_UNKNOWN'],
+      ['CONTAINMENT','go','price_containment → P(subset)','']]},
+    {t:'fetch beliefs',s:'Kalshi book mid + external-odds blend (fail-closed)',l:'OK PATH'},
+    {dec:1,t:'structural_applicable?',l:'MODEL',exits:[
+      ['yes','go','Dixon-Coles / margin-total / mlb-runs','STRUCTURAL'],
+      ['no','alt','Gaussian copula + priced ρ-uncertainty + Fréchet','COPULA']]},
+    {t:'safety clamps',s:'cap our bid BELOW the individual legs so we never hand the taker a risk-free arb · widen on longshots so a surprise hit doesn\'t wreck the short side',l:'GUARDRAILS'},
+    {t:'construct_quote',s:'width (base+legs+unc+size+time) · fees · maker-favorable rounding',l:'QUOTE'},
+    {dec:1,t:'sell_parlays_only?',l:'FADE DEFENSE',exits:[['yes','go','yes_bid = 0  (never long the parlay)','']]},
+    {term:1,t:'MAKER BID',s:'yes_bid · no_bid, snapped to grid — or reasoned no-quote',l:'OUTPUT'}];
+  $('flow').innerHTML=flow.map(function(n,i){
+    var conn=i<flow.length?'<div class="fconn"></div>':'';
+    var cls=n.term?'fnode term':n.dec?'fnode dec':'fnode';
+    var body='<div class="fnode-wrap"><div class="'+cls+'"><div class="fl">'+n.l+'</div><div class="ft">'+n.t+'</div>'+(n.s?'<div class="fs">'+n.s+'</div>':'')+'</div>';
+    if(n.exits){body+='<div class="fbranch">'+n.exits.map(function(e){return '<div class="fexit '+e[1]+'"><div class="el">'+e[0]+'</div>'+e[2]+(e[3]?' <code>'+e[3]+'</code>':'')+'</div>'}).join('')+'</div>';}
+    body+='</div>';
+    return (i>0?'<div class="fconn"></div>':'')+body;}).join('');
+
+  var pmods=[
+    ['engine.py',364,'Orchestrates the pipeline; hosts <code>_enforce_sell_only</code> — the single boundary guaranteeing no combo quote carries a non-zero yes_bid.'],
+    ['quote.py',295,'Fair → width → two maker bids on the grid. Maker-favorable rounding (always DOWN), free-money caps, sell-only forces yes_bid=0.'],
+    ['sgp.py',673,'Pairwise ρ builder: alphabetical pair_key + oriented resolvers (:same/:opp/:tie/:team) for same-game legs.'],
+    ['dixon_coles.py + structural.py',1428,'Structural scoreline pricer (soccer) inverted from live leg prices; coherent scorelines beat pairwise-ρ stitching, most on dense combos.'],
+    ['joint.py + copula.py',441,'Gaussian-copula joint with priced ρ-uncertainty and Fréchet clamps — the conservative default.'],
+    ['relationships.py',384,'Leg-relationship classifier w/ explicit UNKNOWN/IMPOSSIBLE branches; farmable flag on the 5 airtight tautologies.'],
+    ['margin_total.py + mlb_runs.py',422,'(margin,total) bivariate-normal for NFL/NBA/WNBA + Poisson runs for MLB. Enabled per sport via OOS gate.'],
+    ['legs · legtypes · fees · devig',564,'Belief blending, market-family classification, fail-safe fee attribution, external-odds devig (quarantined).']];
+  $('pmods').innerHTML=pmods.map(function(m){return '<div class="card"><div class="top"><h3 class="mono">'+m[0]+'</h3><span class="st coded mono">'+m[1]+' loc</span></div><p>'+m[2]+'</p></div>'}).join('');
+
+  var riskmods=[
+    ['exposure.py',246,'Signed exposure book with the <b>mass-acceptance worst case</b> — every open quote is instantly executable, so dominance must hold across all at once.'],
+    ['limits.py',156,'Per-quote / market / event / gross-notional / daily-loss / worst-case-event caps. Enforced pre-quote AND pre-confirm.'],
+    ['lastlook.py',89,'Pure last-look at confirm: re-checks leg moves + staleness inside the 3s HVM window; declines a stale fill.'],
+    ['inplay.py',65,'Velocity detector — flags a market gone in-play and widens or pulls quotes.'],
+    ['killswitch.py',101,'Hard halts (kill file, reconciliation mismatch) → cancel-all and stop. Fail-safe, never silent.'],
+    ['markouts.py',81,'Post-fill markouts vs BOTH our fair and raw leg mids — a biased fair can\'t grade itself.']];
+  $('riskmods').innerHTML=riskmods.map(function(m){return '<div class="card"><div class="top"><h3 class="mono">'+m[0]+'</h3><span class="st coded mono">'+m[1]+' loc</span></div><p>'+m[2]+'</p></div>'}).join('');
+
+  var exmods=[
+    ['config.py + .env',930,'Pydantic config, YAML per env, secrets via env only. Prod guard: quoting needs <code>--confirm-live</code> + <code>prod_limits_configured</code> (both off).'],
+    ['rfq/lifecycle.py',732,'quote→accept→last-look→confirm→execute→position; TTL/reprice/cancel-all; NO-side declines while the combo settlement convention is unverified.'],
+    ['ops/persistence.py',391,'SQLite store: combo_trades, rfqs, would_quotes, fills, markouts, EV ledger. Prod DB opened read-only for shadow analytics.'],
+    ['ops/ground_truth.py',420,'Phase-2.5 harness: real demo RFQ round-trips recorded to a fixture; conventions.py imports only from it. Combo pass in flight.'],
+    ['exchange/auth.py',113,'RSA-PSS request signing (SHA256, salt=digest), doc-verified. Key material never logged or persisted.'],
+    ['ops/app · quote_app',688,'Observe/paper/quote apps with hard gates: verified conventions + whitelist + prod guard; recorder + cancel-all on halt.']];
+  $('exmods').innerHTML=exmods.map(function(m){return '<div class="card"><div class="top"><h3 class="mono">'+m[0]+'</h3><span class="st ship">'+m[1]+'</span></div><p>'+m[2]+'</p></div>'}).join('');
+
+  var phases=[['0','Scaffold','ship','Repo, uv, config, money core, auth, REST/WS, kill switch, doc-independent math (copula, MC, devig).'],
+    ['1','Market data','ship','Order-book mirror, price grid, metadata cache.'],
+    ['2','Observe','ship','Read-only RFQ tape recording; would-quotes logged.'],
+    ['2.5','Ground-truth conventions','gate','Real demo round-trips fix direction/sign/fee into a fixture. Single-market promoted; combo pass placed (settling ~Jul 11).'],
+    ['3','Pricing','gate','Spine coded & backtested (classifier, copula, structural, quote, sell-only) — but the correlation surface is far from complete and fairs aren\'t settlement-validated.'],
+    ['4','Risk + MC','coded','Exposure book, limits, last-look, in-play, markouts, EV ledger, Monte-Carlo — all written and unit-tested, but NONE verified working against real flow.'],
+    ['5','Demo quote e2e','ship','30 live demo quotes + combo round-trips — the plumbing (quote→accept→confirm→fill) is proven. Validates plumbing, NOT edge.'],
+    ['6','Shadow on prod','gate','Read-only prod-flow shadowing: would-quotes vs clearings, settlement calibration, recorder running.'],
+    ['7','Prod tiny','off','First real quotes at tiny size — gated behind prod_limits_configured + operator sign-off.'],
+    ['8','Optional bottom-up','off','Hedging (residual correlation), Ising AMM — exploratory, phase-gated off.']];
+  $('rail').innerHTML=phases.map(function(p){var lbl={ship:'proven',coded:'coded · unverified',gate:'in progress',off:'not started'}[p[2]];
+    return '<li><div class="ph">'+p[0]+'</div><div><h3 style="display:inline">'+p[1]+'</h3> <span class="st '+p[2]+'">'+lbl+'</span><p style="margin-top:5px;font-size:13px">'+p[3]+'</p></div></li>'}).join('');
+
+  var defenses=[
+    ['UNKNOWN → no-quote','property-tested','Every classifier has an explicit UNKNOWN branch that provably cannot reach a normal-width quote. A mutation sweep enforces it.'],
+    ['Maker-favorable rounding','property-tested','Both bids round DOWN onto the grid — a rounded-away side becomes a decline, never a rounded-up bid.'],
+    ['Sell-only invariant','400-example fuzz','Across fair, skew (both signs), size, in-play, leg-count — yes_bid is always 0 in sell-only, plus an engine-boundary leak test.'],
+    ['OOS model gates','held-out seasons','Structural (8,980 games) and margin/total (NFL) both beat the shipped copula on held-out joint-log-loss before enabling.']];
+  $('defenses').innerHTML=defenses.map(function(d){return '<div class="card"><div class="top"><h3>'+d[0]+'</h3><span class="st ship">'+d[1]+'</span></div><p>'+d[2]+'</p></div>'}).join('');
+
+  $('backtests').innerHTML=[
+    ['Final RFQ blind test','28 real combos, agent-priced','median 2.2¢ vs maker quote; backbone validated'],
+    ['Soccer backtest vs clearing','1,480 combos through the engine','median |err| 1.6–1.9¢; dense same-game stacks worst'],
+    ['WC settlement P&L','123 resolved WC combos, real outcomes','sell-parlay book +EV, best at ~1¢; markup is adversely selected'],
+    ['Demo combo round-trip','live 2-account demo combo','landed long NO; sell-only + direction verified live']
+  ].map(function(r){return '<tr><td class="k">'+r[0]+'</td><td style="font-size:12.5px;color:var(--muted)">'+r[1]+'</td><td style="font-size:12.5px">'+r[2]+'</td></tr>'}).join('');
+
+  $('reports').innerHTML=[
+    ['07-09','Demo combo round-trip — maker landed long NO','gate','settlement pending'],
+    ['07-08','Sell-parlays-only fix (one-sided) + dual review','ship','done'],
+    ['07-08','Combo YES/NO sides + fade config (Kalshi-verified)','ship','done'],
+    ['07-08','Combo taker cash-out exposure — verified none','ship','done'],
+    ['07-08','Soccer settlement P&L (WC-only, real outcomes)','ship','done'],
+    ['07-08','Soccer backtest vs clearing (1,480 combos)','ship','done'],
+    ['07-07','Soccer calibration (1H cluster + corners) & farming','ship','done'],
+    ['07-07','Final RFQ blind test (28 combos)','ship','done']
+  ].map(function(r){return '<tr><td class="k">'+r[0]+'</td><td>'+r[1]+'</td><td><span class="st '+r[2]+'">'+r[3]+'</span></td></tr>'}).join('');
+
+  /* ================= CORRELATIONS ================= */
+  var soccerRows={
+    'Game-level (football-data.co.uk · 8,982 games)':[
+      ['btts × over 2.5',.746,'','pooled rank-1/2','shipped'],
+      ['home-win × over 2.5',.276,'','pooled','shipped'],
+      ['btts × home-win',-.197,'','pooled','shipped']],
+    '1H × full-game (football-data · 8,981 · era-stable)':[
+      ['1H home-lead × FT home-win',.71,'.649–.766','pooled + era-split','ship'],
+      ['1H away-lead × FT away-win',.70,'.638–.753','pooled + era-split','ship'],
+      ['1H over 0.5 × FT over 2.5',.69,'.610–.772','pooled + era-split','ship'],
+      ['1H over 1.5 × FT over 2.5',.77,'.700–.826','pooled + era-split','ship'],
+      ['1H over 1.5 × FT over 3.5',.72,'.664–.775','pooled + era-split','ship']],
+    'Player scorers (Understat 5-lg 21–22 · cond-MLE, OOS-passed)':[
+      ['scorer × own-team win (star)',.49,'.44–.54','conditional-MLE','ship'],
+      ['scorer × over 2.5 (star)',.46,'.414–.506','conditional-MLE','ship'],
+      ['moneyline | player_goal',.50,'DC-induced +0.56','structural + kept prior','ship'],
+      ['player_goal | total',.47,'nudge from 0.40','conditional-MLE','ship'],
+      ['two teammates both score',.00,'≈0 · double-counts team','conditional-MLE','widen'],
+      ['two opposing scorers',.03,'≈independent','conditional-MLE','widen']],
+    'Corners cluster (calibrated 2026-07-07)':[
+      ['corners | corners_team',.62,'team ⊂ total corners','history','cfg'],
+      ['corners_team | moneyline :same',-.15,':opp +0.15 · :tie 0','oriented','cfg'],
+      ['corners_team | spread :same',-.11,':opp +0.11','oriented','cfg'],
+      ['corners | spread',.00,'~independent','history','cfg'],
+      ['btts | first-half total',.55,'','history','cfg']],
+    '1H cross-type cluster (36-entry block · 2026-07-07)':[
+      ['advance | 1H-moneyline :same',.64,':opp −0.64 · :tie 0','oriented','cfg'],
+      ['advance | 1H-spread :same',.72,':opp −0.72','oriented','cfg'],
+      ['1H-spread | 1H-total',.95,'near-comonotone','history','cfg'],
+      ['1H-btts | total',.65,'','history','cfg'],
+      ['1H-moneyline | total :team',.24,':tie −0.42','oriented','cfg'],
+      ['btts | 1H-moneyline :team',.10,':tie −0.17','oriented','cfg'],
+      ['1H-total | moneyline',.14,'','history','cfg'],
+      ['advance | 1H-total',.09,'','history','cfg']],
+    'Structural (Dixon-Coles · OOS-gated, ENABLED)':[
+      ['dc_rho (low-score adj.)',-.05,'band ±0.08 · fitted','grid-MLE on scorelines','ship']]};
+  var vmap={ship:['ship','OOS-gated'],cfg:['gate','calibrated'],widen:['off','widen-only'],shipped:['ship','OOS-gated']};
+
+  function soccerPanel(){
+    var n=0;Object.keys(soccerRows).forEach(function(g){n+=soccerRows[g].length});
+    var html='<div class="grid g4" style="margin-bottom:20px">'+
+      [['37','ρ pairs','teal'],['5','OOS-gated ship','green'],['2','widen-only','gold'],['4','data sources','']].map(function(k){
+        return '<div class="hs"><div class="v '+k[2]+' num">'+k[0]+'</div><div class="l">'+k[1]+'</div></div>'}).join('')+'</div>';
+    html+='<div class="callout">Soccer is the deepest calibration and the only live sell-only surface today. Structural Dixon-Coles is <b>enabled</b>; the pairwise ρ tables below are the copula fallback + same-game resolvers. Colour = strength &amp; sign of ρ.</div>';
+    Object.keys(soccerRows).forEach(function(g){
+      html+='<h2 style="font-size:16px;margin-top:26px">'+g+'</h2><div class="tw"><table><thead><tr><th>pair</th><th style="text-align:center">ρ</th><th>note / 99% CI</th><th>method</th><th>status</th></tr></thead><tbody>';
+      soccerRows[g].forEach(function(r){var v=vmap[r[4]]||['off',r[4]];
+        html+='<tr><td class="k">'+r[0]+'</td><td style="text-align:center">'+rhoCell(r[1])+'</td><td class="ci">'+(r[2]||'—')+'</td><td style="font-size:12px;color:var(--muted)">'+r[3]+'</td><td><span class="st '+v[0]+'">'+v[1]+'</span></td></tr>';});
+      html+='</tbody></table></div>';});
+    html+='<h2 style="font-size:16px">Data sources</h2><div class="grid g4">'+[
+      ['football-data.co.uk','8,981 club matches','E0/D1/F1/I1/SP1 · 20/21–24/25 · HT+FT goals + closing odds'],
+      ['Understat JSON','3,652 result-matches','5 leagues × 2021,2022 · per-player goals/xG for scorer props'],
+      ['Kalshi live books','marginals + validation','leg mids at quote time; RFQ tape for backtests'],
+      ['Dixon-Coles OOS','8,980 held-out games','structural gate: beats copula on all 3 joint-log-loss metrics']
+    ].map(function(s){return '<div class="card"><h3 class="mono" style="font-size:12.5px">'+s[0]+'</h3><p style="margin-top:4px;color:var(--teal);font-family:var(--mono);font-size:11px">'+s[1]+'</p><p style="margin-top:6px">'+s[2]+'</p></div>'}).join('')+'</div>';
+    return html;}
+
+  var sports=[
+    {k:'soccer',label:'Soccer',dot:'var(--ship)',build:soccerPanel},
+    {k:'mlb',label:'MLB',dot:'var(--gate)',state:'partial',html:'<div class="callout gate"><b>Partial.</b> The Poisson <b>runs model</b> (<code>mlb_runs.py</code>) is enabled for game / total / spread. Player props (HR, K\'s, total-bases) are typed UNKNOWN → <b>no-quote</b> today, so DNP-scalar props aren\'t on the surface.</div><div class="grid g3"><div class="card"><h3>Runs model</h3><p>Poisson team-runs → game/total/spread joint, inverted from live prices.</p><div class="meta"><span>enabled</span></div></div><div class="card"><h3>Baseball calibration</h3><p>results_baseball.md — HR×win +0.23 &lt; HR×team-total +0.37 shape validated.</p><div class="meta"><span>reference</span></div></div><div class="card"><h3>Player props</h3><p>HR/K/TB not yet typed → no-quote. DNP settles to scalar (fair price).</p><div class="meta"><span>UNKNOWN</span></div></div></div>'},
+    {k:'nfl',label:'NFL',dot:'var(--ship)',html:'<div class="callout"><b>Shipped.</b> (margin, total) bivariate-normal, means inverted per game from live prices, shape from recent seasons. OOS-gate passed (hw×cover = exact comonotone geometry vs copula 0.88).</div><div class="grid g3"><div class="card"><h3>σ margin</h3><p class="mono" style="font-size:22px;color:var(--teal)">12.66</p></div><div class="card"><h3>σ total</h3><p class="mono" style="font-size:22px;color:var(--teal)">13.06</p></div><div class="card"><h3>ρ (margin,total)</h3><p class="mono" style="font-size:22px;color:var(--teal)">+0.026</p></div></div>'},
+    {k:'wnba',label:'WNBA',dot:'var(--ship)',html:'<div class="callout"><b>Shipped</b> (operator-enabled 2026-07-06, season live). Same (margin,total) geometry as NFL; shape calibrated on 1,338 recent games through 2026-07-05. ρ≈0 means ml×total prices ≈ independent.</div><div class="grid g3"><div class="card"><h3>σ margin</h3><p class="mono" style="font-size:22px;color:var(--teal)">12.04</p></div><div class="card"><h3>σ total</h3><p class="mono" style="font-size:22px;color:var(--teal)">16.55</p></div><div class="card"><h3>ρ</h3><p class="mono" style="font-size:22px;color:var(--teal)">−0.019</p></div></div>'},
+    {k:'nba',label:'NBA',dot:'var(--gate)',html:'<div class="callout gate"><b>Calibrated but gated OFF.</b> Shape params exist (σ<sub>m</sub> 13.71 · σ<sub>t</sub> 18.42 · ρ 0.000) but NBA is not in <code>enabled_sports</code> — held back pending an odds source or prod-shadow settlements to validate live.</div>'},
+    {k:'ufc',label:'UFC',dot:'var(--off)',html:'<div class="callout block"><b>Not built.</b> No model, no calibration. Method-of-victory × round × fight-outcome correlations would need their own structural model — a future sport once soccer is proven end-to-end.</div>'},
+    {k:'tennis',label:'Tennis',dot:'var(--off)',html:'<div class="callout block"><b>Not built.</b> No model. Set/game/match correlations (a strongly path-dependent structure) are a distinct modelling problem — not started.</div>'}];
+  var tabs=$('sporttabs'),cont=$('sports');
+  sports.forEach(function(sp,i){
+    var t=document.createElement('button');t.className='tab'+(i===0?' active':'');
+    t.innerHTML='<span class="dot" style="background:'+sp.dot+'"></span>'+sp.label;
+    t.onclick=function(){[].slice.call(tabs.children).forEach(function(x){x.classList.remove('active')});t.classList.add('active');
+      [].slice.call(cont.children).forEach(function(x){x.classList.remove('on')});
+      var pane=document.getElementById('sp-'+sp.k);pane.classList.add('on');};
+    tabs.appendChild(t);
+    var d=document.createElement('div');d.className='sport'+(i===0?' on':'');d.id='sp-'+sp.k;
+    d.innerHTML=sp.build?sp.build():sp.html;cont.appendChild(d);});
+
+  var h=(location.hash||'').replace('#','');if(h&&secs.some(function(s){return s.getAttribute('data-sec')===h})){show(h);}
+})();
+</script>
