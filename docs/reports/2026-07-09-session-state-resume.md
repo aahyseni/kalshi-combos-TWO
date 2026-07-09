@@ -100,6 +100,32 @@ channel, atlas, DNP, calibration, CLAUDE.md rules 7-8) · `c976f0d` tools (the
 wc_backtest harness + calibration one-offs + experimental ising_amm, which is
 unreviewed and imported by nothing). Working tree clean at `c976f0d`.
 
+## 🔵 ACTIVE WORKSTREAM — MLB/baseball SGP finalization (operator directive 2026-07-09)
+
+Soccer is strong and nearly done (final tests pending) — **baseball is now the
+focus**: "measure all possible correlations in baseball based on what Kalshi
+allows in combos." A multi-agent pass launched 2026-07-09 evening:
+
+1. **Classify** every MLB ticker family strictly from Kalshi docs + API + the
+   RFQ tape (verify existing classifications, add missing ones — staged, not
+   promoted).
+2. **Re-measure ρ**: rerun the shipped calibration (reproducibility), an
+   INDEPENDENT from-scratch re-derivation, and extension to Retrosheet 2005-25
+   (era stability); then measure every allowed-but-unmeasured pair.
+3. **Adversarially verify** classification (completeness + correctness lenses)
+   and every number; produce the **unknowns queue** (props needing more
+   research/math).
+
+**Finalization gate (operator):** numbers correct + backed by lots of data +
+tape backtest + **zero unknown legs**. Promotion of ρ values into
+`pair_rho_by_sport["mlb"]` + `legtypes.py` classifications happens only after
+verification AND the backtest (CLAUDE.md rule 8 config-promote clause). Known
+money-risk motivating this: K×total is truly NEGATIVE (~−0.2) while unclassified
+pairs fall to the +0.6 untyped fallback. Watch: the calibration measured HR ×
+TEAM-runs — if Kalshi MLB totals are GAME totals, those pairs need re-measuring
+against game totals (source-of-truth check in flight). Results report lands as a
+dated .md when the pass completes.
+
 ## OPERATOR DECISIONS (2026-07-09 evening)
 
 - **Markup: DEFERRED.** The 2026-07-08 settlement P&L showed sim P&L peaking at
