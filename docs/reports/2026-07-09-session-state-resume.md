@@ -116,15 +116,28 @@ allows in combos." A multi-agent pass launched 2026-07-09 evening:
    and every number; produce the **unknowns queue** (props needing more
    research/math).
 
-**Finalization gate (operator):** numbers correct + backed by lots of data +
-tape backtest + **zero unknown legs**. Promotion of ρ values into
-`pair_rho_by_sport["mlb"]` + `legtypes.py` classifications happens only after
-verification AND the backtest (CLAUDE.md rule 8 config-promote clause). Known
-money-risk motivating this: K×total is truly NEGATIVE (~−0.2) while unclassified
-pairs fall to the +0.6 untyped fallback. Watch: the calibration measured HR ×
-TEAM-runs — if Kalshi MLB totals are GAME totals, those pairs need re-measuring
-against game totals (source-of-truth check in flight). Results report lands as a
-dated .md when the pass completes.
+**PHASE 1 DONE (2026-07-09 ~23:30 UTC)** — full detail in
+`2026-07-09-mlb-classification-and-rho-verification.md`; staged code (NOT
+applied) in `docs/calibration/staged_mlb_props.md`. Headlines: exactly **9
+combo-eligible families** (props all UNKNOWN→+0.6 today); **KXMLBTOTAL = GAME
+total**, TEAMTOTAL untradeable → +0.367/−0.380 are reference-only and
+player_hr|game_total was never measured; 3 latent live misclass bugs found
+(F5TOTAL/F5SPREAD/SERIESGAMETOTAL); shipped ρ reproduced EXACTLY at 3
+independent levels + 21-season stable; **NEW TOP BLOCKER:
+event_mutually_exclusive metadata** (all of a game's prop markets share one
+event ticker; relationships.py groups by event BEFORE the ρ table → gates ALL
+multi-player basket pricing); same-player cross-stat rungs are deterministic
+CONTAINMENTS (not ρ).
+
+**MEASUREMENT TRANCHE RUNNING (launched ~23:45 UTC, run wf_6e350a3f-b84):** 8
+agents — game-frame totals (HR/HIT/TB/RFI×game-total), basket pairs (KS×KS,
+HR×HR/HIT×HIT teammate-opponent splits + basket-level P(all-no) validation),
+HRR pairs, game-level (margin×total, win×cover containment, same-day
+independence), hit×KS facing splits, strike-ladder flatness (resolves the K-line
+convention question), event-metadata resolution, same-player rungs (tape) —
+then an xhigh judge emits the final recommended mlb table. Results report to
+follow. **Promotion gate:** tools/backtest_mlb_pairs.py (tape replay,
+staged-vs-live config, log-loss gate) → port + parity-check (rule 8).
 
 ## OPERATOR DECISIONS (2026-07-09 evening)
 
