@@ -20,7 +20,7 @@ from decimal import Decimal
 from fractions import Fraction
 
 from combomaker.core.conventions import Conventions
-from combomaker.core.money import CC_PER_DOLLAR, cc_from_prob
+from combomaker.core.money import CC_PER_DOLLAR, CentiCents, cc_from_prob
 from combomaker.core.quantity import CentiContracts, qty_from_contracts
 from combomaker.core.reasons import ReasonCode
 from combomaker.marketdata.feed import OrderbookFeed
@@ -107,6 +107,15 @@ class PricingEngine:
         }
         self._quote_params = QuoteParams(**quote_fields)
         self._archetype = config.quote
+        if self._quote_params.sell_parlays_only and conventions.combo_no_pays_complement is None:
+            # Sell-only makes EVERY fill a NO position, but the lifecycle declines
+            # every NO-side confirm until this convention is verified (Phase 2.5
+            # combo round-trip). The maker will quote but never fill — surface it.
+            log.warning(
+                "sell_parlays_only_inert_until_combo_no_verified",
+                detail="sell-only quotes only the NO (seller) side; every NO-side "
+                "confirm is declined until combo_no_pays_complement is verified.",
+            )
         self._structural = (
             StructuralPricer(config.structural, config.margin_total, config.mlb_runs)
             if (
@@ -137,7 +146,7 @@ class PricingEngine:
             if relationship.farmable and self._archetype.farm_impossible_combos:
                 farmed = self._farm_impossible(rfq, relationship)
                 if farmed is not None:
-                    return farmed
+                    return self._enforce_sell_only(farmed)
             return NoQuote(ReasonCode.SKIP_LOGICALLY_IMPOSSIBLE, "; ".join(relationship.notes))
         if relationship.kind is RelationshipKind.UNKNOWN:
             return NoQuote(ReasonCode.SKIP_CLASSIFIER_UNKNOWN, "; ".join(relationship.notes))
@@ -190,7 +199,7 @@ class PricingEngine:
         leg_books = [self._feed.book(leg.market_ticker) for leg in rfq.legs]
         yes_cap, no_cap = free_money_caps(leg_books, sides)
 
-        return construct_quote(
+        quote = construct_quote(
             joint=joint,
             n_legs=len(rfq.legs),
             qty=qty,
@@ -206,6 +215,30 @@ class PricingEngine:
             width_multiplier=self._width_multiplier(beliefs, sides),
             params=self._quote_params,
         )
+        return self._enforce_sell_only(quote)
+
+    def _enforce_sell_only(
+        self, quote: ConstructedQuote | NoQuote
+    ) -> ConstructedQuote | NoQuote:
+        """Engine-boundary guarantee: in sell-only mode NO combo quote may carry a
+        non-zero yes_bid, whichever builder produced it. Both builders already zero
+        YES at construction; this is the single authoritative choke point that ALSO
+        catches any future builder that forgets. A non-zero YES reaching here is a
+        bug — correct it to 0 and log loudly (never silently ship long-YES)."""
+        if (
+            self._quote_params.sell_parlays_only
+            and isinstance(quote, ConstructedQuote)
+            and int(quote.yes_bid_cc) != 0
+        ):
+            log.warning("sell_only_yes_bid_forced_zero", was_yes_bid_cc=int(quote.yes_bid_cc))
+            if int(quote.no_bid_cc) == 0:
+                # Zeroing YES on a YES-only quote would leave an invalid both-zero
+                # quote — decline cleanly instead of ever emitting (0, 0).
+                return NoQuote(
+                    ReasonCode.SKIP_PRICING_FAILED, "sell-only: only the YES side was quotable"
+                )
+            return replace(quote, yes_bid_cc=CentiCents(0))
+        return quote
 
     def _fetch_beliefs(self, rfq: Rfq) -> list[LegBelief] | NoQuote:
         """Per-leg blended marginal beliefs (Kalshi book + configured external

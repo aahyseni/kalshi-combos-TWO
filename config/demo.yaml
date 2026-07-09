@@ -10,6 +10,14 @@ logging:
 safety:
   prod_limits_configured: false
 
+pricing:
+  quote:
+    # Fade defense: quote combos ONE-SIDED as a pure parlay seller. yes_bid is
+    # forced to 0 so we can only ever be long NO (sell the parlay), never long
+    # YES (accepting our yes_bid = the -14c/ct adversely-selected fade side).
+    # See docs/reports/2026-07-08-combo-yes-no-side-mechanics.md.
+    sell_parlays_only: true
+
 filters:
   # Sports combos only (mission scope). Prefixes match mve_collection_ticker.
   collection_whitelist:

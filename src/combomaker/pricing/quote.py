@@ -12,6 +12,12 @@ Invariants (property-tested):
 - yes_bid + no_bid ≤ $1 − min_capture, always.
 - Fees are subtracted from each bid (fail-safe taker attribution until ground
   truth), so quotes are profitable net of fees.
+- Sell-parlays-only (``QuoteParams.sell_parlays_only``): force ``yes_bid = 0`` so
+  we can only ever end up LONG NO (sell the parlay), never LONG YES (the fade
+  side that accepting our yes_bid would hand us — settlement backtest −14¢/ct).
+  The markup still rides on ``no_bid`` (implied YES ask = $1 − no_bid); declining
+  a side is a supported one-sided quote
+  (docs/reports/2026-07-08-combo-yes-no-side-mechanics.md).
 
 Width components are explicit and logged: base + per-leg + model uncertainty
 (legs + correlation, from JointEstimate) + size + time-to-event + in-play.
@@ -46,6 +52,11 @@ class QuoteParams:
     in_play_extra_cc: int = 800
     min_capture_cc: int = 100                # required minimum spread capture
     free_money_margin_cc: int = 100
+    # Fade defense: quote combos ONE-SIDED as a pure parlay seller. When True,
+    # yes_bid is forced to 0 (we decline the YES side) so we can only ever be
+    # long NO. Pricing math is otherwise unchanged; the sell markup rides on
+    # no_bid. Default False keeps the primitive two-sided; prod/demo YAML sets it.
+    sell_parlays_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,13 +198,17 @@ def construct_quote(
         snapped = grid.snap_bid_down(CentiCents(min(raw, CC_PER_DOLLAR)))
         return CentiCents(0) if snapped is None else snapped
 
-    yes_bid = snap(yes_raw)
+    # Sell-parlays-only: hard-decline the YES side. Nothing downstream (the
+    # both-zero no-quote check, the capture check) lifts it back up. This builder
+    # zeroes YES here; the engine boundary (PricingEngine._enforce_sell_only) is
+    # the authoritative belt-and-suspenders across ALL quote builders.
+    yes_bid = CentiCents(0) if p.sell_parlays_only else snap(yes_raw)
     no_bid = snap(no_raw)
 
     if yes_bid == 0 and no_bid == 0:
         return NoQuote(
             ReasonCode.SKIP_PRICING_FAILED,
-            "both sides rounded away"
+            ("sell-only: no-bid rounded away" if p.sell_parlays_only else "both sides rounded away")
             + (" (free-money clamp)" if clamped_free_money else ""),
         )
     if yes_bid + no_bid > CC_PER_DOLLAR - p.min_capture_cc:

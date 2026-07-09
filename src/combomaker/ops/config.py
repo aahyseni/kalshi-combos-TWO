@@ -656,6 +656,15 @@ class QuoteConfig(StrictModel):
     in_play_extra_cc: int = 800
     min_capture_cc: int = 100
     free_money_margin_cc: int = 100
+    # Fade defense (2026-07-08): quote combos ONE-SIDED as a pure parlay SELLER —
+    # force yes_bid=0 so we can only ever end up LONG NO (sell the parlay), never
+    # LONG YES (buy it). On Kalshi a combo is a two-sided binary; accepting our
+    # yes_bid makes US long YES = the adversely-selected fade flow (settlement
+    # backtest −14¢/ct on that side); accepting our no_bid makes us long NO = the
+    # +EV seller side. Enabled in prod.yaml/demo.yaml; pydantic default stays
+    # False so the pricing primitive + its tests remain two-sided. See
+    # docs/reports/2026-07-08-combo-yes-no-side-mechanics.md.
+    sell_parlays_only: bool = False
     # Longshots: absolute uncertainty shrinks with tiny fairs (gradient ∝ P),
     # which is anti-conservative in RELATIVE terms for whoever shorts the
     # longshot — floor it as a fraction of fair below the threshold.

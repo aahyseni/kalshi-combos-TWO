@@ -467,3 +467,75 @@ class TestFarmQuote:
         q = self.farm(no_cap_cc=CC(QuoteParams().free_money_margin_cc))
         assert isinstance(q, NoQuote)
         assert q.reason is ReasonCode.SKIP_LOGICALLY_IMPOSSIBLE
+
+
+class TestSellParlaysOnly:
+    """Fade defense: with QuoteParams.sell_parlays_only=True the quote is a pure
+    parlay SELLER — yes_bid is ALWAYS 0 (we can never be handed long-YES, the
+    -14c/ct adverse side), while the no_bid (sell side) is priced exactly as in
+    the two-sided quote."""
+
+    SELL = QuoteParams(sell_parlays_only=True)
+
+    def test_forces_yes_bid_zero_keeps_no_side(self) -> None:
+        q = build_quote(params=self.SELL)
+        assert isinstance(q, ConstructedQuote)
+        assert q.yes_bid_cc == 0            # YES side declined
+        assert q.no_bid_cc > 0             # still selling the parlay
+        # The implied YES ask ($1 - no_bid) carries the markup: above fair.
+        assert CC_PER_DOLLAR - int(q.no_bid_cc) > int(q.fair_cc)
+
+    def test_no_side_identical_to_two_sided(self) -> None:
+        """Turning on sell-only must NOT perturb the sell-side price — it only
+        drops the YES bid. Same fair, same no_bid; only yes_bid differs."""
+        two = build_quote()                                    # default params
+        one = build_quote(params=self.SELL)
+        assert isinstance(two, ConstructedQuote) and isinstance(one, ConstructedQuote)
+        assert two.yes_bid_cc > 0 and one.yes_bid_cc == 0      # the only difference
+        assert one.no_bid_cc == two.no_bid_cc
+        assert one.fair_cc == two.fair_cc
+
+    def test_negative_skew_cannot_lift_yes_off_zero(self) -> None:
+        """A large negative inventory skew RAISES yes_raw and would produce a big
+        yes_bid two-sided — sell-only must still pin it to 0 (mutation guard)."""
+        two = build_quote(inventory_skew_cc=-3_000)
+        one = build_quote(inventory_skew_cc=-3_000, params=self.SELL)
+        assert isinstance(two, ConstructedQuote) and isinstance(one, ConstructedQuote)
+        assert two.yes_bid_cc > 0                              # skew DID lift it two-sided
+        assert one.yes_bid_cc == 0                             # ...but not in sell-only
+        assert one.no_bid_cc > 0
+
+    def test_declines_when_no_side_rounds_away(self) -> None:
+        """Fair ~ $0.99: the no side rounds to 0; with yes also declined the
+        result is a clean NoQuote carrying the sell-only reason."""
+        q = build_quote(joint=make_joint(0.99, 0.0), params=self.SELL)
+        assert isinstance(q, NoQuote)
+        assert q.reason is ReasonCode.SKIP_PRICING_FAILED
+        assert "sell-only" in q.detail
+
+    @settings(derandomize=True, max_examples=400, deadline=None)
+    @given(
+        p=st.integers(min_value=2, max_value=98),        # fair in cents
+        skew=st.integers(min_value=-6_000, max_value=6_000),
+        qty=st.integers(min_value=100, max_value=50_000),
+        in_play=st.booleans(),
+        n_legs=st.integers(min_value=2, max_value=8),
+    )
+    def test_yes_bid_is_always_zero(
+        self, p: int, skew: int, qty: int, in_play: bool, n_legs: int
+    ) -> None:
+        """HARD INVARIANT: across fair, inventory skew (either sign), size,
+        in-play, and leg count, sell-only NEVER emits a non-zero yes_bid."""
+        q = build_quote(
+            joint=make_joint(p / 100.0, 0.01),
+            n_legs=n_legs,
+            qty=Q(qty),
+            in_play=in_play,
+            inventory_skew_cc=skew,
+            params=self.SELL,
+        )
+        if isinstance(q, NoQuote):
+            return
+        assert q.yes_bid_cc == 0
+        # And the capture invariant still holds (now just: keep >= min_capture).
+        assert int(q.yes_bid_cc) + int(q.no_bid_cc) <= CC_PER_DOLLAR - self.SELL.min_capture_cc

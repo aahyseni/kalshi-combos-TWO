@@ -86,3 +86,6 @@ class TestProdGuard:
         prod = load_config(repo_config / "prod.yaml")
         assert prod.env is Env.PROD
         assert prod.safety.prod_limits_configured is False
+        # Fade defense is ON in the main config files (parlay-seller only).
+        assert demo.pricing.quote.sell_parlays_only is True
+        assert prod.pricing.quote.sell_parlays_only is True

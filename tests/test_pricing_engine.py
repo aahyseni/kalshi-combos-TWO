@@ -1,14 +1,20 @@
+from pathlib import Path
+
+import pytest
+
 from combomaker.core.conventions import DOC_ASSUMED
-from combomaker.core.money import cc_from_prob
+from combomaker.core.money import CentiCents, cc_from_prob
 from combomaker.core.quantity import CentiContracts
 from combomaker.core.reasons import ReasonCode
 from combomaker.marketdata.metadata import EventMeta
-from combomaker.ops.config import PricingConfig, QuoteConfig
+from combomaker.ops.config import PricingConfig, QuoteConfig, load_config
 from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.legs import KalshiBookSource
 from combomaker.pricing.quote import ConstructedQuote, NoQuote
 from combomaker.rfq.models import Rfq
 from tests.test_filters import Harness
+
+REPO_ROOT = Path(__file__).resolve().parents[1]  # module scope: no Path I/O inside async tests
 
 SAME_MARKET_BOTH_SIDES = [
     {"market_ticker": "M1", "side": "yes", "event_ticker": "E1"},
@@ -62,6 +68,97 @@ async def test_happy_path_produces_two_sided_quote() -> None:
     assert result.yes_bid_cc + result.no_bid_cc <= 10_000 - 100
     assert result.yes_bid_cc % 100 == 0  # on the 1-cent grid
     assert result.width_components_cc["legs"] == 200  # 2 legs x 100
+
+
+async def test_sell_parlays_only_declines_yes_side() -> None:
+    """Full-stack fade defense: QuoteConfig.sell_parlays_only flows YAML ->
+    PricingConfig -> engine -> QuoteParams -> construct_quote, so a normal combo
+    quotes ONLY the NO (parlay-seller) side. yes_bid=0, no_bid still live."""
+    h = Harness()
+    await h.with_books(["M1", "M2"])
+    h.with_meta("KXMVE-C1")
+    seed_event(h, "E1", exclusive=True)
+    seed_event(h, "E2", exclusive=True)
+    cfg = PricingConfig(quote=QuoteConfig(sell_parlays_only=True))
+    engine = PricingEngine(h.feed, h.metadata, DOC_ASSUMED, cfg)
+    result = engine.price(combo(CROSS_EVENT_LEGS), time_to_close_s=100_000)
+    assert isinstance(result, ConstructedQuote), result
+    assert result.yes_bid_cc == 0          # fade defense: never long the YES combo
+    assert result.no_bid_cc > 0            # still selling the parlay
+
+
+async def test_sell_only_wired_from_real_prod_yaml() -> None:
+    """True end-to-end: load the ACTUAL config/prod.yaml, build the engine from
+    the loaded config.pricing, price a normal combo -> yes_bid must be 0. Locks
+    the whole YAML -> PricingConfig -> engine -> quote chain (a future refactor of
+    the engine exclusion list could pass the narrower tests but break this)."""
+    cfg = load_config(REPO_ROOT / "config" / "prod.yaml")
+    assert cfg.pricing.quote.sell_parlays_only is True
+    h = Harness()
+    await h.with_books(["M1", "M2"])
+    h.with_meta("KXMVE-C1")
+    seed_event(h, "E1", exclusive=True)
+    seed_event(h, "E2", exclusive=True)
+    engine = PricingEngine(h.feed, h.metadata, DOC_ASSUMED, cfg.pricing)
+    result = engine.price(combo(CROSS_EVENT_LEGS), time_to_close_s=100_000)
+    assert isinstance(result, ConstructedQuote), result
+    assert result.yes_bid_cc == 0
+    assert result.no_bid_cc > 0
+
+
+async def test_engine_boundary_zeros_a_leaked_yes_bid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Belt-and-suspenders (defense in depth): if a builder ever WRONGLY returned a
+    non-zero yes_bid, the engine boundary must still zero it in sell-only mode.
+    Forces the leak via monkeypatch and asserts the real price() path corrects it;
+    a two-sided engine leaves it untouched."""
+    import combomaker.pricing.engine as eng_mod
+
+    leaked = ConstructedQuote(
+        yes_bid_cc=CentiCents(2_600), no_bid_cc=CentiCents(6_500),
+        fair_cc=CentiCents(3_000), width_components_cc={"base": 200},
+    )
+    h = Harness()
+    await h.with_books(["M1", "M2"])
+    h.with_meta("KXMVE-C1")
+    seed_event(h, "E1", exclusive=True)
+    seed_event(h, "E2", exclusive=True)
+    monkeypatch.setattr(eng_mod, "construct_quote", lambda **_: leaked)
+
+    sell = PricingEngine(h.feed, h.metadata, DOC_ASSUMED,
+                         PricingConfig(quote=QuoteConfig(sell_parlays_only=True)))
+    corrected = sell.price(combo(CROSS_EVENT_LEGS), time_to_close_s=100_000)
+    assert isinstance(corrected, ConstructedQuote)
+    assert corrected.yes_bid_cc == 0        # boundary caught the leaked YES
+    assert corrected.no_bid_cc == 6_500     # sell side untouched
+
+    two_sided = PricingEngine(h.feed, h.metadata, DOC_ASSUMED, PricingConfig())
+    passed = two_sided.price(combo(CROSS_EVENT_LEGS), time_to_close_s=100_000)
+    assert isinstance(passed, ConstructedQuote)
+    assert passed.yes_bid_cc == 2_600       # two-sided: untouched
+
+
+async def test_engine_boundary_declines_a_leaked_yes_only_quote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """H1: if a builder ever leaked a YES-only quote (yes>0, no=0), zeroing YES
+    must NOT emit an invalid (0,0) quote — the boundary declines cleanly."""
+    import combomaker.pricing.engine as eng_mod
+
+    yes_only = ConstructedQuote(
+        yes_bid_cc=CentiCents(2_600), no_bid_cc=CentiCents(0),
+        fair_cc=CentiCents(3_000), width_components_cc={"base": 200},
+    )
+    h = Harness()
+    await h.with_books(["M1", "M2"])
+    h.with_meta("KXMVE-C1")
+    seed_event(h, "E1", exclusive=True)
+    seed_event(h, "E2", exclusive=True)
+    monkeypatch.setattr(eng_mod, "construct_quote", lambda **_: yes_only)
+    sell = PricingEngine(h.feed, h.metadata, DOC_ASSUMED,
+                         PricingConfig(quote=QuoteConfig(sell_parlays_only=True)))
+    result = sell.price(combo(CROSS_EVENT_LEGS), time_to_close_s=100_000)
+    assert isinstance(result, NoQuote)      # not a both-zero ConstructedQuote
+    assert result.reason is ReasonCode.SKIP_PRICING_FAILED
 
 
 async def test_impossible_combo_refused_not_arbed() -> None:
