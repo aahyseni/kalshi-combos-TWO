@@ -92,10 +92,33 @@ in `tests/fixtures/ground_truth/conventions.json` → **un-gates sell-only fills
 - **In progress:** pricing (Phase 3) — spine works, **correlation surface far from complete** (soccer furthest; MLB partial; NBA gated; UFC/Tennis unbuilt).
 - **Blocked/inert:** sell-only fills, until the demo settlement confirms `combo_no_pays_complement`.
 
+## ✅ COMMITTED + PUSHED (2026-07-09 ~20:20 UTC)
+
+All session work is now on `origin/main` (was 24 dirty/untracked entries on a
+single disk): `9e13305` sell_parlays_only feature · `3e02bdc` docs (reports
+channel, atlas, DNP, calibration, CLAUDE.md rules 7-8) · `c976f0d` tools (the
+wc_backtest harness + calibration one-offs + experimental ising_amm, which is
+unreviewed and imported by nothing). Working tree clean at `c976f0d`.
+
+## OPERATOR DECISIONS (2026-07-09 evening)
+
+- **Markup: DEFERRED.** The 2026-07-08 settlement P&L showed sim P&L peaking at
+  ~1¢ with toxicity rising monotonically toward 5¢, tensioning the standing
+  "2-3¢ wide while capital low" prior. Operator call: **decide after more WC
+  data** — i.e. after the post-Jul-11 wc_backtest run on the freshly settled set.
+  Until then neither number is doctrine.
+- **LAA leg watch tonight:** operator is watching the Jul 9 LAA game settle.
+
 ## NEXT ACTIONS (prioritized)
 
-1. **~Jul 11:** re-check the demo combo settlement → set `combo_no_pays_complement`
-   → un-gate sell-only. (memory `project_kct_combo_settlement_watch`)
+1. **TONIGHT (~2026-07-10T03:05Z+) then ~Jul 11:** check the demo combo legs
+   (all `active` as of 20:05Z). LAA leg (KXMLBGAME-26JUL092005LAATEX-LAA)
+   expected-expires 03:05Z — **if LAA loses, early-NO determination fires FULL
+   combo settlement immediately** (see cashout report), confirming
+   `combo_no_pays_complement` a day early; otherwise the BOS leg + combo resolve
+   ~2026-07-11T02:15Z. Then set the convention in
+   `tests/fixtures/ground_truth/conventions.json` → un-gate sell-only fills.
+   (memory `project_kct_combo_settlement_watch`)
 2. **After Jul 9–11 WC settles:** run the ready harness
    **`tools/backtests/wc_backtest.py`** — `gather --since 2026-07-01` (OFF-PEAK;
    it now only READS rfqs/would_quotes, no longer touches the write-locked
