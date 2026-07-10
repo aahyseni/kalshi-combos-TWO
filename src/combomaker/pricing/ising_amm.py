@@ -260,7 +260,7 @@ class IsingAMM:
 
         max_resid = math.inf
         it = 0
-        for it in range(1, max_iters + 1):
+        for _it in range(1, max_iters + 1):
             model_m = self.marginals()
             model_pair = self.pairwise_matrix()
             max_resid = 0.0

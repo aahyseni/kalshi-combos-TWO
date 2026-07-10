@@ -544,6 +544,10 @@ class CorrelationConfig(StrictModel):
             "player_hit|player_hr": 0.01,
             "player_hit|player_hrr": 0.04,
             "player_hit|player_tb": 0.02,
+            # hr|hrr: measured in the 2026-07-09 tranche (teammate +0.053 /
+            # opponent -0.003, cross-player only — same-player HR=>HRR>=3 is
+            # EXACT containment, never a copula rho); judge unrouted +0.03.
+            "player_hr|player_hrr": 0.03,
             "player_hr|player_tb": 0.02,
             "player_hrr|player_tb": 0.04,
             # ks|tb: judge RE-CENTERED from the resolver-gated 0.00/0.15
@@ -716,6 +720,7 @@ class CorrelationConfig(StrictModel):
         "mlb:player_hit|player_hr": 0.06,
         "mlb:player_hit|player_hrr": 0.10,
         "mlb:player_hit|player_tb": 0.08,
+        "mlb:player_hr|player_hrr": 0.08,   # covers teammate +0.053 / opp ~0
         "mlb:player_hr|player_tb": 0.06,
         "mlb:player_hrr|player_tb": 0.10,
         "mlb:player_ks|player_tb": 0.10,    # judge re-centered -0.06/0.10
