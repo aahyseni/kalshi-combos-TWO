@@ -38,6 +38,13 @@ continuous-settlement handling; the `sim/` draw is nice-to-have; `pricing/` need
 no mean change. We already price the correlation well
 (`docs/calibration/results_soccer.md`) — this is orthogonal tail mechanics.
 
+**2026-07-10 MLB amendment:** the baseball settlement audit materially widens
+the scalar surface — under MLB's 48-hour rain rule **every** MLB family (not
+just props) scalar-settles, MLB prop DNP is **stricter** than soccer's, and the
+trigger frequency jumps from ~0-in-5,000 to **~1–2% of game-days** once MLB
+combos are quoted. See §7.1; the 2026-07-09 REACTIVE decision is flagged for
+operator re-affirmation (NEXT STEPS).
+
 ## 1. Convention & setup
 
 We are the **parlay seller**: we sell the YES combo / hold NO. A combo settles to
@@ -187,10 +194,18 @@ markets = 90'+stoppage; props = full game incl. ET).
 `functional_description` (every collection): *"Scalar outcomes are multiplied
 (rounded down)."* Not voided, not refunded. `s ≈ the leg's own market YES price` —
 i.e. **≈ our top-down marginal `p` by construction** (this is why §4 holds).
+*(2026-07-10: for MLB the clause is materially STRICTER than the soccer wording
+suggests — binary needs a START plus ≥1 PA / 1 pitch; see §7.1.)*
 
 - **Which leg types are DNP-able?** single-named-player stat props (scorer, points,
   HR, K's, TB): **YES** (scalar path). moneyline, total, spread, team-total,
-  advance, btts, corners, correct-score: strictly binary.
+  advance, btts, corners, correct-score: strictly binary — **in soccer only**.
+  > **CORRECTION 2026-07-10** (MLB settlement audit,
+  > `docs/reports/2026-07-10-baseball-vs-soccer-template-scorecard.md`): the
+  > original "ML/total/spread strictly binary" claim is **FALSIFIED for MLB**.
+  > The 48-hour postponement/suspension rule scalar-settles **EVERY MLB
+  > family** — moneyline, total, spread, RFI, and all props. No MLB leg type
+  > is strictly binary. Details in §7.1.
 - **Still UNVERIFIED:** (a) exact meaning of "fair market price" at freeze — last
   trade? mid? a Kalshi mark? — undefined in the rules and the **crux of the
   manipulation/adverse-selection case** (§6.2); (b) player **not active at all**
@@ -199,6 +214,50 @@ i.e. **≈ our top-down marginal `p` by construction** (this is why §4 holds).
 - **Empirically RARE:** the agent scanned **4,913** nested combo markets and found
   **zero** with `0 < settlement_value < 1`. Verified by RULE, not yet by a settled
   on-tape example (a scalar settlement needs every other leg to hit AND a DNP).
+  *(Scope note 2026-07-10: that 0-in-4,913 is a soccer-era scan. MLB's rain rule
+  puts the scalar trigger at ~1–2% of game-days — §7.1 — so "rare" does NOT
+  carry over to MLB combos.)*
+
+## 7.1 MLB settlement — 2026-07-10 audit (rain rule + stricter prop DNP)
+
+Source: settlement edge-case audit in
+`docs/reports/2026-07-10-baseball-vs-soccer-template-scorecard.md` (live rules
+text + all 9 MLB contract PDFs: GAME/TOTAL/SPREAD/KS/HIT/HR/HRR/TB/RFI).
+
+1. **The 48-hour rule scalar-settles EVERY MLB family.** A game postponed or
+   suspended and not completed within 48 hours settles to fair market price —
+   and this applies to moneyline, total, spread, RFI, **and** every prop, not
+   just player props. The §7 "strictly binary" list has **no MLB members**.
+   The §1–§6 math is unchanged, but note the mechanics differ from a
+   single-player DNP: a rainout freezes **all same-game legs at once**, so a
+   same-game combo collapses to a product of scalars ("rounded down" still
+   tilting to the NO-seller, §6). "Fair market price" remains **undefined** for
+   MLB too — same manipulation/adverse-selection crux as §7 flag (a);
+   TOTAL/SPREAD/RFI even ship empty `rules_secondary` (binding text only in
+   the PDFs).
+2. **MLB prop DNP is STRICTER than soccer.** Binary settlement requires the
+   player to **START** the game **and** record ≥1 plate appearance (batters) /
+   throw ≥1 pitch (listed starting pitcher). Scratched, **started-with-0-PA**,
+   and entered-without-starting ALL scalar-settle to fair market price —
+   **pinch-hit and relief stats explicitly do NOT count**, even though the
+   player played. Contrast soccer, where ANY entry (even ~1s) makes the leg a
+   clean binary. The MLB DNP hazard `h_i` therefore includes bullpen
+   games/openers and bench days — a larger surface than soccer's
+   active-but-unused-substitute case.
+3. **Frequency: ~1–2% of MLB game-days** hit the postponement/suspension path
+   → fractional combo settlements are orders of magnitude MORE likely than the
+   soccer 0-in-4,913 estimate the 2026-07-09 REACTIVE decision was based on.
+   If/when MLB combos are quoted, **expect `HALT_RECONCILIATION_MISMATCH` to
+   fire** on the first such settlement. The halt is fail-safe (stop, not loss)
+   and this doc makes the `1 − V` fix minutes-long, so the reactive stance is
+   *likely* still fine — but the decision basis changed, so **operator
+   re-affirmation is flagged** (NEXT STEPS).
+
+Related MLB scalar paths in the same audit (see the report for full text):
+shortened-game totals go scalar unless the over already clinched (~0.3–0.5% of
+games — the under can never binary-win a called game); settlement timing is NOT
+same-day across a combo's legs (TOTAL up to 15 days vs 3 for GAME/SPREAD/RFI);
+forfeits settle per-family differently (last occurred 1995).
 
 ## 8. Implementation spec
 
@@ -251,16 +310,27 @@ i.e. **≈ our top-down marginal `p` by construction** (this is why §4 holds).
 |------|------|-----|
 | DNP hazard term in `pricing/` fair | **NO** | mean is neutral (`s ≈ p`), move is sub-cent — complexity for nothing |
 | `sim/` scalar-draw (Ideas 3/5) | **DEFER** | corrects variance/deltas but scalar settlements are rare (0/4,913); not worth it now |
-| **Reconciliation tolerates fractional `V`** | **REACTIVE (operator decision 2026-07-09)** | a settled scorer-combo can pay `1 − V` and would trip `HALT_RECONCILIATION_MISMATCH` — **but that halt is fail-SAFE (stop, not loss), and the event is ~0-in-5,000.** Operator's call: don't pre-build; if the halt ever fires, this doc makes it instantly diagnosable and the `1 − V` fix is minutes |
+| **Reconciliation tolerates fractional `V`** | **REACTIVE (operator decision 2026-07-09)** | a settled scorer-combo can pay `1 − V` and would trip `HALT_RECONCILIATION_MISMATCH` — **but that halt is fail-SAFE (stop, not loss), and the event is ~0-in-5,000** *for soccer*. **2026-07-10 (§7.1): trigger becomes ~1–2% of game-days once MLB combos are quoted — reactive likely still fine, but re-affirmation flagged.** Operator's call: don't pre-build; if the halt ever fires, this doc makes it instantly diagnosable and the `1 − V` fix is minutes |
 | Freshness/thinness gate on DNP-able props (Idea 1) | **OPTIONAL / low** | defends the only −EV case (§6.2); an extension of existing freshness discipline, not pricing complexity; minimal for soccer starters |
 | Classify props out of UNKNOWN (Idea 2) | **only if** we expand to MLB/NBA props | UNKNOWN→no-quote is a SAFE default today |
 
 ## NEXT STEPS
 - **Decided (operator 2026-07-09): BUILD NOTHING.** DNP is ≈EV-neutral (`s ≈ p`),
-  tilts slightly toward the NO-seller, is ~0-in-5,000 rare, and its only failure
-  mode (a fractional-settlement reconciliation mismatch) is a **fail-safe halt**,
-  not a loss — so it's handled **reactively**: if the halt ever fires, this doc
-  makes it a minutes-long fix. Revisit only if we quote thin/illiquid props or size up.
+  tilts slightly toward the NO-seller, is ~0-in-5,000 rare *(soccer — see §7.1
+  for MLB)*, and its only failure mode (a fractional-settlement reconciliation
+  mismatch) is a **fail-safe halt**, not a loss — so it's handled **reactively**:
+  if the halt ever fires, this doc makes it a minutes-long fix. Revisit if we
+  quote thin/illiquid props, size up, **or quote MLB combos (§7.1)**.
+- **Re-affirm (owner: operator, before any MLB combo quoting — flagged
+  2026-07-10):** the REACTIVE stance on fractional settlement under the §7.1
+  frequency (~1–2% of MLB game-days vs the soccer ~0-in-5,000 it was decided
+  on). Halt is fail-safe, so reactive is likely still right — but the decision
+  basis changed and needs a re-sign-off.
+- **Guard (owner: eng, standing):** run `tools/mvec_eligibility_scan.py`
+  monthly + before playoffs — exits nonzero if the MLB combo-eligibility
+  surface drifts from the 9-family baseline (TEAMTOTAL/F5/RBI appearing in an
+  MVE collection = new DNP/settlement audit needed before quoting).
 - **Verify (owner: eng, before sizing up on thin props):** what "fair market
-  price" means at freeze (§7 flag a) — the crux of the manipulation risk.
+  price" means at freeze (§7 flag a, unchanged by §7.1 — MLB rules leave it
+  equally undefined) — the crux of the manipulation risk.
 - Fold the 2026-07-09 demo combo settlement (binary anchor) in when it resolves.

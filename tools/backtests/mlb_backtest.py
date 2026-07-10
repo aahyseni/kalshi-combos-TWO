@@ -34,10 +34,23 @@ DB DISCIPLINE — the prod recorder is LIVE: read-only URI, busy_timeout ≤ 10s
 rowid-bounded LIMIT chunks (adaptive: a slow chunk halves the next chunk size),
 progress persisted so an interrupted gather resumes instead of re-scanning.
 
+PER-PRINT CHRONOLOGICAL MODE (--per-print on price/analyze) — the sharper
+upgrade over the per-combo join (one snaps[-1] fair vs the MEDIAN of a combo's
+prints): gather also writes printed_times.json = {ticker: [strictly-pregame
+print TIMESTAMPS]} — TIMES ONLY, never prices (a print's timing is
+outcome-ADJACENT but PRICE-FREE; see the note in gather). price --per-print
+computes, for every (ticker, print_time), the fair from the latest snapshot
+STRICTLY BEFORE that print → fairs_perprint.pkl keyed (ticker, print_time);
+analyze --per-print judges each print against ITS OWN price and prints the
+same headline/bucket tables plus a per-print vs per-combo comparison.
+migrate-printed-times backfills printed_times.json into a pre-existing cache
+from its outcomes.pkl (gather-side utility — times only leave it).
+
 Usage (from repo root):
   python -m tools.backtests.mlb_backtest gather --since 2026-07-05 [--pregame-hours 4.0]
-  python -m tools.backtests.mlb_backtest price
-  python -m tools.backtests.mlb_backtest analyze
+  python -m tools.backtests.mlb_backtest price   [--per-print]
+  python -m tools.backtests.mlb_backtest analyze [--per-print]
+  python -m tools.backtests.mlb_backtest migrate-printed-times  # backfill an old cache
 """
 from __future__ import annotations
 
@@ -339,11 +352,38 @@ def gather(outdir: Path, since: str, pregame_hours: float, chunk_rows: int,
     # counter records still cover ALL priceable combos).
     json.dump(sorted(mt for mt in priceable if outcomes[mt]["clearings"]),
               open(outdir / "printed_tickers.json", "w"))
+    # PER-PRINT MODE SUPPORT — {ticker: [strictly-pregame print TIMESTAMPS]}.
+    # TIMES ONLY, never prices: a print's existence/timing is outcome-ADJACENT
+    # (the file exists because someone traded, and when) but PRICE-FREE —
+    # knowing WHEN a print landed only tells the price stage WHICH earlier
+    # snapshot to price from, nothing about the print's level. The fair stays
+    # a pure function of strictly-pre-print inputs, so the inputs/outcomes
+    # zero-bias split holds for --per-print exactly as it does per-combo.
+    json.dump({mt: [c[3] for c in outcomes[mt]["clearings"]]
+               for mt in priceable if outcomes[mt]["clearings"]},
+              open(outdir / "printed_times.json", "w"))
     progress_path.unlink(missing_ok=True)
     print(f"WROTE inputs.pkl ({len(inputs)} combos) + outcomes.pkl "
           f"({nres} resolved · {n_pre} with pre-game prints · "
           f"{n_inplay_only} in-play/post-start only · {n_no_prints} never traded · "
           f"cutoff = expiry − {pregame_hours}h).  inputs.pkl has NO prices.", flush=True)
+
+
+def migrate_printed_times(outdir: Path) -> None:
+    """MIGRATION helper: backfill printed_times.json into a cache gathered
+    before per-print mode existed, straight from its outcomes.pkl. This is a
+    GATHER-SIDE utility (gather owns/writes outcomes.pkl, so opening it here is
+    the same trust boundary): it extracts ONLY the timestamps of the
+    strictly-pregame prints — no price ever leaves this function — so the
+    price stage's zero-bias contract is intact: price --per-print still opens
+    inputs.pkl + printed_times.json only, never outcomes.pkl."""
+    outcomes = pickle.load(open(outdir / "outcomes.pkl", "rb"))
+    times = {mt: [c[3] for c in o["clearings"]]
+             for mt, o in outcomes.items() if o["clearings"]}
+    json.dump(times, open(outdir / "printed_times.json", "w"))
+    n = sum(len(v) for v in times.values())
+    print(f"WROTE printed_times.json — {len(times)} combos / {n} strictly-pregame "
+          "print times (TIMES ONLY, no prices)", flush=True)
 
 
 async def _fetch_clearings(
@@ -745,6 +785,80 @@ def price(outdir: Path, workers: int) -> None:
           "live pricing code (engine.py untouched; blind to any maker price)", flush=True)
 
 
+def price_perprint(outdir: Path, workers: int) -> None:
+    """PER-PRINT chronological fair pass — sharper than the per-combo mode's
+    single snaps[-1] fair: for EVERY strictly-pregame print, the fair is
+    computed from the latest marginal snapshot STRICTLY BEFORE that print's
+    timestamp, i.e. the fair we could actually have quoted when that print
+    occurred. Reads inputs.pkl + printed_times.json ONLY (print TIMES, never
+    prices — see gather); outcomes.pkl is never opened. Memoized per distinct
+    (ticker, snapshot): prints sharing their preceding snapshot share one fair
+    computation. Prints with NO earlier snapshot are skipped and counted.
+    Writes fairs_perprint.pkl keyed (ticker, print_time), BOTH configs."""
+    from bisect import bisect_left
+    from concurrent.futures import ProcessPoolExecutor
+
+    from combomaker.pricing.legtypes import classify_leg
+
+    inputs = pickle.load(open(outdir / "inputs.pkl", "rb"))   # ← ONLY inputs. Never outcomes.
+    ptimes: dict[str, list[str]] = json.load(open(outdir / "printed_times.json"))
+    n_prints = sum(len(v) for v in ptimes.values())
+    print(f"per-print fair pass: {len(ptimes)} printed combos / {n_prints} "
+          "strictly-pregame prints", flush=True)
+
+    tick_meta: dict[str, dict] = {}
+    work: dict[tuple[str, str], tuple] = {}          # (mt, snap_at) → worker item (memo)
+    snap_of_print: dict[tuple[str, str], str] = {}   # (mt, print_time) → snap_at
+    n_no_prior = n_missing = 0
+    for mt, times in ptimes.items():
+        d = inputs.get(mt)
+        snaps = ([(at, m) for at, m in d["snaps"] if len(m) == len(d["legs"])]
+                 if d else [])
+        if not snaps:
+            n_missing += len(times)
+            continue
+        snaps.sort(key=lambda s: _parse_ts(s[0]))
+        sdts = [_parse_ts(at) for at, _ in snaps]
+        fam_names = {classify_leg(t).name.lower() for t in d["legs"]}
+        tick_meta[mt] = {"fams": "+".join(sorted(fam_names)),
+                         "bucket": _bucket(fam_names), "n_legs": len(d["legs"])}
+        for pt in times:
+            i = bisect_left(sdts, _parse_ts(pt)) - 1  # latest snap STRICTLY before
+            if i < 0:
+                n_no_prior += 1  # print predates every snapshot → unpriceable, counted
+                continue
+            at, marg = snaps[i]
+            work[(mt, at)] = ((mt, at), d["legs"], d["sides"], marg)
+            snap_of_print[(mt, pt)] = at
+    print(f"  {len(snap_of_print)} prints priceable → {len(work)} distinct "
+          f"(combo, snapshot) fairs (memoized); skipped {n_no_prior} prints with "
+          f"no earlier snapshot + {n_missing} with missing/mismatched inputs",
+          flush=True)
+
+    worklist = list(work.values())
+    chunks = [worklist[i:i + 100] for i in range(0, len(worklist), 100)]
+    snap_fair: dict[tuple[str, str], tuple] = {}
+    done = 0
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        for batch in ex.map(_price_worker, chunks):
+            for key, fp, pp, fl, pl in batch:
+                snap_fair[key] = (fp, pp, fl, pl)
+            done += len(batch)
+            if done % 1000 < 100:
+                print(f"  fairs {done}/{len(worklist)}", flush=True)
+
+    fairs_pp: dict[tuple[str, str], dict] = {}
+    for (mt, pt), at in snap_of_print.items():
+        fp, pp, fl, pl = snap_fair[(mt, at)]
+        fairs_pp[(mt, pt)] = {"snap_at": at, "fair_promoted": fp, "path_promoted": pp,
+                              "fair_legacy": fl, "path_legacy": pl, **tick_meta[mt]}
+    pickle.dump(fairs_pp, open(outdir / "fairs_perprint.pkl", "wb"))
+    ok = sum(1 for f in fairs_pp.values() if f["fair_promoted"] is not None)
+    print(f"WROTE fairs_perprint.pkl — {len(fairs_pp)} (ticker, print_time) records, "
+          f"{ok} priced under BOTH configs via the live pricing code (blind to "
+          "every print's PRICE — only its timestamp was used)", flush=True)
+
+
 # ───────────────────────── stage 3: ANALYZE ─────────────────────────
 def _stats(errs: list[float]) -> str:
     ae = [abs(x) for x in errs]
@@ -901,10 +1015,113 @@ def analyze(outdir: Path) -> None:
     print("\nwrote mlb_backtest.json")
 
 
+def analyze_perprint(outdir: Path) -> None:
+    """PER-PRINT chronological join: one row per strictly-pregame PRINT, each
+    print's OWN price vs the fair computed from the latest snapshot strictly
+    before it (fairs_perprint.pkl). Removes the per-combo mode's residual
+    timing mismatch (one snaps[-1] fair vs the MEDIAN of prints, some of which
+    landed before the pricing snapshot). Same headline/bucket tables, plus an
+    explicit per-print vs per-combo comparison."""
+    fairs_pp = pickle.load(open(outdir / "fairs_perprint.pkl", "rb"))
+    outcomes = pickle.load(open(outdir / "outcomes.pkl", "rb"))  # ← outcomes enter HERE, not before
+    rows = []
+    n_unpriced = 0
+    for mt, o in outcomes.items():
+        for c in o["clearings"]:  # every strictly-pregame print is its own row
+            f = fairs_pp.get((mt, c[3]))
+            if not f or f["fair_promoted"] is None or f["fair_legacy"] is None:
+                n_unpriced += 1
+                continue
+            rows.append({"ticker": mt, "print_time": c[3], "snap_at": f["snap_at"],
+                         "clearing": c[0],
+                         "fair_promoted": f["fair_promoted"],
+                         "fair_legacy": f["fair_legacy"],
+                         "err_promoted": f["fair_promoted"] - c[0],
+                         "err_legacy": f["fair_legacy"] - c[0],
+                         "bucket": f["bucket"], "fams": f["fams"],
+                         "n_legs": f["n_legs"]})
+    if not rows:
+        print("no per-print rows — run gather (or migrate-printed-times) then "
+              "price --per-print first.")
+        return
+
+    def report(label: str, sub: list[dict]) -> None:
+        if not sub:
+            print(f"  {label:24s} n=0")
+            return
+        print(f"  {label:24s} n={len(sub):5d}")
+        print(f"    promoted : {_stats([r['err_promoted'] * 100 for r in sub])}")
+        print(f"    legacy   : {_stats([r['err_legacy'] * 100 for r in sub])}")
+
+    print(f"\n=== MLB BACKTEST (PER-PRINT) — fair-just-before-print vs THAT print, "
+          f"promoted vs legacy (n={len(rows)} prints; {n_unpriced} prints unpriced) ===")
+    report("ALL", rows)
+    print("\n=== by family-composition bucket (per-print) ===")
+    for b in ("game_lines_only", "props_only", "mixed", "unknown_carrying"):
+        report(b, [r for r in rows if r["bucket"] == b])
+    report("prop_carrying (po+mx)",
+           [r for r in rows if r["bucket"] in ("props_only", "mixed")])
+
+    print("\n=== by family (per-print, n>=50 prints, best→worst promoted med|err|) ===")
+    fam_groups: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        fam_groups[r["fams"]].append(r)
+    big = [(statistics.median(abs(r["err_promoted"]) * 100 for r in sub), fam, sub)
+           for fam, sub in fam_groups.items() if len(sub) >= 50]
+    for med, fam, sub in sorted(big):
+        print(f"  {med:5.2f}c  n={len(sub):5d}  {fam}")
+
+    print("\n=== per-print vs per-combo (same cache; per-combo = fair@snaps[-1] "
+          "vs MEDIAN print) ===")
+    if not (outdir / "fairs.pkl").exists():
+        print("  fairs.pkl missing — run the per-combo price stage for the comparison.")
+    else:
+        fairs = pickle.load(open(outdir / "fairs.pkl", "rb"))
+        combo_rows = []
+        for mt, f in fairs.items():
+            if f.get("fair_promoted") is None or f.get("fair_legacy") is None:
+                continue
+            o = outcomes.get(mt)
+            if not o or not o["clearings"]:
+                continue
+            clr = statistics.median(c[0] for c in o["clearings"])
+            combo_rows.append({"ticker": mt, "fams": f["fams"],
+                               "err_promoted": f["fair_promoted"] - clr,
+                               "err_legacy": f["fair_legacy"] - clr})
+        pp_tickers = {r["ticker"] for r in rows}
+        scopes = [("ALL", combo_rows, rows),
+                  ("ML-parlay (fams=moneyline)",
+                   [r for r in combo_rows if r["fams"] == "moneyline"],
+                   [r for r in rows if r["fams"] == "moneyline"])]
+        for label, csub, psub in scopes:
+            cshared = [r for r in csub if r["ticker"] in pp_tickers]
+            print(f"  {label}")
+            for which in ("promoted", "legacy"):
+                k = f"err_{which}"
+                if csub:
+                    print(f"    per-combo  {which:8s} n={len(csub):5d}  "
+                          f"{_stats([r[k] * 100 for r in csub])}")
+                if cshared and len(cshared) != len(csub):
+                    print(f"    per-combo∩ {which:8s} n={len(cshared):5d}  "
+                          f"{_stats([r[k] * 100 for r in cshared])}  "
+                          "(only tickers with per-print rows)")
+                if psub:
+                    print(f"    per-print  {which:8s} n={len(psub):5d}  "
+                          f"{_stats([r[k] * 100 for r in psub])}")
+
+    json.dump({"rows": rows}, open(outdir / "mlb_backtest_perprint.json", "w"))
+    print("\nwrote mlb_backtest_perprint.json")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("stage", choices=["gather", "price", "analyze"])
+    ap.add_argument("stage", choices=["gather", "price", "analyze", "migrate-printed-times"])
     ap.add_argument("--outdir", type=Path, default=Path("data") / "backtests" / "mlb")
+    ap.add_argument("--per-print", action="store_true",
+                    help="price/analyze: chronological PER-PRINT mode — every strictly-"
+                         "pregame print is priced from the latest snapshot strictly "
+                         "BEFORE it (fairs_perprint.pkl) and judged against THAT "
+                         "print's own price")
     ap.add_argument("--since", default="2026-07-05",
                     help="gather: only scan rfqs seen_at >= this date")
     ap.add_argument("--pregame-hours", type=float, default=DEFAULT_PREGAME_HOURS,
@@ -928,8 +1145,15 @@ def main() -> None:
     if a.stage == "gather":
         gather(a.outdir, a.since, a.pregame_hours, a.chunk_rows,
                a.audit_sample, a.refetch_outcomes)
+    elif a.stage == "migrate-printed-times":
+        migrate_printed_times(a.outdir)
     elif a.stage == "price":
-        price(a.outdir, a.workers)
+        if a.per_print:
+            price_perprint(a.outdir, a.workers)
+        else:
+            price(a.outdir, a.workers)
+    elif a.per_print:
+        analyze_perprint(a.outdir)
     else:
         analyze(a.outdir)
 
