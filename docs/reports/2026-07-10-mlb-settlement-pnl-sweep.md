@@ -65,3 +65,35 @@ By bucket at 1¢ markup: game-lines **−$99,641 (−11.6¢/ct)** · mixed −$1
   parlays wide-or-skip pending the favorites question.
 - Per-print chronological backtest mode (proposed) + Phase 6 paper shadow =
   the pipeline that makes these sweeps continuous.
+
+---
+
+## ADDENDUM (verification, 2026-07-10 ~15:30 UTC): the maker loss is REAL
+
+Operator challenged the −$1.25M figure; full audit ran: refetched the complete
+authed tape for all 5,604 sweep combos (136,621 trades), matched **41,363/41,363
+stored prints (100.000%)**, and read `taker_outcome_side` (the reliable field)
+on every print.
+
+- **Inversion theory DEAD:** taker_outcome_side agrees with the stored field on
+  ALL 41,363 prints (0 disagreements); `taker_book_side` 1:1 consistent. Only
+  **2.93% of contracts were NO-buys** (324,320 ct).
+- **Corrected maker P&L: −$1,231,634 (−11.12¢/ct)** vs as-recorded −$1,254,630
+  — a 1.8% correction. The flagship "loser" (375k ct @ 34¢, settled YES) was
+  **98.2% genuine YES-buys at the bid**: raw trades verbatim in the audit
+  (e.g. 10,499.8 ct @ 0.339, yes/yes/bid). Makers really sold it and lost
+  −$238,687 on that one combo.
+- The forensics' "giveaway 22¢ pure-ML" cell: **97.24% genuine YES-buys** —
+  not inverted prints; volume clustered on eventual winners (40% of contracts
+  on settled-YES combos vs 28% of combos). A favorite-hot week, dollar-weighted.
+- Makers made +$11,498 on the tiny NO-buy flow.
+- **Corrected sell-only sweep (NO-buys excluded): nearly identical** — m=0
+  −$941,772 (−10.32¢/ct); m=1 −$103,915; props-only stays positive at 0–1¢
+  (+$12,668 / +$6,138); the 2–2.5¢ adverse-selection trough intact; breakeven
+  ~4.25–4.75¢ on negligible flow.
+
+**Reading:** the whole market's parlay sellers genuinely bled ~$1.23M on ~4
+favorite-hot days — and kept quoting, because their discipline is the same one
+the operator articulated: markup × volume × calibration wins over weeks; bad
+days occur. Side-quality bonus: the recorder's stored side field matched the
+authoritative field 100% — our tape data is clean.
