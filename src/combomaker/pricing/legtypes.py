@@ -46,6 +46,20 @@ class LegType(StrEnum):
     # ARE reachable (real same-game combos in the prod tape — the earlier
     # "blocked by Kalshi" assumption was wrong); they're DEFERRED, not blocked.
     FIRST_HALF_SPREAD = "first_half_spread"
+    # MLB per-game player props (combo-eligible per KXMVESPORTSMULTIGAMEEXTENDED-R
+    # / KXMVECROSSCATEGORY-R, 2026-07-09). Ticker line suffix -N means N+
+    # (floor_strike = N-0.5) — NOT the N-0.5 "over" convention of TOTAL/SPREAD.
+    PLAYER_HR = "player_hr"    # batter home runs N+ (KXMLBHR; -1 = 'to hit a HR')
+    PLAYER_HIT = "player_hit"  # batter hits N+ (KXMLBHIT)
+    PLAYER_KS = "player_ks"    # starting-pitcher strikeouts N+ (KXMLBKS)
+    PLAYER_TB = "player_tb"    # batter total bases N+ (KXMLBTB)
+    # Combined hits+runs+RBIs (KXMLBHRR, MLBHITSRUNSRBIS.pdf). NOT a home-run
+    # market — and 'MLBHRR' contains 'MLBHR', so its keyword MUST precede MLBHR.
+    PLAYER_HRR = "player_hrr"
+    # Run in the FIRST INNING by either team (KXMLBRFI). Dedicated type: it
+    # settles on a first-inning window (never a game TOTAL), and the market
+    # ticker has NO outcome suffix (KXMLBRFI-<gamecode> is the full ticker).
+    RFI = "rfi"
     UNKNOWN = "unknown"
 
 
@@ -59,6 +73,30 @@ _KEYWORDS: tuple[tuple[str, LegType], ...] = (
     # (e.g. KXNFLTEAMTOTAL-…-SEA24), distinct from the game TOTAL (…-N). Same
     # precede-the-superstring pattern as TCORNERS-before-CORNERS below.
     ("TEAMTOTAL", LegType.TEAM_TOTAL),
+    # MLB props block — placement is LOAD-BEARING: the F5TOTAL / SERIESGAMETOTAL /
+    # F5SPREAD blockers must precede TOTAL and SPREAD. SOURCE OF TRUTH (full
+    # 11,305-series universe scan, job 24844262, 2026-07-09): bare "HR"/"KS"/
+    # "HIT"/"TB"/"RFI" collide with 64/67/9/128/10 series (KXANTHROPICRISK,
+    # KXLEADERNFLSACKS, KXDANAWHITEFB, KXBILBASKETBALL, KXSINNERFINISH, …) — so
+    # every MLB prop keyword is MLB-anchored, and UNKNOWN-mapped blocker entries
+    # kill the known superstring traps (same precede-the-superstring pattern as
+    # TEAMTOTAL above / TCORNERS below).
+    # --- blockers (explicit UNKNOWN = widen, never masquerade) ---
+    ("LEADERMLB", LegType.UNKNOWN),        # KXLEADERMLB{HR,HITS,KS,…} season leaders
+    ("MLBHRDERBY", LegType.UNKNOWN),       # KXMLBHRDERBY[QUAL] — contains 'MLBHR'
+    ("SERIESGAMETOTAL", LegType.UNKNOWN),  # KXMLBSERIESGAMETOTAL = series game COUNT,
+                                           # was mis-typing as full-game TOTAL (live bug)
+    ("F5TOTAL", LegType.UNKNOWN),          # KX{MLB,WBC}F5TOTAL = first-5-innings total,
+                                           # was mis-typing as full-game TOTAL (live bug:
+                                           # 'F5' evades _PERIOD_SERIES)
+    ("F5SPREAD", LegType.UNKNOWN),         # KX{MLB,WBC}F5SPREAD — was mis-typing as SPREAD
+    # --- MLB player props + RFI (universe-verified unique hit sets) ---
+    ("MLBHRR", LegType.PLAYER_HRR),        # MUST precede MLBHR (contains it)
+    ("MLBHR", LegType.PLAYER_HR),
+    ("MLBHIT", LegType.PLAYER_HIT),
+    ("MLBKS", LegType.PLAYER_KS),
+    ("MLBTB", LegType.PLAYER_TB),
+    ("MLBRFI", LegType.RFI),
     ("TOTAL", LegType.TOTAL),
     # TCORNERS must precede CORNERS (it contains it). SOURCE OF TRUTH (RFQ tape
     # 2026-07-07): team corners = KXWCTCORNERS, total corners = KXWCCORNERS.

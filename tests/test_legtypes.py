@@ -81,6 +81,130 @@ def test_game_total_still_types_total_not_team_total() -> None:
     assert classify_leg("KXMLBTOTAL-26JUL081840NYYTB-4") is LegType.TOTAL
 
 
+# --- MLB player props + RFI (promoted from docs/calibration/staged_mlb_props.md) ---
+
+
+@pytest.mark.parametrize(
+    ("ticker", "expected"),
+    [
+        # SOURCE OF TRUTH (prod RFQ tape + Kalshi API, 2026-07-09): line suffix
+        # -N means N+ (floor_strike = N-0.5), NOT the TOTAL/SPREAD over-line.
+        ("KXMLBKS-26JUL092145COLSF-SFCWHISENHUNT88-8", LegType.PLAYER_KS),
+        ("KXMLBHIT-26JUL091840ATHDET-ATHZGELOF20-3", LegType.PLAYER_HIT),
+        ("KXMLBHR-26JUL092005LAATEX-TEXWLANGFORD36-1", LegType.PLAYER_HR),
+        ("KXMLBHRR-26JUL092005LAATEX-TEXWLANGFORD36-5", LegType.PLAYER_HRR),
+        ("KXMLBTB-26JUL092005LAATEX-TEXWLANGFORD36-5", LegType.PLAYER_TB),
+        # RFI has NO outcome suffix: KXMLBRFI-<gamecode> is the full ticker.
+        ("KXMLBRFI-26JUL121605COLSF", LegType.RFI),
+    ],
+)
+def test_mlb_player_prop_families_classify(ticker: str, expected: LegType) -> None:
+    assert classify_leg(ticker) is expected
+
+
+def test_mlb_hrr_keyword_precedes_hr() -> None:
+    # 'MLBHRR' contains 'MLBHR', so keyword order is load-bearing: KXMLBHRR is
+    # combined hits+runs+RBIs (MLBHITSRUNSRBIS.pdf) — NOT a home-run market,
+    # despite identical ticker grammar to KXMLBHR on the same players.
+    ticker = "KXMLBHRR-26JUL092005LAATEX-TEXWLANGFORD36-5"
+    assert classify_leg(ticker) is LegType.PLAYER_HRR
+    assert classify_leg(ticker) is not LegType.PLAYER_HR
+
+
+@pytest.mark.parametrize(
+    "ticker",
+    [
+        # Superstring traps around the MLB-anchored prop keywords: each carries
+        # an explicit UNKNOWN blocker entry (widen, never masquerade).
+        "KXLEADERMLBHR-26-XXX",       # season leaders (contains 'MLBHR')
+        "KXMLBHRDERBY-26-XXX",        # HR derby (contains 'MLBHR')
+        "KXMLBSERIESGAMETOTAL-26JUL09NYYTB-3",
+        "KXMLBF5TOTAL-26JUL091840NYYTB-4",
+        "KXMLBF5SPREAD-26JUL091840NYYTB-NYY2",
+    ],
+)
+def test_mlb_blocker_series_are_unknown(ticker: str) -> None:
+    assert classify_leg(ticker) is LegType.UNKNOWN
+
+
+def test_mlb_blockers_fix_live_total_and_spread_misclassification() -> None:
+    # Regression for two LIVE misclassification bugs (latent — families not
+    # combo-eligible today): KXMLBF5TOTAL/KXMLBF5SPREAD settle on a FIRST-5-
+    # INNINGS window ('F5' evades _PERIOD_SERIES) and KXMLBSERIESGAMETOTAL is a
+    # series game COUNT — all three used to type as full-game TOTAL/SPREAD.
+    assert classify_leg("KXMLBSERIESGAMETOTAL-26JUL09NYYTB-3") is not LegType.TOTAL
+    assert classify_leg("KXMLBF5TOTAL-26JUL091840NYYTB-4") is not LegType.TOTAL
+    assert classify_leg("KXMLBF5SPREAD-26JUL091840NYYTB-NYY2") is not LegType.SPREAD
+
+
+@pytest.mark.parametrize(
+    "ticker",
+    [
+        # SOURCE OF TRUTH (11,305-series universe scan, 2026-07-09): bare
+        # HR/KS/HIT/TB/RFI keywords would hit 64/67/9/128/10 foreign series —
+        # exactly why every prop keyword is MLB-anchored. None of these may
+        # ever classify as an MLB prop type.
+        "KXANTHROPICRISK-26-YES",     # contains 'HR'
+        "KXLEADERNFLSACKS-26-XXX",    # contains 'KS'
+        "KXDANAWHITEFB-26-YES",       # contains 'HIT'
+        "KXBILBASKETBALL-26-YES",     # contains 'TB'
+        "KXSINNERFINISH-26-XXX",      # contains 'RFI'
+    ],
+)
+def test_substring_collisions_never_type_as_mlb_props(ticker: str) -> None:
+    mlb_prop_types = {
+        LegType.PLAYER_HR,
+        LegType.PLAYER_HIT,
+        LegType.PLAYER_KS,
+        LegType.PLAYER_TB,
+        LegType.PLAYER_HRR,
+        LegType.RFI,
+    }
+    assert classify_leg(ticker) not in mlb_prop_types
+    assert classify_leg(ticker) is LegType.UNKNOWN
+
+
+def test_wbc_and_kbo_props_stay_unknown() -> None:
+    # WBC/KBO prop families are intentionally unmapped (dormant, widen-safe):
+    # the keywords are MLB-anchored, so these fall through to UNKNOWN.
+    assert classify_leg("KXWBCHIT-26MAR10JPNUSA-USAPLAYER1-2") is LegType.UNKNOWN
+    assert classify_leg("KXKBORFI-26JUL10LGDOO") is LegType.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "ticker",
+    [
+        "KXMLBKS-26JUL092145COLSF-SFCWHISENHUNT88-8",
+        "KXMLBHIT-26JUL091840ATHDET-ATHZGELOF20-3",
+        "KXMLBHR-26JUL092005LAATEX-TEXWLANGFORD36-1",
+        "KXMLBHRR-26JUL092005LAATEX-TEXWLANGFORD36-5",
+        "KXMLBTB-26JUL092005LAATEX-TEXWLANGFORD36-5",
+        "KXMLBRFI-26JUL121605COLSF",
+    ],
+)
+def test_mlb_prop_families_classify_sport_mlb(ticker: str) -> None:
+    # The sport-scoped pair table lookup keys on classify_sport: all 6 prop
+    # families must stay Sport.MLB so 'mlb:'-prefixed entries can attach.
+    assert classify_sport(ticker) is Sport.MLB
+
+
+def test_rfi_is_deliberately_not_period_flagged() -> None:
+    # RFI settles on a first-inning window but is deliberately NOT period-
+    # flagged: its own LegType carries the window (unlike 1H/2H/quarter series,
+    # which must be gated out of the full-game structural inverter).
+    assert classify_leg("KXMLBRFI-26JUL121605COLSF") is LegType.RFI
+    assert not is_period_leg("KXMLBRFI-26JUL121605COLSF")
+
+
+def test_mlb_full_game_families_unchanged_by_prop_keywords() -> None:
+    # Regression: the MLB-anchored prop keywords + blockers must not disturb
+    # the verified-existing full-game MLB families.
+    assert classify_leg("KXMLBGAME-26JUL081840NYYTB-NYY") is LegType.MONEYLINE
+    assert classify_leg("KXMLBTOTAL-26JUL081840NYYTB-4") is LegType.TOTAL
+    assert classify_leg("KXMLBSPREAD-26JUL081840NYYTB-NYY2") is LegType.SPREAD
+    assert classify_leg("KXMLBEXTRAS-26JUL081840NYYTB-EXTRAS") is LegType.EXTRAS
+
+
 # --- tennis (match winner) ---------------------------------------------------
 
 

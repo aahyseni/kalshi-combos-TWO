@@ -485,6 +485,74 @@ class CorrelationConfig(StrictModel):
             "extras|total": 0.10,
             "extras|moneyline": -0.04,
             "moneyline|moneyline": -0.95,
+            # ---- MLB props tranche (Retrosheet 2005-25, 49,486 games; 8-agent
+            # measurement pass + xhigh adversarial judge, 2026-07-09; source of
+            # truth docs/calibration/staged_mlb_props.md FINAL RECOMMENDED
+            # TABLE). All keys legtypes.pair_key-sorted, verified by running the
+            # helper. Retires the sign-wrong flat +0.60/0.90 fallback these
+            # same-game pairs hit while KXMLBKS/HIT/HR/HRR/TB/RFI typed UNKNOWN.
+            # -- [A] orientation-free MEASURED --
+            # Starter K over × GAME total over: cluster-boot 99% [-0.271,-0.230];
+            # ladder-FLAT across all posted K lines 3.5-8.5, so ONE entry serves
+            # every KS rung (self-median line convention judge-validated).
+            "player_ks|total": -0.25,
+            # MEASURED +0.233 in the GAME-total frame. NOT the team-frame +0.367:
+            # that is HR × OWN-TEAM total (KXMLBTEAMTOTAL), which is NOT
+            # combo-eligible — loading it here would mis-sign/mis-scale
+            # (staged_mlb_props.md:166-169). Dilution below team-frame is required.
+            "player_hr|total": 0.24,
+            "player_hit|total": 0.25,      # rung-monotone 0.19(1+)/0.25(2+)/0.30(3+)
+            "player_tb|total": 0.27,       # rungs: 2+ 0.26 / 4+ 0.28
+            "player_hrr|total": 0.40,      # starters-only pop; line-monotone .33/.40/.44
+            "rfi|total": 0.37,             # strongest + most era-stable MLB pair measured
+            "moneyline|rfi": 0.00,         # either-team RFI is team-symmetric ⇒ ⊥ winner
+            "player_ks|rfi": -0.10,        # orientation-free; ships without the resolver
+            "player_ks|player_ks": 0.04,   # opposing starters; sign confirmed small-pos
+            # Copula-FALLBACK only: the structural margin/total grid supersedes
+            # this whenever it prices; it fires on structural declines. Parity
+            # coupling explains the fixed-line oscillation seen in calibration.
+            "spread|total": 0.13,
+            # -- [B] same-family batter pairs, UNROUTED -- teammate/opponent
+            # ticker-prefix routing is the next phase; these are the measured
+            # sign-spanning UNROUTED blends (e.g. hrr: teammate +0.17 / opponent
+            # 0.00). Bands span both routed values.
+            "player_hr|player_hr": 0.03,
+            "player_hit|player_hit": 0.00,
+            "player_tb|player_tb": 0.00,
+            "player_hrr|player_hrr": 0.08,
+            # -- [C] ML-orientation-resolver-gated, NEUTRALIZED -- the measured
+            # values are team-oriented (+/-0.24 ml|ks, +/-0.23 ml|hr, +/-0.23
+            # ml|hit, +/-0.37 ml|hrr; facing-pitcher hit|ks -0.13, hr|ks -0.075,
+            # hrr|ks -0.18) and sign-FLIP when the ML leg is the opponent.
+            # sgp.py has no MLB team-orientation resolver yet (the fav/dog
+            # marginal axis is the WRONG axis) — until a resolver compares the
+            # prop ticker's team prefix to the ML suffix, ship 0.00 with a
+            # sign-spanning band: point error <=0.37 vs up to 0.84 at +0.60.
+            # The signed values above unlock with the resolver.
+            "moneyline|player_ks": 0.00,
+            "moneyline|player_hr": 0.00,
+            "moneyline|player_hit": 0.00,
+            "moneyline|player_hrr": 0.00,
+            "player_hit|player_ks": 0.00,
+            "player_hr|player_ks": 0.00,
+            # Judge-CONFIRMED neutralized: binding constraint is facing/starters
+            # -0.190 (CI lo -0.196), not the now-measured ~0 teammate.
+            "player_hrr|player_ks": 0.00,
+            # -- [D] cross-family batter-batter, distinct players (judge-approved
+            # 2026-07-09; bounded by the measured same-family values; hr|hrr
+            # measured teammate +0.05 / opponent 0.00) --
+            "player_hit|player_hr": 0.01,
+            "player_hit|player_hrr": 0.04,
+            "player_hit|player_tb": 0.02,
+            "player_hr|player_tb": 0.02,
+            "player_hrr|player_tb": 0.04,
+            # ks|tb: judge RE-CENTERED from the resolver-gated 0.00/0.15
+            # placeholder — orientation-free like player_ks|rfi.
+            "player_ks|player_tb": -0.06,
+            # TODO(route, mlb): "moneyline|spread" is deliberately NOT tabled —
+            # truth is containment-shaped +/-0.95 by side (:same +0.95 / :opp
+            # -0.95, exact: 0/98,980 violations); NO unoriented scalar is right,
+            # so it falls to the flat default until same/opp routing ships.
         },
     }
     # Band overrides: sport-prefixed keys ("nfl:moneyline|total") for
@@ -618,6 +686,39 @@ class CorrelationConfig(StrictModel):
         "mlb:extras|total": 0.10,           # post-rule-change sample is smaller
         "mlb:extras|moneyline": 0.08,
         "mlb:moneyline|moneyline": 0.04,
+        # MLB props tranche bands (2026-07-09 measurement pass + judge; see the
+        # pair_rho_by_sport["mlb"] block for provenance).
+        # [A] measured, orientation-free:
+        "mlb:player_ks|total": 0.12,        # spans era drift -0.28..-0.22
+        "mlb:player_hr|total": 0.10,
+        "mlb:player_hit|total": 0.12,       # spans the 1+/2+/3+ rung ladder
+        "mlb:player_tb|total": 0.10,
+        "mlb:player_hrr|total": 0.08,
+        "mlb:rfi|total": 0.10,
+        "mlb:moneyline|rfi": 0.05,
+        "mlb:player_ks|rfi": 0.08,
+        "mlb:player_ks|player_ks": 0.08,
+        "mlb:spread|total": 0.10,
+        # [B] same-family unrouted (span teammate/opponent):
+        "mlb:player_hr|player_hr": 0.06,
+        "mlb:player_hit|player_hit": 0.08,
+        "mlb:player_tb|player_tb": 0.08,
+        "mlb:player_hrr|player_hrr": 0.12,
+        # [C] neutralized (sign-spanning until the ML orientation resolver):
+        "mlb:moneyline|player_ks": 0.30,    # spans +/-0.24 orientation
+        "mlb:moneyline|player_hr": 0.28,    # spans +/-0.23
+        "mlb:moneyline|player_hit": 0.26,   # spans +/-0.23
+        "mlb:moneyline|player_hrr": 0.40,   # spans +/-0.37
+        "mlb:player_hit|player_ks": 0.15,   # facing -0.13 / teammate ~0
+        "mlb:player_hr|player_ks": 0.12,    # facing -0.075
+        "mlb:player_hrr|player_ks": 0.20,   # facing -0.18 (judge-confirmed band)
+        # [D] cross-family batter-batter (judge-approved):
+        "mlb:player_hit|player_hr": 0.06,
+        "mlb:player_hit|player_hrr": 0.10,
+        "mlb:player_hit|player_tb": 0.08,
+        "mlb:player_hr|player_tb": 0.06,
+        "mlb:player_hrr|player_tb": 0.10,
+        "mlb:player_ks|player_tb": 0.10,    # judge re-centered -0.06/0.10
     }
     # Orientation CURVES: a pair whose YES-YES rho is a monotone function of one
     # leg's marginal (not a single scalar or a fav/dog step). Keyed

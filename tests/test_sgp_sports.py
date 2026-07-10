@@ -140,3 +140,52 @@ class TestDefaultConfigOrientation:
         assert cfg.pair_rho_by_sport["soccer"]["moneyline|player_goal"] == 0.50
         assert cfg.pair_rho["moneyline|player_goal"] == 0.40  # non-soccer fallback
         assert cfg.pair_rho_uncertainty["soccer:moneyline|player_goal"] == 0.12
+
+
+def shipped_params() -> SgpParams:
+    """SgpParams built from the SHIPPED CorrelationConfig, mirroring the
+    engine's own construction (pricing/engine.py) — the integration seam."""
+    cfg = CorrelationConfig()
+    return SgpParams(
+        pair_rho=dict(cfg.pair_rho),
+        default_rho=cfg.same_event_rho,
+        cross_event_rho=cfg.cross_event_rho,
+        typed_uncertainty=cfg.typed_rho_uncertainty,
+        untyped_uncertainty=cfg.untyped_rho_uncertainty,
+        pair_uncertainty=dict(cfg.pair_rho_uncertainty),
+        pair_rho_by_sport={s: dict(t) for s, t in cfg.pair_rho_by_sport.items()},
+        oriented_curve={k: list(v) for k, v in cfg.oriented_curve.items()},
+        oriented_curve_uncertainty=dict(cfg.oriented_curve_uncertainty),
+    )
+
+
+class TestMlbPropPairsShippedConfig:
+    """MLB props tranche end to end (2026-07-09): real tickers through the real
+    classifier + the SHIPPED config. The regression guarded against is the old
+    path — KXMLBKS/HIT/HR typed UNKNOWN, so every same-game prop pair fell to
+    the flat +0.6/0.90 fallback (sign-wrong for KS × total, measured −0.25)."""
+
+    def test_ks_total_same_game_resolves_measured_negative(self) -> None:
+        legs = [
+            RfqLeg("KXMLBKS-26JUL091110NYYBOS-BOSGCROCHET45-7", "E1", "yes", None),
+            RfqLeg("KXMLBTOTAL-26JUL091110NYYBOS-9", "E1", "yes", None),
+        ]
+        result = build_sgp_correlation(legs, [(0, 1)], shipped_params())
+        assert abs(result.corr[0, 1] - (-0.25)) < 1e-9  # NOT the 0.6 flat prior
+        assert result.typed_pairs == 1
+        assert result.untyped_pairs == 0
+        # band = mlb:player_ks|total 0.12, not the 0.90 fallback width
+        assert abs(result.corr_low[0, 1] - (-0.37)) < 1e-9
+        assert abs(result.corr_high[0, 1] - (-0.13)) < 1e-9
+        assert any("mlb:player_ks|total" in note for note in result.notes)
+
+    def test_hit_hr_same_game_resolves_judge_value(self) -> None:
+        legs = [
+            RfqLeg("KXMLBHIT-26JUL091110NYYBOS-NYYAJUDGE99-2", "E1", "yes", None),
+            RfqLeg("KXMLBHR-26JUL091110NYYBOS-BOSRDEVERS11-1", "E1", "yes", None),
+        ]
+        result = build_sgp_correlation(legs, [(0, 1)], shipped_params())
+        assert abs(result.corr[0, 1] - 0.01) < 1e-9  # wired [D] cross-family value
+        assert abs(result.corr_high[0, 1] - 0.07) < 1e-9  # band mlb:… = 0.06
+        assert result.typed_pairs == 1
+        assert any("mlb:player_hit|player_hr" in note for note in result.notes)

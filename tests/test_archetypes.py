@@ -251,6 +251,11 @@ def test_engine_forwards_sport_tables() -> None:
     assert tables, "sport tables missing from engine SgpParams"
     assert tables["soccer"]["moneyline|total"] == 0.28
     assert tables["nfl"]["moneyline|total"] == 0.00
+    # MLB props tranche (2026-07-09): the measured player-prop entries and
+    # their sport-prefixed bands must reach the hot path too.
+    assert tables["mlb"]["player_ks|total"] == -0.25
+    bands = engine._sgp_params.pair_uncertainty  # noqa: SLF001 (test seam)
+    assert bands["mlb:player_ks|total"] == 0.12
 
 
 async def dog_ml_btts_harness(config: PricingConfig | None = None) -> PricingEngine:
