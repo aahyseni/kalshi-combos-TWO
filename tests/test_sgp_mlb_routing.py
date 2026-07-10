@@ -173,12 +173,19 @@ class TestPropPairRouting:
         rel = classify_legs(legs, _Prov())
         assert rel.kind is RelationshipKind.CONTAINMENT
         assert rel.containment == (0, 1)  # subset = the HR leg
-        # The sgp seam ALONE (classifier bypassed) still refuses to plain 0.03
-        # — the exact cell is not a measured conditional, so the same-player
-        # conditional resolver returns None and the routing resolver refuses.
+        # RETARGETED 2026-07-10 (full table): the sgp seam ALONE (classifier
+        # bypassed) now prices via the REVERSE measured cell ('hrr',3,'hr',1)
+        # = 0.366, n=276,418 — restored with the full 142-cell table. This is
+        # exact-consistent (P(A∧B) = P(B)·P(A|B) is an identity), so the seam
+        # no longer falls to plain 0.03; it emits the conditional-implied rho.
         c = build_sgp_correlation(legs, ((0, 1),), shipped_params(),
                                   marginals=[0.5, 0.5])
-        assert abs(c.corr[0, 1] - 0.03) < 1e-9
+        assert any("conditional" in n for n in c.notes)
+        # With the synthetic 0.5/0.5 test marginals, joint = 0.5*0.366 = 0.183
+        # < independence 0.25, so the conditional-implied rho is NEGATIVE
+        # (-0.408) — the sign is an artifact of the fake marginals, the point
+        # is the seam prices the conditional instead of plain 0.03.
+        assert c.corr[0, 1] < -0.3
 
     def test_hr_hrr_distinct_player_routes(self) -> None:
         assert abs(_rho(f"KXMLBHR-{_G}-COLHGOODMAN15-1",

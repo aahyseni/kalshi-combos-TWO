@@ -149,14 +149,17 @@ def test_same_player_exact_pair_buried_in_larger_combo_is_unknown() -> None:
 # --- classifier: measured cells -> bare-pair conditional / buried UNKNOWN ----------
 
 
-def test_same_player_hit_tb_bare_pair_falls_through_to_conditional() -> None:
-    """HIT-1 x TB-2 is a strong measured cell (n=587,975): the bare pair stays
-    OK (grouped) and the sgp seam prices it via the conditional table."""
+def test_same_player_hit_tb_bare_pair_is_exact_containment() -> None:
+    """RETARGETED 2026-07-10 (full 142-cell table restored): TB>=2 arithmetically
+    implies HIT>=1 (total bases only come from hits), and the restored
+    reverse-direction cell ('tb',2,'hit',1) is EXACT — so HIT-1 x TB-2
+    same-player is CONTAINMENT (subset = the TB leg), no longer a conditional.
+    (The original assertion reflected the truncated 60-cell table, where all
+    tb-conditioned rows were missing.)"""
     legs = (_leg(HIT1), _leg(TB2))
     rel = classify_legs(legs, _Prov())
-    assert rel.kind is RelationshipKind.OK
-    assert rel.same_event_groups == ((0, 1),)
-    assert any("conditional" in n for n in rel.notes)
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containment == (1, 0)  # subset = the TB-2 leg
 
 
 def test_same_player_hit3_hr1_prices_via_the_reverse_direction() -> None:
@@ -190,22 +193,26 @@ def test_same_player_conditional_pair_buried_is_unknown() -> None:
 
 
 def test_same_player_unmeasured_pair_is_unknown_even_bare() -> None:
-    """TB-2 x HRR-2 same player has NO usable cell in either direction (the
-    delivered table is truncated there) — UNKNOWN, never the distinct-player
-    [D] rho (the regression this family fixes)."""
-    legs = (_leg(TB2), _leg(HRR2))
+    """RETARGETED 2026-07-10: TB-2 x HRR-2 is measured both directions in the
+    restored full table, so the truly-unmeasured probe now uses an OUT-OF-GRID
+    rung — TB-9 has no cell in either direction (the grid tops out at 6) —
+    UNKNOWN, never the distinct-player [D] rho (the regression this fixes)."""
+    legs = (_leg(HIT1), _leg(TB2[:-1] + "9"))  # swap ONLY the trailing rung digit
     rel = classify_legs(legs, _Prov())
     assert rel.kind is RelationshipKind.UNKNOWN
     assert any("unmeasured" in n for n in rel.notes)
 
 
-def test_same_player_exact_only_none_sign_case_is_unknown() -> None:
-    """{HR no, HRR-2 yes}: the exact hr->hrr direction gives no verdict and the
-    reverse ('hrr',2,'hr',1) cell is in the TRUNCATED table region — UNKNOWN
-    (fail-closed on the missing measurement)."""
+def test_same_player_exact_none_sign_case_prices_via_reverse_conditional() -> None:
+    """RETARGETED 2026-07-10: {HR no, HRR-2 yes} — the exact hr->hrr direction
+    gives no side-verdict, but the reverse ('hrr',2,'hr',1) cell (0.2312,
+    n=437,563) exists in the full table, so the pair stays OK and the sgp seam
+    prices the conditional. P(A∧B) = P(B)·P(A|B) is an identity, so this is
+    exact-consistent, not an approximation."""
     legs = (_leg(HR1, "no"), _leg(HRR2))
     rel = classify_legs(legs, _Prov())
-    assert rel.kind is RelationshipKind.UNKNOWN
+    assert rel.kind is RelationshipKind.OK
+    assert any("conditional" in n for n in rel.notes)
 
 
 def test_distinct_players_are_not_intercepted() -> None:
