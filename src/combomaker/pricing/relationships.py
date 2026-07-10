@@ -26,6 +26,7 @@ the caller must turn into widen-or-no-quote:
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal, Protocol
@@ -39,6 +40,10 @@ class RelationshipKind(StrEnum):
     IMPOSSIBLE = "impossible"    # logically zero payout — v1: no-quote
     UNKNOWN = "unknown"          # classification failed — widen-or-no-quote
     CONTAINMENT = "containment"  # one leg logically implies another (joint pinned)
+    # yes-LOW + no-HIGH rungs of one nested ladder: the pair's joint is EXACT
+    # arithmetic P(over-low) − P(over-high) — no ρ. The engine collapses each
+    # band pair into a super-leg before any copula runs.
+    NESTED_BAND = "nested_band"
 
 
 class EventInfoProvider(Protocol):
@@ -68,6 +73,11 @@ class Relationship:
     # exchange METADATA (event_mutually_exclusive) and so is not logically
     # certain. False everywhere except the tautological IMPOSSIBLE returns.
     farmable: bool = False
+    # NESTED_BAND only: (low_i, high_i) leg-index pairs — low_i is the LOWER
+    # over-line selected YES, high_i the HIGHER over-line selected NO, same
+    # ladder (LegType + game + scope). Guaranteed pairwise disjoint, each
+    # band's game holding ONLY its two rungs. Empty for every other kind.
+    bands: tuple[tuple[int, int], ...] = ()
 
 
 # Team-corners ticker suffix = team code + the over-line digits (…-COL5 -> COL, 5).
@@ -113,6 +123,43 @@ def _total_line(market_ticker: str) -> int | None:
     if _TOTAL_LINE.match(suffix):
         return int(suffix)
     return None
+
+
+def _match_ladder_line(market_ticker: str) -> tuple[str, int] | None:
+    """(scope, over-line) for a MATCH-level ladder ticker whose suffix is the
+    bare line digits (``KXWCCORNERS-…-8`` -> ``("", 8)``; rule-book verified:
+    strike_type greater_or_equal, so ``-8`` = "8 or more"). Scope ``""`` = the
+    whole match. None when the suffix isn't pure digits — never guess a line."""
+    suffix = market_ticker.rsplit("-", 1)[-1]
+    if _TOTAL_LINE.match(suffix):
+        return "", int(suffix)
+    return None
+
+
+def _team_ladder_line(market_ticker: str) -> tuple[str, int] | None:
+    """(scope, over-line) for a TEAM-scoped ladder ticker whose suffix
+    concatenates TEAM+LINE with no separator (``…-MAR4`` -> ``("MAR", 4)``)."""
+    return _corners_team_line(market_ticker)
+
+
+# --- Nested-ladder registry ------------------------------------------------------
+# A ladder = one family's over-lines on ONE counting variable, so over-H ⊆ over-L
+# for H > L is EXACT monotone containment (KXWCCORNERS rules verified 2026-07-09:
+# every rung of an event settles on the SAME combined count — "regulation,
+# stoppage and any extra time periods", strike_type greater_or_equal). Value =
+# suffix parser returning (scope, line); scope is the within-game unit ("" =
+# whole match, a team code for team ladders, a player code if a player ladder
+# ever lists), so the branch keys on LegType + game + scope + numeric line —
+# NOT on soccer specifics. A future nested family (e.g. MLB TOTAL if Kalshi
+# lifts size_max: over-9.5 YES + over-11.5 NO must price exactly) is ONE entry
+# here, gated on a validator/settlement probe of that family's own tickers.
+# TOTAL / FIRST_HALF_TOTAL / TEAM_TOTAL are deliberately withheld: their events
+# carry size_max=1 today (no band buildable), so an entry would only add
+# unprobed farm surface.
+_NESTED_LADDER_FAMILIES: dict[LegType, Callable[[str], tuple[str, int] | None]] = {
+    LegType.CORNERS: _match_ladder_line,
+    LegType.CORNERS_TEAM: _team_ladder_line,
+}
 
 
 def _moneyline_is_team(market_ticker: str) -> bool:
@@ -232,38 +279,60 @@ def classify_legs(
     # branch. See ``_containment_sign`` for the shared YES/NO sign matrix.
     types = [classify_leg(leg.market_ticker) for leg in legs]
 
-    # Same-team TEAM-corner lines are EXACT CONTAINMENT (over-M ⊆ over-N for
-    # M>N: a team with more than M corners necessarily has more than N — 0
-    # violations in the tape). So within one game, for ONE team, a YES on the
-    # HIGHER line with a NO on the LOWER line is logically impossible (v1 policy:
-    # no-quote), mirroring the 1H-BTTS-yes × FT-BTTS-no branch below. Scoped to
-    # corners_team only (game-total corners do NOT nest); same-team lower-yes ×
-    # higher-no stays POSSIBLE and falls to the copula, as does the buried-in-
-    # combo same-team pair (approximated by the comonotone prior, not pinned).
-    corner_legs: list[tuple[int, str, int]] = []
+    # NESTED LADDERS (registry above): same family + same game + same scope,
+    # different over-lines ⇒ over-H ⊆ over-L exactly (H > L). Verdicts follow
+    # ``_containment_sign`` with A = the HIGHER line (subset), B = the LOWER:
+    #   {A yes, B no}  → IMPOSSIBLE, farmable (≥H ∧ <L is an airtight
+    #                    contradiction on one count — the corners_team farm,
+    #                    now family-generic incl. match corners)
+    #   {A yes, B yes} → containment joint = P(over-H). Exchange BLOCKS
+    #                    same-side rungs (400 duplicated_legs, 0 in 3.02M tape
+    #                    combos) — defensive branch.
+    #   {A no,  B no}  → containment joint = P(over-L no) (¬B⟹¬A); also
+    #                    exchange-blocked today, defensive.
+    #   {A no,  B yes} → NESTED BAND "count in [L, H)": ALLOWED by the
+    #                    side-aware validator (114 real tape combos) and EXACT:
+    #                    joint = P(over-L) − P(over-H). The copula cannot
+    #                    express a difference of marginals (match-corner bands
+    #                    were falling to the flat +0.6 fallback).
+    ladder_legs: list[tuple[int, str, int]] = []
     for i, leg in enumerate(legs):
-        if types[i] is not LegType.CORNERS_TEAM:
+        parse = _NESTED_LADDER_FAMILIES.get(types[i])
+        if parse is None:
             continue
-        parsed = _corners_team_line(leg.market_ticker)
+        parsed = parse(leg.market_ticker)
         if parsed is not None:
-            corner_legs.append((i, parsed[0], parsed[1]))
-    for a_i, a_team, a_line in corner_legs:
-        if legs[a_i].side != "yes":
-            continue
-        for b_i, b_team, b_line in corner_legs:
-            if b_i == a_i or legs[b_i].side != "no":
+            # Nesting key: family + game + within-game scope. SAME LegType only —
+            # cross-window nesting (1H vs FT) belongs to Family 3 below.
+            ladder_legs.append((i, f"{types[i]}|{game_keys[i]}|{parsed[0]}", parsed[1]))
+    containment: tuple[int, int] | None = None
+    bands: list[tuple[int, int]] = []
+    for a_i, a_key, a_line in ladder_legs:      # A = higher line (subset)
+        for b_i, b_key, b_line in ladder_legs:  # B = lower line (superset)
+            if a_i == b_i or a_key != b_key or a_line <= b_line:
                 continue
-            if a_team != b_team or game_keys[a_i] != game_keys[b_i] or a_line <= b_line:
-                continue
-            notes.append(
-                f"same-team corners over-{a_line} yes ({legs[a_i].market_ticker}) "
-                f"implies over-{b_line} yes: {legs[b_i].market_ticker} no is impossible"
-            )
-            # Airtight nested-line containment (over-M ⊆ over-N, 0 tape
-            # violations) ⇒ farmable.
-            return Relationship(
-                RelationshipKind.IMPOSSIBLE, (), tuple(notes), farmable=True
-            )
+            verdict = _containment_sign(a_i, b_i, legs[a_i].side, legs[b_i].side)
+            if verdict == "impossible":
+                notes.append(
+                    f"nested ladder over-{a_line} yes ({legs[a_i].market_ticker}) "
+                    f"implies over-{b_line} yes: {legs[b_i].market_ticker} no is "
+                    "impossible"
+                )
+                # Airtight nested-line containment tautology ⇒ farmable.
+                return Relationship(
+                    RelationshipKind.IMPOSSIBLE, (), tuple(notes), farmable=True
+                )
+            if isinstance(verdict, tuple):
+                containment = verdict
+            else:
+                # Sides are validated yes/no above, so the remaining case is
+                # exactly {A no, B yes}: the band, stored as (low_i, high_i).
+                bands.append((b_i, a_i))
+                notes.append(
+                    f"nested band [{b_line},{a_line}) "
+                    f"{legs[b_i].market_ticker} yes + {legs[a_i].market_ticker} no: "
+                    "joint = P(low) - P(high)"
+                )
 
     # Three period/line implications A⟹B are EXACT scoring facts (not
     # correlations). A Kalshi taker-API probe proved these three — and only these
@@ -276,7 +345,6 @@ def classify_legs(
     # A bare 2-leg containment is priced coherently; the SAME pair buried in a
     # >2-leg combo is not modeled → UNKNOWN (widen-or-no-quote), never a copula
     # guess. IMPOSSIBLE returns immediately, so it always beats a buried pair.
-    containment: tuple[int, int] | None = None
 
     # Family 1 — 1H-BTTS (A) ⟹ FT-BTTS (B): both teams scoring by half-time means
     # both have scored in the match. All four sign cases reachable.
@@ -370,7 +438,8 @@ def classify_legs(
 
     # Pass 2 — per-GAME: the correlation blocks. Same-game legs from DIFFERENT
     # market families share a game code but not an event_ticker, so they must be
-    # grouped here or they price independent (the bug this fixes).
+    # grouped here or they price independent (the bug this fixes). Shared by the
+    # NESTED_BAND and OK returns.
     by_game: dict[str, list[int]] = {}
     for i, key in enumerate(game_keys):
         by_game.setdefault(key, []).append(i)
@@ -380,5 +449,30 @@ def classify_legs(
             continue
         groups.append(tuple(indices))
         notes.append(f"same-game group {key}: {len(indices)} legs")
+
+    if bands:
+        # A band is modeled ONLY as an isolated pair: each band's game must
+        # contain exactly its two rungs. A third same-game leg (incl. a second
+        # band or a 3-rung shape) is declined UNKNOWN: a band is a WINDOW event,
+        # non-monotone in the latent count, so its correlation to a same-game
+        # neighbour is the rung's ρ ATTENUATED by an unmeasured factor (bites
+        # hardest on corners|corners_team 0.62) — widen-or-no-quote, never a
+        # copula guess. Cross-game companions are fine (cross_event_rho
+        # machinery, where representing the band by its low rung is exact).
+        # Disjointness follows: a shared rung would put ≥3 legs in one game.
+        for low_i, _high_i in bands:
+            game = game_keys[low_i]
+            if sum(1 for k in game_keys if k == game) != 2:
+                notes.append(
+                    f"nested band game {game} carries other legs: "
+                    "band-vs-neighbour correlation unmodeled"
+                )
+                return Relationship(RelationshipKind.UNKNOWN, (), tuple(notes))
+        return Relationship(
+            RelationshipKind.NESTED_BAND,
+            tuple(groups),
+            tuple(notes),
+            bands=tuple(bands),
+        )
 
     return Relationship(RelationshipKind.OK, tuple(groups), tuple(notes))

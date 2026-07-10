@@ -41,7 +41,7 @@ from combomaker.pricing.quote import (
 from combomaker.pricing.relationships import Relationship, RelationshipKind, classify_legs
 from combomaker.pricing.sgp import SgpParams, build_sgp_correlation
 from combomaker.pricing.structural import StructuralPricer, structural_applicable
-from combomaker.rfq.models import Rfq
+from combomaker.rfq.models import Rfq, RfqLeg
 
 log = get_logger(__name__)
 
@@ -166,6 +166,16 @@ class PricingEngine:
             # here so it never reaches the copula (which would price the pair at
             # a pairwise ρ and under-quote the certain part).
             joint = price_containment(beliefs, sides, relationship.containment)
+        elif relationship.kind is RelationshipKind.NESTED_BAND:
+            # Nested-band arithmetic is EXACT (P(low) − P(high)); it must never
+            # fall to the copula (flat-0.6 overprices live match-corner bands by
+            # +1.8c to +6.6c of fair, 2026-07-09 prod mids). Collapse each band
+            # pair into a super-leg, then price the reduced set as usual. Any
+            # failure declines — never a copula guess on a band shape.
+            banded = self._price_nested_bands(rfq, beliefs, sides, relationship)
+            if isinstance(banded, NoQuote):
+                return banded
+            joint = banded
         elif self._structural is not None and structural_applicable(
             list(rfq.legs), relationship.same_event_groups
         ):
@@ -324,6 +334,94 @@ class PricingEngine:
             notes="; ".join(relationship.notes),
         )
         return result
+
+    def _price_nested_bands(
+        self,
+        rfq: Rfq,
+        beliefs: list[LegBelief],
+        sides: list[str],
+        relationship: Relationship,
+    ) -> JointEstimate | NoQuote:
+        """Collapse each nested-band pair (yes-LOW + no-HIGH rungs of one
+        ladder) into a SUPER-LEG whose marginal is the EXACT band probability
+        P(over-low) − P(over-high), then price the reduced leg set with the
+        ordinary SGP/copula machinery.
+
+        - A bare 2-leg band reduces to ONE leg: the joint IS the arithmetic,
+          no ρ anywhere in the price.
+        - The classifier guarantees every band's game holds ONLY its two rungs,
+          so a band super-leg only ever meets other legs CROSS-game
+          (cross_event_rho), where representing it by its low-line leg is exact
+          (band × same-game-neighbour shapes decline UNKNOWN upstream).
+        - Width: the super-leg carries u_low + u_high (a difference's errors
+          add — conservative linear sum, same convention as price_joint).
+        - Fail-closed: P(low) ≤ P(high) means the leg books contradict the
+          ladder ordering (stale/crossed data) ⇒ NoQuote, never a clamped-to-0
+          fair whose sell-only NO bid would quote near $1 on bad data.
+        """
+        if not relationship.bands:
+            # Classifier bug guard: the kind without pairs must refuse, never
+            # fall through to a copula guess.
+            return NoQuote(
+                ReasonCode.SKIP_PRICING_FAILED, "nested-band kind without band pairs"
+            )
+        band_p: dict[int, float] = {}
+        band_u: dict[int, float] = {}
+        dropped: set[int] = set()
+        for low_i, high_i in relationship.bands:
+            p_band = beliefs[low_i].p - beliefs[high_i].p
+            if p_band <= 0.0:
+                return NoQuote(
+                    ReasonCode.SKIP_PRICING_FAILED,
+                    f"nested band inverted: P({rfq.legs[low_i].market_ticker})="
+                    f"{beliefs[low_i].p:.4f} <= P({rfq.legs[high_i].market_ticker})="
+                    f"{beliefs[high_i].p:.4f}",
+                )
+            band_p[low_i] = p_band
+            band_u[low_i] = beliefs[low_i].uncertainty + beliefs[high_i].uncertainty
+            dropped.add(high_i)
+        keep = [i for i in range(len(rfq.legs)) if i not in dropped]
+        remap = {old: new for new, old in enumerate(keep)}
+        reduced_legs: list[RfqLeg] = [rfq.legs[i] for i in keep]
+        reduced_beliefs = [
+            replace(
+                beliefs[i],
+                p=band_p[i],
+                uncertainty=band_u[i],
+                source=f"{beliefs[i].source}+band",
+            )
+            if i in band_p
+            else beliefs[i]
+            for i in keep
+        ]
+        reduced_sides = ["yes" if i in band_p else sides[i] for i in keep]
+        reduced_groups = [
+            g
+            for g in (
+                tuple(remap[i] for i in group if i in remap)
+                for group in relationship.same_event_groups
+            )
+            if len(g) >= 2
+        ]
+        sgp = build_sgp_correlation(
+            reduced_legs,
+            reduced_groups,
+            self._sgp_params,
+            marginals=[b.p for b in reduced_beliefs],
+        )
+        band_notes = tuple(
+            f"nested band exact: P({rfq.legs[low_i].market_ticker}) - "
+            f"P({rfq.legs[high_i].market_ticker}) = {band_p[low_i]:.4f}"
+            for low_i, high_i in relationship.bands
+        )
+        return price_joint_matrices(
+            reduced_beliefs,
+            reduced_sides,
+            sgp.corr,
+            sgp.corr_low,
+            sgp.corr_high,
+            extra_notes=(*sgp.notes, *band_notes),
+        )
 
     def _apply_longshot_floor(self, joint: JointEstimate) -> JointEstimate:
         """Below the longshot threshold, absolute uncertainty must not shrink

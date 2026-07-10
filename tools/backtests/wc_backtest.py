@@ -304,6 +304,39 @@ def _build_pricer():
         beliefs = [LegBelief(p=y, uncertainty=0.005, source="bt") for y in yes]
         if rel.kind is RelationshipKind.CONTAINMENT and rel.containment is not None:
             return price_containment(beliefs, sides, rel.containment).p
+        if rel.kind is RelationshipKind.NESTED_BAND:
+            # Keep in sync with PricingEngine._price_nested_bands: EXACT
+            # super-leg collapse, band p = P(over-low) - P(over-high); inverted
+            # mids decline (None). A band shape must NEVER fall to the copula.
+            if not rel.bands:
+                return None  # classifier bug guard: kind without pairs refuses
+            band_p: dict[int, float] = {}
+            dropped: set[int] = set()
+            for low_i, high_i in rel.bands:
+                p_band = yes[low_i] - yes[high_i]
+                if p_band <= 0.0:
+                    return None  # inverted mids: books contradict the ladder
+                band_p[low_i] = p_band
+                dropped.add(high_i)
+            keep = [i for i in range(len(legs)) if i not in dropped]
+            remap = {old: new for new, old in enumerate(keep)}
+            r_legs = [legs[i] for i in keep]
+            r_beliefs = [
+                LegBelief(p=band_p.get(i, yes[i]),
+                          uncertainty=0.01 if i in band_p else 0.005, source="bt")
+                for i in keep
+            ]
+            r_sides = ["yes" if i in band_p else sides[i] for i in keep]
+            r_groups = [
+                g for g in (
+                    tuple(remap[i] for i in group if i in remap)
+                    for group in rel.same_event_groups
+                ) if len(g) >= 2
+            ]
+            r_corr = build_sgp_correlation(
+                r_legs, r_groups, sgp, marginals=[b.p for b in r_beliefs])
+            return price_joint_matrices(
+                r_beliefs, r_sides, r_corr.corr, r_corr.corr_low, r_corr.corr_high).p
         if structural_applicable(list(legs), rel.same_event_groups):
             j, _ = pricer.try_price(list(legs), beliefs, sides)
             if j is not None:

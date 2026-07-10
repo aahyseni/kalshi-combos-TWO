@@ -291,12 +291,15 @@ def test_same_team_corners_higher_yes_lower_no_is_impossible() -> None:
     assert rel.farmable is True  # nested-line containment tautology
 
 
-def test_same_team_corners_lower_yes_higher_no_is_possible() -> None:
-    """over-4 YES with over-8 NO is a normal band bet (4 < corners ≤ 8) — NOT
-    impossible; it groups for the copula."""
+def test_same_team_corners_lower_yes_higher_no_is_nested_band() -> None:
+    """over-4 YES with over-8 NO is the band '4 < corners <= 8' — previously OK
+    (copula corners_team:same 0.90); now NESTED_BAND: exact P(low) − P(high).
+    (BEHAVIOR CHANGE 2026-07-10, intentional: the exact band arithmetic beats
+    the 0.90-rho copula approximation — was test_..._is_possible.)"""
     legs = (leg(TC_MEX4, TC_EV, "yes"), leg(TC_MEX8, TC_EV, "no"))
     rel = classify_legs(legs, MappingProvider({TC_EV: False}))
-    assert rel.kind is RelationshipKind.OK
+    assert rel.kind is RelationshipKind.NESTED_BAND
+    assert rel.bands == ((0, 1),)
     assert rel.same_event_groups == ((0, 1),)
 
 
@@ -315,6 +318,105 @@ def test_same_team_corners_same_line_both_sides_is_caught_upstream() -> None:
     rel = classify_legs(legs, MappingProvider({TC_EV: False}))
     assert rel.kind is RelationshipKind.IMPOSSIBLE
     assert rel.farmable is True  # same-market both sides tautology
+
+
+# --- nested MATCH-corner ladders (KXWCCORNERS: bare-digit suffix, scope=match) ---
+
+MC_EV = "KXWCCORNERS-26JUL10ESPBEL"
+MC_8 = "KXWCCORNERS-26JUL10ESPBEL-8"
+MC_11 = "KXWCCORNERS-26JUL10ESPBEL-11"
+MC2_EV = "KXWCCORNERS-26JUL11ARGSUI"
+MC2_7 = "KXWCCORNERS-26JUL11ARGSUI-7"
+MC2_10 = "KXWCCORNERS-26JUL11ARGSUI-10"
+MC3_EV = "KXWCCORNERS-26JUL11NORENG"
+MC3_8 = "KXWCCORNERS-26JUL11NORENG-8"
+MC3_9 = "KXWCCORNERS-26JUL11NORENG-9"
+
+
+def test_match_corners_higher_yes_lower_no_is_farmable_impossible() -> None:
+    """over-11 YES implies over-8 YES (one combined count, rules-verified incl.
+    extra time) — the corners_team farm now covers match-level CORNERS."""
+    legs = (leg(MC_11, MC_EV, "yes"), leg(MC_8, MC_EV, "no"))
+    rel = classify_legs(legs, MappingProvider({MC_EV: False}))
+    assert rel.kind is RelationshipKind.IMPOSSIBLE
+    assert rel.farmable is True
+
+
+def test_match_corners_band_detected() -> None:
+    """yes-low + no-high is the band the side-aware validator allows (114 real
+    tape combos): NESTED_BAND, joint exact — never the flat-0.6 copula."""
+    legs = (leg(MC_8, MC_EV, "yes"), leg(MC_11, MC_EV, "no"))
+    rel = classify_legs(legs, MappingProvider({MC_EV: False}))
+    assert rel.kind is RelationshipKind.NESTED_BAND
+    assert rel.bands == ((0, 1),)
+    assert rel.same_event_groups == ((0, 1),)
+
+
+def test_match_corners_same_side_rungs_defensive_containment() -> None:
+    """The exchange blocks same-side rungs (400 duplicated_legs) — defensive:
+    if one ever arrived, the joint pins to P(higher line) exactly."""
+    legs = (leg(MC_11, MC_EV, "yes"), leg(MC_8, MC_EV, "yes"))
+    rel = classify_legs(legs, MappingProvider({MC_EV: False}))
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containment == (0, 1)  # subset = the higher line
+
+
+def test_match_corners_both_no_defensive_containment() -> None:
+    """¬over-8 ⟹ ¬over-11: subset is the LOWER line's NO."""
+    legs = (leg(MC_11, MC_EV, "no"), leg(MC_8, MC_EV, "no"))
+    rel = classify_legs(legs, MappingProvider({MC_EV: False}))
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containment == (1, 0)
+
+
+def test_three_cross_game_bands_all_detected() -> None:
+    """The real tape shape (rowid 10983663): a 6-leg combo holding three bands
+    in three different games — all three collapse, kind NESTED_BAND."""
+    legs = (
+        leg(MC_8, MC_EV, "yes"), leg(MC_11, MC_EV, "no"),
+        leg(MC2_7, MC2_EV, "yes"), leg(MC2_10, MC2_EV, "no"),
+        leg(MC3_8, MC3_EV, "yes"), leg(MC3_9, MC3_EV, "no"),
+    )
+    rel = classify_legs(
+        legs, MappingProvider({MC_EV: False, MC2_EV: False, MC3_EV: False})
+    )
+    assert rel.kind is RelationshipKind.NESTED_BAND
+    assert set(rel.bands) == {(0, 1), (2, 3), (4, 5)}
+
+
+def test_band_with_same_game_companion_is_unknown() -> None:
+    """A band sharing its game with ANY other leg is UNKNOWN: the band is a
+    window event, its correlation to a neighbour is NOT the rung's rho
+    (attenuation unmeasured) — widen-or-no-quote, never a copula guess."""
+    tot_ev = "KXWCTOTAL-26JUL10ESPBEL"
+    legs = (
+        leg(MC_8, MC_EV, "yes"), leg(MC_11, MC_EV, "no"),
+        leg("KXWCTOTAL-26JUL10ESPBEL-3", tot_ev, "yes"),
+    )
+    rel = classify_legs(legs, MappingProvider({MC_EV: False, tot_ev: False}))
+    assert rel.kind is RelationshipKind.UNKNOWN
+
+
+def test_band_with_cross_game_companion_is_priced() -> None:
+    tot_ev = "KXWCTOTAL-26JUL11ARGSUI"
+    legs = (
+        leg(MC_8, MC_EV, "yes"), leg(MC_11, MC_EV, "no"),
+        leg("KXWCTOTAL-26JUL11ARGSUI-3", tot_ev, "yes"),
+    )
+    rel = classify_legs(legs, MappingProvider({MC_EV: False, tot_ev: False}))
+    assert rel.kind is RelationshipKind.NESTED_BAND
+    assert rel.bands == ((0, 1),)
+
+
+def test_three_rung_shape_is_not_quoted_as_band() -> None:
+    """yes-7 + no-10 + no-11 in one game: a band plus a redundant no-rung —
+    unmodeled (the no/no pair is containment inside a 3-leg combo) → UNKNOWN."""
+    legs = (
+        leg(MC2_7, MC2_EV, "yes"), leg(MC2_10, MC2_EV, "no"),
+        leg("KXWCCORNERS-26JUL11ARGSUI-11", MC2_EV, "no"),
+    )
+    rel = classify_legs(legs, MappingProvider({MC2_EV: False}))
+    assert rel.kind is RelationshipKind.UNKNOWN
 
 
 # --- Family 1: 1H-BTTS ⟹ FT-BTTS, the NO/NO containment added ---------------------
