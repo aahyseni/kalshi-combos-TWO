@@ -403,6 +403,140 @@ def _period_total_prior(
     return _lookup_pair(f"{key}:{orient}", sport, params)
 
 
+# --- MLB team routing ---------------------------------------------------------
+# An MLB prop ticker embeds the player's team as the PREFIX of its player
+# segment (KXMLBKS-26JUL092145COLSF-SFCWHISENHUNT88-8 -> SF) and the game
+# code's tail is the away+home team-code blob, ALSO un-delimited (COLSF =
+# COL+SF). Codes are 2 or 3 chars, so a naive both-split prefix match is
+# ambiguous ~20% of the time (COLSF + COLRFELTNER18 matches CO and COL).
+# Resolution mirrors structural.py:143-180 (keep in sync): anchor a candidate
+# fragment at the blob ENDS — prefix ⇒ away, suffix ⇒ home, both-or-neither
+# refuses. Safe because no Kalshi MLB team code is a prefix of another and
+# every away+home concatenation tiles uniquely (all 30 codes enumerated live
+# 2026-07-09, 295 game blobs + all 870 ordered pairs, job 24844262;
+# tools/spotcheck_mlb_team_routing.py re-proves this against the live API).
+# Doubleheaders append G<digit> to the blob (structural.py:126-135) and are
+# stripped identically; both legs must carry the IDENTICAL raw game-code
+# segment so a G1×G2 pair can never route. ANY doubt -> None -> the caller
+# falls back to the plain (neutralized / unrouted) entry — never invent an
+# orientation (the soccer scorer-guard contract).
+
+_MLB_GAME_CODE = re.compile(r"^\d{2}[A-Z]{3}\d{2}(?:\d{4})?([A-Z0-9]{4,})$")
+_MLB_DOUBLEHEADER = re.compile(r"([A-Z]{4,})G\d")
+
+# The routed MLB player-prop leg types. RFI is absent on purpose (team-
+# symmetric, suffixless KXMLBRFI-<gamecode>); KS is included so batter-stat ×
+# starter-Ks pairs route to the FACING (:opp) / teammate (:same) keys.
+_MLB_PLAYER_PROP_TYPES = frozenset({
+    LegType.PLAYER_HR,
+    LegType.PLAYER_HIT,
+    LegType.PLAYER_KS,
+    LegType.PLAYER_TB,
+    LegType.PLAYER_HRR,
+})
+
+
+def _mlb_team_blob(ticker: str) -> tuple[str, str] | None:
+    """(raw game-code segment, away+home team blob) from an MLB ticker's second
+    hyphen segment, doubleheader G<digit> stripped. None when the segment isn't
+    date+time+alpha-blob shaped (don't guess)."""
+    parts = ticker.upper().split("-")
+    if len(parts) < 2:
+        return None
+    m = _MLB_GAME_CODE.match(parts[1])
+    if m is None:
+        return None
+    blob = m.group(1)
+    dh = _MLB_DOUBLEHEADER.fullmatch(blob)
+    if dh is not None:
+        blob = dh.group(1)
+    if not blob.isalpha() or len(blob) < 4:
+        return None
+    return parts[1], blob
+
+
+def _mlb_side_of(code: str, blob: str) -> str | None:
+    """Which side of the away+home blob ``code`` anchors to: ``"away"`` when it
+    prefixes the blob, ``"home"`` when it suffixes it. Both-or-neither refuses
+    (None) — mirrors structural.py ``_team_of``. Unambiguous on the verified
+    vocabulary: no MLB team code is a prefix of another."""
+    if len(code) < 2 or len(code) >= len(blob):
+        return None
+    is_away = blob.startswith(code)
+    is_home = blob.endswith(code)
+    if is_away == is_home:
+        return None
+    return "away" if is_away else "home"
+
+
+def _mlb_player_side(player_seg: str, blob: str) -> str | None:
+    """The side the player-segment's team prefix anchors to — longest leading
+    fragment (4→2) that anchors exactly one blob end, mirroring structural.py
+    ``_player_team``. None when nothing anchors (don't guess)."""
+    for length in range(min(4, len(player_seg) - 1), 1, -1):
+        side = _mlb_side_of(player_seg[:length], blob)
+        if side is not None:
+            return side
+    return None
+
+
+def _mlb_prop_pair_prior(
+    key: str, sport: str, params: SgpParams, ticker_a: str, ticker_b: str
+) -> _PairPrior | None:
+    """MLB prop × prop prior, resolved to ``:same`` / ``:opp`` by whether the
+    two players' team prefixes anchor to the same side of the game blob.
+    FACING CONVENTION: for any batter-stat × player_ks pair, ``:opp`` IS the
+    facing case (a batter bats against the OPPOSING starter) and carries the
+    measured negative; ``:same`` is the teammate case. Guards: both legs must
+    carry the identical raw game-code segment (doubleheader-safe), and an
+    IDENTICAL player segment (same player, cross-family) refuses — that pair
+    is containment-shaped (HR⇒HIT/TB/HRR), never a copula rho; the
+    containment phase owns it. Unparseable anything → None (caller falls back
+    to the plain unrouted entry; never invent an orientation)."""
+    game_a = _mlb_team_blob(ticker_a)
+    game_b = _mlb_team_blob(ticker_b)
+    if game_a is None or game_b is None or game_a != game_b:
+        return None
+    parts_a = ticker_a.upper().split("-")
+    parts_b = ticker_b.upper().split("-")
+    if len(parts_a) != 4 or len(parts_b) != 4:
+        return None
+    seg_a, seg_b = parts_a[2], parts_b[2]
+    if seg_a == seg_b:
+        return None  # same player cross-family: containment, not a rho
+    side_a = _mlb_player_side(seg_a, game_a[1])
+    side_b = _mlb_player_side(seg_b, game_b[1])
+    if side_a is None or side_b is None:
+        return None
+    orient = "same" if side_a == side_b else "opp"
+    return _lookup_pair(f"{key}:{orient}", sport, params)
+
+
+def _mlb_winner_prop_prior(
+    key: str, sport: str, params: SgpParams, ml_ticker: str, prop_ticker: str
+) -> _PairPrior | None:
+    """MLB moneyline × player-prop prior, resolved to ``:same`` / ``:opp`` by
+    whether the prop player's team prefix and the ML suffix anchor to the same
+    side of the game blob (``:same`` = the player's team is the ML YES team,
+    e.g. ml|ks +0.24; ``:opp`` the exact sign flip). YES–YES orientation only —
+    the copula sign-flips NO legs downstream. Both legs must carry the
+    identical raw game-code segment. Unparseable → None (caller falls back to
+    the neutralized 0.00 sign-spanning entry; never guess a sign)."""
+    game_m = _mlb_team_blob(ml_ticker)
+    game_p = _mlb_team_blob(prop_ticker)
+    if game_m is None or game_p is None or game_m != game_p:
+        return None
+    ml_side = _mlb_side_of(ml_ticker.upper().rsplit("-", 1)[-1], game_m[1])
+    parts = prop_ticker.upper().split("-")
+    if len(parts) != 4:
+        return None
+    prop_side = _mlb_player_side(parts[2], game_p[1])
+    if ml_side is None or prop_side is None:
+        return None
+    orient = "same" if ml_side == prop_side else "opp"
+    return _lookup_pair(f"{key}:{orient}", sport, params)
+
+
 def build_sgp_correlation(
     legs: Sequence[RfqLeg],
     same_event_groups: Sequence[Sequence[int]],
@@ -635,6 +769,31 @@ def build_sgp_correlation(
                     m_i = i if types[i] is LegType.MONEYLINE else j
                     if legs[m_i].market_ticker.rsplit("-", 1)[-1].upper() in _DRAW_SUFFIXES:
                         prior = _lookup_pair(f"{key}:tie", sport, params)
+                elif (
+                    types[i] in _MLB_PLAYER_PROP_TYPES
+                    and types[j] in _MLB_PLAYER_PROP_TYPES
+                ):
+                    # MLB prop × prop: teammate vs opponent stacking; batter
+                    # prop × the OPPOSING starter's Ks is the FACING case
+                    # (:opp carries the negative). Same-player cross-family is
+                    # containment-shaped -> None -> plain (containment phase).
+                    prior = _mlb_prop_pair_prior(
+                        key, sport, params,
+                        legs[i].market_ticker, legs[j].market_ticker,
+                    )
+                elif (
+                    LegType.MONEYLINE in pair_types
+                    and pair_types & _MLB_PLAYER_PROP_TYPES
+                ):
+                    # MLB winner × player prop: sign flips on whether the prop
+                    # player's team IS the ML YES team. Must intercept BEFORE
+                    # the generic one-moneyline fav/dog axis (wrong axis here).
+                    ml_i = i if types[i] is LegType.MONEYLINE else j
+                    pr_i = j if ml_i == i else i
+                    prior = _mlb_winner_prop_prior(
+                        key, sport, params,
+                        legs[ml_i].market_ticker, legs[pr_i].market_ticker,
+                    )
                 else:
                     one_moneyline = (types[i] is LegType.MONEYLINE) != (
                         types[j] is LegType.MONEYLINE

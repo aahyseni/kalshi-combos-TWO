@@ -561,6 +561,44 @@ class CorrelationConfig(StrictModel):
             # ks|tb: judge RE-CENTERED from the resolver-gated 0.00/0.15
             # placeholder — orientation-free like player_ks|rfi.
             "player_ks|player_tb": -0.06,
+            # -- ROUTED oriented entries (sgp.py MLB team-routing resolvers,
+            # 2026-07-10). The plain 0.00 / unrouted entries ABOVE STAY as the
+            # fail-closed fallback for any parse doubt (soccer precedent:
+            # plain + oriented coexist). ML×prop ':same' = the prop player's
+            # team IS the ML YES team. For batter-stat × player_ks, ':opp' IS
+            # the facing case (batter bats against the opposing starter) and
+            # carries the measured negative. hr|ks / hrr|ks ':same' (teammate)
+            # deliberately ABSENT — unmeasured/inferred-only (tranche report
+            # 2026-07-09 line 79-80); those orientations fall to the plain
+            # 0.00 wide-band entries until measured. Values:
+            # staged_mlb_props.md FINAL RECOMMENDED TABLE [B]/[C]/[D] +
+            # 2026-07-10 judge amendments.
+            "moneyline|player_ks:same": 0.24,   # pitcher's team wins × his Ks over
+            "moneyline|player_ks:opp": -0.24,   # exact sign flip (2-way complement)
+            "moneyline|player_hr:same": 0.23,   # (2+ rung +0.27: per-rung later)
+            "moneyline|player_hr:opp": -0.23,
+            "moneyline|player_hit:same": 0.23,
+            "moneyline|player_hit:opp": -0.23,
+            "moneyline|player_hrr:same": 0.37,  # strongest oriented pair measured
+            "moneyline|player_hrr:opp": -0.37,
+            "player_hit|player_ks:opp": -0.13,  # FACING (measured -0.126)
+            "player_hit|player_ks:same": 0.00,  # teammate (measured +0.013)
+            "player_hr|player_ks:opp": -0.075,  # FACING (measured -0.076)
+            "player_hrr|player_ks:opp": -0.18,  # FACING (measured -0.190, judge band)
+            # [B] same-family batter stacks, teammate/opponent split (measured):
+            "player_hr|player_hr:same": 0.04,
+            "player_hr|player_hr:opp": 0.02,
+            "player_hit|player_hit:same": 0.07,
+            "player_hit|player_hit:opp": 0.00,
+            "player_tb|player_tb:same": 0.06,
+            "player_tb|player_tb:opp": 0.00,
+            "player_hrr|player_hrr:same": 0.17,
+            "player_hrr|player_hrr:opp": 0.00,
+            # [D] cross-family: ONLY hr|hrr split is measured (teammate +0.053
+            # / opp -0.003); hit|hr, hit|hrr, hit|tb, hr|tb, hrr|tb stay
+            # unrouted-plain until the split measurement runs (existing npz).
+            "player_hr|player_hrr:same": 0.05,
+            "player_hr|player_hrr:opp": 0.00,
             # ---- DO-1 untabled-cell quick-fix (2026-07-10; source
             # docs/reports/2026-07-10-bands-routing-sweep-designs.md §3). The
             # sweep's full 9x9 matrix audit marked 12 cells NO prior tranche
@@ -780,6 +818,30 @@ class CorrelationConfig(StrictModel):
         "mlb:player_hr|player_tb": 0.06,
         "mlb:player_hrr|player_tb": 0.10,
         "mlb:player_ks|player_tb": 0.10,    # judge re-centered -0.06/0.10
+        # ROUTED oriented bands (1:1 with the pair_rho_by_sport["mlb"] oriented
+        # entries; measured-value bands from staged_mlb_props.md [B]/[C]/[D]):
+        "mlb:moneyline|player_ks:same": 0.06,   # ladder-flat across K rungs
+        "mlb:moneyline|player_ks:opp": 0.06,
+        "mlb:moneyline|player_hr:same": 0.08,
+        "mlb:moneyline|player_hr:opp": 0.08,
+        "mlb:moneyline|player_hit:same": 0.08,
+        "mlb:moneyline|player_hit:opp": 0.08,
+        "mlb:moneyline|player_hrr:same": 0.08,
+        "mlb:moneyline|player_hrr:opp": 0.08,
+        "mlb:player_hit|player_ks:opp": 0.10,
+        "mlb:player_hit|player_ks:same": 0.05,
+        "mlb:player_hr|player_ks:opp": 0.05,
+        "mlb:player_hrr|player_ks:opp": 0.06,
+        "mlb:player_hr|player_hr:same": 0.06,
+        "mlb:player_hr|player_hr:opp": 0.05,
+        "mlb:player_hit|player_hit:same": 0.06,
+        "mlb:player_hit|player_hit:opp": 0.06,
+        "mlb:player_tb|player_tb:same": 0.05,
+        "mlb:player_tb|player_tb:opp": 0.06,
+        "mlb:player_hrr|player_hrr:same": 0.06,
+        "mlb:player_hrr|player_hrr:opp": 0.05,
+        "mlb:player_hr|player_hrr:same": 0.06,
+        "mlb:player_hr|player_hrr:opp": 0.05,
         # DO-1 untabled-cell bands (2026-07-10 sweep §3; every new entry gets
         # a band — zero orphans, count-verified):
         "mlb:moneyline|player_tb": 0.30,    # unmeasured; widest ml|prop sibling span
