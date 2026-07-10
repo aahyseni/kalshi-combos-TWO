@@ -1,0 +1,32 @@
+CONVENTION — same 3 header lines as docs/calibration/phase2_wire_list.txt govern this addendum: table pair_rho_by_sport['mlb']; band = 'mlb:'+key in pair_rho_uncertainty (half-width); base keys EXECUTED via combomaker.pricing.legtypes.pair_key (verified in b4_measurements.json _meta.pair_keys_executed); ':same'/':opp' = shipped sgp.py semantics (for batter-stat×player_ks ':opp' IS the facing case, ':same' = own-team starter); ':rN' = Kalshi ticker line integer of the rung-keyed leg only (player_ks/total never carry rungs); lookup fallback exact rung key -> un-runged oriented key -> plain key (fail-closed). Values keyed to the 2015-2025 window; full-precision numbers in b4_measurements.json.
+CONVENTION — provenance: estimator = tetrachoric rho (validated solver, bvnu err vs scipy 1.1e-16), game-cluster bootstrap CI95/CI99; 7/7 regression anchors reproduced to ±0.0005 (hr1|total 0.2328, hr2|total:15-25 0.3061, tb2|oppK -0.1224, tb5|oppK -0.1271, hit1|ownK +0.0134, hr1|ownK +0.0098, hrr3|oppK -0.1776) before any new number was trusted. Judge standard identical to Phase 1: era shift (2005-14 vs 2015-25) inside band; CI95 half-width <= 0.08; band = max(0.04, CI95 hw, |era shift|).
+CONVENTION — TB rung universe (tape evidence, 3.0M most-recent RFQ rows 2026-07-10, b4_measurements.json rung_universe): KXMLBTB rungs seen = {2:14331, 3:1141, 4:1102, 5:1117, 6:650, 7:161}. r6/r7 are Kalshi-real and wired below by DIRECT measurement (no slope, no extrapolation — line-90 REFUTATION still stands); r1 does NOT exist (skipped, not invented); rungs >7 unseen -> fail-closed to the un-runged :opp fallback.
+
+# --- line 89 hole: player_hr|total:r3 ---
+player_hr|total:r3 = +0.357 band 0.07 (B4 2026-07-10; all-PA frame consistent with wired :r1/:r2; FULL-precision remeasure of the A4 UNCERTAIN cell; 15-25: 154 positives, rho +0.3566, CI95 [+0.2921,+0.4301] (hw 0.0690), CI99 [+0.2786,+0.4737]; pooled 05-25: 227 positives, +0.3568 hw95 0.0544; era shift 15-25 minus 05-14 = -0.0034; ladder monotone r1 +0.238 -> r2 +0.306 -> r3 +0.357; band 0.07 = CI95 hw rounded up)
+
+# --- line 90 hole: tb x ks Kalshi-real extra rungs (DIRECT, per-rung keyed ONLY) ---
+player_ks|player_tb:opp:r6 = -0.127 band 0.04 (B4 2026-07-10; FACING, direct measurement of a Kalshi-real rung (650 tape leg-occurrences); 15-25 n=398097, 12661 positives, CI95 [-0.1370,-0.1174] hw 0.0098; era shift -0.0057; multi-hit channel keeps the post-U-turn depth (r5 -0.127); NO interpolation used)
+player_ks|player_tb:opp:r7 = -0.128 band 0.04 (B4 2026-07-10; FACING, direct measurement of a Kalshi-real rung (161 tape leg-occurrences); 15-25 n=398097, 6045 positives, CI95 [-0.1405,-0.1153] hw 0.0126; era shift -0.0054; multi-hit channel keeps the post-U-turn depth (r5 -0.127); NO interpolation used)
+NOTE — player_ks|player_tb:opp un-runged fallback (-0.12 band 0.05) still covers r6 -0.127/r7 -0.128; no change needed. TB rungs outside {2..7}: none exist on tape; fail-closed.
+
+# --- line 91 hole: teammate ':same' orientations (own-team starter K frame, batter==starter excluded) ---
+player_hit|player_ks:same:r1 = +0.013 band 0.04 (B4 2026-07-10; teammate/env channel ~0; 15-25 n=386792, CI95 [+0.0080,+0.0191] hw 0.0055; era shift -0.0015)
+player_hit|player_ks:same:r2 = +0.007 band 0.04 (B4 2026-07-10; teammate/env channel ~0; 15-25 n=386792, CI95 [+0.0004,+0.0140] hw 0.0068; era shift -0.0025)
+player_hit|player_ks:same:r3 = -0.002 band 0.04 (B4 2026-07-10; teammate/env channel ~0; 15-25 n=386792, CI95 [-0.0119,+0.0073] hw 0.0096; era shift -0.0085)
+player_hit|player_ks:same = +0.010 band 0.04 (B4 2026-07-10; un-runged oriented aggregate; spans r1-r3 -0.0023..+0.0134, all rung CI95s inside band)
+player_hr|player_ks:same = +0.010 band 0.04 (B4 2026-07-10; single un-runged oriented entry at the hr 1+ anchor (precedent: hr|spread:same); 15-25 CI95 [+0.0035,+0.0169] hw 0.0067; era shift -0.0031; r2 sensitivity -0.0005 inside band)
+player_hrr|player_ks:same:r2 = +0.017 band 0.04 (B4 2026-07-10; all-PA frame (frame of the Phase-1 hrr facing runs); 15-25 CI95 [+0.0096,+0.0238] hw 0.0071; era shift +0.0002)
+player_hrr|player_ks:same:r3 = +0.014 band 0.04 (B4 2026-07-10; all-PA frame (frame of the Phase-1 hrr facing runs); 15-25 CI95 [+0.0065,+0.0209] hw 0.0072; era shift -0.0020; STARTERS-frame sensitivity +0.0059 inside band)
+player_hrr|player_ks:same:r4 = +0.010 band 0.04 (B4 2026-07-10; all-PA frame (frame of the Phase-1 hrr facing runs); 15-25 CI95 [+0.0019,+0.0179] hw 0.0080; era shift -0.0048)
+player_hrr|player_ks:same:r5 = +0.005 band 0.04 (B4 2026-07-10; all-PA frame (frame of the Phase-1 hrr facing runs); 15-25 CI95 [-0.0040,+0.0145] hw 0.0093; era shift -0.0097)
+player_hrr|player_ks:same = +0.010 band 0.04 (B4 2026-07-10; un-runged oriented aggregate; spans r2-r5 +0.0052..+0.0165; hrr r1 (Kalshi-real on tape) unmeasured -> falls here fail-closed)
+player_ks|player_tb:same:r2 = +0.010 band 0.04 (B4 2026-07-10; rung is the TB leg's (pair_key puts ks first); 15-25 CI95 [+0.0045,+0.0161] hw 0.0058; era shift -0.0017)
+player_ks|player_tb:same:r3 = +0.007 band 0.04 (B4 2026-07-10; rung is the TB leg's (pair_key puts ks first); 15-25 CI95 [+0.0011,+0.0141] hw 0.0065; era shift -0.0059)
+player_ks|player_tb:same:r4 = +0.009 band 0.04 (B4 2026-07-10; rung is the TB leg's (pair_key puts ks first); 15-25 CI95 [+0.0030,+0.0163] hw 0.0066; era shift -0.0020)
+player_ks|player_tb:same:r5 = +0.006 band 0.04 (B4 2026-07-10; rung is the TB leg's (pair_key puts ks first); 15-25 CI95 [-0.0023,+0.0140] hw 0.0081; era shift -0.0057)
+player_ks|player_tb:same = +0.010 band 0.04 (B4 2026-07-10; un-runged oriented aggregate; spans r2-r5 +0.0056..+0.0104)
+NOTE — wire-list line 85 blend (KEEP player_ks|player_tb = -0.06 band 0.10, 'unmeasured teammate ~0') is now CONFIRMED by measurement: teammate = +0.006..+0.010; plain blend stays valid.
+NOTE — teammate rungs NOT wired above (hit r4, hrr r1 — both Kalshi-real on tape) were outside this task's measurement scope; they fall back to the un-runged :same aggregates (fail-closed), NOT interpolated.
+
+# --- STILL NOT WIRED: none. All 3 holes closed by measurement passing the unrelaxed Phase-1 judge standard (25/25 judge windows PASS, 7/7 anchors reproduced). ---

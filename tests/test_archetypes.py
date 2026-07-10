@@ -260,28 +260,41 @@ def test_engine_forwards_sport_tables() -> None:
     # neutralized cells and the rfi labeled priors must reach the hot path —
     # one sentinel per new group, plus the enumeration-gap ml|tb cell.
     assert tables["mlb"]["moneyline|player_tb"] == 0.00
+    # Phase 2 wire (2026-07-10): the plain spread×prop fallback stays 0.00 but
+    # its band was RAISED to span the measured oriented extremes (±0.304); the
+    # rfi labeled priors were REPLACED by the measured A3 values; and one
+    # sentinel per new measured group must reach the hot path.
     assert bands["mlb:moneyline|player_tb"] == 0.30
     assert tables["mlb"]["player_hit|spread"] == 0.00
-    assert bands["mlb:player_hit|spread"] == 0.20
+    assert bands["mlb:player_hit|spread"] == 0.31
     assert tables["mlb"]["rfi|spread"] == 0.00
     assert bands["mlb:rfi|spread"] == 0.15
-    assert tables["mlb"]["player_hrr|rfi"] == 0.10
-    assert bands["mlb:player_hrr|rfi"] == 0.20
+    assert tables["mlb"]["player_hrr|rfi"] == 0.122
+    assert bands["mlb:player_hrr|rfi"] == 0.06
+    assert tables["mlb"]["player_hit|spread:same:r2:r5"] == 0.304  # (A1) chained rungs
+    assert bands["mlb:player_hit|spread:same:r2:r5"] == 0.05
+    assert tables["mlb"]["player_ks|spread:opp:r5"] == -0.310      # (A2)
+    assert bands["mlb:player_ks|spread:opp:r5"] == 0.08
+    assert tables["mlb"]["player_hrr|total:r5"] == 0.468           # (A4)
+    assert tables["mlb"]["player_hit|spread:same"] == 0.27         # judge fallback
+    assert tables["mlb"]["player_hit|player_hr:same"] == 0.03      # routed [D] split
 
 
 def test_mlb_pair_table_has_no_band_orphans() -> None:
     """DO-1 invariant: every mlb pair entry has an 'mlb:'-prefixed band and
     every mlb-prefixed band has an entry — a point without a band gets the
     default width (wrong confidence), a band without a point is dead config.
-    43 entries / 43 bands as of the 2026-07-10 untabled-cell quick-fix; the
-    count only ever grows (routing/measurement phases add oriented keys)."""
+    165 entries / 165 bands as of the B4 measurement addendum (2026-07-10;
+    was 148 at the Phase 2 wire, 43 at the untabled-cell quick-fix, 68
+    pre-wire); the count only ever grows (routing/measurement phases add
+    oriented keys)."""
     h = Harness()
     engine = PricingEngine(h.feed, h.metadata, DOC_ASSUMED, PricingConfig())
     mlb = engine._sgp_params.pair_rho_by_sport["mlb"]  # noqa: SLF001 (test seam)
     bands = engine._sgp_params.pair_uncertainty  # noqa: SLF001 (test seam)
     mlb_bands = {k.removeprefix("mlb:") for k in bands if k.startswith("mlb:")}
     assert set(mlb) == mlb_bands
-    assert len(mlb) >= 43
+    assert len(mlb) >= 165
 
 
 async def dog_ml_btts_harness(config: PricingConfig | None = None) -> PricingEngine:

@@ -20,8 +20,11 @@ Invariants (property-tested):
   (docs/reports/2026-07-08-combo-yes-no-side-mechanics.md).
 
 Width components are explicit and logged: base + per-leg + model uncertainty
-(legs + correlation, from JointEstimate) + size + time-to-event + in-play.
-Inventory skew arrives from the risk engine (0 until Phase 4 wires it).
+(legs + correlation, from JointEstimate) + size + time-to-event + in-play +
+basket (DO-6: extra width on 8+-leg all-NO single-prop-family baskets, the
+measured +25-35c/$1 overbid shape — the caller detects the shape, this module
+adds the width). Inventory skew arrives from the risk engine (0 until Phase 4
+wires it).
 """
 
 from __future__ import annotations
@@ -50,6 +53,10 @@ class QuoteParams:
     time_wide_threshold_s: float = 6 * 3600.0
     time_width_cc: int = 200                 # scaled up as close_time nears
     in_play_extra_cc: int = 800
+    # DO-6 basket width adder: extra width when the caller flags an 8+-leg
+    # all-NO single-prop-family basket (basket_extra_applies). Only ever
+    # WIDENS; <= 0 disables.
+    basket_width_extra_cc: int = 250
     min_capture_cc: int = 100                # required minimum spread capture
     free_money_margin_cc: int = 100
     # Fade defense: quote combos ONE-SIDED as a pure parlay seller. When True,
@@ -120,6 +127,7 @@ def construct_quote(
     no_cap_cc: CentiCents | None,
     inventory_skew_cc: int = 0,
     width_multiplier: float = 1.0,
+    basket_extra_applies: bool = False,
     params: QuoteParams | None = None,
 ) -> ConstructedQuote | NoQuote:
     p = params or QuoteParams()
@@ -141,6 +149,14 @@ def construct_quote(
         # half the base spread — a multiplier is a tilt, not an override.
         scaled = max(int(sum(width.values()) * width_multiplier), p.base_width_cc // 2)
         width = {"scaled": scaled}
+    if basket_extra_applies and p.basket_width_extra_cc > 0:
+        # DO-6 (2026-07-10): 8+-leg all-NO single-prop-family baskets overbid
+        # +25-35c/$1 on file. Added AFTER every normal width component (incl.
+        # the archetype multiplier, which must never scale it away) and BEFORE
+        # the maker-favorable snap below. Strictly additive under the > 0
+        # guard: it can only WIDEN the quote, never tighten it; a tunable of 0
+        # (or below) disables it.
+        width["basket"] = p.basket_width_extra_cc
     half = sum(width.values()) // 2
 
     # The fill happens at the BID, not at fair, and the quadratic fee peaks at

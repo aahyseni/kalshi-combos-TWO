@@ -185,7 +185,12 @@ class TestMlbPropPairsShippedConfig:
             RfqLeg("KXMLBHR-26JUL091110NYYBOS-BOSRDEVERS11-1", "E1", "yes", None),
         ]
         result = build_sgp_correlation(legs, [(0, 1)], shipped_params())
-        assert abs(result.corr[0, 1] - 0.01) < 1e-9  # wired [D] cross-family value
-        assert abs(result.corr_high[0, 1] - 0.07) < 1e-9  # band mlb:… = 0.06
+        # Phase 2 wire (2026-07-10): NYY batter × BOS batter is the OPPONENT
+        # case and hit|hr now routes :same/:opp (final-pairs judge,
+        # phase2_wire_list.txt lines 95-96) — :opp 0.00 band 0.04 replaces the
+        # plain 0.01/0.06 this test asserted pre-wire (plain stays as the
+        # fail-closed parse fallback).
+        assert abs(result.corr[0, 1] - 0.00) < 1e-9  # wired [D] :opp split
+        assert abs(result.corr_high[0, 1] - 0.04) < 1e-9  # band mlb:…:opp = 0.04
         assert result.typed_pairs == 1
         assert any("mlb:player_hit|player_hr" in note for note in result.notes)

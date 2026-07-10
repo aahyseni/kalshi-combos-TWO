@@ -133,21 +133,30 @@ class TestMlOrientation:
 
 class TestPropPairRouting:
     def test_facing_hit_x_ks_negative(self) -> None:
-        # COL batter vs SF starter = FACING -> :opp carries -0.13
+        # COL batter vs SF starter = FACING -> :opp. Phase 2 wire
+        # (2026-07-10): the hit-2+ ticker now hits the EXACT rung key
+        # player_hit|player_ks:opp:r2 = -0.149 (A4) ahead of the un-runged
+        # :opp fallback -0.13 (lookup: exact rung -> un-runged oriented ->
+        # plain, fail-closed).
         c = _corr(f"KXMLBHIT-{_G}-COLWCASTRO3-2", f"KXMLBKS-{_G}-SFCWHISENHUNT88-6")
-        assert abs(c.corr[0, 1] - (-0.13)) < 1e-9
+        assert abs(c.corr[0, 1] - (-0.149)) < 1e-9
         assert any("player_hit|player_ks:opp" in n for n in c.notes)
 
-    def test_teammate_hit_x_ks_zero_tight(self) -> None:
+    def test_teammate_hit_x_ks_measured_rung(self) -> None:
+        # B4 addendum (2026-07-10): teammate ':same' is now MEASURED — the
+        # hit-2+ ticker hits the EXACT rung key player_hit|player_ks:same:r2
+        # = +0.007 band 0.04 (was the 0.00/0.05 placeholder pre-B4).
         c = _corr(f"KXMLBHIT-{_G}-SFJLEE51-2", f"KXMLBKS-{_G}-SFCWHISENHUNT88-6")
-        assert abs(c.corr[0, 1] - 0.00) < 1e-9
-        assert abs(c.corr_high[0, 1] - 0.05) < 1e-9
+        assert abs(c.corr[0, 1] - 0.007) < 1e-9
+        assert abs(c.corr_high[0, 1] - (0.007 + 0.04)) < 1e-9
 
-    def test_teammate_hr_x_ks_falls_to_plain_unmeasured(self) -> None:
-        # :same key deliberately absent -> plain 0.00 band 0.12 (never invent)
+    def test_teammate_hr_x_ks_measured_same(self) -> None:
+        # B4 addendum (2026-07-10): hr|ks ':same' is now MEASURED at the hr-1+
+        # anchor — player_hr|player_ks:same = +0.010 band 0.04 (pre-B4 the key
+        # was deliberately absent and fell to plain 0.00 band 0.12).
         c = _corr(f"KXMLBHR-{_G}-SFJLEE51-1", f"KXMLBKS-{_G}-SFCWHISENHUNT88-6")
-        assert abs(c.corr[0, 1] - 0.00) < 1e-9
-        assert abs(c.corr_high[0, 1] - 0.12) < 1e-9
+        assert abs(c.corr[0, 1] - 0.010) < 1e-9
+        assert abs(c.corr_high[0, 1] - (0.010 + 0.04)) < 1e-9
 
     def test_facing_hr_and_hrr_x_ks(self) -> None:
         assert abs(_rho(f"KXMLBHR-{_G}-COLHGOODMAN15-1",
@@ -193,10 +202,13 @@ class TestPropPairRouting:
         assert abs(_rho(f"KXMLBHR-{_G}-COLHGOODMAN15-1",
                         f"KXMLBHRR-{_G}-SFJLEE51-3") - 0.00) < 1e-9
 
-    def test_unrouted_cross_family_stays_plain(self) -> None:
-        # hit|hr has no oriented keys (split unmeasured) -> plain 0.01
+    def test_cross_family_hit_hr_routes_teammate_split(self) -> None:
+        # Phase 2 wire (2026-07-10): hit|hr now HAS routed :same/:opp keys
+        # (final-pairs judge, phase2_wire_list.txt lines 95-96) — the same-team
+        # pair resolves the teammate value 0.03, no longer the plain 0.01
+        # (which stays as the fail-closed parse fallback).
         assert abs(_rho(f"KXMLBHIT-{_G}-COLWCASTRO3-2",
-                        f"KXMLBHR-{_G}-COLHGOODMAN15-1") - 0.01) < 1e-9
+                        f"KXMLBHR-{_G}-COLHGOODMAN15-1") - 0.03) < 1e-9
 
     def test_ks_x_ks_stays_plain(self) -> None:
         assert abs(_rho(f"KXMLBKS-{_G}-SFCWHISENHUNT88-6",

@@ -447,6 +447,96 @@ _MLB_PLAYER_PROP_TYPES = frozenset({
     LegType.PLAYER_HRR,
 })
 
+# --- :rN rung keys (Phase 2 wire-list convention line 2) ------------------------
+# A rung key pins a pair prior to the Kalshi ticker LINE INTEGER of a
+# rung-keyed leg (leg settles YES iff stat/margin > N-0.5; props: N+; spread:
+# wins by N+ — an r1.5 run line is ticker 2 = ':r2'). Rung-keyed families:
+# the four batter props below + SPREAD. player_ks / total / moneyline / rfi
+# legs NEVER carry a rung (self-median / season-median frames) even when
+# their tickers end in digits (KXMLBKS-…-8, KXMLBTOTAL-…-9) — the gate is the
+# LEG TYPE, never the ticker shape. When BOTH legs are rung-keyed families
+# the suffixes CHAIN in pair_key leg order, first leg's rung first
+# ('player_hit|spread:same:r1:r2' = hit 1+ × own team wins by 2+); when only
+# one is, the suffix is single ('player_ks|player_tb:opp:r4' — the TB leg's).
+# Lookup fallback (fail-closed): exact rung key → un-runged oriented key →
+# plain key. NO interpolation or extrapolation of rungs, EVER — the tb×ks
+# facing ladder is U-shaped (wire-list NOT-WIRED flag), so a missing rung
+# falls through the chain, never to a neighbouring rung. Each chain level is
+# a single ``_lookup_pair`` call, so the uncertainty band ('mlb:'+key)
+# always resolves at the SAME level as the value.
+
+_RUNG_KEYED_PROP_TYPES = frozenset({
+    LegType.PLAYER_HIT,
+    LegType.PLAYER_HR,
+    LegType.PLAYER_TB,
+    LegType.PLAYER_HRR,
+})
+_RUNG_KEYED_TYPES = _RUNG_KEYED_PROP_TYPES | {LegType.SPREAD}
+
+# Spread suffix TEAM+line-digits with the digits REQUIRED (contrast
+# _CORNERS_TEAM_SUFFIX, digits optional): a spread leg without a parseable
+# line int has no rung — it falls back un-runged, never to a guessed rung.
+_SPREAD_RUNG_SUFFIX = re.compile(r"^[A-Za-z]+(\d+)$")
+
+
+def _leg_rung(leg_type: LegType, ticker: str) -> int | None:
+    """The Kalshi line integer of a RUNG-KEYED leg (the ':rN' grammar), or
+    None. Batter props: 4-segment ticker with an all-digit last segment
+    (KXMLBHIT-<game>-<player>-<line>; the exact access pattern of
+    ``_mlb_same_player_conditional_prior``). Spread: TEAM+line-digits suffix,
+    the digits are the line int (…-COL2 → 2, same suffix shape
+    ``_spread_team`` strips). Never-rung-keyed families return None
+    unconditionally — a trailing digit segment on ks/total/… is NOT a rung."""
+    if leg_type in _RUNG_KEYED_PROP_TYPES:
+        parts = ticker.upper().split("-")
+        if len(parts) == 4 and parts[3].isdigit():
+            return int(parts[3])
+        return None
+    if leg_type is LegType.SPREAD:
+        m = _SPREAD_RUNG_SUFFIX.match(ticker.rsplit("-", 1)[-1].upper())
+        if m is not None:
+            return int(m.group(1))
+        return None
+    return None
+
+
+def _pair_rung_suffix(ticker_a: str, ticker_b: str) -> str:
+    """The chained ':rN' suffix for a pair, in pair_key leg order (first
+    leg's rung first; an equal-type pair orders its rungs ascending so the
+    key is leg-order-independent). Empty string when no leg is a rung-keyed
+    family, OR when ANY rung-keyed leg's rung fails to parse — a partial
+    chain would collide with the single-suffix grammar, so the whole pair
+    falls back un-runged (never guess a rung)."""
+    type_a, type_b = classify_leg(ticker_a), classify_leg(ticker_b)
+    if str(type_a) > str(type_b):
+        type_a, type_b = type_b, type_a
+        ticker_a, ticker_b = ticker_b, ticker_a
+    rungs: list[int] = []
+    for leg_type, ticker in ((type_a, ticker_a), (type_b, ticker_b)):
+        if leg_type in _RUNG_KEYED_TYPES:
+            rung = _leg_rung(leg_type, ticker)
+            if rung is None:
+                return ""
+            rungs.append(rung)
+    if type_a is type_b and len(rungs) == 2:
+        rungs.sort()
+    return "".join(f":r{r}" for r in rungs)
+
+
+def _lookup_pair_runged(
+    key: str, sport: str, params: SgpParams, rung_suffix: str
+) -> _PairPrior | None:
+    """One chain level plus its rung refinement: the exact rung key wins when
+    wired, else the un-runged ``key``. Both lookups go through
+    ``_lookup_pair``, so the band always resolves at the same chain level as
+    the value (never an exact-rung value with an un-runged band, or vice
+    versa)."""
+    if rung_suffix:
+        exact = _lookup_pair(key + rung_suffix, sport, params)
+        if exact is not None:
+            return exact
+    return _lookup_pair(key, sport, params)
+
 
 def _mlb_team_blob(ticker: str) -> tuple[str, str] | None:
     """(raw game-code segment, away+home team blob) from an MLB ticker's second
@@ -521,7 +611,9 @@ def _mlb_prop_pair_prior(
     if side_a is None or side_b is None:
         return None
     orient = "same" if side_a == side_b else "opp"
-    return _lookup_pair(f"{key}:{orient}", sport, params)
+    return _lookup_pair_runged(
+        f"{key}:{orient}", sport, params, _pair_rung_suffix(ticker_a, ticker_b)
+    )
 
 
 def _mlb_same_player_conditional_prior(
@@ -606,7 +698,9 @@ def _mlb_winner_spread_prior(
     if spread_side is None:
         return None
     orient = "same" if ml_side == spread_side else "opp"
-    return _lookup_pair(f"{key}:{orient}", sport, params)
+    return _lookup_pair_runged(
+        f"{key}:{orient}", sport, params, _pair_rung_suffix(ml_ticker, spread_ticker)
+    )
 
 
 def _mlb_winner_prop_prior(
@@ -631,7 +725,43 @@ def _mlb_winner_prop_prior(
     if ml_side is None or prop_side is None:
         return None
     orient = "same" if ml_side == prop_side else "opp"
-    return _lookup_pair(f"{key}:{orient}", sport, params)
+    return _lookup_pair_runged(
+        f"{key}:{orient}", sport, params, _pair_rung_suffix(ml_ticker, prop_ticker)
+    )
+
+
+def _mlb_spread_prop_prior(
+    key: str, sport: str, params: SgpParams, spread_ticker: str, prop_ticker: str
+) -> _PairPrior | None:
+    """MLB run-line spread × player-prop prior, resolved to ``:same`` /
+    ``:opp`` by whether the prop player's team prefix and the spread leg's
+    team (TEAM+line-digits suffix, digits stripped) anchor to the same side
+    of the game blob — ``:same`` = the player's team IS the spread YES team,
+    the exact ml|prop axis (spread is team-signed like the moneyline, config
+    [C-sibling] note). SPREAD is a rung-keyed family, so the lookup chains
+    the line ints per the ':rN' grammar ('player_hit|spread:same:r1:r2',
+    'player_ks|spread:opp:r2' — ks never runged). Both legs must carry the
+    identical raw game-code segment (doubleheader-safe). Unparseable
+    anything → None (caller falls back to the plain sign-spanning entry;
+    never guess a sign)."""
+    game_s = _mlb_team_blob(spread_ticker)
+    game_p = _mlb_team_blob(prop_ticker)
+    if game_s is None or game_p is None or game_s != game_p:
+        return None
+    spread_team = _spread_team(spread_ticker)
+    if spread_team is None:
+        return None
+    spread_side = _mlb_side_of(spread_team, game_s[1])
+    parts = prop_ticker.upper().split("-")
+    if len(parts) != 4:
+        return None
+    prop_side = _mlb_player_side(parts[2], game_p[1])
+    if spread_side is None or prop_side is None:
+        return None
+    orient = "same" if spread_side == prop_side else "opp"
+    return _lookup_pair_runged(
+        f"{key}:{orient}", sport, params, _pair_rung_suffix(spread_ticker, prop_ticker)
+    )
 
 
 def build_sgp_correlation(
@@ -917,6 +1047,22 @@ def build_sgp_correlation(
                         key, sport, params,
                         legs[ml_i].market_ticker, legs[pr_i].market_ticker,
                     )
+                elif (
+                    LegType.SPREAD in pair_types
+                    and pair_types & _MLB_PLAYER_PROP_TYPES
+                ):
+                    # MLB run-line spread × player prop: spread is team-signed
+                    # like the moneyline, so the sign flips on whether the
+                    # prop player's team IS the spread YES team; the rung
+                    # chain keys the line ints (':same:r1:r2'). Prop types
+                    # only classify from KXMLB series, so no sport gate is
+                    # needed (mirrors the winner × prop branch above).
+                    sp3_i = i if types[i] is LegType.SPREAD else j
+                    pp_i = j if sp3_i == i else i
+                    prior = _mlb_spread_prop_prior(
+                        key, sport, params,
+                        legs[sp3_i].market_ticker, legs[pp_i].market_ticker,
+                    )
                 else:
                     one_moneyline = (types[i] is LegType.MONEYLINE) != (
                         types[j] is LegType.MONEYLINE
@@ -928,7 +1074,22 @@ def build_sgp_correlation(
                         prior = _oriented_curve_prior(
                             key, sport, params, marginals[ml_index]
                         ) or _oriented_prior(key, sport, params, marginals[ml_index])
-                prior = prior or _lookup_pair(key, sport, params)
+                if prior is None:
+                    # Plain level of the rung chain. An ORIENTATION-FREE
+                    # rung-keyed pair (prop × total, prop × rfi) wires its
+                    # exact rung key directly onto the plain base
+                    # ('player_hr|total:r2'); orientable pairs that resolved
+                    # no oriented entry simply miss here and land on the
+                    # plain key. MLB-gated: ':rN' is a wire-list / mlb-table
+                    # grammar — other sports' spread lines stay un-runged.
+                    rung = (
+                        _pair_rung_suffix(
+                            legs[i].market_ticker, legs[j].market_ticker
+                        )
+                        if sport == str(Sport.MLB)
+                        else ""
+                    )
+                    prior = _lookup_pair_runged(key, sport, params, rung)
                 if prior is not None:
                     rho, band = prior.rho, prior.band
                     typed += 1

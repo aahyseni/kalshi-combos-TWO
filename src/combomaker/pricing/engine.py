@@ -30,6 +30,7 @@ from combomaker.ops.logging import get_logger
 from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
 from combomaker.pricing.joint import JointEstimate, price_containment, price_joint_matrices
 from combomaker.pricing.legs import KalshiBookSource, LegBelief, OddsSource, blend_beliefs
+from combomaker.pricing.legtypes import LegType, classify_leg
 from combomaker.pricing.quote import (
     ConstructedQuote,
     NoQuote,
@@ -44,6 +45,35 @@ from combomaker.pricing.structural import StructuralPricer, structural_applicabl
 from combomaker.rfq.models import Rfq, RfqLeg
 
 log = get_logger(__name__)
+
+# DO-6 basket width adder (2026-07-10): the measured overbid shape is an
+# 8-16-leg all-NO basket drawn from ONE single prop family — >= 8 legs, every
+# leg NO-side, all legs the same family below. The width itself is the
+# config-tunable QuoteParams.basket_width_extra_cc (0 disables).
+_BASKET_MIN_LEGS = 8
+_BASKET_PROP_FAMILIES = frozenset(
+    {
+        LegType.PLAYER_HR,
+        LegType.PLAYER_HIT,
+        LegType.PLAYER_TB,
+        LegType.PLAYER_HRR,
+        LegType.PLAYER_KS,
+    }
+)
+
+
+def is_single_family_no_basket(legs: list[RfqLeg], sides: list[str]) -> bool:
+    """True iff the combo is a DO-6 basket: >= 8 legs, every leg NO-side, and
+    every leg classifies to the SAME single prop family (player_hr/player_hit/
+    player_tb/player_hrr/player_ks). Any doubt (mixed families, a YES leg,
+    UNKNOWN typing, short combo) is False — the adder then simply does not
+    fire; it never replaces the normal width, only ever adds to it."""
+    if len(legs) < _BASKET_MIN_LEGS:
+        return False
+    if any(side != "no" for side in sides):
+        return False
+    families = {classify_leg(leg.market_ticker) for leg in legs}
+    return len(families) == 1 and next(iter(families)) in _BASKET_PROP_FAMILIES
 
 
 class PricingEngine:
@@ -223,6 +253,7 @@ class PricingEngine:
             no_cap_cc=no_cap,
             inventory_skew_cc=inventory_skew_cc,
             width_multiplier=self._width_multiplier(beliefs, sides),
+            basket_extra_applies=is_single_family_no_basket(list(rfq.legs), sides),
             params=self._quote_params,
         )
         return self._enforce_sell_only(quote)
