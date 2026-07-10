@@ -333,4 +333,4 @@ forfeits settle per-family differently (last occurred 1995).
 - **Verify (owner: eng, before sizing up on thin props):** what "fair market
   price" means at freeze (§7 flag a, unchanged by §7.1 — MLB rules leave it
   equally undefined) — the crux of the manipulation risk.
-- Fold the 2026-07-09 demo combo settlement (binary anchor) in when it resolves.
+- RESOLVED 2026-07-10: the demo combo settled NO via early-NO and paid exactly $1.00 = 1-V (combo_no_pays_complement promoted true; docs/reports/2026-07-10-demo-combo-settled.md).
