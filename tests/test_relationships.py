@@ -600,3 +600,145 @@ def test_1h_over_ft_over_different_game_is_possible() -> None:
     )
     rel = classify_legs(legs, ExplodingProvider())
     assert rel.kind is RelationshipKind.OK
+
+
+# --- MLB MONEYLINE × SPREAD same-team containment family (DO-3, 2026-07-10) -------
+# Real ticker shapes (NOTES.md K2, live-verified): KXMLBSPREAD-…-NYY2 = "NYY wins
+# by over 1.5" (TEAM+line suffix), KXMLBGAME-…-NYY = the winner. Cover ⟹ win is
+# a scoring containment for the SAME team; opposite-team cover-yes × win-yes is
+# mutually exclusive. MLB IMPOSSIBLE verdicts are NEVER farmable (the
+# 48h-postponement rule settles markets scalar — the soccer farm bar does not
+# transfer).
+
+MLB_ML_NYY = "KXMLBGAME-26JUL081840NYYTB-NYY"
+MLB_ML_EV = "KXMLBGAME-26JUL081840NYYTB"
+MLB_SP_NYY2 = "KXMLBSPREAD-26JUL081840NYYTB-NYY2"
+MLB_SP_TB2 = "KXMLBSPREAD-26JUL081840NYYTB-TB2"
+MLB_SP_EV = "KXMLBSPREAD-26JUL081840NYYTB"
+
+
+def test_mlb_cover_yes_win_yes_same_team_is_containment_joint_p_cover() -> None:
+    """NYY covers ⟹ NYY wins, so joint = P(cover); subset = the spread leg (0)."""
+    legs = (leg(MLB_SP_NYY2, MLB_SP_EV, "yes"), leg(MLB_ML_NYY, MLB_ML_EV, "yes"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containment == (0, 1)
+
+
+def test_mlb_cover_yes_win_no_same_team_is_impossible_never_farmable() -> None:
+    """Cover without the win is impossible — but NOT farmable: MLB scalar
+    settlement (48h postponement) breaks the airtight certain-NO bar."""
+    legs = (leg(MLB_SP_NYY2, MLB_SP_EV, "yes"), leg(MLB_ML_NYY, MLB_ML_EV, "no"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.IMPOSSIBLE
+    assert rel.farmable is False
+
+
+def test_mlb_cover_no_win_no_same_team_is_containment_subset_is_ml() -> None:
+    """{cover no, win no}: ¬win ⟹ ¬cover, so the ML-no leg is the effective
+    subset — joint = P(win no); containment points at the ML leg (1)."""
+    legs = (leg(MLB_SP_NYY2, MLB_SP_EV, "no"), leg(MLB_ML_NYY, MLB_ML_EV, "no"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containment == (1, 0)
+
+
+def test_mlb_cover_no_win_yes_same_team_is_possible_copula_routes_it() -> None:
+    """Win without covering is possible — falls to the copula, where sgp routes
+    the oriented :same +0.95 (grouped so the pair correlates)."""
+    legs = (leg(MLB_SP_NYY2, MLB_SP_EV, "no"), leg(MLB_ML_NYY, MLB_ML_EV, "yes"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+    assert rel.same_event_groups == ((0, 1),)
+
+
+def test_mlb_cover_yes_opposite_win_yes_is_impossible_never_farmable() -> None:
+    """TB covers ⟹ TB wins ⟹ NYY cannot win: mutually exclusive. BOTH teams are
+    resolved via the anchored parse (inequality alone is not proof). Never
+    farmable (MLB scalar settlement)."""
+    legs = (leg(MLB_SP_TB2, MLB_SP_EV, "yes"), leg(MLB_ML_NYY, MLB_ML_EV, "yes"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.IMPOSSIBLE
+    assert rel.farmable is False
+
+
+def test_mlb_cover_no_opposite_win_yes_is_possible() -> None:
+    """{TB-cover no, NYY-win yes} is an ordinary outcome (NYY wins, or TB wins
+    by exactly 1) — no pin, copula :opp."""
+    legs = (leg(MLB_SP_TB2, MLB_SP_EV, "no"), leg(MLB_ML_NYY, MLB_ML_EV, "yes"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+    assert rel.same_event_groups == ((0, 1),)
+
+
+def test_mlb_ml_spread_unresolvable_suffix_falls_to_copula() -> None:
+    """A spread suffix that anchors to NEITHER blob end is unresolvable — no
+    containment claim, falls through to the copula (plain sign-spanning
+    fallback in config). Fail-closed: never guess a team."""
+    legs = (
+        leg("KXMLBSPREAD-26JUL081840NYYTB-XX9", MLB_SP_EV, "yes"),
+        leg(MLB_ML_NYY, MLB_ML_EV, "yes"),
+    )
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+
+
+def test_mlb_ml_spread_cross_game_carries_no_relation() -> None:
+    legs = (
+        leg("KXMLBSPREAD-26JUL092145COLSF-SF2", "KXMLBSPREAD-26JUL092145COLSF", "yes"),
+        leg(MLB_ML_NYY, MLB_ML_EV, "yes"),
+    )
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+    assert rel.same_event_groups == ()
+
+
+def test_mlb_ml_spread_doubleheader_g1_g2_never_merges() -> None:
+    """G1 spread × G2 moneyline: the raw game segments differ, so the anchored
+    parse refuses and the games stay independent."""
+    legs = (
+        leg(
+            "KXMLBSPREAD-26JUL071835MILSTLG1-STL2",
+            "KXMLBSPREAD-26JUL071835MILSTLG1",
+            "yes",
+        ),
+        leg("KXMLBGAME-26JUL071835MILSTLG2-STL", "KXMLBGAME-26JUL071835MILSTLG2", "yes"),
+    )
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+    assert rel.same_event_groups == ()
+
+
+def test_mlb_ml_spread_containment_in_larger_combo_is_unknown() -> None:
+    """Bare-pair policy (soccer precedent): the same-team containment buried in
+    a >2-leg combo is not modeled → UNKNOWN, never a copula guess."""
+    legs = (
+        leg(MLB_SP_NYY2, MLB_SP_EV, "yes"),
+        leg(MLB_ML_NYY, MLB_ML_EV, "yes"),
+        leg("KXMLBTOTAL-26JUL081840NYYTB-9", "KXMLBTOTAL-26JUL081840NYYTB", "yes"),
+    )
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.UNKNOWN
+
+
+def test_mlb_ml_spread_line_zero_is_not_a_containment_claim() -> None:
+    """Defensive: a (never-listed) line-0 spread would mean margin > -0.5, which
+    does NOT force a win — the branch requires N >= 1 and refuses."""
+    legs = (
+        leg("KXMLBSPREAD-26JUL081840NYYTB-NYY0", MLB_SP_EV, "yes"),
+        leg(MLB_ML_NYY, MLB_ML_EV, "no"),
+    )
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+
+
+def test_soccer_ml_spread_is_not_intercepted_by_the_mlb_family() -> None:
+    """Soccer cover×win pairs keep their existing path (structural / copula) —
+    the MLB family is sport-gated and must not fire on KXWC tickers."""
+    legs = (
+        leg("KXWCSPREAD-26JUL05MEXENG-MEX2", "KXWCSPREAD-26JUL05MEXENG", "yes"),
+        leg("KXWCGAME-26JUL05MEXENG-MEX", "KXWCGAME-26JUL05MEXENG", "yes"),
+    )
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.OK
+    assert rel.same_event_groups == ((0, 1),)

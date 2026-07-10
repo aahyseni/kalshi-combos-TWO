@@ -22,8 +22,20 @@ from dataclasses import dataclass, field
 import numpy as np
 from numpy.typing import NDArray
 
+from combomaker.pricing.conditionals_mlb import (
+    BATTER_FAMILIES,
+    SAME_PLAYER_RHO_BAND,
+    implied_rho,
+    strongest_measured_direction,
+)
 from combomaker.pricing.copula import is_psd, nearest_psd
-from combomaker.pricing.legtypes import LegType, classify_leg, classify_sport, pair_key
+from combomaker.pricing.legtypes import (
+    LegType,
+    Sport,
+    classify_leg,
+    classify_sport,
+    pair_key,
+)
 from combomaker.rfq.models import RfqLeg
 
 
@@ -512,6 +524,91 @@ def _mlb_prop_pair_prior(
     return _lookup_pair(f"{key}:{orient}", sport, params)
 
 
+def _mlb_same_player_conditional_prior(
+    type_a: LegType,
+    type_b: LegType,
+    ticker_a: str,
+    ticker_b: str,
+    p_a: float,
+    p_b: float,
+) -> _PairPrior | None:
+    """SAME-PLAYER cross-stat batter pair (DO-2, 2026-07-10): the YES-YES rho
+    implied by the MEASURED same-player conditional — joint = P(conditioning
+    leg) x P(other | conditioning), conditionals_mlb.SAME_PLAYER_CONDITIONALS
+    — solved at the LIVE marginals, so the copula reproduces the
+    conditional-table joint exactly (and prices the NO-side sign cases
+    consistently: one rho fixes the whole 2x2 table). This resolver lands
+    BEFORE the routing resolver's same-player refusal (its None seam,
+    reviewer defect #4) so these pairs never price at the distinct-player [D]
+    entries — the 2026-07-10 sweep regression. The CLASSIFIER
+    (relationships.py MLB same-player family, keep in sync) only lets BARE
+    pairs with a strong measured cell reach the copula: exact cells become
+    containment/impossible there, unmeasured pairs decline UNKNOWN. Guards
+    mirror ``_mlb_prop_pair_prior``; None on any doubt -> the caller proceeds
+    to the ordinary routing resolvers (never invent a conditional)."""
+    fam_a = BATTER_FAMILIES.get(type_a)
+    fam_b = BATTER_FAMILIES.get(type_b)
+    if fam_a is None or fam_b is None or fam_a == fam_b:
+        # KS never maps (different entity); same-family same-player rungs are
+        # a nested ladder, not a conditional cell — out of scope here.
+        return None
+    game_a = _mlb_team_blob(ticker_a)
+    game_b = _mlb_team_blob(ticker_b)
+    if game_a is None or game_b is None or game_a != game_b:
+        return None
+    parts_a = ticker_a.upper().split("-")
+    parts_b = ticker_b.upper().split("-")
+    if len(parts_a) != 4 or len(parts_b) != 4:
+        return None
+    if not parts_a[2] or parts_a[2] != parts_b[2]:
+        return None  # different players: teammate/opponent routing owns it
+    if not (parts_a[3].isdigit() and parts_b[3].isdigit()):
+        return None
+    pick = strongest_measured_direction(fam_a, int(parts_a[3]), fam_b, int(parts_b[3]))
+    if pick is None:
+        return None  # exact-only / unmeasured: classifier owns those shapes
+    a_conditions, p_cond, n = pick
+    p_c, p_o = (p_a, p_b) if a_conditions else (p_b, p_a)
+    rho = implied_rho(p_c, p_o, p_cond)
+    if rho is None:
+        return None
+    return _PairPrior(
+        rho,
+        SAME_PLAYER_RHO_BAND,
+        f"mlb same-player {fam_a}{parts_a[3]}|{fam_b}{parts_b[3]} conditional "
+        f"(p_cond={p_cond:.3f} n={n} rho={rho:+.3f})",
+    )
+
+
+def _mlb_winner_spread_prior(
+    key: str, sport: str, params: SgpParams, ml_ticker: str, spread_ticker: str
+) -> _PairPrior | None:
+    """MLB moneyline x spread (run line) prior, resolved to ``:same`` /
+    ``:opp`` by anchoring BOTH the ML suffix and the spread suffix's team
+    (trailing line digits stripped) against the game blob — raw suffix
+    inequality alone is NOT proof of opposite teams (reviewer defect #3, the
+    ONE anchored parser). The containment / impossible shapes are intercepted
+    in relationships.py BEFORE the copula; this routes the reachable copula
+    cases (e.g. win-yes x cover-no) to the near-Frechet +-0.95 oriented
+    entries (measured exact: 0/98,980 violations). Both legs must carry the
+    identical raw game-code segment (doubleheader-safe). Unparseable anything
+    -> None (caller falls back to the plain sign-spanning 0.00 fallback;
+    never guess a sign)."""
+    game_m = _mlb_team_blob(ml_ticker)
+    game_s = _mlb_team_blob(spread_ticker)
+    if game_m is None or game_s is None or game_m != game_s:
+        return None
+    ml_side = _mlb_side_of(ml_ticker.upper().rsplit("-", 1)[-1], game_m[1])
+    spread_team = _spread_team(spread_ticker)
+    if ml_side is None or spread_team is None:
+        return None
+    spread_side = _mlb_side_of(spread_team, game_s[1])
+    if spread_side is None:
+        return None
+    orient = "same" if ml_side == spread_side else "opp"
+    return _lookup_pair(f"{key}:{orient}", sport, params)
+
+
 def _mlb_winner_prop_prior(
     key: str, sport: str, params: SgpParams, ml_ticker: str, prop_ticker: str
 ) -> _PairPrior | None:
@@ -773,13 +870,39 @@ def build_sgp_correlation(
                     types[i] in _MLB_PLAYER_PROP_TYPES
                     and types[j] in _MLB_PLAYER_PROP_TYPES
                 ):
+                    # SAME-PLAYER cross-stat first (the routing resolver's
+                    # None seam): measured conditional cells price via the
+                    # implied rho; exact/unmeasured same-player shapes are
+                    # owned by relationships.py (containment / UNKNOWN).
+                    if marginals is not None:
+                        prior = _mlb_same_player_conditional_prior(
+                            types[i], types[j],
+                            legs[i].market_ticker, legs[j].market_ticker,
+                            marginals[i], marginals[j],
+                        )
                     # MLB prop × prop: teammate vs opponent stacking; batter
                     # prop × the OPPOSING starter's Ks is the FACING case
                     # (:opp carries the negative). Same-player cross-family is
                     # containment-shaped -> None -> plain (containment phase).
-                    prior = _mlb_prop_pair_prior(
+                    if prior is None:
+                        prior = _mlb_prop_pair_prior(
+                            key, sport, params,
+                            legs[i].market_ticker, legs[j].market_ticker,
+                        )
+                elif (
+                    pair_types == {LegType.MONEYLINE, LegType.SPREAD}
+                    and sport == str(Sport.MLB)
+                ):
+                    # MLB winner × run line (DO-3): containment-shaped ±0.95
+                    # by side. relationships.py intercepts the containment /
+                    # impossible shapes before any copula; only cases like
+                    # win-yes × cover-no reach here. MLB-gated so NFL (0.88)
+                    # and soccer ml|spread behavior is untouched.
+                    ml2_i = i if types[i] is LegType.MONEYLINE else j
+                    sp2_i = j if ml2_i == i else i
+                    prior = _mlb_winner_spread_prior(
                         key, sport, params,
-                        legs[i].market_ticker, legs[j].market_ticker,
+                        legs[ml2_i].market_ticker, legs[sp2_i].market_ticker,
                     )
                 elif (
                     LegType.MONEYLINE in pair_types

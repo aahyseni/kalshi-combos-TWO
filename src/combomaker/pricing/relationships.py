@@ -31,7 +31,18 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal, Protocol
 
-from combomaker.pricing.legtypes import LegType, classify_leg
+from combomaker.pricing.conditionals_mlb import (
+    BATTER_FAMILIES,
+    is_exact,
+    strongest_measured_direction,
+)
+from combomaker.pricing.legtypes import LegType, Sport, classify_leg, classify_sport
+
+# The ONE anchored MLB team parser (reviewer defect #3): the game-blob /
+# end-anchoring helpers live in sgp.py (prefix=away, suffix=home,
+# both-or-neither refuses; provably unambiguous on the live-enumerated 30-code
+# vocabulary). Imported — not mirrored — so the parse can never drift.
+from combomaker.pricing.sgp import _mlb_side_of, _mlb_team_blob
 from combomaker.rfq.models import RfqLeg
 
 
@@ -171,6 +182,33 @@ def _moneyline_is_team(market_ticker: str) -> bool:
     return bool(suffix) and suffix not in _DRAW_SUFFIXES
 
 
+# --- MLB same-player / winner-spread parsing -------------------------------------
+# Batter-stat leg types covered by the same-player conditional table (KS is
+# deliberately absent — a starter's Ks and a batter's stats are different
+# entities, so their player segments can never match; no branch needed).
+_MLB_BATTER_TYPES = frozenset(BATTER_FAMILIES)
+
+
+def _mlb_prop_entity(market_ticker: str) -> tuple[str, str, int] | None:
+    """(raw game-code segment, player/entity segment, rung) for an MLB
+    player-prop ticker (``KXMLBHR-26JUL092145COLSF-COLHGOODMAN15-1`` ->
+    ``("26JUL092145COLSF", "COLHGOODMAN15", 1)``). Shape guards mirror
+    sgp._mlb_prop_pair_prior / _mlb_same_player_conditional_prior (keep in
+    sync): exactly 4 hyphen segments, a game code whose team blob parses
+    (doubleheader G<digit> tolerated but the RAW segment is returned, so a
+    G1 x G2 pair can never merge), and a digits-only line suffix (``-N`` =
+    "N or more", floor_strike N-0.5). None on any doubt — never guess an
+    entity or a rung for containment logic."""
+    if _mlb_team_blob(market_ticker) is None:
+        return None
+    parts = market_ticker.upper().split("-")
+    if len(parts) != 4 or not parts[2]:
+        return None
+    if not _TOTAL_LINE.match(parts[3]):
+        return None
+    return parts[1], parts[2], int(parts[3])
+
+
 def _containment_sign(
     sub_i: int, sup_i: int, sub_side: str, sup_side: str
 ) -> tuple[int, int] | Literal["impossible"] | None:
@@ -274,9 +312,10 @@ def classify_legs(
             # a POSSIBLE combo as impossible, the one loss path farming has.
             return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
 
-    # LOGICAL CONTAINMENT families (A⟹B) — exact soccer-scoring facts the copula
-    # cannot express, handled in the same-game block just below the corners
-    # branch. See ``_containment_sign`` for the shared YES/NO sign matrix.
+    # LOGICAL CONTAINMENT families (A⟹B) — exact scoring/arithmetic facts the
+    # copula cannot express: the nested ladders and soccer families below, plus
+    # the MLB same-player and winner×spread families (2026-07-10). See
+    # ``_containment_sign`` for the shared YES/NO sign matrix.
     types = [classify_leg(leg.market_ticker) for leg in legs]
 
     # NESTED LADDERS (registry above): same family + same game + same scope,
@@ -333,6 +372,149 @@ def classify_legs(
                     f"{legs[b_i].market_ticker} yes + {legs[a_i].market_ticker} no: "
                     "joint = P(low) - P(high)"
                 )
+
+    # MLB SAME-PLAYER cross-stat batter pairs (DO-2, 2026-07-10): HIT/HR/TB/HRR
+    # of ONE batter-game (identical entity segment, trailing line stripped into
+    # the rung). The distinct-player [D] rhos are WRONG for the same player
+    # (the sweep regression: HIT×HR truth is containment-shaped, not +0.01), so
+    # a same-player pair must NEVER fall through to them. Operator-approved
+    # policy, driven by conditionals_mlb.SAME_PLAYER_CONDITIONALS:
+    #   'exact' cells (arithmetic containments, verified == 1.0 pooled AND
+    #     per-era) -> the ``_containment_sign`` verdicts. IMPOSSIBLE verdicts
+    #     are NEVER farmable: MLB's 48h-postponement rule settles markets
+    #     SCALAR, which breaks the airtight certain-NO bar the farm requires
+    #     (unlike soccer's one-count tautologies).
+    #   'measured' cells with n >= MIN_CONDITIONAL_N -> conditional-table
+    #     pricing (joint = P(conditioning leg) × p_cond) via the sgp.py
+    #     implied-rho seam — BARE 2-leg pairs only; buried partials decline
+    #     UNKNOWN (soccer bare-pair precedent).
+    #   anything else (unmeasured cell, truncated table region, unparseable
+    #     rung) -> UNKNOWN — widen-or-no-quote, never the distinct-player rho.
+    # Same-player SAME-family rungs (a nested ladder, e.g. HIT-1 × HIT-2) are
+    # deliberately NOT handled this step: no table cell exists, and the ladder
+    # registry's farm path must not fire for MLB (scalar settlement).
+    batter_entities: dict[int, tuple[str, str, int]] = {}
+    for i, leg in enumerate(legs):
+        if types[i] in _MLB_BATTER_TYPES:
+            entity = _mlb_prop_entity(leg.market_ticker)
+            if entity is not None:
+                batter_entities[i] = entity
+    batter_indices = sorted(batter_entities)
+    for x in range(len(batter_indices)):
+        for y in range(x + 1, len(batter_indices)):
+            a_i, b_i = batter_indices[x], batter_indices[y]
+            game_a, seg_a, rung_a = batter_entities[a_i]
+            game_b, seg_b, rung_b = batter_entities[b_i]
+            if game_a != game_b or seg_a != seg_b:
+                continue  # different game or player: teammate/opp routing owns it
+            fam_a = BATTER_FAMILIES[types[a_i]]
+            fam_b = BATTER_FAMILIES[types[b_i]]
+            if fam_a == fam_b:
+                continue  # same-family rung ladder: out of scope this step
+            pinned = False
+            for sub, sup in ((a_i, b_i), (b_i, a_i)):
+                sub_fam, sub_rung = (fam_a, rung_a) if sub == a_i else (fam_b, rung_b)
+                sup_fam, sup_rung = (fam_b, rung_b) if sub == a_i else (fam_a, rung_a)
+                if not is_exact(sub_fam, sub_rung, sup_fam, sup_rung):
+                    continue
+                verdict = _containment_sign(sub, sup, legs[sub].side, legs[sup].side)
+                if verdict == "impossible":
+                    notes.append(
+                        f"same-player {sub_fam}-{sub_rung} yes "
+                        f"({legs[sub].market_ticker}) implies {sup_fam}-{sup_rung} "
+                        f"yes: {legs[sup].market_ticker} no is impossible"
+                    )
+                    # NOT farmable: MLB scalar settlement (48h postponement)
+                    # breaks the airtight bar.
+                    return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
+                if isinstance(verdict, tuple):
+                    containment = verdict
+                    pinned = True
+                    break
+                # verdict None ({subset no, superset yes}): not a containment —
+                # a measured reverse cell may still price it below.
+            if pinned:
+                continue
+            if strongest_measured_direction(fam_a, rung_a, fam_b, rung_b) is not None:
+                if len(legs) != 2:
+                    notes.append(
+                        "same-player conditional pair inside a larger combo: "
+                        "not modeled"
+                    )
+                    return Relationship(RelationshipKind.UNKNOWN, (), tuple(notes))
+                notes.append(
+                    f"same-player conditional cell {fam_a}-{rung_a} x "
+                    f"{fam_b}-{rung_b}: priced via conditional table (sgp)"
+                )
+                continue  # bare pair falls through to OK; the sgp seam prices it
+            notes.append(
+                f"same-player cross-stat pair {fam_a}-{rung_a} x {fam_b}-{rung_b} "
+                "unmeasured: widen-or-no-quote"
+            )
+            return Relationship(RelationshipKind.UNKNOWN, (), tuple(notes))
+
+    # MLB MONEYLINE × SPREAD, same game (DO-3, 2026-07-10). The spread suffix is
+    # TEAM+line ("wins by over N-0.5", so any N >= 1 forces a win margin >= 1):
+    # SAME-team cover ⟹ win is a scoring containment — ``_containment_sign``
+    # with A = the spread leg. OPPOSITE teams (BOTH sides resolved via the ONE
+    # anchored parser — raw suffix inequality alone is NOT proof, reviewer
+    # defect #3) make cover-yes × win-yes mutually exclusive ⇒ IMPOSSIBLE, but
+    # NEVER farmable: MLB's 48h-postponement rule settles markets SCALAR,
+    # breaking the airtight certain-NO bar (the soccer farm precedent does NOT
+    # transfer). Unresolvable either side falls through to the copula, where
+    # sgp routes :same/:opp (±0.95) and parse-failures hit the plain
+    # sign-spanning 0.00 fallback. MLB-gated: soccer/NFL ml|spread keep their
+    # structural/copula paths untouched.
+    for ml_i in range(len(legs)):
+        if types[ml_i] is not LegType.MONEYLINE:
+            continue
+        if classify_sport(legs[ml_i].market_ticker) is not Sport.MLB:
+            continue
+        game_m = _mlb_team_blob(legs[ml_i].market_ticker)
+        if game_m is None:
+            continue
+        ml_side = _mlb_side_of(
+            legs[ml_i].market_ticker.upper().rsplit("-", 1)[-1], game_m[1]
+        )
+        if ml_side is None:
+            continue
+        for sp_i in range(len(legs)):
+            if types[sp_i] is not LegType.SPREAD:
+                continue
+            if classify_sport(legs[sp_i].market_ticker) is not Sport.MLB:
+                continue
+            game_s = _mlb_team_blob(legs[sp_i].market_ticker)
+            if game_s is None or game_s != game_m:
+                continue
+            parsed_spread = _corners_team_line(legs[sp_i].market_ticker)
+            if parsed_spread is None or parsed_spread[1] < 1:
+                continue  # need TEAM + a line N >= 1 for cover ⟹ win
+            spread_side = _mlb_side_of(parsed_spread[0], game_s[1])
+            if spread_side is None:
+                continue
+            if spread_side == ml_side:
+                verdict = _containment_sign(
+                    sp_i, ml_i, legs[sp_i].side, legs[ml_i].side
+                )
+                if verdict == "impossible":
+                    notes.append(
+                        f"spread cover yes ({legs[sp_i].market_ticker}) implies "
+                        f"the win: {legs[ml_i].market_ticker} no is impossible"
+                    )
+                    # NOT farmable: MLB scalar settlement (48h postponement).
+                    return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
+                if isinstance(verdict, tuple):
+                    containment = verdict
+                # verdict None ({cover no, win yes}): possible — copula :same.
+            elif legs[sp_i].side == "yes" and legs[ml_i].side == "yes":
+                notes.append(
+                    f"spread cover yes ({legs[sp_i].market_ticker}) and the "
+                    f"OPPOSITE team's win yes ({legs[ml_i].market_ticker}) are "
+                    "mutually exclusive"
+                )
+                # NOT farmable: MLB scalar settlement (48h postponement).
+                return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
+            # other opposite-team sign cases: possible — copula :opp.
 
     # Three period/line implications A⟹B are EXACT scoring facts (not
     # correlations). A Kalshi taker-API probe proved these three — and only these

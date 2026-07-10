@@ -163,9 +163,21 @@ class TestPropPairRouting:
         assert abs(_rho(f"KXMLBHRR-{_G}-COLHGOODMAN15-3",
                         f"KXMLBHRR-{_G}-COLETOVAR14-3") - 0.17) < 1e-9
 
-    def test_same_player_cross_family_refuses_to_plain(self) -> None:
-        # HR x HRR same player is containment-shaped -> plain 0.03, NOT :same 0.05
-        c = _corr(f"KXMLBHR-{_G}-COLHGOODMAN15-1", f"KXMLBHRR-{_G}-COLHGOODMAN15-3")
+    def test_same_player_cross_family_owned_by_containment_phase(self) -> None:
+        # HR x HRR same player is containment-shaped, never a :same rho. Since
+        # step 4 (2026-07-10) the CLASSIFIER owns the pair: HR-1 yes x HRR-3
+        # yes is an EXACT arithmetic containment (a HR is 1 hit + >=1 R +
+        # >=1 RBI => HRR >= 3), so it never reaches the copula at all.
+        legs = [_leg(f"KXMLBHR-{_G}-COLHGOODMAN15-1"),
+                _leg(f"KXMLBHRR-{_G}-COLHGOODMAN15-3")]
+        rel = classify_legs(legs, _Prov())
+        assert rel.kind is RelationshipKind.CONTAINMENT
+        assert rel.containment == (0, 1)  # subset = the HR leg
+        # The sgp seam ALONE (classifier bypassed) still refuses to plain 0.03
+        # — the exact cell is not a measured conditional, so the same-player
+        # conditional resolver returns None and the routing resolver refuses.
+        c = build_sgp_correlation(legs, ((0, 1),), shipped_params(),
+                                  marginals=[0.5, 0.5])
         assert abs(c.corr[0, 1] - 0.03) < 1e-9
 
     def test_hr_hrr_distinct_player_routes(self) -> None:
