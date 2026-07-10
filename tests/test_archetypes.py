@@ -256,6 +256,32 @@ def test_engine_forwards_sport_tables() -> None:
     assert tables["mlb"]["player_ks|total"] == -0.25
     bands = engine._sgp_params.pair_uncertainty  # noqa: SLF001 (test seam)
     assert bands["mlb:player_ks|total"] == 0.12
+    # DO-1 untabled-cell quick-fix (2026-07-10 sweep): the spread×prop
+    # neutralized cells and the rfi labeled priors must reach the hot path —
+    # one sentinel per new group, plus the enumeration-gap ml|tb cell.
+    assert tables["mlb"]["moneyline|player_tb"] == 0.00
+    assert bands["mlb:moneyline|player_tb"] == 0.30
+    assert tables["mlb"]["player_hit|spread"] == 0.00
+    assert bands["mlb:player_hit|spread"] == 0.20
+    assert tables["mlb"]["rfi|spread"] == 0.00
+    assert bands["mlb:rfi|spread"] == 0.15
+    assert tables["mlb"]["player_hrr|rfi"] == 0.10
+    assert bands["mlb:player_hrr|rfi"] == 0.20
+
+
+def test_mlb_pair_table_has_no_band_orphans() -> None:
+    """DO-1 invariant: every mlb pair entry has an 'mlb:'-prefixed band and
+    every mlb-prefixed band has an entry — a point without a band gets the
+    default width (wrong confidence), a band without a point is dead config.
+    43 entries / 43 bands as of the 2026-07-10 untabled-cell quick-fix; the
+    count only ever grows (routing/measurement phases add oriented keys)."""
+    h = Harness()
+    engine = PricingEngine(h.feed, h.metadata, DOC_ASSUMED, PricingConfig())
+    mlb = engine._sgp_params.pair_rho_by_sport["mlb"]  # noqa: SLF001 (test seam)
+    bands = engine._sgp_params.pair_uncertainty  # noqa: SLF001 (test seam)
+    mlb_bands = {k.removeprefix("mlb:") for k in bands if k.startswith("mlb:")}
+    assert set(mlb) == mlb_bands
+    assert len(mlb) >= 43
 
 
 async def dog_ml_btts_harness(config: PricingConfig | None = None) -> PricingEngine:

@@ -1,0 +1,31 @@
+{
+  "_provenance": {
+    "probe_date": "2026-07-09",
+    "method": "live Kalshi GetEvent probe of 24 open MLB events spanning all 9 combo-eligible families (MLB measurement tranche, event-metadata agent): 24/24 responses carried a real boolean mutually_exclusive flag — never null. Recorded in docs/reports/2026-07-09-mlb-measurement-tranche.md ('both phase-1 blockers resolved' item 1) and docs/calibration/staged_mlb_props.md [E].",
+    "pinned": "2026-07-10 (DO-7, docs/reports/2026-07-10-bands-routing-sweep-designs.md wiring order step 1)",
+    "event_samples": {
+      "_note": "one real event ticker per family, drawn from the prod RFQ tape (rfqs rowid > 13,200,000, read 2026-07-10) — examples of each family's event grammar, not necessarily the 24 probed events",
+      "KXMLBGAME": "KXMLBGAME-26JUL101840MILPIT",
+      "KXMLBTOTAL": "KXMLBTOTAL-26JUL092145COLSF",
+      "KXMLBSPREAD": "KXMLBSPREAD-26JUL092140AZSD",
+      "KXMLBKS": "KXMLBKS-26JUL101910SEATB",
+      "KXMLBHIT": "KXMLBHIT-26JUL092140AZSD",
+      "KXMLBHR": "KXMLBHR-26JUL092140AZSD",
+      "KXMLBHRR": "KXMLBHRR-26JUL101915BOSNYM",
+      "KXMLBTB": "KXMLBTB-26JUL092145COLSF",
+      "KXMLBRFI": "KXMLBRFI-26JUL092145COLSF"
+    },
+    "reverification": "the quote path fetches event metadata LIVE per event (marketdata/metadata.py), so this fixture never feeds pricing — it is the PIN. The standing re-verification is the live probe: if a later tools/ spot check records a different flag, tests/test_mlb_event_conventions.py fires (fixture vs last-recorded mismatch) and the fixture must be re-recorded deliberately."
+  },
+  "event_mutually_exclusive": {
+    "KXMLBGAME": true,
+    "KXMLBTOTAL": false,
+    "KXMLBSPREAD": false,
+    "KXMLBKS": false,
+    "KXMLBHIT": false,
+    "KXMLBHR": false,
+    "KXMLBHRR": false,
+    "KXMLBTB": false,
+    "KXMLBRFI": false
+  }
+}
