@@ -144,10 +144,19 @@ same-player same-family rungs = ZERO flow; cross-family same-player (6.5%) =
 deterministic containment (HR⇒HRR≥3 exact 101,186/101,186). Remaining gaps:
 cross-family distinct-player batter pairs (hit|hr etc., labeled priors staged,
 hours to measure) + teammate hrr|ks + tb|ks.
-**Promotion path (in order):** (1) `tools/backtest_mlb_pairs.py` tape-replay
-gate (staged vs live flat-0.6) — THE gate; (2) ship legtypes + [A]/[B] entries +
-teammate/opponent routing + containment branches + event-flag fixture, port +
-parity-check; (3) ML-orientation resolver → flip [C] signed; (4) measure [D].
+**PROMOTED 2026-07-10 (operator-directed, commits 4c57f86 + 85d02cb):**
+classification is **9/9 LIVE** (6 LegTypes + blockers; 3 live misclass bugs
+fixed) and the **32-entry mlb pair table + 32 bands is LIVE in config** — final
+[D] pairs measured (20.8M pair-units) + judge-confirmed first. Full suite 1013
+passed / mypy strict / ruff fully clean; SGP spot checks 6/6 (KS×TOTAL −0.25
+not +0.6; soccer 0.70 / NFL 0.88 untouched). Remaining, in order: (1)
+`tools/backtest_mlb_pairs.py` tape-replay VALIDATION gate; (2) resolver phase
+(ML-team orientation + teammate/opponent routing — signed values sit in config
+comments); (3) containment phase (ml|spread routing, same-player cross-stat
+containments, nested-BAND arithmetic — see the one-leg-per-ladder report:
+same-side rungs are exchange-blocked, yes-low+no-high corner BANDS are real
+tape flow currently at flat +0.6). Reports:
+`2026-07-10-mlb-promotion-wired.md`, `2026-07-10-one-leg-per-ladder-rule.md`.
 
 ## OPERATOR DECISIONS (2026-07-09 evening)
 

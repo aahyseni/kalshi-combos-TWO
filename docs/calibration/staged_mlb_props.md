@@ -1,4 +1,13 @@
-# STAGED — MLB prop classification + pair table (2026-07-09, NOT applied)
+# PROMOTED 2026-07-10 (commits 4c57f86 + 85d02cb) — was: STAGED MLB prop classification + pair table
+
+**STATUS: WIRED INTO LIVE CONFIG.** Classification 9/9 (legtypes.py) + 32-entry
+pair table + 32 bands (ops/config.py). Full suite 1013 passed; universe diff
+exactly as verified; SGP spot checks 6/6. Remaining gates: tape-replay backtest
+(validation), then resolver phase (unlocks [C] signed values), then containment
+phase (ml|spread routing, same-player containments, nested-band arithmetic).
+The FINAL RECOMMENDED TABLE below is what shipped (plus player_hr|player_hrr
++0.03/0.08, restored in 85d02cb); the older staged-code block further down is
+historical.
 
 Produced by the multi-agent classification pass (12 agents; docs+API+tape+code,
 triple-verified ρ). **Promotion gate (CLAUDE.md rule 8): the measurement tranche
