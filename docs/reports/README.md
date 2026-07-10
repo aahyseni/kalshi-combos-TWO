@@ -22,6 +22,7 @@ Naming: `YYYY-MM-DD-<sport-or-scope>-<what>.md`. Each report ends with a
 | Date | Area | State | One-line |
 |------|------|-------|----------|
 | 2026-07-10 | **MLB settlement P&L sweep 0-5¢** | DONE (52-game window — variance-dominated) | actual makers LOST −12.85¢/ct on game-lines this favorite-hot week (−$1.23M) while props made +1.81¢/ct; our sim beats makers like-for-like (−10.2 vs −11.3 at m=0) and **props-only is profitable at every markup 0-3¢** (+6.8¢/ct at 1¢, YES-hit 2.8-19%); 2-2.5¢ markup trough = adverse selection visible; needs multi-week pooling before the markup decision — [report](2026-07-10-mlb-settlement-pnl-sweep.md) |
+| 2026-07-10 | **Demo combo SETTLED — convention CONFIRMED, sell-only UN-GATED** | **combo_no_pays_complement = true (ledger-verified)** | early-NO fired when LAA lost; NO paid EXACTLY $1.00 (balance 1082.62→1083.62, 1−V to the cent, +$0.50 realized); fixture promoted, suite 1095/0; lifecycle NO-confirm gate now OPEN — [report](2026-07-10-demo-combo-settled.md) |
 | 2026-07-10 | **LOOK-AHEAD VERDICT: all 6 pre-registered predictions TRUE** | **artifact confirmed as THE cause; WC survived; NO pickoff risk** | fresh 3-bucket × 2-policy reruns (13.5M rows, 82k tape fetches, independent verifier zero-discrepancy): honest MLB book = 0.34¢ med/−0.39 bias/94% w2; pure-ML 99% w2; HR+ML −0.59¢ & HIT+ML −1.07¢ (old scares were artifact); WC backbone reproduces at 19× sample; cross-sport independence EXACT; gate PASS under both policies; artifact v2 re-issued, 18.3¢ retracted — [report](2026-07-10-lookahead-verdict.md) |
 | 2026-07-10 | **Steps 4-5 wired: same-player conditionals + ml\|spread** | **DONE — suite 1095/0; mlb table 68 entries** | 142-cell conditional table (33 exact ==1.0 verified); ml\|spread containment, farmable=False per rain-scalar; differential surgical; CAUGHT+FIXED a prompt-slice truncation (60/142 cells) — pass data by file, never inline — [report](2026-07-10-sameplayer-mlspread-wired.md) |
 | 2026-07-10 | **Bands + routing WIRED (steps 2-3)** | **prop-carrying now 0.97¢ — sub-cent vs market** | 85/85 tape bands price exactly (was +2.6-6.1¢ over); routing 25/25 parity to 1e-12; differential: 43,199 transitions ALL on routed keys, game-lines bit-identical; suite 1055/0 — [report](2026-07-10-bands-routing-wired.md) |
@@ -51,11 +52,10 @@ Naming: `YYYY-MM-DD-<sport-or-scope>-<what>.md`. Each report ends with a
 
 ## Blocked / open gates
 
-- **Phase 2.5 ground-truth combo pass** — combo NO-payout convention
-  (`combo_no_pays_complement`) still null; the demo combo round trip WAS executed
-  2026-07-09 (maker long NO, $0.50) — only the settlement observation remains
-  (~Jul 10-11; earliest possible: ~2026-07-10T03:05Z if the LAA leg loses →
-  early-NO fires full settlement immediately).
+- ~~Phase 2.5 ground-truth combo pass~~ **RESOLVED 2026-07-10**: demo combo
+  settled NO via early-NO; payout exactly $1.00 = 1−V to the cent →
+  `combo_no_pays_complement: true` promoted; sell-only fills UN-GATED
+  (report `2026-07-10-demo-combo-settled.md`).
 - **Soccer blind re-test** — operator's planned gate before replicating the
   calibrate→audit→test workflow to other sports (MLB, basketball, esports).
 - **UCL/UEL/UECL gated OFF** — two-legged-tie legs decline (`filters.py`); NOT

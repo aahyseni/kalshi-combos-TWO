@@ -1,8 +1,9 @@
 {
   "_promoted": "2026-07-05 by operator sign-off after reviewing the recorded demo round trips (see scenario_*.jsonl and NOTES.md Phase 2.5 table)",
+  "_combo_no_promoted": "2026-07-10 from the live demo combo settlement: KXMVECROSSCATEGORY-S2026C1138DA69BC-7ADA8E5486D (LAA win AND BOS win) finalized result=no via EARLY-NO the moment LAA lost; our LONG NO 1.00 contract (cost $0.50) paid EXACTLY $1.00 (balance 1082.62 -> 1083.62, zero settlement fee) = 1 - V with V=0, to the cent. See docs/reports/2026-07-10-demo-combo-settled.md",
   "maker_side_on_yes_accept": "yes",
   "maker_side_on_no_accept": "no",
   "maker_pays_own_bid": true,
   "maker_is_taker_on_fill": false,
-  "combo_no_pays_complement": null
+  "combo_no_pays_complement": true
 }
