@@ -247,9 +247,10 @@
         beat the copula on held-out data doesn't ship. Pick a sport.</p>
       <div class="callout gate"><b>The correlation surface is far from complete.</b>
         Soccer is strong and nearly done (final tests pending) — it only hardens from
-        here. <b>MLB is the ACTIVE workstream</b> (finalization in process since
-        2026-07-09: classify all prop families → measure every allowed pair → verify →
-        backtest). NBA gated, UFC & Tennis unbuilt.
+        here. <b>MLB is the ACTIVE workstream</b>: all 9 leg families classified and
+        every allowed pair measured on Retrosheet 2005–25 + adversarially verified
+        (2026-07-09, 0 of 33 verdicts refuted) — now STAGED behind the tape-backtest
+        gate. NBA gated, UFC & Tennis unbuilt.
         This is the biggest open work in the whole system.</div>
       <div class="tabs" id="sporttabs"></div>
       <div id="sports"></div>
@@ -530,9 +531,85 @@
     ].map(function(s){return '<div class="card"><h3 class="mono" style="font-size:12.5px">'+s[0]+'</h3><p style="margin-top:4px;color:var(--teal);font-family:var(--mono);font-size:11px">'+s[1]+'</p><p style="margin-top:6px">'+s[2]+'</p></div>'}).join('')+'</div>';
     return html;}
 
+  /* ---- MLB panel (measured 2026-07-09; STAGED — backtest-gated, rule 8) ---- */
+  var mlbLegs=[
+    ['KXMLBGAME','moneyline','team wins the game','ok'],
+    ['KXMLBTOTAL','total','GAME total — rules say "collectively score" (NOT a team total)','ok'],
+    ['KXMLBSPREAD','spread','team wins by more than N−0.5','ok'],
+    ['KXMLBKS','player_ks','starter strikeouts N+ (rungs 2–12)','add'],
+    ['KXMLBHIT','player_hit','batter hits N+ (rungs 1–3+)','add'],
+    ['KXMLBHR','player_hr','batter home runs N+ (−1 rung = "to hit a HR")','add'],
+    ['KXMLBHRR','player_hrr','hits+runs+RBIs N+ — NOT a HR market; keyword MLBHRR must precede MLBHR','add'],
+    ['KXMLBTB','player_tb','total bases N+ (rungs 2–6)','add'],
+    ['KXMLBRFI','rfi','run in the 1st inning by either team (no-suffix ticker grammar)','add']];
+  var mlbA=[ /* pair, rho(null=containment), note, method */
+    ['player_ks | total',-0.25,'band 0.12 · ladder-FLAT across ALL posted K lines 3.5–8.5 → one entry serves every KS rung','Retrosheet 2005–25 · triple-verified'],
+    ['player_hr | total',0.24,'band 0.10 · GAME frame (measured +0.233; team-frame +0.367 is UNTRADEABLE — KXMLBTEAMTOTAL not combo-eligible)','era-stable 0.222–0.244'],
+    ['player_hit | total',0.25,'band 0.12 · rung-monotone: 0.19 (1+) / 0.25 (2+) / 0.30 (3+)','two independent parses agree to 4dp'],
+    ['player_tb | total',0.27,'band 0.10 · rungs: 2+ 0.26 / 4+ 0.28','Retrosheet 2005–25'],
+    ['player_hrr | total',0.40,'band 0.08 · starters population · line-monotone 0.33/0.40/0.44','new RBI scorer, runs/hits/HR 100% exact'],
+    ['rfi | total',0.37,'band 0.10 · strongest + most era-stable pair measured','inning-1 runs validated 49,486/49,486'],
+    ['rfi | player_ks',-0.10,'band 0.08 · orientation-free (rfi is either-team)','Retrosheet 2005–25'],
+    ['moneyline | rfi',0.00,'band 0.05 · team-symmetric → carries no which-team info → independence','measured +0.02, economically nil'],
+    ['player_ks | player_ks',0.04,'band 0.08 · the two OPPOSING starters, both over their lines','sign confirmed small-positive'],
+    ['spread | total',0.13,'band 0.10 · copula fallback only (NegBin runs-grid supersedes) · total≡margin (mod 2) parity coupling','game logs 2005–25'],
+    ['moneyline | spread',null,'EXACT containment (win-by-N ⊂ win): 0 violations in 98,980 team-games · fallbacks :same +0.95 / :opp −0.95 (mutual exclusion, p11=0 exact)','route structurally, never a ρ']];
+  var mlbB=[ /* pair, teammate rho, opponent rho, note */
+    ['player_hr | player_hr',0.04,0.02,'unrouted fallback +0.03 / 0.06'],
+    ['player_hit | player_hit',0.07,0.00,'unrouted 0.00 / 0.08 — split of 0.06 makes routing REQUIRED'],
+    ['player_tb | player_tb',0.06,0.00,'unrouted 0.00 / 0.08'],
+    ['player_hrr | player_hrr',0.17,0.00,'unrouted +0.08 / 0.12 · strongest same-family pair (one player&#39;s run is a teammate&#39;s RBI)']];
+  var mlbC=[ /* pair, neutralized-now, with-resolver */
+    ['moneyline | player_ks','0.00 · band 0.30','±0.24 / 0.06 — ladder-flat, all KS rungs'],
+    ['moneyline | player_hr','0.00 · band 0.28','±0.23 / 0.08 (2+ rung +0.27)'],
+    ['moneyline | player_hit','0.00 · band 0.26 (widened)','±0.23 / 0.08 (2+ hits +0.25)'],
+    ['moneyline | player_hrr','0.00 · band 0.40','±0.37 / 0.08 — flattest pair measured'],
+    ['player_hit | player_ks','0.00 · band 0.15 (tightened)','facing −0.13 / 0.10 · teammate ~0'],
+    ['player_hr | player_ks','0.00 · band 0.12 (was MISSING — 11.6k pairs/10h sign-wrong at +0.6)','facing −0.075 / 0.05'],
+    ['player_hrr | player_ks','0.00 · band 0.20','facing −0.18 / 0.06 (teammate unmeasured)'],
+    ['player_tb | player_ks','0.00 · band 0.15','MEASURE next']];
+  var mlbBaskets=[
+    ['9-leg star','0.257','0.529','+27¢','0.240'],
+    ['16-leg (top-8 both lineups)','0.158','0.506','+35¢','0.1579 — Δ 0.0003'],
+    ['8-leg top-4','0.356','0.604','+25¢','±1.4¢']];
+  function mlbPanel(){
+    var html='<div class="grid g4" style="margin-bottom:20px">'+
+      [['9','combo-eligible leg families','teal'],['25+','ρ values measured &amp; verified','green'],['49,486','games — parsers 100% exact vs gamelogs',''],['+25–35¢','all-NO basket overbid found','gold']].map(function(k){
+        return '<div class="hs"><div class="v '+k[2]+'">'+k[0]+'</div><div class="l">'+k[1]+'</div></div>'}).join('')+'</div>';
+    html+='<div class="callout gate"><b>MEASURED + adversarially verified (33 verdicts, 0 refuted) — STAGED, not live.</b> Everything below ships only after the tape-replay backtest gate (<span class="mono">tools/backtest_mlb_pairs.py</span>, CLAUDE.md rule 8). TODAY the six prop families classify UNKNOWN, so every same-game prop pair prices flat +0.60 — sign-wrong on K pairs and a +25–35¢ overbid on the signature all-NO HR baskets. Source of truth: <span class="mono">docs/calibration/staged_mlb_props.md</span>.</div>';
+    html+='<h2 style="font-size:16px;margin-top:26px">The 9 combo-eligible leg families <span style="color:var(--muted);font-weight:400;font-size:12px">(exhaustive — verified vs all 1,387 MVE collections + 3 tape windows)</span></h2><div class="tw"><table><thead><tr><th>family</th><th>LegType</th><th>settles on (API rules text)</th><th>classified today</th></tr></thead><tbody>'+
+      mlbLegs.map(function(r){var chip=r[3]==='ok'?'<span class="st ship">classified ✓</span>':'<span class="st gate">staged add</span>';
+        return '<tr><td class="k">'+r[0]+'</td><td class="mono" style="font-size:12px;color:var(--teal)">'+r[1]+'</td><td style="font-size:12.5px">'+r[2]+'</td><td>'+chip+'</td></tr>'}).join('')+
+      '</tbody></table></div><p style="font-size:12px;color:var(--muted);margin-top:6px">NOT combo-eligible (reference only): KXMLBTEAMTOTAL — which strands the team-frame ρs (HR +0.367 / K×opp −0.380) — KXMLBEXTRAS, RBI/SB/OUTS, F5*. Blockers staged for 3 live misclassification bugs found (F5TOTAL/F5SPREAD/SERIESGAMETOTAL typed as full-game total/spread).</p>';
+    html+='<h2 style="font-size:16px;margin-top:26px">A — prop × game-total &amp; game-level <span style="color:var(--muted);font-weight:400;font-size:12px">(orientation-free — stage now)</span></h2><div class="tw"><table><thead><tr><th>pair</th><th style="text-align:center">ρ</th><th>band · note</th><th>evidence</th><th>status</th></tr></thead><tbody>'+
+      mlbA.map(function(r){var cell=r[1]===null?'<span class="st ship">contain</span>':rhoCell(r[1]);var chip=r[1]===null?'<span class="st ship">structural</span>':'<span class="st gate">measured · staged</span>';
+        return '<tr><td class="k">'+r[0]+'</td><td style="text-align:center">'+cell+'</td><td class="ci">'+r[2]+'</td><td style="font-size:12px;color:var(--muted)">'+r[3]+'</td><td>'+chip+'</td></tr>'}).join('')+'</tbody></table></div>';
+    html+='<h2 style="font-size:16px;margin-top:26px">B — same-family batter baskets <span style="color:var(--muted);font-weight:400;font-size:12px">(teammate/opponent routing via ticker team prefix — no ML resolver needed)</span></h2><div class="tw"><table><thead><tr><th>pair</th><th style="text-align:center">teammate</th><th style="text-align:center">opponent</th><th>note</th><th>status</th></tr></thead><tbody>'+
+      mlbB.map(function(r){return '<tr><td class="k">'+r[0]+'</td><td style="text-align:center">'+rhoCell(r[1])+'</td><td style="text-align:center">'+rhoCell(r[2])+'</td><td class="ci">'+r[3]+'</td><td><span class="st gate">measured · staged</span></td></tr>'}).join('')+
+      '</tbody></table></div><p style="font-size:12px;color:var(--muted);margin-top:6px">PLUS: +2–3¢ symmetric WIDTH (never ρ inflation) on same-family all-NO baskets of ≥8 legs — pairwise Gaussian understates the joint tail by ~2¢, sign wobbles by shape.</p>';
+    html+='<h2 style="font-size:16px;margin-top:26px">The all-NO HR basket overbid — the money finding</h2><div class="tw"><table><thead><tr><th>basket shape</th><th>empirical P(all-no)</th><th>flat-0.6 copula</th><th>overbid</th><th>measured-ρ copula</th></tr></thead><tbody>'+
+      mlbBaskets.map(function(r){return '<tr><td class="k">'+r[0]+'</td><td class="mono">'+r[1]+'</td><td class="mono">'+r[2]+'</td><td class="mono" style="color:var(--gold);font-weight:700">'+r[3]+'/$1</td><td class="mono" style="color:var(--teal)">'+r[4]+'</td></tr>'}).join('')+
+      '</tbody></table></div>';
+    html+='<h2 style="font-size:16px;margin-top:26px">C — ML-orientation-resolver-gated <span style="color:var(--muted);font-weight:400;font-size:12px">(neutralized 0.00 now; signed values unlock when the prop-team vs ML-suffix resolver ships)</span></h2><div class="tw"><table><thead><tr><th>pair</th><th>staged now (neutralized)</th><th>with resolver (measured)</th><th>status</th></tr></thead><tbody>'+
+      mlbC.map(function(r){return '<tr><td class="k">'+r[0]+'</td><td class="mono" style="font-size:12px">'+r[1]+'</td><td class="mono" style="font-size:12px;color:var(--teal)">'+r[2]+'</td><td><span class="st coded">resolver-gated</span></td></tr>'}).join('')+
+      '</tbody></table></div>';
+    html+='<h2 style="font-size:16px;margin-top:26px">D — cross-family batter pairs <span style="color:var(--muted);font-weight:400;font-size:12px">(the one remaining measurement gap — hours, data already parsed)</span></h2><div class="tw"><table><thead><tr><th>pair</th><th style="text-align:center">teammate</th><th style="text-align:center">opponent</th><th>note</th><th>status</th></tr></thead><tbody>'+
+      '<tr><td class="k">player_hr | player_hrr</td><td style="text-align:center">'+rhoCell(0.05)+'</td><td style="text-align:center">'+rhoCell(0.00)+'</td><td class="ci">unrouted +0.03 / 0.08</td><td><span class="st gate">measured · staged</span></td></tr>'+
+      '<tr><td class="k">hit|hr · hit|hrr · hit|tb · hr|tb · hrr|tb</td><td style="text-align:center">'+rhoCell(0.06)+'</td><td style="text-align:center">'+rhoCell(0.00)+'</td><td class="ci">unrouted +0.04 / 0.10 — bounded by measured same-family values; ~31k same-game pairs/10h</td><td><span class="st off">labeled prior</span></td></tr>'+
+      '</tbody></table></div>';
+    html+='<h2 style="font-size:16px;margin-top:26px">E — structural findings (routing, not ρ)</h2><div class="grid g3">'+[
+      ['Same-player containment','Cross-family same-player pairs (6.5% of prop flow) are DETERMINISTIC: HR-k ⇒ HIT≥k, TB≥4k; HIT-k ⇒ TB≥k; HR ⇒ HRR≥3 verified EXACT 101,186/101,186. Conditional table P(HRR≥5|HR)=0.529. Route structurally, never a copula.','structural'],
+      ['Same-family rungs = zero flow','0 of 223,096 same-game same-family prop pairs share a player — takers never bundle two rungs of one stat (rungs ARE live, 45–71% of players). Generic nested-threshold guard ships as free safety.','tape-verified'],
+      ['event_mutually_exclusive','RESOLVED, not a blocker: live probe 24/24 — FALSE on all 6 prop families (baskets priceable, merely uncalibrated), TRUE on KXMLBGAME (correctly kills YES+YES). Pin via ground-truth fixture.','resolved'],
+      ['Strike ladders','Pitcher K pairs are ladder-FLAT (copula validated; self-median K-line convention was fine — question CLOSED). Batter HIT/HR rungs DRIFT +0.04–0.08/rung → per-rung entries; a single 1+ ρ sells deep rungs cheap.','measured'],
+      ['Runs model (shipped)','Poisson/NegBin team-runs grid → game/total/spread joint, inverted from live prices — ENABLED; the pair table above only governs structural declines.','enabled'],
+      ['Same-day cross-game','Independence STANDS: +0.007 (CI under the 0.02 threshold, 266k pairs). Doubleheader-spanning combos → UNKNOWN/wide (n=538, contaminated).','measured']
+    ].map(function(c){return '<div class="card"><h3>'+c[0]+'</h3><p>'+c[1]+'</p><div class="meta"><span>'+c[2]+'</span></div></div>'}).join('')+'</div>';
+    return html;}
+
   var sports=[
     {k:'soccer',label:'Soccer',dot:'var(--ship)',build:soccerPanel},
-    {k:'mlb',label:'MLB',dot:'var(--gate)',state:'finalizing',html:'<div class="callout gate"><b>IN PROCESS — being finalized (active workstream since 2026-07-09).</b> Baseball SGPs are the focus now that soccer is strong. The finalization gate: every MLB leg family classified from Kalshi docs + API (<b>zero unknown legs</b>), every pair Kalshi allows in combos measured on deep history (Retrosheet 2005–25) with independent cross-verification, then promoted only after a tape backtest. Multi-agent classify + re-measure + verify pass launched 2026-07-09.</div><div class="grid g3"><div class="card"><h3>Runs model</h3><p>Poisson team-runs → game/total/spread joint, inverted from live prices.</p><div class="meta"><span>enabled</span></div></div><div class="card"><h3>Baseball calibration</h3><p>results_baseball.md — HR×win +0.23 &lt; HR×team-total +0.37 shape validated (2015–25). Re-verification + extension to 2005–25 in flight; game-total vs team-total ticker semantics under source-of-truth check.</p><div class="meta"><span>verifying</span></div></div><div class="card"><h3>Player props</h3><p>HR / K\'s / hits families being classified + ρ-measured per allowed pair. K×total is NEGATIVE — the money-risk pair a +0.6 untyped fallback would price badly wrong. Promotion = classification + ρ + backtest together.</p><div class="meta"><span>in progress</span></div></div></div>'},
+    {k:'mlb',label:'MLB',dot:'var(--gate)',build:mlbPanel},
     {k:'nfl',label:'NFL',dot:'var(--ship)',html:'<div class="callout"><b>Shipped.</b> (margin, total) bivariate-normal, means inverted per game from live prices, shape from recent seasons. OOS-gate passed (hw×cover = exact comonotone geometry vs copula 0.88).</div><div class="grid g3"><div class="card"><h3>σ margin</h3><p class="mono" style="font-size:22px;color:var(--teal)">12.66</p></div><div class="card"><h3>σ total</h3><p class="mono" style="font-size:22px;color:var(--teal)">13.06</p></div><div class="card"><h3>ρ (margin,total)</h3><p class="mono" style="font-size:22px;color:var(--teal)">+0.026</p></div></div>'},
     {k:'wnba',label:'WNBA',dot:'var(--ship)',html:'<div class="callout"><b>Shipped</b> (operator-enabled 2026-07-06, season live). Same (margin,total) geometry as NFL; shape calibrated on 1,338 recent games through 2026-07-05. ρ≈0 means ml×total prices ≈ independent.</div><div class="grid g3"><div class="card"><h3>σ margin</h3><p class="mono" style="font-size:22px;color:var(--teal)">12.04</p></div><div class="card"><h3>σ total</h3><p class="mono" style="font-size:22px;color:var(--teal)">16.55</p></div><div class="card"><h3>ρ</h3><p class="mono" style="font-size:22px;color:var(--teal)">−0.019</p></div></div>'},
     {k:'nba',label:'NBA',dot:'var(--gate)',html:'<div class="callout gate"><b>Calibrated but gated OFF.</b> Shape params exist (σ<sub>m</sub> 13.71 · σ<sub>t</sub> 18.42 · ρ 0.000) but NBA is not in <code>enabled_sports</code> — held back pending an odds source or prod-shadow settlements to validate live.</div>'},
