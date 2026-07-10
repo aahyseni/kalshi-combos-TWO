@@ -302,9 +302,26 @@ def gather(outdir: Path, since: str, pregame_hours: float, chunk_rows: int,
         }
 
     # SPLIT WRITE — pricing inputs and outcomes never share a file.
+    # LOOK-AHEAD FIX (2026-07-10): snapshots are PREGAME-FILTERED here so the
+    # price stage's snaps[-1] is the last PRE-CUTOFF snapshot. Without this,
+    # 60.4% of cleared ML×N combos were priced off in-play/post-game marginals
+    # (re-RFQ flow is winner-conditioned: settled-YES combos drift +28.6c
+    # first→last snapshot) → a +6.5c PHANTOM bias vs strictly-pregame
+    # clearings. Honest repricing: pooled bias −0.03c, median |err| 0.27c.
+    # See docs/reports/2026-07-10-ml-parlay-bias-forensics.md. The cutoff is
+    # price-free public metadata (expected_expiration − pregame_hours), so
+    # filtering here keeps the inputs/outcomes zero-bias split intact.
+    def _pregame_snaps(mt: str) -> list[tuple[str, list[float]]]:
+        cut = outcomes[mt]["cutoff"]
+        sn = ticker_snaps.get(mt, [])
+        if cut is None:
+            return sn
+        cdt = _parse_ts(cut)
+        return [s for s in sn if _parse_ts(s[0]) < cdt]
+
     inputs = {mt: {"legs": [lg["market_ticker"] for lg in legs],
                    "sides": [lg["side"] for lg in legs],
-                   "snaps": ticker_snaps.get(mt, [])}
+                   "snaps": _pregame_snaps(mt)}
               for mt, legs in ticker_legs.items()}
     pickle.dump(inputs, open(outdir / "inputs.pkl", "wb"))
     pickle.dump(outcomes, open(outdir / "outcomes.pkl", "wb"))
@@ -671,7 +688,8 @@ def price(outdir: Path, workers: int) -> None:
         snaps = d["snaps"]
         if not snaps:
             continue
-        marginals = snaps[-1][1]  # latest recorded snapshot
+        marginals = snaps[-1][1]  # latest PREGAME snapshot (gather pre-filters
+        # snaps to before the cutoff — see the LOOK-AHEAD FIX note in gather)
         if len(marginals) != len(d["legs"]):
             continue
         rec: dict = {"n_legs": len(d["legs"]),

@@ -180,9 +180,24 @@ def gather(outdir: Path, since: str | None, pregame_hours: float) -> None:
         }
 
     # SPLIT WRITE — pricing inputs and outcomes never share a file.
+    # LOOK-AHEAD FIX (2026-07-10, found on the MLB harness — same bug here):
+    # snapshots are PREGAME-FILTERED so the price stage's snaps[-1] is the last
+    # PRE-CUTOFF snapshot. Unfiltered, in-play/post-game snapshots (which are
+    # winner-conditioned via re-RFQ flow) inflate fairs vs strictly-pregame
+    # clearings — a +6.5c phantom bias on MLB ML parlays. The cutoff is
+    # price-free public metadata, so the zero-bias split stays intact.
+    # See docs/reports/2026-07-10-ml-parlay-bias-forensics.md.
+    def _pregame_snaps(mt: str) -> list[tuple[str, list[float]]]:
+        cut = outcomes[mt]["cutoff"]
+        sn = ticker_snaps.get(mt, [])
+        if cut is None:
+            return sn
+        cdt = _parse_ts(cut)
+        return [s for s in sn if _parse_ts(s[0]) < cdt]
+
     inputs = {mt: {"legs": [lg["market_ticker"] for lg in legs],
                    "sides": [lg["side"] for lg in legs],
-                   "snaps": ticker_snaps.get(mt, [])}
+                   "snaps": _pregame_snaps(mt)}
               for mt, legs in ticker_legs.items()}
     outdir.mkdir(parents=True, exist_ok=True)
     pickle.dump(inputs, open(outdir / "inputs.pkl", "wb"))
@@ -359,7 +374,8 @@ def price(outdir: Path) -> None:
         snaps = d["snaps"]
         if not snaps:
             continue
-        marginals = snaps[-1][1]  # latest recorded snapshot (see analyze note on freshness)
+        marginals = snaps[-1][1]  # latest PREGAME snapshot (gather pre-filters;
+        # see the LOOK-AHEAD FIX note in gather)
         if len(marginals) != len(d["legs"]):
             continue
         key = (mt, round(sum(marginals), 6), len(marginals))
