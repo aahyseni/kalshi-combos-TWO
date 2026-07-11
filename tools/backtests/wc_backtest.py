@@ -359,29 +359,67 @@ def _build_pricer():
         beliefs = [LegBelief(p=y, uncertainty=0.005, source="bt") for y in yes]
         if rel.kind is RelationshipKind.CONTAINMENT and rel.containment is not None:
             return price_containment(beliefs, sides, rel.containment).p
-        if rel.kind is RelationshipKind.NESTED_BAND:
-            # Keep in sync with PricingEngine._price_nested_bands: EXACT
-            # super-leg collapse, band p = P(over-low) - P(over-high); inverted
-            # mids decline (None). A band shape must NEVER fall to the copula.
-            if not rel.bands:
+        if rel.kind in (RelationshipKind.NESTED_BAND, RelationshipKind.CONTAINMENT):
+            # Keep in sync with PricingEngine._price_nested_bands (2026-07-11:
+            # CONTAINMENT-multi collapse plans + containment windows in
+            # ``bands`` + WIRE-4 ``conditionals``; identical branch in
+            # mlb_backtest._build_pricer): EXACT super-leg collapse — band
+            # p = P(low) - P(high) (ladder rungs AND containment windows,
+            # inverted mids decline None); containment pairs drop the implied
+            # superset leg + Frechet-cap the kept subset's selected marginal;
+            # conditional pairs become super-legs carrying the bare path's
+            # 2-leg conditional joint. Never the copula on these shapes.
+            if not rel.bands and not rel.containments and not rel.conditionals:
                 return None  # classifier bug guard: kind without pairs refuses
             band_p: dict[int, float] = {}
+            band_u: dict[int, float] = {}
             dropped: set[int] = set()
             for low_i, high_i in rel.bands:
                 p_band = yes[low_i] - yes[high_i]
                 if p_band <= 0.0:
-                    return None  # inverted mids: books contradict the ladder
+                    return None  # inverted mids: books contradict the ordering
                 band_p[low_i] = p_band
+                band_u[low_i] = 0.005 + 0.005  # u_low + u_high (bt belief u)
                 dropped.add(high_i)
+            cond_p: dict[int, float] = {}
+            cond_u: dict[int, float] = {}
+            for keep_i, drop_i in rel.conditionals:
+                pair_beliefs = [beliefs[keep_i], beliefs[drop_i]]
+                pair_sides = [sides[keep_i], sides[drop_i]]
+                pair_corr = build_sgp_correlation(
+                    [legs[keep_i], legs[drop_i]], ((0, 1),), sgp,
+                    marginals=[b.p for b in pair_beliefs])
+                pair_joint = price_joint_matrices(
+                    pair_beliefs, pair_sides, pair_corr.corr,
+                    pair_corr.corr_low, pair_corr.corr_high)
+                if pair_joint.p <= 0.0:
+                    return None  # degenerate pair joint: decline
+                cond_p[keep_i] = pair_joint.p
+                cond_u[keep_i] = pair_joint.uncertainty
+                dropped.add(drop_i)
+            selected = [y if s == "yes" else 1.0 - y
+                        for y, s in zip(yes, sides, strict=False)]
+            sub_cap: dict[int, float] = {}
+            for sub_i, sup_i in rel.containments:
+                dropped.add(sup_i)
+                sub_cap[sub_i] = min(sub_cap.get(sub_i, 1.0), selected[sup_i])
+            clamped: dict[int, float] = {}  # kept subset leg -> YES-space p
+            for sub_i, cap in sub_cap.items():
+                if sub_i in dropped or selected[sub_i] <= cap:
+                    continue
+                clamped[sub_i] = cap if sides[sub_i] == "yes" else 1.0 - cap
             keep = [i for i in range(len(legs)) if i not in dropped]
             remap = {old: new for new, old in enumerate(keep)}
             r_legs = [legs[i] for i in keep]
             r_beliefs = [
-                LegBelief(p=band_p.get(i, yes[i]),
-                          uncertainty=0.01 if i in band_p else 0.005, source="bt")
+                LegBelief(
+                    p=band_p.get(i, cond_p.get(i, clamped.get(i, yes[i]))),
+                    uncertainty=band_u.get(i, cond_u.get(i, 0.005)),
+                    source="bt")
                 for i in keep
             ]
-            r_sides = ["yes" if i in band_p else sides[i] for i in keep]
+            r_sides = ["yes" if (i in band_p or i in cond_p) else sides[i]
+                       for i in keep]
             r_groups = [
                 g for g in (
                     tuple(remap[i] for i in group if i in remap)

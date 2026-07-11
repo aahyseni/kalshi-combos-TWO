@@ -87,12 +87,14 @@ class Relationship:
     # NESTED_BAND + N-leg CONTAINMENT collapse: (low_i, high_i) leg-index pairs
     # whose joint is the EXACT window arithmetic P(low selected-YES event) −
     # P(high selected-NO event's complement) = P(low) − P(high). On
-    # NESTED_BAND: same-ladder rungs (LegType + game + scope), low_i the LOWER
-    # over-line selected YES, high_i the HIGHER selected NO. On the N-leg
-    # CONTAINMENT return: additionally the containment families' {A no, B yes}
-    # window pairs (low_i = the superset-YES leg, high_i = the subset-NO leg).
-    # Guaranteed pairwise disjoint, each band's game holding ONLY its two legs
-    # among the post-collapse kept set. Empty for every other kind.
+    # NESTED_BAND: same-ladder rungs (LegType + game + scope) with low_i the
+    # LOWER over-line selected YES / high_i the HIGHER selected NO, PLUS (the
+    # 2026-07-11 universal-window rule) the containment families' {A no, B yes}
+    # window pairs (low_i = the superset-YES leg, high_i = the subset-NO leg) —
+    # both are the same arithmetic P(B) − P(A). On the N-leg CONTAINMENT
+    # return: the same two species, consumed by the collapse plan. Guaranteed
+    # pairwise disjoint, each band's game holding ONLY its two legs among the
+    # post-collapse kept set. Empty for every other kind.
     bands: tuple[tuple[int, int], ...] = ()
     # N-leg CONTAINMENT collapse ONLY (2026-07-11): every recorded
     # (subset_index, superset_index) pair in SELECTED-side space — the selected
@@ -103,6 +105,15 @@ class Relationship:
     # tuple is populated only where the old "containment pair inside a larger
     # combo" UNKNOWN decline used to fire. Empty for every other kind.
     containments: tuple[tuple[int, int], ...] = ()
+    # N-leg collapse ONLY (2026-07-11, WIRE-4): every recorded same-player
+    # MEASURED-conditional pair (kept_index, dropped_index) buried in a >2-leg
+    # combo (the shape that used to decline UNKNOWN "not modeled"). The engine
+    # collapses each pair into a super-leg whose p is the SAME 2-leg selected-
+    # side joint the bare path prices through the sgp implied-rho seam
+    # (conditionals_mlb.SAME_PLAYER_CONDITIONALS), u the pair joint's — the
+    # bare 2-leg pair itself never records here (it keeps the OK/sgp path,
+    # bit-identical). Empty for every other kind.
+    conditionals: tuple[tuple[int, int], ...] = ()
 
 
 # Team-corners ticker suffix = team code + the over-line digits (…-COL5 -> COL, 5).
@@ -223,6 +234,32 @@ def _mlb_prop_entity(market_ticker: str) -> tuple[str, str, int] | None:
     return parts[1], parts[2], int(parts[3])
 
 
+# --- Spread scope registries (2026-07-11) -----------------------------------------
+# SOCCER spread cover ⟹ win, SCOPE-MATCHED (S12 + its 1H analog S6): a KXWCSPREAD
+# leg settles on the END-OF-REGULATION scoreline exactly like KXWCGAME (NOTES.md
+# I8, rule-book verified), so FT spread pairs ONLY the regulation moneyline; a
+# KXWC1HSPREAD leg settles on the half-time scoreline exactly like the KXWC1H
+# winner, so 1H spread pairs ONLY the 1H moneyline. Cross-scope spread⟹win pairs
+# (a 1H lead does NOT force the FT win) are deliberately ABSENT.
+_SOCCER_SPREAD_WIN_SCOPES: dict[LegType, LegType] = {
+    LegType.SPREAD: LegType.MONEYLINE,
+    LegType.FIRST_HALF_SPREAD: LegType.FIRST_HALF_MONEYLINE,
+}
+
+# (1H-)spread cover-by-N ⟹ total ≥ N, SCOPE-NESTED (S7/S8/S13/S34): valid iff the
+# spread's scope is CONTAINED in the total's. Soccer: FT spread and FT total both
+# settle END OF REGULATION (NOTES.md I8) — same scope; 1H spread nests in both
+# the 1H total and the regulation total (goals persist; the MARGIN does not, but
+# the implication only needs the winner's own 1H goals). MLB: spread and total
+# both settle on the final score INCLUDING extra innings — and extras only ADD
+# runs, so the implication stays airtight. FT-spread ⟹ 1H-total is deliberately
+# ABSENT (a regulation margin does not bound first-half goals).
+_SPREAD_TOTAL_SCOPES: dict[LegType, frozenset[LegType]] = {
+    LegType.SPREAD: frozenset({LegType.TOTAL}),
+    LegType.FIRST_HALF_SPREAD: frozenset({LegType.FIRST_HALF_TOTAL, LegType.TOTAL}),
+}
+
+
 def _containment_sign(
     sub_i: int, sup_i: int, sub_side: str, sup_side: str
 ) -> tuple[int, int] | Literal["impossible"] | None:
@@ -272,31 +309,38 @@ def _collapse_containments(
     containments: list[tuple[int, int]],
     ladder_bands: list[tuple[int, int]],
     cont_bands: list[tuple[int, int]],
+    conditionals: list[tuple[int, int]],
     game_keys: list[str],
     notes: list[str],
 ) -> Relationship:
     """The CONTAINMENT-IN-LARGER-COMBO collapse plan (2026-07-11) — replaces
     the old "logical containment pair inside a larger combo: not modeled"
     UNKNOWN decline and fires ONLY where that decline fired (>=1 recorded
-    containment pair, combo size != 2).
+    containment/conditional pair, combo size != 2).
 
     Per recorded pair the engine collapses exactly like a nested band
     (superset legs drop; {A no, B yes} window pairs become band super-legs
-    P(B) − P(A)), then prices the reduced set. This function only validates
-    the STRUCTURE and fails closed to UNKNOWN on any shape the collapse
-    arithmetic cannot represent:
+    P(B) − P(A); same-player MEASURED-conditional pairs become super-legs
+    whose p is the bare path's 2-leg conditional joint — WIRE-4). This
+    function only validates the STRUCTURE and fails closed to UNKNOWN on any
+    shape the collapse arithmetic cannot represent:
 
     - every dropped (implied) superset leg must trace to a KEPT subset witness
       through the recorded subset links (a hypothetical mutual A⊆B⊆A cycle
       would drop both legs and silently lose the constraint);
-    - a leg may hold at most ONE collapse role: band legs must be disjoint
-      from every containment pair and from other bands;
+    - a leg may hold at most ONE collapse role: band legs and conditional
+      pairs must be disjoint from every containment pair, from each other,
+      and from other pairs of their own species;
     - a band super-leg is a WINDOW event (non-monotone in the latent count),
       so its game must hold ONLY the band's two legs among the KEPT set — the
       post-collapse mirror of the NESTED_BAND same-game-companion guard.
+      Conditional super-legs carry NO such isolation requirement: the pair's
+      joint is monotone in the batter's game and is represented by its kept
+      leg for neighbour correlation, the containment-subset precedent.
     """
     pairs = list(dict.fromkeys(containments))
     band_pairs = list(dict.fromkeys([*ladder_bands, *cont_bands]))
+    cond_pairs = list(dict.fromkeys(conditionals))
     dropped = {sup for _sub, sup in pairs}
     subsets_of: dict[int, list[int]] = {}
     for sub, sup in pairs:
@@ -329,7 +373,20 @@ def _collapse_containments(
             )
             return Relationship(RelationshipKind.UNKNOWN, (), tuple(notes))
         used_band_legs |= {low_i, high_i}
-    consumed = dropped | {high_i for _low_i, high_i in band_pairs}
+    used_cond_legs: set[int] = set()
+    for keep_i, drop_i in cond_pairs:
+        if {keep_i, drop_i} & (cont_legs | used_band_legs | used_cond_legs):
+            notes.append(
+                "containment collapse: leg holds more than one collapse role "
+                "(conditional overlap) — not modeled"
+            )
+            return Relationship(RelationshipKind.UNKNOWN, (), tuple(notes))
+        used_cond_legs |= {keep_i, drop_i}
+    consumed = (
+        dropped
+        | {high_i for _low_i, high_i in band_pairs}
+        | {drop_i for _keep_i, drop_i in cond_pairs}
+    )
     kept = [i for i in range(len(legs)) if i not in consumed]
     for low_i, _high_i in band_pairs:
         game = game_keys[low_i]
@@ -350,17 +407,13 @@ def _collapse_containments(
             f"containment collapse: {legs[sup].market_ticker} implied by "
             f"{legs[sub].market_ticker} — superset leg drops"
         )
-    for low_i, high_i in cont_bands:
-        notes.append(
-            f"containment band {legs[low_i].market_ticker} yes + "
-            f"{legs[high_i].market_ticker} no: joint = P(superset) - P(subset)"
-        )
     return Relationship(
         RelationshipKind.CONTAINMENT,
         groups,
         tuple(notes),
         bands=tuple(band_pairs),
         containments=tuple(pairs),
+        conditionals=tuple(cond_pairs),
     )
 
 
@@ -461,9 +514,15 @@ def classify_legs(
     containments: list[tuple[int, int]] = []
     # The containment families' {A no, B yes} window pairs (low = superset-YES
     # leg, high = subset-NO leg; joint = P(B) − P(A), the nested-band mirror).
-    # Consumed ONLY by the N-leg collapse plan below — a combo without a
-    # recorded containment pair keeps its existing (copula/band) path.
+    # UNIVERSAL EXACT WINDOW rule (2026-07-11, WIRE-1): consumed by the N-leg
+    # collapse plan when a containment/conditional pair is also present, and
+    # otherwise merged into the NESTED_BAND return — so the bare 2-leg window
+    # and the embedded window price the SAME exact arithmetic instead of the
+    # old copula fallback.
     cont_bands: list[tuple[int, int]] = []
+    # Same-player MEASURED-conditional pairs buried in a >2-leg combo
+    # (kept_i, dropped_i) — the WIRE-4 collapse; bare pairs never record here.
+    conditionals: list[tuple[int, int]] = []
     bands: list[tuple[int, int]] = []
     for a_i, a_key, a_line in ladder_legs:      # A = higher line (subset)
         for b_i, b_key, b_line in ladder_legs:  # B = lower line (superset)
@@ -556,11 +615,19 @@ def classify_legs(
                 continue
             if strongest_measured_direction(fam_a, rung_a, fam_b, rung_b) is not None:
                 if len(legs) != 2:
+                    # EMBEDDED CONDITIONAL COLLAPSE (2026-07-11, WIRE-4 — was
+                    # the "not modeled" UNKNOWN decline): the plan collapses
+                    # the pair into a super-leg whose p is the SAME 2-leg
+                    # conditional joint the bare path prices via the sgp
+                    # implied-rho seam; the bare 2-leg pair below stays
+                    # bit-identical (OK → sgp).
+                    conditionals.append((a_i, b_i))
                     notes.append(
-                        "same-player conditional pair inside a larger combo: "
-                        "not modeled"
+                        f"same-player conditional pair {fam_a}-{rung_a} x "
+                        f"{fam_b}-{rung_b} in a larger combo: collapses to a "
+                        "conditional super-leg"
                     )
-                    return Relationship(RelationshipKind.UNKNOWN, (), tuple(notes))
+                    continue
                 notes.append(
                     f"same-player conditional cell {fam_a}-{rung_a} x "
                     f"{fam_b}-{rung_b}: priced via conditional table (sgp)"
@@ -624,10 +691,19 @@ def classify_legs(
                     return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
                 if isinstance(verdict, tuple):
                     containments.append(verdict)
-                # verdict None ({cover no, win yes}): possible — copula :same.
-                # Deliberately NOT a cont_band: MLB settles scalar under the
-                # 48h-postponement rule, so the binary window arithmetic is
-                # not airtight (mirror of the ladder registry's MLB absence).
+                elif legs[sp_i].side == "no" and legs[ml_i].side == "yes":
+                    # {cover no, win yes} = win-NOT-by-N (S33-ny): the exact
+                    # window P(win) − P(cover), the 2026-07-11 universal-window
+                    # rule (operator-directed; replaces the :same ±0.95 copula
+                    # route). Window PRICING is unaffected by the 48h
+                    # rain-scalar policy — that policy only gates FARMING
+                    # (impossible mixes stay not-farmable above).
+                    cont_bands.append((ml_i, sp_i))
+                    notes.append(
+                        f"containment window {legs[ml_i].market_ticker} yes "
+                        f"without {legs[sp_i].market_ticker}: "
+                        "joint = P(superset) - P(subset)"
+                    )
             elif legs[sp_i].side == "yes" and legs[ml_i].side == "yes":
                 notes.append(
                     f"spread cover yes ({legs[sp_i].market_ticker}) and the "
@@ -638,10 +714,107 @@ def classify_legs(
                 return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
             # other opposite-team sign cases: possible — copula :opp.
 
+    # SOCCER SPREAD cover ⟹ WIN, scope-matched (S12 + 1H analog, 2026-07-11
+    # WIRE-1; mirrors the shipped MLB ml|spread family above). The spread
+    # suffix is TEAM+line ("wins/leads by over N-0.5", so any N >= 1 forces a
+    # win margin >= 1): SAME-team cover ⟹ win within the SAME scope — see
+    # ``_SOCCER_SPREAD_WIN_SCOPES`` (FT spread × regulation ML; 1H spread × 1H
+    # winner; both scope pairs settle on ONE scoreline, NOTES.md I8). 3-way
+    # results are immaterial: win ⊇ cover for the same team, so the window
+    # arithmetic P(win) − P(cover) is unaffected by draws. Same-team is proven
+    # by suffix EQUALITY within one game (draw suffixes excluded); soccer has
+    # NO anchored two-team parse (game codes concatenate variable-length team
+    # codes), so a non-equal suffix proves nothing — opposite-team pairs fall
+    # through to the copula untouched (reviewer-defect-#3 discipline). The
+    # impossible mix {cover yes, win no} is an airtight regulation scoring
+    # tautology ⇒ farmable (win-NO legs are exchange-blocked — defensive).
+    for sp_i in range(len(legs)):
+        win_type = _SOCCER_SPREAD_WIN_SCOPES.get(types[sp_i])
+        if win_type is None:
+            continue
+        if classify_sport(legs[sp_i].market_ticker) is not Sport.SOCCER:
+            continue
+        parsed_spread = _corners_team_line(legs[sp_i].market_ticker)
+        if parsed_spread is None or parsed_spread[1] < 1:
+            continue  # need TEAM + a line N >= 1 for cover ⟹ win
+        for ml_i in range(len(legs)):
+            if types[ml_i] is not win_type or game_keys[sp_i] != game_keys[ml_i]:
+                continue
+            if classify_sport(legs[ml_i].market_ticker) is not Sport.SOCCER:
+                continue
+            if not _moneyline_is_team(legs[ml_i].market_ticker):
+                continue  # a draw side is never implied by a team's cover
+            ml_team = legs[ml_i].market_ticker.rsplit("-", 1)[-1].upper()
+            if ml_team != parsed_spread[0]:
+                continue  # not provably the same team: never a containment claim
+            verdict = _containment_sign(sp_i, ml_i, legs[sp_i].side, legs[ml_i].side)
+            if verdict == "impossible":
+                notes.append(
+                    f"spread cover yes ({legs[sp_i].market_ticker}) implies "
+                    f"the win: {legs[ml_i].market_ticker} no is impossible"
+                )
+                # Airtight one-scoreline scoring tautology ⇒ farmable.
+                return Relationship(
+                    RelationshipKind.IMPOSSIBLE, (), tuple(notes), farmable=True
+                )
+            if isinstance(verdict, tuple):
+                containments.append(verdict)
+            elif legs[sp_i].side == "no" and legs[ml_i].side == "yes":
+                # {cover no, win yes} = win-NOT-by-N (S12-ny, the 637-combo
+                # tape cell): exact window P(win) − P(cover).
+                cont_bands.append((ml_i, sp_i))
+                notes.append(
+                    f"containment window {legs[ml_i].market_ticker} yes "
+                    f"without {legs[sp_i].market_ticker}: "
+                    "joint = P(superset) - P(subset)"
+                )
+
+    # (1H-)SPREAD cover-by-N YES × TOTAL over-(M−0.5) NO, M <= N: LOGICALLY
+    # IMPOSSIBLE cross-scope (S7/S8/S13/S34, 2026-07-11 WIRE-3) — a margin of N
+    # needs the winner ALONE to score >= N >= M, and the total's scope contains
+    # the spread's (``_SPREAD_TOTAL_SCOPES``; MLB extras only ADD runs).
+    # Detection covers the impossible mix ONLY: the yy/nn/ny mixes keep their
+    # existing structural/copula paths (spread×total windows are NOT wired).
+    # farmable per sport: soccer = airtight one-scoreline tautology ⇒ True;
+    # MLB = False (48h rain-scalar policy, the shipped ml|spread precedent).
+    for sp_i in range(len(legs)):
+        total_types = _SPREAD_TOTAL_SCOPES.get(types[sp_i])
+        if total_types is None or legs[sp_i].side != "yes":
+            continue
+        sport = classify_sport(legs[sp_i].market_ticker)
+        if sport not in (Sport.SOCCER, Sport.MLB):
+            continue  # only the two probed/settlement-verified sports
+        parsed_spread = _corners_team_line(legs[sp_i].market_ticker)
+        if parsed_spread is None or parsed_spread[1] < 1:
+            continue  # need TEAM + a line N >= 1 (line-0 margin proves nothing)
+        for tot_i in range(len(legs)):
+            if types[tot_i] not in total_types or legs[tot_i].side != "no":
+                continue
+            if game_keys[sp_i] != game_keys[tot_i]:
+                continue
+            if classify_sport(legs[tot_i].market_ticker) is not sport:
+                continue
+            tot_line = _total_line(legs[tot_i].market_ticker)
+            if tot_line is None or not 1 <= tot_line <= parsed_spread[1]:
+                continue  # M > N (or unparseable): a cover does not force it
+            notes.append(
+                f"spread cover-by-{parsed_spread[1]} yes "
+                f"({legs[sp_i].market_ticker}) forces >= {parsed_spread[1]} "
+                f"goals/runs: total over-{tot_line - 1}.5 "
+                f"{legs[tot_i].market_ticker} no is impossible"
+            )
+            return Relationship(
+                RelationshipKind.IMPOSSIBLE,
+                (),
+                tuple(notes),
+                farmable=sport is Sport.SOCCER,
+            )
+
     # Three period/line implications A⟹B are EXACT scoring facts (not
-    # correlations). A Kalshi taker-API probe proved these three — and only these
-    # — are reachable: a taker can actually build them; every other implication
-    # is blocked at build time. For each, ``_containment_sign`` gives:
+    # correlations), probe-verified constructible (2026-07-11 exchange matrix;
+    # the original taker-API probe found these three, the containment-probe
+    # taxonomy since mapped the full 50-shape universe — the additional
+    # families live above). For each, ``_containment_sign`` gives:
     #   {A yes, B no}  → IMPOSSIBLE (v1 no-quote; fires at ANY combo size)
     #   {A yes, B yes} → CONTAINMENT joint = P(A)     (subset = A leg)
     #   {A no,  B no}  → CONTAINMENT joint = P(B no)  (subset = B leg; ¬B⟹¬A)
@@ -673,19 +846,27 @@ def classify_legs(
             if isinstance(verdict, tuple):
                 containments.append(verdict)
             elif legs[a_i].side == "no" and legs[b_i].side == "yes":
-                # {A no, B yes} = FT-BTTS without 1H-BTTS: an exact window
-                # P(B) − P(A). Recorded for the N-leg collapse ONLY — a combo
-                # without a pinned containment keeps its shipped copula path.
+                # {A no, B yes} = FT-BTTS without 1H-BTTS (S2-ny): an exact
+                # window P(B) − P(A) — the universal-window rule (2026-07-11):
+                # consumed by the collapse plan when a pinned pair coexists,
+                # else priced as a NESTED_BAND super-leg (bare and embedded).
                 cont_bands.append((b_i, a_i))
+                notes.append(
+                    f"containment window {legs[b_i].market_ticker} yes "
+                    f"without {legs[a_i].market_ticker}: "
+                    "joint = P(superset) - P(subset)"
+                )
 
     # Family 2 — regulation moneyline team-WIN (A) ⟹ FT Over-0.5 (B): a win needs
-    # a goal. Kalshi blocks moneyline-NO legs in combos, so only the win-YES half
-    # is reachable (moneyline NO orientations are NOT added). The total must be
-    # the over-0.5 line (suffix -1); over-1.5+ is a possible combo (a 1-0 win is
-    # under 1.5). TIE (0-0 draw) and ADVANCE (0-0 on pens, a different LegType)
-    # do not imply a goal and are excluded.
+    # a goal. The total must be the over-0.5 line (suffix -1); over-1.5+ is a
+    # possible combo (a 1-0 win is under 1.5). TIE (0-0 draw) and ADVANCE (0-0 on
+    # pens, a different LegType) do not imply a goal and are excluded. Kalshi
+    # blocks moneyline-NO legs in combos, so only the win-YES half is REACHABLE;
+    # the NO orientations ({A no, B no} containment, {A no, B yes} window
+    # S1-ny) are wired DEFENSIVELY by the same sign matrix (2026-07-11
+    # universal-window rule) — exact if the exchange ever unblocks them.
     for ml_i in range(len(legs)):
-        if types[ml_i] is not LegType.MONEYLINE or legs[ml_i].side != "yes":
+        if types[ml_i] is not LegType.MONEYLINE:
             continue
         if not _moneyline_is_team(legs[ml_i].market_ticker):
             continue
@@ -694,7 +875,7 @@ def classify_legs(
                 continue
             if _total_line(legs[tot_i].market_ticker) != _OVER_HALF_LINE:
                 continue
-            verdict = _containment_sign(ml_i, tot_i, "yes", legs[tot_i].side)
+            verdict = _containment_sign(ml_i, tot_i, legs[ml_i].side, legs[tot_i].side)
             if verdict == "impossible":
                 notes.append(
                     f"moneyline win yes ({legs[ml_i].market_ticker}) needs a goal: "
@@ -707,8 +888,15 @@ def classify_legs(
                 )
             if isinstance(verdict, tuple):
                 containments.append(verdict)
-            # No band case here: the loop enters on moneyline-YES only (Kalshi
-            # blocks moneyline-NO legs in combos), so {A no, B yes} can't occur.
+            elif legs[ml_i].side == "no" and legs[tot_i].side == "yes":
+                # {A no, B yes} = a goal but no win (S1-ny): exact window
+                # P(over-0.5) − P(win) — defensive (win-NO exchange-blocked).
+                cont_bands.append((tot_i, ml_i))
+                notes.append(
+                    f"containment window {legs[tot_i].market_ticker} yes "
+                    f"without {legs[ml_i].market_ticker}: "
+                    "joint = P(superset) - P(subset)"
+                )
 
     # Family 3 — 1H Over-N (A) ⟹ FT Over-N (B), SAME line N: full-time goals ≥
     # first-half goals. Only EQUAL lines are reachable AND logically directional
@@ -739,28 +927,34 @@ def classify_legs(
             if isinstance(verdict, tuple):
                 containments.append(verdict)
             elif legs[fh_i].side == "no" and legs[ft_i].side == "yes":
-                # {A no, B yes} = FT-over-N without 1H-over-N: exact window
-                # P(B) − P(A), recorded for the N-leg collapse ONLY (see
-                # Family 1).
+                # {A no, B yes} = FT-over-N without 1H-over-N (S3-ny, the
+                # 379-combo tape cell): exact window P(B) − P(A) — the
+                # universal-window rule (see Family 1).
                 cont_bands.append((ft_i, fh_i))
+                notes.append(
+                    f"containment window {legs[ft_i].market_ticker} yes "
+                    f"without {legs[fh_i].market_ticker}: "
+                    "joint = P(superset) - P(subset)"
+                )
 
-    if containments:
-        if len(legs) != 2:
-            # CONTAINMENT-IN-LARGER-COMBO collapse (2026-07-11): exactly where
-            # the "not modeled" UNKNOWN decline used to fire. The engine drops
-            # each implied superset leg / collapses each window pair into a
-            # band super-leg, then prices the reduced set — every combo that
-            # priced before this change is untouched (this branch was
-            # UNKNOWN), and the bare 2-leg pair below keeps price_containment.
-            return _collapse_containments(
-                legs, containments, bands, cont_bands, game_keys, notes
-            )
+    if containments and len(legs) == 2:
         containment = containments[-1]  # shipped last-write-wins 2-leg pair
         notes.append(
             f"logical containment: joint = P(leg {containment[0]} "
             f"{legs[containment[0]].market_ticker})"
         )
         return Relationship(RelationshipKind.CONTAINMENT, (), tuple(notes), containment)
+    if containments or conditionals:
+        # CONTAINMENT/CONDITIONAL-IN-LARGER-COMBO collapse (2026-07-11):
+        # exactly where the "not modeled" UNKNOWN declines used to fire
+        # (``conditionals`` is only ever recorded on >2-leg combos). The
+        # engine drops each implied superset leg, collapses each window pair
+        # into a band super-leg and each conditional pair into a
+        # conditional super-leg, then prices the reduced set. The bare 2-leg
+        # containment above keeps price_containment.
+        return _collapse_containments(
+            legs, containments, bands, cont_bands, conditionals, game_keys, notes
+        )
 
     # Pass 2 — per-GAME: the correlation blocks. Same-game legs from DIFFERENT
     # market families share a game code but not an event_ticker, so they must be
@@ -776,17 +970,23 @@ def classify_legs(
         groups.append(tuple(indices))
         notes.append(f"same-game group {key}: {len(indices)} legs")
 
-    if bands:
+    # Ladder bands and containment windows are ONE species here (both are the
+    # exact arithmetic P(low) − P(high) on a band super-leg): merged, so a
+    # bare 2-leg window (S2-ny/S3-ny/S12-ny/S33-ny…) and an embedded window
+    # without a pinned containment price EXACTLY instead of the old copula
+    # fallback (2026-07-11 universal-window rule).
+    all_bands = list(dict.fromkeys([*bands, *cont_bands]))
+    if all_bands:
         # A band is modeled ONLY as an isolated pair: each band's game must
-        # contain exactly its two rungs. A third same-game leg (incl. a second
+        # contain exactly its two legs. A third same-game leg (incl. a second
         # band or a 3-rung shape) is declined UNKNOWN: a band is a WINDOW event,
         # non-monotone in the latent count, so its correlation to a same-game
         # neighbour is the rung's ρ ATTENUATED by an unmeasured factor (bites
         # hardest on corners|corners_team 0.62) — widen-or-no-quote, never a
         # copula guess. Cross-game companions are fine (cross_event_rho
         # machinery, where representing the band by its low rung is exact).
-        # Disjointness follows: a shared rung would put ≥3 legs in one game.
-        for low_i, _high_i in bands:
+        # Disjointness follows: a shared leg would put ≥3 legs in one game.
+        for low_i, _high_i in all_bands:
             game = game_keys[low_i]
             if sum(1 for k in game_keys if k == game) != 2:
                 notes.append(
@@ -798,7 +998,7 @@ def classify_legs(
             RelationshipKind.NESTED_BAND,
             tuple(groups),
             tuple(notes),
-            bands=tuple(bands),
+            bands=tuple(all_bands),
         )
 
     return Relationship(RelationshipKind.OK, tuple(groups), tuple(notes))

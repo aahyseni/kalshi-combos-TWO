@@ -441,12 +441,15 @@ def test_1h_btts_no_ft_btts_no_is_containment_subset_is_ft_leg() -> None:
     assert rel.containment == (1, 0)
 
 
-def test_1h_btts_no_ft_btts_yes_is_possible() -> None:
-    """{1H-BTTS no, FT-BTTS yes}: both teams scored, just not both by half-time —
-    a possible combo, no logical pin (groups for the copula)."""
+def test_1h_btts_no_ft_btts_yes_is_exact_window() -> None:
+    """RETARGETED 2026-07-11 (WIRE-1 universal windows; was ..._is_possible/OK):
+    {1H-BTTS no, FT-BTTS yes} = BTTS completes only after half-time — a
+    detected containment window, priced EXACTLY as P(FT) − P(1H) via the
+    nested-band super-leg machinery (S2-ny; was the copula fallback)."""
     legs = (leg(FH_BTTS, FH_BTTS_EV, "no"), leg(FT_BTTS, FT_BTTS_EV, "yes"))
     rel = classify_legs(legs, ExplodingProvider())
-    assert rel.kind is RelationshipKind.OK
+    assert rel.kind is RelationshipKind.NESTED_BAND
+    assert rel.bands == ((1, 0),)  # low = FT superset-YES, high = 1H subset-NO
     assert rel.same_event_groups == ((0, 1),)
 
 
@@ -520,12 +523,16 @@ def test_advance_yes_over05_no_is_possible_not_moneyline() -> None:
     assert rel.kind is RelationshipKind.OK
 
 
-def test_win_no_over05_no_is_possible_moneyline_no_unreachable() -> None:
-    """Moneyline-NO legs are UNREACHABLE (Kalshi blocks them in combos) and are
-    NOT added — win no × over-0.5 no falls to the copula, never a pin."""
+def test_win_no_over05_no_is_defensive_containment() -> None:
+    """RETARGETED 2026-07-11 (WIRE-1; was ..._possible_moneyline_no_unreachable):
+    Family 2 now wires the moneyline-NO orientations DEFENSIVELY by the same
+    sign matrix (exchange still blocks win-NO — this cell is unreachable
+    today). {win no, over-0.5 no}: ¬over-0.5 (0-0) ⟹ ¬win, so the total-NO
+    leg is the effective subset — joint = P(over-0.5 no)."""
     legs = (leg(ML_MEX, ML_EV, "no"), leg(TOT_OVER05, TOT_EV, "no"))
     rel = classify_legs(legs, ExplodingProvider())
-    assert rel.kind is RelationshipKind.OK
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containment == (1, 0)  # subset = the total-NO leg
 
 
 def test_win_yes_over05_yes_in_larger_combo_collapses() -> None:
@@ -575,12 +582,15 @@ def test_1h_over_no_ft_over_no_same_line_is_containment_subset_is_ft() -> None:
     assert rel.containment == (1, 0)
 
 
-def test_1h_over_no_ft_over_yes_same_line_is_possible() -> None:
-    """{1H-over-N no, FT-over-N yes}: the goals came in the second half — possible,
-    no pin → OK."""
+def test_1h_over_no_ft_over_yes_same_line_is_exact_window() -> None:
+    """RETARGETED 2026-07-11 (WIRE-1 universal windows; was ..._is_possible/OK):
+    {1H-over-N no, FT-over-N yes} = the goals complete only in the second
+    half — a detected containment window, priced EXACTLY as P(FT) − P(1H)
+    (S3-ny, the 379-combo tape cell; was the copula fallback)."""
     legs = (leg(FH_TOT2, FH_TOT_EV, "no"), leg(FT_TOT2, FT_TOT2_EV, "yes"))
     rel = classify_legs(legs, ExplodingProvider())
-    assert rel.kind is RelationshipKind.OK
+    assert rel.kind is RelationshipKind.NESTED_BAND
+    assert rel.bands == ((1, 0),)  # low = FT superset-YES, high = 1H subset-NO
     assert rel.same_event_groups == ((0, 1),)
 
 
@@ -657,12 +667,16 @@ def test_mlb_cover_no_win_no_same_team_is_containment_subset_is_ml() -> None:
     assert rel.containment == (1, 0)
 
 
-def test_mlb_cover_no_win_yes_same_team_is_possible_copula_routes_it() -> None:
-    """Win without covering is possible — falls to the copula, where sgp routes
-    the oriented :same +0.95 (grouped so the pair correlates)."""
+def test_mlb_cover_no_win_yes_same_team_is_exact_window() -> None:
+    """RETARGETED 2026-07-11 (WIRE-1 universal windows; was
+    ..._possible_copula_routes_it): {cover no, win yes} = win-NOT-by-N — a
+    detected containment window, priced EXACTLY as P(win) − P(cover) (S33-ny;
+    was the :same ±0.95 copula route). Window PRICING is unaffected by the
+    48h rain-scalar policy, which only gates FARMING."""
     legs = (leg(MLB_SP_NYY2, MLB_SP_EV, "no"), leg(MLB_ML_NYY, MLB_ML_EV, "yes"))
     rel = classify_legs(legs, ExplodingProvider())
-    assert rel.kind is RelationshipKind.OK
+    assert rel.kind is RelationshipKind.NESTED_BAND
+    assert rel.bands == ((1, 0),)  # low = ML superset-YES, high = spread-NO
     assert rel.same_event_groups == ((0, 1),)
 
 
@@ -748,13 +762,25 @@ def test_mlb_ml_spread_line_zero_is_not_a_containment_claim() -> None:
     assert rel.kind is RelationshipKind.OK
 
 
-def test_soccer_ml_spread_is_not_intercepted_by_the_mlb_family() -> None:
-    """Soccer cover×win pairs keep their existing path (structural / copula) —
-    the MLB family is sport-gated and must not fire on KXWC tickers."""
+def test_soccer_ml_spread_is_owned_by_the_soccer_family_not_mlb() -> None:
+    """RETARGETED 2026-07-11 (WIRE-1 S12; was ..._not_intercepted...): soccer
+    cover×win pairs are now owned by the SOCCER spread⟹win family (the MLB
+    family stays sport-gated and still must not fire on KXWC tickers — the
+    farmable flag proves which family fired: the impossible mix is farmable
+    here, which the MLB family never is)."""
     legs = (
         leg("KXWCSPREAD-26JUL05MEXENG-MEX2", "KXWCSPREAD-26JUL05MEXENG", "yes"),
         leg("KXWCGAME-26JUL05MEXENG-MEX", "KXWCGAME-26JUL05MEXENG", "yes"),
     )
     rel = classify_legs(legs, ExplodingProvider())
-    assert rel.kind is RelationshipKind.OK
-    assert rel.same_event_groups == ((0, 1),)
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containment == (0, 1)  # subset = the spread (cover) leg
+    imp = classify_legs(
+        (
+            leg("KXWCSPREAD-26JUL05MEXENG-MEX2", "KXWCSPREAD-26JUL05MEXENG", "yes"),
+            leg("KXWCGAME-26JUL05MEXENG-MEX", "KXWCGAME-26JUL05MEXENG", "no"),
+        ),
+        ExplodingProvider(),
+    )
+    assert imp.kind is RelationshipKind.IMPOSSIBLE
+    assert imp.farmable is True  # soccer tautology — NOT the MLB family

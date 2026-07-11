@@ -184,16 +184,19 @@ def test_same_player_hr_no_hit_yes_prices_via_measured_reverse() -> None:
     assert any("conditional" in n for n in rel.notes)
 
 
-def test_same_player_conditional_pair_buried_is_unknown() -> None:
-    """Partial (measured, non-exact) cells buried in a >2-leg combo still
-    decline UNKNOWN — the 2026-07-11 collapse serves CONTAINMENT pairs only,
-    never conditional-table pairs. (Probe retargeted from HIT1 x TB2, whose
-    ('tb',2,'hit',1) cell is EXACT and now collapses, to HIT3 x HR1 — measured
-    in both directions, no exact cell.)"""
+def test_same_player_conditional_pair_buried_collapses() -> None:
+    """RETARGETED 2026-07-11 (WIRE-4; was ..._is_unknown): a measured
+    (non-exact) same-player pair buried in a >2-leg combo now records a
+    CONDITIONAL collapse pair — the engine replaces it with a super-leg whose
+    p is the bare path's 2-leg conditional joint. (HIT3 x HR1 — measured in
+    both directions, no exact cell.)"""
     legs = (_leg(HIT3), _leg(HR1), _leg(TOTAL9))
     rel = classify_legs(legs, _Prov())
-    assert rel.kind is RelationshipKind.UNKNOWN
-    assert any("larger combo" in n for n in rel.notes)
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containment is None
+    assert rel.conditionals == ((0, 1),)  # HIT3 kept as carrier, HR1 drops
+    assert rel.containments == () and rel.bands == ()
+    assert any("conditional super-leg" in n for n in rel.notes)
 
 
 # --- classifier: unmeasured / out-of-scope shapes ----------------------------------

@@ -171,19 +171,21 @@ def test_window_pair_with_same_game_kept_companion_declines_unknown() -> None:
     assert any("band-vs-neighbour" in n for n in rel.notes)
 
 
-def test_window_pair_without_pinned_containment_stays_ok() -> None:
-    """DON'T OVER-COLLAPSE (bit-identical invariant): {1H no, FT yes} in a
-    combo with NO recorded containment pair priced via the copula before this
-    change and must keep that exact path — no collapse, no band."""
+def test_window_pair_with_same_game_extra_leg_declines_unknown() -> None:
+    """RETARGETED 2026-07-11 (WIRE-1 universal windows; was ..._stays_ok):
+    {1H no, FT yes} now records a containment window even WITHOUT a pinned
+    containment pair — and a window band super-leg is non-monotone in the
+    latent count, so a THIRD same-game leg is the unmeasured
+    band-vs-neighbour correlation: UNKNOWN (the NESTED_BAND companion guard),
+    never the old copula guess."""
     legs = (
         leg(FH_BTTS, ev(FH_BTTS), "no"),
         leg(FT_BTTS, ev(FT_BTTS), "yes"),
         leg(TOT3, ev(TOT3), "yes"),
     )
     rel = classify_legs(legs, ExplodingProvider())
-    assert rel.kind is RelationshipKind.OK
-    assert rel.containments == () and rel.bands == ()
-    assert rel.same_event_groups == ((0, 1, 2),)
+    assert rel.kind is RelationshipKind.UNKNOWN
+    assert any("band-vs-neighbour" in n or "carries other legs" in n for n in rel.notes)
 
 
 def test_cyclic_implication_without_kept_witness_declines_unknown() -> None:
@@ -196,7 +198,7 @@ def test_cyclic_implication_without_kept_witness_declines_unknown() -> None:
         leg(TOT3, ev(TOT3), "yes"),
     ]
     rel = _collapse_containments(
-        legs, [(0, 1), (1, 0)], [], [], ["G", "G", "G"], []
+        legs, [(0, 1), (1, 0)], [], [], [], ["G", "G", "G"], []
     )
     assert rel.kind is RelationshipKind.UNKNOWN
     assert any("witness" in n for n in rel.notes)
@@ -215,12 +217,14 @@ def test_previously_priced_shapes_keep_their_classification() -> None:
     assert rel.kind is RelationshipKind.CONTAINMENT
     assert rel.containment == (0, 1)
     assert rel.containments == () and rel.bands == ()
-    # Bare 2-leg window pair: OK (copula), never a band.
+    # Bare 2-leg window pair: NESTED_BAND (RETARGETED 2026-07-11, WIRE-1
+    # universal windows — was OK/copula): joint = P(FT) − P(1H) exactly.
     rel = classify_legs(
         (leg(FH_BTTS, ev(FH_BTTS), "no"), leg(FT_BTTS, ev(FT_BTTS), "yes")),
         ExplodingProvider(),
     )
-    assert rel.kind is RelationshipKind.OK
+    assert rel.kind is RelationshipKind.NESTED_BAND
+    assert rel.bands == ((1, 0),)  # low = FT superset-YES, high = 1H subset-NO
     assert rel.same_event_groups == ((0, 1),)
     # Bare nested band: NESTED_BAND with empty containments.
     rel = classify_legs(
