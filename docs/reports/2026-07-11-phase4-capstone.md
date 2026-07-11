@@ -1,0 +1,85 @@
+# Phase 4 CAPSTONE — fresh 3-bucket re-backtest (full new config, snapshot + per-print)
+
+**Date:** 2026-07-11 · **Config:** shipped 165-entry MLB table + rung keys +
+spread×prop resolver + DO-6 (repo `648dc61`/`2163642`) · **Window:** 2026-07-06 →
+2026-07-11 ~00:52Z (tape complete ~01:35-02:04Z) · **Artifact:** MLB gate page
+re-issued **v3 CAPSTONE** (same URL, `docs/reports/2026-07-10-mlb-backtest-gate.html`).
+**Status:** MLB ✅ · mixed ✅ · WC per-combo + defect-check ✅ · WC per-print 🔄
+(723k prints, sliced kill-resilient pass running; section to be appended).
+
+## Headline per bucket (all promoted = shipped config, strictly-pregame, zero-bias split)
+
+| bucket | mode | n | med\|err\| | bias | w2 | vs comparator |
+|---|---|---|---|---|---|---|
+| MLB | snapshot | 6,969 | **0.34¢** | −0.43¢ | 93.3% | legacy flat-0.6: 0.35¢ / 88.2% |
+| MLB prop-carrying | snapshot | 1,305 | **0.66¢** | −0.85¢ | 83.6% | legacy **1.37¢ / 57.6%** → GATE PASS |
+| MLB | per-print | 53,022 | 0.38¢ | −0.34¢ | **98.6%** | legacy 97.3% |
+| mixed (cross-sport) | snapshot | 3,844 | **0.70¢** | −0.87¢ | 87.5% | old-window baseline 0.74¢ / 85.2% |
+| mixed | per-print | 8,555 | 0.84¢ | −0.86¢ | 92.3% | (no prior per-print baseline) |
+| WC soccer | per-combo | 21,443 | 1.60¢ | −1.60¢ | 58.1% | honest baseline 1.55¢ / 59.6% at n=18,819 — **backbone reproduces at +14% sample** |
+
+Fresh-data volume vs the old caches: +2.53M RFQ rows (+19%), +18.3h window,
+MLB per-print rows +40% (37,934→53,022). Full lineage + tail decomposition on
+the v3 artifact.
+
+## The four load-bearing verifications
+
+1. **Blast radius exact (MLB-only config change):** WC re-priced all 19,016 old
+   printed inputs under the current repo — **bit-identical fairs, max delta 0**.
+   Mixed same-snapshot overlap: fair changed on exactly **6 of 742** combos, all
+   carrying MLB prop legs (TB/KS/HRR/HIT/HR — the rung-key targets), and their
+   error improved (2.06→0.97¢ med, w2 50→83%). Zero changes on WC-only and
+   no-same-game combos.
+2. **Cross-sport independence EXACT through the live path:** all 2,605
+   pure-cross combos price at the product of leg fairs to <1e-6; live
+   `build_sgp_correlation` spot-checks show cross-sport ρ +0.0000 with same-event
+   pairs consulting the measured priors (notes exposed per pair).
+3. **Look-ahead signature replicated on purpose (A/B control):** mixed
+   fixed-vs-lookahead reproduces the forensics — lookahead med 3.31¢ vs fixed
+   0.70¢ on differing rows; settled-YES fairs drift +8.73¢ vs settled-NO −2.05¢
+   (baseline +10.47/−2.10). The pregame-filtered policy stays vindicated.
+4. **Settlement calibration (thermometers, no refit):** mixed bucket —
+   settled-YES **15.28% vs mean fair 15.25¢** (n=2,892 resolved; clearing 16.18¢
+   = ~0.9¢ maker markup above fair) — essentially perfectly calibrated. MLB
+   window ran favorite-hot again (22.2% YES vs 17.5¢ fair, n=3,128) → pooled
+   multi-week ledger item. WC settled-YES 8.9% (longshot-heavy flow, n=14,359).
+
+## Found + fixed during the capstone
+
+- **Harness bug (repo-fixed `2163642`):** `mlb_backtest.py` gather KeyError on
+  never-snapshotted combos (outcomes covers only priceable; inputs spans all
+  ticker_legs). Latent since the look-ahead fix; first truly-fresh gather
+  exercised it. Fix validated end-to-end via a verbatim job-tmp replica BEFORE
+  porting (rule 8 flow); `wc_backtest.py` verified immune.
+- **Audit-draw churn caveat (methodology):** the fetch policy's seeded 20k audit
+  sample re-draws over a grown untraded pool, so fresh runs are NOT supersets of
+  old runs (MLB shared rows 2,210/6,128; mixed 782). Aggregates comparable;
+  per-ticker longitudinal comparisons only on shared/candidate subsets.
+- Config parity on shared tickers vs ph2 (identical config): 2,073/2,210
+  bit-identical; the 137 diffs are all data-side (more pre-cutoff snapshots
+  attached by the longer scan).
+- 37 combos WARN clearings-incomplete (retry-exhausted 429s) — negligible vs
+  23,293 fetched, recorded.
+- Prior mixed attempt died one-by-one-fetching an 85k clearings universe; the
+  re-run reused the one-pass gather's caches with **zero** API fetches
+  (`ph4\mixed\PROVENANCE.txt`).
+
+## Watch list (measurement-grade, pre-registered — never refit on P&L)
+
+- Illiquid prop-only parlays (HRR/HIT/KS): the only cells ≥1.5¢ (max 2.01¢,
+  n=26); bias −1.4..−2.6¢ = fat-markup-shaped; weekly settlement ledger decides
+  (makers-side settlements 3-4 independent weeks → measurement investigation).
+- `mlb_runs` structural grid: config-independent 1.10¢ slice — own calibration
+  pass queued.
+- Mixed weakest cell wc2+mlb1 (n=385, 1.11¢) is WC-pair-heavy — a soccer
+  same-event correlation item, not MLB config.
+
+## NEXT STEPS
+
+- Me: WC per-print pass completes (overnight) → merge parts → harness analyze →
+  stock-vs-parallel parity gate → append the WC per-print section here.
+- Then the runway: **#14 demo fill e2e** (sell-only un-gated) → **#15 weekly
+  sweep/calibration cadence** (game-clustered, bucket-split) → **#16 MLB blind
+  test** → **E decisions** (markup from pooled multi-week; per-sport kill
+  switch; prod gates).
+- Operator: no decisions owed. Artifact v3 live at the existing URL.
