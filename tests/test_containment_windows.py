@@ -13,11 +13,20 @@ a RE-RUN of the same-player measurement export (job 24844262 wire2, verified
 == 1.0 pooled AND 2021-25 on the 1,033,852 batter-game population).
 
 WIRE-3 — (1h_)spread cover-by-N YES × total over-(M−0.5) NO, M ≤ N, is
-logically impossible cross-scope (S7/S8/S13/S34); soccer farmable, MLB not.
+logically impossible (S7/S8/S13/S34); farmable ONLY for soccer SAME-scope
+pairs (S7 1H×1H, S13 FT×FT); S8 cross-scope farmable=False per the V2 ruling
+(two-official-records lemma unverified), MLB always False (48h rain scalar).
 
 WIRE-4 — same-player MEASURED-conditional pairs inside >2-leg combos collapse
 to a super-leg carrying the bare path's 2-leg conditional joint (all four
-side mixes); the bare 2-leg path stays bit-identical.
+side mixes); the bare 2-leg path stays bit-identical. V2 REFUTATION
+(2026-07-11): the super-leg is priced at side "yes" under the kept leg's
+ticker, so a SAME-GAME companion sees it through the kept leg's YES-side rho
+— whose sign INVERTS for NO-side mixes (live counterexample: HIT3-no x
+HR1-no x own-ML-yes engine 0.4183 vs 0.3451 trivariate truth, +7.32c).
+Mandated remedy: conditional pairs carry the SAME same-game-companion
+isolation guard as window bands — same-game companion ⇒ UNKNOWN decline;
+cross-game companions (ρ = 0) stay priceable.
 """
 
 from __future__ import annotations
@@ -74,6 +83,7 @@ TB5 = f"KXMLBTB-{_G}-COLHGOODMAN15-5"
 TB7 = f"KXMLBTB-{_G}-COLHGOODMAN15-7"
 HRR1 = f"KXMLBHRR-{_G}-COLHGOODMAN15-1"
 TB2_TEAMMATE = f"KXMLBTB-{_G}-COLETOVAR14-2"
+ML_OWN = f"KXMLBGAME-{_G}-COL"                  # the batter's OWN game's ML
 MLB_ML_OTHER = "KXMLBGAME-26JUL101610AZSD-SD"   # cross-game companion
 
 
@@ -97,6 +107,7 @@ BOOKS: list[tuple[str, str, str]] = [
     (TB5, "0.1000", "0.8800"),        # p = 0.11
     (HRR1, "0.6300", "0.3500"),       # p = 0.64
     (TB2_TEAMMATE, "0.4000", "0.5800"),  # p = 0.41
+    (ML_OWN, "0.5700", "0.4100"),        # p = 0.58 (V2 counterexample book)
     (MLB_ML_OTHER, "0.5500", "0.4300"),  # p = 0.56
 ]
 # Window inverted: books price the subset ABOVE its superset.
@@ -139,10 +150,13 @@ def test_soccer_spread_win_cross_scope_is_never_claimed() -> None:
 
 
 def test_soccer_spread_win_refusals_fail_closed() -> None:
-    """Opposite team, draw side, line-0, unparseable suffix, different game:
-    never a containment claim — all fall through (defect-#3 discipline)."""
+    """Draw side, line-0, unparseable suffix, different game: never a
+    containment claim — all fall through (defect-#3 discipline). The
+    other-suffix yes+yes pair is NO longer OK: it is the pinned S17 exclusion
+    (cover ⟹ win excludes the opponent's win), intercepted by the FIX-4
+    taxonomy tripwire as a farmable=False DECLINE — defect-#3 still holds
+    because nothing is ever priced or farmed off the unproven team parse."""
     for legs in (
-        (_leg(SP_ESP2), _leg(ML_BEL)),           # not provably same team
         (_leg(SP_ESP2), _leg(ML_TIE, "no")),     # draw side is never implied
         (_leg(SP_ESP0), _leg(ML_ESP, "no")),     # line 0 proves nothing
         (_leg(SP_BARE_LINE), _leg(ML_ESP, "no")),  # unparseable spread suffix
@@ -150,6 +164,10 @@ def test_soccer_spread_win_refusals_fail_closed() -> None:
     ):
         rel = classify_legs(legs, ExplodingProvider())
         assert rel.kind is RelationshipKind.OK, legs[0].market_ticker
+    s17 = classify_legs((_leg(SP_ESP2), _leg(ML_BEL)), ExplodingProvider())
+    assert s17.kind is RelationshipKind.IMPOSSIBLE
+    assert s17.farmable is False
+    assert any("taxonomy-impossible tripwire: S17" in n for n in s17.notes)
 
 
 def test_s1_moneyline_no_orientations_are_wired_defensively() -> None:
@@ -320,15 +338,20 @@ def test_soccer_spread_total_higher_line_is_possible() -> None:
 
 
 def test_soccer_1h_spread_scope_nesting() -> None:
-    """S7-yn (1H spread × 1H total) and S8-yn (1H spread × FT total — 1H goals
-    persist into the regulation total) are both impossible+farmable; the
-    REVERSE cross-scope (FT spread × 1H total) is never claimed."""
+    """S7-yn (1H spread × 1H total, ONE half-time record) stays
+    impossible+farmable; S8-yn (1H spread × FT total, CROSS-scope) is
+    NARROWED per the V2 adversarial ruling 2026-07-11: still IMPOSSIBLE
+    no-quote, but farmable=False — the implication spans TWO official
+    records (half-time + full-time), and Kalshi's abandonment/award rules
+    text for KXWC totals has not been captured as evidence that both records
+    stay consistent (unverified lemma ⇒ fails the airtight one-record farm
+    bar). The REVERSE cross-scope (FT spread × 1H total) is never claimed."""
     s7 = classify_legs((_leg(FH_SP_ESP2), _leg(FH_TOT2, "no")), ExplodingProvider())
     assert s7.kind is RelationshipKind.IMPOSSIBLE
     assert s7.farmable is True
     s8 = classify_legs((_leg(FH_SP_ESP2), _leg(FT_TOT2, "no")), ExplodingProvider())
     assert s8.kind is RelationshipKind.IMPOSSIBLE
-    assert s8.farmable is True
+    assert s8.farmable is False  # V2 ruling: two-official-records claim
     rev = classify_legs((_leg(SP_ESP2), _leg(FH_TOT2, "no")), ExplodingProvider())
     assert rev.kind is RelationshipKind.OK
 
@@ -423,16 +446,50 @@ async def test_bare_conditional_pair_stays_bit_identical() -> None:
     assert result.fair_cc == cc_from_prob(expected)
 
 
-async def test_embedded_conditional_with_same_game_companion_prices() -> None:
-    """Conditional super-legs carry NO game-isolation requirement (unlike
-    window bands): the pair + a same-game OTHER-player leg prices through the
-    reduced copula with the kept leg representing the pair."""
+async def test_embedded_conditional_with_same_game_companion_declines() -> None:
+    """RE-EXPRESSED 2026-07-11 (V2 refutation; was ..._prices, which only
+    passed because the poisoned test event tickers hid the companion in a
+    different game group): a conditional super-leg with a same-game KEPT
+    companion (another player's TB leg of the SAME game) has an unmodeled
+    neighbour-correlation SIGN — the classifier declines UNKNOWN, the exact
+    guard window bands carry."""
     engine, _h = await engine_with(BOOKS)
     result = engine.price(
         rfq_of((HIT3, "yes"), (HR1, "yes"), (TB2_TEAMMATE, "yes")),
         time_to_close_s=100_000,
     )
-    assert isinstance(result, ConstructedQuote), result
+    assert isinstance(result, NoQuote), result
+    assert result.reason is ReasonCode.SKIP_CLASSIFIER_UNKNOWN
+    assert "conditional-vs-neighbour correlation sign unmodeled" in result.detail
+
+
+async def test_v2_counterexample_no_no_own_ml_declines_unknown() -> None:
+    """THE V2 live counterexample as a regression pin (prod-convention
+    2-segment event tickers, tape-verified): HIT3-no x HR1-no x own-ML-yes.
+    Engine BEFORE the guard: fair 0.4183 via corr(super, ML) = +0.23 — the
+    kept leg's YES-side rho applied to a NO/NO super-leg, ABOVE the 0.3451
+    trivariate truth by +7.32c (sign inverted; truth sits BELOW the 0.3849
+    independence product). Now: same-game companion ⇒ UNKNOWN ⇒ NoQuote."""
+    legs = (
+        _leg(HIT3, "no"),
+        _leg(HR1, "no"),
+        _leg(ML_OWN, "yes"),
+    )
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.UNKNOWN
+    assert any(
+        "conditional-vs-neighbour correlation sign unmodeled" in n for n in rel.notes
+    )
+    engine, _h = await engine_with(BOOKS)
+    for s_a, s_b in (("no", "no"), ("yes", "yes"), ("no", "yes"), ("yes", "no")):
+        result = engine.price(
+            rfq_of((HIT3, s_a), (HR1, s_b), (ML_OWN, "yes")),
+            time_to_close_s=100_000,
+        )
+        # Fail-closed doctrine: EVERY side mix declines on a same-game
+        # companion, not just the sign-inverted NO mixes.
+        assert isinstance(result, NoQuote), (s_a, s_b, result)
+        assert result.reason is ReasonCode.SKIP_CLASSIFIER_UNKNOWN, (s_a, s_b)
 
 
 async def test_conditional_and_containment_pairs_compose_in_one_plan() -> None:

@@ -636,6 +636,18 @@ def _build_pricer():
                     continue
                 clamped[sub_i] = cap if sides[sub_i] == "yes" else 1.0 - cap
             keep = [i for i in range(len(legs)) if i not in dropped]
+            # WIRE-4 conditional isolation guard (V2 refutation 2026-07-11)
+            # — identical port of the classifier/engine guard (keep in sync
+            # with relationships._collapse_containments +
+            # engine._price_nested_bands + wc_backtest): a conditional
+            # super-leg with a same-game KEPT companion never prices (the
+            # neighbour-correlation SIGN inverts on NO-side mixes).
+            for keep_i, _drop_i in rel.conditionals:
+                for group in rel.same_event_groups:
+                    if keep_i in group and any(
+                        k in keep for k in group if k != keep_i
+                    ):
+                        return None, f"{path_label}-conditional-companion"
             remap = {old: new for new, old in enumerate(keep)}
             r_legs = [legs[i] for i in keep]
             r_beliefs = [

@@ -415,8 +415,12 @@ class PricingEngine:
           path (build_sgp_correlation on the pair + price_joint_matrices —
           the sgp implied-rho seam over SAME_PLAYER_CONDITIONALS, all four
           side mixes); the super-leg carries that joint as a YES-side
-          marginal with the pair joint's uncertainty, represented by its
-          kept leg for neighbour correlation.
+          marginal with the pair joint's uncertainty. The classifier
+          guarantees the pair's game holds NO other kept leg (V2 refutation
+          2026-07-11: a same-game neighbour would see the super-leg through
+          the kept leg's YES-side rho, whose SIGN is wrong for NO-side
+          mixes), so a conditional super-leg only ever meets other legs
+          CROSS-game — re-checked below fail-closed.
         - Width: a band super-leg carries u_low + u_high (a difference's
           errors add — conservative linear sum, same convention as
           price_joint).
@@ -519,6 +523,21 @@ class PricingEngine:
                 f"{cap:.4f}"
             )
         keep = [i for i in range(len(rfq.legs)) if i not in dropped]
+        # Defensive mirror of the classifier's conditional isolation guard
+        # (V2 refutation 2026-07-11; relationships._collapse_containments is
+        # the authoritative decline — keep in sync, incl. the copies in
+        # tools/backtests/{wc,mlb}_backtest.py): a conditional super-leg with
+        # a same-game KEPT companion must never price here either.
+        for keep_i, _drop_i in relationship.conditionals:
+            for group in relationship.same_event_groups:
+                if keep_i in group and any(
+                    k in keep for k in group if k != keep_i
+                ):
+                    return NoQuote(
+                        ReasonCode.SKIP_PRICING_FAILED,
+                        "conditional super-leg game carries other kept legs: "
+                        "conditional-vs-neighbour correlation sign unmodeled",
+                    )
         remap = {old: new for new, old in enumerate(keep)}
         reduced_legs: list[RfqLeg] = [rfq.legs[i] for i in keep]
 

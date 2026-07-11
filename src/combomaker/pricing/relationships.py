@@ -43,6 +43,7 @@ from combomaker.pricing.legtypes import LegType, Sport, classify_leg, classify_s
 # both-or-neither refuses; provably unambiguous on the live-enumerated 30-code
 # vocabulary). Imported — not mirrored — so the parse can never drift.
 from combomaker.pricing.sgp import _mlb_side_of, _mlb_team_blob
+from combomaker.pricing.tripwire import taxonomy_impossible
 from combomaker.rfq.models import RfqLeg
 
 
@@ -333,10 +334,18 @@ def _collapse_containments(
       and from other pairs of their own species;
     - a band super-leg is a WINDOW event (non-monotone in the latent count),
       so its game must hold ONLY the band's two legs among the KEPT set — the
-      post-collapse mirror of the NESTED_BAND same-game-companion guard.
-      Conditional super-legs carry NO such isolation requirement: the pair's
-      joint is monotone in the batter's game and is represented by its kept
-      leg for neighbour correlation, the containment-subset precedent.
+      post-collapse mirror of the NESTED_BAND same-game-companion guard;
+    - a CONDITIONAL super-leg gets the SAME isolation guard (V2 REFUTATION,
+      2026-07-11): the super-leg carries the SELECTED-side pair joint but is
+      represented by its kept leg's ticker at side "yes", so for NO-side
+      mixes the copula applies the kept leg's YES–YES rho to an event that is
+      ANTI-monotone in the kept leg's latent — the neighbour-correlation SIGN
+      inverts (live counterexample: HIT3-no x HR1-no x own-ML-yes priced
+      0.4183 vs 0.3451 trivariate truth, +7.32c). Fail-closed doctrine: a
+      same-game KEPT companion ⇒ UNKNOWN decline for EVERY side mix;
+      cross-game companions (ρ = 0, the bulk of the observed decliner
+      population) stay priceable — representing the pair by its kept leg is
+      exact at ρ = 0.
     """
     pairs = list(dict.fromkeys(containments))
     band_pairs = list(dict.fromkeys([*ladder_bands, *cont_bands]))
@@ -394,6 +403,20 @@ def _collapse_containments(
             notes.append(
                 f"nested band game {game} carries other kept legs: "
                 "band-vs-neighbour correlation unmodeled"
+            )
+            return Relationship(RelationshipKind.UNKNOWN, (), tuple(notes))
+    # Conditional pairs: the SAME isolation guard (V2 refutation 2026-07-11
+    # — see the docstring): a same-game kept companion sees the super-leg
+    # through the kept leg's YES-side rho, whose SIGN is wrong for NO-side
+    # mixes. Guard applies to every mix (fail-closed); cross-game companions
+    # stay priceable. Keep in sync with the defensive mirrors in
+    # engine._price_nested_bands and tools/backtests/{wc,mlb}_backtest.py.
+    for keep_i, _drop_i in cond_pairs:
+        game = game_keys[keep_i]
+        if any(game_keys[k] == game for k in kept if k != keep_i):
+            notes.append(
+                f"conditional super-leg game {game} carries other kept legs: "
+                "conditional-vs-neighbour correlation sign unmodeled"
             )
             return Relationship(RelationshipKind.UNKNOWN, (), tuple(notes))
     # Same-game groups over ALL legs (the engine remaps them onto the reduced
@@ -775,8 +798,15 @@ def classify_legs(
     # the spread's (``_SPREAD_TOTAL_SCOPES``; MLB extras only ADD runs).
     # Detection covers the impossible mix ONLY: the yy/nn/ny mixes keep their
     # existing structural/copula paths (spread×total windows are NOT wired).
-    # farmable per sport: soccer = airtight one-scoreline tautology ⇒ True;
-    # MLB = False (48h rain-scalar policy, the shipped ml|spread precedent).
+    # farmable: soccer SAME-scope pairs (S7 1H×1H, S13 FT×FT) = airtight
+    # ONE-scoreline tautologies ⇒ True; the soccer CROSS-scope pair (S8
+    # 1H-spread × FT-total) = IMPOSSIBLE no-quote but farmable=False — V2
+    # adversarial ruling 2026-07-11: the S8 implication spans TWO official
+    # records (the half-time record and the full-time record), and Kalshi's
+    # abandonment/award rules text for KXWC totals has not been captured as
+    # evidence that both records stay consistent (e.g. abandonment after the
+    # half) — an unverified lemma fails the airtight one-record farm bar.
+    # MLB = False everywhere (48h rain-scalar policy, ml|spread precedent).
     for sp_i in range(len(legs)):
         total_types = _SPREAD_TOTAL_SCOPES.get(types[sp_i])
         if total_types is None or legs[sp_i].side != "yes":
@@ -807,7 +837,13 @@ def classify_legs(
                 RelationshipKind.IMPOSSIBLE,
                 (),
                 tuple(notes),
-                farmable=sport is Sport.SOCCER,
+                farmable=(
+                    sport is Sport.SOCCER
+                    and not (
+                        types[sp_i] is LegType.FIRST_HALF_SPREAD
+                        and types[tot_i] is LegType.TOTAL
+                    )
+                ),
             )
 
     # Three period/line implications A⟹B are EXACT scoring facts (not
@@ -936,6 +972,25 @@ def classify_legs(
                     f"without {legs[fh_i].market_ticker}: "
                     "joint = P(superset) - P(subset)"
                 )
+
+    # TAXONOMY-IMPOSSIBLE TRIPWIRE (2026-07-11, V3 robustness §2.4-1 —
+    # judge-mandated). The shipped impossibility families above have all had
+    # their say (each returns immediately on its own impossible mixes, with
+    # its own farmable verdict); any same-game pair that STILL matches a
+    # fixture-pinned semantically-impossible shape × side-mix cell — the
+    # 30-cell exchange-BLOCKED dangerous class the probe mapped — is
+    # IMPOSSIBLE, farmable=False: fixture-driven certainty is not an airtight
+    # in-code proof, so it declines and counts, never prices, never farms.
+    # Such an RFQ is also proof Kalshi's validator loosened (every pinned
+    # cell is unbuildable today) — the dedicated note makes it loud.
+    # Fires at ANY combo size and beats any recorded containment/window/
+    # conditional pair (an impossible pair zeroes the whole combo). Inert
+    # (with a warning) when the fixture is missing/corrupt — fail-closed.
+    tripped = taxonomy_impossible(legs, game_keys)
+    if tripped is not None:
+        shape, detail = tripped
+        notes.append(f"taxonomy-impossible tripwire: {shape} — {detail}")
+        return Relationship(RelationshipKind.IMPOSSIBLE, (), tuple(notes))
 
     if containments and len(legs) == 2:
         containment = containments[-1]  # shipped last-write-wins 2-leg pair

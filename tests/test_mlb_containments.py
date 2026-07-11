@@ -185,18 +185,33 @@ def test_same_player_hr_no_hit_yes_prices_via_measured_reverse() -> None:
 
 
 def test_same_player_conditional_pair_buried_collapses() -> None:
-    """RETARGETED 2026-07-11 (WIRE-4; was ..._is_unknown): a measured
-    (non-exact) same-player pair buried in a >2-leg combo now records a
-    CONDITIONAL collapse pair — the engine replaces it with a super-leg whose
-    p is the bare path's 2-leg conditional joint. (HIT3 x HR1 — measured in
-    both directions, no exact cell.)"""
-    legs = (_leg(HIT3), _leg(HR1), _leg(TOTAL9))
+    """RETARGETED 2026-07-11 twice (WIRE-4, then the V2 refutation): a
+    measured (non-exact) same-player pair buried in a >2-leg combo records a
+    CONDITIONAL collapse pair — but ONLY with cross-game companions. (HIT3 x
+    HR1 — measured in both directions, no exact cell — plus another GAME's
+    total.)"""
+    legs = (_leg(HIT3), _leg(HR1), _leg(f"KXMLBTOTAL-{_G2}-9"))
     rel = classify_legs(legs, _Prov())
     assert rel.kind is RelationshipKind.CONTAINMENT
     assert rel.containment is None
     assert rel.conditionals == ((0, 1),)  # HIT3 kept as carrier, HR1 drops
     assert rel.containments == () and rel.bands == ()
     assert any("conditional super-leg" in n for n in rel.notes)
+
+
+def test_same_player_conditional_with_same_game_companion_is_unknown() -> None:
+    """V2 REFUTATION guard (2026-07-11): the SAME buried pair with its OWN
+    game's total is NOT priceable — the conditional super-leg is represented
+    by its kept leg at side "yes", so a same-game neighbour's rho carries the
+    WRONG SIGN for NO-side mixes (live counterexample: HIT3-no x HR1-no x
+    own-ML-yes, engine 0.4183 vs 0.3451 trivariate truth). Fail-closed for
+    EVERY mix — the exact isolation guard window bands carry."""
+    legs = (_leg(HIT3), _leg(HR1), _leg(TOTAL9))
+    rel = classify_legs(legs, _Prov())
+    assert rel.kind is RelationshipKind.UNKNOWN
+    assert any(
+        "conditional-vs-neighbour correlation sign unmodeled" in n for n in rel.notes
+    )
 
 
 # --- classifier: unmeasured / out-of-scope shapes ----------------------------------

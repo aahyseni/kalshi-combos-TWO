@@ -59,7 +59,15 @@ MC_11 = f"{MC_EV}-11"
 
 
 def ev(ticker: str) -> str:
-    return ticker.rsplit("-", 1)[0]
+    """Event ticker = SERIES-GAMECODE, the PROD convention (verified read-only
+    from the prod RFQ tape 2026-07-11: market
+    ``KXMLBHIT-26JUL111605COLSF-SFRDEVERS16-1`` carries event
+    ``KXMLBHIT-26JUL111605COLSF`` — 2-segment PER-GAME, so player props group
+    with their game). The old ``rsplit("-", 1)[0]`` was POISONED for 4-segment
+    MLB prop tickers: it minted per-player 3-segment events that silently put
+    a prop's own-game companions in a DIFFERENT game group — hiding the WIRE-4
+    same-game sign inversion from every e2e test built on this helper."""
+    return "-".join(ticker.split("-")[:2])
 
 
 def rfq_of(*legs: tuple[str, str]) -> Rfq:
