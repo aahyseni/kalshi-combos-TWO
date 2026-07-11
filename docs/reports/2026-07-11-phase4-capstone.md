@@ -75,8 +75,16 @@ the v3 artifact.
   larger combo: not modeled" → UNKNOWN → decline (defense #2 working —
   independence would OVERSTATE fair). Fix designed, mirrors the nested-band
   collapse: A⟹B ⇒ drop the implied leg, P(A∧B)=P(A), price the reduced combo.
-  QUEUED per rule 8 (prototype in backtest → port → parity); size it in the
-  pure-WC bucket first (~0.16% of printed mixed combos here).
+  **SIZED in pure-WC** (`ph4\wc\containment_frequency.json`): 227 printed
+  combos / 712 prints ≈ **91 declined prints/day** — 1.03% of printed combos,
+  0.098% of prints; the ONLY material UNKNOWN species in WC flow. Dominant
+  shape is **1H-BTTS ⟹ FT-BTTS** (127 combos), then ml⟹over-0.5 (70), 1H⟹FT
+  same-line totals (29); spread evenly across 3-6 legs (general N-leg fix
+  required). Pure 2-leg containment already prices via `price_containment`
+  (13 combos / 312 prints — untouched). 194 resolved decliners = free OOS
+  validation set. **Fix IN PROGRESS in an isolated worktree** (main tree
+  untouched while the per-print pass imports from it); merges after the WC
+  per-print pass completes.
 - **Within-2¢ decomposed** (`ph4\mixed\w2c_decomposition.json`): 86% of misses
   are one-sided (fair BELOW clearing = markup + winner's curse in the prints);
   the fixed 2¢ band is relatively harsher on expensive combos (≤5¢: 99.1% w2 →
