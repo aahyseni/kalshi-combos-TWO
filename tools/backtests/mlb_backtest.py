@@ -325,7 +325,11 @@ def gather(outdir: Path, since: str, pregame_hours: float, chunk_rows: int,
     # price-free public metadata (expected_expiration − pregame_hours), so
     # filtering here keeps the inputs/outcomes zero-bias split intact.
     def _pregame_snaps(mt: str) -> list[tuple[str, list[float]]]:
-        cut = outcomes[mt]["cutoff"]
+        # outcomes covers only PRICEABLE combos (line ~292) while inputs spans
+        # ALL ticker_legs — a non-priceable combo has snaps=[] and no cutoff.
+        # (wc_backtest.py is immune: its outcomes loop covers all ticker_legs.)
+        o = outcomes.get(mt)
+        cut = o["cutoff"] if o else None
         sn = ticker_snaps.get(mt, [])
         if cut is None:
             return sn
