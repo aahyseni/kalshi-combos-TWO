@@ -1,0 +1,1459 @@
+{
+ "meta": {
+  "generated": "2026-07-11",
+  "task": "TASK B - exchange constructibility matrix, shape x side-mix",
+  "method": "2026-07-10-one-leg-per-ladder-rule.md probe mechanics: POST /multivariate_event_collections/KXMVECROSSCATEGORY-R (DEMO), construction 200 = ALLOWED; error code recorded otherwise. Tape-evidence first (prod rfq tape, 18.03M rows), probes only for gaps. Docs re-verified 2026-07-11 via docs.kalshi.com create-market page (unchanged: TickerPair{market,event,side yes|no}, 5000 creations/week, 10 tokens/req; leg-validation error vocabulary still undocumented).",
+  "probe_stats": {
+   "constructions_attempted": 86,
+   "rounds": 5,
+   "log": "probe_log.jsonl (this dir): P01-P42, F01-F18, R01-R10, M01-M13, N01-N03",
+   "control": "P01 constructed + RFQ create/delete round-trip OK; minted demo combo markets are inert (no orders/quotes ever placed)"
+  },
+  "error_vocabulary": {
+   "invalid_parameters": "metadata gate: is_yes_only violation (pinned by P02), size_max=1 same-event pair, same market twice, event not in collection, non-active market (P37 MLB control)",
+   "duplicated_legs": "same-side (yy or nn) two rungs of one ladder VARIABLE - includes same-series same-game, same-player same-stat, and the golf finish chain ACROSS series (TOUR/TOP5/TOP10/TOP20)",
+   "conflicting_leg_outcomes": "semantic relationship detector - fires per (pair,line,side-mix) with idiosyncratic side-awareness; see validator_model"
+  },
+  "validator_model_2026_07_11": {
+   "hard_pair_blocks_all_mixes": [
+    "BTTS x TOTAL at the implying line (S11: all 4 mixes)",
+    "NOGOAL x any same-game zero-implication counterpart (S26-S29)",
+    "SPREAD x GAME-TIE / GAME-opponent (S16-S18, S21-S22 incl redundant windows)"
+   ],
+   "side_aware_blocks_impossible_only": [
+    "1H-win x totals (S4/S5: yy allowed, yn blocked)",
+    "SPREAD x TOTAL same scope (S13: yy allowed, yn blocked)",
+    "1HSPREAD x 1HTOTAL (S7)",
+    "totals cross-line 1H->FT (S3 M<N: both yy and yn blocked; same-line both allowed)"
+   ],
+   "entity_containments_blocked": [
+    "SPREAD x GAME same team (S12)",
+    "SPREAD/GAME x ADVANCE (S14/S15)",
+    "1HSPREAD x 1H (S6)",
+    "FIRSTGOAL x GOAL same player (S24)",
+    "WNBA SPREAD x GAME (S44)",
+    "UFC DEC x ROUNDS, FIGHT x DRAW (S47/S48)",
+    "golf finish chain internal (S50, as duplicated_legs)"
+   ],
+   "holes_still_open": [
+    "S1/S2/S3-same-line impossible mixes (the 3 surviving 2026-07-07 audit farms)",
+    "S8 1HSPREAD x FT-TOTAL impossible (NEW farm)",
+    "S19/S20 under-0.5 => draw (undetected both mixes)",
+    "S5/S7/S8/S13 strict redundant yy",
+    "S23/S25 player-goal x under-0.5 (knockout-soft)",
+    "corners/tcorners bands + tcorners->corners windows"
+   ]
+  },
+  "farm_inventory_constructible_tonight": [
+   "S1 yes+no: GAME yes + TOTAL-1 no (F06)",
+   "S2 yes+no: 1HBTTS yes + BTTS no (F08)",
+   "S3 yes+no same line: 1HTOTAL-N yes + TOTAL-N no (F09)",
+   "S8 yes+no: 1HSPREAD-A2 yes + TOTAL-2 no (F03) - NEW",
+   "(group-stage only) S23/S25 yes+no construct now but are ET-soft in knockout"
+  ],
+  "farms_killed_since_jul07_audit": [
+   "S31 team-corners hi-yes x lo-no (audit farm #2) - F12 blocked",
+   "S30 match-corners inverted band - P29 blocked"
+  ],
+  "caveats": [
+   "Validator TIGHTENED between 2026-07-07 (audit constructed the team-corners farm) and tonight (demo blocks it): tape/audit ALLOWED verdicts older than ~Jul-09 are refutable; fresh prod tape (Jul-09..11) shows no contradiction with tonight's demo verdicts on any cross-checkable pair",
+   "Demo-vs-prod skew unresolvable without a prod construction (forbidden); the market-metadata validator service is shared per the 2026-07-10 report",
+   "All MLB events on demo were finalized/closed -> status gate (invalid_parameters) precedes the semantic check (P37-P42), so no direct MLB semantic verdicts tonight; the 2026-07-10 standing item 're-probe MLB when demo lists it' remains OPEN for active MLB events",
+   "S45/S46 taxonomy side_mix constructible:true flags contradict their own line_condition (generation bug in taxonomy.json)"
+  ]
+ },
+ "shapes": {
+  "S1": {
+   "yes+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe F05 + tape 8 pure 2-leg / 70 in larger combos (ph4/wc/containment_frequency.json)",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "ALLOWED",
+    "evidence": "probe F06 - 2026-07-07 audit farm #4 re-verified constructible",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "LIVE FARM (impossible; combo settles NO always)"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S2": {
+   "yes+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe F07 + tape 3 pure / 127 in larger",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "ALLOWED",
+    "evidence": "probe F08 - audit farm #3 re-verified",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "LIVE FARM"
+   },
+   "no+no": {
+    "verdict": "ALLOWED",
+    "evidence": "probe R07",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe R06",
+    "basis": "probe",
+    "confidence": "direct"
+   }
+  },
+  "S3": {
+   "yes+yes(M=N)": {
+    "verdict": "ALLOWED",
+    "evidence": "probe M01 + tape same-line prints",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no(M=N)": {
+    "verdict": "ALLOWED",
+    "evidence": "probe F09 - audit farm #5 re-verified",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "LIVE FARM"
+   },
+   "yes+yes(M<N)": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe F11 (1HTOTAL-2 yes + TOTAL-1 yes)",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no(M<N)": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe M02 (1HTOTAL-2 yes + TOTAL-1 no)",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "ALLOWED",
+    "evidence": "probe F10 + tape prints",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "tape print 1HTOTAL-1 no + TOTAL-2 yes (window)",
+    "basis": "tape",
+    "confidence": "direct"
+   }
+  },
+  "S4": {
+   "yes+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "tape print KXWC1H-ESP yes + KXWC1HTOTAL-1 yes (2026-07-10)",
+    "basis": "tape",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe R01",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "taxonomy expected farmable-constructible - WRONG"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWC1H is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWC1H is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S5": {
+   "yes+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe P03 (strict containment NOT detected cross-scope)",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe F01",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWC1H is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWC1H is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S6": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P04",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "taxonomy said constructible - WRONG; confirms 2026-07-07 'ml+spread same team' block generalizes to 1H"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWC1H is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWC1H is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "tape 4 same-team window prints (KXWC1HSPREAD|KXWC1H)",
+    "basis": "tape",
+    "confidence": "direct"
+   }
+  },
+  "S7": {
+   "yes+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe P05 (spread->total strictness NOT detected)",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe F02",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "ALLOWED",
+    "evidence": "tape prints (KXWC1HSPREAD|KXWC1HTOTAL nn)",
+    "basis": "tape",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe M03",
+    "basis": "probe",
+    "confidence": "direct"
+   }
+  },
+  "S8": {
+   "yes+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe P06",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "ALLOWED",
+    "evidence": "probe F03 - constructed, minted KXMVECROSSCATEGORY-S2026B64872FE1F3-907AAC1A3E3",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "NEW LIVE FARM: 1H-spread-2 yes + FT under-1.5 no is impossible (2 1H goals are 2 regulation goals) yet constructs - cross-scope spread->FT-total check missing"
+   },
+   "no+no": {
+    "verdict": "ALLOWED",
+    "evidence": "pair carries no validator flag (yy/yn/ny all constructed tonight)",
+    "basis": "inference",
+    "confidence": "inferred"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe M04",
+    "basis": "probe",
+    "confidence": "direct"
+   }
+  },
+  "S9": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P07",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "taxonomy said constructible - WRONG"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe R02",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "inferred from S11 full-pair block (same BTTS x TOTAL detector, all 4 mixes)",
+    "basis": "inference",
+    "confidence": "inferred"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "inferred from S11 N02",
+    "basis": "inference",
+    "confidence": "inferred"
+   }
+  },
+  "S10": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P08",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe R03",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "inferred from S11 pattern",
+    "basis": "inference",
+    "confidence": "inferred"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "inferred from S11 pattern",
+    "basis": "inference",
+    "confidence": "inferred"
+   }
+  },
+  "S11": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P09",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe R04",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe N01",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe N02",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "_note": "block is LINE-SPECIFIC: BTTS x TOTAL-2 (the implying line) dies in all 4 mixes while BTTS x TOTAL-3 prints on prod tape 2026-07-11"
+  },
+  "S12": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P10 - pins the 2026-07-07 audit's unlabelled 'ml+spread' block to conflicting_leg_outcomes",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe F17 + tape window prints",
+    "basis": "probe",
+    "confidence": "direct"
+   }
+  },
+  "S13": {
+   "yes+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe P11 (FT spread x FT total strictness NOT detected)",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe F04",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "ALLOWED",
+    "evidence": "tape prints (KXWCSPREAD|KXWCTOTAL nn)",
+    "basis": "tape",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe M05",
+    "basis": "probe",
+    "confidence": "direct"
+   }
+  },
+  "S14": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P12",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe R05",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "ALLOWED",
+    "evidence": "probe M13",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "tape window prints (SPREAD no + ADVANCE yes)",
+    "basis": "tape",
+    "confidence": "direct"
+   }
+  },
+  "S15": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P13",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P14 - re-verifies 2026-07-07 audit 'advance NO + ml YES' block",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "_note": "TIE + ADVANCE window (different leg-a instance) ALLOWED: probe F18 + tape prints"
+  },
+  "S16": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P15",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "farmable cell - DEAD; taxonomy said constructible"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe M07",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "even the redundant window mix is blocked; taxonomy said constructible"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S17": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P16",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "farm DEAD"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe M08",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "redundant mix blocked too"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S18": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P17",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "farm DEAD"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe M09",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S19": {
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe P18 (complement containment NOT detected)",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "yes+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe P19",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S20": {
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "tape print 1H-TIE yes + 1HTOTAL-1 no",
+    "basis": "tape",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWC1H is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "yes+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "inferred from S19 FT analog (P19) + pair unflagged on tape",
+    "basis": "inference",
+    "confidence": "inferred"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWC1H is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S21": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P20",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "farm DEAD"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWC1H is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe M10",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWC1H is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S22": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P21",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "farm DEAD"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWC1H is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe N03",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWC1H is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S23": {
+   "yes+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe F15 + tape 16,495 prints in 07-09..11 window",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "ALLOWED",
+    "evidence": "probe P22",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "knockout: soft (ET goal), NOT a farm this week; becomes a FARM in group-stage/no-ET contexts if still constructible then"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGOAL is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGOAL is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S24": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe 2026-07-10 P5a (FIRSTGOAL yes + GOAL-1 yes same player)",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGOAL is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCFIRSTGOAL+KXWCGOAL is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCFIRSTGOAL is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S25": {
+   "yes+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "tape FIRSTGOALxTOTAL same-game prints",
+    "basis": "tape",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "ALLOWED",
+    "evidence": "probe P23",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "same knockout-soft caveat as S23"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCFIRSTGOAL is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCFIRSTGOAL is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S26": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P24",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "farm DEAD"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P25",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "even the redundant direction blocked - NOGOAL pair-flags fire on both polarities"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCFIRSTGOAL is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCFIRSTGOAL is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S27": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P26",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCFIRSTGOAL+KXWCGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCFIRSTGOAL is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S28": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P27",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "farm DEAD"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P28",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCFIRSTGOAL is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCFIRSTGOAL is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S29": {
+   "probed_member_1HTOTAL_impossible": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe M11 (NOGOAL yes + 1HTOTAL-1 yes)",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "other_members": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "inferred: every probed NOGOAL same-game pair (TOTAL P24/P25, TIE P26, BTTS P27/P28, 1HTOTAL M11) is blocked in both polarities - the NOGOAL leg hard-blocks all semantic counterparts",
+    "basis": "inference",
+    "confidence": "inferred"
+   },
+   "no_side_mixes": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWCFIRSTGOAL is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S30": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "duplicated_legs",
+    "evidence": "probe 2026-07-10 P2b + 0 same-side pairs in 3.02M combos",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P29",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "taxonomy farmable claim DEAD - inverted band now conflicting_leg_outcomes"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "duplicated_legs",
+    "evidence": "probe M06 (same-side rule is side-generic)",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe F13 + 85 tape band combos",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "BAND surface alive"
+   }
+  },
+  "S31": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "duplicated_legs",
+    "evidence": "inferred: same-side same-ladder rule (P2b/P3/P3b/M06) - team-corners tickers not directly probed",
+    "basis": "inference",
+    "confidence": "inferred"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe F12",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "2026-07-07 audit farm #2 (team-corners hi-yes x lo-no) is DEAD - validator tightened since Jul-07"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "duplicated_legs",
+    "evidence": "inferred from M06",
+    "basis": "inference",
+    "confidence": "inferred"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe F14 + 29 tape band combos",
+    "basis": "probe",
+    "confidence": "direct"
+   }
+  },
+  "S32": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P30",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P31",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "ALLOWED",
+    "evidence": "probe M12",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe R08",
+    "basis": "probe",
+    "confidence": "direct"
+   }
+  },
+  "S33": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "structural analogs both blocked: soccer P10 + WNBA P32; 0 strict prints in 8.7M rows; direct MLB probe impossible tonight (demo MLB all finalized; P39 returned ambiguous invalid_parameters)",
+    "basis": "analog",
+    "confidence": "inferred"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXMLBGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXMLBGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "tape 4 window prints (KXMLBSPREAD|KXMLBGAME)",
+    "basis": "tape",
+    "confidence": "direct"
+   },
+   "_note_opponent_farm": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "SPREAD-A yes + GAME-B yes: WNBA analog P33 blocked",
+    "basis": "analog",
+    "confidence": "inferred"
+   }
+  },
+  "S34": {
+   "yes+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "exact structural analog soccer S13 ALLOWED (P11); MLB adjacent-line yes+yes prints on tape",
+    "basis": "analog",
+    "confidence": "inferred"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "analog F04 (soccer same-scope spread x total farm blocked)",
+    "basis": "analog",
+    "confidence": "inferred"
+   },
+   "no+no": {
+    "verdict": "ALLOWED",
+    "evidence": "tape print NYY4 no + TOTAL-15 no",
+    "basis": "tape",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "tape print HOU2 no + TOTAL-6 yes",
+    "basis": "tape",
+    "confidence": "direct"
+   }
+  },
+  "S35": {
+   "yes+yes": {
+    "verdict": "UNPROBEABLE",
+    "why": "demo MLB finalized (P38 invalid_parameters = status gate, semantic check unreached); no cross-sport analog for HR-in-HIT",
+    "lean": "BLOCKED - 0 strict prints in 8.7M rows vs 712 non-strict; validator demonstrably knows same-entity implications (S24, S12, S44)"
+   },
+   "yes+no": {
+    "verdict": "UNPROBEABLE",
+    "why": "same",
+    "lean": "BLOCKED"
+   },
+   "no+no": {
+    "verdict": "ALLOWED",
+    "evidence": "tape same-player print HARPER HR-2 no + HIT-3 no",
+    "basis": "tape",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "tape same-player print KURTZ HR-1 no + HIT-1 yes",
+    "basis": "tape",
+    "confidence": "direct"
+   }
+  },
+  "S36": {
+   "yes+yes": {
+    "verdict": "UNPROBEABLE",
+    "why": "demo MLB finalized",
+    "lean": "BLOCKED - strict TB<=4 zero prints; TB-5 (non-strict) prints 21x"
+   },
+   "yes+no": {
+    "verdict": "UNPROBEABLE",
+    "why": "same",
+    "lean": "BLOCKED"
+   },
+   "no+no": {
+    "verdict": "ALLOWED",
+    "evidence": "tape same-player print KURTZ HR-1 no + TB-3 no",
+    "basis": "tape",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "tape species prints (cross- and same-player windows)",
+    "basis": "tape",
+    "confidence": "inferred"
+   }
+  },
+  "S37": {
+   "yes+yes": {
+    "verdict": "UNPROBEABLE",
+    "why": "demo MLB finalized",
+    "lean": "BLOCKED - strict HRR<=3 zero prints; rung-4/5 print 22/18x"
+   },
+   "yes+no": {
+    "verdict": "UNPROBEABLE",
+    "why": "same",
+    "lean": "BLOCKED"
+   },
+   "no+no": {
+    "verdict": "ALLOWED",
+    "evidence": "tape same-player print HARPER HR-1 no + HRR-1 no",
+    "basis": "tape",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "tape species prints",
+    "basis": "tape",
+    "confidence": "inferred"
+   }
+  },
+  "S38": {
+   "yes+yes": {
+    "verdict": "UNPROBEABLE",
+    "why": "demo MLB finalized",
+    "lean": "BLOCKED - 0 strict prints"
+   },
+   "yes+no": {
+    "verdict": "UNPROBEABLE",
+    "why": "same",
+    "lean": "BLOCKED"
+   },
+   "no+no": {
+    "verdict": "ALLOWED",
+    "evidence": "tape species prints (KXMLBHIT|KXMLBTB)",
+    "basis": "tape",
+    "confidence": "inferred"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "tape same-player print JADELL HIT-2 no + TB-3 yes",
+    "basis": "tape",
+    "confidence": "direct"
+   }
+  },
+  "S39": {
+   "yes+yes": {
+    "verdict": "UNPROBEABLE",
+    "why": "demo MLB finalized",
+    "lean": "BLOCKED - same-entity species; only non-strict rungs print (ABRAMS HIT-1 + HRR-2)"
+   },
+   "yes+no": {
+    "verdict": "UNPROBEABLE",
+    "why": "same",
+    "lean": "BLOCKED"
+   },
+   "no+no": {
+    "verdict": "ALLOWED",
+    "evidence": "tape same-player print JADELL HIT-1 no + HRR-2 no",
+    "basis": "tape",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "tape species prints",
+    "basis": "tape",
+    "confidence": "inferred"
+   }
+  },
+  "S40": {
+   "yes+yes": {
+    "verdict": "UNPROBEABLE",
+    "why": "demo MLB finalized",
+    "lean": "BLOCKED - 0 strict prints"
+   },
+   "yes+no": {
+    "verdict": "UNPROBEABLE",
+    "why": "same",
+    "lean": "BLOCKED"
+   },
+   "no+no": {
+    "verdict": "ALLOWED",
+    "evidence": "tape species prints",
+    "basis": "tape",
+    "confidence": "inferred"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "tape species prints",
+    "basis": "tape",
+    "confidence": "inferred"
+   }
+  },
+  "S41": {
+   "yes+yes": {
+    "verdict": "UNPROBEABLE",
+    "why": "demo MLB finalized",
+    "lean": "BLOCKED - 0 strict prints"
+   },
+   "yes+no": {
+    "verdict": "UNPROBEABLE",
+    "why": "same",
+    "lean": "BLOCKED"
+   },
+   "no+no": {
+    "verdict": "ALLOWED",
+    "evidence": "tape species prints",
+    "basis": "tape",
+    "confidence": "inferred"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "tape species prints",
+    "basis": "tape",
+    "confidence": "inferred"
+   }
+  },
+  "S42": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "duplicated_legs",
+    "evidence": "same-side same-ladder rule is family-generic: probes 2026-07-10 P3 (WC GOAL), P3b (WNBA PTS), P2b (corners), tonight M06 + golf P36/R09; MLB tickers unverified (P41 ambiguous on finalized market)",
+    "basis": "analog",
+    "confidence": "inferred"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "duplicated_legs",
+    "evidence": "same analog set",
+    "basis": "analog",
+    "confidence": "inferred"
+   },
+   "yes+no": {
+    "verdict": "UNPROBEABLE",
+    "why": "MLB unverifiable tonight; corners analog now BLOCKS the inverted-band (P29/F12) but MLB props are a different ladder family",
+    "lean": "BLOCKED (post-tightening validator)"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "corners bands construct (F13/F14) + MLB prop events size_max=null and two-sided; 0 MLB bands in 3.02M tape - allowed-by-analog, unverified on MLB tickers",
+    "basis": "analog",
+    "confidence": "inferred"
+   }
+  },
+  "S43": {
+   "all": {
+    "verdict": "UNPROBEABLE",
+    "why": "line-dead: no MLB total-1 (or 2) rung open anywhere (tape min 2, open min 3) - the implying pair cannot exist"
+   }
+  },
+  "S44": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P32 - DIRECT WNBA probe",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWNBAGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWNBAGAME is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe R10 + tape window prints",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "_note_opponent_farm": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P33 (SPREAD-A yes + GAME-B yes) - farm DEAD; taxonomy note hoped constructible",
+    "basis": "probe",
+    "confidence": "direct"
+   }
+  },
+  "S45": {
+   "spread_total_same_event_pairs_all_mixes": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXWNBASPREAD/KXWNBATOTAL events carry size_max=1 (collections.json); same-event pair -> invalid_parameters (probe species 2026-07-10 P2/P2c)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "pts_same_player_ladder_all_mixes": {
+    "verdict": "BLOCKED",
+    "error": "duplicated_legs",
+    "evidence": "probe 2026-07-10 P3b (direct on WNBA PTS)",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "_note": "taxonomy side_mix constructible:true flags here are a generation bug - shape is fully unconstructible"
+  },
+  "S46": {
+   "all_mixes": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXUFCROUNDS size_max=1 (same-event pair) + is_yes_only for any no-side; probe species P2/P2c",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "_note": "taxonomy yes+yes constructible:true is a generation bug"
+  },
+  "S47": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P34",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "farm DEAD - validator knows DEC excludes early finish"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXUFCROUNDS is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXUFCMOF is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXUFCMOF+KXUFCROUNDS is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S48": {
+   "yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "conflicting_leg_outcomes",
+    "evidence": "probe P35",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "farm DEAD"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXUFCMOF is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXUFCFIGHT is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXUFCFIGHT+KXUFCMOF is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S49": {
+   "yes+yes": {
+    "verdict": "UNPROBEABLE",
+    "why": "dormant: no venue lists a tournament-winner series concurrently with same-tournament match markets sharing an entrant (demo KXATP-26WIM field intersects zero active ATPMATCH events; prod only lists KXATP-26USO pre-tournament)"
+   },
+   "yes+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXATPMATCH is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+no": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXATP+KXATPMATCH is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   },
+   "no+yes": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXATP is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  },
+  "S50": {
+   "chain_internal_yes+yes": {
+    "verdict": "BLOCKED",
+    "error": "duplicated_legs",
+    "evidence": "probes P36 (TOURxTOP5) + R09 (TOP5xTOP10) - the finish-position series are treated as ONE cross-series ladder",
+    "basis": "probe",
+    "confidence": "direct",
+    "note": "SURPRISE: duplicated_legs across different series tickers"
+   },
+   "xMAKECUT_yes+yes": {
+    "verdict": "ALLOWED",
+    "evidence": "probe F16 + tape 202/1180/127/146 same-player prints (TOUR/TOP20/TOP10/TOP5 x MAKECUT)",
+    "basis": "probe",
+    "confidence": "direct"
+   },
+   "all_other_mixes": {
+    "verdict": "BLOCKED",
+    "error": "invalid_parameters",
+    "evidence": "metadata: KXPGATOUR/TOP5/TOP10/TOP20/MAKECUT is_yes_only=true in both open collections; error code pinned by probe P02_YESONLY_VIOLATION (invalid_parameters)",
+    "basis": "metadata",
+    "confidence": "direct"
+   }
+  }
+ }
+}

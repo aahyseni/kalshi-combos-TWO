@@ -1,0 +1,2505 @@
+{
+ "meta": {
+  "generated": "2026-07-11",
+  "task": "TASK A - complete containment-adjacent pair-shape taxonomy, current Kalshi combo board",
+  "definitions": {
+   "containment (A_yes => B_yes)": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)"
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)"
+    }
+   },
+   "exclusion (A_yes => B_no)": {
+    "yes+yes": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true
+    },
+    "yes+no": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)"
+    },
+    "no+yes": {
+     "semantics": "redundant",
+     "joint": "P(B_yes)"
+    },
+    "no+no": {
+     "semantics": "window",
+     "joint": "1 - P(A_yes) - P(B_yes)"
+    }
+   },
+   "complement containment (A_no => B_yes)": {
+    "no+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_no)"
+    },
+    "no+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true
+    },
+    "yes+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_no)"
+    },
+    "yes+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)"
+    }
+   },
+   "constructible": "side-mix buildable on the exchange given collections is_yes_only/size_max + validator probes",
+   "farmable": "the impossible mix: combo can only settle NO; quoting its complement is riskless (convention combo_no_pays_complement promoted true 2026-07-10)"
+  },
+  "sources": {
+   "tape": "data/combomaker-prod.sqlite3 rfqs (18.03M rows, 2026-07-06..07-11T15:14Z; full scan >=07-09 + 1/13 sample before) -> tape_universe.json",
+   "collections": "GET /multivariate_event_collections (open: KXMVESPORTSMULTIGAMEEXTENDED-R, KXMVECROSSCATEGORY-R; per-event is_yes_only/size_max; associated_events truncates at 250) -> collections.json",
+   "open_markets": "GET /markets?series_ticker&status=open&mve_filter=exclude per series -> api_open_markets.json",
+   "rules": "GET /markets/{ticker} rules_primary -> market_rules.json",
+   "pair_prints": "tape_pair_examples.json + strict_pair_evidence.json (8.7M-row window)",
+   "validator_probes": "docs/reports/2026-07-10-one-leg-per-ladder-rule.md (duplicated_legs / conflicting_leg_outcomes / bands allowed)",
+   "settlement_windows": "NOTES.md I8 (rule-book verified) + fetched rules_primary"
+  },
+  "board_now": {
+   "sports_with_combo_legs": [
+    "soccer WC (13 series)",
+    "soccer UCL (4 series, GAME/TOTAL/SPREAD/BTTS only)",
+    "MLB (9)",
+    "WNBA (4)",
+    "UFC (3)",
+    "tennis ATP/WTA (6)",
+    "golf PGA (6)",
+    "crypto (10, no shapes)"
+   ],
+   "key_line_facts": {
+    "KXWCTOTAL": "over-0.5 EXISTS (live lines 1..6); KXUCLTOTAL does NOT list it (2..5)",
+    "KXWC1HTOTAL": "1..4 (over-0.5 exists)",
+    "KXWCSPREAD": "2..3 live (tape to 4)",
+    "KXWC1HSPREAD": "2 only",
+    "KXWCCORNERS": "7..12",
+    "KXWCTCORNERS": "4..10 (TEAM+LINE concatenated suffix)",
+    "KXWCGOAL": "player rungs 1..3",
+    "KXWCFIRSTGOAL": "per-player + NOGOAL (new series this week)",
+    "KXMLBTOTAL": "lowest ever 2 (tape), 3..13 open \u2014 no over-0.5/1.5 today",
+    "KXMLBSPREAD": "2..4 open (tape 2..14)",
+    "KXMLBHR": "1..2",
+    "KXMLBHIT": "1..4",
+    "KXMLBTB": "2..6 open (NO TB-1 anywhere)",
+    "KXMLBKS": "3..10",
+    "KXMLBHRR": "1..5",
+    "KXWNBATOTAL": "142..182",
+    "KXWNBASPREAD": "2..23",
+    "KXWNBAPTS": "10/15/20/25/30",
+    "KXUFCROUNDS": "2..5"
+   }
+  },
+  "shape_count": 50,
+  "unpaired_justifications": {
+   "KXMLBKS": "starting-pitcher strikeouts share no entity with batter props and imply nothing about ML/total/RFI at any line",
+   "KXMLBGAME x KXMLBTOTAL": "MLB cannot end 0-0 (extras until decided) so win => >=1 run is vacuous AND no total-1 line has ever existed (tape min 2)",
+   "KXMLBRFI x KXMLBGAME/props": "a first-inning run implies nothing about the winner or any player stat",
+   "KXWNBATOTAL": "live totals 142..182 vs spreads <=23 / PTS <=30: margin<=total and player-pts<=total implications never reach a live line pair",
+   "KXWNBAPTS x KXWNBAGAME/TOTAL": "no logical link at live lines (player 30+ vs total 142+ gap)",
+   "KXPGAR1LEAD": "leading after R1 implies neither making the cut (36-hole cut) nor any finish position; no R1-score series exists to pair with",
+   "KXATPCHALLENGERMATCH/KXWTACHALLENGERMATCH": "no challenger tournament-winner series is combo-eligible, so no cross-scope pair exists",
+   "KXATP x KXWTA": "different tours share no outcome",
+   "KXUFCFIGHT x KXUFCROUNDS": "the winner's identity says nothing about fight duration",
+   "KXUFCFIGHT x KXUFCMOF-SUB/KOTKODQ/DEC": "method markets are fighter-agnostic ('either competitor'), so no winner implication (only DRAW excludes, S48)",
+   "KXWCCORNERS/TCORNERS x goals/btts/game/spread": "corner counts and goals are correlated but share no logical implication",
+   "KXWCBTTS x KXWCSPREAD": "4-1 satisfies both BTTS and spread-3: no implication either way",
+   "KXWCGAME-TIE x KXWCBTTS/TOTAL over": "a draw can be 0-0 or 3-3: no pairwise over/under implication (draw => even total is a parity fact expressible only in triples, e.g. TIE+over0.5 => over1.5)",
+   "KXWC1H-TIE x FT markets": "level at half implies nothing at full time",
+   "crypto KX*15M / KX*D": "combo-eligible but each bucket settles on its own window and reference price: no cross-window implication",
+   "same-event exclusive families": "GAME A/B/TIE, ADVANCE A/B, MOF, FIRSTGOAL players+NOGOAL, MATCH A/B, FIGHT A/B are mutually exclusive WITHIN one event \u2014 handled by event-level mutual-exclusion logic (and size_max=1 for most), not pair shapes",
+   "not on the current combo board": "TEAM_TOTAL (KXNFLTEAMTOTAL), F5 (KXMLBF5TOTAL/F5SPREAD), EXTRAS, NBA/NFL/NHL series, KXWC outright winner, KXATPGAMETOTAL-style tennis props: zero legs in the 18.03M-RFQ tape AND absent from the open collections' associated_events -> excluded until they list"
+  }
+ },
+ "shapes": [
+  {
+   "id": "S1",
+   "sport": "soccer",
+   "name": "ml_win => ft_over_0.5",
+   "leg_a": "KXWCGAME-<g>-<TEAM> yes (team wins in regulation)",
+   "leg_b": "KXWCTOTAL-<g>-1 yes (over 0.5 goals, regulation)",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWCGAME",
+    "KXWCTOTAL"
+   ],
+   "line_condition": "requires the -1 total rung: LIVE on KXWC (open lines 1..6); DEAD on KXUCL (tape lines 2..5 only)",
+   "scope_note": "same scope (both regulation); a regulation win requires >=1 goal",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXWCGAME is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXWCGAME is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWCGAME-26JUL09FRAMAR-FRA:yes",
+     "KXWCTOTAL-26JUL09FRAMAR-1:yes"
+    ]
+   ],
+   "constructibility_evidence": "TAPE-PRINTED: 8 pure 2-leg + 70 inside larger combos (ph4/wc/containment_frequency.json)",
+   "engine_status": "MODELED (relationships family 2, CONTAINMENT/IMPOSSIBLE)",
+   "notes": []
+  },
+  {
+   "id": "S2",
+   "sport": "soccer",
+   "name": "1h_btts => ft_btts",
+   "leg_a": "KXWC1HBTTS-<g>-BTTS yes",
+   "leg_b": "KXWCBTTS-<g>-BTTS yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWC1HBTTS",
+    "KXWCBTTS"
+   ],
+   "line_condition": "no lines (binary both)",
+   "scope_note": "1H window is a subset of regulation; both reg-scoped",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXWC1HBTTS-26JUL10ESPBEL-BTTS:yes",
+     "KXWCBTTS-26JUL10ESPBEL-BTTS:yes"
+    ]
+   ],
+   "constructibility_evidence": "TAPE-PRINTED: 3 pure + 127 in larger combos",
+   "engine_status": "MODELED (relationships family 1)",
+   "notes": []
+  },
+  {
+   "id": "S3",
+   "sport": "soccer",
+   "name": "1h_over_N => ft_over_M (M<=N)",
+   "leg_a": "KXWC1HTOTAL-<g>-N yes",
+   "leg_b": "KXWCTOTAL-<g>-M yes, M<=N",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWC1HTOTAL",
+    "KXWCTOTAL"
+   ],
+   "line_condition": "1H lines live 1..4, FT lines live 1..6 -> all M<=N pairs live",
+   "scope_note": "goals cannot un-happen: 1H total <= regulation total",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXWC1HTOTAL-26JUL09FRAMAR-1:no",
+     "KXWCTOTAL-26JUL09FRAMAR-1:no"
+    ],
+    [
+     "KXWC1HTOTAL-26JUL11ARGSUI-1:no",
+     "KXWCTOTAL-26JUL11ARGSUI-2:yes"
+    ]
+   ],
+   "constructibility_evidence": "TAPE-PRINTED (same-line pairs, incl NO+NO direction); lower-line pairs also print",
+   "engine_status": "PARTIALLY MODELED (family 3 covers SAME line only; M<N pairs are NOT modeled)",
+   "notes": []
+  },
+  {
+   "id": "S4",
+   "sport": "soccer",
+   "name": "1h_win => 1h_over_0.5",
+   "leg_a": "KXWC1H-<g>-<TEAM> yes (team leads at half)",
+   "leg_b": "KXWC1HTOTAL-<g>-1 yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWC1H",
+    "KXWC1HTOTAL"
+   ],
+   "line_condition": "requires 1H -1 rung: LIVE (1..4 open)",
+   "scope_note": "winning the half requires a 1H goal (1H analog of S1)",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXWC1H is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXWC1H is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWC1H-26JUL10ESPBEL-ESP:yes",
+     "KXWC1HTOTAL-26JUL10ESPBEL-1:yes"
+    ]
+   ],
+   "constructibility_evidence": "TAPE-PRINTED (tape_pair_examples.json)",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S5",
+   "sport": "soccer",
+   "name": "1h_win => ft_over_0.5",
+   "leg_a": "KXWC1H-<g>-<TEAM> yes",
+   "leg_b": "KXWCTOTAL-<g>-1 yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWC1H",
+    "KXWCTOTAL"
+   ],
+   "line_condition": "requires FT -1 rung: LIVE on KXWC",
+   "scope_note": "a 1H goal is a regulation goal",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXWC1H is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXWC1H is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWC1H-26JUL14FRAESP-FRA (open)",
+     "KXWCTOTAL-26JUL14FRAESP-1 (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested pair on tape; both sides' analogs print",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S6",
+   "sport": "soccer",
+   "name": "1h_spread_N => 1h_win",
+   "leg_a": "KXWC1HSPREAD-<g>-<TEAM>N yes (leads half by > N-0.5)",
+   "leg_b": "KXWC1H-<g>-<TEAM> yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWC1HSPREAD",
+    "KXWC1H"
+   ],
+   "line_condition": "1H spread line live: 2 only",
+   "scope_note": "winning the half by 2 implies winning the half",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": false,
+     "blocked_by": "KXWC1H is yes-only in the combo collections"
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXWC1H is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXWC1HSPREAD-26JUL10ESPBEL-ESP2:no",
+     "KXWC1H-26JUL10ESPBEL-ESP:yes"
+    ]
+   ],
+   "constructibility_evidence": "TAPE-PRINTED window mix (no+yes); strict yes+yes untested",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S7",
+   "sport": "soccer",
+   "name": "1h_spread_N => 1h_over_(N-0.5)",
+   "leg_a": "KXWC1HSPREAD-<g>-<TEAM>N yes",
+   "leg_b": "KXWC1HTOTAL-<g>-N yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWC1HSPREAD",
+    "KXWC1HTOTAL"
+   ],
+   "line_condition": "1H spread 2 x 1H total 2: LIVE",
+   "scope_note": "margin >=N implies the team alone scored >=N in the half",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXWC1HSPREAD-26JUL10ESPBEL-ESP2:no",
+     "KXWC1HTOTAL-26JUL10ESPBEL-2:no"
+    ]
+   ],
+   "constructibility_evidence": "TAPE-PRINTED redundant NO+NO mix; yes+yes untested",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S8",
+   "sport": "soccer",
+   "name": "1h_spread_N => ft_over_(N-0.5)",
+   "leg_a": "KXWC1HSPREAD-<g>-<TEAM>N yes",
+   "leg_b": "KXWCTOTAL-<g>-N yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWC1HSPREAD",
+    "KXWCTOTAL"
+   ],
+   "line_condition": "1H spread 2 x FT total 2: LIVE",
+   "scope_note": "1H goals persist into the regulation total (margin does NOT persist)",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXWC1HSPREAD-26JUL14FRAESP-FRA2 (open)",
+     "KXWCTOTAL-26JUL14FRAESP-2 (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S9",
+   "sport": "soccer",
+   "name": "1h_btts => 1h_over_1.5",
+   "leg_a": "KXWC1HBTTS-<g>-BTTS yes",
+   "leg_b": "KXWC1HTOTAL-<g>-2 yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWC1HBTTS",
+    "KXWC1HTOTAL"
+   ],
+   "line_condition": "1H total 2 rung: LIVE",
+   "scope_note": "both teams scoring in the half means >=2 1H goals",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXWC1HBTTS-26JUL14FRAESP-BTTS (open)",
+     "KXWC1HTOTAL-26JUL14FRAESP-2 (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S10",
+   "sport": "soccer",
+   "name": "1h_btts => ft_over_1.5",
+   "leg_a": "KXWC1HBTTS-<g>-BTTS yes",
+   "leg_b": "KXWCTOTAL-<g>-2 yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWC1HBTTS",
+    "KXWCTOTAL"
+   ],
+   "line_condition": "FT total 2 rung: LIVE",
+   "scope_note": "two 1H goals are two regulation goals",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXWC1HBTTS-26JUL14FRAESP-BTTS (open)",
+     "KXWCTOTAL-26JUL14FRAESP-2 (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S11",
+   "sport": "soccer",
+   "name": "btts => ft_over_1.5",
+   "leg_a": "KXWCBTTS-<g>-BTTS yes",
+   "leg_b": "KXWCTOTAL-<g>-2 yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWCBTTS",
+    "KXWCTOTAL"
+   ],
+   "line_condition": "FT total 2 rung: LIVE on KXWC AND KXUCL (UCL lines 2..5)",
+   "scope_note": "both scoring means >=2 goals; contrapositive: under-1.5 => BTTS no (same shape)",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXWCBTTS-26JUL11NORENG-BTTS:yes",
+     "KXWCTOTAL-26JUL11NORENG-3:yes (adjacent-line print)"
+    ]
+   ],
+   "constructibility_evidence": "adjacent-line pairs print heavily; exact-line strict pair untested",
+   "engine_status": "NOT MODELED (btts|total priced via calibrated rho 0.70, not exact arithmetic)",
+   "notes": []
+  },
+  {
+   "id": "S12",
+   "sport": "soccer",
+   "name": "spread_N => ml_win",
+   "leg_a": "KXWCSPREAD-<g>-<TEAM>N yes (wins reg by > N-0.5)",
+   "leg_b": "KXWCGAME-<g>-<TEAM> yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWCSPREAD",
+    "KXWCGAME"
+   ],
+   "line_condition": "spread lines live 2..3 (tape up to 4); binding on KXUCL too (UCL spread 2..3)",
+   "scope_note": "same scope (both regulation)",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": false,
+     "blocked_by": "KXWCGAME is yes-only in the combo collections"
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXWCGAME is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXWCSPREAD-26JUL10ESPBEL-ESP2:no",
+     "KXWCGAME-26JUL10ESPBEL-ESP:yes"
+    ]
+   ],
+   "constructibility_evidence": "TAPE-PRINTED window mix (no+yes); strict yes+yes zero prints in 8.7M-row window (untested)",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S13",
+   "sport": "soccer",
+   "name": "spread_N => ft_over_(N-0.5)",
+   "leg_a": "KXWCSPREAD-<g>-<TEAM>N yes",
+   "leg_b": "KXWCTOTAL-<g>-N yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWCSPREAD",
+    "KXWCTOTAL"
+   ],
+   "line_condition": "spread 2,3 x total 2,3: LIVE (also UCL)",
+   "scope_note": "winning by >N-0.5 means the winner alone scored >=N",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXWCSPREAD-26JUL10ESPBEL-ESP2:yes",
+     "KXWCTOTAL-26JUL10ESPBEL-3:yes (adjacent-line print)"
+    ]
+   ],
+   "constructibility_evidence": "adjacent-line yes+yes printed; exact-line strict untested",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S14",
+   "sport": "soccer",
+   "name": "spread_N => advance (knockout)",
+   "leg_a": "KXWCSPREAD-<g>-<TEAM>N yes",
+   "leg_b": "KXWCADVANCE-<g>-<TEAM> yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWCSPREAD",
+    "KXWCADVANCE"
+   ],
+   "line_condition": "knockout fixtures only (ADVANCE only exists there)",
+   "scope_note": "SCOPE-MISMATCH pair that still implies: reg win by N => reg win => advance (advance = ET+pens scope)",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXWCSPREAD-26JUL10ESPBEL-ESP3:no",
+     "KXWCADVANCE-26JUL10ESPBEL-ESP:yes"
+    ]
+   ],
+   "constructibility_evidence": "TAPE-PRINTED window mix; strict untested",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S15",
+   "sport": "soccer",
+   "name": "ml_win(reg) => advance (knockout)",
+   "leg_a": "KXWCGAME-<g>-<TEAM> yes",
+   "leg_b": "KXWCADVANCE-<g>-<TEAM> yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWCGAME",
+    "KXWCADVANCE"
+   ],
+   "line_condition": "knockout fixtures only",
+   "scope_note": "EXPLICIT SCOPE-MISMATCH SHAPE: GAME = regulation 3-way, ADVANCE includes ET+pens. Reg win => advance is strict; advance does NOT imply reg win (window = ET/pens advance). TIE yes + ADVANCE yes is the pens/ET window (prints on tape)",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXWCGAME is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXWCGAME is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWCGAME-26JUL10ESPBEL-TIE:yes",
+     "KXWCADVANCE-26JUL10ESPBEL-ESP:yes (window print)"
+    ]
+   ],
+   "constructibility_evidence": "window mix TAPE-PRINTED; strict same-team yes+yes zero prints in 8.7M rows (untested)",
+   "engine_status": "NOT MODELED as containment (priced structurally via DC Advance spec)",
+   "notes": []
+  },
+  {
+   "id": "S16",
+   "sport": "soccer",
+   "name": "spread_N excludes draw",
+   "leg_a": "KXWCSPREAD-<g>-<TEAM>N yes",
+   "leg_b": "KXWCGAME-<g>-TIE yes",
+   "implication": "A_yes => B_no (exclusion)",
+   "series": [
+    "KXWCSPREAD",
+    "KXWCGAME"
+   ],
+   "line_condition": "any live spread line",
+   "scope_note": "winning by >=2 contradicts a draw (both regulation)",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXWCGAME is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "redundant",
+     "joint": "P(B_yes)",
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "window",
+     "joint": "1 - P(A_yes) - P(B_yes)",
+     "constructible": false,
+     "blocked_by": "KXWCGAME is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWCSPREAD-26JUL14FRAESP-FRA2 (open)",
+     "KXWCGAME-26JUL14FRAESP-TIE (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested; farmable yes+yes candidate",
+   "engine_status": "NOT MODELED (cross-series; event-level exclusion logic does not see it)",
+   "notes": []
+  },
+  {
+   "id": "S17",
+   "sport": "soccer",
+   "name": "spread_N excludes opponent_win",
+   "leg_a": "KXWCSPREAD-<g>-<A>N yes",
+   "leg_b": "KXWCGAME-<g>-<B> yes (other team)",
+   "implication": "A_yes => B_no (exclusion)",
+   "series": [
+    "KXWCSPREAD",
+    "KXWCGAME"
+   ],
+   "line_condition": "any live spread line",
+   "scope_note": "team A winning by N contradicts team B winning (both regulation)",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXWCGAME is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "redundant",
+     "joint": "P(B_yes)",
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "window",
+     "joint": "1 - P(A_yes) - P(B_yes)",
+     "constructible": false,
+     "blocked_by": "KXWCGAME is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWCSPREAD-26JUL14FRAESP-FRA2 (open)",
+     "KXWCGAME-26JUL14FRAESP-ESP (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested; farmable yes+yes candidate",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S18",
+   "sport": "soccer",
+   "name": "advance_A excludes ml_win_B",
+   "leg_a": "KXWCADVANCE-<g>-<A> yes",
+   "leg_b": "KXWCGAME-<g>-<B> yes",
+   "implication": "A_yes => B_no (exclusion)",
+   "series": [
+    "KXWCADVANCE",
+    "KXWCGAME"
+   ],
+   "line_condition": "knockout fixtures only",
+   "scope_note": "if B won in regulation, B advances, so A cannot advance",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXWCGAME is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "redundant",
+     "joint": "P(B_yes)",
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "window",
+     "joint": "1 - P(A_yes) - P(B_yes)",
+     "constructible": false,
+     "blocked_by": "KXWCGAME is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWCADVANCE-26JUL14FRAESP-FRA (open)",
+     "KXWCGAME-26JUL14FRAESP-ESP (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested; farmable yes+yes candidate",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S19",
+   "sport": "soccer",
+   "name": "under_0.5 => draw",
+   "leg_a": "KXWCTOTAL-<g>-1 NO (regulation 0-0)",
+   "leg_b": "KXWCGAME-<g>-TIE yes",
+   "implication": "A_no => B_yes (complement containment)",
+   "series": [
+    "KXWCTOTAL",
+    "KXWCGAME"
+   ],
+   "line_condition": "requires the -1 total rung: LIVE on KXWC",
+   "scope_note": "a goalless regulation is a draw; the 'draw => under/over' family: draw itself implies nothing about over lines (3-3 exists) \u2014 the implication only runs from under-0.5 to draw",
+   "side_mix": {
+    "no+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_no)",
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": false,
+     "blocked_by": "KXWCGAME is yes-only in the combo collections"
+    },
+    "yes+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_no)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXWCGAME is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWCTOTAL-26JUL14FRAESP-1 (open)",
+     "KXWCGAME-26JUL14FRAESP-TIE (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested at FT; the 1H analog (S20) IS tape-printed",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S20",
+   "sport": "soccer",
+   "name": "1h_under_0.5 => 1h_draw",
+   "leg_a": "KXWC1HTOTAL-<g>-1 NO (0-0 at half)",
+   "leg_b": "KXWC1H-<g>-TIE yes",
+   "implication": "A_no => B_yes (complement containment)",
+   "series": [
+    "KXWC1HTOTAL",
+    "KXWC1H"
+   ],
+   "line_condition": "1H -1 rung: LIVE",
+   "scope_note": "goalless half means level at half",
+   "side_mix": {
+    "no+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_no)",
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": false,
+     "blocked_by": "KXWC1H is yes-only in the combo collections"
+    },
+    "yes+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_no)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXWC1H is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWC1H-26JUL10ESPBEL-TIE:yes",
+     "KXWC1HTOTAL-26JUL10ESPBEL-1:no"
+    ]
+   ],
+   "constructibility_evidence": "TAPE-PRINTED (redundant no+yes mix)",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S21",
+   "sport": "soccer",
+   "name": "1h_spread_N excludes 1h_draw",
+   "leg_a": "KXWC1HSPREAD-<g>-<TEAM>N yes",
+   "leg_b": "KXWC1H-<g>-TIE yes",
+   "implication": "A_yes => B_no (exclusion)",
+   "series": [
+    "KXWC1HSPREAD",
+    "KXWC1H"
+   ],
+   "line_condition": "1H spread line 2 live",
+   "scope_note": "leading the half by 2 contradicts a level half",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXWC1H is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "redundant",
+     "joint": "P(B_yes)",
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "window",
+     "joint": "1 - P(A_yes) - P(B_yes)",
+     "constructible": false,
+     "blocked_by": "KXWC1H is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWC1HSPREAD-26JUL14FRAESP-FRA2 (open)",
+     "KXWC1H-26JUL14FRAESP-TIE (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested; farmable yes+yes candidate",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S22",
+   "sport": "soccer",
+   "name": "1h_spread_N excludes 1h_opponent_win",
+   "leg_a": "KXWC1HSPREAD-<g>-<A>N yes",
+   "leg_b": "KXWC1H-<g>-<B> yes",
+   "implication": "A_yes => B_no (exclusion)",
+   "series": [
+    "KXWC1HSPREAD",
+    "KXWC1H"
+   ],
+   "line_condition": "1H spread line 2 live",
+   "scope_note": "A leading the half by 2 contradicts B leading the half",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXWC1H is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "redundant",
+     "joint": "P(B_yes)",
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "window",
+     "joint": "1 - P(A_yes) - P(B_yes)",
+     "constructible": false,
+     "blocked_by": "KXWC1H is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWC1HSPREAD-26JUL14FRAESP-FRA2 (open)",
+     "KXWC1H-26JUL14FRAESP-ESP (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested; farmable yes+yes candidate",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S23",
+   "sport": "soccer",
+   "name": "player_goal_k => ft_over_(k-0.5)  [STAGE-CONDITIONAL]",
+   "leg_a": "KXWCGOAL-<g>-<PLAYER>-k yes (k+ goals, ENTIRE game incl ET)",
+   "leg_b": "KXWCTOTAL-<g>-k yes (regulation)",
+   "implication": "A_yes => B_yes ONLY in no-ET contexts (group stage); knockout: SOFT (ET goals break it)",
+   "series": [
+    "KXWCGOAL",
+    "KXWCTOTAL"
+   ],
+   "line_condition": "GOAL rungs live 1..3; TOTAL 1..6 -> all pairs line-live",
+   "scope_note": "EXPLICIT SCOPE-MISMATCH SHAPE: KXWCGOAL/KXWCFIRSTGOAL settle on the ENTIRE game incl extra time (pens excluded); KXWCTOTAL/KXWCBTTS/KXWCGAME/KXWCSPREAD settle at END OF REGULATION (rules_primary fetched 2026-07-11, market_rules.json). Current WC stage is KNOCKOUT, so the implication is currently NOT strict \u2014 a Yamal ET goal settles GOAL yes with reg 0-0. In group play (and leagues without ET) it is exact",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXWCGOAL is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXWCGOAL is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWCGOAL-26JUL10ESPBEL-ESPMOYARZ10-1:yes",
+     "KXWCTOTAL-26JUL10ESPBEL-1:yes"
+    ]
+   ],
+   "constructibility_evidence": "TAPE-PRINTED 16,495 times in the 07-09..11 window (validator does NOT treat it as strict)",
+   "engine_status": "NOT MODELED as containment (copula/DC prices the correlation; the group-stage exactness is unpriced)",
+   "notes": []
+  },
+  {
+   "id": "S24",
+   "sport": "soccer",
+   "name": "first_goal(player) => player_goal_1  [VALIDATOR-BLOCKED]",
+   "leg_a": "KXWCFIRSTGOAL-<g>-<PLAYER> yes",
+   "leg_b": "KXWCGOAL-<g>-<PLAYER>-1 yes (same player)",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWCFIRSTGOAL",
+    "KXWCGOAL"
+   ],
+   "line_condition": "player must have both markets (both incl-ET scope, pens excluded)",
+   "scope_note": "scoring the first goal is scoring a goal \u2014 same settlement scope, exact",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": false,
+     "blocked_by": "exchange validator: conflicting_leg_outcomes (demo probe 2026-07-10)"
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": false,
+     "blocked_by": "KXWCGOAL is yes-only in the combo collections"
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXWCFIRSTGOAL is yes-only in the combo collections; KXWCGOAL is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXWCFIRSTGOAL is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWCFIRSTGOAL-26JUL10ESPBEL-ESPLYAMAL10:yes",
+     "KXWCGOAL-26JUL10ESPBEL-ESPLYAMAL10-2:yes  (rung-2 NON-strict variant prints)"
+    ]
+   ],
+   "constructibility_evidence": "DEMO-PROBED 2026-07-10: strict pair returns 400 conflicting_leg_outcomes; 0 strict prints in 8.7M rows; same-player rung-2 (non-strict) prints",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S25",
+   "sport": "soccer",
+   "name": "first_goal(player) => ft_over_0.5  [STAGE-CONDITIONAL]",
+   "leg_a": "KXWCFIRSTGOAL-<g>-<PLAYER> yes",
+   "leg_b": "KXWCTOTAL-<g>-1 yes",
+   "implication": "A_yes => B_yes only in no-ET contexts; knockout SOFT",
+   "series": [
+    "KXWCFIRSTGOAL",
+    "KXWCTOTAL"
+   ],
+   "line_condition": "-1 total rung live",
+   "scope_note": "same ET scope-mismatch as S23 (first goal could be an ET goal)",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXWCFIRSTGOAL is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXWCFIRSTGOAL is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWCFIRSTGOAL-26JUL10ESPBEL-ESPLYAMAL10:yes",
+     "KXWCTOTAL-26JUL10ESPBEL-2:yes (print)"
+    ]
+   ],
+   "constructibility_evidence": "same-game FIRSTGOALxTOTAL prints on tape (various lines)",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S26",
+   "sport": "soccer",
+   "name": "nogoal => ft_under_0.5 (one-way across scopes)",
+   "leg_a": "KXWCFIRSTGOAL-<g>-NOGOAL yes (zero goals INCL extra time)",
+   "leg_b": "KXWCTOTAL-<g>-1 no (regulation 0-0)",
+   "implication": "A_yes => B_no; converse only in no-ET contexts (group stage: equivalence)",
+   "series": [
+    "KXWCFIRSTGOAL",
+    "KXWCTOTAL"
+   ],
+   "line_condition": "-1 total rung live",
+   "scope_note": "zero goals in the whole game implies zero in regulation; reg 0-0 with an ET goal keeps NOGOAL no (knockout window). Group stage: NOGOAL <=> under-0.5 EXACT EQUIVALENCE",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "redundant",
+     "joint": "P(B_yes)",
+     "constructible": false,
+     "blocked_by": "KXWCFIRSTGOAL is yes-only in the combo collections"
+    },
+    "no+no": {
+     "semantics": "window",
+     "joint": "1 - P(A_yes) - P(B_yes)",
+     "constructible": false,
+     "blocked_by": "KXWCFIRSTGOAL is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWCFIRSTGOAL-26JUL14FRAESP-NOGOAL (open)",
+     "KXWCTOTAL-26JUL14FRAESP-1 (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested (FIRSTGOAL series new this week; 63,765 tape legs but no NOGOAL pair prints yet)",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S27",
+   "sport": "soccer",
+   "name": "nogoal => draw",
+   "leg_a": "KXWCFIRSTGOAL-<g>-NOGOAL yes",
+   "leg_b": "KXWCGAME-<g>-TIE yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWCFIRSTGOAL",
+    "KXWCGAME"
+   ],
+   "line_condition": "none",
+   "scope_note": "no goals at all implies regulation 0-0 implies draw (valid despite scope mismatch: incl-ET zero is a subset of reg zero)",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": false,
+     "blocked_by": "KXWCGAME is yes-only in the combo collections"
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXWCFIRSTGOAL is yes-only in the combo collections; KXWCGAME is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXWCFIRSTGOAL is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWCFIRSTGOAL-26JUL14FRAESP-NOGOAL (open)",
+     "KXWCGAME-26JUL14FRAESP-TIE (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S28",
+   "sport": "soccer",
+   "name": "nogoal => btts_no",
+   "leg_a": "KXWCFIRSTGOAL-<g>-NOGOAL yes",
+   "leg_b": "KXWCBTTS-<g>-BTTS yes",
+   "implication": "A_yes => B_no (exclusion)",
+   "series": [
+    "KXWCFIRSTGOAL",
+    "KXWCBTTS"
+   ],
+   "line_condition": "none",
+   "scope_note": "no goals implies not-both-teams-scored",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "redundant",
+     "joint": "P(B_yes)",
+     "constructible": false,
+     "blocked_by": "KXWCFIRSTGOAL is yes-only in the combo collections"
+    },
+    "no+no": {
+     "semantics": "window",
+     "joint": "1 - P(A_yes) - P(B_yes)",
+     "constructible": false,
+     "blocked_by": "KXWCFIRSTGOAL is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWCFIRSTGOAL-26JUL14FRAESP-NOGOAL (open)",
+     "KXWCBTTS-26JUL14FRAESP-BTTS (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested; farmable yes+yes candidate",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S29",
+   "sport": "soccer",
+   "name": "nogoal => every sub-window zero-side (bundle)",
+   "leg_a": "KXWCFIRSTGOAL-<g>-NOGOAL yes",
+   "leg_b": "each of: KXWC1HTOTAL-1 no / KXWC1HBTTS no / KXWC1H-TIE yes / KXWC1HSPREAD-* no / KXWCSPREAD-* no / KXWCGAME-<team> no",
+   "implication": "A_yes => (B in listed polarity) \u2014 one shape per member, same matrix as S26/S27",
+   "series": [
+    "KXWCFIRSTGOAL",
+    "KXWC1HTOTAL"
+   ],
+   "line_condition": "member-specific (all listed rungs live)",
+   "scope_note": "whole-game zero implies zero in every sub-window: 1H 0-0, 1H tie, no spreads cover, no team reg win. Members with yes-only counterparties (KXWC1H TIE yes; KXWCGAME team NO not constructible) inherit those blocks",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXWCFIRSTGOAL is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXWCFIRSTGOAL is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXWCFIRSTGOAL-26JUL14FRAESP-NOGOAL (open)",
+     "KXWC1HTOTAL-26JUL14FRAESP-1 (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested",
+   "engine_status": "NOT MODELED",
+   "notes": [
+    "side_mix shown for the 1HTOTAL member (A_yes => B_no form maps per member polarity)"
+   ]
+  },
+  {
+   "id": "S30",
+   "sport": "soccer",
+   "name": "match-corners ladder rungs (band/impossible)",
+   "leg_a": "KXWCCORNERS-<g>-H (higher rung)",
+   "leg_b": "KXWCCORNERS-<g>-L (lower rung), H>L",
+   "implication": "A_yes => B_yes (over-H subset of over-L)",
+   "series": [
+    "KXWCCORNERS",
+    "KXWCCORNERS"
+   ],
+   "line_condition": "match corners live 7..12; corners count INCLUDES extra time (rule-book verified 2026-07-09)",
+   "scope_note": "same counting variable: exact monotone containment; joint(band) = P(over-L) - P(over-H) exact",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": false,
+     "blocked_by": "exchange: duplicated_legs (demo probe)"
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "exchange: duplicated_legs (same ladder, same side)"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXWCCORNERS-26JUL06PORESP-8:yes",
+     "KXWCCORNERS-26JUL06PORESP-11:no  (real band, 85 tape pairs)"
+    ]
+   ],
+   "constructibility_evidence": "TAPE: 114 band combos (85 match + 29 team, report 2026-07-10); same-side rungs DEMO-BLOCKED 400 duplicated_legs; corners events have size_max=null (bands allowed)",
+   "engine_status": "MODELED (nested-ladder registry; band arithmetic is the flagged gap: flat fallback today)",
+   "notes": []
+  },
+  {
+   "id": "S31",
+   "sport": "soccer",
+   "name": "team-corners ladder rungs (band/impossible)",
+   "leg_a": "KXWCTCORNERS-<g>-<TEAM>H",
+   "leg_b": "KXWCTCORNERS-<g>-<TEAM>L, H>L (same team)",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWCTCORNERS",
+    "KXWCTCORNERS"
+   ],
+   "line_condition": "team corners live 4..10 (suffix concatenates TEAM+LINE, no dash: MAR4)",
+   "scope_note": "same team's corner count; incl-ET scope",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": false,
+     "blocked_by": "exchange: duplicated_legs"
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "exchange: duplicated_legs"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXWCTCORNERS-26JUL06PORESP-POR8:yes",
+     "KXWCTCORNERS-26JUL06PORESP-POR10:no (29 tape band pairs)"
+    ]
+   ],
+   "constructibility_evidence": "TAPE: 29 team-corner bands; same-side blocked (duplicated_legs)",
+   "engine_status": "MODELED (nested-ladder registry + farmable IMPOSSIBLE direction)",
+   "notes": []
+  },
+  {
+   "id": "S32",
+   "sport": "soccer",
+   "name": "team_corners_N => match_corners_M (M<=N)",
+   "leg_a": "KXWCTCORNERS-<g>-<TEAM>N yes",
+   "leg_b": "KXWCCORNERS-<g>-M yes, M<=N",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWCTCORNERS",
+    "KXWCCORNERS"
+   ],
+   "line_condition": "team lines 4..10 x match lines 7..12 -> live strict pairs need team rung >=7",
+   "scope_note": "one team's corners are a subset of the match total; both incl-ET scope (no mismatch)",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXWCTCORNERS-26JUL10ESPBEL-BEL4:yes",
+     "KXWCCORNERS-26JUL10ESPBEL-8:yes (NON-strict direction, prints)"
+    ]
+   ],
+   "constructibility_evidence": "non-strict direction prints; strict (team-N >= match-M) zero prints in 8.7M rows (untested)",
+   "engine_status": "NOT MODELED (nested family keys on same LegType+scope; cross team->match absent)",
+   "notes": []
+  },
+  {
+   "id": "S33",
+   "sport": "mlb",
+   "name": "spread_cover => ml_win",
+   "leg_a": "KXMLBSPREAD-<g>-<TEAM>N yes (wins by > N-0.5)",
+   "leg_b": "KXMLBGAME-<g>-<TEAM> yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXMLBSPREAD",
+    "KXMLBGAME"
+   ],
+   "line_condition": "spread lines live 2..4 (tape 2..14); final score incl extra innings, same scope",
+   "scope_note": "winning by 1.5+ implies winning; no tie possible in MLB",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": false,
+     "blocked_by": "KXMLBGAME is yes-only in the combo collections"
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXMLBGAME is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXMLBSPREAD-26JUL12<g>-<TEAM>2 (open)",
+     "KXMLBGAME-26JUL12<g>-<TEAM> (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested strict; window mixes print in mixed flow",
+   "engine_status": "NOT MODELED as containment (mlb_runs grid prices win x runline jointly)",
+   "notes": [
+    "KXMLBGAME is 2-outcome: GAME-B yes == GAME-A no, so the impossible mix blocked by yes-only on this matrix is CONSTRUCTIBLE as SPREAD-A-N yes + GAME-B(opponent) yes (farmable exclusion, MLB analog of S17) \u2014 untested"
+   ]
+  },
+  {
+   "id": "S34",
+   "sport": "mlb",
+   "name": "spread_N => total_over_(N-0.5)",
+   "leg_a": "KXMLBSPREAD-<g>-<TEAM>N yes",
+   "leg_b": "KXMLBTOTAL-<g>-N yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXMLBSPREAD",
+    "KXMLBTOTAL"
+   ],
+   "line_condition": "LINE-DEPENDENT: live spread 2..4 x live totals 3..13 -> live pairs N in {3,4}; N=2 dead (no total-2 open; tape had it)",
+   "scope_note": "margin >= N implies winner alone scored >= N",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXMLBSPREAD-<g>-<TEAM>4 (open)",
+     "KXMLBTOTAL-<g>-4 (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S35",
+   "sport": "mlb",
+   "name": "hr_k => hit_k (same batter)",
+   "leg_a": "KXMLBHR-<g>-<PLAYER>-k yes",
+   "leg_b": "KXMLBHIT-<g>-<PLAYER>-k yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXMLBHR",
+    "KXMLBHIT"
+   ],
+   "line_condition": "HR rungs live 1..2 (tape 1..3) x HIT 1..4: all live",
+   "scope_note": "every home run is scored a hit; doubleheader G1/G2 segments must match",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXMLBHR-26JUL082210COLLAD-LADSOHTANI17-1:yes",
+     "KXMLBHIT-26JUL082210COLLAD-LADSOHTANI17-2:yes (rung-2 NON-strict prints 712x)"
+    ]
+   ],
+   "constructibility_evidence": "strict (equal-rung) pair: ZERO prints in 8.7M rows while non-strict prints 712x \u2014 plausibly validator-blocked (cf. S24) but UNTESTED on demo",
+   "engine_status": "NOT MODELED as containment (same-player conditional table prices it softly)",
+   "notes": []
+  },
+  {
+   "id": "S36",
+   "sport": "mlb",
+   "name": "hr_k => tb_4k (same batter)",
+   "leg_a": "KXMLBHR-<g>-<PLAYER>-k yes",
+   "leg_b": "KXMLBTB-<g>-<PLAYER>-min(4k, top rung) yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXMLBHR",
+    "KXMLBTB"
+   ],
+   "line_condition": "HR-1 => TB-4 live (TB 2..6 open, tape to 8); HR-2 => TB-8 tape-only (open max 6 -> HR-2 => TB-6 live)",
+   "scope_note": "a home run banks 4 total bases",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXMLBHR-26JUL081835CHCBAL-CHCPCROWARMSTRONG4-1:yes",
+     "KXMLBTB-26JUL081835CHCBAL-CHCPCROWARMSTRONG4-5:yes (rung-5 NON-strict prints)"
+    ]
+   ],
+   "constructibility_evidence": "strict (TB-4 with HR-1) zero prints; non-strict rung-5 prints 21x \u2014 untested",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S37",
+   "sport": "mlb",
+   "name": "hr_k => hrr_3k (same batter)",
+   "leg_a": "KXMLBHR-<g>-<PLAYER>-k yes",
+   "leg_b": "KXMLBHRR-<g>-<PLAYER>-min(3k, top rung) yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXMLBHR",
+    "KXMLBHRR"
+   ],
+   "line_condition": "HR-1 => HRR-3 live (HRR 1..5)",
+   "scope_note": "a HR = 1 hit + 1 run + >=1 RBI = >=3 combined hits+runs+RBIs (rules_primary verified)",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXMLBHR-26JUL082210COLLAD-LADSOHTANI17-1:yes",
+     "KXMLBHRR-26JUL082210COLLAD-LADSOHTANI17-4:yes (rung-4 NON-strict prints 22x)"
+    ]
+   ],
+   "constructibility_evidence": "strict (HRR<=3) zero prints; rung-4/5 print \u2014 untested",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S38",
+   "sport": "mlb",
+   "name": "hit_k => tb_k (same batter)",
+   "leg_a": "KXMLBHIT-<g>-<PLAYER>-k yes",
+   "leg_b": "KXMLBTB-<g>-<PLAYER>-k yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXMLBHIT",
+    "KXMLBTB"
+   ],
+   "line_condition": "LINE-DEPENDENT: live for k in 2..4 (no TB-1 exists anywhere: tape min 2) \u2014 k=1 DEAD",
+   "scope_note": "k hits bank >=k total bases",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXMLBHIT-<g>-<PLAYER>-2 (open)",
+     "KXMLBTB-<g>-<PLAYER>-2 (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S39",
+   "sport": "mlb",
+   "name": "hit_k => hrr_k (same batter)",
+   "leg_a": "KXMLBHIT-<g>-<PLAYER>-k yes",
+   "leg_b": "KXMLBHRR-<g>-<PLAYER>-k yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXMLBHIT",
+    "KXMLBHRR"
+   ],
+   "line_condition": "live for k in 1..4 (HIT 1..4 x HRR 1..5)",
+   "scope_note": "hits count directly into hits+runs+RBIs",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXMLBHIT-<g>-<PLAYER>-1 (open)",
+     "KXMLBHRR-<g>-<PLAYER>-1 (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S40",
+   "sport": "mlb",
+   "name": "tb_N => hit_ceil(N/4) (same batter)",
+   "leg_a": "KXMLBTB-<g>-<PLAYER>-N yes",
+   "leg_b": "KXMLBHIT-<g>-<PLAYER>-ceil(N/4) yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXMLBTB",
+    "KXMLBHIT"
+   ],
+   "line_condition": "live: TB 2..4 => HIT-1; TB 5..6 => HIT-2 (max 4 bases per hit)",
+   "scope_note": "total bases accrue only through hits",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXMLBTB-<g>-<PLAYER>-5 (open)",
+     "KXMLBHIT-<g>-<PLAYER>-2 (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S41",
+   "sport": "mlb",
+   "name": "tb_N => hrr_ceil(N/4) (same batter)",
+   "leg_a": "KXMLBTB-<g>-<PLAYER>-N yes",
+   "leg_b": "KXMLBHRR-<g>-<PLAYER>-ceil(N/4) yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXMLBTB",
+    "KXMLBHRR"
+   ],
+   "line_condition": "live for all open TB rungs",
+   "scope_note": "bases need hits; hits count into HRR",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXMLBTB-<g>-<PLAYER>-2 (open)",
+     "KXMLBHRR-<g>-<PLAYER>-1 (open)"
+    ]
+   ],
+   "constructibility_evidence": "untested",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S42",
+   "sport": "mlb",
+   "name": "same-stat same-player ladders (HIT/TB/HRR/KS/HR) \u2014 band/impossible",
+   "leg_a": "KX MLB prop -<g>-<PLAYER>-H (higher rung)",
+   "leg_b": "same series/player -L, H>L",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXMLBHIT",
+    "KXMLBHIT"
+   ],
+   "line_condition": "rungs live: HIT 1..4, TB 2..6, HRR 1..5, KS 3..10, HR 1..2; prop events carry size_max=null AND both sides tradeable -> yes-low/no-high BANDS are constructible",
+   "scope_note": "exact monotone same-variable containment (MLB analog of S30/S31)",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": false,
+     "blocked_by": "exchange: duplicated_legs (structural analog probe)"
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "exchange: duplicated_legs"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXMLBKS-<g>-<PITCHER>-6 yes (open)",
+     "KXMLBKS-<g>-<PITCHER>-9 no (open) = Ks in [6,9) band"
+    ]
+   ],
+   "constructibility_evidence": "same-side rungs: demo analog probes blocked (duplicated_legs, MLB analog unverified on MLB tickers per report 2026-07-10); bands: 0 MLB prop bands in 3.02M-combo scan \u2014 untested but structurally allowed",
+   "engine_status": "NOT MODELED (nested registry covers corners only)",
+   "notes": []
+  },
+  {
+   "id": "S43",
+   "sport": "mlb",
+   "name": "rfi => total_over_0.5  [LINE-DEAD]",
+   "leg_a": "KXMLBRFI-<g> yes (a first-inning run)",
+   "leg_b": "KXMLBTOTAL-<g>-1 yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXMLBRFI",
+    "KXMLBTOTAL"
+   ],
+   "line_condition": "DEAD: lowest MLB total anywhere = 2 on tape, 3 open \u2014 the -1 rung has never existed. RFI implies only >=1 run, which no live line expresses",
+   "scope_note": "first-inning window is a subset of the game; would be exact if a -1 (or a live -2 with a 2-run first inning variant) listed. Also note: MLB games cannot end 0-0, so ml_win adds nothing",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXMLBRFI-26JUL121340PHIDET (open)",
+     "KXMLBTOTAL-26JUL12<g>-3 (open, NOT implied)"
+    ]
+   ],
+   "constructibility_evidence": "n/a (no implying line pair exists)",
+   "engine_status": "NOT MODELED (nothing to model until the line exists)",
+   "notes": []
+  },
+  {
+   "id": "S44",
+   "sport": "wnba",
+   "name": "spread_cover => ml_win",
+   "leg_a": "KXWNBASPREAD-<g>-<TEAM>N yes (wins by > N-0.5)",
+   "leg_b": "KXWNBAGAME-<g>-<TEAM> yes",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXWNBASPREAD",
+    "KXWNBAGAME"
+   ],
+   "line_condition": "spread lines live 2..23; both settle on final score incl OT (no ties)",
+   "scope_note": "same scope, exact (K2/L7 doc-verified TEAMn = wins by over n-0.5)",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": false,
+     "blocked_by": "KXWNBAGAME is yes-only in the combo collections"
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXWNBAGAME is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [
+    [
+     "KXWNBASPREAD-26JUL10GSCONN-GS13:no",
+     "KXWNBAGAME-26JUL10GSCONN-GS:yes (window print)"
+    ]
+   ],
+   "constructibility_evidence": "TAPE-PRINTED window mixes; strict yes+yes untested",
+   "engine_status": "NOT MODELED as containment (margin_total bivariate prices it)",
+   "notes": [
+    "KXWNBAGAME is 2-outcome (no ties): the farmable impossible mix is constructible as SPREAD-A-N yes + GAME-B(opponent) yes despite GAME being yes-only (WNBA analog of S17) \u2014 untested"
+   ]
+  },
+  {
+   "id": "S45",
+   "sport": "wnba",
+   "name": "wnba same-event ladders (SPREAD rungs, TOTAL rungs, PTS rungs) \u2014 exchange-blocked",
+   "leg_a": "any two rungs of one KXWNBASPREAD / KXWNBATOTAL event, or one player's KXWNBAPTS ladder",
+   "leg_b": "same event",
+   "implication": "A_yes => B_yes logically, but NO pair is constructible",
+   "series": [
+    "KXWNBASPREAD",
+    "KXWNBATOTAL"
+   ],
+   "line_condition": "SPREAD/TOTAL events carry size_max=1 (collections.json) -> ALL same-event pairs blocked incl. bands; PTS is yes-only + same-ladder duplicated_legs -> fully blocked",
+   "scope_note": "listed for completeness: the logic exists, the exchange forbids the construction",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": true
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": true
+    }
+   },
+   "examples": [],
+   "constructibility_evidence": "collections size_max=1 + duplicated_legs probe",
+   "engine_status": "NOT APPLICABLE (unconstructible)",
+   "notes": [
+    "cross-team same-event exclusions (SPREAD-A x SPREAD-B) are also blocked by size_max=1"
+   ]
+  },
+  {
+   "id": "S46",
+   "sport": "ufc",
+   "name": "rounds ladder: ends_before_2 => ends_before_3 \u2014 exchange-blocked",
+   "leg_a": "KXUFCROUNDS-<f>-2 yes",
+   "leg_b": "KXUFCROUNDS-<f>-3 yes (rungs 2..5 live)",
+   "implication": "A_yes => B_yes",
+   "series": [
+    "KXUFCROUNDS",
+    "KXUFCROUNDS"
+   ],
+   "line_condition": "same-event: size_max=1 + yes-only -> no rung pair or band constructible",
+   "scope_note": "'fight ends before round N' is monotone in N",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": false,
+     "blocked_by": "KXUFCROUNDS is yes-only in the combo collections"
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXUFCROUNDS is yes-only in the combo collections; KXUFCROUNDS is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXUFCROUNDS is yes-only in the combo collections"
+    }
+   },
+   "examples": [],
+   "constructibility_evidence": "collections size_max=1; yes-only per tape (34,689 legs all yes)",
+   "engine_status": "NOT APPLICABLE (unconstructible)",
+   "notes": []
+  },
+  {
+   "id": "S47",
+   "sport": "ufc",
+   "name": "mof_decision excludes rounds_k  [NEAR-STRICT]",
+   "leg_a": "KXUFCMOF-<f>-DEC yes (either wins by decision)",
+   "leg_b": "KXUFCROUNDS-<f>-k yes (ends before round k)",
+   "implication": "A_yes => B_no (exclusion) \u2014 CAVEAT: a technical decision after an accidental foul can end a fight early AND settle DEC yes; strictness depends on Kalshi's method taxonomy (rules_primary only says 'wins by Decision')",
+   "series": [
+    "KXUFCMOF",
+    "KXUFCROUNDS"
+   ],
+   "line_condition": "ROUNDS rungs 2..5 live; k <= scheduled rounds",
+   "scope_note": "a (full) decision means the fight went the distance",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXUFCROUNDS is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "redundant",
+     "joint": "P(B_yes)",
+     "constructible": false,
+     "blocked_by": "KXUFCMOF is yes-only in the combo collections"
+    },
+    "no+no": {
+     "semantics": "window",
+     "joint": "1 - P(A_yes) - P(B_yes)",
+     "constructible": false,
+     "blocked_by": "KXUFCMOF is yes-only in the combo collections; KXUFCROUNDS is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXUFCMOF-26JUL11COSDUR-DEC (open)",
+     "KXUFCROUNDS-26JUL11COSDUR-2 (open)"
+    ]
+   ],
+   "constructibility_evidence": "zero DEC x ROUNDS prints in 8.7M rows (KOTKODQ x ROUNDS prints freely) \u2014 untested; farmable yes+yes candidate IF Kalshi settles technical decisions as DEC no",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S48",
+   "sport": "ufc",
+   "name": "fight_winner excludes mof_draw",
+   "leg_a": "KXUFCFIGHT-<f>-<FTR> yes",
+   "leg_b": "KXUFCMOF-<f>-DRAW yes (draw / no contest)",
+   "implication": "A_yes => B_no (exclusion)",
+   "series": [
+    "KXUFCFIGHT",
+    "KXUFCMOF"
+   ],
+   "line_condition": "none",
+   "scope_note": "a decided winner contradicts a draw/no-contest result",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXUFCMOF is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "redundant",
+     "joint": "P(B_yes)",
+     "constructible": false,
+     "blocked_by": "KXUFCFIGHT is yes-only in the combo collections"
+    },
+    "no+no": {
+     "semantics": "window",
+     "joint": "1 - P(A_yes) - P(B_yes)",
+     "constructible": false,
+     "blocked_by": "KXUFCFIGHT is yes-only in the combo collections; KXUFCMOF is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXUFCFIGHT-26JUL11MCGHOL-HOL (open)",
+     "KXUFCMOF-26JUL11MCGHOL-DRAW (open)"
+    ]
+   ],
+   "constructibility_evidence": "zero prints (winner x SUB/KOTKODQ/DEC print freely) \u2014 untested; farmable yes+yes candidate",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S49",
+   "sport": "tennis",
+   "name": "tournament_winner => match_winner  [CONDITIONAL/DORMANT]",
+   "leg_a": "KXATP-<tour>-<PLAYER> yes (also KXWTA)",
+   "leg_b": "KX{ATP,WTA}MATCH-<match>-<PLAYER> yes, same player, match inside that tournament",
+   "implication": "A_yes => B_yes when the match is played (retirement/walkover settlement nuances apply)",
+   "series": [
+    "KXATP",
+    "KXATPMATCH"
+   ],
+   "line_condition": "CURRENTLY DORMANT: only KXATP-26USO / KXWTA-26USO are open (US Open, starts ~Aug 31) while open MATCH markets belong to other tournaments; goes LIVE during any slam the two coexist",
+   "scope_note": "winning the tournament requires winning every match you play in it; event codes differ (26USO vs per-match game codes) so the mapping is by tournament membership, not game key",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": false,
+     "blocked_by": "KXATPMATCH is yes-only in the combo collections"
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXATP is yes-only in the combo collections; KXATPMATCH is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXATP is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXATP-26USO-SIN (open)",
+     "KXATPMATCH-<USO R1 match>-SIN (future)"
+    ]
+   ],
+   "constructibility_evidence": "untested (no concurrent window since tape started)",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  },
+  {
+   "id": "S50",
+   "sport": "golf",
+   "name": "finish-position chain: win => top5 => top10 => top20 => make_cut",
+   "leg_a": "KXPGATOUR-<t>-<P> / KXPGATOP5 / KXPGATOP10 / KXPGATOP20 (same player, same tournament)",
+   "leg_b": "any later element of the chain (10 transitive pairs)",
+   "implication": "A_yes => B_yes along the chain (TOP-k includes ties, rules verified; TOPk => MAKECUT valid at cut events \u2014 no-cut events don't list MAKECUT)",
+   "series": [
+    "KXPGATOUR",
+    "KXPGAMAKECUT"
+   ],
+   "line_condition": "all five series live (THOC26 - The Open; GESO26; ISC26 on tape); all yes-only -> ONLY the redundant yes+yes mix is side-constructible",
+   "scope_note": "tournament scope (not per-game); ties inclusion keeps the chain monotone",
+   "side_mix": {
+    "yes+yes": {
+     "semantics": "redundant",
+     "joint": "P(A_yes)",
+     "constructible": true
+    },
+    "yes+no": {
+     "semantics": "impossible",
+     "joint": "0",
+     "farmable": true,
+     "constructible": false,
+     "blocked_by": "KXPGAMAKECUT is yes-only in the combo collections"
+    },
+    "no+no": {
+     "semantics": "redundant",
+     "joint": "P(B_no)",
+     "constructible": false,
+     "blocked_by": "KXPGATOUR is yes-only in the combo collections; KXPGAMAKECUT is yes-only in the combo collections"
+    },
+    "no+yes": {
+     "semantics": "window",
+     "joint": "P(B_yes) - P(A_yes)",
+     "constructible": false,
+     "blocked_by": "KXPGATOUR is yes-only in the combo collections"
+    }
+   },
+   "examples": [
+    [
+     "KXPGATOP20-ISC26-MHOM:yes",
+     "KXPGAMAKECUT-ISC26-MHOM:yes"
+    ],
+    [
+     "KXPGATOUR-ISC26-JWOL:yes",
+     "KXPGAMAKECUT-ISC26-JWOL:yes"
+    ]
+   ],
+   "constructibility_evidence": "TAPE-PRINTED: TOUR/TOP5/TOP10/TOP20 x MAKECUT same-player (1180/146/127/202 prints) \u2014 strict containment constructs on the exchange here; adjacent finish pairs (TOUR x TOP5, TOP5 x TOP10, TOP10 x TOP20) zero prints \u2014 untested, plausibly also allowed",
+   "engine_status": "NOT MODELED",
+   "notes": []
+  }
+ ]
+}
