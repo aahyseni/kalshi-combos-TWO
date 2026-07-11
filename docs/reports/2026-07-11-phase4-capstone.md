@@ -85,6 +85,18 @@ the v3 artifact.
   validation set. **Fix IN PROGRESS in an isolated worktree** (main tree
   untouched while the per-print pass imports from it); merges after the WC
   per-print pass completes.
+- **Historical audit (operator challenge: "soccer was complete — regression?"):
+  NOT a regression.** The decline branch was born 2026-07-07 in `6325dbb` — the
+  SAME commit that wired the 1H×FT soccer correlations (the 1H legs created the
+  shape; the in-larger-combo case was deliberately fail-closed that day). The
+  old honest baseline carried it at the identical rate: its 499 unpriced
+  printed combos = 302 snapshot-empty + **197 containment declines + 0 other**
+  (197/19,318 = 1.02% vs fresh 227/21,968 = 1.03%). No published soccer stat
+  ever included these (declines produce no error rows) and no money was quoted
+  on them. **Process lesson codified:** decline-reason histograms must be
+  printed by every backtest analyze step (MLB's DO-9 counters do; the WC
+  analyzer didn't) — silence must be enumerable. WC analyzer gets the
+  histogram after the per-print pass completes (no mid-pass edits).
 - **Within-2¢ decomposed** (`ph4\mixed\w2c_decomposition.json`): 86% of misses
   are one-sided (fair BELOW clearing = markup + winner's curse in the prints);
   the fixed 2¢ band is relatively harsher on expensive combos (≤5¢: 99.1% w2 →
