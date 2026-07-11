@@ -42,6 +42,8 @@ SAME_PLAYER_CONDITIONALS: dict[_Key, _CellValue] = {
     # 2005-25, gamelog-validated; the original wiring received a truncated
     # 60-cell copy — restored in full from the measurement artifact).
     # 33 exact cells verified empirically == 1.0 pooled AND 2021-25.
+    # +7 ('tb', N, 'hrr', 1) exact cells (WIRE-2 re-run, 2026-07-11 — see the
+    # provenance block at the end of the table) = 149 cells / 40 exact.
     ('hit', 1, 'hr', 1): (0.17209235086525787, 587975, 'measured'),
     ('hit', 1, 'hr', 2): (0.01053616225179642, 587975, 'measured'),
     ('hit', 1, 'hrr', 2): (0.7335583995918193, 587975, 'measured'),
@@ -184,6 +186,22 @@ SAME_PLAYER_CONDITIONALS: dict[_Key, _CellValue] = {
     ('tb', 6, 'hrr', 3): (0.9999042970619199, 31347, 'measured'),
     ('tb', 6, 'hrr', 4): (0.9977031294860752, 31347, 'measured'),
     ('tb', 6, 'hrr', 5): (0.9367403579289885, 31347, 'measured'),
+    # WIRE-2 (2026-07-11, S41): any total-bases rung ⟹ >=1 hit ⟹ HRR >= 1
+    # (total bases are credited only on hits; HRR = H + R + RBI >= H). The
+    # HRR-1 column was absent from the 2026-07-10 export's grid (hrr 2..5) —
+    # these cells come from a RE-RUN of that export's exact join + population
+    # (1,033,852 batter-games; job 24844262 tmp/ph4/wire2/tb_hrr1_cells.py),
+    # each verified == 1.0 POOLED and on the 2021-25 era split; n's for
+    # tb 2..6 reproduce the existing rows' conditioning counts exactly.
+    # Rungs 2..7 are the live TB rung universe; 8 is tape-printed (109 legs)
+    # and carries the identical arithmetic + measurement, so it is wired too.
+    ('tb', 2, 'hrr', 1): (1.0, 340876, 'exact'),
+    ('tb', 3, 'hrr', 1): (1.0, 195319, 'exact'),
+    ('tb', 4, 'hrr', 1): (1.0, 133796, 'exact'),
+    ('tb', 5, 'hrr', 1): (1.0, 64038, 'exact'),
+    ('tb', 6, 'hrr', 1): (1.0, 31347, 'exact'),
+    ('tb', 7, 'hrr', 1): (1.0, 14744, 'exact'),
+    ('tb', 8, 'hrr', 1): (1.0, 8813, 'exact'),
 }
 
 # A measured cell prices only when its conditioning sample is at least this

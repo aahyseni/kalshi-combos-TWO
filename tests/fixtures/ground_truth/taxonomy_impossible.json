@@ -1,0 +1,472 @@
+{
+  "meta": {
+    "generated": "2026-07-11",
+    "task": "FIX-4 constructibility tripwire fixture (V3 kalshi_robustness.md section 2.4-1, judge-mandated)",
+    "sources": [
+      "docs/calibration/containment_probe/taxonomy.json (2026-07-11, 50-shape universe; impossible side-mix semantics per shape)",
+      "docs/calibration/containment_probe/exchange_matrix.json (2026-07-11 validator probes P01-P42/F/R/M/N; per-cell BLOCKED verdicts cited on each cell below)",
+      "tape ticker shapes verified read-only from data/combomaker-prod.sqlite3 rfqs 2026-07-11 (KXWNBAPTS-<g>-<PLAYER>-<line>, KXUFCROUNDS-<f>-<k>, KXUFCMOF-<f>-<method>, KXUFCFIGHT-<f>-<side>, KXPGATOP20-<t>-<P>)"
+    ],
+    "semantics": "every cell is a semantically-IMPOSSIBLE shape x side-mix (its YES can never settle) that is exchange-BLOCKED today and NOT intercepted by the shipped impossibility families; a live RFQ matching one is proof the Kalshi validator loosened",
+    "verdict": "IMPOSSIBLE farmable=False with note 'taxonomy-impossible tripwire: <shape>' - decline + count, never a copula price, never a farm (fixture-driven certainty is not an airtight in-code proof)",
+    "excluded": {
+      "S23, S25": "stage-conditional implications (extra-time contexts break them) - not unconditionally impossible, never pinned",
+      "S49": "tennis tournament-win => match-win is CROSS-scope (tournament and match carry different game codes); the tripwire scans same-game pairs only and no verified same-scope ticker key exists - documented residual (prices at cross_event_rho=0 as before)",
+      "S1, S2, S3(M=N), S6, S7, S8, S12, S13, S30, S31, S33, S34, S35-S41": "already IMPOSSIBLE via the shipped families in relationships.py, which own their farmable verdicts and run before the tripwire"
+    },
+    "leg_pattern_fields": "side (yes|no, required); type (LegType value); series_is/series_has/series_lacks (series-prefix matchers); suffix_in/suffix_not_in (last-segment literal sets); suffix_team (last segment parses TEAM+optional-digits, draw tokens excluded); line/line_ge/line_le (parsed ticker line); requires_line",
+    "relations": "same_team | diff_team (digit-stripped suffix teams; within ONE game two team suffixes are drawn from that game's two-team vocabulary) | same_entity (segment-2 player/entity equality) | line_a_gt_b | line_a_ge_b | line_a_lt_b"
+  },
+  "cells": [
+    {
+      "shape": "S19",
+      "name": "under_0.5 => draw: {total-1 no (0-0), draw no} impossible",
+      "sport": "soccer",
+      "a": {"side": "no", "type": "total", "line": 1},
+      "b": {"side": "no", "type": "moneyline", "suffix_in": ["TIE", "DRAW"]},
+      "relations": [],
+      "blocked": "invalid_parameters - KXWCGAME is_yes_only (probe P02); V3 dangerous row 3 (copula moneyline|total +0.28, 29.5c ref)"
+    },
+    {
+      "shape": "S20",
+      "name": "1h_under_0.5 => 1h_draw: {1h_total-1 no (0-0 at half), 1h draw no} impossible",
+      "sport": "soccer",
+      "a": {"side": "no", "type": "first_half_total", "line": 1},
+      "b": {"side": "no", "type": "first_half_moneyline", "suffix_in": ["TIE", "DRAW"]},
+      "relations": [],
+      "blocked": "invalid_parameters - KXWC1H is_yes_only (probe P02); V3 dangerous row 9 (copula :tie -0.95, 5.1c ref)"
+    },
+    {
+      "shape": "S24",
+      "name": "first_goal(player) => player_goal_1: {first-goal yes, goal-1 no} same player impossible",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "player_goal", "series_has": "FIRSTGOAL", "suffix_not_in": ["NOGOAL"]},
+      "b": {"side": "no", "type": "player_goal", "series_lacks": "FIRSTGOAL", "line": 1},
+      "relations": ["same_entity"],
+      "blocked": "invalid_parameters - KXWCGOAL is_yes_only (probe P02); V3 dangerous row 1 / tier-1 (copula player_goal|player_goal +0.03, 24.5c ref)"
+    },
+    {
+      "shape": "S27",
+      "name": "nogoal => draw: {NOGOAL yes, draw no} impossible",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "player_goal", "series_has": "FIRSTGOAL", "suffix_in": ["NOGOAL"]},
+      "b": {"side": "no", "type": "moneyline", "suffix_in": ["TIE", "DRAW"]},
+      "relations": [],
+      "blocked": "invalid_parameters - KXWCGAME is_yes_only (probe P02); V3 dangerous row 4 / tier-1 (copula moneyline|player_goal +0.50, 16.7c ref)"
+    },
+    {
+      "shape": "S26",
+      "name": "nogoal excludes over-(N-0.5), any N>=1: {NOGOAL yes, total-N yes} impossible (zero goals incl extra time)",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "player_goal", "series_has": "FIRSTGOAL", "suffix_in": ["NOGOAL"]},
+      "b": {"side": "yes", "type": "total", "line_ge": 1},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - probe P24; V3 dangerous row 10 (copula +0.46 SIGN-WRONG for NOGOAL, 32.6c ref)"
+    },
+    {
+      "shape": "S28",
+      "name": "nogoal excludes btts: {NOGOAL yes, BTTS yes} impossible",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "player_goal", "series_has": "FIRSTGOAL", "suffix_in": ["NOGOAL"]},
+      "b": {"side": "yes", "type": "btts"},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - probe P27; V3 dangerous row 11 (copula +0.55 sign-wrong, 34.3c ref)"
+    },
+    {
+      "shape": "S29",
+      "name": "nogoal bundle: {NOGOAL yes, 1h_total-N yes} impossible, any N>=1 (probed member N=1)",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "player_goal", "series_has": "FIRSTGOAL", "suffix_in": ["NOGOAL"]},
+      "b": {"side": "yes", "type": "first_half_total", "line_ge": 1},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - probe M11; V3 dangerous row 12 (copula +0.33, 30.4c ref)"
+    },
+    {
+      "shape": "S29",
+      "name": "nogoal bundle: {NOGOAL yes, 1h_btts yes} impossible",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "player_goal", "series_has": "FIRSTGOAL", "suffix_in": ["NOGOAL"]},
+      "b": {"side": "yes", "type": "first_half_btts"},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - taxonomy S29 bundle, exchange 'other_members' inferred from P24-P28/M11"
+    },
+    {
+      "shape": "S29",
+      "name": "nogoal bundle: {NOGOAL yes, 1h draw no} impossible (0-0 at half is a 1H draw)",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "player_goal", "series_has": "FIRSTGOAL", "suffix_in": ["NOGOAL"]},
+      "b": {"side": "no", "type": "first_half_moneyline", "suffix_in": ["TIE", "DRAW"]},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - taxonomy S29 bundle, exchange 'other_members' inferred"
+    },
+    {
+      "shape": "S29",
+      "name": "nogoal bundle: {NOGOAL yes, 1h team lead yes} impossible (a lead needs a goal)",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "player_goal", "series_has": "FIRSTGOAL", "suffix_in": ["NOGOAL"]},
+      "b": {"side": "yes", "type": "first_half_moneyline", "suffix_team": true},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - taxonomy S29 bundle, exchange 'other_members' inferred"
+    },
+    {
+      "shape": "S29",
+      "name": "nogoal bundle: {NOGOAL yes, 1h spread cover-by-N yes} impossible (N>=1 needs a goal)",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "player_goal", "series_has": "FIRSTGOAL", "suffix_in": ["NOGOAL"]},
+      "b": {"side": "yes", "type": "first_half_spread", "suffix_team": true, "line_ge": 1},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - taxonomy S29 bundle, exchange 'other_members' inferred"
+    },
+    {
+      "shape": "S29",
+      "name": "nogoal bundle: {NOGOAL yes, spread cover-by-N yes} impossible (N>=1 needs a goal)",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "player_goal", "series_has": "FIRSTGOAL", "suffix_in": ["NOGOAL"]},
+      "b": {"side": "yes", "type": "spread", "suffix_team": true, "line_ge": 1},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - taxonomy S29 bundle, exchange 'other_members' inferred"
+    },
+    {
+      "shape": "S29",
+      "name": "nogoal bundle: {NOGOAL yes, team reg win yes} impossible (a reg win needs a goal)",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "player_goal", "series_has": "FIRSTGOAL", "suffix_in": ["NOGOAL"]},
+      "b": {"side": "yes", "type": "moneyline", "suffix_team": true},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - taxonomy S29 bundle, exchange 'other_members' inferred"
+    },
+    {
+      "shape": "S4",
+      "name": "1h_win => 1h_over_0.5: {1h team lead yes, 1h_total-1 no} impossible",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "first_half_moneyline", "suffix_team": true},
+      "b": {"side": "no", "type": "first_half_total", "line": 1},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - probe R01; V3 dangerous row 25 (copula :team +0.95, 5.1c ref)"
+    },
+    {
+      "shape": "S5",
+      "name": "1h_win => ft_over_0.5: {1h team lead yes, ft_total-1 no} impossible (1H goals persist)",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "first_half_moneyline", "suffix_team": true},
+      "b": {"side": "no", "type": "total", "line": 1},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - probe F01; V3 dangerous row 18 (copula :team +0.24, 21.1c ref)"
+    },
+    {
+      "shape": "S9",
+      "name": "1h_btts => 1h_over_1.5: {1h btts yes, 1h_total no line<=2} impossible (both scoring = >=2 goals)",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "first_half_btts"},
+      "b": {"side": "no", "type": "first_half_total", "line_ge": 1, "line_le": 2},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - probe R02; V3 dangerous row 26 (copula +0.95, 5.1c ref)"
+    },
+    {
+      "shape": "S10",
+      "name": "1h_btts => ft_over_1.5: {1h btts yes, ft_total no line<=2} impossible",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "first_half_btts"},
+      "b": {"side": "no", "type": "total", "line_ge": 1, "line_le": 2},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - probe R03; V3 dangerous row 21 (copula +0.65, 13.7c ref)"
+    },
+    {
+      "shape": "S11",
+      "name": "btts => ft_over_1.5: {btts yes, ft_total no line<=2} impossible",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "btts"},
+      "b": {"side": "no", "type": "total", "line_ge": 1, "line_le": 2},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - probe R04; V3 dangerous row 22 (copula +0.70, 12.7c ref)"
+    },
+    {
+      "shape": "S3L",
+      "name": "1h_over_N => ft_over_M (M<=N): {1h_total-N yes, ft_total-M no} impossible (equal lines owned by shipped family 3, farmable)",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "first_half_total", "requires_line": true},
+      "b": {"side": "no", "type": "total", "requires_line": true},
+      "relations": ["line_a_ge_b"],
+      "blocked": "conflicting_leg_outcomes - probe M02 (1HTOTAL-2 yes + TOTAL-1 no); V3 dangerous row 23 (copula +0.73, 12.0c ref)"
+    },
+    {
+      "shape": "S14",
+      "name": "spread_N => advance: {cover-by-N yes, same-team advance no} impossible (knockout reg win by N>=1 advances)",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "spread", "suffix_team": true, "line_ge": 1},
+      "b": {"side": "no", "type": "advance", "suffix_team": true},
+      "relations": ["same_team"],
+      "blocked": "conflicting_leg_outcomes - probe R05; V3 dangerous row 24 (copula advance|spread +0.95, 5.1c ref)"
+    },
+    {
+      "shape": "S15",
+      "name": "ml_win(reg) => advance: {team reg win yes, same-team advance no} impossible",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "moneyline", "suffix_team": true},
+      "b": {"side": "no", "type": "advance", "suffix_team": true},
+      "relations": ["same_team"],
+      "blocked": "conflicting_leg_outcomes - probe P14 (re-verifies 2026-07-07 audit); V3 dangerous row 19 (flat 0.6, 14.8c ref)"
+    },
+    {
+      "shape": "S16",
+      "name": "spread_N excludes draw: {cover-by-N yes, draw yes} impossible",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "spread", "suffix_team": true, "line_ge": 1},
+      "b": {"side": "yes", "type": "moneyline", "suffix_in": ["TIE", "DRAW"]},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - probe P15; V3 dangerous row 15 (flat 0.6, 35.2c ref)"
+    },
+    {
+      "shape": "S17",
+      "name": "spread_N excludes opponent_win: {cover-by-N yes, other-team win yes} impossible",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "spread", "suffix_team": true, "line_ge": 1},
+      "b": {"side": "yes", "type": "moneyline", "suffix_team": true},
+      "relations": ["diff_team"],
+      "blocked": "conflicting_leg_outcomes - probe P16; V3 dangerous row 16 (flat 0.6, 35.2c ref)"
+    },
+    {
+      "shape": "S18",
+      "name": "advance_A excludes ml_win_B: {A advances yes, B reg win yes} impossible (B's reg win advances B)",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "advance", "suffix_team": true},
+      "b": {"side": "yes", "type": "moneyline", "suffix_team": true},
+      "relations": ["diff_team"],
+      "blocked": "conflicting_leg_outcomes - probe P17; V3 dangerous row 17 (flat 0.6, 35.2c ref)"
+    },
+    {
+      "shape": "S21",
+      "name": "1h_spread_N excludes 1h_draw: {1h cover-by-N yes, 1h draw yes} impossible",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "first_half_spread", "suffix_team": true, "line_ge": 1},
+      "b": {"side": "yes", "type": "first_half_moneyline", "suffix_in": ["TIE", "DRAW"]},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - probe P20; V3 dangerous row 27 (copula :tie -0.95, 5.1c ref)"
+    },
+    {
+      "shape": "S22",
+      "name": "1h_spread_N excludes 1h_opponent_win: {1h cover-by-N yes, other-team 1h lead yes} impossible",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "first_half_spread", "suffix_team": true, "line_ge": 1},
+      "b": {"side": "yes", "type": "first_half_moneyline", "suffix_team": true},
+      "relations": ["diff_team"],
+      "blocked": "conflicting_leg_outcomes - probe P21; V3 dangerous row 28 (copula :opp -0.95, 5.1c ref)"
+    },
+    {
+      "shape": "S32",
+      "name": "team_corners_N => match_corners_M (M<=N): {team-corners-N yes, match-corners-M no} impossible",
+      "sport": "soccer",
+      "a": {"side": "yes", "type": "corners_team", "suffix_team": true, "line_ge": 1},
+      "b": {"side": "no", "type": "corners", "requires_line": true},
+      "relations": ["line_a_ge_b"],
+      "blocked": "conflicting_leg_outcomes - probe P31; V3 dangerous row 20 (copula corners|corners_team +0.62, 14.4c ref)"
+    },
+    {
+      "shape": "S44",
+      "name": "wnba spread_cover => ml_win: {cover-by-N yes, same-team win no} impossible",
+      "sport": "wnba",
+      "a": {"side": "yes", "type": "spread", "suffix_team": true, "line_ge": 1},
+      "b": {"side": "no", "type": "moneyline", "suffix_team": true},
+      "relations": ["same_team"],
+      "blocked": "invalid_parameters - KXWNBAGAME is_yes_only (probe P02 species); V3 dangerous row 5 (flat 0.6, 14.8c ref)"
+    },
+    {
+      "shape": "S44",
+      "name": "wnba spread_A excludes win_B: {A cover-by-N yes, B win yes} impossible (opponent farm P33)",
+      "sport": "wnba",
+      "a": {"side": "yes", "type": "spread", "suffix_team": true, "line_ge": 1},
+      "b": {"side": "yes", "type": "moneyline", "suffix_team": true},
+      "relations": ["diff_team"],
+      "blocked": "conflicting_leg_outcomes - probe P33; V3 dangerous row 29 (flat 0.6, 14.8c ref)"
+    },
+    {
+      "shape": "S45",
+      "name": "wnba spread rung ladder: {cover-by-HIGH yes, same-team cover-by-LOW no} impossible",
+      "sport": "wnba",
+      "a": {"side": "yes", "type": "spread", "suffix_team": true, "requires_line": true},
+      "b": {"side": "no", "type": "spread", "suffix_team": true, "requires_line": true},
+      "relations": ["same_team", "line_a_gt_b"],
+      "blocked": "invalid_parameters - KXWNBASPREAD size_max=1 (collections.json); V3 dangerous row 6 (flat 0.6, 14.8c ref)"
+    },
+    {
+      "shape": "S45",
+      "name": "wnba total rung ladder: {over-HIGH yes, over-LOW no} impossible",
+      "sport": "wnba",
+      "a": {"side": "yes", "type": "total", "requires_line": true},
+      "b": {"side": "no", "type": "total", "requires_line": true},
+      "relations": ["line_a_gt_b"],
+      "blocked": "invalid_parameters - KXWNBATOTAL size_max=1 (collections.json); taxonomy S45"
+    },
+    {
+      "shape": "S45",
+      "name": "wnba PTS same-player ladder: {PTS-HIGH yes, PTS-LOW no} impossible",
+      "sport": "wnba",
+      "a": {"side": "yes", "series_has": "WNBAPTS", "requires_line": true},
+      "b": {"side": "no", "series_has": "WNBAPTS", "requires_line": true},
+      "relations": ["same_entity", "line_a_gt_b"],
+      "blocked": "duplicated_legs - probe 2026-07-10 P3b (direct on WNBA PTS); V3 dangerous row 30 (untyped flat 0.6, 14.8c ref); ticker shape tape-verified KXWNBAPTS-26JUL11NYMIN-MINOMILES5-15"
+    },
+    {
+      "shape": "S46",
+      "name": "ufc rounds ladder (ends-before-k): {ends-before-LOW yes, ends-before-HIGH no} impossible",
+      "sport": "ufc",
+      "a": {"side": "yes", "series_has": "UFCROUNDS", "requires_line": true},
+      "b": {"side": "no", "series_has": "UFCROUNDS", "requires_line": true},
+      "relations": ["line_a_lt_b"],
+      "blocked": "invalid_parameters - KXUFCROUNDS size_max=1 + is_yes_only; V3 dangerous row 7 (untyped flat 0.6, 14.8c ref); ticker shape tape-verified KXUFCROUNDS-26JUL11STEELL-2"
+    },
+    {
+      "shape": "S47",
+      "name": "ufc mof_decision excludes rounds_k (NEAR-STRICT per taxonomy - decline-only makes the caveat safe): {DEC yes, ends-before-k yes}",
+      "sport": "ufc",
+      "a": {"side": "yes", "series_has": "UFCMOF", "suffix_in": ["DEC"]},
+      "b": {"side": "yes", "series_has": "UFCROUNDS", "requires_line": true},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - probe P34; V3 dangerous row 13 (untyped flat 0.6, 35.2c ref)"
+    },
+    {
+      "shape": "S48",
+      "name": "ufc fight_winner excludes mof_draw: {winner yes, DRAW yes} impossible",
+      "sport": "ufc",
+      "a": {"side": "yes", "series_has": "UFCFIGHT"},
+      "b": {"side": "yes", "series_has": "UFCMOF", "suffix_in": ["DRAW"]},
+      "relations": [],
+      "blocked": "conflicting_leg_outcomes - probe P35; V3 dangerous row 14 (flat 0.6, 35.2c ref)"
+    },
+    {
+      "shape": "S50",
+      "name": "golf chain win => top5: {TOUR yes, TOP5 no} same player impossible",
+      "sport": null,
+      "a": {"side": "yes", "series_is": "KXPGATOUR"},
+      "b": {"side": "no", "series_is": "KXPGATOP5"},
+      "relations": ["same_entity"],
+      "blocked": "invalid_parameters - KXPGA* is_yes_only (any no-side); V3 dangerous row 8 (untyped flat 0.6, 14.8c ref)"
+    },
+    {
+      "shape": "S50",
+      "name": "golf chain win => top10: {TOUR yes, TOP10 no} same player impossible",
+      "sport": null,
+      "a": {"side": "yes", "series_is": "KXPGATOUR"},
+      "b": {"side": "no", "series_is": "KXPGATOP10"},
+      "relations": ["same_entity"],
+      "blocked": "invalid_parameters - KXPGA* is_yes_only (any no-side)"
+    },
+    {
+      "shape": "S50",
+      "name": "golf chain win => top20: {TOUR yes, TOP20 no} same player impossible",
+      "sport": null,
+      "a": {"side": "yes", "series_is": "KXPGATOUR"},
+      "b": {"side": "no", "series_is": "KXPGATOP20"},
+      "relations": ["same_entity"],
+      "blocked": "invalid_parameters - KXPGA* is_yes_only (any no-side)"
+    },
+    {
+      "shape": "S50",
+      "name": "golf chain win => make_cut: {TOUR yes, MAKECUT no} same player impossible",
+      "sport": null,
+      "a": {"side": "yes", "series_is": "KXPGATOUR"},
+      "b": {"side": "no", "series_is": "KXPGAMAKECUT"},
+      "relations": ["same_entity"],
+      "blocked": "invalid_parameters - KXPGA* is_yes_only (any no-side)"
+    },
+    {
+      "shape": "S50",
+      "name": "golf chain top5 => top10: {TOP5 yes, TOP10 no} same player impossible",
+      "sport": null,
+      "a": {"side": "yes", "series_is": "KXPGATOP5"},
+      "b": {"side": "no", "series_is": "KXPGATOP10"},
+      "relations": ["same_entity"],
+      "blocked": "invalid_parameters - KXPGA* is_yes_only (any no-side)"
+    },
+    {
+      "shape": "S50",
+      "name": "golf chain top5 => top20: {TOP5 yes, TOP20 no} same player impossible",
+      "sport": null,
+      "a": {"side": "yes", "series_is": "KXPGATOP5"},
+      "b": {"side": "no", "series_is": "KXPGATOP20"},
+      "relations": ["same_entity"],
+      "blocked": "invalid_parameters - KXPGA* is_yes_only (any no-side)"
+    },
+    {
+      "shape": "S50",
+      "name": "golf chain top5 => make_cut: {TOP5 yes, MAKECUT no} same player impossible",
+      "sport": null,
+      "a": {"side": "yes", "series_is": "KXPGATOP5"},
+      "b": {"side": "no", "series_is": "KXPGAMAKECUT"},
+      "relations": ["same_entity"],
+      "blocked": "invalid_parameters - KXPGA* is_yes_only (any no-side)"
+    },
+    {
+      "shape": "S50",
+      "name": "golf chain top10 => top20: {TOP10 yes, TOP20 no} same player impossible",
+      "sport": null,
+      "a": {"side": "yes", "series_is": "KXPGATOP10"},
+      "b": {"side": "no", "series_is": "KXPGATOP20"},
+      "relations": ["same_entity"],
+      "blocked": "invalid_parameters - KXPGA* is_yes_only (any no-side)"
+    },
+    {
+      "shape": "S50",
+      "name": "golf chain top10 => make_cut: {TOP10 yes, MAKECUT no} same player impossible",
+      "sport": null,
+      "a": {"side": "yes", "series_is": "KXPGATOP10"},
+      "b": {"side": "no", "series_is": "KXPGAMAKECUT"},
+      "relations": ["same_entity"],
+      "blocked": "invalid_parameters - KXPGA* is_yes_only (any no-side)"
+    },
+    {
+      "shape": "S50",
+      "name": "golf chain top20 => make_cut: {TOP20 yes, MAKECUT no} same player impossible",
+      "sport": null,
+      "a": {"side": "yes", "series_is": "KXPGATOP20"},
+      "b": {"side": "no", "series_is": "KXPGAMAKECUT"},
+      "relations": ["same_entity"],
+      "blocked": "invalid_parameters - KXPGA* is_yes_only (any no-side)"
+    },
+    {
+      "shape": "S42",
+      "name": "mlb same-player HIT ladder: {HIT-HIGH yes, HIT-LOW no} impossible",
+      "sport": "mlb",
+      "a": {"side": "yes", "type": "player_hit", "requires_line": true},
+      "b": {"side": "no", "type": "player_hit", "requires_line": true},
+      "relations": ["same_entity", "line_a_gt_b"],
+      "blocked": "taxonomy S42 (same-side blocked duplicated_legs, probes P3/P3b/P2b; yes+no UNPROBEABLE) - pinned defensively; never farmable (MLB 48h rain-scalar)"
+    },
+    {
+      "shape": "S42",
+      "name": "mlb same-player TB ladder: {TB-HIGH yes, TB-LOW no} impossible",
+      "sport": "mlb",
+      "a": {"side": "yes", "type": "player_tb", "requires_line": true},
+      "b": {"side": "no", "type": "player_tb", "requires_line": true},
+      "relations": ["same_entity", "line_a_gt_b"],
+      "blocked": "taxonomy S42 - pinned defensively; never farmable (MLB 48h rain-scalar)"
+    },
+    {
+      "shape": "S42",
+      "name": "mlb same-player HRR ladder: {HRR-HIGH yes, HRR-LOW no} impossible",
+      "sport": "mlb",
+      "a": {"side": "yes", "type": "player_hrr", "requires_line": true},
+      "b": {"side": "no", "type": "player_hrr", "requires_line": true},
+      "relations": ["same_entity", "line_a_gt_b"],
+      "blocked": "taxonomy S42 - pinned defensively; never farmable (MLB 48h rain-scalar)"
+    },
+    {
+      "shape": "S42",
+      "name": "mlb same-player HR ladder: {HR-HIGH yes, HR-LOW no} impossible",
+      "sport": "mlb",
+      "a": {"side": "yes", "type": "player_hr", "requires_line": true},
+      "b": {"side": "no", "type": "player_hr", "requires_line": true},
+      "relations": ["same_entity", "line_a_gt_b"],
+      "blocked": "taxonomy S42 - pinned defensively; never farmable (MLB 48h rain-scalar)"
+    },
+    {
+      "shape": "S42",
+      "name": "mlb same-pitcher KS ladder: {KS-HIGH yes, KS-LOW no} impossible",
+      "sport": "mlb",
+      "a": {"side": "yes", "type": "player_ks", "requires_line": true},
+      "b": {"side": "no", "type": "player_ks", "requires_line": true},
+      "relations": ["same_entity", "line_a_gt_b"],
+      "blocked": "taxonomy S42 - pinned defensively; never farmable (MLB 48h rain-scalar)"
+    }
+  ]
+}

@@ -196,6 +196,19 @@ class PricingEngine:
             # here so it never reaches the copula (which would price the pair at
             # a pairwise ρ and under-quote the certain part).
             joint = price_containment(beliefs, sides, relationship.containment)
+        elif relationship.kind is RelationshipKind.CONTAINMENT:
+            # CONTAINMENT/CONDITIONAL-IN-LARGER-COMBO collapse (2026-07-11):
+            # the classifier recorded ≥1 containment and/or same-player
+            # conditional pair inside a >2-leg combo (the shapes that used to
+            # decline UNKNOWN "not modeled"). Same mechanical template as
+            # nested bands — drop each implied superset leg / collapse each
+            # window pair into a band super-leg / collapse each conditional
+            # pair into its bare-path 2-leg joint — dispatched before
+            # structural/copula. Any failure declines.
+            collapsed = self._price_nested_bands(rfq, beliefs, sides, relationship)
+            if isinstance(collapsed, NoQuote):
+                return collapsed
+            joint = collapsed
         elif relationship.kind is RelationshipKind.NESTED_BAND:
             # Nested-band arithmetic is EXACT (P(low) − P(high)); it must never
             # fall to the copula (flat-0.6 overprices live match-corner bands by
@@ -374,27 +387,61 @@ class PricingEngine:
         relationship: Relationship,
     ) -> JointEstimate | NoQuote:
         """Collapse each nested-band pair (yes-LOW + no-HIGH rungs of one
-        ladder) into a SUPER-LEG whose marginal is the EXACT band probability
-        P(over-low) − P(over-high), then price the reduced leg set with the
-        ordinary SGP/copula machinery.
+        ladder) AND each containment window pair ({A no, B yes} of A ⟹ B —
+        the same arithmetic P(B) − P(A), 2026-07-11 universal-window rule)
+        into a SUPER-LEG whose marginal is the EXACT band probability, drop
+        each containment pair's implied SUPERSET leg (CONTAINMENT collapse,
+        2026-07-11), collapse each same-player CONDITIONAL pair into a
+        super-leg whose p is the bare path's 2-leg conditional joint
+        (WIRE-4), then price the reduced leg set with the ordinary SGP/copula
+        machinery. NESTED_BAND relationships carry only ``bands`` (ladder
+        rungs + windows); the N-leg CONTAINMENT relationship carries
+        ``containments`` / ``conditionals`` (+ any window ``bands``) — one
+        collapse engine serves both, structural deliberately skipped (its
+        ticker-parse inversion would misread a super-leg's synthetic
+        marginal).
 
         - A bare 2-leg band reduces to ONE leg: the joint IS the arithmetic,
           no ρ anywhere in the price.
-        - The classifier guarantees every band's game holds ONLY its two rungs,
-          so a band super-leg only ever meets other legs CROSS-game
-          (cross_event_rho), where representing it by its low-line leg is exact
-          (band × same-game-neighbour shapes decline UNKNOWN upstream).
-        - Width: the super-leg carries u_low + u_high (a difference's errors
-          add — conservative linear sum, same convention as price_joint).
+        - The classifier guarantees every band's game holds ONLY its two legs
+          among the kept legs, so a band super-leg only ever meets other legs
+          CROSS-game (cross_event_rho), where representing it by its low
+          (superset) leg is exact (band × same-game-neighbour shapes decline
+          UNKNOWN upstream).
+        - A containment pair's joint IS the subset leg's selected marginal
+          (price_containment semantics), so the superset leg simply drops;
+          the kept subset keeps its own belief and single-leg uncertainty.
+        - A conditional pair's joint is computed EXACTLY like the bare 2-leg
+          path (build_sgp_correlation on the pair + price_joint_matrices —
+          the sgp implied-rho seam over SAME_PLAYER_CONDITIONALS, all four
+          side mixes); the super-leg carries that joint as a YES-side
+          marginal with the pair joint's uncertainty. The classifier
+          guarantees the pair's game holds NO other kept leg (V2 refutation
+          2026-07-11: a same-game neighbour would see the super-leg through
+          the kept leg's YES-side rho, whose SIGN is wrong for NO-side
+          mixes), so a conditional super-leg only ever meets other legs
+          CROSS-game — re-checked below fail-closed.
+        - Width: a band super-leg carries u_low + u_high (a difference's
+          errors add — conservative linear sum, same convention as
+          price_joint).
         - Fail-closed: P(low) ≤ P(high) means the leg books contradict the
           ladder ordering (stale/crossed data) ⇒ NoQuote, never a clamped-to-0
-          fair whose sell-only NO bid would quote near $1 on bad data.
+          fair whose sell-only NO bid would quote near $1 on bad data. A
+          degenerate (≤ 0) conditional pair joint declines identically.
+        - Inverted CONTAINMENT marginals (subset priced above superset) are
+          NOT a decline: mirror price_containment's Fréchet clamp on the bare
+          pair — cap the kept subset's selected marginal at the superset's.
         """
-        if not relationship.bands:
+        if (
+            not relationship.bands
+            and not relationship.containments
+            and not relationship.conditionals
+        ):
             # Classifier bug guard: the kind without pairs must refuse, never
             # fall through to a copula guess.
             return NoQuote(
-                ReasonCode.SKIP_PRICING_FAILED, "nested-band kind without band pairs"
+                ReasonCode.SKIP_PRICING_FAILED,
+                "band/containment collapse kind without pairs",
             )
         band_p: dict[int, float] = {}
         band_u: dict[int, float] = {}
@@ -411,21 +458,114 @@ class PricingEngine:
             band_p[low_i] = p_band
             band_u[low_i] = beliefs[low_i].uncertainty + beliefs[high_i].uncertainty
             dropped.add(high_i)
+        # Conditional super-legs (WIRE-4): the pair's 2-leg joint via the
+        # EXACT bare-path machinery (same functions, same params, same-game
+        # group) so the collapse can never drift from the bare 2-leg price.
+        cond_p: dict[int, float] = {}
+        cond_u: dict[int, float] = {}
+        cond_notes: list[str] = []
+        for keep_i, drop_i in relationship.conditionals:
+            pair_beliefs = [beliefs[keep_i], beliefs[drop_i]]
+            pair_sides = [sides[keep_i], sides[drop_i]]
+            pair_sgp = build_sgp_correlation(
+                [rfq.legs[keep_i], rfq.legs[drop_i]],
+                ((0, 1),),
+                self._sgp_params,
+                marginals=[b.p for b in pair_beliefs],
+            )
+            pair_joint = price_joint_matrices(
+                pair_beliefs,
+                pair_sides,
+                pair_sgp.corr,
+                pair_sgp.corr_low,
+                pair_sgp.corr_high,
+            )
+            if pair_joint.p <= 0.0:
+                return NoQuote(
+                    ReasonCode.SKIP_PRICING_FAILED,
+                    "conditional super-leg degenerate: "
+                    f"P({rfq.legs[keep_i].market_ticker} {pair_sides[0]} & "
+                    f"{rfq.legs[drop_i].market_ticker} {pair_sides[1]}) = "
+                    f"{pair_joint.p:.6f}",
+                )
+            cond_p[keep_i] = pair_joint.p
+            cond_u[keep_i] = pair_joint.uncertainty
+            dropped.add(drop_i)
+            cond_notes.append(
+                f"conditional super-leg: P({rfq.legs[keep_i].market_ticker} "
+                f"{pair_sides[0]} & {rfq.legs[drop_i].market_ticker} "
+                f"{pair_sides[1]}) = {pair_joint.p:.4f} (same-player table)"
+            )
+        # Containment drops ((); no-op on NESTED_BAND): the implied superset
+        # leg's only trace is the Fréchet cap min(P_subset, P_superset) on the
+        # kept subset's SELECTED marginal — the exact clamp price_containment
+        # applies to the bare 2-leg pair.
+        selected = [
+            b.p if s == "yes" else 1.0 - b.p for b, s in zip(beliefs, sides, strict=True)
+        ]
+        sub_cap: dict[int, float] = {}
+        cont_notes: list[str] = []
+        for sub_i, sup_i in relationship.containments:
+            dropped.add(sup_i)
+            sub_cap[sub_i] = min(sub_cap.get(sub_i, 1.0), selected[sup_i])
+            cont_notes.append(
+                f"containment collapse: dropped {rfq.legs[sup_i].market_ticker} "
+                f"(implied by {rfq.legs[sub_i].market_ticker})"
+            )
+        clamped: dict[int, float] = {}  # kept subset leg -> YES-space belief p
+        for sub_i, cap in sub_cap.items():
+            if sub_i in dropped or selected[sub_i] <= cap:
+                continue
+            clamped[sub_i] = cap if sides[sub_i] == "yes" else 1.0 - cap
+            cont_notes.append(
+                f"containment Fréchet clamp: P({rfq.legs[sub_i].market_ticker} "
+                f"{sides[sub_i]})={selected[sub_i]:.4f} capped to superset "
+                f"{cap:.4f}"
+            )
         keep = [i for i in range(len(rfq.legs)) if i not in dropped]
+        # Defensive mirror of the classifier's conditional isolation guard
+        # (V2 refutation 2026-07-11; relationships._collapse_containments is
+        # the authoritative decline — keep in sync, incl. the copies in
+        # tools/backtests/{wc,mlb}_backtest.py): a conditional super-leg with
+        # a same-game KEPT companion must never price here either.
+        for keep_i, _drop_i in relationship.conditionals:
+            for group in relationship.same_event_groups:
+                if keep_i in group and any(
+                    k in keep for k in group if k != keep_i
+                ):
+                    return NoQuote(
+                        ReasonCode.SKIP_PRICING_FAILED,
+                        "conditional super-leg game carries other kept legs: "
+                        "conditional-vs-neighbour correlation sign unmodeled",
+                    )
         remap = {old: new for new, old in enumerate(keep)}
         reduced_legs: list[RfqLeg] = [rfq.legs[i] for i in keep]
-        reduced_beliefs = [
-            replace(
-                beliefs[i],
-                p=band_p[i],
-                uncertainty=band_u[i],
-                source=f"{beliefs[i].source}+band",
-            )
-            if i in band_p
-            else beliefs[i]
-            for i in keep
+
+        def reduced_belief(i: int) -> LegBelief:
+            if i in band_p:
+                return replace(
+                    beliefs[i],
+                    p=band_p[i],
+                    uncertainty=band_u[i],
+                    source=f"{beliefs[i].source}+band",
+                )
+            if i in cond_p:
+                return replace(
+                    beliefs[i],
+                    p=cond_p[i],
+                    uncertainty=cond_u[i],
+                    source=f"{beliefs[i].source}+conditional",
+                )
+            if i in clamped:
+                return replace(
+                    beliefs[i], p=clamped[i], source=f"{beliefs[i].source}+contained"
+                )
+            return beliefs[i]
+
+        reduced_beliefs = [reduced_belief(i) for i in keep]
+        reduced_sides = [
+            "yes" if (i in band_p or i in cond_p) else sides[i] for i in keep
         ]
-        reduced_sides = ["yes" if i in band_p else sides[i] for i in keep]
         reduced_groups = [
             g
             for g in (
@@ -451,7 +591,7 @@ class PricingEngine:
             sgp.corr,
             sgp.corr_low,
             sgp.corr_high,
-            extra_notes=(*sgp.notes, *band_notes),
+            extra_notes=(*sgp.notes, *band_notes, *cont_notes, *cond_notes),
         )
 
     def _apply_longshot_floor(self, joint: JointEstimate) -> JointEstimate:
