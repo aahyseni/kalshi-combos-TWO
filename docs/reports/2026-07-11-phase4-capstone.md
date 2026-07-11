@@ -85,6 +85,26 @@ the v3 artifact.
   validation set. **Fix IN PROGRESS in an isolated worktree** (main tree
   untouched while the per-print pass imports from it); merges after the WC
   per-print pass completes.
+- **Residual audit (operator rule: no unexplained residuals — every "N of M"
+  must name the M−N):** exact set arithmetic over the fix
+  (`ph4\containment_residuals.json`, symmetric diffs asserted in code). The
+  implementer's "225 plans + 5 guards = 230" CONFLATED two guards: the gate
+  hits are **227 = 225 PLAN + 2 GUARDED, identical set to the old 227
+  (symmetric difference = ∅)**; the other 3 are PRE-EXISTING nested-band
+  companion declines (corners windows), byte-identical notes old vs new, never
+  in the gate. The 2 GUARDED, each explained: (1) FRA-win + FT-over0.5-YES +
+  1H-over0.5-NO — one leg claimed by both a containment drop and a band window
+  ("goal, but not before half-time"); guard CORRECT, solvable EXACTLY by a
+  containment-drop precedence rule (combo ≡ FRA-win ∧ no-1H-goal — no
+  measurement needed). (2) 5-leg ESPBEL — post-collapse band ("3rd goal after
+  half-time") with same-game companions; guard CORRECT (would smuggle an
+  unmeasured band-vs-companion ρ); solvable EXACTLY by difference-of-parlays
+  (width summed, never differenced). **Full tape accounting, remainder = 0:**
+  245 containment-adjacent combos = 225 PLAN + 2 GUARDED + 3 band-guard
+  UNKNOWN (unchanged) + 13 pure-2-leg (already priced, set unchanged) + 2
+  IMPOSSIBLE (farmable=True re-verified). Mixed: 6/6 → PLAN, remainder 0.
+  Operator decision open: engine-surface the two exact-algebra TODOs (worth 2
+  combos of observed flow) or keep fail-closed.
 - **Historical audit (operator challenge: "soccer was complete — regression?"):
   NOT a regression.** The decline branch was born 2026-07-07 in `6325dbb` — the
   SAME commit that wired the 1H×FT soccer correlations (the 1H legs created the
