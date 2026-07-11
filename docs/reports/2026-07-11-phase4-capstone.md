@@ -63,6 +63,11 @@ the v3 artifact.
 - Prior mixed attempt died one-by-one-fetching an 85k clearings universe; the
   re-run reused the one-pass gather's caches with **zero** API fetches
   (`ph4\mixed\PROVENANCE.txt`).
+- Open (disclosed, operator-deferred): the mixed driver's pricing dispatch is a
+  verbatim copy of the previously parity-checked one, but driver-vs-stock parity
+  was NOT re-run on tonight's rows (operator stopped the optional ~10-min
+  hardening pass). Lineage trust, not a market-fact assumption; close it
+  whenever a mixed re-run happens anyway.
 
 ## Watch list (measurement-grade, pre-registered — never refit on P&L)
 
