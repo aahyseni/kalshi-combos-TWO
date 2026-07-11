@@ -63,11 +63,30 @@ the v3 artifact.
 - Prior mixed attempt died one-by-one-fetching an 85k clearings universe; the
   re-run reused the one-pass gather's caches with **zero** API fetches
   (`ph4\mixed\PROVENANCE.txt`).
-- Open (disclosed, operator-deferred): the mixed driver's pricing dispatch is a
-  verbatim copy of the previously parity-checked one, but driver-vs-stock parity
-  was NOT re-run on tonight's rows (operator stopped the optional ~10-min
-  hardening pass). Lineage trust, not a market-fact assumption; close it
-  whenever a mixed re-run happens anyway.
+- **Trust link (b) CLOSED — PARITY-EXACT** (operator-approved re-run):
+  232-combo stratified sample (6 config-effect, 6 UNKNOWN, 70 prop-carrying,
+  80 pure-cross, 40 wc2+mlb1, 30 same-event) re-priced through the unmodified
+  stock `_build_pricer` path: **232/232 bit-identical, max delta 0.0¢**
+  (`ph4\mixed\parity_tonight.json`).
+- **The 6 UNKNOWN no-quotes root-caused** (`ph4\mixed\unknown_diagnosis.json`):
+  NOT unrecognized families — all 6 are a **logical containment pair inside a
+  larger combo** (soccer ML + same-match total-over-0.5: win ⟹ ≥1 goal, inside
+  4-6 leg combos). The classifier's exact reason: "containment pair inside a
+  larger combo: not modeled" → UNKNOWN → decline (defense #2 working —
+  independence would OVERSTATE fair). Fix designed, mirrors the nested-band
+  collapse: A⟹B ⇒ drop the implied leg, P(A∧B)=P(A), price the reduced combo.
+  QUEUED per rule 8 (prototype in backtest → port → parity); size it in the
+  pure-WC bucket first (~0.16% of printed mixed combos here).
+- **Within-2¢ decomposed** (`ph4\mixed\w2c_decomposition.json`): 86% of misses
+  are one-sided (fair BELOW clearing = markup + winner's curse in the prints);
+  the fixed 2¢ band is relatively harsher on expensive combos (≤5¢: 99.1% w2 →
+  35¢+: 68.8%); recentering on the median bias alone recovers a third of the
+  shortfall (87.5→91.1%); single- vs multi-print identical (not print noise).
+  The genuine drag is soccer same-event pairs (ADVANCE×CORNERS, ADVANCE×PGOAL
+  ×TOTAL) — **the identified lever is measuring soccer pair priors
+  (corners|advance, pgoal|total, btts|advance), not chasing clearing prints.**
+  Against settlements (the ruler that can't bend) the bucket is centered to
+  0.03¢.
 
 ## Watch list (measurement-grade, pre-registered — never refit on P&L)
 
