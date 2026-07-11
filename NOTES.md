@@ -484,3 +484,12 @@ Refuted (16, cleared): frame-sign fix correct+complete; fee code matches the PDF
 | Subscriptions added while connected never sent (lazy leg-watching silently dead) | `add_subscription` sends immediately when connected | ws behavior covered via lifecycle tests |
 | Batch orderbooks wire params wrong (`market_tickers` comma-join vs repeated `tickers`); api-limits path wrong (`/account/api_limits` vs `/account/limits`) | both corrected to the doc-verified contract | (wire-format tests) |
 | `combo_no_pays_complement` convention had zero consumers while the complement was hardcoded | NO-side accepts decline while the convention is unverified (`DECLINE_CONVENTION_UNKNOWN`); NO-side expected edge recorded as NULL (not assumed) when convention isn't True; MTM refresh skips rather than fabricates | ″ |
+
+### Phase 3 assumption audit — pregame-only quote gate (2026-07-10)
+
+| # | assumption | modules | evidence |
+|---|---|---|---|
+| P3-1 | KXMLB* game codes embed the scheduled start as an **US/Eastern** `YYMMMDDHHMM` token; `expected_expiration_time` = that start + exactly 3h | `rfq/pregame.py` | doc:live-API 18/18 markets across GAME/HIT/KS/TB/RFI/TOTAL/SPREAD + ET/CT/PT venues (public GET /markets/{ticker}, 2026-07-10; report 2026-07-10-phase3-pregame-gate.md). Venue-local and UTC readings refuted |
+| P3-2 | Only ticker families in `_EMBEDDED_START_SERIES` (KXMLB) may be trusted for embedded starts; every other family's digits are NOT a clock | `rfq/pregame.py` | fail-closed by construction; extending the allowlist requires fresh API evidence in docs/reports/ |
+| P3-3 | For families without an embedded start, `min(close_time, expected_expiration_time) − offset` with offset **4.5h** (default) / 4.0h (KXMLB fallback) is AT OR BEFORE the true start | `rfq/pregame.py`, `ops/config.py` | measured: WC exp−kickoff 2.95–3.95h (live API, kickoff bracketed by 1H settle times); MLB exp−start = 3.00h exact. UNVERIFIED for sports not yet on the tape (NBA/NFL/NHL season start) — the 4.5h default is the conservative cover; re-measure per family before tightening |
+| P3-4 | MLB `close_time` is game+3 days (= expiration_time), NOT a start/end anchor; active soccer close_time can be event-level far-future | `rfq/pregame.py` (min() anchor choice) | doc:live-API same probe set |

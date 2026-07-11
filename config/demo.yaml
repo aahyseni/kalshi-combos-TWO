@@ -27,6 +27,11 @@ filters:
     - KXMVEMLB
     - KXMVENFL
     - KXMVENHL
+  # Pregame-only quote gate (Phase 3, operator directive 2026-07-10): combos
+  # with ANY in-play or unknown-start leg are declined, all sports. The line
+  # below is the ONLY switch needed to re-enable in-play quoting later.
+  # See rfq/pregame.py + docs/reports/2026-07-10-phase3-pregame-gate.md.
+  # allow_inplay_legs: true
 
 data_dir: data
 kill_file: KILL

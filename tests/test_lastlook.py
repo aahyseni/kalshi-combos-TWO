@@ -33,6 +33,8 @@ ALL_CLEAR = LastLookInputs(
     ws_healthy=True,
     seq_ok=True,
     any_leg_in_play=False,
+    any_leg_started=False,
+    leg_start_unknown=False,
     velocity_anomaly=False,
     exchange_active=True,
     killswitch_halted=False,
@@ -58,6 +60,8 @@ DECLINE_CASES: list[tuple[dict[str, object], ReasonCode]] = [
     ({"ws_healthy": False}, ReasonCode.DECLINE_WS_UNHEALTHY),
     ({"seq_ok": False}, ReasonCode.DECLINE_WS_UNHEALTHY),
     ({"any_leg_in_play": True}, ReasonCode.DECLINE_IN_PLAY),
+    ({"any_leg_started": True}, ReasonCode.DECLINE_INPLAY_LEG),
+    ({"leg_start_unknown": True}, ReasonCode.DECLINE_START_TIME_UNKNOWN),
     ({"velocity_anomaly": True}, ReasonCode.DECLINE_VELOCITY_ANOMALY),
     ({"max_leg_age_s": 2.0001}, ReasonCode.DECLINE_LEG_STALE),
     ({"max_leg_age_s": None}, ReasonCode.DECLINE_LEG_STALE),
@@ -95,6 +99,8 @@ ALL_BAD = LastLookInputs(
     ws_healthy=False,
     seq_ok=False,
     any_leg_in_play=True,
+    any_leg_started=True,
+    leg_start_unknown=True,
     velocity_anomaly=True,
     exchange_active=False,
     killswitch_halted=True,
@@ -110,6 +116,8 @@ def test_severity_ladder_fix_one_reveal_next() -> None:
         ReasonCode.DECLINE_EXCHANGE_INACTIVE,
         ReasonCode.DECLINE_WS_UNHEALTHY,
         ReasonCode.DECLINE_IN_PLAY,
+        ReasonCode.DECLINE_INPLAY_LEG,
+        ReasonCode.DECLINE_START_TIME_UNKNOWN,
         ReasonCode.DECLINE_VELOCITY_ANOMALY,
         ReasonCode.DECLINE_LEG_STALE,
         ReasonCode.DECLINE_FAIR_MOVED_LEG,
@@ -122,6 +130,8 @@ def test_severity_ladder_fix_one_reveal_next() -> None:
         {"exchange_active": True},
         {"ws_healthy": True, "seq_ok": True},
         {"any_leg_in_play": False},
+        {"any_leg_started": False},
+        {"leg_start_unknown": False},
         {"velocity_anomaly": False},
         {"max_leg_age_s": 0.5},
         {"max_leg_move_cc": 0},
@@ -204,6 +214,8 @@ def test_perf_sanity_10k_calls_under_1ms_each() -> None:
     ws_healthy=st.booleans(),
     seq_ok=st.booleans(),
     in_play=st.booleans(),
+    leg_started=st.booleans(),
+    start_unknown=st.booleans(),
     velocity=st.booleans(),
     exchange_active=st.booleans(),
     killswitch=st.booleans(),
@@ -219,6 +231,8 @@ def test_confirm_iff_all_gates_pass(
     ws_healthy: bool,
     seq_ok: bool,
     in_play: bool,
+    leg_started: bool,
+    start_unknown: bool,
     velocity: bool,
     exchange_active: bool,
     killswitch: bool,
@@ -232,6 +246,8 @@ def test_confirm_iff_all_gates_pass(
         ws_healthy=ws_healthy,
         seq_ok=seq_ok,
         any_leg_in_play=in_play,
+        any_leg_started=leg_started,
+        leg_start_unknown=start_unknown,
         velocity_anomaly=velocity,
         exchange_active=exchange_active,
         killswitch_halted=killswitch,
@@ -247,6 +263,8 @@ def test_confirm_iff_all_gates_pass(
         and ws_healthy
         and seq_ok
         and not in_play
+        and not leg_started
+        and not start_unknown
         and not velocity
         and leg_age is not None
         and leg_age <= POLICY.max_leg_age_s

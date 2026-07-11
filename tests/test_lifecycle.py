@@ -79,7 +79,9 @@ class FakeSender:
 
 
 class Rig:
-    def __init__(self, h: Harness, store: Store) -> None:
+    def __init__(
+        self, h: Harness, store: Store, filters: FiltersConfig | None = None
+    ) -> None:
         self.h = h
         self.sender = FakeSender()
         self.killswitch = h.killswitch
@@ -91,7 +93,8 @@ class Rig:
             sender=self.sender,
             engine=engine,
             rfq_filter=RfqFilter(
-                FiltersConfig(min_time_to_close_s=0.0), h.feed, h.metadata, h.killswitch, h.clock
+                filters or FiltersConfig(min_time_to_close_s=0.0),
+                h.feed, h.metadata, h.killswitch, h.clock,
             ),
             limits=LimitChecker(RiskLimits()),
             exposure=self.exposure,

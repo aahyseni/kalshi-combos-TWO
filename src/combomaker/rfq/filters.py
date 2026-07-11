@@ -18,6 +18,7 @@ from combomaker.marketdata.feed import OrderbookFeed
 from combomaker.marketdata.metadata import MetadataCache
 from combomaker.ops.config import FiltersConfig
 from combomaker.rfq.models import Rfq
+from combomaker.rfq.pregame import ComboStartStatus, PregameGate
 from combomaker.risk.killswitch import KillSwitch
 
 # Two-legged-tie European knockouts (Champions/Europa/Conference League): the
@@ -45,6 +46,7 @@ class RfqFilter:
         self._metadata = metadata
         self._killswitch = killswitch
         self._clock = clock
+        self._pregame = PregameGate(config, metadata, clock)
 
     def evaluate(self, rfq: Rfq) -> list[ReasonCode]:
         """Empty list = quotable. Uses only in-memory state (hot-path safe)."""
@@ -80,6 +82,23 @@ class RfqFilter:
 
         reasons.extend(self._leg_book_reasons(rfq))
         reasons.extend(self._timing_reasons(rfq))
+        reasons.extend(self._pregame_reasons(rfq))
+        return reasons
+
+    def pregame_status(self, rfq: Rfq) -> ComboStartStatus:
+        """Schedule-based start gate (Phase 3), also re-checked by last look
+        at confirm time — a leg can go in-play between quote and accept."""
+        return self._pregame.status(rfq.legs)
+
+    def _pregame_reasons(self, rfq: Rfq) -> list[ReasonCode]:
+        """Pregame-only gate: any started leg ⇒ skip; any UNKNOWN start ⇒
+        skip (fail-closed). Stands down only via config.allow_inplay_legs."""
+        status = self.pregame_status(rfq)
+        reasons: list[ReasonCode] = []
+        if status.any_started:
+            reasons.append(ReasonCode.SKIP_INPLAY_LEG)
+        if status.any_unknown:
+            reasons.append(ReasonCode.SKIP_START_TIME_UNKNOWN)
         return reasons
 
     def _size_reasons(self, rfq: Rfq) -> list[ReasonCode]:

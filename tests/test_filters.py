@@ -56,7 +56,9 @@ class Harness:
             env["msg"]["no_dollars_fp"] = [["0.4000", "60.00"], ["0.5100", "25.00"]]
             await self.ws.deliver(env)
 
-    def with_meta(self, ticker: str, *, close_in_s: float | None = 7200.0) -> None:
+    # Default close 6h out: past BOTH the 1h min_time_to_close gate AND the
+    # Phase 3 pregame gate (estimated start = close − 4.5h = NOW + 1.5h).
+    def with_meta(self, ticker: str, *, close_in_s: float | None = 21_600.0) -> None:
         close = None
         if close_in_s is not None:
             from datetime import timedelta

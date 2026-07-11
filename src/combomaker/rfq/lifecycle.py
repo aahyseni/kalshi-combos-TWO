@@ -638,6 +638,9 @@ class QuoteLifecycle:
             self.daily_pnl,
             candidate_positions=[candidate],
         )
+        # Straddle safety (Phase 3): re-run the schedule-based pregame gate —
+        # a leg can go in-play between quote and accept. Peek-only, hot-path safe.
+        pregame = self._filter.pregame_status(state.rfq)
         return LastLookInputs(
             quote_time_fair_cc=int(state.constructed.fair_cc),
             current_fair_cc=current_fair,
@@ -646,6 +649,8 @@ class QuoteLifecycle:
             ws_healthy=self._feed.feed_healthy,
             seq_ok=books_valid,
             any_leg_in_play=self._inplay.any_anomalous(list(state.rfq.leg_tickers)),
+            any_leg_started=pregame.any_started,
+            leg_start_unknown=pregame.any_unknown,
             velocity_anomaly=self._inplay.any_anomalous([state.rfq.market_ticker]),
             exchange_active=self.exchange_active,
             killswitch_halted=self._killswitch.halted,

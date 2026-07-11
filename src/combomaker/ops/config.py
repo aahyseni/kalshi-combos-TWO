@@ -87,6 +87,31 @@ class FiltersConfig(StrictModel):
     # until its own regime is built. Flip to false once that regime exists.
     decline_two_legged_tie: bool = True
 
+    # --- Pregame-only quote gate (Phase 3, operator directive 2026-07-10) ---
+    # "Never quote a combo where a leg is currently in play — ALL sports."
+    # Schedule-based: each leg's game START time comes from a fail-closed
+    # chain — (a) verified ticker-embedded start (KXMLB*, US/Eastern HHMM
+    # token, API-verified 2026-07-10), (b) earliest(close_time,
+    # expected_expiration_time) minus the offset below, (c) UNKNOWN ⇒ decline
+    # (skip_start_time_unknown). Any leg with now >= start declines the RFQ
+    # (skip_inplay_leg) and is re-checked at last look (decline_inplay_leg).
+    # Flip allow_inplay_legs to true to re-enable in-play quoting later
+    # WITHOUT code changes; the market-motion detector (risk/inplay.py) and
+    # min_time_to_close_s stay active regardless. See rfq/pregame.py.
+    allow_inplay_legs: bool = False
+    # Estimate offset (hours) for chain (b). The LIVE-GATE default is 4.5h —
+    # deliberately larger than the backtest harnesses' soccer 2.5h: measured
+    # 2026-07-10 on real WC markets, expected_expiration lands 2.95-3.95h
+    # after kickoff depending on series, so 2.5h would admit ~1.5h of
+    # in-play. Conservative side: too-large only costs late-pregame quoting,
+    # too-small quotes in-play.
+    pregame_start_offset_hours: float = 4.5
+    # Per-series overrides (ticker prefix -> hours). MLB 4.0 is the
+    # mlb_backtest-validated estimate (fallback only — the embedded ET start
+    # normally wins for KXMLB*; API-measured expected_expiration = start+3h,
+    # so 4.0 lands 1h before first pitch).
+    pregame_start_offset_hours_by_prefix: dict[str, float] = {"KXMLB": 4.0}
+
 
 class FeeConfig(StrictModel):
     """Coefficients as decimal strings (exact Fractions downstream). VERIFIED

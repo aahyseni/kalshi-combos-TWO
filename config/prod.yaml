@@ -19,5 +19,11 @@ pricing:
     # See docs/reports/2026-07-08-combo-yes-no-side-mechanics.md.
     sell_parlays_only: true
 
+# Pregame-only quote gate (Phase 3, operator directive 2026-07-10) is ACTIVE
+# by default: combos with ANY in-play or unknown-start leg are declined, all
+# sports. To re-enable in-play quoting later add under `filters:`:
+#   allow_inplay_legs: true
+# See rfq/pregame.py + docs/reports/2026-07-10-phase3-pregame-gate.md.
+
 data_dir: data
 kill_file: KILL

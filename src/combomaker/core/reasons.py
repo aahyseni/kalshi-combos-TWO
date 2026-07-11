@@ -23,6 +23,13 @@ class ReasonCode(StrEnum):
     SKIP_LEG_BOOK_THIN = "skip_leg_book_thin"
     SKIP_EVENT_TOO_SOON = "skip_event_too_soon"
     SKIP_IN_PLAY = "skip_in_play"
+    # Pregame-only gate (Phase 3, operator directive 2026-07-10): a leg's game
+    # has already STARTED per its schedule (verified ticker-embedded start, or
+    # the conservative expiry-minus-offset estimate). Applies to ALL sports.
+    SKIP_INPLAY_LEG = "skip_inplay_leg"
+    # Pregame-only gate: no usable start-time source for a leg. UNKNOWN means
+    # decline, never "probably pregame" (quiet-failure defense #2).
+    SKIP_START_TIME_UNKNOWN = "skip_start_time_unknown"
     SKIP_EXCHANGE_INACTIVE = "skip_exchange_inactive"
     SKIP_RISK_HEADROOM = "skip_risk_headroom"
     SKIP_MASS_ACCEPTANCE_BREACH = "skip_mass_acceptance_breach"
@@ -64,6 +71,11 @@ class ReasonCode(StrEnum):
     DECLINE_LEG_STALE = "decline_leg_stale"
     DECLINE_WS_UNHEALTHY = "decline_ws_unhealthy"
     DECLINE_IN_PLAY = "decline_in_play"
+    # Pregame-only gate re-checked at confirm time (straddle safety): the
+    # leg's game started between quote and accept, or its start time became
+    # unknowable — either way we never confirm a possibly-in-play fill.
+    DECLINE_INPLAY_LEG = "decline_inplay_leg"
+    DECLINE_START_TIME_UNKNOWN = "decline_start_time_unknown"
     DECLINE_VELOCITY_ANOMALY = "decline_velocity_anomaly"
     DECLINE_RISK_LIMIT = "decline_risk_limit"
     DECLINE_MASS_ACCEPTANCE = "decline_mass_acceptance"

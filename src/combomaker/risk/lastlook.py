@@ -33,6 +33,11 @@ class LastLookInputs:
     ws_healthy: bool
     seq_ok: bool                          # no unresolved gaps
     any_leg_in_play: bool
+    # Pregame-only gate re-check (straddle safety, Phase 3): a leg's game
+    # started since the quote went out / its start became unknowable. Both
+    # computed by PregameGate; both already False when allow_inplay_legs.
+    any_leg_started: bool
+    leg_start_unknown: bool
     velocity_anomaly: bool
     exchange_active: bool
     killswitch_halted: bool
@@ -59,6 +64,10 @@ def decide_confirm(inputs: LastLookInputs, policy: LastLookPolicy) -> LastLookDe
         )
     if inputs.any_leg_in_play:
         return LastLookDecision(False, ReasonCode.DECLINE_IN_PLAY)
+    if inputs.any_leg_started:
+        return LastLookDecision(False, ReasonCode.DECLINE_INPLAY_LEG)
+    if inputs.leg_start_unknown:
+        return LastLookDecision(False, ReasonCode.DECLINE_START_TIME_UNKNOWN)
     if inputs.velocity_anomaly:
         return LastLookDecision(False, ReasonCode.DECLINE_VELOCITY_ANOMALY)
     if inputs.max_leg_age_s is None or inputs.max_leg_age_s > policy.max_leg_age_s:
