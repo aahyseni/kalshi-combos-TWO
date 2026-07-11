@@ -387,3 +387,26 @@ Fixture `taxonomy_impossible.json`: **50 cells / 28 shape ids** (S3L, S4, S5, S9
 ## APPENDIX — source inventory used
 
 Code: `src/combomaker/pricing/{legtypes,relationships,sgp,structural,engine,tripwire,legs,joint,copula,dixon_coles,quote}.py`, `src/combomaker/rfq/{filters,pregame,intake,models}.py`, `src/combomaker/ops/config.py`, `config/{demo,prod}.yaml` (all at d65bb6e). Docs: `NOTES.md` (I1–I10, K1–K9, L1–L13, P3-1..4, H1–H7), `docs/calibration/results_soccer.md`, `docs/calibration/containment_probe/{taxonomy,exchange_matrix,engine_matrix}.json`, `docs/dnp_scalar_settlement.md`, `docs/reports/` (2026-07-07 blind test + calibration/farming; 2026-07-08 backtest-vs-clearing + settlement-pnl + sell-parlays-only + yes/no mechanics; 2026-07-10 one-leg-per-ladder, phase3 pregame, demo-combo-settled, scorecard; 2026-07-11 containment sweep, judge fixes, phase4 capstone), `tests/fixtures/ground_truth/{conventions,taxonomy_impossible}.json`. Job-tmp artifacts: `ph4/wc/containment_frequency.json`, `ph4/ph4_wc_report_pconly.json`, `ph4/wc/wc_fixed_printed/wc_backtest_perprint.json`, `ph4/containment_residuals.json`, `ph4/wire2/kalshi_robustness.md`, `containment_probe/tape_universe.json`. Live checks run for this overview 2026-07-11: public GET /markets (KXWCGAME, KXWC1H), `uv run` executions of `classify_leg`/`classify_sport`/`CorrelationConfig` (96/96 count), composition aggregation over the per-print JSON.
+
+
+## JUDGE-FINDINGS ADDENDUM (2026-07-11, post-review)
+
+- **F1 RESOLVED in code:** leg-series allowlist shipped - every leg must match
+  `filters.allowed_leg_series_prefixes` (default `["KXWC", "KXMLB"]`) or the RFQ
+  declines `skip_series_not_allowed`; crypto/esports/unmodeled-league legs can no
+  longer reach the pricer. Unblock = one YAML prefix. Also serves as the
+  per-sport kill switch (F5b): remove a prefix to kill a sport.
+- **F4 addendum:** the 89 soccer-keyword-collision series (incl. KXCLUBWCGAME,
+  KXEWC* esports) are all blocked by the F1 gate until deliberately unblocked;
+  club-to-WC correlation transfer itself is VALIDATED (8,982-match calibration
+  corpus + 8,980-game structural OOS gate + the WC tape's 1.57-1.60c medians),
+  but any NEW competition needs the unblock checklist: classification audit,
+  knockout/regime flags, priors review.
+- **F5a:** foreign-leg share of WC-carrying combos lives in the mixed-bucket
+  capstone (2026-07-11-phase4-capstone.md), not this doc.
+- **F6:** engine_matrix.json carries 53 shape entries (S42K/S50b variants beyond
+  the 50 ids); the S42-yn constructible-vs-UNPROBEABLE artifact conflict is
+  audit-labeling only (live tripwire probe: all five MLB ladders decline).
+- **F7:** section 3.4's window-rule citation should point at the containment-family
+  call sites, not `_containment_sign` (returns None for the ny mix); behavior as
+  described.

@@ -93,7 +93,9 @@ class Rig:
             sender=self.sender,
             engine=engine,
             rfq_filter=RfqFilter(
-                filters or FiltersConfig(min_time_to_close_s=0.0),
+                # synthetic legs; series gate off (it has dedicated tests in test_filters)
+                (filters or FiltersConfig(min_time_to_close_s=0.0)).model_copy(
+                    update={"allowed_leg_series_prefixes": None}),
                 h.feed, h.metadata, h.killswitch, h.clock,
             ),
             limits=LimitChecker(RiskLimits()),

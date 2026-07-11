@@ -82,7 +82,10 @@ class Harness:
 
 
 async def ready_harness(config: FiltersConfig | None = None) -> Harness:
-    h = Harness(config)
+    # Synthetic M1/M2 legs; the series gate has its own dedicated tests below.
+    cfg = (config or FiltersConfig()).model_copy(
+        update={"allowed_leg_series_prefixes": None})
+    h = Harness(cfg)
     await h.with_books(["M1", "M2"])
     h.with_meta("M1")
     h.with_meta("M2")
@@ -230,3 +233,57 @@ def test_regime_gate_can_be_disabled() -> None:
     assert ReasonCode.SKIP_UNMODELED_REGIME not in h.filter.evaluate(
         _regime_combo("KXUCLGAME-26AUG12REALARS-REAL")
     )
+
+
+# --- Leg-series allowlist (operator directive 2026-07-11, judge finding F1:
+# collections mix sports, so crypto/esports/unmodeled-league legs reached the
+# pricer and priced at flat priors instead of declining) ---
+
+
+def _legs(*tickers: str) -> list[dict[str, str]]:
+    return [{"market_ticker": t, "side": "yes"} for t in tickers]
+
+
+def test_series_gate_blocks_crypto_leg() -> None:
+    h = Harness()
+    rfq = combo_rfq(mve_selected_legs=_legs(
+        "KXWCGAME-26JUL09FRAMAR-FRA", "KXETH15M-26JUL091200-T3100"))
+    assert ReasonCode.SKIP_SERIES_NOT_ALLOWED in h.filter.evaluate(rfq)
+
+
+def test_series_gate_blocks_soccer_lookalike_series() -> None:
+    # The F4 masquerade class: esports / club / minor-league series that match
+    # soccer keywords but must NOT inherit WC priors until deliberately
+    # unblocked (classification + priors first).
+    h = Harness()
+    for tk in ("KXEWCGAME-26AUG12ABCDEF-ABC", "KXCLUBWCGAME-26AUG12REALARS-REAL",
+               "KXUAEPLGAME-26AUG12GHIJKL-GHI"):
+        rfq = combo_rfq(mve_selected_legs=_legs(tk, "KXWCTOTAL-26JUL09FRAMAR-3"))
+        assert ReasonCode.SKIP_SERIES_NOT_ALLOWED in h.filter.evaluate(rfq), tk
+
+
+def test_series_gate_passes_wc_and_mlb() -> None:
+    h = Harness()
+    rfq = combo_rfq(mve_selected_legs=_legs(
+        "KXWCGAME-26JUL09FRAMAR-FRA", "KXMLBGAME-26JUL091840NYYTB-NYY"))
+    assert ReasonCode.SKIP_SERIES_NOT_ALLOWED not in h.filter.evaluate(rfq)
+
+
+def test_series_gate_none_disables() -> None:
+    h = Harness(FiltersConfig(allowed_leg_series_prefixes=None))
+    rfq = combo_rfq(mve_selected_legs=_legs("KXETH15M-26JUL091200-T3100", "M2"))
+    assert ReasonCode.SKIP_SERIES_NOT_ALLOWED not in h.filter.evaluate(rfq)
+
+
+def test_series_gate_empty_list_blocks_everything_fail_closed() -> None:
+    h = Harness(FiltersConfig(allowed_leg_series_prefixes=[]))
+    rfq = combo_rfq(mve_selected_legs=_legs(
+        "KXWCGAME-26JUL09FRAMAR-FRA", "KXWCTOTAL-26JUL09FRAMAR-3"))
+    assert ReasonCode.SKIP_SERIES_NOT_ALLOWED in h.filter.evaluate(rfq)
+
+
+def test_series_gate_unblock_via_config_prefix() -> None:
+    # The easy-UNBLOCK path: one YAML prefix re-admits a competition.
+    h = Harness(FiltersConfig(allowed_leg_series_prefixes=["KXWC", "KXMLB", "KXUCL"]))
+    rfq = _regime_combo("KXUCLGAME-26AUG12REALARS-REAL")
+    assert ReasonCode.SKIP_SERIES_NOT_ALLOWED not in h.filter.evaluate(rfq)

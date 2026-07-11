@@ -63,6 +63,16 @@ class RfqFilter:
             if not any(collection.startswith(prefix) for prefix in cfg.collection_whitelist):
                 reasons.append(ReasonCode.SKIP_NOT_WHITELISTED)
 
+        # Leg-series allowlist: collections mix sports, so the collection
+        # whitelist alone admits legs (crypto, esports, unmodeled leagues)
+        # that classify UNKNOWN and would price at flat priors. None = gate
+        # off; empty list = block everything (fail-closed).
+        if cfg.allowed_leg_series_prefixes is not None and any(
+            not leg.market_ticker.startswith(tuple(cfg.allowed_leg_series_prefixes))
+            for leg in rfq.legs
+        ):
+            reasons.append(ReasonCode.SKIP_SERIES_NOT_ALLOWED)
+
         n_legs = len(rfq.legs)
         if rfq.is_combo and not (cfg.min_legs <= n_legs <= cfg.max_legs):
             reasons.append(ReasonCode.SKIP_TOO_MANY_LEGS)

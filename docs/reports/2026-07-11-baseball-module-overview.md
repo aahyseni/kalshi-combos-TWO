@@ -988,3 +988,13 @@ Verdicts [job-tmp ph4/wire2/kalshi_robustness.md §0]:
 - **Queued measurements:** DO-8 leftovers (`ml|tb` oriented already measured; plain-band
   tighten), per-player conditional-rho spread, mlb_runs grid recalibration, KXWNBAPTS
   foreign-gap fix.
+
+
+## JUDGE-FINDINGS ADDENDUM (2026-07-11, post-review)
+
+- **F1 RESOLVED in code:** leg-series allowlist (`filters.allowed_leg_series_prefixes`,
+  default `["KXWC", "KXMLB"]`) - non-MLB/WC legs decline `skip_series_not_allowed`
+  at intake; doubles as the per-sport kill switch.
+- **F3 corrected in-place** (prop YES-hit at 1c markup = 19%, not 2.9%).
+- **F6:** engine_matrix.json carries 53 entries (S42K/S50b variants); the S42-yn
+  artifact-flag conflict is audit-labeling only (tripwire declines verified live).

@@ -71,6 +71,15 @@ class FiltersConfig(StrictModel):
     # Whitelist of mve_collection_ticker prefixes. Empty = observe everything
     # (observe/paper only — quote mode refuses to run with an empty whitelist).
     collection_whitelist: list[str] = []
+    # LEG-SERIES allowlist (operator directive 2026-07-11, judge finding F1:
+    # collections mix sports, so the collection whitelist alone admits
+    # crypto/esports/unmodeled-league legs that classify UNKNOWN and price at
+    # flat priors instead of declining). Every leg's market ticker must start
+    # with one of these prefixes or the RFQ declines SKIP_SERIES_NOT_ALLOWED.
+    # UNBLOCK a new sport/competition by adding its series prefix (per-env
+    # YAML) once its classification + priors exist; null disables the gate;
+    # empty list blocks ALL combos (fail-closed).
+    allowed_leg_series_prefixes: list[str] | None = ["KXWC", "KXMLB"]
     combos_only: bool = True          # skip single-market RFQs
     min_legs: int = 2
     max_legs: int = 6

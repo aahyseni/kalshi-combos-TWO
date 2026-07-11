@@ -86,7 +86,10 @@ def _pregame_codes(reasons: list[ReasonCode]) -> set[ReasonCode]:
 
 
 async def pregame_harness(config: FiltersConfig | None = None) -> Harness:
-    h = Harness(config)
+    # Synthetic M1/M2 legs; the series gate has dedicated tests in test_filters.
+    cfg = (config or FiltersConfig()).model_copy(
+        update={"allowed_leg_series_prefixes": None})
+    h = Harness(cfg)
     await h.with_books(["M1", "M2"])
     h.with_meta("M1")
     h.with_meta("M2")

@@ -24,6 +24,13 @@ pricing:
 # sports. To re-enable in-play quoting later add under `filters:`:
 #   allow_inplay_legs: true
 # See rfq/pregame.py + docs/reports/2026-07-10-phase3-pregame-gate.md.
+#
+# Leg-series allowlist (operator directive 2026-07-11, judge finding F1) is
+# ACTIVE by default in code: every leg must start with KXWC or KXMLB, else the
+# RFQ declines skip_series_not_allowed. To UNBLOCK a new sport/competition add
+# under `filters:` (after its classification + priors exist):
+#   allowed_leg_series_prefixes: [KXWC, KXMLB, <NEWPREFIX>]
+# Set to null to disable the gate entirely.
 
 data_dir: data
 kill_file: KILL

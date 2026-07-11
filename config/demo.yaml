@@ -19,6 +19,11 @@ pricing:
     sell_parlays_only: true
 
 filters:
+  # Leg-series allowlist (operator 2026-07-11, judge F1): every leg must
+  # start with one of these prefixes or the RFQ declines. UNBLOCK a new
+  # sport/competition by adding its prefix here once classification +
+  # priors exist; set to null to disable. Default (code): [KXWC, KXMLB].
+  # allowed_leg_series_prefixes: [KXWC, KXMLB]
   # Sports combos only (mission scope). Prefixes match mve_collection_ticker.
   collection_whitelist:
     - KXMVESPORTS
