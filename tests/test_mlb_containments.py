@@ -137,13 +137,16 @@ def test_same_player_hr_no_hit_no_is_containment_subset_is_hit_no() -> None:
     assert rel.containment == (1, 0)
 
 
-def test_same_player_exact_pair_buried_in_larger_combo_is_unknown() -> None:
-    """Shipped policy for buried exact pairs: bare-pair-only containment; the
-    engine has no containment super-leg collapse, so buried -> UNKNOWN
-    (widen-or-no-quote), never a copula guess."""
+def test_same_player_exact_pair_buried_in_larger_combo_collapses() -> None:
+    """RETARGETED 2026-07-11 (was ..._is_unknown): the engine now HAS the
+    containment super-leg collapse, and it is generic at the
+    CONTAINMENT-relationship level — a buried EXACT same-player pair collapses
+    (the implied HIT leg drops; HR + total price via the reduced copula)."""
     legs = (_leg(HIT1), _leg(HR1), _leg(TOTAL9))
     rel = classify_legs(legs, _Prov())
-    assert rel.kind is RelationshipKind.UNKNOWN
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containment is None
+    assert rel.containments == ((1, 0),)  # subset = HR leg; HIT leg drops
 
 
 # --- classifier: measured cells -> bare-pair conditional / buried UNKNOWN ----------
@@ -182,11 +185,15 @@ def test_same_player_hr_no_hit_yes_prices_via_measured_reverse() -> None:
 
 
 def test_same_player_conditional_pair_buried_is_unknown() -> None:
-    """Partial cells buried in a >2-leg combo decline UNKNOWN (approved
-    policy; soccer bare-pair precedent)."""
-    legs = (_leg(HIT1), _leg(TB2), _leg(TOTAL9))
+    """Partial (measured, non-exact) cells buried in a >2-leg combo still
+    decline UNKNOWN — the 2026-07-11 collapse serves CONTAINMENT pairs only,
+    never conditional-table pairs. (Probe retargeted from HIT1 x TB2, whose
+    ('tb',2,'hit',1) cell is EXACT and now collapses, to HIT3 x HR1 — measured
+    in both directions, no exact cell.)"""
+    legs = (_leg(HIT3), _leg(HR1), _leg(TOTAL9))
     rel = classify_legs(legs, _Prov())
     assert rel.kind is RelationshipKind.UNKNOWN
+    assert any("larger combo" in n for n in rel.notes)
 
 
 # --- classifier: unmeasured / out-of-scope shapes ----------------------------------

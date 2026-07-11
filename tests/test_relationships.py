@@ -194,16 +194,22 @@ def test_1h_btts_yes_ft_btts_no_is_impossible() -> None:
     assert rel.farmable is True  # airtight scoring tautology
 
 
-def test_containment_pair_in_larger_combo_is_unknown() -> None:
-    """A containment pair mixed with other correlated legs is not yet priced
-    coherently — widen-or-no-quote, never a copula guess (defense #2)."""
+def test_containment_pair_in_larger_combo_collapses() -> None:
+    """RETARGETED 2026-07-11 (was ..._is_unknown): a containment pair mixed
+    with other correlated legs now returns the N-leg CONTAINMENT collapse plan
+    — the implied FT leg drops and the reduced set prices (was a 127-combo
+    UNKNOWN decline bucket on the WC tape)."""
     legs = (
         leg(FH_BTTS, FH_BTTS_EV, "yes"),
         leg(FT_BTTS, FT_BTTS_EV, "yes"),
         leg("KXWCTOTAL-26JUL05MEXENG-3", "KXWCTOTAL-26JUL05MEXENG", "yes"),
     )
     rel = classify_legs(legs, ExplodingProvider())
-    assert rel.kind is RelationshipKind.UNKNOWN
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containment is None          # not the bare 2-leg path
+    assert rel.containments == ((0, 1),)    # subset 1H leg kept, FT leg drops
+    assert rel.bands == ()
+    assert rel.same_event_groups == ((0, 1, 2),)
 
 
 def test_1h_btts_different_game_is_not_containment() -> None:
@@ -409,8 +415,10 @@ def test_band_with_cross_game_companion_is_priced() -> None:
 
 
 def test_three_rung_shape_is_not_quoted_as_band() -> None:
-    """yes-7 + no-10 + no-11 in one game: a band plus a redundant no-rung —
-    unmodeled (the no/no pair is containment inside a 3-leg combo) → UNKNOWN."""
+    """yes-7 + no-10 + no-11 in one game: a band plus a redundant no-rung.
+    Still UNKNOWN after the 2026-07-11 collapse: the 10-rung would hold TWO
+    collapse roles (band member AND containment subset), which the overlap
+    guard fails closed — never a double-counted window."""
     legs = (
         leg(MC2_7, MC2_EV, "yes"), leg(MC2_10, MC2_EV, "no"),
         leg("KXWCCORNERS-26JUL11ARGSUI-11", MC2_EV, "no"),
@@ -442,16 +450,18 @@ def test_1h_btts_no_ft_btts_yes_is_possible() -> None:
     assert rel.same_event_groups == ((0, 1),)
 
 
-def test_1h_btts_no_ft_btts_no_in_larger_combo_is_unknown() -> None:
-    """The no/no containment obeys the same bare-2-leg policy: buried in a >2-leg
-    combo it is not modeled → UNKNOWN (widen-or-no-quote)."""
+def test_1h_btts_no_ft_btts_no_in_larger_combo_collapses() -> None:
+    """RETARGETED 2026-07-11 (was ..._is_unknown): the buried no/no pair
+    collapses — the FT-no leg (selected-space subset) is kept, the implied
+    1H-no leg (superset) drops."""
     legs = (
         leg(FH_BTTS, FH_BTTS_EV, "no"),
         leg(FT_BTTS, FT_BTTS_EV, "no"),
         leg("KXWCTOTAL-26JUL05MEXENG-3", "KXWCTOTAL-26JUL05MEXENG", "yes"),
     )
     rel = classify_legs(legs, ExplodingProvider())
-    assert rel.kind is RelationshipKind.UNKNOWN
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containments == ((1, 0),)  # subset = FT-no leg; 1H-no drops
 
 
 # --- Family 2: regulation moneyline team-WIN ⟹ FT Over-0.5 ------------------------
@@ -518,15 +528,17 @@ def test_win_no_over05_no_is_possible_moneyline_no_unreachable() -> None:
     assert rel.kind is RelationshipKind.OK
 
 
-def test_win_yes_over05_yes_in_larger_combo_is_unknown() -> None:
-    """Family-2 containment buried in a >2-leg combo → UNKNOWN (bare-pair policy)."""
+def test_win_yes_over05_yes_in_larger_combo_collapses() -> None:
+    """RETARGETED 2026-07-11 (was ..._is_unknown): Family-2 containment buried
+    in a >2-leg combo collapses (the 70-combo ml⟹over-0.5 decline bucket)."""
     legs = (
         leg(ML_MEX, ML_EV, "yes"),
         leg(TOT_OVER05, TOT_EV, "yes"),
         leg("KXWCBTTS-26JUL05MEXENG-BTTS", "KXWCBTTS-26JUL05MEXENG", "yes"),
     )
     rel = classify_legs(legs, ExplodingProvider())
-    assert rel.kind is RelationshipKind.UNKNOWN
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containments == ((0, 1),)  # over-0.5 leg drops, ML leg kept
 
 
 # --- Family 3: 1H Over-N ⟹ FT Over-N (SAME line N) --------------------------------
@@ -581,15 +593,17 @@ def test_1h_over_ft_over_cross_line_is_possible() -> None:
     assert rel.kind is RelationshipKind.OK
 
 
-def test_1h_over_ft_over_same_line_in_larger_combo_is_unknown() -> None:
-    """Family-3 containment buried in a >2-leg combo → UNKNOWN (bare-pair policy)."""
+def test_1h_over_ft_over_same_line_in_larger_combo_collapses() -> None:
+    """RETARGETED 2026-07-11 (was ..._is_unknown): Family-3 containment buried
+    in a >2-leg combo collapses (the 29-combo 1h_over_N⟹ft_over_N bucket)."""
     legs = (
         leg(FH_TOT2, FH_TOT_EV, "yes"),
         leg(FT_TOT2, FT_TOT2_EV, "yes"),
         leg("KXWCBTTS-26JUL05MEXENG-BTTS", "KXWCBTTS-26JUL05MEXENG", "yes"),
     )
     rel = classify_legs(legs, ExplodingProvider())
-    assert rel.kind is RelationshipKind.UNKNOWN
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containments == ((0, 1),)  # FT-over leg drops, 1H leg kept
 
 
 def test_1h_over_ft_over_different_game_is_possible() -> None:
@@ -709,16 +723,18 @@ def test_mlb_ml_spread_doubleheader_g1_g2_never_merges() -> None:
     assert rel.same_event_groups == ()
 
 
-def test_mlb_ml_spread_containment_in_larger_combo_is_unknown() -> None:
-    """Bare-pair policy (soccer precedent): the same-team containment buried in
-    a >2-leg combo is not modeled → UNKNOWN, never a copula guess."""
+def test_mlb_ml_spread_containment_in_larger_combo_collapses() -> None:
+    """RETARGETED 2026-07-11 (was ..._is_unknown): the generic
+    containment-level collapse also serves the MLB cover⟹win pair — the
+    implied ML leg drops and the reduced (spread, total) set prices."""
     legs = (
         leg(MLB_SP_NYY2, MLB_SP_EV, "yes"),
         leg(MLB_ML_NYY, MLB_ML_EV, "yes"),
         leg("KXMLBTOTAL-26JUL081840NYYTB-9", "KXMLBTOTAL-26JUL081840NYYTB", "yes"),
     )
     rel = classify_legs(legs, ExplodingProvider())
-    assert rel.kind is RelationshipKind.UNKNOWN
+    assert rel.kind is RelationshipKind.CONTAINMENT
+    assert rel.containments == ((0, 1),)  # ML leg drops, spread leg kept
 
 
 def test_mlb_ml_spread_line_zero_is_not_a_containment_claim() -> None:
