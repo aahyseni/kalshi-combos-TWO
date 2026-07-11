@@ -4,8 +4,25 @@
 spread×prop resolver + DO-6 (repo `648dc61`/`2163642`) · **Window:** 2026-07-06 →
 2026-07-11 ~00:52Z (tape complete ~01:35-02:04Z) · **Artifact:** MLB gate page
 re-issued **v3 CAPSTONE** (same URL, `docs/reports/2026-07-10-mlb-backtest-gate.html`).
-**Status:** MLB ✅ · mixed ✅ · WC per-combo + defect-check ✅ · WC per-print 🔄
-(723k prints, sliced kill-resilient pass running; section to be appended).
+**Status:** MLB ✅ · mixed ✅ · WC per-combo + defect-check ✅ · **WC per-print ✅
+(completed 2026-07-11 12:02 — Phase 4 CLOSED, all buckets, both modes).**
+
+## WC per-print (final section — first-ever WC per-print run)
+
+- **PARITY PASS:** 2,656 stock-path keys re-priced through the unmodified
+  single-process harness vs the sliced-parallel pass — **0 mismatches, 0
+  extra keys** (the 10.5h sliced pass ≡ the stock harness exactly).
+- **Numbers** (n=656,555 print-rows, fair recomputed just-before-EACH print):
+  median |err| **1.57¢** · mean 1.98¢ · bias −1.72¢ · within-2¢ **62.1%** ·
+  within-5¢ 95.1% — vs per-combo 1.61¢/58.1%. Same shape as the honest WC
+  baseline; the fat-markup w2 caveat applies (clearing = fair + winning
+  markup; settlement remains the unbendable ruler).
+- **Zero-residual print accounting:** 723,167 trades = 656,555 priced +
+  65,633 no-prior-snapshot + 397 missing-marginals + 582 unpriceable. (The
+  earlier 656,555-vs-631,834 "gap" was trades-vs-unique-(ticker,timestamp)
+  keys — 25,303 trades share a timestamp; identity closes exactly.)
+- Artifacts: `ph4\wc\wc_fixed_printed\{fairs_perprint.pkl (64.7MB, merged),
+  wc_backtest_perprint.json}`; parity in `ph4\parity_pp\`.
 
 ## Headline per bucket (all promoted = shipped config, strictly-pregame, zero-bias split)
 
