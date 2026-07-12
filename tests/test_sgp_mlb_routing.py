@@ -161,8 +161,11 @@ class TestPropPairRouting:
     def test_facing_hr_and_hrr_x_ks(self) -> None:
         assert abs(_rho(f"KXMLBHR-{_G}-COLHGOODMAN15-1",
                         f"KXMLBKS-{_G}-SFCWHISENHUNT88-6") - (-0.075)) < 1e-9
+        # M2 zero-gaps wire (2026-07-12): the hrr×ks facing ladder is now
+        # per-rung — r3 hits the exact rung key -0.178 (the reproduced
+        # Phase-1 anchor -0.1776), no longer the un-runged -0.18 aggregate.
         assert abs(_rho(f"KXMLBHRR-{_G}-COLHGOODMAN15-3",
-                        f"KXMLBKS-{_G}-SFCWHISENHUNT88-6") - (-0.18)) < 1e-9
+                        f"KXMLBKS-{_G}-SFCWHISENHUNT88-6") - (-0.178)) < 1e-9
 
     def test_same_family_teammate_vs_opponent(self) -> None:
         assert abs(_rho(f"KXMLBHR-{_G}-COLHGOODMAN15-1",

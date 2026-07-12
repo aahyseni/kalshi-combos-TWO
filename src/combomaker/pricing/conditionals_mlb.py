@@ -44,6 +44,8 @@ SAME_PLAYER_CONDITIONALS: dict[_Key, _CellValue] = {
     # 33 exact cells verified empirically == 1.0 pooled AND 2021-25.
     # +7 ('tb', N, 'hrr', 1) exact cells (WIRE-2 re-run, 2026-07-11 — see the
     # provenance block at the end of the table) = 149 cells / 40 exact.
+    # +84 M2 zero-gaps cells (2026-07-12 re-run, provenance block below)
+    # = 233 cells / 77 exact.
     ('hit', 1, 'hr', 1): (0.17209235086525787, 587975, 'measured'),
     ('hit', 1, 'hr', 2): (0.01053616225179642, 587975, 'measured'),
     ('hit', 1, 'hrr', 2): (0.7335583995918193, 587975, 'measured'),
@@ -202,6 +204,106 @@ SAME_PLAYER_CONDITIONALS: dict[_Key, _CellValue] = {
     ('tb', 6, 'hrr', 1): (1.0, 31347, 'exact'),
     ('tb', 7, 'hrr', 1): (1.0, 14744, 'exact'),
     ('tb', 8, 'hrr', 1): (1.0, 8813, 'exact'),
+    # M2 ZERO-GAPS wire (2026-07-12, job 24844262 tmp/zerogaps/mlb_wire_list.txt
+    # sections 1-2; full precision mlb_measurements.json). Population = the
+    # 2026-07-10 export join RE-RUN VERBATIM (1,033,852 batter-games 2005-25,
+    # PA>=1, parsed_full x parsed_hrr 1:1, fatal-guarded; shipped-cell parity
+    # float-exact this run). 37 EXACT cells (arithmetic containment from
+    # official scoring — TB only via hits, max 4 TB/hit; HR = 1 hit + 4 TB +
+    # >=1 R + >=1 RBI => HRR >= 3/HR; HRR = H+R+RBI >= H — each verified
+    # == 1.0 POOLED AND 2021-25): closes hit_k=>hrr>=k, hr_k=>hrr>=3k,
+    # hr2=>tb7/8, and the full hr-3 / hit-4 / tb-7 / tb-8 implication rows.
+    # 47 MEASURED cells (all n >= MIN_CONDITIONAL_N; max era drift 0.019 in
+    # p-space, cluster-boot hw95(p) <= 0.0026): includes the FULL
+    # ('hrr', 1, *) reverse row — closes the S41-ny residual (tb-no x
+    # hrr1-yes, 146 tape combos) and every no+yes mix against hit-4 / hr-3 /
+    # tb-7 / tb-8 legs. 149 + 84 = 233 cells / 40 + 37 = 77 exact. The 29
+    # sub-50k directions stay UNWIRED by decision (wire list section 8) —
+    # their mixes keep declining UNKNOWN.
+    ('hit', 1, 'hrr', 1): (1.0, 587975, 'exact'),
+    ('hit', 2, 'hrr', 1): (1.0, 212507, 'exact'),
+    ('hit', 3, 'hrr', 1): (1.0, 48375, 'exact'),
+    ('hit', 4, 'hrr', 1): (1.0, 6658, 'exact'),
+    ('hit', 4, 'hrr', 2): (1.0, 6658, 'exact'),
+    ('hit', 4, 'hrr', 3): (1.0, 6658, 'exact'),
+    ('hit', 4, 'hrr', 4): (1.0, 6658, 'exact'),
+    ('hit', 4, 'tb', 2): (1.0, 6658, 'exact'),
+    ('hit', 4, 'tb', 3): (1.0, 6658, 'exact'),
+    ('hit', 4, 'tb', 4): (1.0, 6658, 'exact'),
+    ('hr', 1, 'hrr', 1): (1.0, 101186, 'exact'),
+    ('hr', 2, 'hrr', 1): (1.0, 6195, 'exact'),
+    ('hr', 2, 'tb', 7): (1.0, 6195, 'exact'),
+    ('hr', 2, 'tb', 8): (1.0, 6195, 'exact'),
+    ('hr', 3, 'hit', 1): (1.0, 243, 'exact'),
+    ('hr', 3, 'hit', 2): (1.0, 243, 'exact'),
+    ('hr', 3, 'hit', 3): (1.0, 243, 'exact'),
+    ('hr', 3, 'hrr', 1): (1.0, 243, 'exact'),
+    ('hr', 3, 'hrr', 2): (1.0, 243, 'exact'),
+    ('hr', 3, 'hrr', 3): (1.0, 243, 'exact'),
+    ('hr', 3, 'hrr', 4): (1.0, 243, 'exact'),
+    ('hr', 3, 'hrr', 5): (1.0, 243, 'exact'),
+    ('hr', 3, 'tb', 2): (1.0, 243, 'exact'),
+    ('hr', 3, 'tb', 3): (1.0, 243, 'exact'),
+    ('hr', 3, 'tb', 4): (1.0, 243, 'exact'),
+    ('hr', 3, 'tb', 5): (1.0, 243, 'exact'),
+    ('hr', 3, 'tb', 6): (1.0, 243, 'exact'),
+    ('hr', 3, 'tb', 7): (1.0, 243, 'exact'),
+    ('hr', 3, 'tb', 8): (1.0, 243, 'exact'),
+    ('tb', 7, 'hit', 1): (1.0, 14744, 'exact'),
+    ('tb', 7, 'hit', 2): (1.0, 14744, 'exact'),
+    ('tb', 7, 'hrr', 2): (1.0, 14744, 'exact'),
+    ('tb', 7, 'hrr', 3): (1.0, 14744, 'exact'),
+    ('tb', 8, 'hit', 1): (1.0, 8813, 'exact'),
+    ('tb', 8, 'hit', 2): (1.0, 8813, 'exact'),
+    ('tb', 8, 'hrr', 2): (1.0, 8813, 'exact'),
+    ('tb', 8, 'hrr', 3): (1.0, 8813, 'exact'),
+    ('hit', 1, 'hr', 3): (0.00041328287767337045, 587975, 'measured'),
+    ('hit', 1, 'tb', 7): (0.02507589608401718, 587975, 'measured'),
+    ('hit', 1, 'tb', 8): (0.014988732514137506, 587975, 'measured'),
+    ('hit', 2, 'hr', 3): (0.0011434917438013807, 212507, 'measured'),
+    ('hit', 2, 'tb', 7): (0.06938124391196525, 212507, 'measured'),
+    ('hit', 2, 'tb', 8): (0.04147157505399822, 212507, 'measured'),
+    ('hr', 1, 'hit', 4): (0.025912675666594193, 101186, 'measured'),
+    ('hr', 1, 'tb', 7): (0.13906073962801177, 101186, 'measured'),
+    ('hr', 1, 'tb', 8): (0.08569367303777202, 101186, 'measured'),
+    ('hrr', 1, 'hit', 1): (0.9040956659993296, 650346, 'measured'),
+    ('hrr', 1, 'hit', 2): (0.3267599093405664, 650346, 'measured'),
+    ('hrr', 1, 'hit', 3): (0.07438348202341523, 650346, 'measured'),
+    ('hrr', 1, 'hit', 4): (0.010237627355284726, 650346, 'measured'),
+    ('hrr', 1, 'hr', 1): (0.1555879485689156, 650346, 'measured'),
+    ('hrr', 1, 'hr', 2): (0.00952569862811488, 650346, 'measured'),
+    ('hrr', 1, 'hr', 3): (0.0003736472585362253, 650346, 'measured'),
+    ('hrr', 1, 'tb', 2): (0.5241456086452442, 650346, 'measured'),
+    ('hrr', 1, 'tb', 3): (0.3003309007820453, 650346, 'measured'),
+    ('hrr', 1, 'tb', 4): (0.20573048807865352, 650346, 'measured'),
+    ('hrr', 1, 'tb', 5): (0.09846758494708971, 650346, 'measured'),
+    ('hrr', 1, 'tb', 6): (0.048200496351173065, 650346, 'measured'),
+    ('hrr', 1, 'tb', 7): (0.02267100897060949, 650346, 'measured'),
+    ('hrr', 1, 'tb', 8): (0.013551248104854955, 650346, 'measured'),
+    ('hrr', 2, 'hit', 4): (0.015216094596663794, 437563, 'measured'),
+    ('hrr', 2, 'hr', 3): (0.0005553486012299943, 437563, 'measured'),
+    ('hrr', 2, 'tb', 7): (0.03369571924500015, 437563, 'measured'),
+    ('hrr', 2, 'tb', 8): (0.020141099681645843, 437563, 'measured'),
+    ('hrr', 3, 'hit', 4): (0.024086709259165468, 276418, 'measured'),
+    ('hrr', 3, 'hr', 3): (0.0008791033868995507, 276418, 'measured'),
+    ('hrr', 3, 'tb', 7): (0.05333950755739496, 276418, 'measured'),
+    ('hrr', 3, 'tb', 8): (0.031882873040105925, 276418, 'measured'),
+    ('hrr', 4, 'hit', 4): (0.04075361751095659, 163372, 'measured'),
+    ('hrr', 4, 'hr', 3): (0.0014874029821511643, 163372, 'measured'),
+    ('hrr', 4, 'tb', 7): (0.09022965991724408, 163372, 'measured'),
+    ('hrr', 4, 'tb', 8): (0.05394437235266753, 163372, 'measured'),
+    ('hrr', 5, 'hit', 4): (0.06992329869988577, 91915, 'measured'),
+    ('hrr', 5, 'hr', 3): (0.002643746940107708, 91915, 'measured'),
+    ('hrr', 5, 'tb', 7): (0.15926671381167382, 91915, 'measured'),
+    ('hrr', 5, 'tb', 8): (0.09587118533427623, 91915, 'measured'),
+    ('tb', 2, 'hit', 4): (0.01953202924230512, 340876, 'measured'),
+    ('tb', 2, 'hr', 3): (0.0007128691958366092, 340876, 'measured'),
+    ('tb', 3, 'hit', 4): (0.034087825557165455, 195319, 'measured'),
+    ('tb', 3, 'hr', 3): (0.001244118595733134, 195319, 'measured'),
+    ('tb', 4, 'hit', 4): (0.04976232473317588, 133796, 'measured'),
+    ('tb', 4, 'hr', 3): (0.0018161977936560136, 133796, 'measured'),
+    ('tb', 5, 'hit', 4): (0.08519941284862113, 64038, 'measured'),
+    ('tb', 5, 'hr', 3): (0.0037946219432212123, 64038, 'measured'),
 }
 
 # A measured cell prices only when its conditioning sample is at least this

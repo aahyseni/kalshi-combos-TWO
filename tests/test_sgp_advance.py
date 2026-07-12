@@ -92,8 +92,34 @@ def test_advance_spread_is_near_containment() -> None:
     assert _rho(f"KXWCADVANCE-{_G}-FRA", f"KXWCSPREAD-{_G}-FRA2") >= 0.9
 
 
-def test_advance_corners_unchanged_zero() -> None:
-    assert abs(_rho(f"KXWCADVANCE-{_G}-FRA", f"KXWCCORNERS-{_G}-8")) < 1e-9
+def test_advance_corners_strength_curve() -> None:
+    # M2 zero-gaps wire (2026-07-12): advance × total corners is a STRENGTH
+    # CURVE on the ADVANCE leg's marginal (dog +0.23 <-> fav -0.23; drawn-90
+    # forces ET and corners settle incl ET) — near-zero at a coin-flip
+    # advance (antisymmetric knots straddle 0.5), signed at the ends.
+    assert abs(_rho(f"KXWCADVANCE-{_G}-FRA", f"KXWCCORNERS-{_G}-8")) < 1e-3
+    out_dog = build_sgp_correlation(
+        (_leg(f"KXWCADVANCE-{_G}-FRA"), _leg(f"KXWCCORNERS-{_G}-8")),
+        [(0, 1)],
+        _sp(),
+        marginals=[0.2823, 0.5],
+    )
+    assert abs(out_dog.corr[0, 1] - 0.2336) < 1e-9
+    out_fav = build_sgp_correlation(
+        (_leg(f"KXWCADVANCE-{_G}-FRA"), _leg(f"KXWCCORNERS-{_G}-8")),
+        [(0, 1)],
+        _sp(),
+        marginals=[0.7177, 0.5],
+    )
+    assert abs(out_fav.corr[0, 1] - (-0.2336)) < 1e-9
+    # No marginals -> the plain 0.00 scalar (band 0.25 spans the curve).
+    out_plain = build_sgp_correlation(
+        (_leg(f"KXWCADVANCE-{_G}-FRA"), _leg(f"KXWCCORNERS-{_G}-8")),
+        [(0, 1)],
+        _sp(),
+    )
+    assert abs(out_plain.corr[0, 1]) < 1e-9
+    assert abs(out_plain.corr_high[0, 1] - 0.25) < 1e-9
 
 
 def test_config_carries_advance_pairs_and_bands() -> None:
