@@ -162,7 +162,7 @@
       <div class="lg"><span class="sw" style="background:var(--block)"></span>blocked</div>
       <div class="lg"><span class="sw" style="background:var(--off)"></span>not built</div>
     </div>
-    <div class="live"><span class="pulse"></span>recorder live · phase 6</div>
+    <div class="live"><span class="pulse"></span>recorder live · capstone closed</div>
   </nav>
 
   <main>
@@ -176,10 +176,10 @@
         moat; everything else is discipline.</p>
 
       <div class="hero-stats">
-        <div class="hs"><div class="v teal num" data-count="54">54</div><div class="l">source modules · 13.5k LOC</div></div>
-        <div class="hs"><div class="v green num" data-count="984">984</div><div class="l">tests green · 61 files</div></div>
-        <div class="hs"><div class="v gold num" data-count="37">37</div><div class="l">soccer ρ pairs calibrated</div></div>
-        <div class="hs"><div class="v block num" data-count="1">1</div><div class="l">blocker to live fills</div></div>
+        <div class="hs"><div class="v teal num" data-count="55">55</div><div class="l">source modules · 15.3k LOC</div></div>
+        <div class="hs"><div class="v green num" data-count="1245">1245</div><div class="l">tests green · 70 files</div></div>
+        <div class="hs"><div class="v gold num" data-count="261">261</div><div class="l">ρ table entries · soccer 96 + MLB 165</div></div>
+        <div class="hs"><div class="v green num" data-count="0">0</div><div class="l">blockers — sell-only UN-GATED</div></div>
       </div>
 
       <h2>The strategy <span class="tag">one line</span></h2>
@@ -190,9 +190,9 @@
         safer.</p>
 
       <div class="grid g3" style="margin-top:18px">
-        <div class="card"><div class="top"><h3>Where we are</h3><span class="st gate">building</span></div><p>Scaffold, market data, observe, and demo round-trips are <b>proven</b>. Pricing is in progress (correlations incomplete); risk + MC are <b>coded but unverified</b>. Now shadowing prod flow read-only.</p></div>
-        <div class="card"><div class="top"><h3>Just shipped</h3><span class="st ship">07-08</span></div><p>Sell-only parlay-seller mode — verified airtight by two independent agents. The engine can never emit a non-zero <code>yes_bid</code> on a combo.</p></div>
-        <div class="card"><div class="top"><h3>The one blocker</h3><span class="st block">pending</span></div><p>Combo NO-settlement convention unverified → sell-only fills are inert (fail-safe). A live demo NO position settles ~Jul 11 to confirm it.</p></div>
+        <div class="card"><div class="top"><h3>Where we are</h3><span class="st ship">capstone closed</span></div><p>MLB props engine <b>shipped + backtest-gated</b> (0.34¢ med); soccer/WC parity-gated (1.57¢ med per-print). Quoting fenced to <b>pregame-only</b> + an <b>MLB/WC leg-series allowlist</b>. Risk + MC still coded-not-verified. Next: #14 demo fill e2e → #15 weekly cadence → #16 MLB blind test.</p></div>
+        <div class="card"><div class="top"><h3>Just shipped</h3><span class="st ship">07-11</span></div><p>Containment campaign merged — collapse plans rescue 225 formerly-UNKNOWN WC combos, universal exact windows, spread⟹win family, taxonomy-impossible tripwire, same-game isolation guard — plus the F1 leg-series allowlist.</p></div>
+        <div class="card"><div class="top"><h3>Blocker cleared</h3><span class="st ship">07-10</span></div><p>The demo combo settled NO and paid <b>exactly $1.00 = 1−V</b> — <code>combo_no_pays_complement: true</code> promoted from the real ledger. Sell-only fills are <b>UN-GATED</b>; the NO-confirm gate is open.</p></div>
       </div>
       <div class="callout">Click into <b>Pricing</b> for the RFQ→quote flowchart, or
         <b>Correlations → Soccer</b> for every calibrated ρ with its source and
@@ -209,7 +209,7 @@
         <div class="stg" data-go="execution"><div class="n">00 SECRETS</div><div class="t">.env → config</div><div class="s">RSA keys · YAML per env · prod guard</div></div><div class="ar">→</div>
         <div class="stg" data-go="execution"><div class="n">01 EXCHANGE</div><div class="t">auth · REST · WS</div><div class="s">signed client · comms channel</div></div><div class="ar">→</div>
         <div class="stg" data-go="execution"><div class="n">02 MARKETDATA</div><div class="t">feed · book · grid</div><div class="s">live leg mids + metadata</div></div><div class="ar">→</div>
-        <div class="stg" data-go="execution"><div class="n">03 RFQ</div><div class="t">intake · filters</div><div class="s">whitelist · freshness · sport-only</div></div><div class="ar">→</div>
+        <div class="stg" data-go="execution"><div class="n">03 RFQ</div><div class="t">intake · filters</div><div class="s">series allowlist · pregame-only · freshness</div></div><div class="ar">→</div>
         <div class="stg" data-go="pricing"><div class="n">04 PRICING</div><div class="t">engine → quote</div><div class="s">marginals × correlation</div></div><div class="ar">→</div>
         <div class="stg" data-go="risk"><div class="n">05 RISK</div><div class="t">exposure · last-look</div><div class="s">caps · kill · in-play</div></div><div class="ar">→</div>
         <div class="stg" data-go="execution"><div class="n">06 EXECUTE</div><div class="t">lifecycle</div><div class="s">quote→accept→confirm→fill</div></div>
@@ -228,14 +228,18 @@
       <p class="lead">The engine is a <b>fail-closed</b> pipeline — every branch that
         isn't provably safe exits to a reasoned no-quote, never a hole in the price.
         Here's the actual control flow.</p>
-      <div class="callout gate"><b>Pricing is not done.</b> The spine below is coded and
-        produces quotes we've backtested — but the <b>correlation surface is far from
-        complete</b> (many pair types, player props, and sports still to build), and the
-        fairs aren't yet validated against real settlements. Treat this as a working
-        skeleton, not a finished pricer.</div>
+      <div class="callout"><b>Soccer + MLB are now backtest-gated.</b> Fresh-window capstone
+        (2026-07-11): MLB <b>0.34¢</b> median error (prop-carrying 0.66¢ vs 1.37¢ legacy;
+        per-print 98.6% within-2¢) — GATE PASS; WC soccer <b>1.57¢</b> median per-print over
+        656,555 prints, parity PASS. Mixed-bucket settlements: 15.28% YES vs 15.25¢ mean
+        fair. Quoting is fenced to exactly these two families (leg-series allowlist) and to
+        pregame; the surface for other sports (NBA gated off, UFC/tennis unbuilt) is still
+        open work.</div>
       <div class="flow" id="flow"></div>
       <h2>Modules <span class="tag">pricing/</span></h2>
       <div class="grid g2" id="pmods"></div>
+      <h2>New machinery <span class="tag">shipped 07-10 → 07-11</span></h2>
+      <div class="grid g3" id="machinery"></div>
     </section>
 
     <!-- ===== CORRELATIONS ===== -->
@@ -245,13 +249,13 @@
       <p class="lead">The joint layer is the only thing modeled bottom-up. Each sport
         is its own calibration with its own out-of-sample gate — a model that doesn't
         beat the copula on held-out data doesn't ship. Pick a sport.</p>
-      <div class="callout gate"><b>The correlation surface is far from complete.</b>
-        Soccer is strong and nearly done (final tests pending) — it only hardens from
-        here. <b>MLB is the ACTIVE workstream</b>: all 9 leg families classified and
-        every allowed pair measured on Retrosheet 2005–25 + adversarially verified
-        (2026-07-09, 0 of 33 verdicts refuted) — now STAGED behind the tape-backtest
-        gate. NBA gated, UFC & Tennis unbuilt.
-        This is the biggest open work in the whole system.</div>
+      <div class="callout"><b>Two sports are live-grade, and only they may quote.</b>
+        Soccer/WC: 96-entry pair table (judge-verified byte-exact vs the executed config)
+        + structural Dixon-Coles, per-print 1.57¢ median. <b>MLB: SHIPPED + GATED</b> —
+        165-entry measured pair table + rung keys + 149-cell same-player conditionals,
+        fresh-window gate PASS (0.34¢ med). Both fenced in by the leg-series allowlist.
+        Remaining open work: soccer pair priors (corners|advance, pgoal|total,
+        btts|advance — the within-2¢ lever), NBA gated, UFC &amp; Tennis unbuilt.</div>
       <div class="tabs" id="sporttabs"></div>
       <div id="sports"></div>
     </section>
@@ -285,6 +289,13 @@
         <div class="stg"><div class="n">4</div><div class="t">confirm</div><div class="s">or lapse (silent void)</div></div><div class="ar">→</div>
         <div class="stg"><div class="n">5</div><div class="t">fill</div><div class="s">signed position booked</div></div>
       </div>
+      <div class="callout"><b>Operator gates ACTIVE:</b> pregame-only quoting — any started
+        or unknown-start leg declines, ALL sports (<code>filters.allow_inplay_legs</code>
+        re-enables without a code change) — and the <b>leg-series allowlist</b>
+        (<code>filters.allowed_leg_series_prefixes = ["KXWC","KXMLB"]</code>: every leg must
+        start with an allowed prefix or the RFQ skips; unblock = one YAML prefix; doubles as
+        the per-sport kill switch). Sell-only is <b>UN-GATED</b>: the demo combo settled at
+        exactly $1.00, <code>combo_no_pays_complement: true</code> promoted from the ledger.</div>
       <h2>Plumbing</h2>
       <div class="grid g2" id="exmods"></div>
     </section>
@@ -295,6 +306,13 @@
       <h1>Phase map.</h1>
       <p class="lead">Each phase ends with passing tests, a demo, and an
         assumption-audit table in <code>NOTES.md</code>. Through Phase 5, into 6.</p>
+      <div class="callout"><b>MLB campaign CLOSED 2026-07-11</b> — Phase 1 measurements →
+        Phase 2 wiring (165 entries + rung keys + DO-6) → Phase 3 pregame gate →
+        <b>Phase 4 capstone</b> (fresh 3-bucket re-backtest, all buckets, both modes,
+        parity PASS). Next: <b>#14</b> demo fill e2e → <b>#15</b> weekly
+        settlement/calibration cadence → <b>#16</b> MLB blind test → <b>E decisions</b>
+        (markup from pooled multi-week evidence — never refit on a P&amp;L window;
+        per-sport kill = the allowlist; prod gates).</div>
       <ul class="rail" id="rail"></ul>
     </section>
 
@@ -306,10 +324,10 @@
         in the code <em>and</em> its test — so everything's green while it loses money.
         The defenses are structural.</p>
       <div class="hero-stats">
-        <div class="hs"><div class="v green num" data-count="984">984</div><div class="l">tests passing</div></div>
-        <div class="hs"><div class="v teal num" data-count="61">61</div><div class="l">test files · 11k LOC</div></div>
+        <div class="hs"><div class="v green num" data-count="1245">1245</div><div class="l">tests passing · 0 failed</div></div>
+        <div class="hs"><div class="v teal num" data-count="70">70</div><div class="l">test files · 14.9k LOC</div></div>
         <div class="hs"><div class="v num">strict</div><div class="l">mypy · ruff clean</div></div>
-        <div class="hs"><div class="v gold num" data-count="3">3</div><div class="l">OOS model gates passed</div></div>
+        <div class="hs"><div class="v gold num">0.34¢</div><div class="l">MLB fresh-window gate — PASS</div></div>
       </div>
       <h2>Structural defenses</h2>
       <div class="grid g2" id="defenses"></div>
@@ -333,7 +351,7 @@
       </table></div>
     </section>
 
-    <footer>combomaker system atlas · v2 · 2026-07-09 — living document. Proven (seen it work): scaffold · market data · observe · demo round-trips. Coded but unverified: risk + MC. In progress: pricing (correlation surface far from complete). Phase 6 shadow recorder running; sell-only book inert pending the combo-settlement convention.</footer>
+    <footer>combomaker system atlas · v3 · 2026-07-11 — living document. Suite 1245/0. MLB props engine SHIPPED + backtest-gated (0.34¢ med); soccer/WC parity-gated (1.57¢ med per-print). Sell-only UN-GATED ($1.00 settlement ledger-verified); quoting fenced pregame-only + MLB/WC leg-series allowlist. Risk + MC still coded-not-verified. MLB campaign Phase 4 CLOSED — next: #14 demo fill e2e · #15 weekly cadence · #16 MLB blind test · E decisions (pooled multi-week markup).</footer>
   </main>
 </div>
 
@@ -370,14 +388,14 @@
 
   /* ---- data ---- */
   var layers=[
-    ['core','money · clock · reasons · quantity · conventions',424,'Centi-cent money, injectable clock, ground-truth conventions','ship'],
+    ['core','money · clock · reasons · quantity · conventions',439,'Centi-cent money, injectable clock, ground-truth conventions (combo settlement now ledger-verified)','ship'],
     ['exchange','auth · rest · ws',673,'RSA-PSS signing, thin REST client, WS comms channel','ship'],
     ['marketdata','feed · orderbook · grid · metadata',717,'Live leg books, price grid, combo metadata cache','ship'],
-    ['rfq','intake · filters · models · lifecycle',1148,'Parse, gate, and run the quote→confirm state machine','ship'],
-    ['pricing','engine · quote · joint · sgp · dixon_coles · structural · …',4515,'Marginals → relationship → correlation → maker bid. Spine works; correlations incomplete','gate'],
-    ['risk','exposure · limits · lastlook · inplay · killswitch · markouts',738,'Coded + unit-tested — NOT verified against live flow','coded'],
+    ['rfq','intake · filters · pregame · models · lifecycle',1342,'Parse, gate (leg-series allowlist + pregame-only), and run the quote→confirm state machine','ship'],
+    ['pricing','engine · quote · joint · sgp · relationships · structural · tripwire · …',7498,'Marginals → relationship → correlation → maker bid. Soccer + MLB calibrated &amp; backtest-gated; other sports open','gate'],
+    ['risk','exposure · limits · lastlook · inplay · killswitch · markouts',747,'Coded + unit-tested — NOT verified against live flow','coded'],
     ['sim','engine',285,'Monte-Carlo joint settlement — coded, never run in anger','coded'],
-    ['ops','app · quote_app · cli · ground_truth · persistence · config',2935,'Wiring, SQLite store, CLIs, Phase-2.5 harness','ship'],
+    ['ops','app · quote_app · cli · ground_truth · persistence · config',3540,'Wiring, SQLite store, CLIs, Phase-2.5 harness','ship'],
     ['hedging','planner',44,'Residual correlation hedging','off']];
   var stLbl={ship:'proven',coded:'coded',gate:'in progress',off:'not built',block:'blocked'};
   $('layers').innerHTML=layers.map(function(r){return '<tr><td class="k">'+r[0]+'</td><td style="color:var(--muted);font-size:12px">'+r[1]+'</td><td class="k num">'+r[2].toLocaleString()+'</td><td style="font-size:12.5px">'+r[3]+'</td><td><span class="st '+r[4]+'">'+stLbl[r[4]]+'</span></td></tr>'}).join('');
@@ -385,6 +403,9 @@
   /* flowchart */
   var flow=[
     {t:'RFQ arrives',s:'combo market ticker + size',l:'ENTRY'},
+    {dec:1,t:'series allowlist + pregame-only?',l:'OPS GATES',exits:[
+      ['foreign series','no','every leg must start KXWC/KXMLB — one YAML prefix unblocks','skip_series_not_allowed'],
+      ['in-play / unknown start','no','no-quote · straddles re-checked at last look','decline_inplay_leg']]},
     {dec:1,t:'is_combo & all leg sides known?',l:'GUARD',exits:[['no','no','no-quote','CLASSIFIER_UNKNOWN']]},
     {t:'classify_legs → Relationship',s:'legtypes + mutual-exclusion + containment',l:'CLASSIFY'},
     {dec:1,t:'relationship kind?',l:'BRANCH',exits:[
@@ -408,15 +429,25 @@
     return (i>0?'<div class="fconn"></div>':'')+body;}).join('');
 
   var pmods=[
-    ['engine.py',364,'Orchestrates the pipeline; hosts <code>_enforce_sell_only</code> — the single boundary guaranteeing no combo quote carries a non-zero yes_bid.'],
-    ['quote.py',295,'Fair → width → two maker bids on the grid. Maker-favorable rounding (always DOWN), free-money caps, sell-only forces yes_bid=0.'],
-    ['sgp.py',673,'Pairwise ρ builder: alphabetical pair_key + oriented resolvers (:same/:opp/:tie/:team) for same-game legs.'],
+    ['engine.py',633,'Orchestrates the pipeline; hosts <code>_enforce_sell_only</code> plus nested-band + collapse pricing with a defensive same-game isolation re-check.'],
+    ['quote.py',311,'Fair → width → two maker bids on the grid. Maker-favorable rounding (always DOWN), free-money caps, sell-only forces yes_bid=0, DO-6 basket width.'],
+    ['sgp.py',1116,'Pairwise ρ builder: pair_key + oriented resolvers (:same/:opp/:tie/:team), MLB team routing + spread×prop resolver, :rN rung keys on the exact→oriented→plain fail-closed chain (no interpolation).'],
+    ['relationships.py',1059,'Leg-relationship classifier: UNKNOWN/IMPOSSIBLE branches, containment-collapse plans, exact windows, spread⟹win family, same-game-companion isolation guard.'],
     ['dixon_coles.py + structural.py',1428,'Structural scoreline pricer (soccer) inverted from live leg prices; coherent scorelines beat pairwise-ρ stitching, most on dense combos.'],
     ['joint.py + copula.py',441,'Gaussian-copula joint with priced ρ-uncertainty and Fréchet clamps — the conservative default.'],
-    ['relationships.py',384,'Leg-relationship classifier w/ explicit UNKNOWN/IMPOSSIBLE branches; farmable flag on the 5 airtight tautologies.'],
-    ['margin_total.py + mlb_runs.py',422,'(margin,total) bivariate-normal for NFL/NBA/WNBA + Poisson runs for MLB. Enabled per sport via OOS gate.'],
-    ['legs · legtypes · fees · devig',564,'Belief blending, market-family classification, fail-safe fee attribution, external-odds devig (quarantined).']];
+    ['tripwire.py + conditionals_mlb.py',707,'Taxonomy-impossible tripwire (fixture-pinned exchange-BLOCKED cells) + the 149-cell same-player conditional table (40 exact, incl. TB⟹HRR).'],
+    ['margin_total.py + mlb_runs.py',422,'(margin,total) bivariate-normal for NFL/NBA/WNBA + NegBin/Poisson runs grid for MLB game/total/spread. Enabled per sport via OOS gate.'],
+    ['legs · legtypes · fees · devig',602,'Belief blending, market-family classification, fail-safe fee attribution, external-odds devig (quarantined).']];
   $('pmods').innerHTML=pmods.map(function(m){return '<div class="card"><div class="top"><h3 class="mono">'+m[0]+'</h3><span class="st coded mono">'+m[1]+' loc</span></div><p>'+m[2]+'</p></div>'}).join('');
+
+  var machinery=[
+    ['Containment collapse plans','A⟹B buried inside a bigger combo ⇒ drop the implied leg and price the reduced combo. Rescues the 225 formerly-UNKNOWN WC combos (1H-BTTS⟹FT-BTTS 127 · ml⟹over-0.5 70 · same-line 1H⟹FT totals 29) — the only material UNKNOWN species in WC flow (~91 declined prints/day).','merged 07-11'],
+    ['Universal exact windows','"A but NOT B" side-mixes price as exact P(B)−P(A) band arithmetic — the ml|spread window family extended from MLB to soccer ("win but not by N", 1,091 tape prints) and WNBA. Exact, free, no measurement.','exact · free'],
+    ['Spread×total impossibility','Win 1H by N ⟹ ≥N goals FT: the S8-yn / S34-yn impossible mixes now classify IMPOSSIBLE instead of pricing +0.52/+0.13 through the copula. S8 farm narrowed to farmable=False (two-record lemma unverified); MLB stays farmable=False per rain-scalar.','correctness'],
+    ['Taxonomy-impossible tripwire','Fixture pins 50 exchange-BLOCKED cells across 28 shapes (29/30 of the dangerous class — S49 is a documented cross-scope residual) ⇒ IMPOSSIBLE farmable=False with a countable note. A live match is proof Kalshi\'s validator loosened; missing fixture ⇒ inert + warning.','fixture-pinned'],
+    ['Same-game isolation guard','Conditional super-legs carrying a same-game KEPT companion decline UNKNOWN — kills the judge-found +7.32¢ sign inversion (engine 0.4183 vs 0.3451 truth). Cross-game companions (the bulk) stay priceable — exact at ρ=0.','judge-mandated'],
+    ['DO-6 basket width','+2.5¢ width (basket_width_extra_cc=250, tunable) on ≥8-leg all-NO single-prop-family combos — widen-only defense for the measured +25–35¢/$1 flat-copula basket-overbid tail.','widen-only']];
+  $('machinery').innerHTML=machinery.map(function(c){return '<div class="card"><h3>'+c[0]+'</h3><p>'+c[1]+'</p><div class="meta"><span>'+c[2]+'</span></div></div>'}).join('');
 
   var riskmods=[
     ['exposure.py',246,'Signed exposure book with the <b>mass-acceptance worst case</b> — every open quote is instantly executable, so dominance must hold across all at once.'],
@@ -428,10 +459,11 @@
   $('riskmods').innerHTML=riskmods.map(function(m){return '<div class="card"><div class="top"><h3 class="mono">'+m[0]+'</h3><span class="st coded mono">'+m[1]+' loc</span></div><p>'+m[2]+'</p></div>'}).join('');
 
   var exmods=[
-    ['config.py + .env',930,'Pydantic config, YAML per env, secrets via env only. Prod guard: quoting needs <code>--confirm-live</code> + <code>prod_limits_configured</code> (both off).'],
-    ['rfq/lifecycle.py',732,'quote→accept→last-look→confirm→execute→position; TTL/reprice/cancel-all; NO-side declines while the combo settlement convention is unverified.'],
+    ['config.py + .env',1535,'Pydantic config, YAML per env, secrets via env only. Hosts the allowlist + pregame flags. Prod guard: quoting needs <code>--confirm-live</code> + <code>prod_limits_configured</code> (both off).'],
+    ['rfq/lifecycle.py',737,'quote→accept→last-look→confirm→execute→position; TTL/reprice/cancel-all. NO-confirm gate now OPEN — combo settlement convention ledger-verified ($1.00 exact).'],
+    ['rfq/filters.py + pregame.py',337,'Leg-series allowlist (every leg starts KXWC/KXMLB else <code>skip_series_not_allowed</code>; null disables, empty blocks all) + pregame gate (MLB HHMM token API-verified US/Eastern; estimate = min(close, exp_exp) − 4.5h, KXMLB 4.0h; UNKNOWN start ⇒ decline).'],
     ['ops/persistence.py',391,'SQLite store: combo_trades, rfqs, would_quotes, fills, markouts, EV ledger. Prod DB opened read-only for shadow analytics.'],
-    ['ops/ground_truth.py',420,'Phase-2.5 harness: real demo RFQ round-trips recorded to a fixture; conventions.py imports only from it. Combo pass in flight.'],
+    ['ops/ground_truth.py',420,'Phase-2.5 harness: real demo RFQ round-trips recorded to a fixture; conventions.py imports only from it. Combo pass COMPLETE — settlement fixture promoted 07-10.'],
     ['exchange/auth.py',113,'RSA-PSS request signing (SHA256, salt=digest), doc-verified. Key material never logged or persisted.'],
     ['ops/app · quote_app',688,'Observe/paper/quote apps with hard gates: verified conventions + whitelist + prod guard; recorder + cancel-all on halt.']];
   $('exmods').innerHTML=exmods.map(function(m){return '<div class="card"><div class="top"><h3 class="mono">'+m[0]+'</h3><span class="st ship">'+m[1]+'</span></div><p>'+m[2]+'</p></div>'}).join('');
@@ -439,11 +471,11 @@
   var phases=[['0','Scaffold','ship','Repo, uv, config, money core, auth, REST/WS, kill switch, doc-independent math (copula, MC, devig).'],
     ['1','Market data','ship','Order-book mirror, price grid, metadata cache.'],
     ['2','Observe','ship','Read-only RFQ tape recording; would-quotes logged.'],
-    ['2.5','Ground-truth conventions','gate','Real demo round-trips fix direction/sign/fee into a fixture. Single-market promoted; combo pass placed (settling ~Jul 11).'],
-    ['3','Pricing','gate','Spine coded & backtested (classifier, copula, structural, quote, sell-only) — but the correlation surface is far from complete and fairs aren\'t settlement-validated.'],
+    ['2.5','Ground-truth conventions','ship','Real demo round-trips fix direction/sign/fee into a fixture. Combo pass RESOLVED 07-10: settled NO paid exactly $1.00 = 1−V → combo_no_pays_complement promoted, sell-only fills UN-GATED.'],
+    ['3','Pricing','gate','Spine shipped; soccer/WC (96-entry table + DC structural, 1.57¢ per-print) and MLB (165-entry table + conditionals, 0.34¢ gate PASS) are backtest-gated. Other sports + soccer pair priors open; settlements tracked as the unbendable ruler.'],
     ['4','Risk + MC','coded','Exposure book, limits, last-look, in-play, markouts, EV ledger, Monte-Carlo — all written and unit-tested, but NONE verified working against real flow.'],
     ['5','Demo quote e2e','ship','30 live demo quotes + combo round-trips — the plumbing (quote→accept→confirm→fill) is proven. Validates plumbing, NOT edge.'],
-    ['6','Shadow on prod','gate','Read-only prod-flow shadowing: would-quotes vs clearings, settlement calibration, recorder running.'],
+    ['6','Shadow on prod','gate','Read-only prod-flow shadowing: recorder live since 07-09; capstone consumed its tape; WC settlement backtest next; weekly calibration cadence (#15) queued.'],
     ['7','Prod tiny','off','First real quotes at tiny size — gated behind prod_limits_configured + operator sign-off.'],
     ['8','Optional bottom-up','off','Hedging (residual correlation), Ising AMM — exploratory, phase-gated off.']];
   $('rail').innerHTML=phases.map(function(p){var lbl={ship:'proven',coded:'coded · unverified',gate:'in progress',off:'not started'}[p[2]];
@@ -453,10 +485,17 @@
     ['UNKNOWN → no-quote','property-tested','Every classifier has an explicit UNKNOWN branch that provably cannot reach a normal-width quote. A mutation sweep enforces it.'],
     ['Maker-favorable rounding','property-tested','Both bids round DOWN onto the grid — a rounded-away side becomes a decline, never a rounded-up bid.'],
     ['Sell-only invariant','400-example fuzz','Across fair, skew (both signs), size, in-play, leg-count — yes_bid is always 0 in sell-only, plus an engine-boundary leak test.'],
-    ['OOS model gates','held-out seasons','Structural (8,980 games) and margin/total (NFL) both beat the shipped copula on held-out joint-log-loss before enabling.']];
+    ['OOS model gates','held-out seasons','Structural (8,980 games) and margin/total (NFL) both beat the shipped copula on held-out joint-log-loss before enabling.'],
+    ['Pregame + allowlist gates','property-tested','A gated RFQ (in-play/unknown-start leg, or any leg off the KXWC/KXMLB allowlist) provably cannot reach CreateQuote; straddles re-checked at last look. Both stand down via one YAML line each.'],
+    ['No refit on P&L','standing doctrine','Model changes only from measurement/structural evidence; P&L sweeps are thermometers; markup decided on pooled multi-week, game-clustered evidence.']];
   $('defenses').innerHTML=defenses.map(function(d){return '<div class="card"><div class="top"><h3>'+d[0]+'</h3><span class="st ship">'+d[1]+'</span></div><p>'+d[2]+'</p></div>'}).join('');
 
   $('backtests').innerHTML=[
+    ['MLB fresh-window capstone gate','6,969 combos · 53,022 per-print rows','0.34¢ med · prop-carrying 0.66¢ vs 1.37¢ legacy · per-print 98.6% w2 — GATE PASS'],
+    ['WC per-print backtest','656,555 prints, fair recomputed before each','1.57¢ med · 62.1% w2 · parity PASS (2,656 keys, 0 mismatches)'],
+    ['Mixed cross-sport bucket','3,844 combos + 2,892 settlements','0.70¢ med; settled-YES 15.28% vs 15.25¢ mean fair; cross-sport independence EXACT'],
+    ['MLB settlement P&L sweep','52-game window · markups 0–5¢','props-only profitable at every markup 0–3¢; variance-dominated — pooled multi-week before any markup decision'],
+    ['Demo combo settlement','live demo NO position','paid exactly $1.00 = 1−V → combo_no_pays_complement promoted; sell-only UN-GATED'],
     ['Final RFQ blind test','28 real combos, agent-priced','median 2.2¢ vs maker quote; backbone validated'],
     ['Soccer backtest vs clearing','1,480 combos through the engine','median |err| 1.6–1.9¢; dense same-game stacks worst'],
     ['WC settlement P&L','123 resolved WC combos, real outcomes','sell-parlay book +EV, best at ~1¢; markup is adversely selected'],
@@ -464,7 +503,24 @@
   ].map(function(r){return '<tr><td class="k">'+r[0]+'</td><td style="font-size:12.5px;color:var(--muted)">'+r[1]+'</td><td style="font-size:12.5px">'+r[2]+'</td></tr>'}).join('');
 
   $('reports').innerHTML=[
-    ['07-09','Demo combo round-trip — maker landed long NO','gate','settlement pending'],
+    ['07-11','F1 leg-series allowlist — MLB + WC only (doubles as per-sport kill switch)','ship','active'],
+    ['07-11','Module overviews (soccer + baseball) + zero-bias judge — 7 findings, all closed or filed','ship','done'],
+    ['07-11','Judge fixes: same-game isolation guard + poisoned fixture + S8 farm + taxonomy tripwire','ship','done'],
+    ['07-11','Containment universe sweep — 50 shapes exchange-probed; 45/56 reachable cells price, 11 gaps, 2 wrong-priced','ship','done'],
+    ['07-11','Phase 4 CAPSTONE — fresh 3-bucket re-backtest, all buckets, both modes, parity PASS','ship','closed'],
+    ['07-10','Phase 3 — pregame-only quote gate (all sports, active by default)','ship','done'],
+    ['07-10','Phase 2 WIRED — rung keys + 165-entry table + 3 holes closed + DO-6','ship','done'],
+    ['07-10','MLB settlement P&L sweep 0–5¢ (52-game window, variance-dominated)','ship','done'],
+    ['07-10','Phase 1 findings + Phase 2 handoff (spend limit) — wire list persisted in-repo','ship','done'],
+    ['07-10','Demo combo SETTLED — convention confirmed, sell-only UN-GATED','ship','done'],
+    ['07-10','Look-ahead verdict — all 6 pre-registered predictions TRUE','ship','done'],
+    ['07-10','Same-player conditionals + ml|spread containment wired','ship','done'],
+    ['07-10','Bands + routing wired — prop-carrying sub-cent (0.97¢)','ship','done'],
+    ['07-10','MLB backtest gate PASS + DO-1 (43 entries)','ship','done'],
+    ['07-10','MLB promotion WIRED — 9/9 classification + 32-entry table live','ship','done'],
+    ['07-10','One-leg-per-ladder rule (side-aware; bands allowed)','ship','done'],
+    ['07-10','Baseball vs soccer-template scorecard + MLB settlement audit','ship','done'],
+    ['07-09','Demo combo round-trip — maker landed long NO','ship','settled 07-10'],
     ['07-08','Sell-parlays-only fix (one-sided) + dual review','ship','done'],
     ['07-08','Combo YES/NO sides + fade config (Kalshi-verified)','ship','done'],
     ['07-08','Combo taker cash-out exposure — verified none','ship','done'],
@@ -515,9 +571,10 @@
   function soccerPanel(){
     var n=0;Object.keys(soccerRows).forEach(function(g){n+=soccerRows[g].length});
     var html='<div class="grid g4" style="margin-bottom:20px">'+
-      [['37','ρ pairs','teal'],['5','OOS-gated ship','green'],['2','widen-only','gold'],['4','data sources','']].map(function(k){
+      [['96','config ρ entries · judge 96/96 byte-exact','teal'],['1.57¢','per-print med · 656,555 prints','green'],['225','UNKNOWN combos rescued by collapse','gold'],['4','data sources','']].map(function(k){
         return '<div class="hs"><div class="v '+k[2]+' num">'+k[0]+'</div><div class="l">'+k[1]+'</div></div>'}).join('')+'</div>';
-    html+='<div class="callout">Soccer is the deepest calibration and the only live sell-only surface today. Structural Dixon-Coles is <b>enabled</b>; the pairwise ρ tables below are the copula fallback + same-game resolvers. Colour = strength &amp; sign of ρ.</div>';
+    html+='<div class="callout">Soccer/WC is the deepest calibration. Structural Dixon-Coles is <b>enabled</b>; the 96-entry pair table (judge-verified byte-exact vs the executed config) + same-game resolvers below are the copula layer. Fresh capstone (07-11): per-print <b>1.57¢ median</b> over 656,555 prints (62.1% within-2¢ · parity PASS, 2,656 keys / 0 mismatches); per-combo 1.60¢ — the backbone reproduces at +14% sample. Colour = strength &amp; sign of ρ.</div>';
+    html+='<div class="callout"><b>Containment campaign merged 07-11:</b> collapse plans rescue the <b>225</b> formerly-UNKNOWN WC combos (1H-BTTS⟹FT-BTTS 127 · ml⟹over-0.5 70 · same-line 1H⟹FT totals 29 — ~91 declined prints/day recovered); universal exact windows price "win but NOT by N" as P(win)−P(win by ≥N) (1,091 tape prints); spread⟹win containment family live (soccer + MLB). Identified within-2¢ lever: measured pair priors for corners|advance, pgoal|total, btts|advance (queued, measurement-first).</div>';
     Object.keys(soccerRows).forEach(function(g){
       html+='<h2 style="font-size:16px;margin-top:26px">'+g+'</h2><div class="tw"><table><thead><tr><th>pair</th><th style="text-align:center">ρ</th><th>note / 99% CI</th><th>method</th><th>status</th></tr></thead><tbody>';
       soccerRows[g].forEach(function(r){var v=vmap[r[4]]||['off',r[4]];
@@ -567,41 +624,41 @@
     ['player_hit | player_ks','0.00 · band 0.15 (tightened)','facing −0.13 / 0.10 · teammate ~0'],
     ['player_hr | player_ks','0.00 · band 0.12 (was MISSING — 11.6k pairs/10h sign-wrong at +0.6)','facing −0.075 / 0.05'],
     ['player_hrr | player_ks','0.00 · band 0.20','facing −0.18 / 0.06 (teammate unmeasured)'],
-    ['player_tb | player_ks','0.00 · band 0.15','MEASURE next']];
+    ['player_tb | player_ks','0.00 · band 0.15','facing U-shaped −0.125/−0.122/−0.103/−0.127 (r4 dip) · r6/r7 −0.127/−0.128 measured DIRECT — rung-keyed, interpolation banned']];
   var mlbBaskets=[
     ['9-leg star','0.257','0.529','+27¢','0.240'],
     ['16-leg (top-8 both lineups)','0.158','0.506','+35¢','0.1579 — Δ 0.0003'],
     ['8-leg top-4','0.356','0.604','+25¢','±1.4¢']];
   function mlbPanel(){
     var html='<div class="grid g4" style="margin-bottom:20px">'+
-      [['9/9','leg families classified — WIRED','teal'],['32','pair entries LIVE in config','green'],['1013','tests passed on promotion',''],['+25–35¢','basket overbid CLOSED','gold']].map(function(k){
+      [['165','pair entries · zero orphans (judge 165/165)','teal'],['149','same-player conditional cells · 40 exact','green'],['0.34¢','fresh-window med |err| — GATE PASS','gold'],['98.6%','per-print within-2¢ · n=53,022','']].map(function(k){
         return '<div class="hs"><div class="v '+k[2]+'">'+k[0]+'</div><div class="l">'+k[1]+'</div></div>'}).join('')+'</div>';
-    html+='<div class="callout"><b>WIRED 2026-07-10 — 9/9 classification + 32-entry pair table LIVE in config</b> (full suite 1013 passed; KS×TOTAL prices −0.25 through the live dispatch, not +0.6; the +25–35¢ all-NO basket overbid is closed; soccer/NFL untouched). Remaining gates: tape-replay backtest = validation (<span class="mono">tools/backtest_mlb_pairs.py</span>), then the resolver phase (unlocks the signed [C] values below), then containment (ml|spread routing, same-player containments, nested corner-BANDs). Source: <span class="mono">docs/calibration/staged_mlb_props.md</span> (PROMOTED).</div>';
+    html+='<div class="callout"><b>SHIPPED + GATED 2026-07-11</b> — 9/9 families classified; <b>165-entry measured pair table</b> (:rN rung keys on the exact→oriented→plain fail-closed chain — no interpolation — plus the spread×prop resolver) and the <b>149-cell same-player conditional table</b> (40 exact, incl. TB⟹HRR). Fresh-window capstone <b>GATE PASS</b>: 0.34¢ med / 93.3% w2 (n=6,969) · prop-carrying <b>0.66¢ vs 1.37¢ legacy</b> · per-print <b>98.6% w2</b> (n=53,022). Judge re-derivation: all 165 rows byte-match the executed config. Quoting live behind the pregame gate + allowlist. Source: <span class="mono">docs/reports/2026-07-11-phase4-capstone.md</span>.</div>';
     html+='<h2 style="font-size:16px;margin-top:26px">The 9 combo-eligible leg families <span style="color:var(--muted);font-weight:400;font-size:12px">(exhaustive — verified vs all 1,387 MVE collections + 3 tape windows)</span></h2><div class="tw"><table><thead><tr><th>family</th><th>LegType</th><th>settles on (API rules text)</th><th>classified today</th></tr></thead><tbody>'+
       mlbLegs.map(function(r){var chip=r[3]==='ok'?'<span class="st ship">classified ✓</span>':'<span class="st ship">wired ✓ 07-10</span>';
         return '<tr><td class="k">'+r[0]+'</td><td class="mono" style="font-size:12px;color:var(--teal)">'+r[1]+'</td><td style="font-size:12.5px">'+r[2]+'</td><td>'+chip+'</td></tr>'}).join('')+
-      '</tbody></table></div><p style="font-size:12px;color:var(--muted);margin-top:6px">NOT combo-eligible (reference only): KXMLBTEAMTOTAL — which strands the team-frame ρs (HR +0.367 / K×opp −0.380) — KXMLBEXTRAS, RBI/SB/OUTS, F5*. Blockers staged for 3 live misclassification bugs found (F5TOTAL/F5SPREAD/SERIESGAMETOTAL typed as full-game total/spread).</p>';
+      '</tbody></table></div><p style="font-size:12px;color:var(--muted);margin-top:6px">NOT combo-eligible (reference only): KXMLBTEAMTOTAL — which strands the team-frame ρs (HR +0.367 / K×opp −0.380) — KXMLBEXTRAS, RBI/SB/OUTS, F5*. The 3 live misclassification bugs found (F5TOTAL/F5SPREAD/SERIESGAMETOTAL typed as full-game total/spread) were FIXED 07-10.</p>';
     html+='<h2 style="font-size:16px;margin-top:26px">A — prop × game-total &amp; game-level <span style="color:var(--muted);font-weight:400;font-size:12px">(orientation-free — stage now)</span></h2><div class="tw"><table><thead><tr><th>pair</th><th style="text-align:center">ρ</th><th>band · note</th><th>evidence</th><th>status</th></tr></thead><tbody>'+
-      mlbA.map(function(r){var cell=r[1]===null?'<span class="st ship">contain</span>':rhoCell(r[1]);var chip=r[1]===null?'<span class="st ship">structural</span>':'<span class="st ship">wired · pre-backtest</span>';
+      mlbA.map(function(r){var cell=r[1]===null?'<span class="st ship">contain</span>':rhoCell(r[1]);var chip=r[1]===null?'<span class="st ship">containment wired</span>':'<span class="st ship">shipped · gate PASS</span>';
         return '<tr><td class="k">'+r[0]+'</td><td style="text-align:center">'+cell+'</td><td class="ci">'+r[2]+'</td><td style="font-size:12px;color:var(--muted)">'+r[3]+'</td><td>'+chip+'</td></tr>'}).join('')+'</tbody></table></div>';
     html+='<h2 style="font-size:16px;margin-top:26px">B — same-family batter baskets <span style="color:var(--muted);font-weight:400;font-size:12px">(teammate/opponent routing via ticker team prefix — no ML resolver needed)</span></h2><div class="tw"><table><thead><tr><th>pair</th><th style="text-align:center">teammate</th><th style="text-align:center">opponent</th><th>note</th><th>status</th></tr></thead><tbody>'+
-      mlbB.map(function(r){return '<tr><td class="k">'+r[0]+'</td><td style="text-align:center">'+rhoCell(r[1])+'</td><td style="text-align:center">'+rhoCell(r[2])+'</td><td class="ci">'+r[3]+'</td><td><span class="st ship">wired · pre-backtest</span></td></tr>'}).join('')+
-      '</tbody></table></div><p style="font-size:12px;color:var(--muted);margin-top:6px">PLUS: +2–3¢ symmetric WIDTH (never ρ inflation) on same-family all-NO baskets of ≥8 legs — pairwise Gaussian understates the joint tail by ~2¢, sign wobbles by shape.</p>';
+      mlbB.map(function(r){return '<tr><td class="k">'+r[0]+'</td><td style="text-align:center">'+rhoCell(r[1])+'</td><td style="text-align:center">'+rhoCell(r[2])+'</td><td class="ci">'+r[3]+'</td><td><span class="st ship">shipped · gate PASS</span></td></tr>'}).join('')+
+      '</tbody></table></div><p style="font-size:12px;color:var(--muted);margin-top:6px">PLUS: DO-6 SHIPPED 07-10 — +2.5¢ width (<span class="mono">basket_width_extra_cc=250</span>, tunable; width, never ρ inflation) on ≥8-leg all-NO single-prop-family baskets — pairwise Gaussian understates the joint tail by ~2¢.</p>';
     html+='<h2 style="font-size:16px;margin-top:26px">The all-NO HR basket overbid — the money finding</h2><div class="tw"><table><thead><tr><th>basket shape</th><th>empirical P(all-no)</th><th>flat-0.6 copula</th><th>overbid</th><th>measured-ρ copula</th></tr></thead><tbody>'+
       mlbBaskets.map(function(r){return '<tr><td class="k">'+r[0]+'</td><td class="mono">'+r[1]+'</td><td class="mono">'+r[2]+'</td><td class="mono" style="color:var(--gold);font-weight:700">'+r[3]+'/$1</td><td class="mono" style="color:var(--teal)">'+r[4]+'</td></tr>'}).join('')+
       '</tbody></table></div>';
-    html+='<h2 style="font-size:16px;margin-top:26px">C — ML-orientation-resolver-gated <span style="color:var(--muted);font-weight:400;font-size:12px">(neutralized 0.00 now; signed values unlock when the prop-team vs ML-suffix resolver ships)</span></h2><div class="tw"><table><thead><tr><th>pair</th><th>staged now (neutralized)</th><th>with resolver (measured)</th><th>status</th></tr></thead><tbody>'+
-      mlbC.map(function(r){return '<tr><td class="k">'+r[0]+'</td><td class="mono" style="font-size:12px">'+r[1]+'</td><td class="mono" style="font-size:12px;color:var(--teal)">'+r[2]+'</td><td><span class="st coded">resolver-gated</span></td></tr>'}).join('')+
+    html+='<h2 style="font-size:16px;margin-top:26px">C — ML-orientation pairs <span style="color:var(--muted);font-weight:400;font-size:12px">(team routing :same/:opp LIVE since 07-10 — rule-8 parity 25/25 to 1e-12; differential: 43,199 pair transitions, ALL on routed keys)</span></h2><div class="tw"><table><thead><tr><th>pair</th><th>pre-routing (was neutralized)</th><th>routed :same/:opp (LIVE)</th><th>status</th></tr></thead><tbody>'+
+      mlbC.map(function(r){return '<tr><td class="k">'+r[0]+'</td><td class="mono" style="font-size:12px">'+r[1]+'</td><td class="mono" style="font-size:12px;color:var(--teal)">'+r[2]+'</td><td><span class="st ship">routed · live</span></td></tr>'}).join('')+
       '</tbody></table></div>';
     html+='<h2 style="font-size:16px;margin-top:26px">D — cross-family batter pairs <span style="color:var(--muted);font-weight:400;font-size:12px">(measured + wired 2026-07-10 — routed teammate/opponent splits unlock with the resolver)</span></h2><div class="tw"><table><thead><tr><th>pair</th><th style="text-align:center">teammate</th><th style="text-align:center">opponent</th><th>note</th><th>status</th></tr></thead><tbody>'+
-      '<tr><td class="k">player_hr | player_hrr</td><td style="text-align:center">'+rhoCell(0.05)+'</td><td style="text-align:center">'+rhoCell(0.00)+'</td><td class="ci">unrouted +0.03 / 0.08</td><td><span class="st ship">wired · pre-backtest</span></td></tr>'+
-      '<tr><td class="k">hit|hr +0.01 · hit|hrr +0.04 · hit|tb +0.02 · hr|tb +0.02 · hrr|tb +0.04 · ks|tb −0.06</td><td style="text-align:center">'+rhoCell(0.02,'meas')+'</td><td style="text-align:center">'+rhoCell(0.00)+'</td><td class="ci">MEASURED 2026-07-10 (Retrosheet 2005–25, 20.8M pair-units, judge-confirmed, copula parity ≤5.6e-5) — all wired unrouted w/ orientation-spanning bands</td><td><span class="st ship">wired · pre-backtest</span></td></tr>'+
+      '<tr><td class="k">player_hr | player_hrr</td><td style="text-align:center">'+rhoCell(0.05)+'</td><td style="text-align:center">'+rhoCell(0.00)+'</td><td class="ci">unrouted +0.03 / 0.08</td><td><span class="st ship">shipped · gate PASS</span></td></tr>'+
+      '<tr><td class="k">hit|hr +0.01 · hit|hrr +0.04 · hit|tb +0.02 · hr|tb +0.02 · hrr|tb +0.04 · ks|tb −0.06</td><td style="text-align:center">'+rhoCell(0.02,'meas')+'</td><td style="text-align:center">'+rhoCell(0.00)+'</td><td class="ci">MEASURED 2026-07-10 (Retrosheet 2005–25, 20.8M pair-units, judge-confirmed, copula parity ≤5.6e-5) — all wired unrouted w/ orientation-spanning bands</td><td><span class="st ship">shipped · gate PASS</span></td></tr>'+
       '</tbody></table></div>';
     html+='<h2 style="font-size:16px;margin-top:26px">E — structural findings (routing, not ρ)</h2><div class="grid g3">'+[
-      ['Same-player containment','Cross-family same-player pairs (6.5% of prop flow) are DETERMINISTIC: HR-k ⇒ HIT≥k, TB≥4k; HIT-k ⇒ TB≥k; HR ⇒ HRR≥3 verified EXACT 101,186/101,186. Conditional table P(HRR≥5|HR)=0.529. Route structurally, never a copula.','structural'],
+      ['Same-player containment — WIRED','Cross-family same-player pairs (6.5% of prop flow) are DETERMINISTIC: HR-k ⇒ HIT≥k, TB≥4k; HIT-k ⇒ TB≥k; HR ⇒ HRR≥3 verified EXACT 101,186/101,186. The 149-cell conditional table (40 exact, incl. TB⟹HRR≥1) + ml|spread containment family are LIVE — routed structurally, never a copula; farmable=False per rain-scalar.','wired 07-10/11'],
       ['Same-family rungs = zero flow','0 of 223,096 same-game same-family prop pairs share a player — takers never bundle two rungs of one stat (rungs ARE live, 45–71% of players). Generic nested-threshold guard ships as free safety.','tape-verified'],
-      ['event_mutually_exclusive','RESOLVED, not a blocker: live probe 24/24 — FALSE on all 6 prop families (baskets priceable, merely uncalibrated), TRUE on KXMLBGAME (correctly kills YES+YES). Pin via ground-truth fixture.','resolved'],
-      ['Strike ladders','Pitcher K pairs are ladder-FLAT (copula validated; self-median K-line convention was fine — question CLOSED). Batter HIT/HR rungs DRIFT +0.04–0.08/rung → per-rung entries; a single 1+ ρ sells deep rungs cheap.','measured'],
+      ['event_mutually_exclusive','RESOLVED, not a blocker: live probe 24/24 — FALSE on all 6 prop families (baskets priceable, now calibrated), TRUE on KXMLBGAME (correctly kills YES+YES). PINNED via the DO-7 ground-truth fixture (KXMLBGAME true, 8× false, 24/24 provenance).','pinned'],
+      ['Strike ladders','Pitcher K pairs are ladder-FLAT (copula validated; self-median K-line convention was fine — question CLOSED). Batter HIT/HR rungs DRIFT +0.04–0.08/rung → per-rung :rN entries WIRED; same-stat-ladder impossible mixes decline via the taxonomy tripwire (judge live probe, all five families).','wired 07-10/11'],
       ['Runs model (shipped)','Poisson/NegBin team-runs grid → game/total/spread joint, inverted from live prices — ENABLED; the pair table above only governs structural declines.','enabled'],
       ['Same-day cross-game','Independence STANDS: +0.007 (CI under the 0.02 threshold, 266k pairs). Doubleheader-spanning combos → UNKNOWN/wide (n=538, contaminated).','measured']
     ].map(function(c){return '<div class="card"><h3>'+c[0]+'</h3><p>'+c[1]+'</p><div class="meta"><span>'+c[2]+'</span></div></div>'}).join('')+'</div>';
@@ -609,9 +666,9 @@
 
   var sports=[
     {k:'soccer',label:'Soccer',dot:'var(--ship)',build:soccerPanel},
-    {k:'mlb',label:'MLB',dot:'var(--gate)',build:mlbPanel},
-    {k:'nfl',label:'NFL',dot:'var(--ship)',html:'<div class="callout"><b>Shipped.</b> (margin, total) bivariate-normal, means inverted per game from live prices, shape from recent seasons. OOS-gate passed (hw×cover = exact comonotone geometry vs copula 0.88).</div><div class="grid g3"><div class="card"><h3>σ margin</h3><p class="mono" style="font-size:22px;color:var(--teal)">12.66</p></div><div class="card"><h3>σ total</h3><p class="mono" style="font-size:22px;color:var(--teal)">13.06</p></div><div class="card"><h3>ρ (margin,total)</h3><p class="mono" style="font-size:22px;color:var(--teal)">+0.026</p></div></div>'},
-    {k:'wnba',label:'WNBA',dot:'var(--ship)',html:'<div class="callout"><b>Shipped</b> (operator-enabled 2026-07-06, season live). Same (margin,total) geometry as NFL; shape calibrated on 1,338 recent games through 2026-07-05. ρ≈0 means ml×total prices ≈ independent.</div><div class="grid g3"><div class="card"><h3>σ margin</h3><p class="mono" style="font-size:22px;color:var(--teal)">12.04</p></div><div class="card"><h3>σ total</h3><p class="mono" style="font-size:22px;color:var(--teal)">16.55</p></div><div class="card"><h3>ρ</h3><p class="mono" style="font-size:22px;color:var(--teal)">−0.019</p></div></div>'},
+    {k:'mlb',label:'MLB',dot:'var(--ship)',build:mlbPanel},
+    {k:'nfl',label:'NFL',dot:'var(--ship)',html:'<div class="callout"><b>Shipped</b> (model). (margin, total) bivariate-normal, means inverted per game from live prices, shape from recent seasons. OOS-gate passed (hw×cover = exact comonotone geometry vs copula 0.88). Quoting currently BLOCKED by the MLB+WC leg-series allowlist — one YAML prefix unblocks.</div><div class="grid g3"><div class="card"><h3>σ margin</h3><p class="mono" style="font-size:22px;color:var(--teal)">12.66</p></div><div class="card"><h3>σ total</h3><p class="mono" style="font-size:22px;color:var(--teal)">13.06</p></div><div class="card"><h3>ρ (margin,total)</h3><p class="mono" style="font-size:22px;color:var(--teal)">+0.026</p></div></div>'},
+    {k:'wnba',label:'WNBA',dot:'var(--ship)',html:'<div class="callout"><b>Shipped</b> (model; operator-enabled 2026-07-06, season live). Same (margin,total) geometry as NFL; shape calibrated on 1,338 recent games through 2026-07-05. ρ≈0 means ml×total prices ≈ independent. Quoting currently BLOCKED by the MLB+WC leg-series allowlist; KXWNBAPTS same-game props flagged as the #1 foreign gap (17,146 pairs at flat +0.6).</div><div class="grid g3"><div class="card"><h3>σ margin</h3><p class="mono" style="font-size:22px;color:var(--teal)">12.04</p></div><div class="card"><h3>σ total</h3><p class="mono" style="font-size:22px;color:var(--teal)">16.55</p></div><div class="card"><h3>ρ</h3><p class="mono" style="font-size:22px;color:var(--teal)">−0.019</p></div></div>'},
     {k:'nba',label:'NBA',dot:'var(--gate)',html:'<div class="callout gate"><b>Calibrated but gated OFF.</b> Shape params exist (σ<sub>m</sub> 13.71 · σ<sub>t</sub> 18.42 · ρ 0.000) but NBA is not in <code>enabled_sports</code> — held back pending an odds source or prod-shadow settlements to validate live.</div>'},
     {k:'ufc',label:'UFC',dot:'var(--off)',html:'<div class="callout block"><b>Not built.</b> No model, no calibration. Method-of-victory × round × fight-outcome correlations would need their own structural model — a future sport once soccer is proven end-to-end.</div>'},
     {k:'tennis',label:'Tennis',dot:'var(--off)',html:'<div class="callout block"><b>Not built.</b> No model. Set/game/match correlations (a strongly path-dependent structure) are a distinct modelling problem — not started.</div>'}];
