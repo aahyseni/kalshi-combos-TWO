@@ -56,6 +56,33 @@ their markup, not our miss. Confirmed by settlement Brier: **our new fair
 the wiring made soccer *more* calibrated to reality, which moves it *further*
 from the padded clearing on longshots.
 
+## Markup-vs-mispricing diagnostic (the 97 soccer families)
+
+The 97 >2¢ families cover **7,305 combos = 34.6% of WC flow**. For each, is our
+fair closer to the SETTLED rate than the maker's clearing is? Resolved-weighted
+across all 97: **our fair is closer to reality on 6,701 combos (92%)**; the maker
+is closer on only 604 (8%). Pattern (top families by flow):
+
+| family | n | %tot | our fair | maker | settled-YES | closer |
+|---|---|---|---|---|---|---|
+| ADVANCE+CORNERS+PLAYER_GOAL | 955 | 4.5% | 7.2% | 10.1% | 6.4% | OURS |
+| ADV+CORNERS+CORNERS_TEAM+PGOAL | 479 | 2.3% | 5.6% | 8.6% | 3.8% | OURS |
+| ADVANCE+CORNERS_TEAM+PLAYER_GOAL | 421 | 2.0% | 4.7% | 7.6% | 3.3% | OURS |
+| ADVANCE+CORNERS | 347 | 1.6% | 19.9% | 23.0% | 18.5% | OURS |
+| ADVANCE+CORNERS+TOTAL | 284 | 1.3% | 21.2% | 24.0% | 12.0% | OURS |
+| ADVANCE+BTTS+TOTAL | 284 | 1.3% | 14.4% | 17.0% | 9.3% | OURS |
+| ADVANCE+CORNERS+PGOAL+TOTAL | 220 | 1.0% | 12.5% | 15.4% | 13.6% | OURS |
+| CORNERS+CORNERS_TEAM | 60 | 0.3% | 26.0% | 30.8% | 9.1% | OURS |
+
+**Verdict: markup, not mispricing.** Our fair sits at or just above the settled
+rate; the maker clearing sits ~3pp above ours. We price these longshot
+corner/advance parlays honestly; the market clears fat because the true
+settlement is far below the print. **To win these auctions we PAD MARKUP on top
+of our (correct) fair — we don't change the fair.** The 8% "maker-closer" tail
+is small-n noise where the settled rate happened to land near the clearing.
+This is the strongest possible evidence for a fat markup on soccer longshots
+(the markup decision, deferred to pooled multi-week — this window is one input).
+
 ## The honest bottom line
 
 - **The measurement mandate is MET**: zero unmeasured, zero fallback, zero
