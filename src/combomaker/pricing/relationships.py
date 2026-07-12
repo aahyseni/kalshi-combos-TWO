@@ -36,6 +36,7 @@ from combomaker.pricing.conditionals_mlb import (
     is_exact,
     strongest_measured_direction,
 )
+from combomaker.pricing.grouping import game_key
 from combomaker.pricing.legtypes import LegType, Sport, classify_leg, classify_sport
 
 # The ONE anchored MLB team parser (reviewer defect #3): the game-blob /
@@ -285,24 +286,12 @@ def _containment_sign(
     return None
 
 
-def _game_key(event_ticker: str) -> str:
-    """The game a leg belongs to, for correlation grouping. Kalshi's
-    event_ticker is ``SERIES-GAMECODE`` (e.g. ``KXWCGAME-26JUL05MEXENG``); the
-    GAMECODE is shared across a game's market families (KXWCGAME/KXWCTOTAL/
-    KXWCBTTS of one game), so it — not the series-specific event_ticker — is the
-    same-game key. No hyphen (synthetic/degenerate ticker) ⇒ key on the whole
-    string, so a leg whose event carries no game code never merges with another.
-
-    Period/derived markets (first/second half — series like KXWC1HTOTAL) DO now
-    key on the game code and rejoin the full-game same-game block, so the copula
-    can correlate a modeled 1H leg with its full-time siblings. They are kept
-    off the full-game STRUCTURAL inverter (no half-time scoreline window) by a
-    guard in structural.py — NOT by grouping them out here (which used to leave
-    a real 1H×FT combo pricing at independence)."""
-    _series, sep, game = event_ticker.partition("-")
-    if not sep:
-        return event_ticker
-    return game
+# The same-game correlation key lives in ``pricing.grouping.game_key`` (promoted
+# to a public, pure export so the RISK layer aggregates on the exact key the
+# pricer correlates on). ``_game_key`` is kept as a private alias for the many
+# call sites in this module; a parity test pins the two equal, so there is a
+# single definition and zero drift.
+_game_key = game_key
 
 
 def _collapse_containments(

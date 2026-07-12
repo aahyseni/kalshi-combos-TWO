@@ -240,14 +240,18 @@ D13 (target-cost conversion).** All fail toward wider/no-quote.
 |---|---|---|---|
 | E1 | Per-leg delta (hot path) = independence product formula, signed by our side and each leg's selected side; missing marginal ⇒ UNKNOWN (never zero); conditional-MC deltas (`sim.leg_deltas`) reserved for slow full-book refresh | `risk/exposure.py` | approximation under correlation — direction documented; MC refresh wired in Phase 5 |
 | E2 | Mass-acceptance worst case: every open quote fills NOW on its per-aggregate worse side (sign-aligned magnitude bound); dominance over every realizable fill combination property-tested (triangle-inequality argument in tests/test_exposure.py) | `risk/exposure.py`, `risk/limits.py` | design rule (+ PreferBetterQuote makes "instantly executable" literal) |
-| E3 | Our max loss per position = entry price × contracts (we always PAY our bid to open — both sides of a quote are bids) | `risk/exposure.py` | follows from A5/D11; re-check against ground-truth fills (Phase 2.5) |
+| E3 | Our max loss per position = entry price × contracts (we always PAY our bid to open — both sides of a quote are bids). Side-aware: on the LONG NO side we hold, a HIT (settles YES) forfeits exactly the premium, NOT the $1 payout | `risk/exposure.py` | **VERIFIED fixture:ground_truth** — 2026-07-10 demo LONG NO 1.00 ct paid $0.50: max_loss=$0.50 to the cent (docs/reports/2026-07-10-demo-combo-settled.md) |
 | E4 | Last-look severity order: kill switch > exchange > WS > in-play > velocity > stale leg > leg move > joint move > risk; every None input fails closed | `risk/lastlook.py` | design rule, pinned by tests |
 | E5 | HVM confirm clock starts at LOCAL receipt of quote_accepted (message carries no timestamp) | (Phase 5 wiring) | doc:asyncapi quote_accepted — timer measured server-side, budget = 3s − latency (Phase 2.5 measures) |
 | E6 | In-play market trigger: mid range > threshold OR update count > N within window ⇒ anomalous for cooldown; schedule-based gate lives in filters | `risk/inplay.py` | design rule (courtside defense = width/size/refusal) |
 | E7 | Markouts recorded vs BOTH model fair and raw Kalshi mid product; declined confirms tracked with fill_ref `declined:<quote_id>` | `risk/markouts.py` | defense #5 |
 | E8 | Daily-loss halt at ≥ limit on realized+unrealized | `risk/limits.py` | design rule |
+| E9 | payout_obligation_cc = contracts × $1 is a SEPARATE bankroll/utilization axis (per position + per game), NEVER summed with max_loss_cc (the loss axis). R1/R2 correctness invariant #2 | `risk/exposure.py` | **VERIFIED fixture:ground_truth** — 2026-07-10 demo 1.00 ct → payout_obligation=$1.00 to the cent (settlement paid $1.00) |
+| E10 | Exposure per-event aggregation keys on the GAME (`pricing.grouping.game_key` = gamecode after the series prefix), NOT raw event_ticker — one match's market families (GAME/TOTAL/SPREAD/props) fold into ONE game cluster. Same key the copula correlates on (parity-tested vs `relationships._game_key`) | `risk/exposure.py`, `pricing/grouping.py` | design rule (B2); closes R1 gap G1 — the correlated per-game risk unit |
+| E11 | Bankroll = live `get_balance` poll (authoritative, stale⇒fail-closed); realized-P&L ledger is an INDEPENDENT running tally advanced on settlement (NO-MISS credits +$1/ct−premium, NO-HIT debits premium), a cross-check never summed with the live balance | `risk/balance.py` | **VERIFIED fixture:ground_truth** — demo NO-settle credited exactly $1.00 (bal 1082.62→1083.62); NO credit gated on `combo_no_pays_complement` True |
 
-**UNVERIFIED rows: E3 (re-check vs ground truth), E5 (latency budget measurement).**
+**UNVERIFIED rows: E5 (latency budget measurement). E3/E9 PROMOTED to VERIFIED
+by the 2026-07-10 demo settlement (was: E3 re-check vs ground truth).**
 
 ### Phase 5 prep — hot path wiring (2026-07-05)
 

@@ -164,6 +164,43 @@ class TestOpenPositionMaxLoss:
         assert pos.max_loss_cc == 10_000
 
 
+class TestB1SideAwareAxesGroundTruth:
+    """B1 anchored to the 2026-07-10 demo settlement: LONG NO 1.00 ct paid
+    $0.50 -> max_loss $0.50 (true loss if it HITS), payout_obligation $1.00
+    (bankroll lock-up). Two axes, never summed."""
+
+    def test_demo_no_position_max_loss_is_the_premium(self) -> None:
+        pos = make_position(
+            "demo", TWO_YES_LEGS, our_side=Side.NO, contracts=100, entry_price=5_000
+        )
+        assert pos.max_loss_cc == 5_000            # $0.50 — what we PAID / can lose
+
+    def test_demo_no_position_payout_obligation_is_one_dollar(self) -> None:
+        pos = make_position(
+            "demo", TWO_YES_LEGS, our_side=Side.NO, contracts=100, entry_price=5_000
+        )
+        assert pos.payout_obligation_cc == 10_000  # $1.00 — bankroll lock-up
+
+    def test_two_axes_are_independent_never_summed(self) -> None:
+        pos = make_position(
+            "demo", TWO_YES_LEGS, our_side=Side.NO, contracts=100, entry_price=5_000
+        )
+        # The loss axis depends on price paid; the payout axis does NOT.
+        assert pos.max_loss_cc != pos.payout_obligation_cc
+        cheaper = make_position(
+            "c", TWO_YES_LEGS, our_side=Side.NO, contracts=100, entry_price=1_000
+        )
+        assert cheaper.max_loss_cc == 1_000               # loss axis moved
+        assert cheaper.payout_obligation_cc == 10_000     # payout axis fixed at $1/ct
+
+    def test_payout_obligation_is_price_independent(self) -> None:
+        for price in (1, 2_500, 5_000, 9_999):
+            pos = make_position(
+                "p", TWO_YES_LEGS, our_side=Side.NO, contracts=250, entry_price=price
+            )
+            assert pos.payout_obligation_cc == 25_000  # 2.50 ct x $1, always
+
+
 class TestHypotheticalPositions:
     def test_both_sides_quoted_maps_via_conventions(self) -> None:
         quote = make_quote("q1", TWO_YES_LEGS, yes_bid=4_500, no_bid=4_700, contracts=150)
@@ -257,6 +294,90 @@ class TestSnapshotWithoutMassAcceptance:
         # ...but its notional risk still counts — missing data never shrinks gross.
         assert snap.gross_notional_cc == 11_600
         assert snap.worst_case_loss_by_event_cc == {"EV1": 11_600, "EV2": 6_000}
+
+
+# --- B2: aggregation keys on the GAME, not the raw event ---------------------
+
+GAME = "26JUL05MEXENG"
+# Two market FAMILIES of ONE match: distinct event_tickers, ONE game code.
+GAME_LEG = LegRef("KXWCGAME-26JUL05MEXENG-MEX", f"KXWCGAME-{GAME}", "yes")
+TOTAL_LEG = LegRef("KXWCTOTAL-26JUL05MEXENG-3", f"KXWCTOTAL-{GAME}", "yes")
+OTHER_GAME_LEG = LegRef("KXWCGAME-26JUL06ARGBRA-ARG", "KXWCGAME-26JUL06ARGBRA", "yes")
+
+
+class TestB2GameClustering:
+    """The B2 proof: a GAME leg and a TOTAL leg of the SAME match (different
+    event_tickers, same game code) MUST land in ONE game bucket — pre-B2 they
+    split across two event buckets."""
+
+    def _book(self) -> ExposureBook:
+        book = ExposureBook(CONVENTIONS)
+        # One combo per family, both NO (sell-only), both on the same game.
+        book.add_position(
+            make_position(
+                "game_combo", (GAME_LEG,), our_side=Side.NO, contracts=100, entry_price=5_000
+            )
+        )
+        book.add_position(
+            make_position(
+                "total_combo", (TOTAL_LEG,), our_side=Side.NO, contracts=100, entry_price=4_000
+            )
+        )
+        return book
+
+    def test_two_families_land_in_one_game_bucket(self) -> None:
+        marg = provider(
+            {GAME_LEG.market_ticker: 0.5, TOTAL_LEG.market_ticker: 0.6}
+        )
+        snap = self._book().snapshot(marg, mass_acceptance=False)
+        # ONE key, the game code — not two event keys.
+        assert set(snap.worst_case_loss_by_game_cc) == {GAME}
+        # Loss axis: both premiums sum into the single game cluster.
+        assert snap.worst_case_loss_by_game_cc[GAME] == 5_000 + 4_000
+        # Payout axis: both $1/ct obligations sum into the same cluster.
+        assert snap.payout_obligation_by_game_cc[GAME] == 10_000 + 10_000
+        # Delta axis also game-keyed to one bucket.
+        assert set(snap.delta_by_game) == {GAME}
+
+    def test_distinct_games_stay_separate(self) -> None:
+        book = self._book()
+        book.add_position(
+            make_position(
+                "other", (OTHER_GAME_LEG,), our_side=Side.NO, contracts=100, entry_price=2_000
+            )
+        )
+        marg = provider(
+            {
+                GAME_LEG.market_ticker: 0.5,
+                TOTAL_LEG.market_ticker: 0.6,
+                OTHER_GAME_LEG.market_ticker: 0.4,
+            }
+        )
+        snap = book.snapshot(marg, mass_acceptance=False)
+        assert set(snap.worst_case_loss_by_game_cc) == {GAME, "26JUL06ARGBRA"}
+        assert snap.worst_case_loss_by_game_cc["26JUL06ARGBRA"] == 2_000
+
+    def test_back_compat_alias_returns_game_keyed_data(self) -> None:
+        marg = provider(
+            {GAME_LEG.market_ticker: 0.5, TOTAL_LEG.market_ticker: 0.6}
+        )
+        snap = self._book().snapshot(marg, mass_acceptance=False)
+        # The old field name now yields the game-keyed data (no event split).
+        assert snap.worst_case_loss_by_event_cc == snap.worst_case_loss_by_game_cc
+        assert snap.delta_by_event == snap.delta_by_game
+
+    def test_ungamed_event_never_merges(self) -> None:
+        # A leg whose event carries no hyphen keys on the whole string, so it
+        # can never be pulled into a real game's cluster (fail-closed).
+        book = ExposureBook(CONVENTIONS)
+        book.add_position(
+            make_position(
+                "u", (LegRef("MKT", "SYNTHETIC", "yes"),),
+                our_side=Side.NO, contracts=100, entry_price=1_000,
+            )
+        )
+        snap = book.snapshot(provider({"MKT": 0.5}), mass_acceptance=False)
+        assert set(snap.worst_case_loss_by_game_cc) == {"SYNTHETIC"}
 
 
 ONE_LEG = (LegRef("AAA", "EV1", "yes"),)

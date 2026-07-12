@@ -118,12 +118,12 @@ class LimitChecker:
                         f"{limits.max_market_delta_contracts}",
                     )
                 )
-        for event, delta in snapshot.delta_by_event.items():
+        for game, delta in snapshot.delta_by_game.items():
             if abs(delta) > limits.max_event_delta_contracts:
                 breaches.append(
                     Breach(
                         ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH,
-                        f"event {event} delta {delta:.1f} > "
+                        f"game {game} delta {delta:.1f} > "
                         f"{limits.max_event_delta_contracts}",
                     )
                 )
@@ -135,12 +135,16 @@ class LimitChecker:
                     f"${limits.max_gross_notional_dollars}",
                 )
             )
-        for event, loss_cc in snapshot.worst_case_loss_by_event_cc.items():
+        # Loss axis (premium at risk), per GAME cluster. R2 will add a separate
+        # game-payout / bankroll-utilization cap on snapshot.payout_obligation_
+        # by_game_cc — a distinct axis that must NEVER be summed with this loss
+        # ceiling (R1/R2 correctness invariant #2). The seam is here.
+        for game, loss_cc in snapshot.worst_case_loss_by_game_cc.items():
             if loss_cc / 10_000 > limits.max_event_worst_case_loss_dollars:
                 breaches.append(
                     Breach(
                         ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH,
-                        f"event {event} worst-case loss ${loss_cc / 10_000:.2f} > "
+                        f"game {game} worst-case loss ${loss_cc / 10_000:.2f} > "
                         f"${limits.max_event_worst_case_loss_dollars}",
                     )
                 )

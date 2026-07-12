@@ -152,7 +152,8 @@ class TestEachLimitIndependently:
         breaches = LimitChecker(RiskLimits()).check(book, MARG, DailyPnl())
         assert len(breaches) == 1
         assert breaches[0].reason is ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH
-        assert "event EV1 delta" in breaches[0].detail
+        # B2: aggregation is now game-keyed; EV1 has no hyphen so game == event.
+        assert "game EV1 delta" in breaches[0].detail
 
     def test_gross_notional(self) -> None:
         # 100 contracts at $0.50 = $50 gross > $10 cap; deltas fine.
