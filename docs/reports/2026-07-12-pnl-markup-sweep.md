@@ -70,12 +70,75 @@ heavy adverse selection). This is the known −$1.23M favorite-hot week.
    bankroll is the metric that matters, and it's only attractive on the FAT
    tier at fat markup (+7-17%).
 
+## VERIFICATION (operator questions, triple-checked — script `zerogaps/pnl_verify.py`)
+
+- **Did everything resolve? NO — the key caveat.** By CONTRACT VOLUME:
+  WC-NORMAL **73.7% unresolved**, WC-FAT 29.4%, MLB-NORMAL 54%, MLB-FAT
+  **87.3% unresolved** (160 resolved combos → MLB-FAT $ = noise). P&L is graded
+  on the resolved minority → **$ magnitudes directional-only, not bankable.**
+  Resolution correlates with combo structure (group-stage legs settle before
+  knockout) → selection bias, not missing-at-random.
+- **Why P&L swings while YES-hit is ~flat:** (a) markup adds ~5¢/contract of
+  pure premium margin on all won flow; (b) rising markup SHEDS low-room combos,
+  some of which were big HITTERS — one 1.8M-contract combo (fair 0.462 / room
+  0.046 / settled YES) alone was ~$970k of the 0¢ loss; at 5¢ our ask exceeds
+  its clearing so we drop it. YES-hit% barely moves (contract-weighted across
+  thousands) while P&L moves (a few big low-room hitters shed).
+- **A few big combos? NO — WC-FAT edge is BROAD/robust:** top-10 = 21% of
+  contracts, 68 combos hold 50%; the +5¢ edge **survives excluding the 25
+  biggest combos (+$850k)**. MLB-FAT IS concentrated (10 combos = 50%) + tiny —
+  not trustworthy.
+
+## RESPONSE — 3-lens synthesis (strategy ∥ risk/capital ∥ measurement agents)
+
+All three lenses converged independently:
+
+- **Act on the ASYMMETRY's SHAPE, never the dollar levels.** The durable finding
+  is: NORMAL flow → wider markup ATTRACTS hitters (lose); FAT flow → wider
+  SELECTS non-hitters (win). Markup should be **monotone increasing in room**;
+  the 2¢/4¢ breakpoints are provisional shape, re-derived only pooled/multi-week.
+- **Flow selection is the biggest, safest lever:** gate the book — quote FAT
+  (room ≳3¢ buffer), thin-or-skip NORMAL. Don't "make it up on margin" by
+  widening NORMAL (that's the pick-off).
+- **The operational crux (strategy):** clearing is revealed AFTER the auction,
+  so you cannot classify tier from a combo's own clearing at quote time → build
+  a **pre-quote ROOM PREDICTOR** (leg spreads, family, favorite-skew, size,
+  historical room) and ship it as a SHADOW classifier first (zero P&L impact),
+  validated out-of-window.
+- **Concentration is a separate, critical risk (risk lens), independent of
+  markup:** per-combo max-payout cap (~2-3% bankroll — caps the $970k single
+  combo), per-GAME aggregate cap (~5-8% — correlated legs are the real risk
+  unit), fill-time committed-payout counter + kill-switch (cancel-all ~50-60%
+  bankroll; hard halt ~10%). Cap everyone — you can't tell hitters ex-ante.
+- **Measurement gate (never refit): FREEZE the snapshot + WAIT for full
+  settlement, re-grade the identical decisions** (do NOT weight/impute the
+  unresolved — that's a hidden refit). Then convert to per-resolved-contract
+  edge with GAME-CLUSTERED bootstrap CIs; decide markup by the POOLED LOWER CI
+  BOUND crossing zero across ≥K games/≥J match-days; stratify FAT edge by
+  favoritism + a placebo outcome-resample to prove it isn't favorite-hot beta.
+
+## SOLID CONCLUSION
+
+1. **Structurally real (WC): two tiers with opposite adverse selection; FAT edge
+   is broad and robust.** MLB-FAT unproven (too unresolved). Normal flow is
+   competitive/toxic.
+2. **The $ are NOT bankable** — one favorite-hot window, majority-unresolved
+   volume. Set no markup number off this.
+3. **Safe to act on NOW (shape, not levels, reversible):** (a) build+shadow the
+   room predictor; (b) per-combo & per-game exposure caps + committed-payout
+   kill-switch; (c) default thin/skip on predicted-NORMAL. **Premature:** any
+   committed markup magnitude, MLB-FAT tuning, full-decline-NORMAL.
+4. **The decision path:** freeze this window → re-grade fully settled → pool
+   ≥3-4 game-clustered weeks → markup from the pooled lower-CI bound. Then the
+   two-tier book goes live behind the risk caps.
+
 ## NEXT STEPS
 
-- **This is ONE window — do NOT set markup off it.** The durable output is the
-  two-tier shape + adverse-selection asymmetry. The markup DECISION needs
-  POOLED MULTI-WEEK, GAME-CLUSTERED data (never refit on a P&L window).
-- Confirmed operator design: two-tier book — NORMAL (competitive) thin ~1¢ or
-  skip; FAT (padded) charge 5-6¢ soccer / 2-3¢ MLB. Validate on pooled windows.
-- Feeds #15 weekly settlement cadence (accumulate windows) → the E markup
-  decision.
+- **Decisions owed by operator:** (1) go/no-go on building + shadow-deploying
+  the room predictor now; (2) the bankroll figure to anchor the % exposure caps;
+  (3) confirm full-decline-NORMAL stays OPEN until resolution improves;
+  (4) whether MLB-FAT gets a token data-collection sleeve or $0.
+- Owner (me/engine): the exposure caps + kill-switch are the highest-impact,
+  least-refit-risk build — can start on operator go.
+- Feeds #15 weekly cadence: freeze windows, re-grade settled, accumulate
+  game-clustered → the E markup decision (pooled, never single-window).
