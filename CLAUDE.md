@@ -93,6 +93,37 @@ way in the code and in its tests, so everything passes while losing money.
 
 ## Current phase
 
+**⚡ CURRENT STATE (2026-07-11 — read this block, then `docs/reports/README.md`
+newest-first, then the latest `*-session-state-resume.md`):**
+
+- **Suite 1245/0 at HEAD.** Sell-only parlay-seller book is LIVE-VERIFIED and
+  UN-GATED (`combo_no_pays_complement: true` promoted from a real $1.00 demo
+  settlement 2026-07-10).
+- **MLB props engine COMPLETE + gated**: 9/9 classification, 165-entry measured
+  pair table (+rung keys, spread×prop resolver), 149-cell same-player
+  conditional table (40 exact), fresh-window backtest GATE PASS (0.34¢ med /
+  prop-carrying 0.66 vs legacy 1.37¢; per-print 98.6% w2). Soccer WC:
+  per-print 1.57¢ med over 656,555 prints, parity-gated.
+- **Containment campaign MERGED** (`d65bb6e`): collapse plans (225 formerly
+  UNKNOWN WC combos now price), universal exact containment windows
+  (P(B)−P(A)), spread⟹win family (soccer+MLB), TB⟹HRR exact cells,
+  spread×total impossibility, taxonomy-impossible TRIPWIRE (fixture-pinned,
+  alarms if Kalshi's validator loosens), same-game isolation guard on
+  conditional super-legs (killed a judge-found +7.32¢ sign inversion).
+  Adversarially judged in two rounds; all verdicts + expected-diff
+  reconciliations in `docs/reports/2026-07-11-*`.
+- **Operator gates ACTIVE**: pregame-only quoting (Phase 3 — no in-play legs,
+  all sports, `filters.allow_inplay_legs` to re-enable) and the LEG-SERIES
+  ALLOWLIST (`filters.allowed_leg_series_prefixes = ["KXWC", "KXMLB"]` —
+  MLB + World Cup ONLY; unblock = one YAML prefix; doubles as per-sport kill
+  switch).
+- **Module overviews + zero-bias judge DONE** (`2026-07-11-{soccer,baseball}-
+  module-overview.md` + judge verdict; all findings closed or filed).
+- **NEXT:** #14 demo fill e2e → #15 weekly settlement/calibration cadence →
+  #16 MLB blind test → E decisions (markup from POOLED MULTI-WEEK evidence —
+  never refit on a P&L window; per-sport kill = the allowlist; prod gates).
+- Phase-numbered history below is context, not state.
+
 **Phase 0 — scaffold: COMPLETE** (215 unit tests green, mypy strict, ruff).
 
 - [x] Repo, .gitignore-first commit, uv project
