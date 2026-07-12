@@ -114,13 +114,14 @@ def test_unparseable_spread_suffix_falls_back_not_a_guess() -> None:
     assert out.corr[0, 1] == pytest.approx(soccer_params().default_rho)
 
 
-def test_unparseable_winner_suffix_in_spread_pair_falls_back() -> None:
-    # A draw-side winner leg has no team, so spread×winner orientation can't be
-    # resolved -> flat fallback, not a guess.
+def test_draw_winner_in_spread_pair_resolves_tie() -> None:
+    # M2 zero-gaps wire (2026-07-12): 1H-spread × FT-DRAW is now MEASURED
+    # (-0.44, pooled both teams) — the flat +0.6 fallback this shape used to
+    # hit had the WRONG SIGN (a 2-goal 1H lead makes a FT draw unlikely).
     draw_ml = f"KXWCGAME-{G}-TIE"
     out = build_sgp_correlation((_leg(FHS_FRA), _leg(draw_ml)), [(0, 1)], soccer_params())
-    assert out.untyped_pairs == 1 and out.typed_pairs == 0
-    assert out.corr[0, 1] == pytest.approx(soccer_params().default_rho)
+    assert out.typed_pairs == 1 and out.untyped_pairs == 0
+    assert out.corr[0, 1] == pytest.approx(-0.44)
 
 
 # --- config carries the calibrated entries -----------------------------------

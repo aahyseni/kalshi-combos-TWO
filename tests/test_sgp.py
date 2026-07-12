@@ -105,16 +105,17 @@ def test_first_half_total_gets_positive_prior() -> None:
     assert out.typed_pairs == 1 and out.untyped_pairs == 0
 
 
-def test_first_half_winner_with_draw_leg_falls_back_to_flat() -> None:
-    # A draw-involving 1H winner pair is UNMEASURED -> untyped flat prior, not a
-    # guessed number.
+def test_first_half_winner_with_draw_leg_resolves_tiexwin() -> None:
+    # M2 zero-gaps wire (2026-07-12): draw-involving 1H×FT winner shapes are
+    # now MEASURED — a 1H draw × FT team win resolves :tiexwin (-0.15), no
+    # longer the flat +0.6 fallback (which had the WRONG SIGN here).
     out = build_sgp_correlation(
         (leg("KXWC1H-26JUL05MEXENG-TIE", "EV"), leg(FT_ML_MEX, "EV")),
         [(0, 1)],
         soccer_params(),
     )
-    assert out.untyped_pairs == 1 and out.typed_pairs == 0
-    assert out.corr[0, 1] == pytest.approx(soccer_params().default_rho)
+    assert out.typed_pairs == 1 and out.untyped_pairs == 0
+    assert out.corr[0, 1] == pytest.approx(-0.15)
 
 
 # --- cross-event pairs --------------------------------------------------------

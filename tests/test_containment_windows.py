@@ -272,24 +272,27 @@ def test_tb_hrr1_exact_cells_wired_with_measured_ns() -> None:
 
 
 def test_preexisting_cells_untouched_and_table_size() -> None:
-    """The 142 pre-WIRE-2 cells stay byte-identical (spot checks on the
-    hit⟹hrr / hr⟹hrr exact cells the task singles out) and the table is
-    exactly 142 + 7 = 149 cells / 33 + 7 = 40 exact."""
+    """Pre-existing cells stay byte-identical (spot checks on the hit⟹hrr /
+    hr⟹hrr exact cells earlier passes singled out) and the table is exactly
+    149 + 84 (M2 zero-gaps wire, 2026-07-12: 37 exact + 47 measured) = 233
+    cells / 40 + 37 = 77 exact."""
     assert SAME_PLAYER_CONDITIONALS[("hit", 2, "hrr", 2)] == (1.0, 212_507, "exact")
     assert SAME_PLAYER_CONDITIONALS[("hit", 3, "hrr", 3)] == (1.0, 48_375, "exact")
     assert SAME_PLAYER_CONDITIONALS[("hr", 1, "hrr", 2)] == (1.0, 101_186, "exact")
     assert SAME_PLAYER_CONDITIONALS[("hr", 1, "hrr", 3)] == (1.0, 101_186, "exact")
     assert SAME_PLAYER_CONDITIONALS[("hr", 2, "hrr", 5)] == (1.0, 6_195, "exact")
-    assert len(SAME_PLAYER_CONDITIONALS) == 149
+    assert len(SAME_PLAYER_CONDITIONALS) == 233
     n_exact = sum(1 for v in SAME_PLAYER_CONDITIONALS.values() if v[2] == "exact")
-    assert n_exact == 40
+    assert n_exact == 77
 
 
 def test_s41_classifier_verdicts() -> None:
     """TB-N × HRR-1 same player: yy containment (subset = TB), yn IMPOSSIBLE
     never farmable (MLB scalar settlement), nn containment (subset = the
-    HRR-NO leg), ny UNKNOWN (fail-closed: no measured reverse cell exists —
-    the known, documented S41-ny residual)."""
+    HRR-NO leg), ny OK — the M2 zero-gaps wire (2026-07-12) added the FULL
+    ('hrr', 1, *) measured reverse row (n=650,346), so the formerly-UNKNOWN
+    S41-ny residual (tb-no × hrr1-yes, 146 tape combos) now prices via the
+    conditional-table sgp seam."""
     yy = classify_legs((_leg(TB2), _leg(HRR1)), ExplodingProvider())
     assert yy.kind is RelationshipKind.CONTAINMENT
     assert yy.containment == (0, 1)
@@ -300,7 +303,8 @@ def test_s41_classifier_verdicts() -> None:
     assert nn.kind is RelationshipKind.CONTAINMENT
     assert nn.containment == (1, 0)
     ny = classify_legs((_leg(TB2, "no"), _leg(HRR1)), ExplodingProvider())
-    assert ny.kind is RelationshipKind.UNKNOWN
+    assert ny.kind is RelationshipKind.OK
+    assert any("conditional table" in n for n in ny.notes)
     # TB-7 (beyond the old 2..6 grid) carries the same exact cell.
     r7 = classify_legs((_leg(TB7), _leg(HRR1)), ExplodingProvider())
     assert r7.kind is RelationshipKind.CONTAINMENT

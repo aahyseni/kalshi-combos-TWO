@@ -267,8 +267,12 @@ def test_engine_forwards_sport_tables() -> None:
     assert bands["mlb:moneyline|player_tb"] == 0.30
     assert tables["mlb"]["player_hit|spread"] == 0.00
     assert bands["mlb:player_hit|spread"] == 0.31
-    assert tables["mlb"]["rfi|spread"] == 0.00
-    assert bands["mlb:rfi|spread"] == 0.15
+    # M2 zero-gaps wire (2026-07-12): the rfi|spread 0.00/0.15 hand prior was
+    # REPLACED by the measured plain fallback +0.05/0.08 + an r1-r5 rung ladder.
+    assert tables["mlb"]["rfi|spread"] == 0.05
+    assert bands["mlb:rfi|spread"] == 0.08
+    assert tables["mlb"]["rfi|spread:r5"] == 0.107
+    assert bands["mlb:rfi|spread:r5"] == 0.04
     assert tables["mlb"]["player_hrr|rfi"] == 0.122
     assert bands["mlb:player_hrr|rfi"] == 0.06
     assert tables["mlb"]["player_hit|spread:same:r2:r5"] == 0.304  # (A1) chained rungs
@@ -284,17 +288,17 @@ def test_mlb_pair_table_has_no_band_orphans() -> None:
     """DO-1 invariant: every mlb pair entry has an 'mlb:'-prefixed band and
     every mlb-prefixed band has an entry — a point without a band gets the
     default width (wrong confidence), a band without a point is dead config.
-    165 entries / 165 bands as of the B4 measurement addendum (2026-07-10;
-    was 148 at the Phase 2 wire, 43 at the untabled-cell quick-fix, 68
-    pre-wire); the count only ever grows (routing/measurement phases add
-    oriented keys)."""
+    186 entries / 186 bands as of the M2 zero-gaps wire (2026-07-12; was 165
+    at the B4 measurement addendum, 148 at the Phase 2 wire, 43 at the
+    untabled-cell quick-fix, 68 pre-wire); the count only ever grows
+    (routing/measurement phases add oriented keys)."""
     h = Harness()
     engine = PricingEngine(h.feed, h.metadata, DOC_ASSUMED, PricingConfig())
     mlb = engine._sgp_params.pair_rho_by_sport["mlb"]  # noqa: SLF001 (test seam)
     bands = engine._sgp_params.pair_uncertainty  # noqa: SLF001 (test seam)
     mlb_bands = {k.removeprefix("mlb:") for k in bands if k.startswith("mlb:")}
     assert set(mlb) == mlb_bands
-    assert len(mlb) >= 165
+    assert len(mlb) >= 186
 
 
 async def dog_ml_btts_harness(config: PricingConfig | None = None) -> PricingEngine:

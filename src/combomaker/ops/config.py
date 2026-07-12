@@ -222,33 +222,51 @@ class CorrelationConfig(StrictModel):
             "corners|moneyline": 0.00,
             "corners|spread": 0.00,       # TOTAL corners ⊥ margin (measured +0.02)
             "btts|corners": 0.00,
-            # CORNERS × FIRST-HALF markets. Corners are in NO scoreline model
-            # (structural declines a corners leg -> copula), and total corners
-            # are MEASURED ⊥ result/goals — same basis as corners|total/moneyline
-            # above — so a corners × 1H pair is ~0, NOT the flat +0.6 the engine
-            # used to hit (corners × 1H was UNTYPED, ~21k tape combos). 0.00 for
-            # every 1H family (winner/total/btts/spread), total AND team corners.
+            # CORNERS × FIRST-HALF markets — MEASURED (M1 2026-07-12, job
+            # 24844262 tmp/zerogaps/soccer_wire_list.txt; football-data top-5
+            # EU 20/21-24/25 n=8,981, implied-rho thru the shipped copula;
+            # match-cluster bootstrap CI95 hw <= 0.08). TOTAL corners stay ~0
+            # against every 1H family (the 2026-07-08 near-zero priors now
+            # measured): 1H-winner ~0 (:team +0.013 / :tie -0.023), 1H-total
+            # -0.02 (centers over0.5 +0.010 / over1.5 -0.046), 1H-btts -0.01,
+            # 1H-spread -0.05 (a 1H margin>=2 kills the late corners chase).
             "corners|first_half_moneyline": 0.00,
-            "corners|first_half_total": 0.00,
-            "corners|first_half_btts": 0.00,
-            "corners|first_half_spread": 0.00,
+            "corners|first_half_total": -0.02,
+            "corners|first_half_btts": -0.01,
+            "corners|first_half_spread": -0.05,
+            # TEAM corners × 1H-winner/1H-spread are ORIENTED (:same/:opp/
+            # :tie), MEASURED strength-controlled (raw pooled is the Simpson
+            # trap, same as corners_team|moneyline): the chasing team earns
+            # corners, 1H stronger than FT (:same -0.204 vs FT -0.15). Routed
+            # by the corners_team|moneyline / |spread resolvers (sgp.py — the
+            # 1H suffixes are the same TEAM-code / TEAM+digits shapes); the
+            # plain entries are the unparseable-orientation fallback, bands
+            # RAISED to span the measured oriented extremes.
             "corners_team|first_half_moneyline": 0.00,
-            "corners_team|first_half_total": 0.00,
-            "corners_team|first_half_btts": 0.00,
+            "corners_team|first_half_moneyline:same": -0.20,
+            "corners_team|first_half_moneyline:opp": 0.23,
+            "corners_team|first_half_moneyline:tie": 0.00,
+            "corners_team|first_half_total": 0.00,   # M1: o0.5 +0.010 / o1.5 -0.021
+            "corners_team|first_half_btts": 0.00,    # M1: -0.002 ~0
             "corners_team|first_half_spread": 0.00,
-            # advance|corners and corners|player_goal were UNLISTED, so a same-
-            # game combo mixing total corners with an ADVANCE or player-goal leg
-            # fell to the flat same_event_rho +0.6 fallback — a fail-safe-inversion
-            # that made corners look strongly comonotone with the result/scorer
-            # and drove the 3,344-contract WC combo to 8.76c vs the maker's 5.60c
-            # (job 24844262). ADVANCE is a diluted moneyline and corners|moneyline
-            # is a MEASURED 0.00 (corners ⊥ result), so advance|corners ≈ 0.00.
-            # corners × a player's goal mirrors the same-team-attack team-corners
-            # prior corners_team|player_goal +0.05. Both are LABELED PRIORS (wide,
-            # zero-spanning band): total corners is measured ⊥ goals/result, these
-            # just replace the WRONG +0.6 default with the grounded near-zero value.
+            "corners_team|first_half_spread:same": -0.18,
+            "corners_team|first_half_spread:opp": 0.15,
+            # advance|corners (M1 2026-07-12): DERIVED+MEASURED ET channel —
+            # pooled 0.00 by identity, but a STRENGTH CURVE dog +0.23 <-> fav
+            # -0.23 (a drawn-90 forces ET; corners settle INCLUDING ET, so a
+            # dog's advance co-occurs with the extra corners window). The
+            # curve ships in oriented_curve["soccer:advance|corners"] keyed on
+            # the ADVANCE leg's marginal (btts|moneyline machinery); this
+            # plain scalar is the marginal-less fallback and must band-span
+            # the curve (band 0.25; q-sweep +-0.04, ET-pmf unc +-0.01).
             "advance|corners": 0.00,
-            "corners|player_goal": 0.05,
+            # corners|player_goal (M1 2026-07-12): MEASURED on the Understat x
+            # football-data join (n=3,614 matches / 7,228 star rows, 99.0%
+            # join) — club strength-controlled -0.054, raw -0.042; KO-ET
+            # adjusted -0.010 (goal+corners both settle incl ET; kick
+            # +0.02..0.03; 87.4% of tape flow is knockout) -> -0.03 centers
+            # the regimes. Replaces the +0.05 labeled prior.
+            "corners|player_goal": -0.03,
             # TOTAL corners × a TEAM's corners (same game). Unlike the other
             # corners pairs (measured ~0), the total CONTAINS the team's corners
             # as a large component, so they are strongly comonotone — the one
@@ -347,20 +365,46 @@ class CorrelationConfig(StrictModel):
             "corners_team|corners_team": -0.28,
             "corners_team|corners_team:opp": -0.28,
             "corners_team|corners_team:same": 0.90,
-            "corners_team|player_goal": 0.05,     # prior (same-team attack), wide band
-            "advance|corners_team": -0.05,        # prior (diluted moneyline), wide band
+            # corners_team × scorer (M1 2026-07-12): ORIENTED, MEASURED
+            # strength-controlled on the Understat x football-data join
+            # (n=3,614 / 7,228 star rows). SIGN FLIP vs the old +0.05
+            # same-team-attack folk prior: the star scores -> his team is
+            # ahead -> its corners are SUPPRESSED (:same -0.163; raw -0.025
+            # is the Simpson trap, same as shipped corners_team|moneyline);
+            # the OPPONENT's corners rise (:opp +0.113). Routed by the
+            # spread×scorer resolver (sgp.py — corners_team's TEAM+digits
+            # suffix parses identically); plain = unparseable fallback, band
+            # spans the measured -0.14..+0.11.
+            "corners_team|player_goal": 0.00,
+            "corners_team|player_goal:same": -0.14,
+            "corners_team|player_goal:opp": 0.11,
+            # advance × team corners (M1 2026-07-12): ORIENTED, DERIVED
+            # (bridge advance = win90 + q*draw90, q=0.5+-0.14 sweep) + ET
+            # boost, strength-controlled -0.132/+0.132, VALIDATED on real
+            # knockouts (KO direct :same -0.08..-0.14, CI contains derived).
+            # Routed by the winner-vs-team resolver (advance suffix IS the
+            # team code); plain -0.05 kept (flow skews same-team backing),
+            # band raised to span +-0.13.
+            "advance|corners_team": -0.05,
+            "advance|corners_team:same": -0.13,
+            "advance|corners_team:opp": 0.13,
             "moneyline|moneyline": -0.95,
             # Period (1st-half) × full-time, CALIBRATED 2026-07-07 on 8,981 club
             # matches (football-data.co.uk HT/FT, era-stable across a 2023
             # split; docs/calibration/results_soccer.md §1). The 1H-winner ×
             # FT-winner sign FLIPS with team orientation — resolved by sgp.py to
-            # ":same" (both legs name one team) vs ":opp" (different teams);
-            # draw-involving winner pairs are unmeasured and fall to the flat
-            # prior. Matched-family only; cross-type (1H-winner × FT-total,
-            # 1H-spread) is DEFERRED. 1H-BTTS × FT-BTTS is not a rho — it is a
-            # logical CONTAINMENT handled in relationships.py, not here.
+            # ":same" (both legs name one team) vs ":opp" (different teams).
+            # DRAW-involving winner pairs (M1 2026-07-12): MEASURED — the flat
+            # +0.6/band-0.90 fallback they used to hit had the WRONG SIGN for
+            # tiexwin/teamxtie. Suffix order = pair_key leg order (1H leg
+            # first): ":tiexwin" = 1H draw × FT team win, ":teamxtie" = 1H
+            # team lead × FT draw, ":tiextie" = draw × draw (each pooled over
+            # both teams where a team is named).
             "first_half_moneyline|moneyline:same": 0.71,
             "first_half_moneyline|moneyline:opp": -0.67,
+            "first_half_moneyline|moneyline:tiexwin": -0.15,
+            "first_half_moneyline|moneyline:teamxtie": -0.21,
+            "first_half_moneyline|moneyline:tiextie": 0.35,
             "first_half_total|total": 0.73,
             # FT-BTTS x 1H-TOTAL-over-N. UNLISTED -> the pair fell to the flat
             # +0.6 same_event fallback whenever the DC pricer declined (live-RFQ
@@ -435,6 +479,12 @@ class CorrelationConfig(StrictModel):
             "first_half_spread|spread:opp": -0.65,
             "first_half_spread|moneyline:same": 0.74,
             "first_half_spread|moneyline:opp": -0.66,
+            # 1H-spread × FT-DRAW (M1 2026-07-12): MEASURED -0.444 — the flat
+            # +0.6 fallback this case used to hit was the WRONG SIGN (a 2-goal
+            # 1H lead makes a FT draw unlikely; a 1.04 rho swing). Pooled over
+            # both teams; resolved by the 1H-spread × winner resolver's :tie
+            # branch (sgp.py).
+            "first_half_spread|moneyline:tie": -0.44,
             "first_half_spread|total": 0.52,
             # === 1H CROSS-TYPE CLUSTER (calibrated 2026-07-08, 3-agent batch:
             # half-time Dixon-Coles + football-data HT/FT + Understat; every pair
@@ -477,6 +527,14 @@ class CorrelationConfig(StrictModel):
             "first_half_moneyline|first_half_spread:tie": -0.95,
             "first_half_btts|first_half_spread": -0.22,
             "first_half_btts|first_half_total": 0.95,      # 1H-btts => 1H over1.5
+            # FT-btts × 1H-btts (M1 2026-07-12): EXACT CONTAINMENT — 1H-btts
+            # => FT-btts, 0/8,981 violations, implied rho at the +0.99 cap ->
+            # the containment clamp 0.95 (convention of
+            # first_half_btts|first_half_total above). The BARE pair is
+            # intercepted by relationships.py containment; this entry prices
+            # the pair when BURIED in a larger combo (corners_team|
+            # corners_team:same precedent).
+            "btts|first_half_btts": 0.95,
             "advance|first_half_spread:same": 0.72,
             "advance|first_half_spread:opp": -0.72,
             "btts|first_half_spread": 0.00,      # VERIFIED ~0 (2H recovery cancels it)
@@ -663,11 +721,20 @@ class CorrelationConfig(StrictModel):
             # (MEASURE-BEFORE-TIGHTEN — DO-8) -- rfi ("a run in the FIRST
             # INNING by EITHER team") is team-symmetric / orientation-FREE,
             # so these ship as plain scalars with no resolver dependency.
-            # rfi|spread: team-directional × team-symmetric ≈ ⊥, exactly the
-            # geometry of the MEASURED moneyline|rfi 0.00 — a margin win is a
-            # stronger directional signal but adds no first-inning
-            # information. Prior 0.00, modest band.
-            "rfi|spread": 0.00,
+            # rfi|spread: MEASURED per-rung (M2 2026-07-12, zero-gaps wire —
+            # DO-8 MEASURE-BEFORE-TIGHTEN executed; corpus parsed2.npz PBP
+            # inning-1 runs, linescore-validated, x final margins, 49,486
+            # games 2005-25, ties excluded). rfi is team-symmetric but the
+            # spread frame is NOT (leading home team skips bottom-9), so each
+            # rung value is the HOME/AWAY MIDPOINT; the band covers the frame
+            # half-span (<= 0.0344), CI hw (<= 0.0245) and era shift
+            # (<= 0.0295). The plain key is the unparsed-rung fallback —
+            # REPLACES the hand-prior 0.00/0.15: spans the r1-r5 midpoints
+            # 0.000..+0.107 and both frames -0.026..+0.131 (the old 0.00 was
+            # right ONLY at r1, 0.13 shallow at deep rungs — inside the old
+            # band, so no misprice occurred, but now MEASURED). Rung ladder
+            # in the M2 zero-gaps block at the end of this table.
+            "rfi|spread": 0.05,
             # rfi × batter props: MEASURED plain orientation-free values (A3,
             # Phase 2 wire 2026-07-10, docs/calibration/phase2_wire_list.txt
             # lines 51-54) — REPLACES the one-factor labeled priors
@@ -880,6 +947,48 @@ class CorrelationConfig(StrictModel):
             "player_ks|player_tb:same:r4": 0.009,    # (B4 2026-07-10)
             "player_ks|player_tb:same:r5": 0.006,    # (B4 2026-07-10)
             "player_ks|player_tb:same": 0.010,       # (B4 2026-07-10; aggregate r2-r5)
+            # ---- M2 ZERO-GAPS wire (M2 2026-07-12): pair-table rungs wired
+            # VERBATIM from job 24844262 tmp/zerogaps/mlb_wire_list.txt
+            # sections 3-7 (full precision mlb_measurements.json). Estimator =
+            # tetrachoric (bvnu vs scipy 1.1e-16), game-cluster bootstrap,
+            # 2015-25 window; judge standard UNRELAXED (CI95 hw <= 0.08, era
+            # shift inside band, band = max(0.04, CI95 hw, |era shift|)).
+            # Grammar/frames per the Phase 2 CONVENTION header above; rung
+            # universe = TAPE EVIDENCE (852,940 MLB-strict RFQ'd combos) — no
+            # rung invented, nothing interpolated (TB U-ladder refutation
+            # stands). ----
+            # -- (S3) teammate rungs formerly on the un-runged :same
+            # aggregates (which STAY as the unparsed-rung fallback) --
+            "player_hit|player_ks:same:r4": -0.009,  # (M2; teammate ~0 at r4)
+            "player_hrr|player_ks:same:r1": 0.015,   # (M2; completes r1-r5)
+            # -- (S4) FACING (:opp) sides of the same Kalshi-real rungs
+            # (monotone ladder continuation, per-rung DIRECT) --
+            "player_hit|player_ks:opp:r4": -0.187,   # (M2; extends r1-r3 ladder)
+            "player_hrr|player_ks:opp:r1": -0.153,   # (M2; r1 SHALLOWER than -0.18)
+            "player_hrr|player_ks:opp:r2": -0.176,   # (M2)
+            "player_hrr|player_ks:opp:r3": -0.178,   # (M2; = Phase-1 anchor -0.1776)
+            "player_hrr|player_ks:opp:r4": -0.184,   # (M2)
+            "player_hrr|player_ks:opp:r5": -0.189,   # (M2; r1->r5 monotone)
+            # -- (S5) TB r8 (now Kalshi-real: 98 legs this window) + ks|tb
+            # :same deep rungs; post-U-turn depth holds, NO interpolation --
+            "player_ks|player_tb:opp:r8": -0.119,    # (M2; FACING, direct)
+            "player_ks|player_tb:same:r6": -0.002,   # (M2; teammate ~0)
+            "player_ks|player_tb:same:r7": -0.004,   # (M2; teammate ~0)
+            "player_ks|player_tb:same:r8": -0.007,   # (M2; teammate ~0)
+            # -- (S6) moneyline × player_hr 2+/3+ rungs (detector est ~+0.27
+            # CONFIRMED; :opp = exact tetrachoric complement, ties excluded,
+            # same convention as the shipped +/-0.23 pair) --
+            "moneyline|player_hr:same:r2": 0.270,    # (M2)
+            "moneyline|player_hr:opp:r2": -0.270,    # (M2; mirror)
+            "moneyline|player_hr:same:r3": 0.338,    # (M2; 163 positives 15-25)
+            "moneyline|player_hr:opp:r3": -0.338,    # (M2; mirror)
+            # -- (S7) rfi|spread per-rung ladder (HOME/AWAY midpoints; see the
+            # plain-entry comment above) --
+            "rfi|spread:r1": 0.000,                  # (M2; home +0.026/away -0.026)
+            "rfi|spread:r2": 0.050,                  # (M2)
+            "rfi|spread:r3": 0.079,                  # (M2)
+            "rfi|spread:r4": 0.097,                  # (M2)
+            "rfi|spread:r5": 0.107,                  # (M2)
         },
     }
     # Band overrides: sport-prefixed keys ("nfl:moneyline|total") for
@@ -899,16 +1008,27 @@ class CorrelationConfig(StrictModel):
         "soccer:btts|corners": 0.08,
         "soccer:corners|moneyline": 0.08,        # total corners, measured ~0 (team is separate now)
         "soccer:corners|spread": 0.08,           # total corners ⊥ margin (measured +0.02)
-        # corners × 1H: grounded near-zero (corners ⊥ result/goals), wide band.
-        "soccer:corners|first_half_moneyline": 0.10,
-        "soccer:corners|first_half_total": 0.10,
-        "soccer:corners|first_half_btts": 0.10,
-        "soccer:corners|first_half_spread": 0.10,
-        "soccer:corners_team|first_half_moneyline": 0.10,
-        "soccer:corners_team|first_half_total": 0.10,
-        "soccer:corners_team|first_half_btts": 0.10,
-        "soccer:corners_team|first_half_spread": 0.10,
-        "soccer:advance|corners": 0.15,          # labeled prior (corners ⊥ result)
+        # corners × 1H: MEASURED (M1 2026-07-12); band = max(0.04, CI95 hw,
+        # |season shift|, line-halfspread) per the judge standard. Plain
+        # corners_team entries are the unparseable-orientation fallbacks and
+        # SPAN the measured oriented extremes (-0.20..+0.23 / -0.18..+0.15).
+        "soccer:corners|first_half_moneyline": 0.06,
+        "soccer:corners|first_half_total": 0.05,
+        "soccer:corners|first_half_btts": 0.04,
+        "soccer:corners|first_half_spread": 0.05,
+        "soccer:corners_team|first_half_moneyline": 0.25,
+        "soccer:corners_team|first_half_moneyline:same": 0.05,
+        "soccer:corners_team|first_half_moneyline:opp": 0.04,
+        "soccer:corners_team|first_half_moneyline:tie": 0.04,
+        "soccer:corners_team|first_half_total": 0.07,
+        "soccer:corners_team|first_half_btts": 0.05,
+        "soccer:corners_team|first_half_spread": 0.22,
+        "soccer:corners_team|first_half_spread:same": 0.07,
+        # :opp small cell: season shift +0.156 is the band driver (M1).
+        "soccer:corners_team|first_half_spread:opp": 0.16,
+        # advance|corners plain: band must SPAN the strength curve (+-0.23)
+        # for marginal-less callers (M1 2026-07-12; was the 0.15 labeled prior).
+        "soccer:advance|corners": 0.25,
         # advance × full-time bands (DC-derived + 4-study cross-check; the
         # correlation swings 0→~0.22 with favorite strength, so a wide band):
         "soccer:advance|total": 0.15,
@@ -922,7 +1042,9 @@ class CorrelationConfig(StrictModel):
         "soccer:btts|spread": 0.13,
         "soccer:player_goal|spread:same": 0.15,
         "soccer:player_goal|spread:opp": 0.15,
-        "soccer:corners|player_goal": 0.20,      # labeled prior (~ corners_team|player_goal)
+        # MEASURED (M1 2026-07-12): band 0.10 spans the club-controlled /
+        # KO-ET-adjusted regime spread around -0.03 (was the 0.20 labeled prior).
+        "soccer:corners|player_goal": 0.10,
         "soccer:corners_team|moneyline": 0.10,
         "soccer:corners_team|moneyline:same": 0.10,
         "soccer:corners_team|moneyline:opp": 0.10,
@@ -936,8 +1058,15 @@ class CorrelationConfig(StrictModel):
         "soccer:corners_team|corners_team": 0.10,
         "soccer:corners_team|corners_team:opp": 0.10,   # re-measured, tight
         "soccer:corners_team|corners_team:same": 0.10,  # comonotone containment approx
-        "soccer:corners_team|player_goal": 0.20,  # labeled prior
-        "soccer:advance|corners_team": 0.15,      # labeled prior
+        # corners_team × scorer / advance × corners_team (M1 2026-07-12):
+        # oriented cells measured/derived tight; plain fallbacks span their
+        # oriented extremes (-0.14..+0.11 / +-0.13).
+        "soccer:corners_team|player_goal": 0.20,
+        "soccer:corners_team|player_goal:same": 0.05,
+        "soccer:corners_team|player_goal:opp": 0.04,
+        "soccer:advance|corners_team": 0.20,
+        "soccer:advance|corners_team:same": 0.05,
+        "soccer:advance|corners_team:opp": 0.05,
         "soccer:player_goal|total": 0.15,        # hand-prior width around measured +0.46
         "soccer:player_goal|player_goal": 0.10,  # teammate(0)/opponent(+0.05) blend band
         "soccer:moneyline|moneyline": 0.04,
@@ -945,6 +1074,15 @@ class CorrelationConfig(StrictModel):
         # not the conditional-MLE gate — no live 1H book yet — so kept modest).
         "soccer:first_half_moneyline|moneyline:same": 0.08,
         "soccer:first_half_moneyline|moneyline:opp": 0.08,
+        # Draw-orientation cells (M1 2026-07-12): all on the 0.04 judge floor
+        # (n=8,981, CI95 hw and season shift inside).
+        "soccer:first_half_moneyline|moneyline:tiexwin": 0.04,
+        "soccer:first_half_moneyline|moneyline:teamxtie": 0.04,
+        "soccer:first_half_moneyline|moneyline:tiextie": 0.04,
+        "soccer:first_half_spread|moneyline:tie": 0.04,
+        # Exact-containment cap value (M1 2026-07-12): tight band, the
+        # containment-clamp convention.
+        "soccer:btts|first_half_btts": 0.04,
         "soccer:first_half_total|total": 0.12,
         # FT-BTTS × 1H-total: two-method agreement (structural +0.53/+0.54,
         # empirical +0.57/+0.55) + line-stability; 1H-family proxy band (no live
@@ -1085,7 +1223,10 @@ class CorrelationConfig(StrictModel):
         "mlb:player_hr|spread": 0.28,       # spans -0.210..+0.241 + unmeasured hr2+ ~+0.27
         "mlb:player_hrr|spread": 0.42,      # spans -0.334..+0.413
         "mlb:player_tb|spread": 0.30,       # spans ±0.287
-        "mlb:rfi|spread": 0.15,             # ⊥ prior (mirrors measured ml|rfi 0.00)
+        # (M2 2026-07-12) plain rfi|spread is now the MEASURED unparsed-rung
+        # fallback +0.05: band 0.08 spans the r1-r5 midpoints AND both
+        # home/away frames -0.026..+0.131 (replaces the 0.00/0.15 hand prior).
+        "mlb:rfi|spread": 0.08,
         # rfi × props: MEASURED bands (A3, Phase 2 wire — replaces the
         # labeled-prior 0.15/0.20 widths; cover rung + pooled spreads)
         "mlb:player_hit|rfi": 0.05,
@@ -1215,6 +1356,34 @@ class CorrelationConfig(StrictModel):
         "mlb:player_ks|player_tb:same:r4": 0.04,
         "mlb:player_ks|player_tb:same:r5": 0.04,
         "mlb:player_ks|player_tb:same": 0.04,
+        # M2 ZERO-GAPS wire bands (M2 2026-07-12; 1:1 with the M2 rho block in
+        # pair_rho_by_sport["mlb"] — zero orphans, count-verified). Band =
+        # max(0.04, CI95 hw, |era shift|) per the unrelaxed judge standard;
+        # ml|hr r3 = 0.07 (CI95 hw 0.0627 rounded up, 163 positives 15-25 —
+        # precedent player_hr|total:r3); everything else sits on the 0.04
+        # floor. rfi|spread rung bands additionally cover the home/away frame
+        # half-span (<= 0.0344).
+        "mlb:player_hit|player_ks:same:r4": 0.04,
+        "mlb:player_hrr|player_ks:same:r1": 0.04,
+        "mlb:player_hit|player_ks:opp:r4": 0.04,
+        "mlb:player_hrr|player_ks:opp:r1": 0.04,
+        "mlb:player_hrr|player_ks:opp:r2": 0.04,
+        "mlb:player_hrr|player_ks:opp:r3": 0.04,
+        "mlb:player_hrr|player_ks:opp:r4": 0.04,
+        "mlb:player_hrr|player_ks:opp:r5": 0.04,
+        "mlb:player_ks|player_tb:opp:r8": 0.04,
+        "mlb:player_ks|player_tb:same:r6": 0.04,
+        "mlb:player_ks|player_tb:same:r7": 0.04,
+        "mlb:player_ks|player_tb:same:r8": 0.04,
+        "mlb:moneyline|player_hr:same:r2": 0.04,
+        "mlb:moneyline|player_hr:opp:r2": 0.04,
+        "mlb:moneyline|player_hr:same:r3": 0.07,
+        "mlb:moneyline|player_hr:opp:r3": 0.07,
+        "mlb:rfi|spread:r1": 0.04,
+        "mlb:rfi|spread:r2": 0.04,
+        "mlb:rfi|spread:r3": 0.04,
+        "mlb:rfi|spread:r4": 0.04,
+        "mlb:rfi|spread:r5": 0.04,
     }
     # Orientation CURVES: a pair whose YES-YES rho is a monotone function of one
     # leg's marginal (not a single scalar or a fav/dog step). Keyed
@@ -1234,9 +1403,34 @@ class CorrelationConfig(StrictModel):
             (0.65, -0.34),
             (0.85, -0.36),
         ],
+        # advance × TOTAL corners STRENGTH CURVE (M1 2026-07-12, zero-gaps
+        # wire; job 24844262 tmp/zerogaps/soccer_measurements.json 'curves',
+        # q=0.5, corners line >= 9; knots verbatim). Keyed on the ADVANCE
+        # leg's YES-side marginal — NOT a moneyline (sgp.py routes the
+        # {advance, corners} pair here explicitly). Mechanism: a drawn-90
+        # forces ET and corners settle INCLUDING ET, so a longshot's advance
+        # co-occurs with the extra corners window (dog +0.23) while a heavy
+        # favorite's advance skips it (fav -0.23); pooled 0.00 by identity —
+        # the plain scalar entry (0.00 band 0.25) is the marginal-less
+        # fallback spanning this curve. Antisymmetric by construction
+        # (rho(p) = -rho(1-p)); knot band 0.10 (q attenuation at the ends;
+        # q-sweep +-0.04, ET-pmf unc +-0.01).
+        "soccer:advance|corners": [
+            (0.1684, 0.2274),
+            (0.2823, 0.2336),
+            (0.3491, 0.1549),
+            (0.4195, 0.0732),
+            (0.4607, 0.0204),
+            (0.5393, -0.0205),
+            (0.5805, -0.0732),
+            (0.6509, -0.1549),
+            (0.7177, -0.2336),
+            (0.8316, -0.2274),
+        ],
     }
     oriented_curve_uncertainty: dict[str, float] = {
         "soccer:btts|moneyline": 0.13,
+        "soccer:advance|corners": 0.10,
     }
 
 

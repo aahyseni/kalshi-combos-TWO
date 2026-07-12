@@ -232,14 +232,22 @@ def _spread_winner_prior(
 ) -> _PairPrior | None:
     """1H-spread × FT-moneyline prior, resolved to ``:same`` / ``:opp`` by
     whether the spread leg (TEAM+line-digits suffix) and the winner leg (whole
-    last segment) name the same team (a 1H lead → that team wins, +ρ) or opposite
-    teams (near-mutually-exclusive, −ρ). Either suffix unparseable (spread not
-    TEAM+digits, or a draw-side winner) → None so the caller falls back — never
-    guess a sign."""
+    last segment) name the same team (a 1H lead → that team wins, +ρ) or
+    opposite teams (near-mutually-exclusive, −ρ), or to ``:tie`` when the
+    winner leg is a DRAW (MEASURED −0.44, M1 2026-07-12 — a 2-goal 1H lead
+    makes a FT draw unlikely; the flat +0.6 fallback this case used to hit
+    was the WRONG SIGN; pooled over both teams). Either suffix unparseable
+    (spread not TEAM+digits, or a non-draw non-team winner) → None so the
+    caller falls back — never guess a sign."""
     team_s = _spread_team(spread_ticker)
-    team_m = _winner_team(ml_ticker)
-    if team_s is None or team_m is None:
+    if team_s is None:
         return None
+    team_m = _winner_team(ml_ticker)
+    if team_m is None:
+        suffix = ml_ticker.rsplit("-", 1)[-1].upper()
+        if suffix not in _DRAW_SUFFIXES:
+            return None  # unparseable winner suffix: do not invent an orientation
+        return _lookup_pair(f"{key}:tie", sport, params)
     orient = "same" if team_s == team_m else "opp"
     return _lookup_pair(f"{key}:{orient}", sport, params)
 
@@ -379,19 +387,36 @@ def _period_winner_player_prior(
 
 
 def _winner_period_prior(
-    key: str, sport: str, params: SgpParams, ticker_a: str, ticker_b: str
+    key: str, sport: str, params: SgpParams, fhm_ticker: str, ml_ticker: str
 ) -> _PairPrior | None:
-    """1H-winner × FT-winner prior, resolved to ``:same`` / ``:opp`` by whether
-    the two winner legs name the same team (+ρ) or opposite teams (−ρ). This is
-    the same/opposite analogue of ``_oriented_prior``'s fav/dog blend, but the
-    choice is HARD (a sign flip), not a marginal-blended interpolation. A
-    draw-involving pair is unmeasured → None (caller falls back to the flat
-    prior; do not invent a number)."""
-    team_a = _winner_team(ticker_a)
-    team_b = _winner_team(ticker_b)
-    if team_a is None or team_b is None:
+    """1H-winner × FT-winner prior. Team-vs-team resolves to ``:same`` /
+    ``:opp`` by whether the two winner legs name the same team (+ρ) or opposite
+    teams (−ρ) — the same/opposite analogue of ``_oriented_prior``'s fav/dog
+    blend, but the choice is HARD (a sign flip), not a marginal-blended
+    interpolation. DRAW-involving pairs (MEASURED, M1 2026-07-12 — the flat
+    +0.6 fallback they used to hit was the WRONG SIGN for two of the three
+    shapes) resolve to ``:tiexwin`` (1H draw × FT team win), ``:teamxtie``
+    (1H team lead × FT draw) or ``:tiextie`` (draw × draw); suffix order =
+    pair_key leg order, 1H leg first, so the caller MUST pass the 1H ticker
+    first. An empty/garbage suffix on either leg → None (caller falls back;
+    never invent an orientation)."""
+    fh_suffix = fhm_ticker.rsplit("-", 1)[-1].upper()
+    ft_suffix = ml_ticker.rsplit("-", 1)[-1].upper()
+    if not fh_suffix or not ft_suffix:
         return None
-    orient = "same" if team_a == team_b else "opp"
+    fh_tie = fh_suffix in _DRAW_SUFFIXES
+    ft_tie = ft_suffix in _DRAW_SUFFIXES
+    if fh_tie and ft_tie:
+        return _lookup_pair(f"{key}:tiextie", sport, params)
+    if fh_tie:
+        return _lookup_pair(f"{key}:tiexwin", sport, params)
+    if ft_tie:
+        return _lookup_pair(f"{key}:teamxtie", sport, params)
+    team_fh = _winner_team(fhm_ticker)
+    team_ft = _winner_team(ml_ticker)
+    if team_fh is None or team_ft is None:
+        return None
+    orient = "same" if team_fh == team_ft else "opp"
     return _lookup_pair(f"{key}:{orient}", sport, params)
 
 
@@ -822,9 +847,17 @@ def build_sgp_correlation(
             else:
                 pair_types = {types[i], types[j]}
                 if pair_types == {LegType.FIRST_HALF_MONEYLINE, LegType.MONEYLINE}:
-                    # 1H-winner × FT-winner: sign flips on same-vs-opposite team.
+                    # 1H-winner × FT-winner: sign flips on same-vs-opposite
+                    # team; draw shapes resolve :tiexwin/:teamxtie/:tiextie
+                    # (suffix order = pair_key leg order, 1H leg first).
+                    fhm2_i = i if types[i] is LegType.FIRST_HALF_MONEYLINE else j
+                    ml3_i = j if fhm2_i == i else i
                     prior = _winner_period_prior(
-                        key, sport, params, legs[i].market_ticker, legs[j].market_ticker
+                        key,
+                        sport,
+                        params,
+                        legs[fhm2_i].market_ticker,
+                        legs[ml3_i].market_ticker,
                     )
                 elif pair_types == {LegType.FIRST_HALF_SPREAD, LegType.SPREAD}:
                     # 1H-spread × FT-spread: sign flips on same-vs-opposite team.
@@ -912,6 +945,84 @@ def build_sgp_correlation(
                         params,
                         legs[cts_index].market_ticker,
                         legs[spr2_index].market_ticker,
+                    )
+                elif pair_types == {
+                    LegType.CORNERS_TEAM,
+                    LegType.FIRST_HALF_MONEYLINE,
+                }:
+                    # team corners × 1H-winner (M1 2026-07-12): same shape as
+                    # the FT winner pair — the chasing team earns corners
+                    # (:same −0.20 / :opp +0.23 / :tie ~0, 1H stronger than
+                    # FT). The 1H-winner suffix is the same TEAM-code-or-TIE
+                    # shape, so the FT resolver routes it unchanged.
+                    ct2_i = i if types[i] is LegType.CORNERS_TEAM else j
+                    fh3_i = j if ct2_i == i else i
+                    prior = _corners_winner_prior(
+                        key,
+                        sport,
+                        params,
+                        legs[ct2_i].market_ticker,
+                        legs[fh3_i].market_ticker,
+                    )
+                elif pair_types == {
+                    LegType.CORNERS_TEAM,
+                    LegType.FIRST_HALF_SPREAD,
+                }:
+                    # team corners × 1H-spread (M1 2026-07-12): sibling of the
+                    # FT spread pair (:same −0.18 / :opp +0.15); the 1H-spread
+                    # suffix is the same TEAM+digits shape.
+                    ct3_i = i if types[i] is LegType.CORNERS_TEAM else j
+                    fhs2_i = j if ct3_i == i else i
+                    prior = _corners_spread_prior(
+                        key,
+                        sport,
+                        params,
+                        legs[ct3_i].market_ticker,
+                        legs[fhs2_i].market_ticker,
+                    )
+                elif pair_types == {LegType.ADVANCE, LegType.CORNERS}:
+                    # advance × TOTAL corners (M1 2026-07-12): a STRENGTH
+                    # CURVE keyed on the ADVANCE leg's marginal (dog +0.23 ↔
+                    # fav −0.23 — a drawn-90 forces ET and corners settle
+                    # incl ET), the btts|moneyline machinery on a non-ML
+                    # marginal. Without marginals the plain 0.00 scalar
+                    # (band 0.25 spans the curve) applies via the fallthrough.
+                    if marginals is not None:
+                        adv2_i = i if types[i] is LegType.ADVANCE else j
+                        prior = _oriented_curve_prior(
+                            key, sport, params, marginals[adv2_i]
+                        )
+                elif pair_types == {LegType.ADVANCE, LegType.CORNERS_TEAM}:
+                    # advance × TEAM corners (M1 2026-07-12): −ρ when the
+                    # corners team IS the advancing team (chasing-team corners
+                    # + the ET boost), +ρ for the opponent — derived via the
+                    # advance=win90+q·draw90 bridge, KO-validated. Advance
+                    # never names a draw, so no tie branch.
+                    adv3_i = i if types[i] is LegType.ADVANCE else j
+                    ct4_i = j if adv3_i == i else i
+                    prior = _oriented_team_prior(
+                        key,
+                        sport,
+                        params,
+                        _winner_team(legs[adv3_i].market_ticker),
+                        _corners_team_name(legs[ct4_i].market_ticker),
+                        is_tie=False,
+                    )
+                elif pair_types == {LegType.CORNERS_TEAM, LegType.PLAYER_GOAL}:
+                    # team corners × scorer (M1 2026-07-12): SIGN FLIP vs the
+                    # old +0.05 folk prior — the star scores → his team leads
+                    # → its corners are SUPPRESSED (:same −0.14 / :opp +0.11,
+                    # strength-controlled). The corners_team suffix is the
+                    # same TEAM+digits shape a spread leg carries, so the
+                    # spread×scorer resolver routes it unchanged.
+                    ct5_i = i if types[i] is LegType.CORNERS_TEAM else j
+                    pg2_i = j if ct5_i == i else i
+                    prior = _spread_player_prior(
+                        key,
+                        sport,
+                        params,
+                        legs[ct5_i].market_ticker,
+                        legs[pg2_i].market_ticker,
                     )
                 elif pair_types == {LegType.ADVANCE, LegType.FIRST_HALF_MONEYLINE}:
                     # advance × 1H-winner: +ρ if the 1H leader advances, −ρ if the
