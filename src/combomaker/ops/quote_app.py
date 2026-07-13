@@ -421,7 +421,9 @@ class QuoteApp:
             # Phase 6 circuit breakers: fail-closed detectors that trip the kill
             # switch on the known failure signatures. Evaluated in the status
             # loop off the hot path (a trip cancels-all + stops via on_halt).
-            breakers = CircuitBreakers(killswitch, config.breakers.to_thresholds())
+            breakers = CircuitBreakers(
+                killswitch, config.breakers.to_thresholds(), self._clock
+            )
 
             # Idempotent startup: reconcile before doing anything, THEN enforce
             # the Phase 6 go-live gates. Both are quote-mode only (demo/paper are

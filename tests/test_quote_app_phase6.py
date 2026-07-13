@@ -461,7 +461,7 @@ def _breakers(app: QuoteApp) -> Any:
     from combomaker.risk.killswitch import KillSwitch
 
     ks = KillSwitch(app._clock, kill_file=app._config.kill_file)
-    return CircuitBreakers(ks, app._config.breakers.to_thresholds())
+    return CircuitBreakers(ks, app._config.breakers.to_thresholds(), app._clock)
 
 
 def test_marginal_jump_breaker_fires_on_real_book_move(tmp_path: Path) -> None:

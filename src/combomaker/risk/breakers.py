@@ -290,10 +290,33 @@ class CircuitBreakers:
     can't run must fail closed, never silently pass.
     """
 
-    def __init__(self, killswitch: KillSwitch, thresholds: BreakerThresholds) -> None:
+    # Transient/recoverable failure signatures get a GRACE window: the book is NOT
+    # hard-killed on a sub-window blip (a WS reconnect, a latency spike aging out
+    # of its window, a 429 burst subsiding, a one-off marginal move). During the
+    # hold the EXISTING safeguards keep us safe — feed.on_invalidate cancels
+    # resting quotes, the WS force-reconnects, and the pricer declines on stale
+    # legs — so we hold + re-evaluate; only a condition that stays bad PAST the
+    # window escalates to the hard kill. Structural/genuine reasons (metadata/rule
+    # change, an unmappable game key that escapes the caps, a breaker that itself
+    # raised) are NOT here and hard-halt immediately. Windows are sized in multiples
+    # of the 15s status-loop cadence so a reconnect gets ≥1 full tick to heal.
+    # (2026-07-13 live: a transient WS reconnect hard-killed the whole book 0.8s in
+    # — this is the fix.)
+    _GRACE_S: dict[ReasonCode, float] = {
+        ReasonCode.HALT_DATA_STALE: 30.0,        # WS reconnect (force_reconnect on drop)
+        ReasonCode.HALT_LATENCY_SPIKE: 90.0,     # a spike ages out of the 60s window
+        ReasonCode.HALT_RATE_LIMIT_BURST: 30.0,  # 429s subside as the window rolls
+        ReasonCode.HALT_MARGINAL_JUMP: 30.0,     # one-off move re-baselines; halt on churn
+    }
+
+    def __init__(
+        self, killswitch: KillSwitch, thresholds: BreakerThresholds, clock: Clock
+    ) -> None:
         self._killswitch = killswitch
         self._thr = thresholds
+        self._clock = clock
         self._last_marginal: dict[str, float] = {}
+        self._bad_since: dict[ReasonCode, float] = {}
 
     def evaluate(self, inputs: BreakerInputs) -> BreakerVerdict:
         """Run all detectors; return the FIRST trip (or clear). Never halts.
@@ -363,14 +386,56 @@ class CircuitBreakers:
         return tripped or BreakerVerdict.clear()
 
     async def evaluate_and_halt(self, inputs: BreakerInputs) -> BreakerVerdict:
-        """Evaluate; on a trip, halt the kill switch (idempotent). Returns the
-        verdict so the caller can log/meter it. This is the WIRED call site the
-        maintenance/status loops use."""
+        """Evaluate; react. A TRANSIENT trip (see ``_GRACE_S``) is HELD for a grace
+        window — the book is not hard-killed on a blip (a WS reconnect etc.); the
+        existing cancel-all-on-invalidate + WS force-reconnect + pricer leg-freshness
+        keep us safe during the hold, and only a condition that stays bad PAST the
+        window escalates to the hard kill. A STRUCTURAL/genuine trip hard-halts
+        immediately (unchanged). A clear tick resets every grace timer (recovered).
+        Returns the verdict so the caller can log/meter it. WIRED call site (status
+        loop)."""
         verdict = self.evaluate(inputs)
-        if verdict.tripped:
-            assert verdict.reason is not None  # a trip always carries a reason
+        now = self._clock.now().timestamp()
+        if not verdict.tripped:
+            if self._bad_since:  # recovered before escalating — resume, reset timers
+                log.info(
+                    "circuit_breaker_recovered", held=[str(r) for r in self._bad_since]
+                )
+                self._bad_since = {}
+            return verdict
+
+        reason = verdict.reason
+        assert reason is not None  # a trip always carries a reason
+        grace = self._GRACE_S.get(reason)
+        if grace is None:
+            # structural / genuine → hard-halt immediately (unchanged behaviour)
             log.error(
-                "circuit_breaker_tripped", reason=str(verdict.reason), detail=verdict.detail
+                "circuit_breaker_tripped", reason=str(reason), detail=verdict.detail
             )
-            await self._killswitch.halt(verdict.reason, verdict.detail)
+            await self._killswitch.halt(reason, verdict.detail)
+            return verdict
+
+        # transient → hold for the grace window; keep only THIS reason's timer so a
+        # different reason on the next tick can't inherit a stale start time.
+        since = self._bad_since.get(reason, now)
+        self._bad_since = {reason: since}
+        elapsed = now - since
+        if elapsed < grace:
+            log.warning(
+                "circuit_breaker_transient_holding",
+                reason=str(reason),
+                elapsed_s=round(elapsed, 1),
+                grace_s=grace,
+                detail=verdict.detail,
+            )
+            return verdict  # do NOT hard-halt — give the recovery path time
+        log.error(
+            "circuit_breaker_tripped_sustained",
+            reason=str(reason),
+            elapsed_s=round(elapsed, 1),
+            detail=verdict.detail,
+        )
+        await self._killswitch.halt(
+            reason, f"{verdict.detail} (sustained {elapsed:.0f}s > {grace:.0f}s grace)"
+        )
         return verdict

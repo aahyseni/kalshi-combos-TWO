@@ -140,22 +140,32 @@ def test_rate_limit_window_prunes_old_events() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _breakers() -> tuple[CircuitBreakers, KillSwitch]:
-    ks = KillSwitch(FakeClock())
-    return CircuitBreakers(ks, BreakerThresholds()), ks
+def _breakers() -> tuple[CircuitBreakers, KillSwitch, FakeClock]:
+    clock = FakeClock()
+    ks = KillSwitch(clock)
+    return CircuitBreakers(ks, BreakerThresholds(), clock), ks, clock
 
 
-async def test_evaluate_and_halt_trips_killswitch() -> None:
-    breakers, ks = _breakers()
-    v = await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=None))  # stale
-    assert v.tripped
+async def test_transient_data_stale_holds_within_grace_then_halts() -> None:
+    breakers, ks, clock = _breakers()
+    # A warm-feed stale (rx_age None) is TRANSIENT — it must NOT hard-kill on the
+    # first tick (the 2026-07-13 live false-kill on a WS reconnect). It holds for
+    # the grace window; only a SUSTAINED stale escalates to the hard halt.
+    v = await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=None))
+    assert v.tripped and v.reason is ReasonCode.HALT_DATA_STALE
+    assert not ks.halted  # held, not killed
+    clock.advance(20.0)  # still within the 30s grace
+    await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=None))
+    assert not ks.halted
+    clock.advance(15.0)  # 35s total > 30s grace ⇒ sustained ⇒ hard halt
+    await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=None))
     assert ks.halted
     assert ks.halt_event is not None
     assert ks.halt_event.reason is ReasonCode.HALT_DATA_STALE
 
 
 async def test_clear_inputs_do_not_halt() -> None:
-    breakers, ks = _breakers()
+    breakers, ks, _clock = _breakers()
     v = await breakers.evaluate_and_halt(
         BreakerInputs(rx_age_s=1.0, seq_gap=False, latency_ms=50.0, rate_limit_count=0)
     )
@@ -164,22 +174,28 @@ async def test_clear_inputs_do_not_halt() -> None:
 
 
 async def test_coordinator_tracks_marginal_baseline_across_ticks() -> None:
-    breakers, ks = _breakers()
+    breakers, ks, _clock = _breakers()
     # Tick 1 establishes the baseline (no trip).
     v1 = await breakers.evaluate_and_halt(
         BreakerInputs(rx_age_s=1.0, marginals={"LEG": 0.50})
     )
     assert v1.tripped is False
-    # Tick 2 jumps past the threshold ⇒ trip.
+    # Tick 2 jumps past the threshold ⇒ trip verdict — but marginal-jump is
+    # TRANSIENT (a single move re-baselines), so it HOLDS, not hard-kill.
     v2 = await breakers.evaluate_and_halt(
         BreakerInputs(rx_age_s=1.0, marginals={"LEG": 0.90})
     )
     assert v2.tripped and v2.reason is ReasonCode.HALT_MARGINAL_JUMP
-    assert ks.halted
+    assert not ks.halted
+    # It re-baselined to 0.90; a stable next tick clears ⇒ timer resets, no halt.
+    v3 = await breakers.evaluate_and_halt(
+        BreakerInputs(rx_age_s=1.0, marginals={"LEG": 0.90})
+    )
+    assert not v3.tripped and not ks.halted
 
 
 async def test_coordinator_unmapped_game_trips() -> None:
-    breakers, ks = _breakers()
+    breakers, ks, _clock = _breakers()
     v = await breakers.evaluate_and_halt(
         BreakerInputs(rx_age_s=1.0, game_keys={"LEG": None})
     )
@@ -188,7 +204,7 @@ async def test_coordinator_unmapped_game_trips() -> None:
 
 
 async def test_detector_exception_fails_closed_to_breaker_error() -> None:
-    breakers, ks = _breakers()
+    breakers, ks, _clock = _breakers()
 
     # A mapping whose iteration raises simulates an uncomputable input; the
     # coordinator must convert the raise into a HALT_BREAKER_ERROR trip, never
@@ -208,7 +224,7 @@ async def test_cold_feed_inputs_do_not_halt() -> None:
     # The live cold-start signature: rx_age None + seq_gap True while feed_warm
     # is still False. The coordinator must NOT halt (regression for the
     # cold-start self-halt that bricked the process before its first quote).
-    breakers, ks = _breakers()
+    breakers, ks, _clock = _breakers()
     v = await breakers.evaluate_and_halt(
         BreakerInputs(rx_age_s=None, seq_gap=True, feed_warm=False)
     )
@@ -216,20 +232,48 @@ async def test_cold_feed_inputs_do_not_halt() -> None:
     assert not ks.halted
 
 
-async def test_warm_feed_stale_still_halts() -> None:
-    # After warmup (feed_warm True, the BreakerInputs default), a stale/None feed
-    # trips as before — the exemption is warmup-only.
-    breakers, ks = _breakers()
+async def test_warm_feed_stale_trips_and_halts_when_sustained() -> None:
+    # After warmup (feed_warm True), a stale/None feed + seq gap TRIPS the verdict
+    # (the exemption is warmup-only). It is transient, so it holds, then hard-halts
+    # once sustained past grace.
+    breakers, ks, clock = _breakers()
     v = await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=None, seq_gap=True))
     assert v.tripped and v.reason is ReasonCode.HALT_DATA_STALE
+    assert not ks.halted  # transient: held
+    clock.advance(35.0)  # sustained past the 30s grace
+    await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=None, seq_gap=True))
     assert ks.halted
 
 
 async def test_data_stale_precedence_over_later_breakers() -> None:
     # A stale feed trips first even if a later input would also trip — the
     # first-trip contract keeps the halt reason deterministic.
-    breakers, ks = _breakers()
+    breakers, ks, _clock = _breakers()
     v = await breakers.evaluate_and_halt(
         BreakerInputs(rx_age_s=None, game_keys={"LEG": None})
     )
     assert v.reason is ReasonCode.HALT_DATA_STALE
+
+
+async def test_transient_recovers_within_grace_never_halts() -> None:
+    # The core WS-reconnect fix: a stale feed that comes back fresh within the
+    # grace window never hard-kills, and a LATER stale starts a fresh timer.
+    breakers, ks, clock = _breakers()
+    await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=None))  # stale — held
+    assert not ks.halted
+    clock.advance(10.0)  # feed reconnects within grace
+    v = await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=1.0))  # fresh again
+    assert not v.tripped and not ks.halted  # recovered, timer reset
+    clock.advance(100.0)  # a much later, separate stale
+    await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=None))
+    assert not ks.halted  # fresh timer — not escalated by the earlier blip
+
+
+async def test_metadata_change_hard_halts_immediately_no_grace() -> None:
+    # A rule/metadata change is structural, not transient — hard-halt at once.
+    breakers, ks, _clock = _breakers()
+    v = await breakers.evaluate_and_halt(
+        BreakerInputs(rx_age_s=1.0, tripwire_hit=("S18", "impossible mix"))
+    )
+    assert v.reason is ReasonCode.HALT_METADATA_CHANGE
+    assert ks.halted  # no grace for structural reasons
