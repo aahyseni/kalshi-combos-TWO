@@ -443,8 +443,25 @@ class QuoteApp:
         keep the ``needs_reconcile`` block in place — a bot that couldn't reach
         the exchange has NOT proven its book and must not resume quoting."""
         try:
-            payload = await rest.get_quotes(user_filter="self", status="open")
-            leftover = payload.get("quotes", []) or []
+            # Cursor-paginate to exhaustion: a startup leftover-cancel must see
+            # EVERY resting quote, not just the first page — the same kill-path
+            # gap the supervisor's list_open_quote_ids closes. limit=500 is the
+            # /communications/quotes documented max (docs/api-notes; NOT 1000).
+            leftover: list[dict[str, object]] = []
+            cursor = ""
+            for _ in range(1000):  # bounded belt-and-braces vs a non-terminating cursor
+                params: dict[str, str | int] = {
+                    "user_filter": "self",
+                    "status": "open",
+                    "limit": 500,
+                }
+                if cursor:
+                    params["cursor"] = cursor
+                payload = await rest.get_quotes(**params)
+                leftover.extend(payload.get("quotes", []) or [])
+                cursor = str(payload.get("cursor") or "")
+                if not cursor:
+                    break
             for quote in leftover:
                 quote_id = str(quote.get("id") or quote.get("quote_id") or "")
                 if quote_id:

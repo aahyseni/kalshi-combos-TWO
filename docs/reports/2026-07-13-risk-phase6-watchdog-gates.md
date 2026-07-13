@@ -174,7 +174,42 @@ supervisor conditions are load-bearing.
 - Go-live gates (static whitelist gate + runtime preflight); prod refuses to quote
   with any gate red.
 
+## Adversarial judge + orchestrator review (2026-07-13)
+
+The pipeline judge FAILED the first cut with 5 findings (2 kill-path, all
+verified with runnable probes); the fix stage addressed them and re-judged; the
+orchestrator closed the re-judge residual + a parallel gap. Because this is the
+KILL PATH, every finding mattered:
+
+- **HIGH (fixed) — cold-start self-halt.** The data-staleness breaker tripped
+  during WS warmup (rx_age None / feed unhealthy) → permanent human-only halt
+  before the first quote. Fixed with a feed-warmth latch + a `feed_warm`
+  exemption (post-warmup disconnect still fails closed).
+- **HIGH (fixed) — KILL file not honored synchronously at restart.** A revived
+  bot could emit a quote before the 1s async KILL watcher noticed the file.
+  Fixed: a SYNCHRONOUS KILL-file gate in `run()` before any quoting, and the
+  `needs_reconcile` marker is no longer cleared while a KILL file is present.
+- **MEDIUM (fixed) — latency breaker used the all-time histogram max** → one
+  transient slow confirm latched the halt forever. Fixed with a rolling-window
+  `recent_max_ms`.
+- **HIGH (fixed) — seq-gap mis-wired** to WS traffic-silence instead of a real
+  in-stream gap. Fixed with a `pop_seq_gap()` event on the feed.
+- **LOW→HIGH (fixed) — emergency cancel-all didn't paginate**, then the fix
+  hardcoded `limit=1000` while `/communications/quotes` caps at **500** (a 400
+  would make the kill enumerate NOTHING — hard rule 4). **Orchestrator fix:**
+  `limit=500`; the bot's OWN `_startup_reconcile` (the identical single-page gap,
+  also on the kill-critical path) now cursor-paginates too; the pagination test's
+  fake rejects an over-range limit so a regression to >500 fails.
+
+Final: suite **1596/0**, mypy strict + ruff clean on every touched file.
+
 **Deferred (post-Phase-6, on the go-live runway):**
+- **Three of the seven breakers (marginal-jump, unmapped-game, metadata-change)
+  are built + unit-tested but NOT yet sampled in the live status loop** — wiring
+  their real signals reaches into the pricing/lifecycle hot path (a larger change
+  than a minimal fix, and CLAUDE.md rule 8 wants it prototyped→ported carefully).
+  The 4 sampled breakers (staleness, latency, 429-burst, reconciliation-mismatch)
+  ARE live. This is a pre-go-live wiring task, not a merge blocker (all NOT-LIVE).
 - Wiring the richer breaker snapshot from the live risk path (marginal-jump per-leg
   map, resolved game-key map, market-metadata-change diff) — detectors are proven;
   the live sampler currently feeds feed/latency/429 and the seams for the rest.

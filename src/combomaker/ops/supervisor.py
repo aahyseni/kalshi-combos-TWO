@@ -380,7 +380,11 @@ class KalshiSupervisorExchange:
             params: dict[str, str | int] = {
                 "user_filter": "self",
                 "status": "open",
-                "limit": 1000,
+                # /communications/quotes caps limit at 500 (docs/api-notes/
+                # index-scan.md + live-data.md; NOT the 1000 of /portfolio/orders).
+                # An over-range limit risks a 400 that would make the emergency
+                # cancel-all enumerate NOTHING — hard rule 4 (docs beat guesses).
+                "limit": 500,
             }
             if cursor:
                 params["cursor"] = cursor

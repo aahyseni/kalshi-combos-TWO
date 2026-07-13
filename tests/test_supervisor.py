@@ -239,6 +239,13 @@ class PagingRest:
         self.cursors_seen: list[str] = []
 
     async def get_quotes(self, **params: Any) -> dict[str, Any]:
+        # /communications/quotes caps limit at 500 (docs/api-notes). Reject an
+        # over-range limit the way Kalshi would (HTTP 400) so a regression that
+        # sends 1000 on the emergency-cancel enumerate path fails this test
+        # instead of silently relying on undocumented lenient clamping.
+        limit = int(params.get("limit", 500))
+        if limit > 500:
+            raise ValueError(f"/communications/quotes limit max 500, got {limit}")
         cursor = str(params.get("cursor", ""))
         self.cursors_seen.append(cursor)
         start = int(cursor) if cursor else 0
