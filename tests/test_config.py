@@ -7,6 +7,7 @@ from combomaker.ops.config import (
     ConfigError,
     EndpointsConfig,
     Env,
+    FiltersConfig,
     Mode,
     ProdGuardError,
     load_config,
@@ -89,3 +90,61 @@ class TestProdGuard:
         # Fade defense is ON in the main config files (parlay-seller only).
         assert demo.pricing.quote.sell_parlays_only is True
         assert prod.pricing.quote.sell_parlays_only is True
+
+
+class TestPregameMarginInvariant:
+    """M_c >= M_q (confirm never looser than quote) — the fail-closed pregame
+    precision invariant, enforced on BOTH the scalar margins and the per-prefix
+    tables (judge finding #3: the per-prefix path was previously unguarded)."""
+
+    def test_scalar_confirm_below_quote_rejected(self) -> None:
+        with pytest.raises(ValueError, match="confirm never looser than quote"):
+            FiltersConfig(
+                pregame_quote_margin_s=300.0, pregame_confirm_margin_s=100.0
+            )
+
+    def test_scalar_confirm_ge_quote_ok(self) -> None:
+        cfg = FiltersConfig(
+            pregame_quote_margin_s=100.0, pregame_confirm_margin_s=300.0
+        )
+        assert cfg.pregame_confirm_margin_s == 300.0
+
+    def test_per_prefix_confirm_below_quote_rejected(self) -> None:
+        # Both tables name the prefix, confirm looser than quote → reject.
+        with pytest.raises(ValueError, match="per-prefix"):
+            FiltersConfig(
+                pregame_quote_margin_s_by_prefix={"KXMLB": 300.0},
+                pregame_confirm_margin_s_by_prefix={"KXMLB": 100.0},
+            )
+
+    def test_per_prefix_quote_only_falls_back_to_scalar_confirm(self) -> None:
+        # Quote table sets a prefix (300) but the confirm table is EMPTY, so the
+        # effective confirm falls back to the scalar default (0) → 0 < 300 →
+        # reject (the mixed-table hole the judge flagged).
+        with pytest.raises(ValueError, match="per-prefix"):
+            FiltersConfig(
+                pregame_quote_margin_s_by_prefix={"KXMLB": 300.0},
+            )
+
+    def test_per_prefix_confirm_ge_quote_ok(self) -> None:
+        cfg = FiltersConfig(
+            pregame_quote_margin_s_by_prefix={"KXMLB": 100.0},
+            pregame_confirm_margin_s_by_prefix={"KXMLB": 300.0},
+        )
+        assert cfg.pregame_confirm_margin_s_by_prefix["KXMLB"] == 300.0
+
+    def test_per_prefix_confirm_uses_scalar_quote_fallback(self) -> None:
+        # Confirm table names a prefix (300); quote for that prefix falls back to
+        # the scalar quote default (100) → 300 >= 100 → OK.
+        cfg = FiltersConfig(
+            pregame_quote_margin_s=100.0,
+            pregame_confirm_margin_s=300.0,
+            pregame_confirm_margin_s_by_prefix={"KXMLB": 300.0},
+        )
+        assert cfg.pregame_confirm_margin_s_by_prefix["KXMLB"] == 300.0
+
+    def test_defaults_construct_clean(self) -> None:
+        # All margin tables default empty ⇒ no per-prefix rows ⇒ invariant holds.
+        cfg = FiltersConfig()
+        assert cfg.pregame_quote_margin_s_by_prefix == {}
+        assert cfg.pregame_confirm_margin_s_by_prefix == {}

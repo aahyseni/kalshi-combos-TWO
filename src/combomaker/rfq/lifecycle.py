@@ -849,8 +849,9 @@ class QuoteLifecycle:
         log.info(
             "inventory_skew_shadow",
             rfq_id=rfq.rfq_id,
-            skew_cc=skew.skew_cc,
-            applied_cc=skew.applied_cc,
+            skew_cc=skew.skew_cc,                        # honest classifier sign
+            applied_cc=skew.applied_cc,                  # 0 while dark
+            shadow_applied_cc=skew.shadow_applied_cc,    # pricer-frame, dark-independent
             concentration_cc=skew.concentration_cc,
             offset_cc=skew.offset_cc,
             enabled=skew.enabled,

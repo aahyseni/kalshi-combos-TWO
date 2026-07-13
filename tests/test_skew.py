@@ -20,13 +20,18 @@ policy's shadow/enabled + offsetting-never-declined behaviour.
 from __future__ import annotations
 
 from collections.abc import Callable
+from fractions import Fraction
 
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from combomaker.core.conventions import Conventions, Side
-from combomaker.core.money import CentiCents
+from combomaker.core.conventions import DOC_ASSUMED, Conventions, Side
+from combomaker.core.money import CC_PER_DOLLAR, CentiCents
 from combomaker.core.quantity import CentiContracts
+from combomaker.marketdata.grid import PriceGrid
+from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
+from combomaker.pricing.joint import JointEstimate
+from combomaker.pricing.quote import ConstructedQuote, construct_quote
 from combomaker.risk.exposure import (
     ExposureBook,
     ExposureSnapshot,
@@ -35,6 +40,7 @@ from combomaker.risk.exposure import (
 )
 from combomaker.risk.skew import (
     GameSkewCache,
+    InventorySkew,
     SkewLimits,
     SkewParams,
     WidenPolicyParams,
@@ -137,7 +143,9 @@ class TestSignSafety:
         )
         assert skew.skew_cc >= 0
         assert skew.offset_cc == 0
-        assert skew.applied_cc == skew.skew_cc  # enabled
+        # enabled ⇒ applied is the classifier NEGATED into the pricer frame (a
+        # concentrating skew_cc >= 0 WIDENS ⇒ enters the pricer as <= 0).
+        assert skew.applied_cc == -skew.skew_cc
 
     def test_offsetting_candidate_is_nonpositive(self) -> None:
         # Book long-NO of {A yes, B yes} (game net negative). A candidate long-NO
@@ -463,3 +471,91 @@ class TestWidenPolicy:
             skew, snap, candidate, LIMITS, WidenPolicyParams(enabled=True)
         )
         assert not decision.would_decline
+
+
+# ---------------------------------------------------------------------------
+# PRICER-BOUNDARY SIGN (finding #1). Feed compute_inventory_skew(...).applied_cc
+# into the REAL construct_quote and assert the DIRECTION of the implied YES ask
+# ($1 − no_bid): a CONCENTRATING candidate must quote a strictly HIGHER ask than
+# base (dearer ⇒ we sell LESS of what we're loaded on), an OFFSETTING candidate a
+# strictly LOWER ask (cheaper ⇒ we win MORE of the flattening flow). This checks
+# the classifier→pricer seam end to end, not just the skew fn's decomposition.
+# ---------------------------------------------------------------------------
+
+
+_SCHEDULE = FeeSchedule.from_strings("0.07", "0.0175")
+_TAKER_FEES = FeeModel(_SCHEDULE, DOC_ASSUMED)
+
+
+def _deci_grid() -> PriceGrid:
+    # Fine grid so a modest skew moves the snapped bid at all (a 1c grid can
+    # swallow small shades; the direction, not the magnitude, is under test).
+    return PriceGrid.from_market_payload(
+        {"ticker": "T", "price_ranges": [{"start": "0.001", "end": "0.999", "step": "0.001"}]}
+    )
+
+
+def _implied_yes_ask_cc(skew_applied_cc: int) -> int:
+    """Price the RFQ-candidate combo through the REAL construct_quote at the given
+    applied skew and return the implied YES ask ($1 − no_bid). Fair 0.30, two
+    legs, generous free-money caps so the clamp never masks the skew's effect."""
+    quote = construct_quote(
+        joint=JointEstimate(p=0.30, uncertainty=0.0, frechet_lo=0.0, frechet_hi=1.0, notes=()),
+        n_legs=2,
+        qty=Q(10_000),
+        grid=_deci_grid(),
+        fee_model=_TAKER_FEES,
+        fee_type=FeeType.QUADRATIC,
+        fee_multiplier=Fraction(1),
+        time_to_close_s=48 * 3600.0,
+        in_play=False,
+        yes_cap_cc=CC(9_900),
+        no_cap_cc=CC(9_900),
+        inventory_skew_cc=skew_applied_cc,
+    )
+    assert isinstance(quote, ConstructedQuote)
+    return CC_PER_DOLLAR - int(quote.no_bid_cc)
+
+
+def _skew_for(cand_side: str, *, held: int = 96_000, cand: int = 10_000) -> InventorySkew:
+    book = ExposureBook(CONVENTIONS)
+    marginals = {"A": 0.5, "B": 0.5}
+    book.add_position(
+        no_position("held", (leg("A", "yes"), leg("B", "yes")), contracts=held)
+    )
+    snap = snapshot_of(book, marginals)
+    candidate = no_position(
+        "cand", (leg("A", cand_side), leg("B", cand_side)), contracts=cand
+    )
+    return compute_inventory_skew(
+        candidate, snap, provider(marginals), CONVENTIONS, LIMITS, PARAMS
+    )
+
+
+class TestPricerBoundarySign:
+    def test_concentrating_quotes_strictly_higher_yes_ask(self) -> None:
+        base_ask = _implied_yes_ask_cc(0)
+        conc = _skew_for("yes")                 # SAME shape ⇒ concentrating
+        assert conc.skew_cc > 0                 # classifier: concentrating is +
+        assert conc.applied_cc < 0              # ...negated into the pricer
+        conc_ask = _implied_yes_ask_cc(conc.applied_cc)
+        # Concentrating ⇒ DEARER combo ⇒ HIGHER ask ⇒ we sell LESS. (Pre-fix the
+        # positive skew_cc flowed straight in and made the ask LOWER — backwards.)
+        assert conc_ask > base_ask
+
+    def test_offsetting_quotes_strictly_lower_yes_ask(self) -> None:
+        base_ask = _implied_yes_ask_cc(0)
+        off = _skew_for("no")                   # OPPOSITE shape ⇒ offsetting
+        assert off.skew_cc < 0                  # classifier: offsetting is −
+        assert off.applied_cc > 0               # ...negated into the pricer
+        off_ask = _implied_yes_ask_cc(off.applied_cc)
+        # Offsetting ⇒ CHEAPER combo ⇒ LOWER ask ⇒ we win MORE flattening flow.
+        assert off_ask < base_ask
+
+    def test_concentrating_and_offsetting_straddle_base(self) -> None:
+        # The two halves are backwards of each other about the base, in the RIGHT
+        # order: concentrating dearer, offsetting cheaper.
+        base_ask = _implied_yes_ask_cc(0)
+        conc_ask = _implied_yes_ask_cc(_skew_for("yes").applied_cc)
+        off_ask = _implied_yes_ask_cc(_skew_for("no").applied_cc)
+        assert off_ask < base_ask < conc_ask

@@ -547,14 +547,44 @@ class TestSellParlaysOnly:
 
 
 class TestSkewNoArb:
-    """R3 §A6.3 — NO-ARB survives a large negative (tightening) skew.
+    """R3 §A6.3 — NO-ARB survives ANY skew, stressing the FREE-MONEY-DANGEROUS
+    direction.
 
-    A negative inventory skew RAISES no_raw (the offset rebate); a large one
-    would push no_bid above the free-money cap if unchecked. The free-money
-    clamp in construct_quote (quote.py:202) fires AFTER skew and the capture
-    invariant re-checks, so the tightening rebate can shrink our edge but can
-    NEVER produce an arb quote. This proves the clamp fires and the capture
-    check still passes even at a skew far below any configured tighten cap."""
+    The pricer seam is ``no_raw = ($1 − fair) − half − fee_no + inventory_skew_cc``,
+    so a POSITIVE ``inventory_skew_cc`` RAISES ``no_bid`` toward the free-money
+    cap — this is the direction that can produce an arb if unchecked, and (after
+    the classifier→pricer sign fix in risk/skew.py) it is the sign the OFFSETTING
+    rebate now enters the pricer with. The free-money clamp in construct_quote
+    (quote.py:202) fires AFTER skew and the capture invariant re-checks, so the
+    rebate can shrink our edge but can NEVER produce an arb quote. A NEGATIVE
+    ``inventory_skew_cc`` LOWERS ``no_bid`` (moves AWAY from the cap) — safe by
+    construction; kept as coverage of that side, but the clamp is stressed by the
+    positive cases below (regression for the judge's finding #2: the pre-fix test
+    fuzzed only the negative side and never exercised the clamp)."""
+
+    @settings(derandomize=True, max_examples=300, deadline=None)
+    @given(
+        p=st.integers(min_value=5, max_value=95),
+        no_cap=st.integers(min_value=2_000, max_value=9_900),
+        rebate=st.integers(min_value=0, max_value=6_000),
+    )
+    def test_positive_skew_never_breaches_free_money_cap(
+        self, p: int, no_cap: int, rebate: int
+    ) -> None:
+        # POSITIVE skew RAISES no_raw toward the cap — the arb-dangerous side.
+        q = build_quote(
+            joint=make_joint(p / 100.0, 0.0),
+            grid=deci_grid(),
+            inventory_skew_cc=rebate,
+            no_cap_cc=CC(no_cap),
+            yes_cap_cc=CC(9_900),
+        )
+        if isinstance(q, NoQuote):
+            return
+        # The emitted NO bid never crosses the free-money cap minus its margin,
+        # no matter how large the rebate skew (the clamp is the backstop).
+        assert int(q.no_bid_cc) <= no_cap - 100  # free_money_margin_cc default
+        assert int(q.yes_bid_cc) + int(q.no_bid_cc) <= CC_PER_DOLLAR - 100
 
     @settings(derandomize=True, max_examples=300, deadline=None)
     @given(
@@ -565,28 +595,53 @@ class TestSkewNoArb:
     def test_negative_skew_never_breaches_free_money_cap(
         self, p: int, no_cap: int, tighten: int
     ) -> None:
+        # NEGATIVE skew LOWERS no_raw (away from the cap) — coverage of the safe
+        # side; the invariant must still hold.
         q = build_quote(
             joint=make_joint(p / 100.0, 0.0),
             grid=deci_grid(),
-            inventory_skew_cc=-tighten,        # tightening (raises no_raw)
+            inventory_skew_cc=-tighten,
             no_cap_cc=CC(no_cap),
             yes_cap_cc=CC(9_900),
         )
         if isinstance(q, NoQuote):
             return
-        # The emitted NO bid never crosses the free-money cap minus its margin,
-        # no matter how deep the tightening skew (the clamp is the backstop).
         assert int(q.no_bid_cc) <= no_cap - 100  # free_money_margin_cc default
-        # And the capture invariant still holds.
         assert int(q.yes_bid_cc) + int(q.no_bid_cc) <= CC_PER_DOLLAR - 100
 
-    def test_deep_tightening_skew_fires_the_clamp(self) -> None:
-        # A skew that WOULD push no_bid to ~$1 is clamped to the cap; the
-        # unclamped-vs-clamped comparison proves the clamp actually bound.
+    def test_deep_positive_skew_fires_the_clamp(self) -> None:
+        # A large POSITIVE skew WOULD push no_bid to ~$1; it is clamped to the
+        # cap. Uses a fair (0.30) whose UNCLAMPED no_raw would exceed the cap, so
+        # the clamp provably BINDS: base no_bid ≈ $0.70 − half; +9_000 skew would
+        # drive it toward ~$1 but the cap at 7_000 − 100 holds.
         clamped = build_quote(
             joint=make_joint(0.30, 0.0),
             grid=deci_grid(),
-            inventory_skew_cc=-9_000,          # absurd tighten
+            inventory_skew_cc=9_000,           # absurd rebate toward the cap
+            no_cap_cc=CC(7_000),
+            yes_cap_cc=CC(9_900),
+        )
+        assert isinstance(clamped, ConstructedQuote)
+        assert int(clamped.no_bid_cc) == 7_000 - 100  # clamped to exactly the cap
+        # Sanity: WITHOUT the skew the no_bid is strictly below the cap, proving
+        # the +9_000 is what drove it into the clamp (not the base price alone).
+        base = build_quote(
+            joint=make_joint(0.30, 0.0),
+            grid=deci_grid(),
+            inventory_skew_cc=0,
+            no_cap_cc=CC(7_000),
+            yes_cap_cc=CC(9_900),
+        )
+        assert isinstance(base, ConstructedQuote)
+        assert int(base.no_bid_cc) < 7_000 - 100
+
+    def test_deep_tightening_skew_stays_below_cap(self) -> None:
+        # The opposite side: a deep NEGATIVE skew lowers no_bid, so it sits well
+        # below the cap (never breaches). Retained coverage of the safe side.
+        clamped = build_quote(
+            joint=make_joint(0.30, 0.0),
+            grid=deci_grid(),
+            inventory_skew_cc=-9_000,          # absurd tighten (away from cap)
             no_cap_cc=CC(7_000),
             yes_cap_cc=CC(9_900),
         )

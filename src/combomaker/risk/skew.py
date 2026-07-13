@@ -12,23 +12,34 @@ skew enters as::
 
     no_raw = ($1 − fair) − half − fee_no + inventory_skew_cc
 
-so a POSITIVE skew RAISES ``no_bid`` toward its cap — wait, no: it raises
-``no_raw`` which is then clamped, but the net effect the design specifies is that
-a *positive* skew makes the combo MORE EXPENSIVE to the requester (a higher NO
-bid means a higher implied ask $1 − no_bid... ). The authoritative reading, kept
-verbatim from R3 §A0, is:
+so a POSITIVE ``inventory_skew_cc`` at the PRICER RAISES ``no_bid`` ⇒ LOWERS the
+implied YES ask ($1 − no_bid) ⇒ the combo gets CHEAPER ⇒ we sell MORE. To WIDEN
+(sell less) we must pass a NEGATIVE number to the pricer, and to REBATE (sell
+more) a POSITIVE one. That is the OPPOSITE of the classifier convention below,
+so the flip is applied ONCE, at the pricer boundary (``applied_cc``), keeping the
+honest classifier direction readable in every shadow log and internal decomp.
 
-- **positive skew ⇒ we quote a MORE expensive combo ⇒ we sell LESS**. Use it when
-  the candidate CONCENTRATES the book (adds to a game's net per-game direction).
-- **negative skew ⇒ we quote a CHEAPER NO ⇒ we win MORE of that flow**. Use it
-  when the candidate OFFSETS an existing net position (opposes the book's
-  per-game direction).
+The CLASSIFIER convention (``skew_cc`` and the ``concentration_cc`` /
+``offset_cc`` decomposition) reads the intuitive way:
 
-So::
+- **CONCENTRATING candidate ⇒ ``skew_cc`` ≥ 0** (adds to a game's net per-game
+  direction). We must WIDEN (sell less), so ``applied_cc`` NEGATES it ⇒ a
+  negative number lowers ``no_bid`` ⇒ dearer combo ⇒ sell less. ✓
+- **OFFSETTING candidate ⇒ ``skew_cc`` ≤ 0** (opposes the book's per-game
+  direction). We want to WIN MORE of that flattening flow, so ``applied_cc``
+  NEGATES it ⇒ a positive number raises ``no_bid`` ⇒ cheaper combo ⇒ sell more. ✓
 
-    skew_cc(C) =  Σ_game concentration_term(game)     # ≥ 0, WIDEN when adding
-                − Σ_game offset_term(game)            # ≥ 0, REBATE when opposing
+So the honest classifier is::
+
+    skew_cc(C) =  Σ_game concentration_term(game)     # ≥ 0, CONCENTRATING
+                − Σ_game offset_term(game)            # ≥ 0, OFFSETTING
       clamped to [−skew_max_tighten_cc, +skew_max_widen_cc]
+
+and the pricer receives ``applied_cc = −skew_cc`` (when enabled). Because the
+NEGATION swaps sides, the OFFSETTING rebate — now the POSITIVE, no_bid-RAISING,
+free-money-dangerous direction at the pricer — is the one bounded by the small
+``skew_max_tighten_cc`` cap (and doubly contained by the free-money clamp in
+``construct_quote``), exactly as intended.
 
 Every term is driven PRIMARILY off the per-GAME aggregates (the real risk unit,
 2026-07-12 sweep): ``snapshot.delta_by_game`` (signed net direction) and the two
@@ -66,19 +77,21 @@ class SkewParams:
 
     Weights (``w_conc`` / ``w_off``) and the convexity ``gamma`` are structural
     knobs tuned on exposure-vs-markout, NEVER on a P&L window. The two caps are
-    HARD safety, not tuning:
+    HARD safety, not tuning. They bound the CLASSIFIER ``skew_cc`` (before the
+    ``applied_cc`` negation that flips it into the pricer):
 
-    - ``skew_max_widen_cc`` bounds the concentrating (positive) side. Unbounded
-      widening is safe (it only makes us sell less), but a cap (~600cc) stops a
-      mispriced game delta posting an absurd near-$1 ask that looks like a
-      fat-finger.
-    - ``skew_max_tighten_cc`` bounds the offsetting (negative) rebate. This is
-      the dangerous side — a rebate that tightens the NO bid toward the
-      free-money cap. It is ALREADY structurally contained by the free-money
-      clamp in ``construct_quote`` (the clamp fires after skew, the capture
-      invariant re-checks), so the rebate can shrink our edge but never make an
-      arb quote. The cap (~150cc, ~½ base width) just stops us rebating away the
-      whole markup chasing a balance.
+    - ``skew_max_widen_cc`` bounds the concentrating (positive ``skew_cc``) side.
+      At the pricer this NEGATES to a WIDEN (lower ``no_bid``, dearer combo, sell
+      less). Widening is safe (it only makes us sell less), but a cap (~600cc)
+      stops a mispriced game delta posting an absurd near-$1 ask that looks like
+      a fat-finger.
+    - ``skew_max_tighten_cc`` bounds the offsetting (negative ``skew_cc``) rebate.
+      At the pricer this NEGATES to a POSITIVE ``inventory_skew_cc`` that RAISES
+      ``no_bid`` toward the free-money cap — the dangerous side. It is ALREADY
+      doubly contained by the free-money clamp in ``construct_quote`` (the clamp
+      fires after skew, the capture invariant re-checks), so the rebate can
+      shrink our edge but never make an arb quote. The cap (~150cc, ~½ base
+      width) just stops us rebating away the whole markup chasing a balance.
     """
 
     w_conc: float = 1.0
@@ -142,8 +155,13 @@ class GameSkewCache:
 class InventorySkew:
     """The computed skew + its decomposition, for shadow logging.
 
-    ``skew_cc`` is what would be passed to ``engine.price`` WHEN ENABLED; while
-    disabled the caller passes 0 and logs this. ``concentration_cc`` /
+    ``skew_cc`` is the honest CLASSIFIER value (≥ 0 concentrating, ≤ 0
+    offsetting) — the intuitive-direction number a human reads in a shadow log.
+    ``applied_cc`` is what the caller passes to ``engine.price``: the classifier
+    NEGATED (pricer-frame) when enabled, a hard 0 while dark. ``shadow_applied_cc``
+    is the would-be pricer-frame value REGARDLESS of the dark flag — the
+    correctly-signed signal the pooled shadow-markout gate must study (studying
+    ``applied_cc`` while dark would only ever see 0). ``concentration_cc`` /
     ``offset_cc`` are the (non-negative) halves before the net + clamp, so a
     shadow log can see which side drove the number.
     """
@@ -157,8 +175,20 @@ class InventorySkew:
     @property
     def applied_cc(self) -> int:
         """The value the caller actually passes to the pricer: the honest skew
-        when enabled, a hard 0 while dark (a zero-P&L shadow)."""
-        return self.skew_cc if self.enabled else 0
+        NEGATED (the pricer's ``+ inventory_skew_cc`` on ``no_bid`` runs opposite
+        the classifier convention — a CONCENTRATING ``skew_cc >= 0`` must WIDEN,
+        i.e. LOWER ``no_bid``, so it enters the pricer negative), when enabled;
+        a hard 0 while dark (a zero-P&L shadow). This is the SINGLE place the
+        classifier→pricer sign flip lives."""
+        return -self.skew_cc if self.enabled else 0
+
+    @property
+    def shadow_applied_cc(self) -> int:
+        """The pricer-frame value the skew WOULD apply if enabled (``−skew_cc``),
+        independent of the dark flag. Logged so the pooled shadow-markout
+        validation gate studies the SAME sign it would live-apply — the gate runs
+        entirely while dark, where ``applied_cc`` is pinned to 0."""
+        return -self.skew_cc
 
 
 def _sign(x: float) -> int:

@@ -14,7 +14,14 @@ from pathlib import Path
 from typing import Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from combomaker.risk.limits import RiskLimits
 
@@ -157,6 +164,36 @@ class FiltersConfig(StrictModel):
                 f"pregame_quote_margin_s ({q}) — confirm never looser than quote"
             )
         return v
+
+    @model_validator(mode="after")
+    def _confirm_ge_quote_by_prefix(self) -> Self:
+        # The scalar validator above only guards the DEFAULT margins. The
+        # per-prefix tables must obey the SAME fail-closed invariant, or an
+        # operator could configure a prefix whose confirm cutoff (the last-look
+        # SAFETY gate) is LOOSER than its quote cutoff — the exact inversion the
+        # invariant exists to prevent. This includes the mixed case where only
+        # ONE table names a prefix (the other side falls back to its scalar
+        # default). For EVERY prefix appearing in EITHER table, resolve the
+        # effective quote margin (prefix override, else scalar) and confirm
+        # margin (likewise) and reject if the effective confirm is looser.
+        prefixes = (
+            self.pregame_quote_margin_s_by_prefix.keys()
+            | self.pregame_confirm_margin_s_by_prefix.keys()
+        )
+        for prefix in sorted(prefixes):
+            q_eff = self.pregame_quote_margin_s_by_prefix.get(
+                prefix, self.pregame_quote_margin_s
+            )
+            c_eff = self.pregame_confirm_margin_s_by_prefix.get(
+                prefix, self.pregame_confirm_margin_s
+            )
+            if c_eff < q_eff:
+                raise ValueError(
+                    f"pregame_confirm_margin_s for prefix {prefix!r} ({c_eff}) "
+                    f"must be >= the effective quote margin ({q_eff}) — confirm "
+                    "never looser than quote (per-prefix)"
+                )
+        return self
 
 
 class FeeConfig(StrictModel):
@@ -1534,11 +1571,16 @@ class SkewConfig(StrictModel):
     adverse markout?) may flip ``enabled`` true; the weights are STRUCTURAL,
     tuned on exposure-vs-markout, NEVER on a P&L window (feedback_no_refit_on_pnl).
 
-    Sign (load-bearing, R3 §A0): the whole lever operates on ``no_bid``. POSITIVE
-    skew ⇒ more expensive combo ⇒ sell LESS ⇒ used for CONCENTRATING flow;
-    NEGATIVE skew ⇒ cheaper NO ⇒ win MORE ⇒ used for OFFSETTING flow. The
-    tighten (negative) cap is the dangerous side and is doubly contained by the
-    free-money clamp in construct_quote.
+    Sign (load-bearing, R3 §A0): the whole lever operates on ``no_bid``. The
+    CLASSIFIER ``skew_cc`` reads intuitively — a CONCENTRATING candidate is
+    ``>= 0`` and an OFFSETTING one is ``<= 0`` — but the PRICER seam
+    (``no_raw = ($1 − fair) − half − fee_no + inventory_skew_cc``) runs opposite,
+    so ``InventorySkew.applied_cc`` NEGATES it into the pricer: a CONCENTRATING
+    candidate WIDENS (lower ``no_bid`` ⇒ dearer combo ⇒ sell LESS), an OFFSETTING
+    one REBATES (higher ``no_bid`` ⇒ cheaper combo ⇒ win MORE of the flattening
+    flow). After the negation the offsetting rebate is the ``no_bid``-raising,
+    free-money-dangerous direction — bounded by ``skew_max_tighten_cc`` and
+    doubly contained by the free-money clamp in construct_quote.
     """
 
     enabled: bool = False
