@@ -64,6 +64,14 @@ class ReasonCode(StrEnum):
     # ⇒ fail-closed (widen-or-no-quote), NEVER a convenient default. In shadow
     # mode this is log-only; enforced later it blocks for real.
     SKIP_BANKROLL_UNAVAILABLE = "skip_bankroll_unavailable"
+    # Widen-vs-DECLINE (Phase 5, R3 Part R2): near a per-game cap on
+    # NORMAL/uncertain flow we DECLINE rather than post a wide quote — widening
+    # a thin book near a limit only attracts hitters (our own P&L-sweep finding).
+    # SHADOW by default (logged, zero live impact) until an operator enables the
+    # policy; the widen-attracts-toxic-flow decision is graded on markouts, never
+    # a P&L window. Distinct from the enforced delta/loss caps: this fires BELOW
+    # the hard cap, in the low-headroom band where a quote would have to be wide.
+    SKIP_WIDEN_AVOIDED = "skip_widen_avoided"
     SKIP_HALTED = "skip_halted"
     SKIP_PRICING_FAILED = "skip_pricing_failed"
     SKIP_NEGATIVE_MARGINAL_EV = "skip_negative_marginal_ev"

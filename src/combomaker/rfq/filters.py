@@ -19,6 +19,7 @@ from combomaker.marketdata.metadata import MetadataCache
 from combomaker.ops.config import FiltersConfig
 from combomaker.rfq.models import Rfq
 from combomaker.rfq.pregame import ComboStartStatus, PregameGate
+from combomaker.rfq.schedule import ScheduleCache
 from combomaker.risk.killswitch import KillSwitch
 
 # Two-legged-tie European knockouts (Champions/Europa/Conference League): the
@@ -40,13 +41,16 @@ class RfqFilter:
         metadata: MetadataCache,
         killswitch: KillSwitch,
         clock: Clock,
+        schedule: ScheduleCache | None = None,
     ) -> None:
         self._config = config
         self._feed = feed
         self._metadata = metadata
         self._killswitch = killswitch
         self._clock = clock
-        self._pregame = PregameGate(config, metadata, clock)
+        # Phase 5: the explicit schedule feed (inactive by default) enters the
+        # pregame precision ladder; the gate owns the M_q/M_c margin split.
+        self._pregame = PregameGate(config, metadata, clock, schedule)
 
     def evaluate(self, rfq: Rfq) -> list[ReasonCode]:
         """Empty list = quotable. Uses only in-memory state (hot-path safe)."""
@@ -96,9 +100,28 @@ class RfqFilter:
         return reasons
 
     def pregame_status(self, rfq: Rfq) -> ComboStartStatus:
-        """Schedule-based start gate (Phase 3), also re-checked by last look
-        at confirm time — a leg can go in-play between quote and accept."""
+        """Schedule-based start gate (Phase 3), quote-time margin M_q."""
         return self._pregame.status(rfq.legs)
+
+    def pregame_confirm_status(self, rfq: Rfq) -> ComboStartStatus:
+        """Last-look pregame gate with the STRICTER confirm margin M_c
+        (M_c >= M_q). Re-checked at confirm so a leg going in-play between quote
+        and accept declines, keeping the confirm side strict (R3 §B2)."""
+        return self._pregame.confirm_status(rfq.legs)
+
+    def min_time_to_start_s(self, rfq: Rfq) -> float | None:
+        """Seconds until the EARLIEST leg's raw game start (no margin), for the
+        flow-loss measurement logged on pregame declines. None = any leg's start
+        is UNKNOWN (which is itself the decline reason)."""
+        now = self._clock.now().astimezone(UTC)
+        earliest: float | None = None
+        for leg in rfq.legs:
+            start = self._pregame.leg_start_time(leg.market_ticker)
+            if start is None:
+                return None
+            ttl = (start.astimezone(UTC) - now).total_seconds()
+            earliest = ttl if earliest is None else min(earliest, ttl)
+        return earliest
 
     def leg_start_time(self, market_ticker: str) -> datetime | None:
         """A leg's game start (tz-aware), or None = UNKNOWN. The R2 slate cap's

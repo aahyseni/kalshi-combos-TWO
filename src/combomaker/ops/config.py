@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 from combomaker.risk.limits import RiskLimits
 
@@ -124,6 +124,39 @@ class FiltersConfig(StrictModel):
     # normally wins for KXMLB*; API-measured expected_expiration = start+3h,
     # so 4.0 lands 1h before first pitch).
     pregame_start_offset_hours_by_prefix: dict[str, float] = {"KXMLB": 4.0}
+
+    # --- Precision ladder margins (Phase 5, R3 Part B) -----------------------
+    # Split the single start buffer into TWO margins applied to a PRECISE start
+    # (from the embedded-ET path or the explicit schedule feed — NOT the blunt
+    # expiry-minus-offset estimate, which already bakes in its own conservative
+    # padding):
+    #   - quote-cutoff margin M_q — stop QUOTING M_q seconds before start. The
+    #     flow knob: with a verified precise start it can be small (recover the
+    #     last ~1.5h the 4.5h estimate forgoes). CONSERVATIVE DEFAULT this phase.
+    #   - confirm-cutoff margin M_c (M_c >= M_q) — the SAFETY knob, applied at
+    #     LAST LOOK (decline if now >= start − M_c). Keeps the confirm side
+    #     strict even when the quote side is tightened for flow.
+    # SEAM + CONSERVATIVE DEFAULTS only: no live tightening without a hard-rule-5
+    # verified feed (deferred). The defaults keep today's behaviour — the
+    # embedded-ET path currently pairs with a 0s M_q/M_c (the estimate's padding
+    # is the buffer), so quoting/confirm cutoffs are unchanged until an operator
+    # sets per-prefix margins backed by a measured pooled markout study.
+    pregame_quote_margin_s: float = 0.0
+    pregame_confirm_margin_s: float = 0.0
+    pregame_quote_margin_s_by_prefix: dict[str, float] = {}
+    pregame_confirm_margin_s_by_prefix: dict[str, float] = {}
+
+    @field_validator("pregame_confirm_margin_s")
+    @classmethod
+    def _confirm_ge_quote(cls, v: float, info: ValidationInfo) -> float:
+        # M_c >= M_q (the confirm side is never looser than the quote side).
+        q = info.data.get("pregame_quote_margin_s")
+        if q is not None and v < q:
+            raise ValueError(
+                f"pregame_confirm_margin_s ({v}) must be >= "
+                f"pregame_quote_margin_s ({q}) — confirm never looser than quote"
+            )
+        return v
 
 
 class FeeConfig(StrictModel):
@@ -1492,6 +1525,74 @@ class QuoteConfig(StrictModel):
     farm_max_contracts: int = 50
 
 
+class SkewConfig(StrictModel):
+    """Inventory-aware quote skew (Phase 5, R3 Part A; risk/skew.py).
+
+    DARK SHIP by default (``enabled=False``): the skew is COMPUTED + LOGGED on
+    every quote but passed as 0 into the pricer — a zero-P&L shadow classifier.
+    Only a shadow-markout validation (does it reduce portfolio CVaR without an
+    adverse markout?) may flip ``enabled`` true; the weights are STRUCTURAL,
+    tuned on exposure-vs-markout, NEVER on a P&L window (feedback_no_refit_on_pnl).
+
+    Sign (load-bearing, R3 §A0): the whole lever operates on ``no_bid``. POSITIVE
+    skew ⇒ more expensive combo ⇒ sell LESS ⇒ used for CONCENTRATING flow;
+    NEGATIVE skew ⇒ cheaper NO ⇒ win MORE ⇒ used for OFFSETTING flow. The
+    tighten (negative) cap is the dangerous side and is doubly contained by the
+    free-money clamp in construct_quote.
+    """
+
+    enabled: bool = False
+    w_conc: float = 1.0                # concentration (widen) weight
+    w_off: float = 1.0                 # offset (rebate) weight
+    gamma: float = 2.0                 # convex headroom ramp f(u)=u**gamma
+    skew_max_widen_cc: int = 600       # cap on the positive (concentrating) side
+    skew_max_tighten_cc: int = 150     # cap on the negative (offsetting) rebate
+
+    @field_validator("w_conc", "w_off")
+    @classmethod
+    def _nonneg_weight(cls, v: float) -> float:
+        if v < 0.0:
+            raise ValueError(f"skew weight must be >= 0, got {v}")
+        return v
+
+    @field_validator("gamma")
+    @classmethod
+    def _positive_gamma(cls, v: float) -> float:
+        if v <= 0.0:
+            raise ValueError(f"skew gamma must be > 0, got {v}")
+        return v
+
+    @field_validator("skew_max_widen_cc", "skew_max_tighten_cc")
+    @classmethod
+    def _nonneg_cap(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"skew cap must be >= 0, got {v}")
+        return v
+
+
+class WidenConfig(StrictModel):
+    """Widen-vs-DECLINE policy (Phase 5, R3 Part R2; risk/skew.py).
+
+    SHADOW by default (``enabled=False``): the would-be decision is LOGGED every
+    quote with zero live impact. When enabled, a candidate that is CONCENTRATING
+    AND near a per-game cap (``util >= util_threshold``) DECLINES
+    (SKIP_WIDEN_AVOIDED) rather than posting a wide quote — widening a thin book
+    near a limit only attracts hitters (our own P&L-sweep finding). An OFFSETTING
+    candidate near a cap is never declined (it balances the book). The
+    widen-attracts-toxic-flow decision is graded on markouts, never a P&L window.
+    """
+
+    enabled: bool = False
+    util_threshold: float = 0.75
+
+    @field_validator("util_threshold")
+    @classmethod
+    def _valid_threshold(cls, v: float) -> float:
+        if not 0.0 < v <= 1.0:
+            raise ValueError(f"widen util_threshold must be in (0, 1], got {v}")
+        return v
+
+
 class ExternalOddsConfig(StrictModel):
     """SportsGameOdds adapter (docs/api-notes/sportsgameodds.md). OFF by
     default; free tier is 2,500 objects/month so the poller is budget-gated."""
@@ -1630,6 +1731,12 @@ class PricingConfig(StrictModel):
     margin_total: MarginTotalConfig = Field(default_factory=MarginTotalConfig)
     mlb_runs: MlbRunsConfig = Field(default_factory=MlbRunsConfig)
     external_odds: ExternalOddsConfig = Field(default_factory=ExternalOddsConfig)
+    # Inventory-aware quote skew (Phase 5, R3 Part A). DARK by default: computed
+    # + logged every quote but passed as 0 into the pricer (a zero-P&L shadow).
+    skew: SkewConfig = Field(default_factory=SkewConfig)
+    # Widen-vs-DECLINE policy (Phase 5, R3 Part R2). SHADOW by default: the
+    # would-be decision is logged, the quote still goes out.
+    widen: WidenConfig = Field(default_factory=WidenConfig)
     max_source_disagreement: float = 0.08
 
 

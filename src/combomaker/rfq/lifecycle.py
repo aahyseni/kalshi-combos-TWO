@@ -60,6 +60,14 @@ from combomaker.risk.limits import (
 )
 from combomaker.risk.markouts import MarkoutSubject, MarkoutTracker
 from combomaker.risk.reservation import RiskReservationService
+from combomaker.risk.skew import (
+    GameSkewCache,
+    SkewLimits,
+    SkewParams,
+    WidenPolicyParams,
+    compute_inventory_skew,
+    decide_widen_or_decline,
+)
 
 log = get_logger(__name__)
 
@@ -127,6 +135,10 @@ class QuoteLifecycle:
         start_time_provider: StartTimeProvider | None = None,
         starvation_watchdog: StarvationWatchdog | None = None,
         reservation: RiskReservationService | None = None,
+        skew_params: SkewParams | None = None,
+        skew_limits: SkewLimits | None = None,
+        skew_cache: GameSkewCache | None = None,
+        widen_params: WidenPolicyParams | None = None,
     ) -> None:
         self._clock = clock
         self._sender = sender
@@ -160,6 +172,17 @@ class QuoteLifecycle:
         # the confirm path behaves exactly as before (the reservation is race-free
         # today under one asyncio loop; the service makes it safe for fan-out).
         self._reservation = reservation
+        # Phase 5 (R3 Part A): inventory-aware skew, DARK by default. When
+        # skew_params/skew_limits are wired, handle_rfq COMPUTES + LOGS the honest
+        # skew every quote but passes 0 into the pricer while skew_params.enabled
+        # is False (a zero-P&L shadow). Omitted ⇒ no skew computed at all (the
+        # pricer's inventory_skew_cc stays 0, behaviour identical to Phase 4).
+        self._skew_params = skew_params
+        self._skew_limits = skew_limits
+        self._skew_cache = skew_cache
+        # Widen-vs-DECLINE policy (R3 Part R2), SHADOW by default. Needs the same
+        # snapshot + candidate the skew builds, so it is computed alongside it.
+        self._widen_params = widen_params
         self._markouts = MarkoutTracker(store.record_markout)
         self._open: dict[str, OpenQuoteState] = {}       # quote_id → state
         self._by_rfq: dict[str, str] = {}                # rfq_id → quote_id
@@ -297,7 +320,7 @@ class QuoteLifecycle:
     async def handle_rfq(self, rfq: Rfq) -> None:
         reasons = self._filter.evaluate(rfq)
         if reasons:
-            await self._record_skip(rfq, reasons, {})
+            await self._record_skip(rfq, reasons, self._pregame_flow_context(rfq, reasons))
             return
         result = self._price(rfq)
         if isinstance(result, NoQuote):
@@ -314,6 +337,34 @@ class QuoteLifecycle:
                 rfq, [ReasonCode.SKIP_CLASSIFIER_UNKNOWN], {"detail": "unresolvable risk size"}
             )
             return
+
+        # Phase 5 (R3 Part A + R2): compute + LOG the inventory skew AND the
+        # widen-vs-decline verdict from the book + this candidate. Dark ship:
+        # applied_skew_cc is 0 and widen_declines False while both policies are
+        # disabled, so the re-price is a bit-identical no-op — a zero-P&L shadow.
+        applied_skew_cc, widen_declines = self._quoting_policy(rfq, result, risk_qty)
+        if widen_declines:
+            # ENABLED widen policy: decline near a cap on concentrating flow
+            # rather than post a wide quote (SHADOW mode never reaches here).
+            await self._record_skip(rfq, [ReasonCode.SKIP_WIDEN_AVOIDED], {})
+            return
+        if applied_skew_cc != 0:
+            reskewed = self._price(rfq, inventory_skew_cc=applied_skew_cc)
+            if isinstance(reskewed, NoQuote):
+                await self._record_skip(
+                    rfq, [reskewed.reason], {"detail": reskewed.detail}
+                )
+                return
+            result = reskewed
+            new_qty = self._risk_qty(rfq, result)
+            if new_qty is None:
+                await self._record_skip(
+                    rfq,
+                    [ReasonCode.SKIP_CLASSIFIER_UNKNOWN],
+                    {"detail": "unresolvable risk size after skew"},
+                )
+                return
+            risk_qty = new_qty
 
         quote_risk = self._quote_risk(rfq, result, quote_id="pending", qty=risk_qty)
         raw_breaches = self._limits.check(
@@ -744,13 +795,83 @@ class QuoteLifecycle:
 
     # ---------------------------------------------------------------- helpers
 
-    def _price(self, rfq: Rfq) -> ConstructedQuote | NoQuote:
+    def _price(
+        self, rfq: Rfq, *, inventory_skew_cc: int = 0
+    ) -> ConstructedQuote | NoQuote:
         time_to_close = self._min_time_to_close_s(rfq)
         return self._engine.price(
             rfq,
             time_to_close_s=time_to_close if time_to_close is not None else -1.0,
             in_play=self._inplay.any_anomalous(list(rfq.leg_tickers)),
+            inventory_skew_cc=inventory_skew_cc,
         )
+
+    def _quoting_policy(
+        self, rfq: Rfq, constructed: ConstructedQuote, risk_qty: CentiContracts
+    ) -> tuple[int, bool]:
+        """Compute + LOG the inventory skew AND the widen-vs-decline verdict for
+        this quote (R3 Part A + Part R2). Returns ``(applied_skew_cc,
+        widen_declines)``:
+
+        - ``applied_skew_cc`` — 0 while the skew is dark (skew_params.enabled
+          False) or unwired, the honest skew once enabled (fed to the pricer).
+        - ``widen_declines`` — True only when the widen policy is ENABLED and
+          fires (near a cap on concentrating flow). SHADOW-mode fires log-only.
+
+        Both share ONE snapshot + candidate (the NO position a fill creates —
+        exactly what the limit check builds). Never raises on the hot path: a
+        hole (unknown marginals ⇒ empty per-game map) yields skew 0 / no decline.
+        Returns (0, False) immediately when nothing is wired."""
+        if self._skew_params is None or self._skew_limits is None:
+            return 0, False
+        candidate = OpenPosition(
+            position_id=f"skew:{rfq.rfq_id}",
+            combo_ticker=rfq.market_ticker,
+            collection=rfq.mve_collection_ticker,
+            # A sell-only fill leaves us long NO; the honest candidate is the NO
+            # position at the quoted no_bid. maker_position_side maps the accepted
+            # side ⇒ our side; a NO accept is the seller side we ever hold.
+            our_side=self._conventions.maker_position_side(Side.NO),
+            contracts=risk_qty,
+            entry_price_cc=constructed.no_bid_cc,
+            legs=self._leg_refs(rfq),
+        )
+        snap = self._exposure.snapshot(self._marginals, mass_acceptance=True)
+        skew = compute_inventory_skew(
+            candidate,
+            snap,
+            self._marginals,
+            self._conventions,
+            self._skew_limits,
+            self._skew_params,
+            cache=self._skew_cache,
+        )
+        log.info(
+            "inventory_skew_shadow",
+            rfq_id=rfq.rfq_id,
+            skew_cc=skew.skew_cc,
+            applied_cc=skew.applied_cc,
+            concentration_cc=skew.concentration_cc,
+            offset_cc=skew.offset_cc,
+            enabled=skew.enabled,
+            per_game=list(skew.per_game),
+        )
+        widen_declines = False
+        if self._widen_params is not None:
+            widen = decide_widen_or_decline(
+                skew, snap, candidate, self._skew_limits, self._widen_params
+            )
+            if widen.would_decline:
+                log.info(
+                    "widen_vs_decline_shadow",
+                    rfq_id=rfq.rfq_id,
+                    would_decline=widen.would_decline,
+                    applied=widen.applied,
+                    max_util=round(widen.max_util, 4),
+                    reason=widen.reason,
+                )
+            widen_declines = widen.applied
+        return skew.applied_cc, widen_declines
 
     def _min_time_to_close_s(self, rfq: Rfq) -> float | None:
         times: list[float] = []
@@ -882,7 +1003,10 @@ class QuoteLifecycle:
         )
         # Straddle safety (Phase 3): re-run the schedule-based pregame gate —
         # a leg can go in-play between quote and accept. Peek-only, hot-path safe.
-        pregame = self._filter.pregame_status(state.rfq)
+        # Phase 5 (R3 §B2): the CONFIRM side uses the stricter M_c margin, so a
+        # leg near kickoff declines at last look even if the quote side (M_q) let
+        # it through — the confirm buffer stays hard while quoting recovers flow.
+        pregame = self._filter.pregame_confirm_status(state.rfq)
         return LastLookInputs(
             quote_time_fair_cc=int(state.constructed.fair_cc),
             current_fair_cc=current_fair,
@@ -949,6 +1073,21 @@ class QuoteLifecycle:
         if state is not None and self._by_rfq.get(state.rfq.rfq_id) == quote_id:
             del self._by_rfq[state.rfq.rfq_id]
 
+    def _pregame_flow_context(self, rfq: Rfq, reasons: list[ReasonCode]) -> JsonDict:
+        """Attach ``time_to_start_s`` to a pregame decline for the flow-loss
+        measurement (R3 §B3): the distribution of near-kickoff declines bucketed
+        by minutes-to-start is the flow we forgo. Pure counting on the decision
+        log, zero P&L. Empty for non-pregame declines (no cost to attach)."""
+        pregame_reasons = {
+            ReasonCode.SKIP_INPLAY_LEG,
+            ReasonCode.SKIP_START_TIME_UNKNOWN,
+        }
+        if not (set(reasons) & pregame_reasons):
+            return {}
+        ttl = self._filter.min_time_to_start_s(rfq)
+        # None ⇒ start UNKNOWN (itself the decline reason); record as such.
+        return {"time_to_start_s": None if ttl is None else round(ttl, 1)}
+
     async def _record_skip(
         self, rfq: Rfq, reasons: list[ReasonCode], context: JsonDict
     ) -> None:
@@ -966,14 +1105,23 @@ class QuoteLifecycle:
         detail: str,
         decision_ms: float,
     ) -> None:
+        context: JsonDict = {
+            "quote_id": state.quote_id,
+            "detail": detail,
+            "decision_ms": round(decision_ms, 3),
+            "quote_time_fair_cc": int(state.constructed.fair_cc),
+        }
+        # Flow-loss measurement (R3 §B3): log time_to_start on pregame declines
+        # at CONFIRM too (the M_c straddle re-check), matching the quote-time log.
+        if reason in (
+            ReasonCode.DECLINE_INPLAY_LEG,
+            ReasonCode.DECLINE_START_TIME_UNKNOWN,
+        ):
+            ttl = self._filter.min_time_to_start_s(state.rfq)
+            context["time_to_start_s"] = None if ttl is None else round(ttl, 1)
         await self._store.record_decision(
             "confirm" if confirm else "decline",
             state.rfq.rfq_id,
             [str(reason)],
-            {
-                "quote_id": state.quote_id,
-                "detail": detail,
-                "decision_ms": round(decision_ms, 3),
-                "quote_time_fair_cc": int(state.constructed.fair_cc),
-            },
+            context,
         )

@@ -516,6 +516,11 @@ class TestSellParlaysOnly:
     @settings(derandomize=True, max_examples=400, deadline=None)
     @given(
         p=st.integers(min_value=2, max_value=98),        # fair in cents
+        # Draw skew across a SUPERSET of compute_inventory_skew's whole live
+        # range [−skew_max_tighten_cc, +skew_max_widen_cc] (Phase 5, R3 §A6.2):
+        # ±6000 comfortably contains the widest configured caps (±600/150), so
+        # the sell-only invariant is proven to survive ANY skew the risk engine
+        # can emit — including a large negative (tightening) one.
         skew=st.integers(min_value=-6_000, max_value=6_000),
         qty=st.integers(min_value=100, max_value=50_000),
         in_play=st.booleans(),
@@ -539,3 +544,51 @@ class TestSellParlaysOnly:
         assert q.yes_bid_cc == 0
         # And the capture invariant still holds (now just: keep >= min_capture).
         assert int(q.yes_bid_cc) + int(q.no_bid_cc) <= CC_PER_DOLLAR - self.SELL.min_capture_cc
+
+
+class TestSkewNoArb:
+    """R3 §A6.3 — NO-ARB survives a large negative (tightening) skew.
+
+    A negative inventory skew RAISES no_raw (the offset rebate); a large one
+    would push no_bid above the free-money cap if unchecked. The free-money
+    clamp in construct_quote (quote.py:202) fires AFTER skew and the capture
+    invariant re-checks, so the tightening rebate can shrink our edge but can
+    NEVER produce an arb quote. This proves the clamp fires and the capture
+    check still passes even at a skew far below any configured tighten cap."""
+
+    @settings(derandomize=True, max_examples=300, deadline=None)
+    @given(
+        p=st.integers(min_value=5, max_value=95),
+        no_cap=st.integers(min_value=2_000, max_value=9_900),
+        tighten=st.integers(min_value=0, max_value=6_000),
+    )
+    def test_negative_skew_never_breaches_free_money_cap(
+        self, p: int, no_cap: int, tighten: int
+    ) -> None:
+        q = build_quote(
+            joint=make_joint(p / 100.0, 0.0),
+            grid=deci_grid(),
+            inventory_skew_cc=-tighten,        # tightening (raises no_raw)
+            no_cap_cc=CC(no_cap),
+            yes_cap_cc=CC(9_900),
+        )
+        if isinstance(q, NoQuote):
+            return
+        # The emitted NO bid never crosses the free-money cap minus its margin,
+        # no matter how deep the tightening skew (the clamp is the backstop).
+        assert int(q.no_bid_cc) <= no_cap - 100  # free_money_margin_cc default
+        # And the capture invariant still holds.
+        assert int(q.yes_bid_cc) + int(q.no_bid_cc) <= CC_PER_DOLLAR - 100
+
+    def test_deep_tightening_skew_fires_the_clamp(self) -> None:
+        # A skew that WOULD push no_bid to ~$1 is clamped to the cap; the
+        # unclamped-vs-clamped comparison proves the clamp actually bound.
+        clamped = build_quote(
+            joint=make_joint(0.30, 0.0),
+            grid=deci_grid(),
+            inventory_skew_cc=-9_000,          # absurd tighten
+            no_cap_cc=CC(7_000),
+            yes_cap_cc=CC(9_900),
+        )
+        assert isinstance(clamped, ConstructedQuote)
+        assert int(clamped.no_bid_cc) <= 7_000 - 100

@@ -42,6 +42,7 @@ from combomaker.risk.killswitch import HaltEvent, KillSwitch
 from combomaker.risk.lastlook import LastLookPolicy
 from combomaker.risk.limits import LimitChecker, StarvationWatchdog
 from combomaker.risk.reservation import RiskReservationService
+from combomaker.risk.skew import SkewLimits, SkewParams, WidenPolicyParams
 
 log = get_logger(__name__)
 
@@ -149,6 +150,32 @@ class QuoteApp:
             )
             watchdog = StarvationWatchdog(threshold=risk_cfg.starvation_threshold)
             rfq_filter = RfqFilter(config.filters, feed, metadata, killswitch, self._clock)
+            # Phase 5 (R3): inventory skew + widen-vs-decline policies, both DARK
+            # by default (SkewConfig.enabled / WidenConfig.enabled False ⇒ computed
+            # + logged, passed as 0 / non-blocking). The skew's headroom
+            # denominators are the SAME enforced per-event caps the LimitChecker
+            # uses (the % of headroom left drives the convex ramp); notional uses
+            # the book-wide gross cap as a loose per-game denominator.
+            skew_cfg = config.pricing.skew
+            widen_cfg = config.pricing.widen
+            skew_params = SkewParams(
+                w_conc=skew_cfg.w_conc,
+                w_off=skew_cfg.w_off,
+                gamma=skew_cfg.gamma,
+                skew_max_widen_cc=skew_cfg.skew_max_widen_cc,
+                skew_max_tighten_cc=skew_cfg.skew_max_tighten_cc,
+                enabled=skew_cfg.enabled,
+            )
+            skew_limits = SkewLimits(
+                max_event_delta_contracts=risk_cfg.max_event_delta_contracts,
+                max_event_worst_case_loss_dollars=(
+                    risk_cfg.max_event_worst_case_loss_dollars
+                ),
+                max_event_gross_notional_dollars=risk_cfg.max_gross_notional_dollars,
+            )
+            widen_params = WidenPolicyParams(
+                enabled=widen_cfg.enabled, util_threshold=widen_cfg.util_threshold
+            )
             sender = (
                 PaperSender()
                 if config.mode is Mode.PAPER
@@ -179,6 +206,10 @@ class QuoteApp:
                 # the filter already uses (peek-only, hot-path safe, no network).
                 start_time_provider=rfq_filter.leg_start_time,
                 starvation_watchdog=watchdog,
+                # Phase 5 quoting policies (DARK by default; see above).
+                skew_params=skew_params,
+                skew_limits=skew_limits,
+                widen_params=widen_params,
             )
             # R3 Phase 3: single-writer risk-reservation service. Wired AFTER the
             # lifecycle (it reuses the lifecycle's shadow splitter, so a %-cap
