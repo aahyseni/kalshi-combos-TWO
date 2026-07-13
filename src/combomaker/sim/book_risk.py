@@ -250,7 +250,11 @@ def compute_book_risk(
         )
 
     corr = model.corr_for_band(band)
-    rng = np.random.default_rng(seed)
+    # Two INDEPENDENT, reproducible RNG substreams (production + challenger) via
+    # SeedSequence.spawn — never `seed`/`seed+1`, which are correlated streams
+    # (M2 §4.3). Both derive deterministically from the single ``seed``.
+    seq_prod, seq_chal = np.random.SeedSequence(seed).spawn(2)
+    rng = np.random.default_rng(seq_prod)
     values = sample_leg_values(model.legs, corr, n_samples, rng)
 
     # Book P&L per scenario (float cc) + engine-consistent stats.
@@ -276,7 +280,7 @@ def compute_book_risk(
 
     # --- challenger: correlation-inflated re-sample (anti-monoculture) --------
     challenger_corr = _inflate_corr(corr, challenger_inflation)
-    rng_c = np.random.default_rng(seed + 1)  # independent stream, still seeded
+    rng_c = np.random.default_rng(seq_chal)  # spawned substream (M2 §4.3)
     values_c = sample_leg_values(model.legs, challenger_corr, n_samples, rng_c)
     book_c = _book_pnl_from_values(values_c, model.positions)
     _, challenger_es = _es_from_pnl(book_c, HEADLINE_LEVEL)
