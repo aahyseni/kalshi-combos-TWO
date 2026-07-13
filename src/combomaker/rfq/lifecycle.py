@@ -41,6 +41,7 @@ from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.quote import ConstructedQuote, NoQuote
 from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.models import Rfq
+from combomaker.risk.balance import BalanceTracker
 from combomaker.risk.exposure import ExposureBook, LegRef, OpenPosition, OpenQuoteRisk
 from combomaker.risk.inplay import InPlayDetector
 from combomaker.risk.killswitch import KillSwitch
@@ -49,7 +50,13 @@ from combomaker.risk.lastlook import (
     LastLookPolicy,
     decide_confirm,
 )
-from combomaker.risk.limits import DailyPnl, LimitChecker
+from combomaker.risk.limits import (
+    Breach,
+    DailyPnl,
+    LimitChecker,
+    StartTimeProvider,
+    StarvationWatchdog,
+)
 from combomaker.risk.markouts import MarkoutSubject, MarkoutTracker
 
 log = get_logger(__name__)
@@ -114,6 +121,9 @@ class QuoteLifecycle:
         metrics: Metrics,
         lastlook_policy: LastLookPolicy,
         config: LifecycleConfig,
+        balance_tracker: BalanceTracker | None = None,
+        start_time_provider: StartTimeProvider | None = None,
+        starvation_watchdog: StarvationWatchdog | None = None,
     ) -> None:
         self._clock = clock
         self._sender = sender
@@ -130,6 +140,15 @@ class QuoteLifecycle:
         self._metrics = metrics
         self._policy = lastlook_policy
         self._config = config
+        # R2 Phase 2 (SHADOW): live bankroll denominator for the %-of-bankroll
+        # caps (fail-closed → None when stale), the per-leg game-start source for
+        # the slate cap, and the starvation watchdog that warns if the new caps
+        # silently decline everything. All optional — omitted, the checker's R2
+        # layer simply fails closed (SKIP_BANKROLL_UNAVAILABLE, shadow) and the
+        # enforced caps behave exactly as before.
+        self._balance = balance_tracker
+        self._start_time_provider = start_time_provider
+        self._watchdog = starvation_watchdog
         self._markouts = MarkoutTracker(store.record_markout)
         self._open: dict[str, OpenQuoteState] = {}       # quote_id → state
         self._by_rfq: dict[str, str] = {}                # rfq_id → quote_id
@@ -138,6 +157,63 @@ class QuoteLifecycle:
         self._confirm_failures = 0
         self.daily_pnl = DailyPnl()
         self.exchange_active = config.exchange_active
+
+    # ------------------------------------------------------------------ R2 seam
+
+    def _risk_bankroll_cc(self) -> int | None:
+        """The live risk-capital denominator in cc for the %-of-bankroll caps,
+        or None when unavailable/stale (fail-closed — the checker then emits
+        SKIP_BANKROLL_UNAVAILABLE, shadow in Phase 2). Uses the NON-raising
+        accessor so a stale poll never throws on the hot path."""
+        if self._balance is None:
+            return None
+        got = self._balance.risk_bankroll_cc_or_none()
+        return None if got is None else int(got)
+
+    def _partition_breaches(self, breaches: list[Breach]) -> list[Breach]:
+        """Split R2 SHADOW breaches (log-only) from enforced breaches.
+
+        SHADOW GUARANTEE: shadow breaches are LOGGED (structured — reason code,
+        the cap, the bankroll, the detail) but are DROPPED from the returned list,
+        so they can never remove a quote, block a confirm, or trigger a halt. Only
+        enforced (shadow=False) breaches are returned to the caller. This is the
+        one place shadow is enforced-away, so every check() call site is
+        shadow-safe by construction. (The starvation watchdog is driven separately
+        in ``handle_rfq``, on the ISSUE decision, so it observes shadow would-be
+        declines even though those quotes still go out.)
+        """
+        enforced: list[Breach] = []
+        for breach in breaches:
+            if breach.shadow:
+                log.info(
+                    "risk_cap_shadow_breach",
+                    reason=str(breach.reason),
+                    detail=breach.detail,
+                    bankroll_cc=self._risk_bankroll_cc(),
+                )
+            else:
+                enforced.append(breach)
+        return enforced
+
+    def _note_watchdog(self, *, risk_declined: bool) -> None:
+        """Feed the starvation watchdog one quote decision. ``risk_declined`` is
+        True when the quote WOULD be declined for a risk reason — either an
+        ENFORCED breach really blocked it, OR (in shadow mode) an R2 breach
+        would have. Consecutive would-be declines with zero clean issues fire the
+        WARNING (a mis-set cap or stuck/zero bankroll silently declining
+        everything). A clean issue (no risk breach of any kind) resets it."""
+        if self._watchdog is None:
+            return
+        if risk_declined:
+            if self._watchdog.record_risk_decline():
+                log.warning(
+                    "risk_starvation_watchdog",
+                    consecutive_declines=self._watchdog.consecutive_declines,
+                    detail="consecutive risk-driven declines — a cap may be "
+                    "mis-set or the bankroll stuck/zero",
+                )
+        else:
+            self._watchdog.record_quote_issued()
 
     # ------------------------------------------------------------------ intake
 
@@ -163,13 +239,20 @@ class QuoteLifecycle:
             return
 
         quote_risk = self._quote_risk(rfq, result, quote_id="pending", qty=risk_qty)
-        breaches = self._limits.check(
+        raw_breaches = self._limits.check(
             self._exposure,
             self._marginals,
             self.daily_pnl,
             candidate_positions=quote_risk.hypothetical_positions(self._conventions),
             adding_quote=True,
+            risk_bankroll_cc=self._risk_bankroll_cc(),
+            start_time_provider=self._start_time_provider,
         )
+        # Watchdog sees the ISSUE decision: any breach (enforced OR shadow) is a
+        # would-be decline; only a fully clean check is a real issue (reset). This
+        # lets a mis-set cap surface in SHADOW mode even though the quote goes out.
+        self._note_watchdog(risk_declined=bool(raw_breaches))
+        breaches = self._partition_breaches(raw_breaches)
         if breaches:
             await self._record_skip(
                 rfq, [b.reason for b in breaches], {"details": [b.detail for b in breaches]}
@@ -456,7 +539,15 @@ class QuoteLifecycle:
         """TTL expiry + reprice + P&L mark + daily-loss halt. Every few 100ms."""
         self._refresh_daily_pnl()
         if not self._killswitch.halted:
-            breaches = self._limits.check(self._exposure, self._marginals, self.daily_pnl)
+            breaches = self._partition_breaches(
+                self._limits.check(
+                    self._exposure,
+                    self._marginals,
+                    self.daily_pnl,
+                    risk_bankroll_cc=self._risk_bankroll_cc(),
+                    start_time_provider=self._start_time_provider,
+                )
+            )
             for breach in breaches:
                 if breach.reason == ReasonCode.HALT_DAILY_LOSS:
                     await self._killswitch.halt(ReasonCode.HALT_DAILY_LOSS, breach.detail)
@@ -632,11 +723,15 @@ class QuoteLifecycle:
             entry_price_cc=bid,
             legs=self._leg_refs(state.rfq),
         )
-        breaches = self._limits.check(
-            self._exposure,
-            self._marginals,
-            self.daily_pnl,
-            candidate_positions=[candidate],
+        breaches = self._partition_breaches(
+            self._limits.check(
+                self._exposure,
+                self._marginals,
+                self.daily_pnl,
+                candidate_positions=[candidate],
+                risk_bankroll_cc=self._risk_bankroll_cc(),
+                start_time_provider=self._start_time_provider,
+            )
         )
         # Straddle safety (Phase 3): re-run the schedule-based pregame gate —
         # a leg can go in-play between quote and accept. Peek-only, hot-path safe.

@@ -35,6 +35,29 @@ class ReasonCode(StrEnum):
     SKIP_RISK_HEADROOM = "skip_risk_headroom"
     SKIP_MASS_ACCEPTANCE_BREACH = "skip_mass_acceptance_breach"
     SKIP_MAX_OPEN_QUOTES = "skip_max_open_quotes"
+
+    # --- R2 %-of-bankroll cap hierarchy (Phase 2; SHADOW by default) ---
+    # Each of these binds a candidate/book aggregate against a threshold derived
+    # AT CHECK TIME from the live risk bankroll:
+    #   thr_cc = frac.numerator * bankroll_cc // frac.denominator (integer-exact).
+    # They run in PARALLEL with the existing enforced hard-dollar caps; in shadow
+    # mode they are emitted with Breach.shadow=True (log-only, zero quote impact).
+    # Axes are strictly the LOSS axis (premium at risk) except the utilization
+    # backstop, which is the ONLY new cap on the gross-settlement-notional axis
+    # (R1/R2 invariant #2: the two money axes are NEVER summed).
+    SKIP_GAME_LOSS_CAP = "skip_game_loss_cap"            # %-of-GAME correlated loss
+    SKIP_PER_COMBO_LOSS_CAP = "skip_per_combo_loss_cap"  # single position max_loss
+    SKIP_DIRECTIONAL_CAP = "skip_directional_cap"        # net one-directional theme
+    SKIP_SLATE_CAP = "skip_slate_cap"                    # Σ game loss over a slate
+    # Loose backstop ABOVE the % caps on the gross-settlement-notional axis
+    # (multiple × bankroll). A stale bankroll fails closed (SKIP_BANKROLL_
+    # UNAVAILABLE) instead — a stricter block than a loose multiple.
+    SKIP_UTILIZATION_BACKSTOP = "skip_utilization_backstop"
+    # The %-of-bankroll caps cannot be computed because the live bankroll reading
+    # is unavailable/stale (BalanceTracker fails closed → None). UNKNOWN bankroll
+    # ⇒ fail-closed (widen-or-no-quote), NEVER a convenient default. In shadow
+    # mode this is log-only; enforced later it blocks for real.
+    SKIP_BANKROLL_UNAVAILABLE = "skip_bankroll_unavailable"
     SKIP_HALTED = "skip_halted"
     SKIP_PRICING_FAILED = "skip_pricing_failed"
     SKIP_NEGATIVE_MARGINAL_EV = "skip_negative_marginal_ev"
@@ -93,6 +116,12 @@ class ReasonCode(StrEnum):
 
     # --- Kill switches / halts ---
     HALT_DAILY_LOSS = "halt_daily_loss"
+    # R2 give-back / rate halts (Phase 2; SHADOW by default). Drawdown = give-back
+    # from intraday peak equity; hard-trip = the deeper give-back that KILLs
+    # (human-only clear); fill-velocity = committed notional per rolling window.
+    HALT_DRAWDOWN = "halt_drawdown"
+    HALT_HARD_TRIP = "halt_hard_trip"
+    HALT_FILL_VELOCITY = "halt_fill_velocity"
     HALT_ERROR_RATE = "halt_error_rate"
     HALT_CONFIRM_TIMEOUTS = "halt_confirm_timeouts"
     HALT_EXCHANGE_STATUS = "halt_exchange_status"

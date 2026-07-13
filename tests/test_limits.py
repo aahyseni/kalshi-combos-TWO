@@ -13,7 +13,7 @@ from combomaker.core.money import CentiCents
 from combomaker.core.quantity import CentiContracts
 from combomaker.core.reasons import ReasonCode
 from combomaker.risk.exposure import ExposureBook, LegRef, OpenPosition, OpenQuoteRisk
-from combomaker.risk.limits import DailyPnl, LimitChecker, RiskLimits
+from combomaker.risk.limits import Breach, DailyPnl, LimitChecker, RiskLimits
 
 CC = CentiCents
 Q = CentiContracts
@@ -84,31 +84,42 @@ def empty_book() -> ExposureBook:
     return ExposureBook(CONVENTIONS)
 
 
-def reasons(breaches: list) -> list[ReasonCode]:
-    return [b.reason for b in breaches]
+def enforced(breaches: list[Breach]) -> list[Breach]:
+    """Only the ENFORCED (non-shadow) breaches. The R2 %-of-bankroll cap layer
+    (Phase 2) is SHADOW by default: when no ``risk_bankroll_cc`` is passed it
+    always appends a shadow ``SKIP_BANKROLL_UNAVAILABLE`` (fail-closed, log-only).
+    These existing tests exercise the ENFORCED hard-dollar caps, whose behaviour
+    is unchanged, so they assert on the enforced subset. Shadow behaviour has its
+    own dedicated tests in test_limits_caps.py + test_risk_shadow_mode.py."""
+    return [b for b in breaches if not b.shadow]
+
+
+def reasons(breaches: list[Breach]) -> list[ReasonCode]:
+    return [b.reason for b in enforced(breaches)]
 
 
 class TestEachLimitIndependently:
     def test_per_quote_contracts(self) -> None:
         # 150 contracts > 100 cap; price tiny so nothing else trips.
         candidate = make_position("cand", contracts=15_000, entry_price=100)
-        breaches = LimitChecker(RiskLimits()).check(
+        breaches = enforced(LimitChecker(RiskLimits()).check(
             empty_book(), MARG, DailyPnl(), candidate_positions=[candidate]
-        )
+        ))
         assert len(breaches) == 1
         assert breaches[0].reason is ReasonCode.SKIP_SIZE_ABOVE_MAX
         assert "contracts" in breaches[0].detail
 
     def test_per_quote_notional(self) -> None:
-        # 100 contracts at $0.90 = $90 notional > $50 cap; contracts at cap pass.
+        # 100 contracts at $0.90 = $90 loss > $50 cap; contracts at cap pass.
         limits = RiskLimits(max_notional_per_quote_dollars=50.0)
         candidate = make_position("cand", contracts=10_000, entry_price=9_000)
-        breaches = LimitChecker(limits).check(
+        breaches = enforced(LimitChecker(limits).check(
             empty_book(), MARG, DailyPnl(), candidate_positions=[candidate]
-        )
+        ))
         assert len(breaches) == 1
         assert breaches[0].reason is ReasonCode.SKIP_SIZE_ABOVE_MAX
-        assert "notional" in breaches[0].detail
+        # Detail now names the LOSS axis (premium at risk), not "notional".
+        assert "loss" in breaches[0].detail
 
     def test_max_open_quotes_at_cap_when_adding(self) -> None:
         limits = RiskLimits(max_open_quotes=2)
@@ -118,19 +129,23 @@ class TestEachLimitIndependently:
         breaches = LimitChecker(limits).check(book, MARG, DailyPnl(), adding_quote=True)
         assert reasons(breaches) == [ReasonCode.SKIP_MAX_OPEN_QUOTES]
         # Not adding a quote: sitting at the cap is fine.
-        assert LimitChecker(limits).check(book, MARG, DailyPnl(), adding_quote=False) == []
+        assert enforced(
+            LimitChecker(limits).check(book, MARG, DailyPnl(), adding_quote=False)
+        ) == []
 
     def test_max_open_quotes_below_cap_passes(self) -> None:
         limits = RiskLimits(max_open_quotes=2)
         book = empty_book()
         book.upsert_quote(make_quote("q1"))
-        assert LimitChecker(limits).check(book, MARG, DailyPnl(), adding_quote=True) == []
+        assert enforced(
+            LimitChecker(limits).check(book, MARG, DailyPnl(), adding_quote=True)
+        ) == []
 
     def test_market_delta(self) -> None:
         # 400 contracts on one leg -> market delta 400 > 300; $4 notional.
         book = empty_book()
         book.add_position(make_position("p1", contracts=40_000, entry_price=100))
-        breaches = LimitChecker(RiskLimits()).check(book, MARG, DailyPnl())
+        breaches = enforced(LimitChecker(RiskLimits()).check(book, MARG, DailyPnl()))
         assert len(breaches) == 1
         assert breaches[0].reason is ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH
         assert "market A" in breaches[0].detail
@@ -140,7 +155,7 @@ class TestEachLimitIndependently:
         book.add_position(
             make_position("p1", our_side=Side.NO, contracts=40_000, entry_price=100)
         )
-        breaches = LimitChecker(RiskLimits()).check(book, MARG, DailyPnl())
+        breaches = enforced(LimitChecker(RiskLimits()).check(book, MARG, DailyPnl()))
         assert reasons(breaches) == [ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH]
         assert "market A" in breaches[0].detail
 
@@ -149,7 +164,7 @@ class TestEachLimitIndependently:
         book = empty_book()
         book.add_position(make_position("p1", LEG_A, contracts=28_000, entry_price=100))
         book.add_position(make_position("p2", LEG_B, contracts=28_000, entry_price=100))
-        breaches = LimitChecker(RiskLimits()).check(book, MARG, DailyPnl())
+        breaches = enforced(LimitChecker(RiskLimits()).check(book, MARG, DailyPnl()))
         assert len(breaches) == 1
         assert breaches[0].reason is ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH
         # B2: aggregation is now game-keyed; EV1 has no hyphen so game == event.
@@ -160,7 +175,7 @@ class TestEachLimitIndependently:
         limits = RiskLimits(max_gross_notional_dollars=10.0)
         book = empty_book()
         book.add_position(make_position("p1", contracts=10_000, entry_price=5_000))
-        breaches = LimitChecker(limits).check(book, MARG, DailyPnl())
+        breaches = enforced(LimitChecker(limits).check(book, MARG, DailyPnl()))
         assert len(breaches) == 1
         assert breaches[0].reason is ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH
         assert "gross notional" in breaches[0].detail
@@ -169,7 +184,7 @@ class TestEachLimitIndependently:
         limits = RiskLimits(max_event_worst_case_loss_dollars=10.0)
         book = empty_book()
         book.add_position(make_position("p1", contracts=10_000, entry_price=5_000))
-        breaches = LimitChecker(limits).check(book, MARG, DailyPnl())
+        breaches = enforced(LimitChecker(limits).check(book, MARG, DailyPnl()))
         assert len(breaches) == 1
         assert breaches[0].reason is ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH
         assert "worst-case loss" in breaches[0].detail
@@ -192,7 +207,7 @@ class TestDailyLoss:
 
     def test_just_under_limit_passes(self) -> None:
         pnl = DailyPnl(realized_cc=-4_999_999)  # -$499.9999
-        assert LimitChecker(RiskLimits()).check(empty_book(), MARG, pnl) == []
+        assert enforced(LimitChecker(RiskLimits()).check(empty_book(), MARG, pnl)) == []
 
     def test_realized_plus_unrealized_combine(self) -> None:
         pnl = DailyPnl(realized_cc=-2_000_000, unrealized_cc=-3_000_000)
@@ -201,7 +216,7 @@ class TestDailyLoss:
 
     def test_unrealized_gains_offset_realized_losses(self) -> None:
         pnl = DailyPnl(realized_cc=-6_000_000, unrealized_cc=2_500_000)  # -$350 net
-        assert LimitChecker(RiskLimits()).check(empty_book(), MARG, pnl) == []
+        assert enforced(LimitChecker(RiskLimits()).check(empty_book(), MARG, pnl)) == []
 
 
 class TestCleanBook:
@@ -210,13 +225,13 @@ class TestCleanBook:
         book.add_position(make_position("p1", contracts=1_000, entry_price=5_000))  # $5
         book.upsert_quote(make_quote("q1", contracts=1_000))
         candidate = make_position("cand", LEG_B, contracts=1_000, entry_price=4_000)  # $4
-        breaches = LimitChecker(RiskLimits()).check(
+        breaches = enforced(LimitChecker(RiskLimits()).check(
             book,
             MARG,
             DailyPnl(realized_cc=-1_000_000),  # -$100, well under $500
             candidate_positions=[candidate],
             adding_quote=True,
-        )
+        ))
         assert breaches == []
 
 
@@ -272,11 +287,11 @@ class TestMassAcceptanceEnforcement:
         current = book.snapshot(MARG, mass_acceptance=False)
         assert current.gross_notional_cc == 0  # not a current-exposure breach
 
-        breaches = LimitChecker(limits).check(book, MARG, DailyPnl())
+        breaches = enforced(LimitChecker(limits).check(book, MARG, DailyPnl()))
         assert reasons(breaches) == [ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH]
         assert "gross notional" in breaches[0].detail
 
     def test_same_book_passes_under_default_gross_limit(self) -> None:
         book = empty_book()
         book.upsert_quote(make_quote("q1", yes_bid=9_000, no_bid=9_000, contracts=10_000))
-        assert LimitChecker(RiskLimits()).check(book, MARG, DailyPnl()) == []
+        assert enforced(LimitChecker(RiskLimits()).check(book, MARG, DailyPnl())) == []

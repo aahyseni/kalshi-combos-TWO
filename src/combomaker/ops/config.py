@@ -7,12 +7,16 @@ true`` in the prod config file. Demo is the default environment everywhere.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from enum import StrEnum
+from fractions import Fraction
 from pathlib import Path
 from typing import Self
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
+
+from combomaker.risk.limits import RiskLimits
 
 
 class Env(StrEnum):
@@ -1649,6 +1653,59 @@ class RiskConfig(StrictModel):
     velocity_threshold_cc: int = 300
     update_count_threshold: int = 25
     in_play_cooldown_s: float = 30.0
+
+    # --- R2 %-of-bankroll cap layer (Phase 2). SHADOW by DEFAULT: the new caps
+    # run in parallel with the enforced caps above and are LOG-ONLY (zero quote
+    # impact) until the operator sets caps_shadow_mode: false to enforce. The
+    # percentages are decimal STRINGS parsed to exact Fractions (the established
+    # FeeConfig pattern — YAML can't hold a Fraction and floats are banned for
+    # thresholds); thresholds are computed at check time from the live bankroll.
+    # Defaults are the researched $2,000 START values
+    # (docs/research/CAP_recommendation_2000.md). ---
+    caps_shadow_mode: bool = True
+    game_loss_frac: str = "0.08"          # %-of-GAME correlated loss
+    per_combo_loss_frac: str = "0.01"     # single position max_loss
+    directional_frac: str = "0.10"        # net one-directional / theme
+    slate_loss_frac: str = "0.08"         # Σ game loss over one slate
+    daily_loss_frac: str = "0.06"         # soft daily-loss halt
+    drawdown_frac: str = "0.10"           # peak-drawdown halt
+    hard_trip_frac: str = "0.12"          # hard-trip KILL
+    absolute_notional_multiple: int = 3   # utilization backstop (× bankroll)
+    fill_velocity_window_s: float = 2.0
+    fill_velocity_soft_frac: str = "0.05"
+    fill_velocity_hard_frac: str = "0.10"
+    fill_velocity_max_fills: int = 8
+    # After this many consecutive risk-driven declines with zero quotes issued,
+    # the StarvationWatchdog warns (a mis-set cap silently declining everything).
+    starvation_threshold: int = 20
+
+    def to_risk_limits(self) -> RiskLimits:
+        """Build the ``RiskLimits`` the checker uses, parsing the decimal-string
+        percentages into exact Fractions (via Decimal so "0.08" is EXACTLY 8/100,
+        never a binary-float approximation). The one place config → limits."""
+        return RiskLimits(
+            max_contracts_per_quote=self.max_contracts_per_quote,
+            max_notional_per_quote_dollars=self.max_notional_per_quote_dollars,
+            max_market_delta_contracts=self.max_market_delta_contracts,
+            max_event_delta_contracts=self.max_event_delta_contracts,
+            max_gross_notional_dollars=self.max_gross_notional_dollars,
+            max_open_quotes=self.max_open_quotes,
+            max_daily_loss_dollars=self.max_daily_loss_dollars,
+            max_event_worst_case_loss_dollars=self.max_event_worst_case_loss_dollars,
+            caps_shadow_mode=self.caps_shadow_mode,
+            game_loss_frac=Fraction(Decimal(self.game_loss_frac)),
+            per_combo_loss_frac=Fraction(Decimal(self.per_combo_loss_frac)),
+            directional_frac=Fraction(Decimal(self.directional_frac)),
+            slate_loss_frac=Fraction(Decimal(self.slate_loss_frac)),
+            daily_loss_frac=Fraction(Decimal(self.daily_loss_frac)),
+            drawdown_frac=Fraction(Decimal(self.drawdown_frac)),
+            hard_trip_frac=Fraction(Decimal(self.hard_trip_frac)),
+            absolute_notional_multiple=self.absolute_notional_multiple,
+            fill_velocity_window_s=self.fill_velocity_window_s,
+            fill_velocity_soft_frac=Fraction(Decimal(self.fill_velocity_soft_frac)),
+            fill_velocity_hard_frac=Fraction(Decimal(self.fill_velocity_hard_frac)),
+            fill_velocity_max_fills=self.fill_velocity_max_fills,
+        )
 
 
 class ObserveConfig(StrictModel):

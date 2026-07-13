@@ -9,7 +9,7 @@ defaults (quiet-failure defense #2).
 
 from __future__ import annotations
 
-from datetime import UTC
+from datetime import UTC, datetime
 
 from combomaker.core.clock import Clock
 from combomaker.core.quantity import CENTI_PER_CONTRACT
@@ -99,6 +99,13 @@ class RfqFilter:
         """Schedule-based start gate (Phase 3), also re-checked by last look
         at confirm time — a leg can go in-play between quote and accept."""
         return self._pregame.status(rfq.legs)
+
+    def leg_start_time(self, market_ticker: str) -> datetime | None:
+        """A leg's game start (tz-aware), or None = UNKNOWN. The R2 slate cap's
+        start-time source (``limits.StartTimeProvider``): peek-only, hot-path
+        safe, exactly the gate this filter uses so slate bucketing and the
+        pregame gate agree on each game's start."""
+        return self._pregame.leg_start_time(market_ticker)
 
     def _pregame_reasons(self, rfq: Rfq) -> list[ReasonCode]:
         """Pregame-only gate: any started leg ⇒ skip; any UNKNOWN start ⇒

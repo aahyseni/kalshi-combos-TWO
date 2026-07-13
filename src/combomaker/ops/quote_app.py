@@ -35,15 +35,22 @@ from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.intake import RfqIntake
 from combomaker.rfq.lifecycle import LifecycleConfig, QuoteLifecycle
 from combomaker.rfq.models import Rfq
+from combomaker.risk.balance import BalanceTracker, StaleBalanceError
 from combomaker.risk.exposure import ExposureBook
 from combomaker.risk.inplay import InPlayDetector
 from combomaker.risk.killswitch import HaltEvent, KillSwitch
 from combomaker.risk.lastlook import LastLookPolicy
-from combomaker.risk.limits import LimitChecker, RiskLimits
+from combomaker.risk.limits import LimitChecker, StarvationWatchdog
 
 log = get_logger(__name__)
 
 JsonDict = dict[str, Any]
+
+# The balance poll cadence must keep the risk bankroll fresh for the %-of-bankroll
+# caps: staleness beyond this ⇒ risk_bankroll_cc_or_none() returns None and the
+# caps fail closed (SKIP_BANKROLL_UNAVAILABLE). Poll interval is well inside it.
+BALANCE_STALE_AFTER_S = 30.0
+BALANCE_POLL_INTERVAL_S = 10.0
 
 
 class PaperSender:
@@ -130,20 +137,17 @@ class QuoteApp:
             )
             exposure = ExposureBook(conventions)
             risk_cfg = config.risk
-            limits = LimitChecker(
-                RiskLimits(
-                    max_contracts_per_quote=risk_cfg.max_contracts_per_quote,
-                    max_notional_per_quote_dollars=risk_cfg.max_notional_per_quote_dollars,
-                    max_market_delta_contracts=risk_cfg.max_market_delta_contracts,
-                    max_event_delta_contracts=risk_cfg.max_event_delta_contracts,
-                    max_gross_notional_dollars=risk_cfg.max_gross_notional_dollars,
-                    max_open_quotes=risk_cfg.max_open_quotes,
-                    max_daily_loss_dollars=risk_cfg.max_daily_loss_dollars,
-                    max_event_worst_case_loss_dollars=(
-                        risk_cfg.max_event_worst_case_loss_dollars
-                    ),
-                )
+            # RiskLimits now carries the R2 %-of-bankroll cap layer (Phase 2,
+            # SHADOW by default); to_risk_limits() parses the decimal-string
+            # percentages into exact Fractions (no binary-float money).
+            limits = LimitChecker(risk_cfg.to_risk_limits())
+            # Live bankroll denominator for the %-caps (fail-closed on stale) +
+            # the starvation watchdog. The tracker is polled in _balance_loop.
+            balance_tracker = BalanceTracker(
+                conventions, self._clock, stale_after_s=BALANCE_STALE_AFTER_S
             )
+            watchdog = StarvationWatchdog(threshold=risk_cfg.starvation_threshold)
+            rfq_filter = RfqFilter(config.filters, feed, metadata, killswitch, self._clock)
             sender = (
                 PaperSender()
                 if config.mode is Mode.PAPER
@@ -153,7 +157,7 @@ class QuoteApp:
                 clock=self._clock,
                 sender=sender,
                 engine=engine,
-                rfq_filter=RfqFilter(config.filters, feed, metadata, killswitch, self._clock),
+                rfq_filter=rfq_filter,
                 limits=limits,
                 exposure=exposure,
                 feed=feed,
@@ -169,6 +173,11 @@ class QuoteApp:
                     max_leg_age_s=risk_cfg.max_leg_age_s,
                 ),
                 config=LifecycleConfig(),
+                balance_tracker=balance_tracker,
+                # Slate cap's per-leg game-start source — the exact pregame gate
+                # the filter already uses (peek-only, hot-path safe, no network).
+                start_time_provider=rfq_filter.leg_start_time,
+                starvation_watchdog=watchdog,
             )
 
             # Idempotent startup: reconcile before doing anything.
@@ -243,6 +252,9 @@ class QuoteApp:
                 ),
                 asyncio.create_task(
                     self._report_loop(store, exposure, lifecycle), name="report"
+                ),
+                asyncio.create_task(
+                    self._balance_loop(rest, balance_tracker), name="balance-poll"
                 ),
             ]
             if external is not None:
@@ -354,6 +366,23 @@ class QuoteApp:
                 await lifecycle.maintenance_tick()
             except Exception:
                 log.exception("maintenance_tick_failed")
+
+    async def _balance_loop(
+        self, rest: KalshiRestClient, tracker: BalanceTracker
+    ) -> None:
+        """Poll the exchange balance so the R2 %-of-bankroll caps have a fresh
+        risk-bankroll denominator. A failed/stale poll leaves the last good
+        reading to age out ⇒ the caps fail closed (they never quote off a guessed
+        bankroll). Shadow in Phase 2, so a dark poll has zero quote impact today —
+        but the poll keeps the shadow numbers honest on the tape."""
+        while True:
+            try:
+                await tracker.refresh(rest)
+            except StaleBalanceError as exc:
+                log.warning("balance_poll_stale", error=str(exc))
+            except Exception as exc:
+                log.warning("balance_poll_failed", error=repr(exc))
+            await asyncio.sleep(BALANCE_POLL_INTERVAL_S)
 
     async def _status_loop(
         self, rest: KalshiRestClient, lifecycle: QuoteLifecycle, killswitch: KillSwitch
