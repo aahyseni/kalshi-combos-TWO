@@ -1,0 +1,334 @@
+================================================================================
+RISK ENGINE BRIEFING — combomaker (a Kalshi combo/parlay market maker)
+Prepared 2026-07-12 for external review. Self-contained: assumes no prior context.
+================================================================================
+
+PURPOSE OF THIS DOCUMENT
+------------------------
+This describes the RISK ENGINE we are building for an automated market-making
+bot, plus enough background about the bot and its market to make the risk design
+legible. It is written to be handed to a second AI/analyst for a critical
+second opinion. Please be skeptical: point out flaws, missing failure modes,
+wrong assumptions, and better designs. Section 10 lists the specific questions
+we most want challenged.
+
+
+================================================================================
+1. WHAT THE PROJECT IS (one paragraph)
+================================================================================
+"combomaker" is an automated market maker for COMBO markets (parlays / same-game
+parlays / cross-game bundles) on Kalshi, a regulated US prediction-market
+exchange. A combo is a single binary contract whose YES pays $1 if EVERY leg of
+the bundle comes true, and whose NO pays $1 if ANY leg fails. Combos arrive as
+RFQs (requests-for-quote): a customer proposes a bundle of legs and asks makers
+to quote it. Our bot prices the combo and posts a quote. It is currently in
+observe/paper mode; going live is gated behind explicit config + a configured
+risk engine (the subject of this doc). Stack: Python 3.12, async, SQLite,
+hand-rolled Kalshi REST/WS client. Money is handled as integer "centi-cents"
+(1 cent = 100 units; $1 = 10,000 units) — binary floats for money are banned.
+
+
+================================================================================
+2. THE MARKET MECHANICS (critical to get right)
+================================================================================
+2.1 Binary contracts. A Kalshi binary has a YES and a NO side; YES price + NO
+price = $1. If you BUY a NO contract at price p_no, you pay p_no upfront and
+receive $1 if the event resolves NO (else $0). Your max loss is exactly p_no
+(what you paid) — bought binaries are never margin-called.
+
+2.2 We are a PARLAY SELLER, SELL-ONLY. When we quote a combo we only ever take
+the NO side of the parlay: we quote a NO bid (yes_bid forced to 0). Economically
+we are "selling the parlay" to the customer who wants YES. So:
+  - We hold NO. If the parlay MISSES (any leg fails -> combo settles NO), we get
+    $1/contract. If the parlay HITS (all legs true -> settles YES), our NO is
+    worthless and we lose what we paid.
+  - Parlays usually miss. Empirically ~75% of the combos we'd hold settle NO
+    (we win), ~25% settle YES (we pay out).
+  - GROUND TRUTH we verified live: a demo combo, 1.00 NO contract, cost $0.50,
+    settled NO, paid $1.00 (realized +$0.50). This anchors all our accounting.
+
+2.3 Why sell-only. We measured (5.7M-RFQ backtest) that taking the YES side of
+parlay flow is structurally adversely selected (customers who buy parlays lose,
+but the maker who accepts the YES side inherits toxic flow). Selling the parlay
+(NO) is the +EV side. yes_bid=0 guarantees single-sided exposure.
+
+2.4 Pricing (context; not the subject here but needed). Leg probabilities
+("marginals") come LIVE from Kalshi's individual leg order books. The only thing
+we model is the JOINT/correlation layer: how legs co-move (a Gaussian copula
+with correlation values measured from historical sports data, plus structural
+scoreline models, plus exact arithmetic for logically-related legs). Our "fair
+value" of a combo = our estimate of P(all legs true). We quote fair + a markup.
+
+2.5 The clearing price. When a combo trades, it trades at a "clearing" price =
+the winning maker's fair value PLUS their markup. So clearing is NOT truth; it
+is fair+markup. The only unbiased ruler for whether our fair is right is actual
+SETTLEMENT (did the parlay hit or miss). We have measured our fair beats the
+clearing on settlement calibration (we are closer to realized outcomes than the
+market's clearing price is).
+
+
+================================================================================
+3. WHERE THE PROJECT STANDS TODAY
+================================================================================
+- PRICING is mature: two live sports (World Cup soccer + MLB baseball), every
+  correlation pair measured or exact (no hand-guessed priors), adversarially
+  audited, backtest-gated. MLB prices to ~0.34 cents median error vs the market;
+  soccer beats the market on settlement calibration. Only MLB + World Cup are
+  enabled (a hard allowlist blocks all other sports/crypto at intake).
+- EXECUTION plumbing exists: RFQ intake, quote lifecycle (quote -> accept ->
+  last-look -> confirm/execute), a "pregame-only" gate (never quote a combo any
+  of whose legs is already in-play).
+- RISK ENGINE is ~80% built but had gaps; we are now hardening it to run a live
+  book autonomously. THIS is what the rest of the doc covers.
+- Bankroll to START: $2,000 (deliberately small; scale later).
+
+
+================================================================================
+4. THE RISK ENGINE — PHILOSOPHY
+================================================================================
+The edge is execution discipline, not just pricing. A correctly-priced book can
+still blow up from: over-concentration (many combos on one game/leg all breaking
+together), mass-acceptance (many resting quotes accepted at once), a bad
+correlated week, or a single huge combo. The risk engine must let the bot run
+100% autonomously and know, at every instant: its balance, its open legs, its
+per-game exposure, its losses, and its headroom against every limit.
+
+Key structural fact discovered empirically: THE TRUE RISK UNIT IS THE GAME, NOT
+THE COMBO. Combos share legs and share games; combos on the same match are
+highly correlated (they can all break together on one result). So exposure must
+be aggregated per GAME, and the scariest scenario is one game resolving entirely
+against us.
+
+
+================================================================================
+5. THE POSITION BOOK MODEL (built)
+================================================================================
+A hierarchical live view: GAME -> LEG -> COMBO. For every position we hold or
+could take, we track:
+  - Per LEG: net exposure, and P(this leg hits) from our pricing marginals.
+  - Per GAME (the aggregation key): worst-case loss if the whole game breaks
+    against us (the correlated cluster), and gross payout exposure.
+  - Per COMBO: its max loss and its gross payout.
+  - Directional bias: are we piled up on the same outcome across many games?
+
+TWO MONEY AXES, tracked separately and NEVER summed (this distinction is
+load-bearing):
+  (a) MAX-LOSS axis = what we can actually LOSE. For our NO position = contracts
+      x (the NO price we paid). On the demo: 1 ct x $0.50 = $0.50. This is the
+      true downside — it is what the loss caps limit.
+  (b) PAYOUT-OBLIGATION / gross axis = contracts x $1 (the gross settlement
+      size). On the demo: $1.00. This is the "how much is locked up / gross
+      exposure" number. For longshot combos (NO price near $1) the two axes
+      nearly coincide; for near-even combos they diverge.
+
+IMPLEMENTATION NOTE / a correction we made: an early design claimed our max-loss
+field was "6-11x too loose" (it assumed the field stored a small YES-premium).
+On inspection it already stored the NO price we paid, i.e. the TRUE max loss,
+verified against the demo settlement. So the loss accounting was already correct;
+what was missing was the separate gross-payout axis (now added) and per-GAME
+aggregation (see next).
+
+
+================================================================================
+6. GAME-KEY AGGREGATION (built)
+================================================================================
+Problem found: exposure was aggregated by Kalshi "event_ticker", but each market
+FAMILY of one match (the moneyline market, the totals market, the spread market,
+the player-prop markets) is a DIFFERENT event_ticker. So one match's exposure
+was silently split across several buckets, and the per-game correlated risk was
+invisible. This is the direct cause of a concentration finding (a few games /
+combos dominated volume with correlated ~$1M swings) going unseen.
+
+Fix (built): a single canonical GAME KEY = the game-code embedded in the ticker
+(e.g. "26JUL09FRAMAR" for a France-Morocco match on Jul 9), the same key the
+correlation model already uses. Now every market family of one match aggregates
+into ONE game cluster. Verified: moneyline + totals legs of one match fold into
+one bucket; two different matches stay separate.
+
+
+================================================================================
+7. LIVE BALANCE TRACKER (built)
+================================================================================
+The bot must always know its money. A BalanceTracker:
+  - Polls the exchange for the live account balance -> the authoritative
+    "bankroll" figure. If the poll is stale (older than a threshold), it
+    FAILS CLOSED (treats bankroll as unknown -> caps bind conservatively).
+  - Runs an internal realized-P&L ledger: on each settlement, NO-miss (we win)
+    CREDITS, YES-hit (we lose) DEBITS. This gives a running realized P&L and
+    cumulative-loss number queryable at any instant.
+  - Design decision (flagged): the live exchange poll is AUTHORITATIVE for the
+    bankroll; the internal ledger is a separate cross-check, never summed into
+    the bankroll (that would drift from the exchange and lose the fail-closed
+    guarantee).
+
+
+================================================================================
+8. THE CAPS / LIMITS / KILL-SWITCH (designed; values sized for $2,000)
+================================================================================
+All caps expressed as % of bankroll so they scale. Two independent derivations
+(risk-of-ruin/Kelly theory + an empirical game-clustered simulation over 17,351
+real settled combos across 59 games) were reconciled to these conservative START
+values for a $2,000 bankroll:
+
+  Cap                         Start   $ at $2k   Limits
+  --------------------------  ------  ---------  ---------------------------------
+  %-of-GAME (correlated loss) 8%      $160       max loss if one game breaks fully
+  per-COMBO max payout        1%      $20        single combo's max loss (slice whales)
+  one-directional / theme     10%     $200       net exposure to one outcome across games
+  absolute-$ backstop         3x      $6,000     gross committed payout, whole book
+  daily-loss halt (soft)      6%      $120       realized+unrealized in a day -> stop
+  peak-drawdown halt          10%     $200       give-back from intraday peak
+  hard-trip kill (human clear)12%     $240       KILL file, survives restart
+  fill-velocity               5%/2s soft, 10%/2s hard, 8 fills/2s (mass-acceptance rate)
+
+MECHANICS:
+  - Quote-time checks decide whether to POST a resting quote (using a
+    hypothetical "what if this and all resting quotes get accepted" worst case).
+  - Confirm-time checks gate the ACTUAL fill (real committed payout + fill
+    velocity), because quotes rest and acceptance timing is the customer's.
+  - Near a cap, the quote WIDENS (via an inventory-skew term) until it declines,
+    rather than hitting a hard cliff.
+  - Everything fails closed; a "starvation watchdog" alarms if all flow is being
+    silently blocked (blocking everything is itself a bug).
+
+TWO CAVEATS BOTH DERIVATIONS INSISTED ON:
+  1. CAPS LIMIT DOWNSIDE; THEY DO NOT CREATE PROFIT. Profit comes from the
+     MARKUP. At thin markup EVERY cap set loses money in simulation (adverse
+     selection); no cap fixes a book priced in the loss zone. These cap values
+     assume a profitable markup is in force (above the break-even ~2c soccer /
+     ~1c MLB). Caps + markup are a package.
+  2. At $2,000 with these caps, probability of RUIN is ~0 across the whole range
+     — the binding constraint is DRAWDOWN, not blow-up. Sized this way the book
+     bleeds in a bad week (the halts catch it) but does not die.
+
+
+================================================================================
+9. THE FULL RFQ LIFECYCLE (how a combo flows through the system)
+================================================================================
+When a combo RFQ arrives:
+
+ 1. FILTERS         combos-only; sport allowlist (MLB+WC only); leg count; size;
+                    not-halted. [decline -> stop]
+ 2. CLASSIFY        type every leg; UNKNOWN leg -> DECLINE (fail-closed);
+                    detect logically-impossible or contained legs.
+ 3. PREGAME GATE    if ANY leg is in-play or its start-time is unknown -> DECLINE.
+                    (Courtsider defense: never quote something a live in-venue
+                    bettor could pick us off on.)
+ 4. PRICE           marginals from live leg books + correlation layer -> fair V.
+ 5. RISK CHECK      read the BOOK: what does THIS combo add? Check per-combo,
+                    per-game, directional, absolute caps + fast Monte-Carlo
+                    marginal tail impact. [breach -> decline]
+ 6. QUOTE BUILD     ask = fair + MARKUP + inventory SKEW (tighter if it balances
+                    the book, wider if it concentrates); round in our favor;
+                    near-cap -> widen into a decline.
+ 7. QUOTE OUT       post the NO-side quote (yes_bid=0), now resting.
+ 8. LAST LOOK       on customer accept, RE-CHECK: did a leg go in-play since we
+                    quoted? fill-velocity / committed-payout budget ok? books
+                    fresh? [fail -> lapse/decline]
+ 9. EXECUTE         fill booked; the BOOK + BALANCE update incrementally;
+                    predicted vs exchange-ledger reconciled to the cent
+                    (mismatch -> HALT).
+10. SETTLE          parlay misses (NO) -> keep premium; hits (YES) -> pay $1/ct;
+                    realized P&L to the ledger.
+
+BACKGROUND LOOP (off the hot path, every maintenance tick): a full Monte-Carlo
+over the WHOLE book -> P&L distribution, VaR/CVaR (tail loss), probability of a
+large drawdown/ruin, per-game/leg tail contribution. Feeds the drawdown /
+daily-loss / hard-trip halts (cancel-all + stop if breached) and refreshes the
+inventory-skew targets used in step 6.
+
+
+================================================================================
+10. MONTE CARLO (designed; engine partly exists)
+================================================================================
+The bot already has a Monte-Carlo engine that simulates combo settlement under
+the copula. The plan:
+  - Simulate the ENTIRE book jointly (not one combo at a time) using the SAME
+    correlation model the pricer uses (so risk and price are consistent). Legs
+    within a game are correlated; different games are independent. This makes
+    the GAME the risk unit in the simulation too.
+  - Outputs: full P&L distribution; VaR and CVaR at 95%/99%; probability of
+    ruin/large drawdown; per-game and per-leg contribution to tail loss; and the
+    MARGINAL change in tail risk from accepting a candidate RFQ (this feeds the
+    inventory skew — accept/price combos by whether they raise or lower
+    portfolio tail risk).
+  - Methodology emphasis: the dangerous number for a NO-seller is the small
+    probability of a large correlated payout (ruin). Naive Monte Carlo estimates
+    rare tails badly; the plan uses IMPORTANCE SAMPLING (Glasserman-Li style,
+    treating games as common risk factors and parlay-hits as "defaults" — the
+    portfolio-credit-risk analogy) to estimate the ruin probability precisely
+    with far fewer paths. Plus variance reduction (control variate = the
+    analytic fair) for the mean, and a settlement-graded VaR back-test to prove
+    the tail estimate is not confidently wrong.
+
+
+================================================================================
+11. KEY EMPIRICAL FINDINGS THAT SHAPE THE RISK DESIGN
+================================================================================
+From a settlement-graded P&L study over one window (favorite-heavy; partially
+settled — treated as directional, not precise):
+  - Combos split into two tiers by how much markup the makers charge above our
+    fair: "NORMAL" (tight, competitive) and "FAT" (makers charging a lot, mostly
+    longshot corner/advance parlays).
+  - ADVERSE-SELECTION ASYMMETRY (the durable finding): on NORMAL/competitive
+    flow, widening our markup ATTRACTS the combos that hit (bad); on FAT/padded
+    flow, widening SELECTS OUT the hitters (good). Same knob, opposite sign. So
+    markup should be per-tier: thin/skip on competitive flow, fat on padded flow.
+  - Both tiers resolve NO ~75% of the time (FAT is not "safer to sell" — it is
+    just more overpriced by makers).
+  - CONCENTRATION: a few games/combos dominate volume; correlated per-game
+    payouts create ~$1M swings on a single game in-sample; hence the per-game
+    caps and the whole game-keyed book.
+  - CAPITAL: selling parlays ties up large gross exposure for thin premium;
+    return-on-capital only becomes attractive on the fat tier at fat markup.
+
+
+================================================================================
+12. OPEN DECISIONS / KNOWN LIMITS (be skeptical here)
+================================================================================
+  - The cap %s above are START values from ONE window of data (soccer only 6
+    games in the sample; MLB 53). They are to be run in SHADOW and re-derived
+    from POOLED MULTI-WEEK, GAME-CLUSTERED settlement before gating real capital.
+    We deliberately do NOT tune risk parameters on a single P&L window.
+  - Classifying an incoming RFQ as NORMAL vs FAT at quote-time is unsolved: the
+    "markup room" that defines the tier is only revealed AFTER the combo clears,
+    so a live system needs a PREDICTOR of markup room from pre-quote features
+    (leg spreads, family, favorite-skew, size). Planned as a shadow classifier.
+  - The markup LEVELS themselves are deferred to multi-week data; the caps assume
+    a profitable markup exists but do not set it.
+  - Active hedging on single-leg markets is designed but off (would convert
+    outright event risk into correlation risk); the sell-only mandate constrains
+    only combo quotes, not leg markets.
+  - Small-bankroll reality: at $2,000, position sizes are tiny slices of the
+    available volume; the caps mostly govern how big a slice of each game we hold.
+
+
+================================================================================
+13. QUESTIONS WE MOST WANT A SECOND OPINION ON
+================================================================================
+  1. Is the TWO-AXIS accounting (true max-loss vs gross payout-obligation) the
+     right decomposition for a sell-only NO book, and are we capping the right
+     axis for each cap (loss caps on max-loss, utilization on gross)?
+  2. Is the GAME the correct risk-aggregation unit, and are we missing a
+     higher-order correlation (e.g. same-day, same-league, weather/injury
+     regimes) that could correlate ACROSS games?
+  3. Are the $2,000 cap levels sane? Too tight (no flow) or too loose (ruin)?
+     Is drawdown-not-ruin the right thing to optimize at this size?
+  4. Is importance sampling the right tool for the ruin estimate, and is the
+     portfolio-credit-risk (games=factors, hits=defaults) analogy sound here?
+  5. The adverse-selection asymmetry (markup attracts hitters on competitive
+     flow, sheds them on padded flow) — is that mechanism real, and does the
+     per-tier markup + room-predictor response make sense?
+  6. Biggest blind spot: what failure mode are we NOT modeling? (Exchange
+     outage mid-book, settlement disputes, a correlated-across-games shock,
+     mass-acceptance faster than our cancel loop, a mispriced-marginal feed,
+     adverse selection we can't see because the counterparty is informed.)
+  7. For an autonomous bot on a small bankroll, is our halt/kill hierarchy
+     (soft daily-loss -> drawdown -> hard-trip) sufficient, or do we need
+     circuit breakers we haven't listed?
+
+================================================================================
+END OF BRIEFING. Supporting detail lives in the repo under docs/research/
+(R1 book model, R2 caps, R3 hedging+pregame, M1/M2 Monte Carlo, the $2,000 cap
+recommendation) and docs/reports/ (the dated P&L and pricing studies).
+================================================================================
