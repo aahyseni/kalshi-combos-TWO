@@ -59,6 +59,7 @@ from combomaker.risk.limits import (
     StarvationWatchdog,
 )
 from combomaker.risk.markouts import MarkoutSubject, MarkoutTracker
+from combomaker.risk.reservation import RiskReservationService
 
 log = get_logger(__name__)
 
@@ -125,6 +126,7 @@ class QuoteLifecycle:
         balance_tracker: BalanceTracker | None = None,
         start_time_provider: StartTimeProvider | None = None,
         starvation_watchdog: StarvationWatchdog | None = None,
+        reservation: RiskReservationService | None = None,
     ) -> None:
         self._clock = clock
         self._sender = sender
@@ -150,6 +152,14 @@ class QuoteLifecycle:
         self._balance = balance_tracker
         self._start_time_provider = start_time_provider
         self._watchdog = starvation_watchdog
+        # R3 Phase 3: single-writer risk-reservation service. When present, the
+        # confirm path RESERVES headroom (atomic + versioned) BEFORE the confirm
+        # round-trip and commits/releases/marks-unconfirmed based on the outcome —
+        # closing the check→confirm→book gap where two concurrent accepts could
+        # each pass the same check against stale headroom. Optional: when omitted
+        # the confirm path behaves exactly as before (the reservation is race-free
+        # today under one asyncio loop; the service makes it safe for fan-out).
+        self._reservation = reservation
         self._markouts = MarkoutTracker(store.record_markout)
         self._open: dict[str, OpenQuoteState] = {}       # quote_id → state
         self._by_rfq: dict[str, str] = {}                # rfq_id → quote_id
@@ -160,6 +170,18 @@ class QuoteLifecycle:
         self.exchange_active = config.exchange_active
 
     # ------------------------------------------------------------------ R2 seam
+
+    def partition_breaches(self, breaches: list[Breach]) -> list[Breach]:
+        """Public alias for the shadow-split used to build the reservation
+        service's ``breach_splitter`` — so the shadow rule lives in ONE place
+        (this lifecycle) and the reservation layer reuses it verbatim."""
+        return self._partition_breaches(breaches)
+
+    def attach_reservation(self, reservation: RiskReservationService) -> None:
+        """Wire the reservation service in AFTER construction (the service needs
+        this lifecycle's shadow splitter, and this lifecycle needs the service —
+        break the cycle by attaching post-construction). Set once."""
+        self._reservation = reservation
 
     def _risk_bankroll_cc(self) -> int | None:
         """The live risk-capital denominator in cc for the %-of-bankroll caps,
@@ -209,6 +231,46 @@ class QuoteLifecycle:
             else:
                 enforced.append(breach)
         return enforced
+
+    def _reserve_headroom(
+        self, reservation_id: str, quote_id: str, state: OpenQuoteState
+    ) -> bool:
+        """Reserve risk headroom for a contemplated fill BEFORE the confirm
+        round-trip (R3 Phase 3). Returns True to proceed with the confirm, False
+        to decline.
+
+        No reservation service ⇒ always True (behaviour unchanged from Phase 2 —
+        the check already ran at last look; the race only matters under fan-out).
+        With a service, the reservation re-checks the caps against
+        committed + all outstanding reservations + this fill, atomically, and
+        consumes the headroom on grant. Denied ⇒ False (an ENFORCED cap breach —
+        impossible while caps_shadow_mode is True, so SHADOW-mode behaviour is
+        unchanged; real once the operator flips caps to enforce). The reservation
+        SHARES the lifecycle's shadow split, so a shadow breach never denies.
+
+        NOTE (conservative, intended): this quote's OWN open-quote record is still
+        in the exposure book here (it is dropped only at the end of
+        ``on_quote_accepted``), so the reservation snapshot counts this fill's
+        economic exposure twice — once as the still-open quote's mass-acceptance
+        hypothetical, once as the candidate fill. That over-counts (never
+        under-counts) the headroom for THIS reservation — the same fail-conservative
+        double-count the last-look check already makes — so a reservation can only
+        be denied more readily, never granted against a real breach. It is
+        transient: after commit + ``_drop_quote`` the book holds the position once
+        and the open quote is gone, so the steady-state total is exact."""
+        if self._reservation is None:
+            return True
+        candidate = self._fill_position(quote_id, state)
+        result = self._reservation.try_reserve(
+            reservation_id,
+            candidate,
+            marginals=self._marginals,
+            daily_pnl=self.daily_pnl,
+            risk_bankroll_cc=self._risk_bankroll_cc(),
+            start_time_provider=self._start_time_provider,
+            halt_inputs=self._halt_inputs(),
+        )
+        return result.granted
 
     def _note_watchdog(self, *, risk_declined: bool) -> None:
         """Feed the starvation watchdog one quote decision. ``risk_declined`` is
@@ -390,6 +452,26 @@ class QuoteLifecycle:
             # eventual quote_executed must find this state and book the fill.
             state.pending_fill = (accepted_side, bid, qty)
             self._executed_states[quote_id] = state
+            # R3 Phase 3: RESERVE headroom BEFORE the confirm round-trip (atomic +
+            # versioned). If the reservation is ENFORCED-denied — impossible in
+            # Phase-2 SHADOW mode, real once caps are flipped — we do NOT confirm;
+            # we decline instead (the last book of headroom went to another RFQ).
+            reservation_id = f"fill:{quote_id}"
+            reserved = self._reserve_headroom(reservation_id, quote_id, state)
+            if not reserved:
+                self._metrics.inc(
+                    f"confirm.declined.{ReasonCode.DECLINE_RISK_LIMIT}"
+                )
+                self._track_markout(f"declined:{quote_id}", state)
+                await self._record_confirm_decision(
+                    state, confirm=False, reason=ReasonCode.DECLINE_RISK_LIMIT,
+                    detail="risk reservation denied at confirm (no headroom)",
+                    decision_ms=decision_ms,
+                )
+                self._executed_states.pop(quote_id, None)
+                state.pending_fill = None
+                self._drop_quote(quote_id)
+                return
             rtt0 = self._clock.monotonic_ns()
             try:
                 await self._sender.confirm_quote(quote_id)
@@ -400,11 +482,22 @@ class QuoteLifecycle:
                 # Once confirmed neither party can withdraw: the position is
                 # REAL now — book it immediately, not at quote_executed
                 # (execution is ~1s later and the channel has no replay).
-                self._book_position(quote_id, state)
+                # COMMIT the reservation (which books the position) — or, with no
+                # reservation service, book directly. Both are idempotent on id.
+                if self._reservation is not None:
+                    self._reservation.commit(reservation_id)
+                else:
+                    self._book_position(quote_id, state)
             except Exception as exc:
                 self._metrics.inc("confirm.failed")
                 self._confirm_failures += 1
                 log.error("confirm_failed", quote_id=quote_id, error=repr(exc))
+                # Confirm TIMED OUT: unknown-committed. ASSUME COMMITTED — keep the
+                # reserved headroom held (mark_unconfirmed) so a possibly-real
+                # position keeps counting against the caps until reconciled against
+                # the exchange. Never release on a lost ack.
+                if self._reservation is not None:
+                    self._reservation.mark_unconfirmed(reservation_id)
                 if self._confirm_failures >= 3:
                     await self._killswitch.halt(
                         ReasonCode.HALT_CONFIRM_TIMEOUTS,
@@ -423,25 +516,38 @@ class QuoteLifecycle:
         # Accepted quotes are no longer open either way.
         self._drop_quote(quote_id)
 
-    def _book_position(self, quote_id: str, state: OpenQuoteState) -> None:
-        """Idempotent: adds the confirmed fill's position to the exposure book."""
+    def _fill_position(self, quote_id: str, state: OpenQuoteState) -> OpenPosition:
+        """The exact ``OpenPosition`` a confirmed fill of this quote produces.
+
+        The SINGLE builder shared by ``_book_position`` and the reservation
+        service, so the headroom RESERVED before confirm equals the position
+        BOOKED after confirm to the cent (position_id, side, contracts, price and
+        legs are byte-identical — no drift between reserve and commit)."""
         assert state.pending_fill is not None
         accepted_side, bid, qty = state.pending_fill
-        position_id = f"fill:{quote_id}"
-        if position_id in self._exposure.positions:
-            return
-        self._exposure.add_position(
-            OpenPosition(
-                position_id=position_id,
-                combo_ticker=state.rfq.market_ticker,
-                collection=state.rfq.mve_collection_ticker,
-                our_side=self._conventions.maker_position_side(accepted_side),
-                contracts=qty,
-                entry_price_cc=bid,
-                legs=self._leg_refs(state.rfq),
-                farmed=state.constructed.farmed,
-            )
+        return OpenPosition(
+            position_id=f"fill:{quote_id}",
+            combo_ticker=state.rfq.market_ticker,
+            collection=state.rfq.mve_collection_ticker,
+            our_side=self._conventions.maker_position_side(accepted_side),
+            contracts=qty,
+            entry_price_cc=bid,
+            legs=self._leg_refs(state.rfq),
+            farmed=state.constructed.farmed,
         )
+
+    def _book_position(self, quote_id: str, state: OpenQuoteState) -> None:
+        """Idempotent: adds the confirmed fill's position to the exposure book.
+
+        When a reservation service is wired, the booking flows through
+        ``reservation.commit`` (the reservation IS this same position, same id),
+        so this is a no-op for an already-committed id. Kept as the fallback
+        booking path when no reservation service is present, and as the
+        idempotency backstop for the ``on_quote_executed`` replay."""
+        position = self._fill_position(quote_id, state)
+        if position.position_id in self._exposure.positions:
+            return
+        self._exposure.add_position(position)
 
     async def on_quote_executed(self, msg: JsonDict) -> None:
         quote_id = str(msg.get("quote_id", ""))
@@ -453,7 +559,20 @@ class QuoteLifecycle:
             log.warning("execution_without_pending_fill", quote_id=quote_id)
             return
         accepted_side, bid, qty = state.pending_fill
-        self._book_position(quote_id, state)  # no-op if booked at confirm
+        # Book the fill. With a reservation service, execution CONFIRMS the fill
+        # landed — commit the reservation (converts a still-outstanding
+        # reservation, e.g. one whose confirm timed out and was marked
+        # unconfirmed, into a committed position exactly once; a no-op if the
+        # confirm already committed it). Without a service, book directly. Both
+        # are idempotent on the position id, so a replayed execution is safe.
+        if self._reservation is not None:
+            reservation_id = f"fill:{quote_id}"
+            if not self._reservation.commit(reservation_id):
+                # Not outstanding (already committed at confirm, or a replay) —
+                # ensure the position exists in the book anyway (idempotent).
+                self._book_position(quote_id, state)
+        else:
+            self._book_position(quote_id, state)  # no-op if booked at confirm
         our_side = self._conventions.maker_position_side(accepted_side)
         expected_edge_cc: int | None
         if our_side is Side.YES:

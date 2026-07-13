@@ -41,6 +41,7 @@ from combomaker.risk.inplay import InPlayDetector
 from combomaker.risk.killswitch import HaltEvent, KillSwitch
 from combomaker.risk.lastlook import LastLookPolicy
 from combomaker.risk.limits import LimitChecker, StarvationWatchdog
+from combomaker.risk.reservation import RiskReservationService
 
 log = get_logger(__name__)
 
@@ -179,6 +180,17 @@ class QuoteApp:
                 start_time_provider=rfq_filter.leg_start_time,
                 starvation_watchdog=watchdog,
             )
+            # R3 Phase 3: single-writer risk-reservation service. Wired AFTER the
+            # lifecycle (it reuses the lifecycle's shadow splitter, so a %-cap
+            # breach in Phase-2 SHADOW mode never denies a reservation — only
+            # ENFORCED breaches do). Reserves headroom BEFORE each confirm so two
+            # RFQs can't both claim the same headroom under any future fan-out.
+            reservation = RiskReservationService(
+                exposure=exposure,
+                limits=limits,
+                breach_splitter=lifecycle.partition_breaches,
+            )
+            lifecycle.attach_reservation(reservation)
 
             # Idempotent startup: reconcile before doing anything.
             if config.mode is Mode.QUOTE:
