@@ -7,8 +7,8 @@ The operator memory (`project_kct_resume_state`) mirrors this.**
 
 ## Repo state
 
-- `main` @ `632cc1f` (pushed; check `git log --oneline -5`), tree clean,
-  **suite 1406 passed / 0 failed** (`uv run pytest -q`).
+- `main` @ `72ba72b` (pushed; check `git log --oneline -5`), tree clean,
+  **suite 1427 passed / 0 failed** (`uv run pytest -q`).
 - Engine UNCHANGED from 2026-07-11 (MLB props + WC containment complete,
   pregame-only gate + leg-series allowlist MLB/WC ACTIVE, sell-only book
   un-gated). The current thread is the **RISK ENGINE build**, not pricing.
@@ -52,13 +52,27 @@ challenger → quoting policy → external watchdog → go live at $2,000.
     halts already stop quoting). Enforce-time notes (give-back denominator =
     haircut risk-bankroll so halts bite sooner; enforced give-back stops the book
     from 3 directions) in the report.
-- **PHASE 3 — concurrency & state safety: NEXT.** Single-writer risk-reservation
-  service — reserve capacity BEFORE sending confirm (atomic + versioned), so two
-  RFQs can't both claim the same headroom; confirm-TIMEOUT = assume-committed +
-  reconcile against the exchange. Race-free today only because we run one asyncio
-  loop; this makes it safe for any future fan-out. (See RISK_BUILD_PLAN Phase 3.)
-- **PHASES 4–6:** portfolio MC + challenger overlay → skew/widen-vs-decline/
-  pregame precision → external watchdog + go-live gates.
+- **PHASE 3 — concurrency & state safety: DONE, MERGED `72ba72b` (judge PASS).**
+  New `risk/reservation.py` `RiskReservationService` reserves headroom BEFORE the
+  confirm round-trip (atomic single-writer sync section, versioned) so two RFQs
+  can never both claim the same room — re-runs `LimitChecker.check` vs committed +
+  ALL outstanding reservations + candidate; PASS records + bumps version, FAIL
+  returns enforced breaches. `commit`/`release`/`mark_unconfirmed`/`reconcile`,
+  all idempotent. Confirm-TIMEOUT = assume-committed (HOLDS headroom, never
+  released on a lost ack) + `reconcile(exchange_ids)` (exchange-first; doubles as
+  startup pass). Wired into `lifecycle` confirm path + `quote_app`. SHADOW-safe
+  (shares the lifecycle breach splitter; behaviour unchanged until caps enforce).
+  Report: `2026-07-13-risk-phase3-reservation-service.md`. DEFERRED: automatic
+  reconcile LOOP (needs the Phase-6 exchange position-id map), fill-velocity
+  enforcement (commit is its natural feed).
+- **PHASE 4 — portfolio MC + challenger overlay: NEXT.** Wire the portfolio MC
+  (`sim/` game-keyed block copula + NO-side correlation) → VaR/CVaR, P(ruin),
+  per-game/leg tail attribution, marginal ΔCVaR; ADD a challenger/stress overlay
+  (operative risk = max(production-copula ES, challenger ES, deterministic
+  stress)); feeds drawdown/hard-trip halts + the skew. Off the hot path. (See
+  RISK_BUILD_PLAN Phase 4.)
+- **PHASES 5–6:** skew/widen-vs-decline/pregame precision → external watchdog +
+  go-live gates.
 
 ## RUNNING processes (verify before assuming!)
 
