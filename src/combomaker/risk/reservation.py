@@ -66,6 +66,7 @@ from combomaker.risk.limits import (
     DailyPnl,
     HaltInputs,
     LimitChecker,
+    PortfolioRisk,
     StartTimeProvider,
 )
 
@@ -229,6 +230,7 @@ class RiskReservationService:
         bankroll_source_configured: bool = True,
         start_time_provider: StartTimeProvider | None = None,
         halt_inputs: HaltInputs | None = None,
+        book_risk: PortfolioRisk | None = None,
     ) -> ReserveResult:
         """Atomically reserve headroom for ``candidate`` if the limits allow it.
 
@@ -273,6 +275,7 @@ class RiskReservationService:
             bankroll_source_configured=bankroll_source_configured,
             start_time_provider=start_time_provider,
             halt_inputs=halt_inputs,
+            book_risk=book_risk,
         )
         enforced = self._split(raw)
         if enforced:

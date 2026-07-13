@@ -57,6 +57,7 @@ from combomaker.risk.limits import (
     DailyPnl,
     HaltInputs,
     LimitChecker,
+    PortfolioRisk,
     StartTimeProvider,
     StarvationWatchdog,
 )
@@ -70,6 +71,8 @@ from combomaker.risk.skew import (
     compute_inventory_skew,
     decide_widen_or_decline,
 )
+from combomaker.sim.book_model import WithinGameRhoProvider, build_book_model
+from combomaker.sim.book_risk import BookRiskSnapshot, compute_book_risk
 
 log = get_logger(__name__)
 
@@ -98,6 +101,27 @@ class LifecycleConfig:
     quote_ttl_s: float = 30.0
     reprice_threshold_cc: int = 100
     exchange_active: bool = True  # updated by the exchange-status poller
+    # Portfolio-CVaR book-risk MC (armed off the slow loop; never inside check()).
+    # ``book_risk_mc_samples`` is smaller than the report's 100k because this runs
+    # on the maintenance cadence and only feeds the operative-ES cap; it is still
+    # a full portfolio MC. ``book_risk_stale_after_s`` is the freshness window: a
+    # non-empty book whose latest snapshot is older than this (or was never built)
+    # fails the CVaR cap CLOSED (UNKNOWN tail is never safe). ``book_risk_seed``
+    # keeps the MC deterministic/auditable.
+    book_risk_mc_samples: int = 20_000
+    book_risk_stale_after_s: float = 30.0
+    book_risk_seed: int = 7
+
+
+@dataclass(frozen=True, slots=True)
+class _StaleBookRisk:
+    """A fail-closed ``PortfolioRisk`` sentinel: a NON-empty book whose book-risk
+    snapshot is stale/absent must still make the CVaR cap BREACH (UNKNOWN joint
+    tail is never safe). ``usable`` False ⇒ the cap fails closed regardless of the
+    ES value; ``operative_es_99_cc`` is 0.0 and never read on the unusable path."""
+
+    usable: bool = False
+    operative_es_99_cc: float = 0.0
 
 
 @dataclass
@@ -136,6 +160,7 @@ class QuoteLifecycle:
         balance_tracker: BalanceTracker | None = None,
         start_time_provider: StartTimeProvider | None = None,
         starvation_watchdog: StarvationWatchdog | None = None,
+        within_game_rho: WithinGameRhoProvider | None = None,
         reservation: RiskReservationService | None = None,
         skew_params: SkewParams | None = None,
         skew_limits: SkewLimits | None = None,
@@ -169,6 +194,22 @@ class QuoteLifecycle:
         self._balance = balance_tracker
         self._start_time_provider = start_time_provider
         self._watchdog = starvation_watchdog
+        # Phase 4: the PRICER's real within-game rho for the portfolio-CVaR book
+        # risk MC. Threaded into build_book_model so the MC's joint tail uses the
+        # SHIPPED per-pair correlations (not the flat DEFAULT_FLAT_BAND). Omitted ⇒
+        # the MC falls back to the flat band (the pre-wire behaviour); the cap
+        # still arms, just off a coarser correlation view.
+        self._within_game_rho = within_game_rho
+        # Latest full-MC book-risk snapshot + the monotonic time it was built.
+        # Armed by recompute_book_risk() off the slow loop; READ (never recomputed)
+        # inside check() via _book_risk_for_check(), which keeps check() cheap. A
+        # non-empty book with a stale/absent snapshot fails the CVaR cap CLOSED.
+        self._book_risk: BookRiskSnapshot | None = None
+        self._book_risk_mono_ns: int | None = None
+        # Throttle the MC recompute to comfortably inside the freshness window
+        # (half of it) so the snapshot stays fresh without running a full MC every
+        # 0.5s maintenance tick. None ⇒ never refreshed yet.
+        self._book_risk_refresh_mono_ns: int | None = None
         # R3 Phase 3: single-writer risk-reservation service. When present, the
         # confirm path RESERVES headroom (atomic + versioned) BEFORE the confirm
         # round-trip and commits/releases/marks-unconfirmed based on the outcome —
@@ -254,6 +295,74 @@ class QuoteLifecycle:
             current_equity_cc=self._balance.exchange_equity_cc_or_none(),
         )
 
+    # ------------------------------------------------ portfolio-CVaR book risk
+
+    def recompute_book_risk(self) -> None:
+        """Arm the portfolio-CVaR cap: build a fresh full-MC ``BookRiskSnapshot``
+        over the REAL book and store it (with the monotonic time it was built).
+
+        Runs OFF the hot path (the slow/maintenance loop) — never inside check().
+        The book model threads the PRICER's real ``within_game_rho`` (so the joint
+        tail carries the shipped per-pair correlations, not the flat default band)
+        and the live ``bankroll_cc`` (so the ruin thresholds populate). An empty
+        book stores an empty (unusable) snapshot; a missing marginal makes the
+        model UNKNOWN and the snapshot unusable (fail-closed downstream).
+
+        Never raises on the loop: any failure leaves the LAST snapshot to age out
+        (the freshness guard in ``_book_risk_for_check`` then fails the cap closed
+        for a non-empty book) rather than crashing the maintenance tick."""
+        try:
+            positions = list(self._exposure.positions.values())
+            model = build_book_model(
+                positions,
+                marginals=self._marginals,
+                within_game_rho=self._within_game_rho,
+            )
+            snap = compute_book_risk(
+                model,
+                n_samples=self._config.book_risk_mc_samples,
+                seed=self._config.book_risk_seed,
+                band="high",
+                bankroll_cc=self._risk_bankroll_cc(),
+            )
+            self._book_risk = snap
+            self._book_risk_mono_ns = self._clock.monotonic_ns()
+            if snap.usable:
+                log.info(
+                    "book_risk_snapshot",
+                    n_positions=snap.n_positions,
+                    operative_es_99_cc=int(snap.operative_es_99_cc),
+                    es_99_cc=int(snap.es_99_cc),
+                    challenger_es_99_cc=int(snap.challenger_es_99_cc),
+                    deterministic_stress_cc=int(snap.deterministic_stress_cc),
+                )
+        except Exception:
+            log.exception("book_risk_recompute_failed")
+
+    def _book_risk_for_check(self) -> PortfolioRisk | None:
+        """The book-risk snapshot to feed ``check()``'s portfolio-CVaR cap.
+
+        Rules (fail-closed; UNKNOWN joint tail is never safe):
+          - EMPTY book (no committed positions) ⇒ None: the CVaR cap is simply not
+            evaluated (nothing to cap; an empty book must still quote).
+          - NON-EMPTY book with NO snapshot yet, or a snapshot older than
+            ``book_risk_stale_after_s`` ⇒ a ``_StaleBookRisk`` sentinel
+            (``usable=False``) so the cap FAILS CLOSED — the book carries a joint
+            tail we have not measured recently.
+          - Otherwise ⇒ the latest snapshot (which itself fails closed when its
+            ``usable`` is False, e.g. an UNKNOWN marginal made the model no-go).
+        Cheap: reads stored state + one clock read; never runs MC."""
+        if not self._exposure.positions:
+            return None
+        snap = self._book_risk
+        stamp = self._book_risk_mono_ns
+        if snap is None or stamp is None:
+            return _StaleBookRisk()  # non-empty book, never measured ⇒ fail closed
+        age_s = (self._clock.monotonic_ns() - stamp) / 1e9
+        if age_s > self._config.book_risk_stale_after_s:
+            return _StaleBookRisk()  # snapshot too old ⇒ fail closed
+        return snap
+
     def _partition_breaches(self, breaches: list[Breach]) -> list[Breach]:
         """Split R2 SHADOW breaches (log-only) from enforced breaches.
 
@@ -317,6 +426,7 @@ class QuoteLifecycle:
             bankroll_source_configured=self._bankroll_source_configured(),
             start_time_provider=self._start_time_provider,
             halt_inputs=self._halt_inputs(),
+            book_risk=self._book_risk_for_check(),
         )
         return result.granted
 
@@ -402,6 +512,7 @@ class QuoteLifecycle:
             bankroll_source_configured=self._bankroll_source_configured(),
             start_time_provider=self._start_time_provider,
             halt_inputs=self._halt_inputs(),
+            book_risk=self._book_risk_for_check(),
         )
         # Watchdog sees the ISSUE decision: any breach (enforced OR shadow) is a
         # would-be decline; only a fully clean check is a real issue (reset). This
@@ -809,9 +920,25 @@ class QuoteLifecycle:
             unrealized += value - position.max_loss_cc
         self.daily_pnl = DailyPnl(realized_cc=self._realized_pnl_cc, unrealized_cc=unrealized)
 
+    def _maybe_recompute_book_risk(self) -> None:
+        """Refresh the portfolio-CVaR snapshot off the maintenance tick, throttled
+        to half the freshness window so it stays fresh without running a full MC
+        every 0.5s. The MC itself is off the hot path (never inside check())."""
+        now = self._clock.monotonic_ns()
+        interval_ns = int(self._config.book_risk_stale_after_s / 2 * 1e9)
+        last = self._book_risk_refresh_mono_ns
+        if last is not None and now - last < interval_ns:
+            return
+        self._book_risk_refresh_mono_ns = now
+        self.recompute_book_risk()
+
     async def maintenance_tick(self) -> None:
         """TTL expiry + reprice + P&L mark + daily-loss halt. Every few 100ms."""
         self._refresh_daily_pnl()
+        # Arm/refresh the portfolio-CVaR book-risk snapshot (throttled, off the hot
+        # path) BEFORE the check below reads it, so the maintenance-driven halt
+        # escalation sees a current joint-tail figure.
+        self._maybe_recompute_book_risk()
         if not self._killswitch.halted:
             breaches = self._partition_breaches(
                 self._limits.check(
@@ -822,6 +949,7 @@ class QuoteLifecycle:
                     bankroll_source_configured=self._bankroll_source_configured(),
                     start_time_provider=self._start_time_provider,
                     halt_inputs=self._halt_inputs(),
+                    book_risk=self._book_risk_for_check(),
                 )
             )
             for breach in breaches:
@@ -1090,6 +1218,7 @@ class QuoteLifecycle:
                 bankroll_source_configured=self._bankroll_source_configured(),
                 start_time_provider=self._start_time_provider,
                 halt_inputs=self._halt_inputs(),
+                book_risk=self._book_risk_for_check(),
             )
         )
         # Straddle safety (Phase 3): re-run the schedule-based pregame gate —

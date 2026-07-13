@@ -156,6 +156,16 @@ class PricingEngine:
             else None
         )
 
+    @property
+    def sgp_params(self) -> SgpParams:
+        """The SHIPPED same-game-parlay correlation params this engine prices
+        with. Read-only accessor (exposes already-built state; no pricing
+        behaviour changes) so the book-risk MC can thread the REAL within-game
+        rho through ``build_sgp_correlation`` — the exact function the pricer
+        calls — instead of the flat book-model default band (hard rule 8: reuse,
+        never reimplement the correlation numbers)."""
+        return self._sgp_params
+
     def price(
         self,
         rfq: Rfq,

@@ -59,6 +59,8 @@ from combomaker.risk.reservation import (
 )
 from combomaker.risk.settlement import SettlementHandler, SettlementPoller
 from combomaker.risk.skew import SkewLimits, SkewParams, WidenPolicyParams
+from combomaker.sim.book_model import WithinGameRhoProvider
+from combomaker.sim.within_game_rho import sgp_within_game_rho_provider
 
 log = get_logger(__name__)
 
@@ -266,6 +268,11 @@ class QuoteApp:
             )
             fee_type = FeeType.parse(fee_cfg.default_fee_type)
             fee_multiplier = Fraction(Decimal(fee_cfg.default_multiplier))
+            # The PRICER's real within-game rho, built ONCE from the engine's
+            # shipped SgpParams via the pricer's own build_sgp_correlation. Shared
+            # by the lifecycle's portfolio-CVaR MC AND the observability report MC
+            # so BOTH use the same per-pair correlations we quote on.
+            within_game_rho = sgp_within_game_rho_provider(engine.sgp_params)
             lifecycle = QuoteLifecycle(
                 clock=self._clock,
                 sender=sender,
@@ -291,6 +298,11 @@ class QuoteApp:
                 # the filter already uses (peek-only, hot-path safe, no network).
                 start_time_provider=rfq_filter.leg_start_time,
                 starvation_watchdog=watchdog,
+                # Portfolio-CVaR MC: the PRICER's real within-game rho (built from
+                # the engine's shipped SgpParams via the pricer's own
+                # build_sgp_correlation) so the book-risk joint tail uses the same
+                # per-pair correlations we quote on, not the flat default band.
+                within_game_rho=within_game_rho,
                 # Phase 5 quoting policies (DARK by default; see above).
                 skew_params=skew_params,
                 skew_limits=skew_limits,
@@ -420,7 +432,10 @@ class QuoteApp:
                     name="exchange-status",
                 ),
                 asyncio.create_task(
-                    self._report_loop(store, exposure, lifecycle), name="report"
+                    self._report_loop(
+                        store, exposure, lifecycle, within_game_rho, balance_tracker
+                    ),
+                    name="report",
                 ),
                 asyncio.create_task(
                     self._balance_loop(rest, balance_tracker), name="balance-poll"
@@ -868,7 +883,12 @@ class QuoteApp:
         )
 
     async def _report_loop(
-        self, store: Store, exposure: ExposureBook, lifecycle: QuoteLifecycle
+        self,
+        store: Store,
+        exposure: ExposureBook,
+        lifecycle: QuoteLifecycle,
+        within_game_rho: WithinGameRhoProvider,
+        balance_tracker: BalanceTracker,
     ) -> None:
         while True:
             await asyncio.sleep(300.0)
@@ -878,6 +898,12 @@ class QuoteApp:
                     env=str(self._config.env),
                     exposure=exposure,
                     marginals=lifecycle._marginals,  # noqa: SLF001 (wiring seam)
+                    # The observability MC uses the SAME real per-pair correlations
+                    # the quoted book carries (not the flat band) + the live
+                    # bankroll so its ruin thresholds populate. Non-raising bankroll
+                    # accessor: None when stale ⇒ the report MC skips ruin bands.
+                    within_game_rho=within_game_rho,
+                    bankroll_cc=balance_tracker.risk_bankroll_cc_or_none(),
                 )
                 log.info("periodic_report", report=format_report(report))
             except Exception:
