@@ -24,6 +24,7 @@ from combomaker.core.conventions import load_conventions
 from combomaker.core.money import CentiCents
 from combomaker.core.reasons import ReasonCode
 from combomaker.exchange.auth import Credentials, RequestSigner
+from combomaker.exchange.quote_query import list_open_quotes, open_quote_ids
 from combomaker.exchange.rest import KalshiApiError, KalshiRestClient, RateLimitedError
 from combomaker.exchange.ws import WsManager
 from combomaker.marketdata.feed import OrderbookFeed
@@ -652,32 +653,18 @@ class QuoteApp:
         keep the ``needs_reconcile`` block in place — a bot that couldn't reach
         the exchange has NOT proven its book and must not resume quoting."""
         try:
-            # Cursor-paginate to exhaustion: a startup leftover-cancel must see
-            # EVERY resting quote, not just the first page — the same kill-path
-            # gap the supervisor's list_open_quote_ids closes. limit=500 is the
-            # /communications/quotes documented max (docs/api-notes; NOT 1000).
-            leftover: list[dict[str, object]] = []
-            cursor = ""
-            for _ in range(1000):  # bounded belt-and-braces vs a non-terminating cursor
-                params: dict[str, str | int] = {
-                    "user_filter": "self",
-                    "status": "open",
-                    "limit": 500,
-                }
-                if cursor:
-                    params["cursor"] = cursor
-                payload = await rest.get_quotes(**params)
-                leftover.extend(payload.get("quotes", []) or [])
-                cursor = str(payload.get("cursor") or "")
-                if not cursor:
-                    break
-            for quote in leftover:
-                quote_id = str(quote.get("id") or quote.get("quote_id") or "")
-                if quote_id:
-                    try:
-                        await rest.delete_quote(quote_id)
-                    except KalshiApiError as exc:
-                        log.warning("startup_cancel_failed", quote_id=quote_id, error=str(exc))
+            # Enumerate leftover resting quotes via the SHARED bounded+retrying
+            # helper (cursor-paginated, min_ts/max_ts windowed so it never trips
+            # the exchange circuit-breaker with a full-history scan, 5xx-retried).
+            # Same helper the supervisor's kill-path uses — see exchange/quote_query.
+            leftover = await list_open_quotes(
+                rest, int(self._clock.now().timestamp())
+            )
+            for quote_id in open_quote_ids(leftover):
+                try:
+                    await rest.delete_quote(quote_id)
+                except KalshiApiError as exc:
+                    log.warning("startup_cancel_failed", quote_id=quote_id, error=str(exc))
             log.info("startup_reconciled", leftover_quotes=len(leftover))
             positions = await rest.get_positions()
             if positions.get("market_positions") or positions.get("positions"):

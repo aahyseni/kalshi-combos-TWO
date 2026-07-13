@@ -424,41 +424,26 @@ class KalshiSupervisorExchange:
     """Production ``SupervisorExchange`` over ``KalshiRestClient`` built with the
     supervisor's OWN credential. Thin: list our open quotes, cancel one."""
 
-    def __init__(self, rest: object) -> None:
+    def __init__(self, rest: object, clock: Clock) -> None:
         # ``rest`` is a KalshiRestClient; typed as object to keep this module
         # importable without pulling the aiohttp client into unit tests.
         self._rest = rest
+        self._clock = clock
 
     async def list_open_quote_ids(self) -> list[str]:
-        # Cursor-paginate to exhaustion: an emergency cancel-all must see EVERY
-        # resting quote, not just the first page. Kalshi paginates
-        # /communications/quotes via a top-level ``cursor`` that comes back
-        # empty/absent when there are no more pages (docs/api-notes/index-scan.md).
-        # A bounded loop (belt-and-braces vs a server that never terminates the
-        # cursor) capped well above any realistic open-quote count.
-        ids: list[str] = []
-        cursor: str = ""
-        for _ in range(1000):
-            params: dict[str, str | int] = {
-                "user_filter": "self",
-                "status": "open",
-                # /communications/quotes caps limit at 500 (docs/api-notes/
-                # index-scan.md + live-data.md; NOT the 1000 of /portfolio/orders).
-                # An over-range limit risks a 400 that would make the emergency
-                # cancel-all enumerate NOTHING — hard rule 4 (docs beat guesses).
-                "limit": 500,
-            }
-            if cursor:
-                params["cursor"] = cursor
-            payload = await self._rest.get_quotes(**params)  # type: ignore[attr-defined]
-            for quote in payload.get("quotes", []) or []:
-                quote_id = str(quote.get("id") or quote.get("quote_id") or "")
-                if quote_id:
-                    ids.append(quote_id)
-            cursor = str(payload.get("cursor") or "")
-            if not cursor:
-                break
-        return ids
+        # SHARED bounded+retrying enumeration: cursor-paginated, min_ts/max_ts
+        # windowed so the emergency cancel-all NEVER trips the exchange
+        # circuit-breaker with a full-history scan (which 500/504s — verified
+        # 2026-07-13, NOTES.md), and 5xx-retried so a transient fail-fast
+        # cooldown doesn't abort the kill. Lazy import keeps this module
+        # importable without the aiohttp client. See exchange/quote_query.
+        from combomaker.exchange.quote_query import list_open_quotes, open_quote_ids
+
+        quotes = await list_open_quotes(
+            self._rest,  # type: ignore[arg-type]
+            int(self._clock.now().timestamp()),
+        )
+        return open_quote_ids(quotes)
 
     async def cancel_quote(self, quote_id: str) -> None:
         await self._rest.delete_quote(quote_id)  # type: ignore[attr-defined]
@@ -510,7 +495,7 @@ async def _run_supervisor_cli(env: str, config_path: Path | None) -> int:
     )
     signer = RequestSigner(creds, clock)
     async with KalshiRestClient(app_config.endpoints.rest_base_url, signer) as rest:
-        exchange = KalshiSupervisorExchange(rest)
+        exchange = KalshiSupervisorExchange(rest, clock)
         supervisor = SafetySupervisor(sup_config, clock, exchange=exchange)
         await supervisor.run()
     return 0

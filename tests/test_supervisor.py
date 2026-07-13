@@ -266,7 +266,7 @@ async def test_list_open_quote_ids_paginates_to_exhaustion() -> None:
     # just the first page (regression for the single-page cancel-all miss).
     ids = [f"q{i}" for i in range(25)]
     rest = PagingRest(ids, page_size=10)
-    adapter = KalshiSupervisorExchange(rest)
+    adapter = KalshiSupervisorExchange(rest, FakeClock())
     got = await adapter.list_open_quote_ids()
     assert got == ids
     assert len(rest.cursors_seen) == 3  # looped: page 1 (""), page 2, page 3
@@ -275,7 +275,7 @@ async def test_list_open_quote_ids_paginates_to_exhaustion() -> None:
 async def test_list_open_quote_ids_single_page_when_no_cursor() -> None:
     ids = ["q1", "q2"]
     rest = PagingRest(ids, page_size=100)  # everything fits ⇒ empty next cursor
-    adapter = KalshiSupervisorExchange(rest)
+    adapter = KalshiSupervisorExchange(rest, FakeClock())
     assert await adapter.list_open_quote_ids() == ids
     assert rest.cursors_seen == [""]  # one request, no follow-up page
 
