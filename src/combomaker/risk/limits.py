@@ -136,9 +136,11 @@ class LimitChecker:
                 )
             )
         # Loss axis (premium at risk), per GAME cluster. R2 will add a separate
-        # game-payout / bankroll-utilization cap on snapshot.payout_obligation_
-        # by_game_cc — a distinct axis that must NEVER be summed with this loss
-        # ceiling (R1/R2 correctness invariant #2). The seam is here.
+        # game-notional / capital-utilization cap on
+        # snapshot.gross_settlement_notional_by_game_cc — a distinct axis that
+        # must NEVER be summed with this loss ceiling, and on which NO cash/loss
+        # cap may bind (it is not capital-at-risk) — R1/R2 correctness invariant
+        # #2. The seam is here.
         for game, loss_cc in snapshot.worst_case_loss_by_game_cc.items():
             if loss_cc / 10_000 > limits.max_event_worst_case_loss_dollars:
                 breaches.append(

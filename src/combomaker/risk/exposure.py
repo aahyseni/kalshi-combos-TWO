@@ -12,8 +12,9 @@ data.
 Two money axes, NEVER summed (B1, R1/R2 invariant #2):
 - ``max_loss_cc`` = premium PAID = our TRUE max loss on the side we hold (a long
   NO forfeits its premium if the parlay HITS, not the $1 payout). The LOSS axis.
-- ``payout_obligation_cc`` = contracts x $1 = gross bankroll lock-up. The
-  CAPITAL-UTILIZATION axis (the "$23.5M payout for $1.8M premium" dimension).
+- ``gross_settlement_notional_cc`` = contracts x $1 = gross settlement notional.
+  The CAPITAL-UTILIZATION axis (the "$23.5M payout for $1.8M premium" dimension).
+  NOT capital-at-risk and NOT a cash lock — no cash/loss cap may consume it.
 
 Delta convention: exposure to leg L is in contracts-equivalent — the change in
 portfolio value, in dollars, per +1.00 change in P(L settles YES). Analytic
@@ -82,14 +83,16 @@ class OpenPosition:
         collateral the TAKER posted for their YES.
 
         This is the LOSS axis. It feeds daily-loss / genuine-P&L-at-risk caps.
-        It must NEVER be summed with ``payout_obligation_cc`` (the bankroll
-        lock-up axis) — R1/R2 correctness invariant #2. The two are orthogonal.
+        It must NEVER be summed with ``gross_settlement_notional_cc`` (the
+        capital-utilization axis) — R1/R2 correctness invariant #2. The two are
+        orthogonal.
         """
         return int(self.contracts) * int(self.entry_price_cc) // 100
 
     @property
-    def payout_obligation_cc(self) -> int:
-        """Gross bankroll lock-up = contracts x $1 — the SEPARATE capital axis.
+    def gross_settlement_notional_cc(self) -> int:
+        """Gross settlement notional = contracts x $1; NOT capital-at-risk and
+        NOT a cash lock — do not cap cash/loss on this axis.
 
         For a sell-only long-NO position, when the parlay HITS the taker's YES
         pays $1/contract, collateralized against the bankroll while the position
@@ -99,7 +102,7 @@ class OpenPosition:
         ``max_loss_cc``). Verified ground truth: 1.00 contract -> $1.00.
 
         Kept on a distinct axis so the R2 cluster/tail/utilization caps can bind
-        on payout while daily-loss caps bind on premium. NEVER summed with
+        on notional while daily-loss caps bind on premium. NEVER summed with
         ``max_loss_cc`` (R1/R2 correctness invariant #2).
         """
         return int(self.contracts) * CC_PER_DOLLAR // 100
@@ -179,10 +182,12 @@ class ExposureSnapshot:
     # comonotone premium worst case — every combo on the game resolving adverse
     # together). This is genuine P&L-at-risk.
     worst_case_loss_by_game_cc: dict[str, int]
-    # BANKROLL / capital-utilization axis, per game: Σ payout_obligation_cc
-    # (contracts x $1) over positions touching the game. NEVER summed with the
-    # loss axis (R1/R2 correctness invariant #2). New in B2.
-    payout_obligation_by_game_cc: dict[str, int]
+    # GROSS SETTLEMENT NOTIONAL / capital-utilization axis, per game:
+    # Σ gross_settlement_notional_cc (contracts x $1) over positions touching
+    # the game. NOT capital-at-risk and NOT a cash lock — no cash/loss cap may
+    # consume it. NEVER summed with the loss axis (R1/R2 correctness invariant
+    # #2). New in B2.
+    gross_settlement_notional_by_game_cc: dict[str, int]
     open_quote_count: int
     unknown_marginals: bool                 # any delta was uncomputable
 
@@ -234,12 +239,12 @@ class ExposureBook:
         event_ticker) — the copula's correlation unit — so a match's market
         families cluster into ONE bucket. The E2 mass-acceptance dominance bound
         (sign-aligned magnitude, per-aggregate worse side) is preserved verbatim
-        on every axis, including the new payout-obligation one.
+        on every axis, including the gross-settlement-notional one.
         """
         delta_market: dict[str, float] = defaultdict(float)
         delta_game: dict[str, float] = defaultdict(float)
         game_worst: dict[str, int] = defaultdict(int)      # LOSS axis (premium)
-        game_payout: dict[str, int] = defaultdict(int)     # BANKROLL axis ($1/ct)
+        game_notional: dict[str, int] = defaultdict(int)   # NOTIONAL axis ($1/ct)
         gross_cc = 0
         unknown = False
 
@@ -257,7 +262,7 @@ class ExposureBook:
             }
             for game in games:
                 game_worst[game] += position.max_loss_cc
-                game_payout[game] += position.payout_obligation_cc
+                game_notional[game] += position.gross_settlement_notional_cc
             if deltas is not None:
                 # Leg market tickers are unique within a position (duplicate
                 # legs are rejected by the relationship classifier upstream).
@@ -273,16 +278,16 @@ class ExposureBook:
                 if not hypos:
                     continue
                 # Worst side on each money axis (independently — the loss and
-                # payout worst sides are the same side here, but computed per
+                # notional worst sides are the same side here, but computed per
                 # axis so the invariant never depends on that coincidence).
                 gross_cc += max(h.max_loss_cc for h in hypos)
                 worst_loss = max(h.max_loss_cc for h in hypos)
-                worst_payout = max(h.payout_obligation_cc for h in hypos)
+                worst_notional = max(h.gross_settlement_notional_cc for h in hypos)
                 for game in {
                     game_key(leg.event_ticker) for leg in quote.legs if leg.event_ticker
                 }:
                     game_worst[game] += worst_loss
-                    game_payout[game] += worst_payout
+                    game_notional[game] += worst_notional
                 # Sign-aligned delta bound per market/game.
                 per_market: dict[str, float] = defaultdict(float)
                 for hypo in hypos:
@@ -312,7 +317,7 @@ class ExposureBook:
             delta_by_game=dict(delta_game),
             gross_notional_cc=gross_cc,
             worst_case_loss_by_game_cc=dict(game_worst),
-            payout_obligation_by_game_cc=dict(game_payout),
+            gross_settlement_notional_by_game_cc=dict(game_notional),
             open_quote_count=len(self.open_quotes),
             unknown_marginals=unknown,
         )

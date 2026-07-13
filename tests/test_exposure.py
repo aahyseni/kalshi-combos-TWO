@@ -166,8 +166,8 @@ class TestOpenPositionMaxLoss:
 
 class TestB1SideAwareAxesGroundTruth:
     """B1 anchored to the 2026-07-10 demo settlement: LONG NO 1.00 ct paid
-    $0.50 -> max_loss $0.50 (true loss if it HITS), payout_obligation $1.00
-    (bankroll lock-up). Two axes, never summed."""
+    $0.50 -> max_loss $0.50 (true loss if it HITS), gross_settlement_notional
+    $1.00 (capital-utilization axis). Two axes, never summed."""
 
     def test_demo_no_position_max_loss_is_the_premium(self) -> None:
         pos = make_position(
@@ -175,30 +175,30 @@ class TestB1SideAwareAxesGroundTruth:
         )
         assert pos.max_loss_cc == 5_000            # $0.50 — what we PAID / can lose
 
-    def test_demo_no_position_payout_obligation_is_one_dollar(self) -> None:
+    def test_demo_no_position_gross_settlement_notional_is_one_dollar(self) -> None:
         pos = make_position(
             "demo", TWO_YES_LEGS, our_side=Side.NO, contracts=100, entry_price=5_000
         )
-        assert pos.payout_obligation_cc == 10_000  # $1.00 — bankroll lock-up
+        assert pos.gross_settlement_notional_cc == 10_000  # $1.00 — notional axis
 
     def test_two_axes_are_independent_never_summed(self) -> None:
         pos = make_position(
             "demo", TWO_YES_LEGS, our_side=Side.NO, contracts=100, entry_price=5_000
         )
-        # The loss axis depends on price paid; the payout axis does NOT.
-        assert pos.max_loss_cc != pos.payout_obligation_cc
+        # The loss axis depends on price paid; the notional axis does NOT.
+        assert pos.max_loss_cc != pos.gross_settlement_notional_cc
         cheaper = make_position(
             "c", TWO_YES_LEGS, our_side=Side.NO, contracts=100, entry_price=1_000
         )
-        assert cheaper.max_loss_cc == 1_000               # loss axis moved
-        assert cheaper.payout_obligation_cc == 10_000     # payout axis fixed at $1/ct
+        assert cheaper.max_loss_cc == 1_000                       # loss axis moved
+        assert cheaper.gross_settlement_notional_cc == 10_000     # notional fixed $1/ct
 
-    def test_payout_obligation_is_price_independent(self) -> None:
+    def test_gross_settlement_notional_is_price_independent(self) -> None:
         for price in (1, 2_500, 5_000, 9_999):
             pos = make_position(
                 "p", TWO_YES_LEGS, our_side=Side.NO, contracts=250, entry_price=price
             )
-            assert pos.payout_obligation_cc == 25_000  # 2.50 ct x $1, always
+            assert pos.gross_settlement_notional_cc == 25_000  # 2.50 ct x $1, always
 
 
 class TestHypotheticalPositions:
@@ -334,8 +334,8 @@ class TestB2GameClustering:
         assert set(snap.worst_case_loss_by_game_cc) == {GAME}
         # Loss axis: both premiums sum into the single game cluster.
         assert snap.worst_case_loss_by_game_cc[GAME] == 5_000 + 4_000
-        # Payout axis: both $1/ct obligations sum into the same cluster.
-        assert snap.payout_obligation_by_game_cc[GAME] == 10_000 + 10_000
+        # Notional axis: both $1/ct notionals sum into the same cluster.
+        assert snap.gross_settlement_notional_by_game_cc[GAME] == 10_000 + 10_000
         # Delta axis also game-keyed to one bucket.
         assert set(snap.delta_by_game) == {GAME}
 
