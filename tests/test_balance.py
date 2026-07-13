@@ -225,6 +225,32 @@ class TestRealizedLedger:
                 Settlement.binary("x", Side.NO, Q(100), CC(5_000), settled_yes=False)
             )
 
+    def test_scalar_payout_lands_exactly_on_the_cent(self) -> None:
+        # DEFECT-1 regression: int(0.57*10000) floats to 5699 -> a spurious 1cc
+        # under-floor that mismatches the exchange ledger (V=0.57 => NO pays
+        # exactly $0.43 = 4300cc). round() recovers the true grid value, so the
+        # book matches Kalshi to the cent and never false-trips the reconcile HALT.
+        for v, want_realized in ((0.57, -700), (0.69, -1900)):
+            bt, _clock = tracker()
+            realized = bt.apply_settlement(
+                Settlement(f"scalar-{v}", Side.NO, Q(100), CC(5_000), settled_value=v)
+            )
+            assert realized == want_realized, f"V={v}: {realized} != {want_realized}"
+
+    def test_raised_settlement_is_not_poison_pilled(self) -> None:
+        # DEFECT-2 regression: a settlement that RAISES (convention not yet
+        # verified) must NOT be marked settled — else a replay after the
+        # convention is verified is silently dropped, permanently under-counting
+        # realized P&L. The id is added only on the booking path (after the guard).
+        bt, _clock = tracker(NO_UNVERIFIED)
+        s = Settlement.binary("replay", Side.NO, Q(100), CC(5_000), settled_yes=False)
+        with pytest.raises(StaleBalanceError):
+            bt.apply_settlement(s)
+        assert bt.settled_count == 0            # the raise did NOT mark it settled
+        # A VERIFIED tracker books the same settlement cleanly (not poison-pilled).
+        bt2, _c2 = tracker()
+        assert bt2.apply_settlement(s) == 5_000
+
     def test_long_yes_mirror_hit_wins(self) -> None:
         # Defensive (not sell-only): LONG YES, parlay HITS (V=1) -> YES pays $1.
         bt, _clock = tracker()

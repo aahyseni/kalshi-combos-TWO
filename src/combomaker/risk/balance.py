@@ -154,7 +154,12 @@ def _no_payout_per_contract_cc(settled_value: float) -> int:
     Binary V ∈ {0,1} is exact either way (V=0 → $1.00, V=1 → $0.00). A scalar
     that already lands on the grid (e.g. 0.70 → 7,000 cc) is likewise exact.
     """
-    v_cc = int(settled_value * CC_PER_DOLLAR)  # floor V onto the cc grid
+    # V arrives ALREADY floored onto Kalshi's cent grid by the DNP settlement
+    # convention, so we only convert it to cc — round(), not int(): the float
+    # int(0.57 * 10000) is 5699.999… → 5699 (a spurious 1cc under-floor that
+    # would trip HALT_RECONCILIATION_MISMATCH), whereas round() recovers the
+    # true grid value 5700. Grid-aligned V ⇒ round == the intended floor.
+    v_cc = round(settled_value * CC_PER_DOLLAR)
     return CC_PER_DOLLAR - v_cc
 
 
@@ -416,7 +421,6 @@ class BalanceTracker:
         """
         if settlement.position_id in self._settled_ids:
             return 0
-        self._settled_ids.add(settlement.position_id)
 
         contracts = int(settlement.contracts)
         premium_paid_cc = contracts * int(settlement.entry_price_cc) // 100
@@ -434,7 +438,12 @@ class BalanceTracker:
             payout_per_ct_cc = _no_payout_per_contract_cc(settlement.settled_value)
         else:
             # LONG YES pays V per contract (the mirror; defensive path).
-            payout_per_ct_cc = int(settlement.settled_value * CC_PER_DOLLAR)
+            payout_per_ct_cc = round(settlement.settled_value * CC_PER_DOLLAR)
+
+        # Mark settled ONLY after every raising guard above, so a settlement that
+        # raised (e.g. convention not yet verified) can be replayed and booked
+        # once the guard clears — idempotency without a poison-pill drop.
+        self._settled_ids.add(settlement.position_id)
         payout_cc = contracts * payout_per_ct_cc // 100
 
         realized_cc = payout_cc - premium_paid_cc - fee_cc
