@@ -21,13 +21,25 @@ the multi-week data that will decide the edge.
 
 ## Phase 0 — Credentials + cap sign-off (off-exchange, do first)
 
+**Note on the one-account (SSN) limit:** Kalshi limits *accounts*, not *API keys*.
+You can create MULTIPLE API keys under one account (`kalshi.com/account/profile →
+Create New API Key`; `get-api-keys`/`create-api-key` endpoints). Demo and prod keys
+are separate environments — demo keys only hit `demo.kalshi.co`, prod only
+`kalshi.com`. So keep your existing DEMO keys in `.env` for Phases 1-2; create the
+PROD keys at Phase 3.
+
 - [ ] **Bot credential** (env only, never committed): `KALSHI_API_KEY_ID` +
-  `KALSHI_PRIVATE_KEY_PATH` (or `KALSHI_PRIVATE_KEY_PEM`).
-- [ ] **SEPARATE supervisor credential** — a DISTINCT Kalshi API key:
-  `KALSHI_SUPERVISOR_API_KEY_ID` + `KALSHI_SUPERVISOR_PRIVATE_KEY_PATH` (or
-  `_PEM`). It MUST be a different key from the bot's, so a throttled/compromised
-  bot key can't disable the kill path. Without it the supervisor runs KILL-only
-  (no cancel) and the prod preflight `external_kill_reachable` gate fails.
+  `KALSHI_PRIVATE_KEY_PATH` (or `KALSHI_PRIVATE_KEY_PEM`). Demo now; prod at Phase 3.
+- [ ] **Supervisor credential** — `KALSHI_SUPERVISOR_API_KEY_ID` +
+  `KALSHI_SUPERVISOR_PRIVATE_KEY_PATH` (or `_PEM`). BEST: a SECOND API key on the
+  SAME account (scope `write::trade`) — key-level isolation so a rotated/revoked
+  bot key doesn't kill the cancel path. FALLBACK (fine at $2k): set it to the SAME
+  key as the bot — the supervisor is still a separate process that catches the main
+  failure (bot event-loop wedge/crash) and fires KILL + cancel-all; you only lose
+  key-level ban isolation. Without ANY supervisor credential it runs KILL-only (no
+  cancel) and the prod preflight `external_kill_reachable` gate fails.
+  RESIDUAL (accepted at tiny scale): same host ⇒ a host crash kills both, but then
+  nothing is quoting and startup reconcile + cancel-all handle resting orders.
 - [ ] **Review + freeze the cap values.** The $2k caps (game 8%/$160, per-combo
   1%/$20, directional 10%, slate 8%, daily 6%, drawdown 10%, hard-trip 12%,
   utilization 3×, portfolio-CVaR 15%) are research-derived defaults, now ENFORCED
