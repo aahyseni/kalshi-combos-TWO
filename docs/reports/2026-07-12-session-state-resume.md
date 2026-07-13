@@ -1,4 +1,4 @@
-# SESSION STATE / RESUME — 2026-07-12 (supersedes 2026-07-11-session-state-resume.md)
+# SESSION STATE / RESUME — 2026-07-12 (updated 2026-07-13; supersedes 2026-07-11)
 
 **If you are a fresh Claude/operator session: read this file, then
 `docs/reports/README.md` newest-first, then `docs/research/RISK_BUILD_PLAN.md`
@@ -7,8 +7,8 @@ The operator memory (`project_kct_resume_state`) mirrors this.**
 
 ## Repo state
 
-- `main` @ `6b5c76f` (pushed; check `git log --oneline -5`), tree clean,
-  **suite 1355 passed / 0 failed** (`uv run pytest -q`).
+- `main` @ `632cc1f` (pushed; check `git log --oneline -5`), tree clean,
+  **suite 1406 passed / 0 failed** (`uv run pytest -q`).
 - Engine UNCHANGED from 2026-07-11 (MLB props + WC containment complete,
   pregame-only gate + leg-series allowlist MLB/WC ACTIVE, sell-only book
   un-gated). The current thread is the **RISK ENGINE build**, not pricing.
@@ -31,16 +31,34 @@ challenger → quoting policy → external watchdog → go live at $2,000.
   `gross_settlement_notional`. **Adversarial judge PASS + 2 latent defects
   filed and FIXED before merge** (float-floor reconciliation gap; poison-pill
   idempotency). Report: `2026-07-12-risk-phase1-four-correctness-fixes.md`.
-- **PHASE 2 — caps + slate level: NEXT (not started).** Wire the R2 cap
-  hierarchy at $2,000 values: game-loss 8%/$160 (on `worst_case_loss_by_game`),
-  per-combo 1%/$20 max-LOSS, directional 10%, absolute 3× notional backstop,
-  daily-loss 6%, drawdown 10%, hard-trip 12% + the NEW slate/time-window
-  PRE-TRADE cap (games settling in one 2–3h window). Fail-closed + starvation
-  watchdog. **Ships in SHADOW mode** (logs every would-be breach, zero quote
-  impact) before enforce. `risk_bankroll_cc` gets wired into the %-caps here
-  (BalanceTracker is spine-only today, not yet consumed by `limits.py`).
-- **PHASES 3–6:** single-writer reservation → portfolio MC + challenger overlay
-  → skew/widen-vs-decline/pregame precision → external watchdog + go-live gates.
+- **PHASE 2 — caps + slate level: DONE, MERGED `632cc1f`, pushed (2× judge
+  PASS).** Additive SHADOW %-of-bankroll layer alongside the UNCHANGED enforced
+  hard-dollar caps (`Breach.shadow`, split in `lifecycle._partition_breaches` —
+  shadow = LOG-ONLY, dropped before any block/decline/halt). $2,000 START values,
+  integer-exact `thr = frac.num·bankroll // frac.den`: game 8% / per-combo 1%
+  (LOSS axis) / directional 10% / **slate 8%** (Σ game-loss over one US/Eastern
+  calendar-day bucket, source `PregameGate.leg_start_time`; UNKNOWN start ⇒
+  pooled capped bucket) / daily 6% / drawdown 10% / hard-trip 12% / utilization
+  3× (NOTIONAL axis — two axes never summed). Fail-closed (no/≤0 bankroll ⇒
+  `SKIP_BANKROLL_UNAVAILABLE`) + StarvationWatchdog. Intraday **peak-equity
+  latch** in BalanceTracker ARMS the give-back halts (all 9 caps observable in
+  shadow); `maintenance_tick` escalates enforced drawdown/hard-trip to killswitch.
+  Config validation (frac ∈ (0,1], non-finite guarded). **Still SHADOW** — the
+  operator flips `risk.caps_shadow_mode: false` per cap-set sign-off AFTER
+  reviewing real shadow-log behaviour. Report:
+  `2026-07-13-risk-phase2-caps-and-slate.md`.
+  - DEFERRED to Phase 3+: fill-velocity enforcement (needs the reservation
+    service's committed-fill stream); hard-trip KILL-file latch (both give-back
+    halts already stop quoting). Enforce-time notes (give-back denominator =
+    haircut risk-bankroll so halts bite sooner; enforced give-back stops the book
+    from 3 directions) in the report.
+- **PHASE 3 — concurrency & state safety: NEXT.** Single-writer risk-reservation
+  service — reserve capacity BEFORE sending confirm (atomic + versioned), so two
+  RFQs can't both claim the same headroom; confirm-TIMEOUT = assume-committed +
+  reconcile against the exchange. Race-free today only because we run one asyncio
+  loop; this makes it safe for any future fan-out. (See RISK_BUILD_PLAN Phase 3.)
+- **PHASES 4–6:** portfolio MC + challenger overlay → skew/widen-vs-decline/
+  pregame precision → external watchdog + go-live gates.
 
 ## RUNNING processes (verify before assuming!)
 
@@ -50,15 +68,21 @@ challenger → quoting policy → external watchdog → go live at $2,000.
   (ONLY ONE instance ever). Recording since 2026-07-09 for WC settlement
   backtest. **Check this FIRST in any new session.**
 
-## Operator decisions owed (Phase 2 needs these; plan specifies defaults)
+## Operator decisions owed (built on plan defaults; confirm before ENFORCE)
 
-- Confirm `portfolio_haircut = 0.5` and the UTC day-boundary rule (or wire
-  `set_start_of_day_equity` to the desk's session/deposit events).
-- Confirm the cap %s (plan has them at the $2,000 values above) and the
-  hard-trip 12% + fill-velocity rate.
-- Exchange-authoritative bankroll poll cadence.
-These are FLAGGED, not blocking — Phase 2 builds in shadow mode with the plan's
-values and logs would-be breaches for operator review before enforcement.
+Phase 2 shipped on the researched defaults (operator said "build on the
+defaults"), all in SHADOW. Before flipping `risk.caps_shadow_mode: false`:
+
+- Review real shadow-log behaviour, then confirm/adjust the cap %s (game 8 /
+  combo 1 / directional 10 / slate 8 / daily 6 / drawdown 10 / hard-trip 12 /
+  util 3×), `portfolio_haircut = 0.5`, the UTC day-boundary, the ET-day slate
+  bucket (vs a rolling 2–3h window), and `starvation_threshold`.
+- Enforce-time semantics to accept (both SAFE/conservative, in the report):
+  give-back halts measure raw equity vs `frac × haircut-risk-bankroll` (bite
+  sooner than "% of equity"); an enforced give-back stops the book from 3
+  directions (block quote + decline confirm + kill).
+- The caps ASSUME a profitable markup (precondition); markup still pooled-multi-
+  week, decided separately.
 
 ## Parallel data-accumulation track (does NOT block the phases)
 
@@ -85,8 +109,8 @@ values and logs would-be breaches for operator review before enforcement.
 
 ## NEXT STEPS
 
-- Owner (next session): begin Phase 2 (caps + slate, shadow mode) per
-  RISK_BUILD_PLAN — or the operator's chosen thread.
-- Owner (operator): confirm the Phase-2 knobs above (all have plan defaults);
-  prioritize the parallel pricing backlog if desired.
+- Owner (next session): begin Phase 3 (single-writer risk-reservation service)
+  per RISK_BUILD_PLAN — or the operator's chosen thread.
+- Owner (operator): confirm the Phase-2 enforce-time knobs above after shadow
+  logs accumulate; prioritize the parallel pricing backlog if desired.
 - Standing: recorder health check FIRST in any new session.
