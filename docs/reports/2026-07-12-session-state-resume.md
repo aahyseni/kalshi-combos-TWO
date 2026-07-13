@@ -7,8 +7,11 @@ The operator memory (`project_kct_resume_state`) mirrors this.**
 
 ## Repo state
 
-- `main` @ `7601146` (pushed; check `git log --oneline -5`), tree clean,
-  **suite 1515 passed / 0 failed** (`uv run pytest -q`).
+- `main` @ `e12f4f2` (pushed; check `git log --oneline -5`), tree clean,
+  **suite 1596 passed / 0 failed** (`uv run pytest -q`). **ALL 6 RISK-ENGINE
+  PHASES DONE + MERGED** (0 foundation → 1 correct-the-money → 2 caps+slate →
+  3 reservation → 4 portfolio MC+challenger → 5 quoting policy → 6 watchdog+
+  gates). Everything SHADOW/DARK/NOT-LIVE; no live switch flipped.
 - Engine UNCHANGED from 2026-07-11 (MLB props + WC containment complete,
   pregame-only gate + leg-series allowlist MLB/WC ACTIVE, sell-only book
   un-gated). The current thread is the **RISK ENGINE build**, not pricing.
@@ -93,14 +96,35 @@ challenger → quoting policy → external watchdog → go live at $2,000.
   `2026-07-13-risk-phase5-quoting-policy.md`. DEFERRED: enabling skew (shadow-
   markout study, tools/), the schedule-feed data source + hard-rule-5 verify,
   M_q/M_c tightening, payout-axis caps A4.
-- **PHASE 6 — external watchdog + go-live gates: NEXT.** Out-of-process safety
-  supervisor (separate host/credential): heartbeat, emergency cancel-all,
-  credential rotate, reserved API write budget, block-restart-until-reconciled;
-  the full circuit-breaker list (exchange/local mismatch, data staleness/seq-gap,
-  latency spike, 429 burst, marginal jump, rule/metadata change, unmapped game
-  key). Then prod gates: `prod_limits_configured` + `--confirm-live` + prod
-  whitelist. (See RISK_BUILD_PLAN Phase 6.) After P6: the go-live runway (SHADOW
-  whole stack → tiny $2k live → pool multi-week → scale).
+- **PHASE 6 — external watchdog + go-live gates: DONE, MERGED `e12f4f2` (judge
+  caught 5, 2 kill-path, all fixed).** `ops/supervisor.py` external SafetySupervisor
+  (standalone process, own env-only `KALSHI_SUPERVISOR_*` cred, heartbeat watch →
+  emergency cancel-all + KILL + needs_reconcile marker; fail-closed: unreachable
+  ⇒ still KILL; reserved write budget; block-restart-until-reconciled; kill-drill
+  passes). `risk/breakers.py` 7 fail-closed circuit breakers (4 LIVE-sampled:
+  staleness, latency, 429-burst, reconcile-mismatch; 3 built+tested-but-not-yet-
+  sampled: marginal-jump, unmapped-game, metadata-change — wiring touches the hot
+  path, go-live-runway item). Prod go-live gates: static `assert_safe_to_run`
+  (whitelist + --confirm-live + prod_limits_configured) + runtime `preflight.py`
+  (all 5 green before first quote). Report:
+  `2026-07-13-risk-phase6-watchdog-gates.md`.
+
+## ALL 6 RISK PHASES COMPLETE — the go-live runway is what remains (operator + measurement)
+
+Per RISK_BUILD_PLAN "After Phase 6": SHADOW the whole stack (log-only) → flip
+enables one at a time on measured evidence → tiny live at **$2,000** with the
+conservative first-live caps → accumulate POOLED MULTI-WEEK game-clustered
+settlement → re-derive caps AND markup from that data (never one window) → scale.
+Operator decisions owed before any live quote:
+- Flip `caps_shadow_mode: false` (Phase 2) only after reviewing shadow-log
+  behaviour; confirm the cap %s + haircut 0.5 + day-boundary.
+- Provision the dedicated `KALSHI_SUPERVISOR_*` credential + run the kill-drill
+  against the demo exchange; deploy the supervisor on a separate host.
+- Wire the 3 not-yet-sampled breakers' real signals; wire the maintenance-tick
+  BookRiskSnapshot loop (Phase 4) + the marginal-ΔCVaR → skew consumption.
+- Enable inventory skew (Phase 5) only after the pooled shadow-markout study.
+- The MARKUP decision (pooled multi-week, never refit on a P&L window) — the caps
+  assume a profitable markup but don't set it.
 
 ## RUNNING processes (verify before assuming!)
 
