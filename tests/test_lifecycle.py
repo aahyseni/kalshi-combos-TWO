@@ -3,6 +3,7 @@ executed → position, plus TTL/reprice/cancel-all, all against fakes."""
 
 from __future__ import annotations
 
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from combomaker.ops.config import FiltersConfig, PricingConfig
 from combomaker.ops.metrics import Metrics
 from combomaker.ops.persistence import Store
 from combomaker.pricing.engine import PricingEngine
+from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
 from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.lifecycle import LifecycleConfig, QuoteLifecycle
 from combomaker.rfq.models import Rfq
@@ -80,7 +82,13 @@ class FakeSender:
 
 class Rig:
     def __init__(
-        self, h: Harness, store: Store, filters: FiltersConfig | None = None
+        self,
+        h: Harness,
+        store: Store,
+        filters: FiltersConfig | None = None,
+        *,
+        fee_model: FeeModel | None = None,
+        fee_type: FeeType = FeeType.QUADRATIC,
     ) -> None:
         self.h = h
         self.sender = FakeSender()
@@ -109,6 +117,8 @@ class Rig:
             metrics=self.metrics,
             lastlook_policy=LastLookPolicy(),
             config=LifecycleConfig(quote_ttl_s=30.0, reprice_threshold_cc=100),
+            fee_model=fee_model,
+            fee_type=fee_type,
         )
 
 
@@ -123,6 +133,25 @@ async def rig(tmp_path: Path) -> Rig:
     seed_event(h, "E2", exclusive=True)
     store = await Store.open(tmp_path / "t.sqlite3", h.clock)
     return Rig(h, store)
+
+
+@pytest.fixture()
+async def fee_rig(tmp_path: Path) -> Rig:
+    """A rig identical to ``rig`` but wired with a REAL nonzero-fee FeeModel
+    (QUADRATIC_WITH_MAKER_FEES so the maker coef bites under our conventions) —
+    for the trade-fee-into-realized-P&L test (defense #3)."""
+    h = Harness()
+    await h.with_books(["M1", "M2"])
+    h.with_meta("M1")
+    h.with_meta("M2")
+    h.with_meta("KXMVE-C1")
+    seed_event(h, "E1", exclusive=True)
+    seed_event(h, "E2", exclusive=True)
+    store = await Store.open(tmp_path / "fee.sqlite3", h.clock)
+    fee_model = FeeModel(
+        FeeSchedule.from_strings(taker="0.07", maker="0.0175"), TEST_CONVENTIONS
+    )
+    return Rig(h, store, fee_model=fee_model, fee_type=FeeType.QUADRATIC_WITH_MAKER_FEES)
 
 
 def rfq() -> Rfq:
@@ -178,6 +207,43 @@ async def test_accept_no_side_maps_via_conventions(rig: Rig) -> None:
     await rig.lifecycle.on_quote_executed({"quote_id": "q1"})
     position = next(iter(rig.exposure.positions.values()))
     assert position.our_side is Side.NO
+
+
+async def test_nonzero_trade_fee_enters_realized_pnl_at_fill(fee_rig: Rig) -> None:
+    # The trade fee charged AT FILL is a real cash cost — it must enter the
+    # realized ledger the ENFORCED daily-loss cap reads, not only the settlement
+    # fee. $0 today for our quadratic maker fills; this proves a nonzero-fee
+    # series is booked (defense #3). Uses the REAL FeeModel (CLAUDE.md rule 8),
+    # QUADRATIC_WITH_MAKER_FEES so the maker coef bites under our conventions.
+    await fee_rig.lifecycle.handle_rfq(rfq())
+    await fee_rig.lifecycle.on_quote_accepted(accepted_msg("q1", "yes"))
+    await fee_rig.lifecycle.on_quote_executed({"quote_id": "q1"})
+    position = next(iter(fee_rig.exposure.positions.values()))
+
+    fee_model = FeeModel(
+        FeeSchedule.from_strings(taker="0.07", maker="0.0175"), TEST_CONVENTIONS
+    )
+    expected_fee_cc = int(
+        fee_model.trade_fee_cc(
+            price_cc=position.entry_price_cc,
+            qty=position.contracts,
+            fee_type=FeeType.QUADRATIC_WITH_MAKER_FEES,
+            multiplier=Fraction(1),
+        )
+    )
+    assert expected_fee_cc > 0  # the series genuinely charges a fee
+    # The fee reduces realized P&L by exactly the trade fee (negative delta).
+    assert fee_rig.lifecycle._realized_pnl_cc == -expected_fee_cc  # noqa: SLF001
+
+
+async def test_zero_fee_fill_leaves_realized_pnl_untouched(rig: Rig) -> None:
+    # Our default quadratic maker fill charges $0 (and the default rig has no fee
+    # model), so realized P&L stays 0 at fill — no behaviour change (defense #2:
+    # an UNKNOWN/None fee is never booked as a convenient 0).
+    await rig.lifecycle.handle_rfq(rfq())
+    await rig.lifecycle.on_quote_accepted(accepted_msg("q1", "yes"))
+    await rig.lifecycle.on_quote_executed({"quote_id": "q1"})
+    assert rig.lifecycle._realized_pnl_cc == 0  # noqa: SLF001
 
 
 async def test_killswitch_between_accept_declines_without_confirm(rig: Rig) -> None:
@@ -393,6 +459,41 @@ async def test_full_reconcile_scalar_matches(rig: Rig) -> None:
         "KXMVE-C1", settled_yes=False, settled_value=0.7, expected_revenue_cc=3_000
     )
     assert not rig.killswitch.halted
+
+
+async def test_full_reconcile_fractional_contract_scalar_does_not_halt(rig: Rig) -> None:
+    # A target-cost RFQ leaves a FRACTIONAL contract count (0.90 ct = 90 centi-
+    # contracts). On a SCALAR settlement (V=0.43, a leg DNP/rain/void), our
+    # predicted NO credit = 90 ct × (100−43)¢ // 100 = 5130 cc = 51.3¢, which the
+    # exchange's integer-cent revenue (51¢ or 52¢) can NEVER equal. A strict `!=`
+    # would spuriously HALT a legitimate settlement; reconciling to the cent must
+    # NOT halt when the residual is sub-cent.
+    rig.exposure.add_position(held_no_position(contracts=90))
+    predicted = 90 * (10_000 - round(0.43 * 10_000)) // 100  # 5130 cc
+    assert predicted == 5_130
+    # A legitimate settlement never halts, so both candidate exchange bookings
+    # (floor 51¢ or round 52¢ of the true 51.3¢) reconcile without any reset.
+    for exchange_revenue_cc in (5_100, 5_200):  # exchange floors OR rounds 51.3¢
+        await rig.lifecycle.reconcile_combo_settlement(
+            "KXMVE-C1",
+            settled_yes=False,
+            settled_value=0.43,
+            expected_revenue_cc=exchange_revenue_cc,
+        )
+        assert not rig.killswitch.halted
+
+
+async def test_full_reconcile_fractional_scalar_still_halts_on_real_mismatch(rig: Rig) -> None:
+    # The sub-cent tolerance does NOT weaken defense #3: a genuine model error on
+    # the same fractional-contract scalar (revenue a full cent+ off predicted)
+    # STILL halts. Predicted 5130 cc; exchange 4900 cc (49¢) is 230 cc ≥ 1¢ away.
+    rig.exposure.add_position(held_no_position(contracts=90))
+    await rig.lifecycle.reconcile_combo_settlement(
+        "KXMVE-C1", settled_yes=False, settled_value=0.43, expected_revenue_cc=4_900
+    )
+    assert rig.killswitch.halted
+    assert rig.killswitch.halt_event is not None
+    assert rig.killswitch.halt_event.reason is ReasonCode.HALT_RECONCILIATION_MISMATCH
 
 
 async def test_full_reconcile_sums_multiple_positions_on_ticker(rig: Rig) -> None:

@@ -216,6 +216,17 @@ class ExposureBook:
     def add_position(self, position: OpenPosition) -> None:
         self.positions[position.position_id] = position
 
+    def remove_position(self, position_id: str) -> None:
+        """Drop a position from the live book. Called once a position SETTLES
+        (SettlementHandler, after apply_settlement books it): a settled position
+        no longer carries live risk, so it must stop counting toward the enforced
+        game/slate/gross/CVaR caps and the daily-P&L mark. Leaving it in would
+        (a) inflate the risk view forever as settlements pile up over a long run,
+        and (b) make the settlement reconcile re-sum an already-settled position
+        against a re-quote's revenue on the same ticker → a false
+        HALT_RECONCILIATION_MISMATCH. Idempotent: a missing id is a no-op."""
+        self.positions.pop(position_id, None)
+
     def upsert_quote(self, quote: OpenQuoteRisk) -> None:
         self.open_quotes[quote.quote_id] = quote
 

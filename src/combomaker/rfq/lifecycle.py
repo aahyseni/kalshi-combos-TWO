@@ -30,7 +30,7 @@ from typing import Any, Protocol
 
 from combomaker.core.clock import Clock
 from combomaker.core.conventions import Conventions, Side
-from combomaker.core.money import CC_PER_DOLLAR, CentiCents
+from combomaker.core.money import CC_PER_CENT, CC_PER_DOLLAR, CentiCents
 from combomaker.core.quantity import CentiContracts, qty_from_fp_str
 from combomaker.core.reasons import ReasonCode
 from combomaker.marketdata.feed import OrderbookFeed
@@ -884,6 +884,10 @@ class QuoteLifecycle:
             # NO payout semantics unverified — an honest ledger records
             # UNKNOWN, never an assumed complement (defense #5).
             expected_edge_cc = None
+        # Real fill fee from the fee model (defense #3): $0 for our combo maker
+        # quadratic fills, correct for any nonzero-fee series. None only when no
+        # fee model is wired (pre-Phase-6 behaviour) or the fee is UNKNOWN.
+        fill_fee_cc = self._fill_fee_cc(bid, qty)
         await self._store.record_fill(
             f"fill:{quote_id}",
             order_id=str(msg.get("order_id")) if msg.get("order_id") else None,
@@ -891,13 +895,20 @@ class QuoteLifecycle:
             our_side=str(our_side),
             contracts_centi=int(qty),
             price_cc=int(bid),
-            # Real fill fee from the fee model (defense #3): $0 for our combo maker
-            # quadratic fills, correct for any nonzero-fee series. None only when no
-            # fee model is wired (pre-Phase-6 behaviour) or the fee is UNKNOWN.
-            fee_cc=self._fill_fee_cc(bid, qty),
+            fee_cc=fill_fee_cc,
             expected_edge_cc=expected_edge_cc,
             raw=msg,
         )
+        # The trade fee is a real cash cost AT FILL — it must enter the realized
+        # ledger the ENFORCED daily-loss cap reads, not only the settlement fee
+        # (else, on a nonzero-fee series, realized P&L understates costs by the
+        # trade fee and the cap sees a rosier figure than reality). $0 today for
+        # our quadratic maker fills, so no behaviour change now; correct for any
+        # nonzero-fee series. A None (no fee model / UNKNOWN) fee is NOT booked as
+        # a convenient 0 (defense #2) — the live balance poll remains the backstop
+        # that captures the actual cash movement.
+        if fill_fee_cc is not None and fill_fee_cc != 0:
+            self.record_realized_pnl(-int(fill_fee_cc))
         self._metrics.inc("fill.count")
         self._track_markout(f"fill:{quote_id}", state)
 
@@ -982,12 +993,29 @@ class QuoteLifecycle:
         predicted_credit_cc = sum(
             self._predicted_settlement_credit_cc(pos, settled_value) for pos in on_ticker
         )
-        if predicted_credit_cc != expected_revenue_cc:
+        # Reconcile to the exchange's CENT grid, not to the raw centi-cent. The
+        # exchange books `revenue` as an INTEGER number of cents (always a
+        # multiple of CC_PER_CENT). Our predicted credit carries sub-cent
+        # precision ONLY when a position holds a fractional number of contracts
+        # (a target-cost RFQ, e.g. 0.90 ct) and the combo settles SCALAR
+        # (V∈(0,1)): `contracts·(1−V)` is then not a whole cent (0.90·$0.57 =
+        # 51.3¢), which the integer-cent revenue (51¢ or 52¢) can NEVER equal.
+        # A strict `!=` there would spuriously HALT a legitimate settlement.
+        # Binary V∈{0,1} and whole-contract scalars stay whole-cent, so this is
+        # still EXACT for them (residual 0). A genuine model error (wrong
+        # sign/value/convention) shifts the credit by ≥ a full cent, so the
+        # strict `< CC_PER_CENT` guard keeps defense #3 intact — only the sub-
+        # cent fractional-contract residual is absorbed, and the tolerance is
+        # robust to whether the exchange rounds or floors the half-cent (both
+        # land < 1¢ away). Residual = 1¢ or more ⇒ still a mismatch ⇒ HALT.
+        residual_cc = abs(predicted_credit_cc - expected_revenue_cc)
+        if residual_cc >= CC_PER_CENT:
             await self._killswitch.halt(
                 ReasonCode.HALT_RECONCILIATION_MISMATCH,
                 f"combo {combo_ticker}: predicted settlement credit "
                 f"{predicted_credit_cc}cc != exchange revenue {expected_revenue_cc}cc "
-                f"(V={settled_value}) — settlement model mismatch",
+                f"(residual {residual_cc}cc ≥ 1¢, V={settled_value}) — "
+                f"settlement model mismatch",
             )
 
     def _predicted_settlement_credit_cc(

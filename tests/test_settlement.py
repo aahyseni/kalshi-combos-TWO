@@ -90,7 +90,11 @@ class FakeLifecycle:
             v_cc = round(settled_value * 10_000)
             per_ct = (10_000 - v_cc) if p.our_side is Side.NO else v_cc
             predicted += int(p.contracts) * per_ct // 100
-        if predicted != expected_revenue_cc:
+        # Reconcile to the exchange's whole-cent grid (mirrors the real
+        # QuoteLifecycle.reconcile_combo_settlement): a fractional-contract scalar
+        # settlement makes `predicted` sub-cent, which the integer-cent revenue can
+        # never equal — only a ≥1¢ residual is a genuine mismatch (defense #3).
+        if abs(predicted - expected_revenue_cc) >= 100:  # 100 cc = 1 cent
             await self._killswitch.halt(
                 ReasonCode.HALT_RECONCILIATION_MISMATCH,
                 f"predicted {predicted} != revenue {expected_revenue_cc}",
@@ -261,6 +265,35 @@ class TestBooking:
         assert results[0].realized_cc == -2_000
         assert balance.realized_pnl_cc == -2_000
 
+    async def test_fractional_contract_scalar_does_not_false_halt(self) -> None:
+        # A target-cost RFQ leaves 0.90 ct (= 90 centi-contracts). On a SCALAR
+        # settlement V=0.43, NO pays $0.57/ct → predicted 90 × 57¢ // 100 = 5130
+        # cc = 51.3¢, which the integer-cent exchange revenue can NEVER equal. The
+        # reconcile (real + FakeLifecycle mirror) reconciles to the cent, so a
+        # legitimate fractional-contract scalar must NOT HALT. Exchange books the
+        # true 51.3¢ as int cents (floor 51¢).
+        exposure, balance, _lc, killswitch, handler = _rig()
+        exposure.add_position(_position(contracts=90, entry_price=5_000))
+        rows = [_settlement_row(market_result="scalar", value=43, revenue=51)]
+        results = await handler.handle_settlements(rows)
+        assert not killswitch.halted
+        assert len(results) == 1 and results[0].booked is True
+        assert balance.settled_count == 1
+        # Realized = 51.3¢ credit − 45¢ premium (0.90 ct @ $0.50) = +6.30¢.
+        assert results[0].realized_cc == 5_130 - 4_500
+
+    async def test_fractional_contract_scalar_still_halts_on_real_mismatch(self) -> None:
+        # The sub-cent tolerance does NOT weaken defense #3 through the handler:
+        # a genuine ≥1¢ mismatch on the fractional-contract scalar STILL HALTs.
+        exposure, _bal, _lc, killswitch, handler = _rig()
+        exposure.add_position(_position(contracts=90, entry_price=5_000))
+        # Predicted 5130 cc; exchange 49¢ (4900 cc) is 230 cc ≥ 1¢ away → HALT.
+        rows = [_settlement_row(market_result="scalar", value=43, revenue=49)]
+        await handler.handle_settlements(rows)
+        assert killswitch.halted
+        assert killswitch.halt_event is not None
+        assert killswitch.halt_event.reason is ReasonCode.HALT_RECONCILIATION_MISMATCH
+
     async def test_settlement_for_unheld_ticker_is_ignored(self) -> None:
         exposure, balance, _lc, killswitch, handler = _rig()
         exposure.add_position(_position("KXMVE-C1"))
@@ -281,13 +314,17 @@ class TestIdempotency:
         rows = [_settlement_row(market_result="no", revenue=100)]
         first = await handler.handle_settlements(rows)
         assert first[0].realized_cc == 5_000
-        # Re-poll the SAME settlement — no double-book.
+        assert first[0].booked is True
+        # Re-poll the SAME settlement — no double-book. The settled position was
+        # pruned from the exposure book on the first pass, so the re-poll finds
+        # nothing held on the ticker and IGNORES the row (returns []). The core
+        # invariant — booked exactly once — holds either way.
         second = await handler.handle_settlements(rows)
-        assert second[0].booked is False
-        assert second[0].realized_cc == 0
+        assert second == []                                # pruned → not ours → ignored
         assert balance.realized_pnl_cc == 5_000            # still just once
         assert balance.settled_count == 1
         assert lifecycle.realized_deltas == [5_000]        # fed exactly once
+        assert exposure.positions == {}                    # pruned after booking
 
 
 # --- reconciliation HALTs -----------------------------------------------------
@@ -336,6 +373,69 @@ class TestReconcileHalts:
         assert killswitch.halt_event is not None
         assert killswitch.halt_event.reason is ReasonCode.HALT_RECONCILIATION_MISMATCH
         assert balance.realized_pnl_cc == 0
+
+
+# --- settled positions leave the exposure book --------------------------------
+
+
+class TestSettledPositionRemoval:
+    async def test_settled_position_removed_from_exposure_book(self) -> None:
+        # A settled position no longer carries live risk → it must be dropped from
+        # the exposure book (else settled exposure accumulates forever and keeps
+        # counting toward the enforced caps + the daily-P&L mark).
+        exposure, _bal, _lc, killswitch, handler = _rig()
+        exposure.add_position(_position(contracts=100, entry_price=5_000))
+        assert len(exposure.positions) == 1
+        rows = [_settlement_row(market_result="no", revenue=100)]
+        await handler.handle_settlements(rows)
+        assert not killswitch.halted
+        assert exposure.positions == {}       # pruned after booking
+
+    async def test_requote_same_ticker_after_settlement_does_not_false_halt(self) -> None:
+        # Re-quote + re-fill the SAME combo ticker AFTER a prior settlement. The
+        # new settlement's revenue reflects only the NEW contracts; the reconcile
+        # must NOT re-sum the already-settled (removed) position → no false
+        # HALT_RECONCILIATION_MISMATCH.
+        exposure, balance, _lc, killswitch, handler = _rig()
+        exposure.add_position(
+            _position(contracts=100, entry_price=5_000, position_id="fill:q1")
+        )
+        # First settlement of the original 1 ct (NO, V=0 → revenue 100¢).
+        await handler.handle_settlements([_settlement_row(market_result="no", revenue=100)])
+        assert not killswitch.halted
+        assert exposure.positions == {}
+
+        # Re-quote + re-fill on the same ticker: a brand-new 2 ct position.
+        exposure.add_position(
+            _position(contracts=200, entry_price=4_000, position_id="fill:q2")
+        )
+        # New settlement: only the NEW 2 ct → revenue = 2 × $1 = 200¢. Without the
+        # prune the reconcile would sum the OLD 1 ct + NEW 2 ct = 300¢ ≠ 200¢ and
+        # HALT. With the prune it reconciles cleanly.
+        await handler.handle_settlements([_settlement_row(market_result="no", revenue=200)])
+        assert not killswitch.halted
+        assert exposure.positions == {}
+        # Both settlements booked: +$0.50 (1 ct miss) + +$1.20 (2 ct @ $0.40 miss).
+        assert balance.realized_pnl_cc == 5_000 + 12_000
+
+    async def test_multi_position_fee_split_still_exact_after_prune(self) -> None:
+        # Two positions on one ticker with a nonzero settlement fee: the exact fee
+        # split (by contract weight over the WHOLE ticker) must survive the mid-
+        # loop prune — settlements are built against the full book first.
+        exposure, balance, _lc, killswitch, handler = _rig()
+        exposure.add_position(
+            _position(contracts=100, entry_price=5_000, position_id="fill:q1")
+        )
+        exposure.add_position(
+            _position(contracts=300, entry_price=5_000, position_id="fill:q2")
+        )
+        # 1 ct + 3 ct = 4 ct total; NO miss → revenue 400¢. Fee $0.04 = 400 cc,
+        # split 1:3 → 100 cc + 300 cc = 400 cc (exact).
+        rows = [_settlement_row(market_result="no", revenue=400, fee_cost="0.04")]
+        await handler.handle_settlements(rows)
+        assert not killswitch.halted
+        assert exposure.positions == {}
+        assert balance.accrued_fees_cc == 400        # fees sum exactly to $0.04
 
 
 # --- poller paging ------------------------------------------------------------

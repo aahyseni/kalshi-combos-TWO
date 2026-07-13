@@ -291,11 +291,17 @@ class SettlementHandler:
         total_realized_cc = 0
         any_new = False
         primary_id = positions[0].position_id
+        # Build every Settlement (incl. its fee share) BEFORE the book+remove
+        # loop below, while the exposure book still holds all positions on this
+        # ticker — `_fee_share_cc` splits the exchange fee by contract weight over
+        # the whole ticker, so it must see the full set (removing positions
+        # mid-loop would shrink the denominator and break the exact fee split).
+        settlements = {pos.position_id: self._build_settlement(pos, parsed) for pos in positions}
         for pos in positions:
             if pos.position_id in self._reconciled:
                 continue  # idempotent: already booked this position
             any_new = True
-            settlement = self._build_settlement(pos, parsed)
+            settlement = settlements[pos.position_id]
             try:
                 realized_cc = self._balance.apply_settlement(settlement)
             except Exception as exc:
@@ -308,6 +314,16 @@ class SettlementHandler:
                 )
                 return None
             self._reconciled.add(pos.position_id)
+            # A settled position no longer carries live risk: drop it from the
+            # exposure book so it stops counting toward the enforced
+            # game/slate/gross/CVaR caps + the daily-P&L mark (else settled
+            # exposure accumulates forever over a long run), and so a later
+            # re-quote+re-fill of the SAME ticker does not make the reconcile
+            # re-sum this already-settled position against the new settlement's
+            # revenue (a false HALT_RECONCILIATION_MISMATCH). Removed only AFTER
+            # apply_settlement succeeds + the id is marked reconciled, so a
+            # replayed row is still an idempotent no-op.
+            self._exposure.remove_position(pos.position_id)
             # Feed the ENFORCED daily-loss cap's realized half.
             self._lifecycle.record_realized_pnl(realized_cc)
             total_realized_cc += realized_cc
