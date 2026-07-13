@@ -7,8 +7,8 @@ The operator memory (`project_kct_resume_state`) mirrors this.**
 
 ## Repo state
 
-- `main` @ `a64b8c9` (pushed; check `git log --oneline -5`), tree clean,
-  **suite 1462 passed / 0 failed** (`uv run pytest -q`).
+- `main` @ `7601146` (pushed; check `git log --oneline -5`), tree clean,
+  **suite 1515 passed / 0 failed** (`uv run pytest -q`).
 - Engine UNCHANGED from 2026-07-11 (MLB props + WC containment complete,
   pregame-only gate + leg-series allowlist MLB/WC ACTIVE, sell-only book
   un-gated). The current thread is the **RISK ENGINE build**, not pricing.
@@ -79,15 +79,28 @@ challenger → quoting policy → external watchdog → go live at $2,000.
   `2026-07-13-risk-phase4-portfolio-mc-challenger.md`. DEFERRED to P5+: ΔCVaR→
   inventory-skew, the maintenance-tick snapshot loop, Glasserman-Li importance
   sampling. Operator: confirm `portfolio_cvar_frac`=0.15 before enforce.
-- **PHASE 5 — quoting policy: NEXT.** Feed the built-but-zeroed inventory-skew
-  seam (tighter on balancing flow, wider on concentrating; consume the Phase-4
-  ΔCVaR); widen-vs-DECLINE (on NORMAL/uncertain flow near a cap, DECLINE rather
-  than widen — widening attracts hitters, our own finding); pregame precision
-  ladder (schedule feed → quote to ~2min before kickoff, recover near-kickoff
-  flow) with strict confirm-cutoff. Off the hot path where possible; SHADOW-grade
-  the skew + pregame markouts. (See RISK_BUILD_PLAN Phase 5.)
-- **PHASE 6:** external watchdog (out-of-process supervisor, circuit breakers) +
-  go-live gates.
+- **PHASE 5 — quoting policy: DONE, MERGED `7601146` (judge caught + FIXED a
+  CRITICAL sign inversion, then PASS-equivalent after orchestrator review).**
+  `risk/skew.py` inventory skew (DARK, enabled=False → computed+logged, applied
+  0): concentrating→NEGATIVE skew (lower no_bid, sell less), offsetting→POSITIVE
+  (higher no_bid, sell more) — the classifier keeps concentrating `skew_cc≥0` and
+  NEGATES at the pricer boundary (`applied_cc=−skew_cc`); the R3 §A0 doc had the
+  sign INVERTED (now banner-corrected). widen-vs-DECLINE (`SKIP_WIDEN_AVOIDED`,
+  per-game concentrating+near-cap, shadow). Pregame precision: `rfq/schedule.py`
+  ScheduleCache seam (inactive, fail-closed) + M_q/M_c split (M_c≥M_q validated
+  via the runtime `_prefix_lookup`), 4.5h estimate kept as default; time_to_start
+  logged on declines. All SHADOW/DARK. Report:
+  `2026-07-13-risk-phase5-quoting-policy.md`. DEFERRED: enabling skew (shadow-
+  markout study, tools/), the schedule-feed data source + hard-rule-5 verify,
+  M_q/M_c tightening, payout-axis caps A4.
+- **PHASE 6 — external watchdog + go-live gates: NEXT.** Out-of-process safety
+  supervisor (separate host/credential): heartbeat, emergency cancel-all,
+  credential rotate, reserved API write budget, block-restart-until-reconciled;
+  the full circuit-breaker list (exchange/local mismatch, data staleness/seq-gap,
+  latency spike, 429 burst, marginal jump, rule/metadata change, unmapped game
+  key). Then prod gates: `prod_limits_configured` + `--confirm-live` + prod
+  whitelist. (See RISK_BUILD_PLAN Phase 6.) After P6: the go-live runway (SHADOW
+  whole stack → tiny $2k live → pool multi-week → scale).
 
 ## RUNNING processes (verify before assuming!)
 
