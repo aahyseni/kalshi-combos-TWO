@@ -246,6 +246,12 @@ class BalanceTracker:
         # rule: first successful poll whose UTC calendar date differs re-anchors).
         self._start_of_day_equity_cc: CentiCents | None = None
         self._anchor_utc_date: date | None = None
+        # Intraday peak of exchange equity — the high-water mark the give-back
+        # (drawdown / hard-trip) halts measure against. Re-anchored to the new
+        # day's start-of-day equity at the SAME UTC boundary as the SOD anchor
+        # (the halts are INTRADAY give-back, matching CAP_recommendation_2000.md),
+        # then high-water-marked on every fresh poll.
+        self._peak_equity_cc: CentiCents | None = None
         self._realized_pnl_cc: int = 0
         self._cumulative_loss_cc: int = 0
         self._accrued_fees_cc: int = 0
@@ -279,9 +285,16 @@ class BalanceTracker:
         self._portfolio_value_cc = portfolio_cc
         self._last_poll_ns = self._clock.monotonic_ns()
         today = self._clock.now().date()
+        equity_cc = int(cash_cc) + int(portfolio_cc)
         if self._anchor_utc_date != today:
-            self._start_of_day_equity_cc = CentiCents(int(cash_cc) + int(portfolio_cc))
+            self._start_of_day_equity_cc = CentiCents(equity_cc)
             self._anchor_utc_date = today
+            # New trading day: the intraday peak restarts at today's SOD equity,
+            # never carried over from yesterday (give-back is measured within the
+            # day, in lockstep with the SOD re-anchor above).
+            self._peak_equity_cc = CentiCents(equity_cc)
+        elif self._peak_equity_cc is None or equity_cc > int(self._peak_equity_cc):
+            self._peak_equity_cc = CentiCents(equity_cc)
         return cash_cc
 
     def set_start_of_day_equity(self, equity_cc: CentiCents) -> None:
@@ -291,6 +304,10 @@ class BalanceTracker:
         day."""
         self._start_of_day_equity_cc = equity_cc
         self._anchor_utc_date = self._clock.now().date()
+        # A manual re-anchor also restarts the intraday peak: the drawdown the
+        # halts measure is give-back from THIS anchor, not a stale prior peak
+        # (e.g. after a deposit the old high-water mark is meaningless).
+        self._peak_equity_cc = equity_cc
 
     @property
     def is_stale(self) -> bool:
@@ -340,6 +357,17 @@ class BalanceTracker:
         assert self._available_cash_cc is not None
         assert self._portfolio_value_cc is not None
         return CentiCents(int(self._available_cash_cc) + int(self._portfolio_value_cc))
+
+    @property
+    def peak_equity_cc(self) -> CentiCents:
+        """Intraday high-water mark of exchange equity — what the give-back
+        (drawdown / hard-trip) halts measure against. Fails closed on stale, and
+        raises if never anchored (no poll yet ⇒ no peak; inventing one would be a
+        convenient default the halts must never rely on)."""
+        self._fresh_or_raise()
+        if self._peak_equity_cc is None:
+            raise StaleBalanceError("peak equity not anchored yet")
+        return self._peak_equity_cc
 
     @property
     def start_of_day_equity_cc(self) -> CentiCents:
@@ -395,6 +423,22 @@ class BalanceTracker:
         if self.is_stale or self._start_of_day_equity_cc is None:
             return None
         return self.risk_bankroll_cc
+
+    def exchange_equity_cc_or_none(self) -> CentiCents | None:
+        """Non-raising current exchange equity (cash + portfolio), or None when
+        stale. Pairs with ``peak_equity_cc_or_none`` to feed the give-back halts
+        fail-closed (a missing reading simply skips that halt's evaluation)."""
+        if self.is_stale or self._available_cash_cc is None or self._portfolio_value_cc is None:
+            return None
+        return CentiCents(int(self._available_cash_cc) + int(self._portfolio_value_cc))
+
+    def peak_equity_cc_or_none(self) -> CentiCents | None:
+        """Non-raising intraday peak equity, or None when stale / not yet
+        anchored. Feeds ``HaltInputs.peak_equity_cc``; None ⇒ the give-back
+        halts skip (no invented peak)."""
+        if self.is_stale or self._peak_equity_cc is None:
+            return None
+        return self._peak_equity_cc
 
     # --- realized-P&L ledger -------------------------------------------------
 

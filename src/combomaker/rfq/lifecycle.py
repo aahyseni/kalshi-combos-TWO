@@ -53,6 +53,7 @@ from combomaker.risk.lastlook import (
 from combomaker.risk.limits import (
     Breach,
     DailyPnl,
+    HaltInputs,
     LimitChecker,
     StartTimeProvider,
     StarvationWatchdog,
@@ -170,6 +171,20 @@ class QuoteLifecycle:
         got = self._balance.risk_bankroll_cc_or_none()
         return None if got is None else int(got)
 
+    def _halt_inputs(self) -> HaltInputs:
+        """Give-back inputs (intraday peak + current equity) for the drawdown /
+        hard-trip halts, from the BalanceTracker via its NON-raising accessors so
+        a stale poll never throws on the hot path. When either reading is
+        unavailable both come back None and the checker simply skips those two
+        halts (no invented peak — a missing input is never a convenient default).
+        Empty when there is no tracker at all."""
+        if self._balance is None:
+            return HaltInputs()
+        return HaltInputs(
+            peak_equity_cc=self._balance.peak_equity_cc_or_none(),
+            current_equity_cc=self._balance.exchange_equity_cc_or_none(),
+        )
+
     def _partition_breaches(self, breaches: list[Breach]) -> list[Breach]:
         """Split R2 SHADOW breaches (log-only) from enforced breaches.
 
@@ -247,6 +262,7 @@ class QuoteLifecycle:
             adding_quote=True,
             risk_bankroll_cc=self._risk_bankroll_cc(),
             start_time_provider=self._start_time_provider,
+            halt_inputs=self._halt_inputs(),
         )
         # Watchdog sees the ISSUE decision: any breach (enforced OR shadow) is a
         # would-be decline; only a fully clean check is a real issue (reset). This
@@ -546,11 +562,22 @@ class QuoteLifecycle:
                     self.daily_pnl,
                     risk_bankroll_cc=self._risk_bankroll_cc(),
                     start_time_provider=self._start_time_provider,
+                    halt_inputs=self._halt_inputs(),
                 )
             )
             for breach in breaches:
-                if breach.reason == ReasonCode.HALT_DAILY_LOSS:
-                    await self._killswitch.halt(ReasonCode.HALT_DAILY_LOSS, breach.detail)
+                # Any ENFORCED halt-class breach escalates to the killswitch
+                # (cancel-all + stop). Shadow breaches were already dropped by
+                # _partition_breaches, so a halt reaching here is real. The
+                # give-back halts (drawdown / hard-trip) escalate here too — not
+                # only the daily-loss halt — so flipping caps to enforce actually
+                # arms them (a peak-equity latch now feeds their inputs).
+                if breach.reason in (
+                    ReasonCode.HALT_DAILY_LOSS,
+                    ReasonCode.HALT_DRAWDOWN,
+                    ReasonCode.HALT_HARD_TRIP,
+                ):
+                    await self._killswitch.halt(breach.reason, breach.detail)
                     return  # halt callbacks (cancel-all) already ran
         now = self._clock.monotonic_ns()
         for quote_id, state in list(self._open.items()):
@@ -731,6 +758,7 @@ class QuoteLifecycle:
                 candidate_positions=[candidate],
                 risk_bankroll_cc=self._risk_bankroll_cc(),
                 start_time_provider=self._start_time_provider,
+                halt_inputs=self._halt_inputs(),
             )
         )
         # Straddle safety (Phase 3): re-run the schedule-based pregame gate —

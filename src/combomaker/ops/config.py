@@ -7,14 +7,14 @@ true`` in the prod config file. Demo is the default environment everywhere.
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from fractions import Fraction
 from pathlib import Path
 from typing import Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from combomaker.risk.limits import RiskLimits
 
@@ -1678,6 +1678,43 @@ class RiskConfig(StrictModel):
     # After this many consecutive risk-driven declines with zero quotes issued,
     # the StarvationWatchdog warns (a mis-set cap silently declining everything).
     starvation_threshold: int = 20
+
+    # A cap percentage is a FRACTION of bankroll: it must parse and sit in
+    # (0, 1]. This catches the footgun where "8" (a typo meaning 8%) would
+    # otherwise parse to Fraction(8) = 800% of bankroll — every position would
+    # pass a 800%-of-bankroll cap — or a negative value would breach everything.
+    @field_validator(
+        "game_loss_frac",
+        "per_combo_loss_frac",
+        "directional_frac",
+        "slate_loss_frac",
+        "daily_loss_frac",
+        "drawdown_frac",
+        "hard_trip_frac",
+        "fill_velocity_soft_frac",
+        "fill_velocity_hard_frac",
+    )
+    @classmethod
+    def _valid_cap_fraction(cls, v: str) -> str:
+        try:
+            d = Decimal(v)
+        except InvalidOperation as exc:
+            raise ValueError(f"cap fraction {v!r} is not a decimal") from exc
+        if not (Decimal(0) < d <= Decimal(1)):
+            raise ValueError(
+                f"cap fraction {v!r} must be in (0, 1] — a percentage of bankroll "
+                f"(e.g. '0.08' = 8%), not {d}"
+            )
+        return v
+
+    @field_validator(
+        "absolute_notional_multiple", "fill_velocity_max_fills", "starvation_threshold"
+    )
+    @classmethod
+    def _positive_int_knob(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"must be >= 1, got {v}")
+        return v
 
     def to_risk_limits(self) -> RiskLimits:
         """Build the ``RiskLimits`` the checker uses, parsing the decimal-string

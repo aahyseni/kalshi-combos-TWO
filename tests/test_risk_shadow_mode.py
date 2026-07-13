@@ -32,16 +32,32 @@ from tests.test_pricing_engine import seed_event
 
 
 class _FixedBankroll:
-    """Minimal stand-in for the balance tracker's non-raising bankroll accessor:
-    the lifecycle only calls ``risk_bankroll_cc_or_none()``. Returns a fixed cc
-    so the R2 caps compute (a real ``BalanceTracker`` is exercised in
-    test_balance.py; here we isolate the shadow behaviour)."""
+    """Minimal stand-in for the balance tracker's non-raising accessors the
+    lifecycle uses: ``risk_bankroll_cc_or_none`` (the %-cap denominator) and the
+    ``peak_equity_cc_or_none`` / ``exchange_equity_cc_or_none`` pair that feeds
+    the give-back halts. Returns fixed cc so the R2 caps compute; peak/current
+    default to None so the give-back halts skip unless a test sets them (a real
+    ``BalanceTracker`` is exercised in test_balance.py)."""
 
-    def __init__(self, bankroll_cc: int | None) -> None:
+    def __init__(
+        self,
+        bankroll_cc: int | None,
+        *,
+        peak_cc: int | None = None,
+        current_cc: int | None = None,
+    ) -> None:
         self._cc = bankroll_cc
+        self._peak = peak_cc
+        self._current = current_cc
 
     def risk_bankroll_cc_or_none(self) -> int | None:
         return self._cc
+
+    def peak_equity_cc_or_none(self) -> int | None:
+        return self._peak
+
+    def exchange_equity_cc_or_none(self) -> int | None:
+        return self._current
 
 
 def _build_lifecycle(
@@ -51,6 +67,8 @@ def _build_lifecycle(
     limits: LimitChecker,
     bankroll_cc: int | None,
     watchdog: StarvationWatchdog | None = None,
+    peak_cc: int | None = None,
+    current_cc: int | None = None,
 ) -> tuple[QuoteLifecycle, FakeSender, ExposureBook, Metrics]:
     sender = FakeSender()
     exposure = ExposureBook(TEST_CONVENTIONS)
@@ -78,7 +96,9 @@ def _build_lifecycle(
         metrics=metrics,
         lastlook_policy=LastLookPolicy(),
         config=LifecycleConfig(quote_ttl_s=30.0, reprice_threshold_cc=100),
-        balance_tracker=_FixedBankroll(bankroll_cc),  # type: ignore[arg-type]
+        balance_tracker=_FixedBankroll(  # type: ignore[arg-type]
+            bankroll_cc, peak_cc=peak_cc, current_cc=current_cc
+        ),
         start_time_provider=rfq_filter.leg_start_time,
         starvation_watchdog=watchdog,
     )
@@ -174,6 +194,52 @@ async def test_enforced_daily_loss_halts(
         h, store, limits=limits, bankroll_cc=20_000_000
     )
     lifecycle.record_realized_pnl(-5_000_000)
+    await lifecycle.maintenance_tick()
+    assert h.killswitch.halted
+
+
+async def test_shadow_give_back_drawdown_does_not_halt(
+    harness: tuple[Harness, Store],
+) -> None:
+    h, store = harness
+    # peak $2,000 → current $1,700 = 15% give-back, over BOTH the 10% drawdown and
+    # 12% hard-trip. caps_shadow_mode=True ⇒ the killswitch must NOT halt. (No
+    # realized loss, hard-dollar daily cap far away, so ONLY the give-back could.)
+    limits = LimitChecker(
+        RiskLimits(
+            caps_shadow_mode=True,
+            drawdown_frac=Fraction(10, 100),
+            hard_trip_frac=Fraction(12, 100),
+            max_daily_loss_dollars=1_000_000.0,
+        )
+    )
+    lifecycle, _, _, _ = _build_lifecycle(
+        h, store, limits=limits, bankroll_cc=20_000_000,
+        peak_cc=20_000_000, current_cc=17_000_000,
+    )
+    await lifecycle.maintenance_tick()
+    assert not h.killswitch.halted
+
+
+async def test_enforced_give_back_drawdown_halts(
+    harness: tuple[Harness, Store],
+) -> None:
+    h, store = harness
+    # SAME 15% give-back, caps_shadow_mode=False → the give-back halt escalates to
+    # the killswitch (proves the peak-latch → HaltInputs → maintenance_tick halt
+    # wiring is live, not dead — the drawdown/hard-trip halts are now armed).
+    limits = LimitChecker(
+        RiskLimits(
+            caps_shadow_mode=False,
+            drawdown_frac=Fraction(10, 100),
+            hard_trip_frac=Fraction(12, 100),
+            max_daily_loss_dollars=1_000_000.0,
+        )
+    )
+    lifecycle, _, _, _ = _build_lifecycle(
+        h, store, limits=limits, bankroll_cc=20_000_000,
+        peak_cc=20_000_000, current_cc=17_000_000,
+    )
     await lifecycle.maintenance_tick()
     assert h.killswitch.halted
 

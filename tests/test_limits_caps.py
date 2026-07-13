@@ -14,6 +14,8 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from fractions import Fraction
 
+import pytest
+
 from combomaker.core.conventions import Conventions, Side
 from combomaker.core.money import CentiCents
 from combomaker.core.quantity import CentiContracts
@@ -575,3 +577,38 @@ class TestConfigFractionExactness:
         assert rl.hard_trip_frac == Fraction(12, 100)
         assert rl.absolute_notional_multiple == 3
         assert rl.caps_shadow_mode is True  # SHADOW by default in Phase 2
+
+    def test_cap_fraction_out_of_range_rejected(self) -> None:
+        # A percentage is a FRACTION of bankroll: "8" (typo for 8%) would parse
+        # to Fraction(8) = 800% of bankroll and silently disable the cap; a
+        # negative would breach everything. Both must be rejected at load.
+        from pydantic import ValidationError
+
+        from combomaker.ops.config import RiskConfig
+
+        for bad in ("8", "1.5", "0", "-0.08"):
+            with pytest.raises(ValidationError):
+                RiskConfig(game_loss_frac=bad)
+        # "1" (= 100% of bankroll) is the inclusive upper bound and is allowed.
+        assert RiskConfig(game_loss_frac="1").to_risk_limits().game_loss_frac == Fraction(1)
+
+    def test_cap_fraction_non_decimal_rejected(self) -> None:
+        from pydantic import ValidationError
+
+        from combomaker.ops.config import RiskConfig
+
+        with pytest.raises(ValidationError):
+            RiskConfig(hard_trip_frac="abc")
+
+    def test_positive_int_knobs_rejected_below_one(self) -> None:
+        from pydantic import ValidationError
+
+        from combomaker.ops.config import RiskConfig
+
+        for field in (
+            "absolute_notional_multiple",
+            "fill_velocity_max_fills",
+            "starvation_threshold",
+        ):
+            with pytest.raises(ValidationError):
+                RiskConfig(**{field: 0})

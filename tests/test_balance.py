@@ -411,6 +411,52 @@ class TestEquityAwareDenominator:
         )
         assert bt.start_of_day_equity_cc == CC(12_000_000)  # re-anchored to new day
 
+    # --- intraday peak-equity latch (feeds the give-back drawdown/hard-trip halts)
+
+    async def test_peak_equity_high_water_marks_within_day(self) -> None:
+        # Same UTC day (FakeClock default 2026-01-01): peak only ever RISES.
+        bt, _clock = tracker()
+        await bt.refresh(FakeBalanceSource({"balance": 100000, "portfolio_value": 0}))
+        assert bt.peak_equity_cc == CC(10_000_000)          # $1000 first poll
+        await bt.refresh(FakeBalanceSource({"balance": 120000, "portfolio_value": 0}))
+        assert bt.peak_equity_cc == CC(12_000_000)          # rose to $1200
+        await bt.refresh(FakeBalanceSource({"balance": 110000, "portfolio_value": 0}))
+        assert bt.peak_equity_cc == CC(12_000_000)          # $1100 < peak -> HELD
+
+    async def test_peak_resets_at_day_boundary_not_carried_over(self) -> None:
+        clock = FakeClock(start=datetime(2026, 7, 12, 23, 0, tzinfo=UTC))
+        bt = BalanceTracker(VERIFIED, clock, stale_after_s=1e9)
+        await bt.refresh(FakeBalanceSource({"balance": 120000, "portfolio_value": 0}))
+        assert bt.peak_equity_cc == CC(12_000_000)          # day-1 peak $1200
+        clock.advance(2 * 3600)                             # cross UTC midnight
+        await bt.refresh(FakeBalanceSource({"balance": 90000, "portfolio_value": 0}))
+        # New day: peak RESTARTS at today's SOD equity ($900), never the prior
+        # $1200 — give-back is measured within the day, in lockstep with SOD.
+        assert bt.peak_equity_cc == CC(9_000_000)
+        assert bt.start_of_day_equity_cc == CC(9_000_000)
+
+    async def test_peak_resets_on_manual_anchor(self) -> None:
+        bt, _clock = tracker()
+        await bt.refresh(FakeBalanceSource({"balance": 120000, "portfolio_value": 0}))
+        assert bt.peak_equity_cc == CC(12_000_000)
+        bt.set_start_of_day_equity(CC(9_000_000))           # e.g. after a deposit
+        assert bt.peak_equity_cc == CC(9_000_000)           # stale prior peak dropped
+
+    async def test_peak_none_before_poll_and_fails_closed_when_stale(self) -> None:
+        bt, clock = tracker(stale_after_s=30.0)
+        assert bt.peak_equity_cc_or_none() is None          # no poll yet
+        with pytest.raises(StaleBalanceError):
+            _ = bt.peak_equity_cc
+        await bt.refresh(FakeBalanceSource({"balance": 100000, "portfolio_value": 0}))
+        assert bt.peak_equity_cc_or_none() == CC(10_000_000)
+        assert bt.exchange_equity_cc_or_none() == CC(10_000_000)
+        clock.advance(30.001)                               # go stale
+        assert bt.is_stale
+        assert bt.peak_equity_cc_or_none() is None          # give-back halts skip
+        assert bt.exchange_equity_cc_or_none() is None
+        with pytest.raises(StaleBalanceError):
+            _ = bt.peak_equity_cc
+
     async def test_same_day_does_not_reanchor(self) -> None:
         clock = FakeClock(start=datetime(2026, 7, 12, 1, 0, tzinfo=UTC))
         bt = BalanceTracker(VERIFIED, clock, stale_after_s=1e9)

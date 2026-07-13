@@ -6,9 +6,12 @@ NEW slate/time-window cap, wired as an ADDITIVE SHADOW layer (log-only, zero
 quote impact) alongside the existing enforced hard-dollar caps. Cap values are
 the researched $2,000 START set (`docs/research/CAP_recommendation_2000.md`).
 
-**Suite: 1355/0 → 1397/0 (+42, 0 failed), 3 deselected.** mypy strict + ruff
-clean on every touched file. NOT merged, NOT pushed — orchestrator + adversarial
-judge review first.
+**Suite: 1355/0 → 1406/0 (+51, 0 failed), 3 deselected.** (+42 the implement
+pass, +9 the orchestrator follow-up: peak-latch ×4, config-validator ×3,
+give-back-through-lifecycle ×2.) mypy strict + ruff clean on every touched file.
+Adversarial judge PASS on the implement pass; the follow-up (peak latch,
+give-back escalation, config validation) closed the two cheap judge-flagged
+latents and is judged before merge.
 
 ## What Phase 2 adds (one picture)
 
@@ -186,19 +189,39 @@ can't hold a `Fraction` and floats are banned for thresholds — parsed via
   inputs threaded into all THREE `check()` sites (pre-quote, maintenance, last
   look), `_partition_breaches` (shadow split + log), `_note_watchdog`.
 
-**Deferred (out of Phase-2 scope; noted):**
+**WIRED (orchestrator follow-up, same branch — closed two judge-flagged latents):**
+- **Intraday peak-equity latch** (`balance.py`) — `BalanceTracker` now
+  high-water-marks `exchange_equity` on every poll and RE-ANCHORS the peak to the
+  new start-of-day equity at the SAME UTC boundary as the SOD anchor (give-back is
+  measured INTRADAY, per `CAP_recommendation_2000.md`); a manual
+  `set_start_of_day_equity` also resets it. New accessors `peak_equity_cc`
+  (raising) + non-raising `peak_equity_cc_or_none` / `exchange_equity_cc_or_none`.
+- **Give-back halts now POPULATED and ARMED** — `lifecycle._halt_inputs()` builds
+  `HaltInputs` from the tracker's non-raising peak/equity and passes it to all
+  three `check()` sites, so `HALT_DRAWDOWN` / `HALT_HARD_TRIP` now EVALUATE (in
+  shadow: logged; enforced: escalate). The `maintenance_tick` halt loop was
+  generalized from daily-loss-only to escalate ALL enforced halt-class breaches
+  (daily-loss, drawdown, hard-trip) to the killswitch — so flipping to enforce
+  actually arms give-back protection (closes the judge's [MEDIUM latent]). Tested
+  through the real lifecycle: shadow give-back does NOT halt, enforced give-back
+  halts.
+- **Config range/sign validation** (`config.py`) — a `field_validator` rejects a
+  cap fraction outside `(0, 1]` (catches the `"8"`→800% typo and negatives) and a
+  non-decimal; the integer knobs (`absolute_notional_multiple`,
+  `fill_velocity_max_fills`, `starvation_threshold`) must be `>= 1` (closes the
+  judge's [LOW latent] footgun).
+
+**Deferred (genuinely out of Phase-2 scope; noted):**
 - **Fill-velocity ENFORCEMENT** — the params live in `RiskLimits` and the reason
   code exists, but rate tracking is a rolling-window committed-notional counter
   that belongs with the Phase-3 reservation service (needs a committed-fill
   stream, not the pre-trade snapshot). The values are carried so config is
   stable; the check is not yet emitted.
-- **Drawdown / hard-trip give-back inputs** — the cap logic + halts are wired and
-  tested via `HaltInputs(peak_equity_cc, current_equity_cc)`, but the app does
-  not yet maintain an intraday peak-equity tracker to POPULATE `HaltInputs` on
-  the maintenance tick (the BalanceTracker exposes `exchange_equity_cc`; a peak
-  latch on top is a small follow-up). Until then these two halts simply don't
-  evaluate (no peak ⇒ no give-back — never a convenient default). Wiring the peak
-  latch is the one clean deferral; flagged for the next pass.
+- **Hard-trip = soft-halt for now.** Both give-back halts escalate to
+  `killswitch.halt` (stop + cancel-all). The recommendation's "hard-trip = KILL
+  file, human-only clear" distinction (a stronger latch than a soft drawdown
+  halt) is a killswitch-policy refinement for a later pass; the SAFETY action
+  (stop quoting) already fires for both.
 
 ## Design decisions made (not pre-specified)
 
@@ -223,10 +246,11 @@ can't hold a `Fraction` and floats are banned for thresholds — parsed via
 
 ## NEXT STEPS
 
-- **Owner: orchestrator + adversarial judge** — review this pass; then merge.
-- **Owner: eng (next pass)** — populate `HaltInputs` from an intraday peak-equity
-  latch on the maintenance tick (BalanceTracker exposes `exchange_equity_cc`);
-  wire fill-velocity enforcement with the Phase-3 reservation service.
+- **Owner: orchestrator + adversarial judge** — reviewed (PASS) + orchestrator
+  follow-up closed the peak-latch + config-validation latents; then merge.
+- **Owner: eng (next pass)** — wire fill-velocity enforcement with the Phase-3
+  reservation service; optionally give hard-trip a distinct KILL-file latch
+  (both give-back halts already stop quoting).
 - **Owner: operator** — after SHADOW logs accumulate on real tape, compare
   would-be R2 breaches vs current behaviour, then flip `risk.caps_shadow_mode:
   false` per cap-set sign-off; confirm the ET-day slate bucket (vs a rolling
