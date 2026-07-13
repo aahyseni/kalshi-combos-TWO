@@ -147,3 +147,48 @@ class ReasonCode(StrEnum):
     # settlement values). The ledger is ground truth; a mismatch means our model
     # of the exchange is wrong somewhere — stop quoting, don't just log.
     HALT_RECONCILIATION_MISMATCH = "halt_reconciliation_mismatch"
+
+    # --- Phase 6 circuit breakers (in-process detectors ⇒ KillSwitch.halt) ---
+    # Each fires on a known failure SIGNATURE and is fail-closed: a detector
+    # that cannot evaluate its input TRIPS (UNKNOWN is never safe). Grouped and
+    # distinct so the halt stream is diagnosable (feedback_enumerate_buckets).
+    # Market data STALE / sequence gap: the feed rx-age exceeded the threshold,
+    # or a WS sequence gap left the book unusable — pricing off a stale book is
+    # a courtsider gift; halt rather than quote on a possibly-wrong marginal.
+    HALT_DATA_STALE = "halt_data_stale"
+    # LATENCY spike: confirm / round-trip milliseconds over threshold — the
+    # exchange (or our link) is slow enough that last-look freshness can't be
+    # trusted and a stale accept could land.
+    HALT_LATENCY_SPIKE = "halt_latency_spike"
+    # 429 BURST: rate-limit responses over threshold in a rolling window — we
+    # are being throttled hard enough that quotes/cancels may not land; stand
+    # down so the reserved supervisor budget can still act.
+    HALT_RATE_LIMIT_BURST = "halt_rate_limit_burst"
+    # MARGINAL JUMP: a leg marginal moved more than the threshold between ticks
+    # — a bad-data print or a real event (goal / injury / suspension). Either
+    # way the book we priced against is no longer the book, so halt.
+    HALT_MARGINAL_JUMP = "halt_marginal_jump"
+    # Rule / metadata CHANGE: the taxonomy tripwire matched (a pinned
+    # exchange-blocked impossible shape became constructible ⇒ the validator
+    # changed) OR a market's settlement-relevant metadata changed under us
+    # (close_time / rules_primary / settlement source). Our model of the market
+    # is stale; halt before pricing on the wrong rules.
+    HALT_METADATA_CHANGE = "halt_metadata_change"
+    # UNMAPPED GAME KEY: a leg whose game_key can't be resolved to a real game
+    # reached the risk path (it would key on its own whole-ticker singleton and
+    # escape every game/slate cluster cap). UNKNOWN cluster membership is never
+    # safe for a correlation book — halt rather than let it slip the caps.
+    HALT_UNMAPPED_GAME = "halt_unmapped_game"
+    # A circuit-breaker detector itself raised while evaluating. A breaker that
+    # can't run is a breaker that can't protect — fail closed to a halt, never
+    # swallow the error and continue quoting.
+    HALT_BREAKER_ERROR = "halt_breaker_error"
+    # The external safety supervisor tripped: a missed heartbeat (bot presumed
+    # wedged) or an explicit external trigger. Written into the KILL file by the
+    # supervisor so a revived bot halts immediately on restart.
+    HALT_SUPERVISOR = "halt_supervisor"
+    # Block-restart-until-reconciled: a `needs_reconcile` marker (left by a
+    # prior hard halt / supervisor kill) is present at startup. The bot refuses
+    # to quote until it reconciles its local book against the exchange and the
+    # marker clears — a restarted bot must never resume quoting blind.
+    HALT_NEEDS_RECONCILE = "halt_needs_reconcile"

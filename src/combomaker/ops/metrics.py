@@ -69,6 +69,16 @@ class Metrics:
     def counter(self, name: str) -> int:
         return self._counters.get(name, 0)
 
+    def histogram_max_ms(self, name: str) -> float | None:
+        """The worst observed latency for a series, or None if never observed.
+        Used by the latency-spike circuit breaker (Phase 6) to sample the
+        worst confirm/round-trip so far — a spike must not hide behind a good
+        mean/median."""
+        h = self._histograms.get(name)
+        if h is None or h.total == 0:
+            return None
+        return h.max_ms
+
     def snapshot(self) -> dict[str, object]:
         return {
             "counters": dict(self._counters),

@@ -16,6 +16,7 @@ from typing import Any
 from combomaker.exchange.auth import CredentialsError
 from combomaker.ops.app import ObserveApp
 from combomaker.ops.config import Env, Mode, ProdGuardError, load_config
+from combomaker.ops.preflight import PreflightError
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -189,6 +190,10 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    except PreflightError as exc:
+        # A red prod go-live gate: the bot refused to quote. Loud, non-zero exit.
+        print(f"REFUSING TO QUOTE: {exc}", file=sys.stderr)
+        return 3
     except KeyboardInterrupt:
         print("interrupted")
     return 0

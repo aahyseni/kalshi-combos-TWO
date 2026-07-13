@@ -11,7 +11,7 @@ from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from fractions import Fraction
 from pathlib import Path
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
 import yaml
 from pydantic import (
@@ -24,6 +24,9 @@ from pydantic import (
 )
 
 from combomaker.risk.limits import RiskLimits
+
+if TYPE_CHECKING:
+    from combomaker.risk.breakers import BreakerThresholds
 
 
 class Env(StrEnum):
@@ -74,6 +77,90 @@ class LoggingConfig(StrictModel):
 class SafetyConfig(StrictModel):
     # Set true in prod.yaml only after limits have been reviewed by the human.
     prod_limits_configured: bool = False
+    # Phase 6 go-live gate: prod requires a NON-EMPTY leg-series allowlist
+    # (``filters.allowed_leg_series_prefixes``) so only whitelisted series quote
+    # on real money. Defaults ON — an operator must deliberately set it false to
+    # weaken it, and even then the empty-collection-whitelist gate still binds.
+    # This is a distinct gate from ``prod_limits_configured``: limits bound how
+    # MUCH we risk; the whitelist bounds WHAT we quote (no crypto/esports/
+    # unmodeled legs on prod, per judge finding F1).
+    prod_require_series_whitelist: bool = True
+    # Phase 6: prod requires an external-supervisor heartbeat to be established
+    # AND the external kill path reachable before the first quote (the preflight
+    # checks both). Defaults ON. An operator can only disable it deliberately;
+    # everything ships NOT-LIVE, so prod stays off regardless.
+    prod_require_supervisor: bool = True
+
+
+class SupervisorConfig(StrictModel):
+    """External safety supervisor knobs (Phase 6; ops/supervisor.py). The
+    supervisor is a SEPARATE process — these values are read both by the bot (to
+    size its heartbeat cadence) and by the standalone ``python -m
+    combomaker.ops.supervisor`` entry point. Defaults are the conservative
+    first-live posture; the report tables them."""
+
+    # The bot must beat within this window or the supervisor presumes it wedged.
+    heartbeat_timeout_s: float = 15.0
+    # How often the supervisor polls the heartbeat file.
+    poll_interval_s: float = 1.0
+    # Reserved API write budget: tokens the supervisor may spend per window on
+    # its OWN cancels, so it can always act under a 429 storm. Sized well above a
+    # realistic resting-quote count (max_open_quotes default 20).
+    write_budget_capacity: int = 200
+    write_budget_refill_s: float = 10.0
+
+    @field_validator("heartbeat_timeout_s", "poll_interval_s", "write_budget_refill_s")
+    @classmethod
+    def _positive_seconds(cls, v: float) -> float:
+        if v <= 0.0:
+            raise ValueError(f"must be > 0, got {v}")
+        return v
+
+    @field_validator("write_budget_capacity")
+    @classmethod
+    def _positive_capacity(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"write_budget_capacity must be >= 1, got {v}")
+        return v
+
+
+class BreakerConfig(StrictModel):
+    """Circuit-breaker thresholds (Phase 6; risk/breakers.py). Every breaker is
+    fail-closed; these are the trip levels. Conservative for the shadow/first-live
+    posture — the report tables them with reason codes."""
+
+    max_rx_age_s: float = 5.0             # feed staleness (HALT_DATA_STALE)
+    max_latency_ms: float = 2_000.0       # confirm/round-trip (HALT_LATENCY_SPIKE)
+    rate_limit_window_s: float = 10.0     # 429-burst window (HALT_RATE_LIMIT_BURST)
+    max_rate_limit_in_window: int = 10    # 429s at/over ⇒ burst
+    max_marginal_jump: float = 0.25       # prob jump between ticks (HALT_MARGINAL_JUMP)
+
+    @field_validator(
+        "max_rx_age_s", "max_latency_ms", "rate_limit_window_s", "max_marginal_jump"
+    )
+    @classmethod
+    def _positive(cls, v: float) -> float:
+        if v <= 0.0:
+            raise ValueError(f"must be > 0, got {v}")
+        return v
+
+    @field_validator("max_rate_limit_in_window")
+    @classmethod
+    def _positive_count(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"max_rate_limit_in_window must be >= 1, got {v}")
+        return v
+
+    def to_thresholds(self) -> BreakerThresholds:
+        from combomaker.risk.breakers import BreakerThresholds
+
+        return BreakerThresholds(
+            max_rx_age_s=self.max_rx_age_s,
+            max_latency_ms=self.max_latency_ms,
+            rate_limit_window_s=self.rate_limit_window_s,
+            max_rate_limit_in_window=self.max_rate_limit_in_window,
+            max_marginal_jump=self.max_marginal_jump,
+        )
 
 
 class FiltersConfig(StrictModel):
@@ -1932,6 +2019,8 @@ class AppConfig(StrictModel):
     filters: FiltersConfig = Field(default_factory=FiltersConfig)
     pricing: PricingConfig = Field(default_factory=PricingConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
+    supervisor: SupervisorConfig = Field(default_factory=SupervisorConfig)
+    breakers: BreakerConfig = Field(default_factory=BreakerConfig)
     observe: ObserveConfig = Field(default_factory=ObserveConfig)
     data_dir: Path = Path("data")
     kill_file: Path = Path("KILL")
@@ -1940,7 +2029,11 @@ class AppConfig(StrictModel):
     confirm_live: bool = Field(default=False, exclude=True)
 
     def assert_safe_to_run(self) -> None:
-        """Hardcoded production guard. Raises ProdGuardError on violation."""
+        """Hardcoded production guard (the STATIC go-live gates). Raises
+        ProdGuardError on violation. The RUNTIME preflight (supervisor heartbeat
+        established, external kill reachable, book reconciled) runs separately at
+        startup in QuoteApp — those need live state this static check can't see.
+        Everything defaults OFF: prod stays not-live until every gate is green."""
         if self.env is Env.PROD and self.mode is Mode.QUOTE:
             if not self.confirm_live:
                 raise ProdGuardError(
@@ -1951,6 +2044,20 @@ class AppConfig(StrictModel):
                     "quoting on production requires safety.prod_limits_configured: true "
                     "in the prod config, set after limits are reviewed"
                 )
+            # Phase 6 WHITELIST gate: only whitelisted series may quote on prod.
+            # The leg-series allowlist must be present AND non-empty (an empty
+            # list or a null disables the per-leg gate — both are unsafe on real
+            # money). The collection whitelist (checked in QuoteApp for all quote
+            # mode) is a separate, coarser gate; this one is the leg-series one.
+            if self.safety.prod_require_series_whitelist:
+                allowed = self.filters.allowed_leg_series_prefixes
+                if not allowed:
+                    raise ProdGuardError(
+                        "quoting on production requires a non-empty "
+                        "filters.allowed_leg_series_prefixes (the leg-series "
+                        "allowlist) — only whitelisted series quote on prod; set "
+                        "safety.prod_require_series_whitelist: false to override"
+                    )
 
 
 class ProdGuardError(RuntimeError):

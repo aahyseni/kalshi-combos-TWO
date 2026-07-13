@@ -21,22 +21,30 @@ from combomaker.core.conventions import load_conventions
 from combomaker.core.money import CentiCents
 from combomaker.core.reasons import ReasonCode
 from combomaker.exchange.auth import Credentials, RequestSigner
-from combomaker.exchange.rest import KalshiApiError, KalshiRestClient
+from combomaker.exchange.rest import KalshiApiError, KalshiRestClient, RateLimitedError
 from combomaker.exchange.ws import WsManager
 from combomaker.marketdata.feed import OrderbookFeed
 from combomaker.marketdata.metadata import MetadataCache
-from combomaker.ops.config import AppConfig, Mode
+from combomaker.ops.config import AppConfig, Env, Mode
 from combomaker.ops.logging import configure_logging, get_logger
 from combomaker.ops.metrics import Metrics
 from combomaker.ops.persistence import Store
+from combomaker.ops.preflight import (
+    PreflightConditions,
+    PreflightError,
+    evaluate_preflight,
+)
 from combomaker.ops.report import build_report, format_report
+from combomaker.ops.supervisor import supervisor_credential_configured
 from combomaker.pricing.engine import PricingEngine
 from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.intake import RfqIntake
 from combomaker.rfq.lifecycle import LifecycleConfig, QuoteLifecycle
 from combomaker.rfq.models import Rfq
 from combomaker.risk.balance import BalanceTracker, StaleBalanceError
+from combomaker.risk.breakers import BreakerInputs, CircuitBreakers, RateLimitWindow
 from combomaker.risk.exposure import ExposureBook
+from combomaker.risk.heartbeat import Heartbeat, ReconcileMarker
 from combomaker.risk.inplay import InPlayDetector
 from combomaker.risk.killswitch import HaltEvent, KillSwitch
 from combomaker.risk.lastlook import LastLookPolicy
@@ -101,6 +109,20 @@ class QuoteApp:
         self._metrics = Metrics()
         self._watched: set[str] = set()
         self._stop = asyncio.Event()
+        # Phase 6 out-of-process safety plumbing. The heartbeat file is what the
+        # external supervisor reads; the reconcile marker enforces
+        # block-restart-until-reconciled (both live under data_dir so the
+        # standalone supervisor process finds them at the same paths).
+        self._heartbeat = Heartbeat(self._clock, config.data_dir / "heartbeat.txt")
+        self._reconcile_marker = ReconcileMarker(config.data_dir / "needs_reconcile")
+        # 429-burst window for the rate-limit circuit breaker (recorded from the
+        # REST error paths in the polling loops).
+        self._rate_limit_window = RateLimitWindow(
+            clock=self._clock, window_s=config.breakers.rate_limit_window_s
+        )
+        # Set once the startup reconcile succeeds and the marker is clear — the
+        # book-reconciled preflight gate reads this.
+        self._book_reconciled = config.mode is not Mode.QUOTE
 
     async def run(self) -> None:
         config = self._config
@@ -223,9 +245,23 @@ class QuoteApp:
             )
             lifecycle.attach_reservation(reservation)
 
-            # Idempotent startup: reconcile before doing anything.
+            # Phase 6 circuit breakers: fail-closed detectors that trip the kill
+            # switch on the known failure signatures. Evaluated in the status
+            # loop off the hot path (a trip cancels-all + stops via on_halt).
+            breakers = CircuitBreakers(killswitch, config.breakers.to_thresholds())
+
+            # Idempotent startup: reconcile before doing anything, THEN enforce
+            # the Phase 6 go-live gates. Both are quote-mode only (demo/paper are
+            # unaffected).
             if config.mode is Mode.QUOTE:
-                await self._startup_reconcile(rest)
+                # BLOCK-RESTART-UNTIL-RECONCILED: a needs_reconcile marker left by
+                # a prior hard halt / supervisor kill means a restarted bot must
+                # NOT resume quoting until it reconciles its book. The startup
+                # reconcile is the exchange-first pass that satisfies it.
+                await self._block_restart_until_reconciled(rest, reservation)
+                # PROD PREFLIGHT: every go-live condition must be green before the
+                # first quote. Refuses to start on any red gate.
+                self._run_prod_preflight()
 
             # RFQs skipped for transient reasons (books warming up on first
             # sighting) get retried until quoted, dead, or out of attempts —
@@ -291,7 +327,8 @@ class QuoteApp:
                 asyncio.create_task(retry_pending(), name="rfq-retry"),
                 asyncio.create_task(self._maintenance_loop(lifecycle), name="maintenance"),
                 asyncio.create_task(
-                    self._status_loop(rest, lifecycle, killswitch), name="exchange-status"
+                    self._status_loop(rest, lifecycle, killswitch, breakers, feed),
+                    name="exchange-status",
                 ),
                 asyncio.create_task(
                     self._report_loop(store, exposure, lifecycle), name="report"
@@ -360,7 +397,12 @@ class QuoteApp:
         )
         return source, poller, client
 
-    async def _startup_reconcile(self, rest: KalshiRestClient) -> None:
+    async def _startup_reconcile(self, rest: KalshiRestClient) -> bool:
+        """Exchange-first startup pass: cancel leftover resting quotes + observe
+        existing positions. Returns True iff the reconcile round-trip SUCCEEDED
+        (the exchange was reachable). A failure returns False so the caller can
+        keep the ``needs_reconcile`` block in place — a bot that couldn't reach
+        the exchange has NOT proven its book and must not resume quoting."""
         try:
             payload = await rest.get_quotes(user_filter="self", status="open")
             leftover = payload.get("quotes", []) or []
@@ -379,8 +421,86 @@ class QuoteApp:
                     detail="existing positions found — exposure book starts EMPTY; "
                     "reconcile manually before trusting limits",
                 )
+            return True
         except KalshiApiError as exc:
             log.warning("startup_reconcile_failed", error=str(exc))
+            return False
+
+    async def _block_restart_until_reconciled(
+        self, rest: KalshiRestClient, reservation: RiskReservationService
+    ) -> None:
+        """BLOCK-RESTART-UNTIL-RECONCILED (Phase 6). A ``needs_reconcile`` marker
+        (dropped by a prior hard halt / supervisor kill and surviving the restart
+        on disk) means the bot must reconcile its book against the exchange BEFORE
+        it may quote. The exchange-first reconcile is the proof; only on success
+        do we clear the marker and set ``_book_reconciled`` (the preflight gate).
+
+        Fail-closed: if the reconcile round-trip FAILS (exchange unreachable), the
+        marker STAYS set and ``_book_reconciled`` STAYS false — the preflight then
+        refuses to quote. A revived bot that can't reach the exchange never
+        resumes blind. Idempotent: no marker ⇒ a normal startup reconcile."""
+        marker_present = self._reconcile_marker.is_set()
+        if marker_present:
+            log.warning(
+                "needs_reconcile_marker_present",
+                detail="a prior hard halt/supervisor kill requires an exchange "
+                "reconcile before quoting resumes",
+            )
+        ok = await self._startup_reconcile(rest)
+        if not ok:
+            log.error(
+                "startup_reconcile_incomplete",
+                detail="exchange unreachable — book NOT reconciled; the bot will "
+                "refuse to quote (needs_reconcile stays in force)",
+            )
+            self._book_reconciled = False
+            return
+        # Exchange-first: no local reservations survive a restart (the service is
+        # fresh in-process), so an empty reconcile is the correct startup state —
+        # nothing to commit, nothing to release. The call is the exchange-first
+        # pass regardless (Phase 3 semantics) and is a no-op on a fresh service.
+        reservation.reconcile(set())
+        self._reconcile_marker.clear()
+        self._book_reconciled = True
+        log.info("book_reconciled", detail="startup reconcile complete; quoting unblocked")
+
+    def _run_prod_preflight(self) -> None:
+        """PROD GO-LIVE PREFLIGHT (Phase 6). Every live go-live condition must be
+        green before the first quote. On demo this is a no-op (no real money);
+        on prod any red gate raises ``PreflightError`` and the bot refuses to
+        start. Fail-closed: an unestablished condition is red.
+
+        The supervisor gates check that (a) the bot has beaten its heartbeat at
+        least once (the file the external supervisor reads exists) and (b) the
+        external kill path is reachable (the dedicated supervisor credential is
+        configured) — so the external kill can actually fire before we risk a
+        cent."""
+        config = self._config
+        if config.env is not Env.PROD:
+            return
+        # The bot writes its first heartbeat here so the supervisor has a file to
+        # watch from t=0 (rather than a gap until the first maintenance tick).
+        self._heartbeat.beat()
+        heartbeat_established = self._heartbeat.path.exists()
+        kill_reachable = supervisor_credential_configured()
+        conditions = PreflightConditions(
+            limits_configured=config.safety.prod_limits_configured,
+            whitelist_non_empty=bool(config.filters.allowed_leg_series_prefixes),
+            supervisor_heartbeat_established=heartbeat_established,
+            external_kill_reachable=kill_reachable,
+            book_reconciled=self._book_reconciled,
+        )
+        result = evaluate_preflight(
+            conditions, require_supervisor=config.safety.prod_require_supervisor
+        )
+        if not result.green:
+            log.error("prod_preflight_red", red_gates=list(result.red_gates))
+            raise PreflightError(
+                "prod go-live preflight failed — red gates: "
+                + ", ".join(result.red_gates)
+                + " (the bot refuses to quote until every gate is green)"
+            )
+        log.info("prod_preflight_green", detail="all go-live gates green")
 
     async def _ensure_watched(
         self, rfq: Rfq, feed: OrderbookFeed, metadata: MetadataCache
@@ -405,6 +525,11 @@ class QuoteApp:
     async def _maintenance_loop(self, lifecycle: QuoteLifecycle) -> None:
         while True:
             await asyncio.sleep(0.5)
+            # Beat the heartbeat FIRST, every tick — the external supervisor
+            # presumes the bot wedged if this file goes stale. A slow/failed
+            # maintenance_tick still leaves the last beat aging, which is exactly
+            # the wedged signal the supervisor watches for (fail-closed).
+            self._heartbeat.beat()
             try:
                 await lifecycle.maintenance_tick()
             except Exception:
@@ -421,6 +546,9 @@ class QuoteApp:
         while True:
             try:
                 await tracker.refresh(rest)
+            except RateLimitedError as exc:
+                self._rate_limit_window.record()  # feed the 429-burst breaker
+                log.warning("balance_poll_rate_limited", error=str(exc))
             except StaleBalanceError as exc:
                 log.warning("balance_poll_stale", error=str(exc))
             except Exception as exc:
@@ -428,7 +556,12 @@ class QuoteApp:
             await asyncio.sleep(BALANCE_POLL_INTERVAL_S)
 
     async def _status_loop(
-        self, rest: KalshiRestClient, lifecycle: QuoteLifecycle, killswitch: KillSwitch
+        self,
+        rest: KalshiRestClient,
+        lifecycle: QuoteLifecycle,
+        killswitch: KillSwitch,
+        breakers: CircuitBreakers,
+        feed: OrderbookFeed,
     ) -> None:
         while True:
             try:
@@ -439,10 +572,33 @@ class QuoteApp:
                 lifecycle.exchange_active = active
                 if not active:
                     await lifecycle.cancel_all(ReasonCode.HALT_EXCHANGE_STATUS)
+            except RateLimitedError as exc:
+                self._rate_limit_window.record()
+                log.warning("exchange_status_rate_limited", error=str(exc))
+                lifecycle.exchange_active = False
             except Exception as exc:
                 log.warning("exchange_status_failed", error=repr(exc))
                 lifecycle.exchange_active = False
+            # Phase 6 circuit breakers, evaluated off the hot path. A trip halts
+            # the kill switch (cancel-all + stop via on_halt). Fail-closed inside
+            # ``evaluate`` — a detector that can't run trips HALT_BREAKER_ERROR.
+            try:
+                await breakers.evaluate_and_halt(self._sample_breaker_inputs(feed))
+            except Exception:
+                log.exception("breaker_evaluation_failed")
             await asyncio.sleep(15.0)
+
+    def _sample_breaker_inputs(self, feed: OrderbookFeed) -> BreakerInputs:
+        """Snapshot the live signals the circuit breakers evaluate. A seq gap /
+        disconnect surfaces as ``feed_healthy=False`` (the feed re-baselines a
+        gap and drops health); confirm latency is the worst observed round-trip;
+        the 429 count is the rolling burst window."""
+        return BreakerInputs(
+            rx_age_s=feed.rx_age_s,
+            seq_gap=not feed.feed_healthy,
+            latency_ms=self._metrics.histogram_max_ms("confirm.rtt_ms"),
+            rate_limit_count=self._rate_limit_window.count(),
+        )
 
     async def _report_loop(
         self, store: Store, exposure: ExposureBook, lifecycle: QuoteLifecycle
