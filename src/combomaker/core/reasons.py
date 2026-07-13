@@ -115,6 +115,13 @@ class ReasonCode(StrEnum):
     DECLINE_INPLAY_LEG = "decline_inplay_leg"
     DECLINE_START_TIME_UNKNOWN = "decline_start_time_unknown"
     DECLINE_VELOCITY_ANOMALY = "decline_velocity_anomaly"
+    # Fill-velocity governor (wire-live 2026-07-13): committed notional or fill
+    # COUNT in the rolling window exceeded the soft limit — DECLINE further
+    # confirms + cancel-all resting quotes so a burst of accepts cannot run the
+    # book away between balance polls. The COUNT limit still binds when the
+    # bankroll is stale (fail-closed). Distinct from DECLINE_VELOCITY_ANOMALY
+    # (a per-leg market-motion signal); this is our OWN acceptance rate.
+    DECLINE_FILL_VELOCITY = "decline_fill_velocity"
     DECLINE_RISK_LIMIT = "decline_risk_limit"
     DECLINE_MASS_ACCEPTANCE = "decline_mass_acceptance"
     DECLINE_KILL_SWITCH = "decline_kill_switch"

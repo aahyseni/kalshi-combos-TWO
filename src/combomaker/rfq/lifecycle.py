@@ -45,6 +45,7 @@ from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.models import Rfq
 from combomaker.risk.balance import BalanceTracker
 from combomaker.risk.exposure import ExposureBook, LegRef, OpenPosition, OpenQuoteRisk
+from combomaker.risk.fill_velocity import FillVelocityTracker
 from combomaker.risk.inplay import InPlayDetector
 from combomaker.risk.killswitch import KillSwitch
 from combomaker.risk.lastlook import (
@@ -60,6 +61,7 @@ from combomaker.risk.limits import (
     PortfolioRisk,
     StartTimeProvider,
     StarvationWatchdog,
+    threshold_cc,
 )
 from combomaker.risk.markouts import MarkoutSubject, MarkoutTracker
 from combomaker.risk.reservation import RiskReservationService
@@ -210,6 +212,14 @@ class QuoteLifecycle:
         # (half of it) so the snapshot stays fresh without running a full MC every
         # 0.5s maintenance tick. None ⇒ never refreshed yet.
         self._book_risk_refresh_mono_ns: int | None = None
+        # Fill-velocity governor: a rolling committed-notional + count window over
+        # our OWN acceptances, built from the SAME RiskLimits the caps use. A
+        # burst over the soft frac / max fills DECLINEs further confirms +
+        # cancels-all; a hard-frac burst HALTs. The COUNT limit binds even on a
+        # stale bankroll (fail-closed).
+        self._fill_velocity = FillVelocityTracker(
+            clock, window_s=limits.limits.fill_velocity_window_s
+        )
         # R3 Phase 3: single-writer risk-reservation service. When present, the
         # confirm path RESERVES headroom (atomic + versioned) BEFORE the confirm
         # round-trip and commits/releases/marks-unconfirmed based on the outcome —
@@ -362,6 +372,77 @@ class QuoteLifecycle:
         if age_s > self._config.book_risk_stale_after_s:
             return _StaleBookRisk()  # snapshot too old ⇒ fail closed
         return snap
+
+    # --------------------------------------------------------- fill velocity
+
+    def _record_fill_velocity(self, bid: CentiCents, qty: CentiContracts) -> None:
+        """Record one ACCEPTED fill in the velocity window at the instant its
+        ``pending_fill`` is set. Committed notional = premium at risk =
+        contracts x bid (the LOSS axis, ``contracts·price//100``), matching the
+        capital a confirmed fill actually puts at risk."""
+        committed_cc = int(qty) * int(bid) // 100
+        self._fill_velocity.record(committed_cc)
+
+    def _fill_velocity_verdict(self) -> tuple[str, str]:
+        """Evaluate the trailing-window velocity against the configured limits.
+
+        Returns ``(verdict, detail)`` where verdict is:
+          - "halt"    committed notional over the HARD frac of bankroll ⇒ the
+                      caller HALTs (HALT_FILL_VELOCITY);
+          - "decline" committed notional over the SOFT frac OR the fill COUNT over
+                      max_fills ⇒ the caller DECLINEs further confirms +
+                      cancels-all resting quotes;
+          - "ok"      within limits.
+        Fail-closed on a STALE bankroll (hard rule 6): the %-of-bankroll notional
+        thresholds cannot be computed, so they are SKIPPED (never defaulted to
+        fine), but the bankroll-free COUNT limit STILL BINDS — a runaway
+        acceptance rate is capped even in the dark. HALT dominates DECLINE.
+
+        SHADOW-consistent with the R2 caps: when ``caps_shadow_mode`` is True the
+        whole R2 risk layer is log-only, so the governor still records + LOGS a
+        would-be breach but returns "ok" (never declines/halts). Only when the
+        caps are ENFORCED (the wire-live default) does it bite."""
+        limits = self._limits.limits
+        state = self._fill_velocity.state()
+        bankroll = self._risk_bankroll_cc()
+        verdict = "ok"
+        detail = ""
+        if bankroll is not None and bankroll > 0:
+            hard_thr = threshold_cc(limits.fill_velocity_hard_frac, bankroll)
+            soft_thr = threshold_cc(limits.fill_velocity_soft_frac, bankroll)
+            if state.committed_cc > hard_thr:
+                verdict, detail = (
+                    "halt",
+                    f"committed {state.committed_cc}cc > "
+                    f"{limits.fill_velocity_hard_frac} bankroll = {hard_thr}cc "
+                    f"in {limits.fill_velocity_window_s}s (count={state.count})",
+                )
+            elif state.committed_cc > soft_thr:
+                verdict, detail = (
+                    "decline",
+                    f"committed {state.committed_cc}cc > "
+                    f"{limits.fill_velocity_soft_frac} bankroll = {soft_thr}cc "
+                    f"in {limits.fill_velocity_window_s}s (count={state.count})",
+                )
+        # COUNT limit — bankroll-free, so it binds even when the bankroll is stale.
+        if verdict == "ok" and state.count > limits.fill_velocity_max_fills:
+            verdict, detail = (
+                "decline",
+                f"fill count {state.count} > max {limits.fill_velocity_max_fills} "
+                f"in {limits.fill_velocity_window_s}s",
+            )
+        if verdict != "ok" and limits.caps_shadow_mode:
+            # SHADOW: log the would-be fill-velocity action but do NOT enforce it,
+            # matching the R2 shadow guarantee (the whole risk layer is log-only).
+            log.info(
+                "fill_velocity_shadow",
+                would_be=verdict,
+                detail=detail,
+                committed_cc=state.committed_cc,
+                count=state.count,
+            )
+            return ("ok", "")
+        return (verdict, detail)
 
     def _partition_breaches(self, breaches: list[Breach]) -> list[Breach]:
         """Split R2 SHADOW breaches (log-only) from enforced breaches.
@@ -640,6 +721,37 @@ class QuoteLifecycle:
             # eventual quote_executed must find this state and book the fill.
             state.pending_fill = (accepted_side, bid, qty)
             self._executed_states[quote_id] = state
+            # FILL-VELOCITY GOVERNOR (wire-live): record this acceptance's
+            # committed notional in the rolling window (the point pending_fill is
+            # set), then evaluate the rate. A burst over the SOFT frac / max fills
+            # DECLINEs this confirm + cancels-all resting quotes; over the HARD
+            # frac HALTs. The COUNT limit binds even on a stale bankroll. Evaluated
+            # BEFORE the reservation/round-trip so a runaway rate never confirms.
+            self._record_fill_velocity(bid, qty)
+            fv_verdict, fv_detail = self._fill_velocity_verdict()
+            if fv_verdict != "ok":
+                if fv_verdict == "halt":
+                    await self._killswitch.halt(
+                        ReasonCode.HALT_FILL_VELOCITY, fv_detail
+                    )
+                    # halt callbacks (cancel-all) already ran; still record the
+                    # declined confirm + back out this fill below.
+                self._metrics.inc(
+                    f"confirm.declined.{ReasonCode.DECLINE_FILL_VELOCITY}"
+                )
+                self._track_markout(f"declined:{quote_id}", state)
+                await self._record_confirm_decision(
+                    state, confirm=False, reason=ReasonCode.DECLINE_FILL_VELOCITY,
+                    detail=fv_detail, decision_ms=decision_ms,
+                )
+                self._executed_states.pop(quote_id, None)
+                state.pending_fill = None
+                # DECLINE further confirms + cancel-all resting quotes (a soft
+                # decline; a hard halt already cancelled-all via its callbacks, but
+                # cancel_all is idempotent so this is safe either way).
+                await self.cancel_all(ReasonCode.DECLINE_FILL_VELOCITY)
+                self._drop_quote(quote_id)
+                return
             # R3 Phase 3: RESERVE headroom BEFORE the confirm round-trip (atomic +
             # versioned). If the reservation is ENFORCED-denied — impossible in
             # Phase-2 SHADOW mode, real once caps are flipped — we do NOT confirm;
@@ -966,6 +1078,20 @@ class QuoteLifecycle:
                 ):
                     await self._killswitch.halt(breach.reason, breach.detail)
                     return  # halt callbacks (cancel-all) already ran
+            # FILL-VELOCITY governor, re-evaluated off the maintenance tick so a
+            # burst that just landed is caught even between confirms: over the HARD
+            # frac HALTs; over the SOFT frac / max fills cancels-all resting quotes
+            # (the same DECLINE action, applied to the standing book). The window
+            # decays on its own, so this self-clears once the burst ages out.
+            fv_verdict, fv_detail = self._fill_velocity_verdict()
+            if fv_verdict == "halt":
+                await self._killswitch.halt(
+                    ReasonCode.HALT_FILL_VELOCITY, fv_detail
+                )
+                return  # halt callbacks (cancel-all) already ran
+            if fv_verdict == "decline" and self._open:
+                log.warning("fill_velocity_cancel_all", detail=fv_detail)
+                await self.cancel_all(ReasonCode.DECLINE_FILL_VELOCITY)
         now = self._clock.monotonic_ns()
         for quote_id, state in list(self._open.items()):
             if state.accepted:

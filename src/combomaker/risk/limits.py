@@ -252,6 +252,14 @@ class LimitChecker:
     def __init__(self, limits: RiskLimits) -> None:
         self._limits = limits
 
+    @property
+    def limits(self) -> RiskLimits:
+        """The immutable ``RiskLimits`` this checker enforces (read-only). Lets
+        callers read the fill-velocity knobs / cap fractions without duplicating
+        the config, so the fill-velocity governor derives its window + thresholds
+        from the SAME limits the caps use."""
+        return self._limits
+
     def check(
         self,
         book: ExposureBook,
