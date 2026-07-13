@@ -1,9 +1,16 @@
 # Risk engine PHASE 1 — four correctness fixes (equity denominator, fees, scalar settlement, rename)
 
-**Date:** 2026-07-12. **Branch:** `risk-phase1`. **Scope:** RISK_BUILD_PLAN
-Phase 1 ("correct the money"). One coherent commit. Prototype-in-test →
-port → parity-check (CLAUDE.md rule 8). Baseline suite **1325/0** →
-**1353/0** (+28, 0 failed). mypy strict + ruff clean on every touched file.
+**Date:** 2026-07-12. **Branch:** `risk-phase1` → **MERGED to `main` (6b5c76f),
+pushed, worktree removed.** **Scope:** RISK_BUILD_PLAN Phase 1 ("correct the
+money"). Two commits (impl `435809b` + judge-defect fixes `6b5c76f`).
+Prototype-in-test → port → parity-check (CLAUDE.md rule 8). Baseline suite
+**1325/0** → **1355/0** (+30, 0 failed). mypy strict + ruff clean on every
+touched file.
+
+**Status: COMPLETE.** Adversarial judge returned PASS with two LATENT defects
+filed (not reachable on today's binary path, but must be correct before the
+ledger is wired to a live scalar settlement in Phase 2). Both fixed before merge
+— see "Judge-found defects" below.
 
 Files changed:
 
@@ -106,6 +113,37 @@ it (the caps bind on `worst_case_loss_by_game_cc` = premium/loss, `gross_notiona
 > outside the `payout_obligation` task and would risk the loss-cap semantics),
 > but the name is misleading and a future rename to `gross_premium_at_risk_cc`
 > should be considered.
+
+## Judge-found defects (both fixed before merge, commit `6b5c76f`)
+
+The Phase-1 adversarial judge PASSed the impl but filed two LATENT defects on the
+settlement path. Neither is reachable today (the live path books only binary
+V∈{0,1} HIT/MISS settlements), but both would bite the moment Phase 2 wires a
+live scalar (DNP/void/rain) settlement — so they were fixed, not deferred.
+
+**DEFECT-1 — float floor breaks reconciliation-to-the-cent (hard rule 5).**
+`_no_payout_per_contract_cc` and the YES mirror computed `int(settled_value *
+CC_PER_DOLLAR)`. For a grid-aligned scalar like V=0.57, IEEE-754 makes
+`0.57 * 10000 = 5699.999…`, and `int()` truncates to **5699** — a spurious 1cc
+under-floor. The exchange pays NO exactly $0.43 = 4300cc for V=0.57, but the old
+code booked 4301cc → a 1cc predicted-vs-exchange gap that **false-trips
+`HALT_RECONCILIATION_MISMATCH`**. Fix: `round()` (V arrives already floored onto
+Kalshi's cent grid by the DNP convention, so `round` recovers the true grid
+value; grid-aligned V ⇒ round == the intended floor). Regression:
+`test_scalar_payout_lands_exactly_on_the_cent` asserts V=0.57 → realized −700cc
+and V=0.69 → −1900cc exactly (the old code gave −699 / −1899).
+
+**DEFECT-2 — poison-pill idempotency under-counts realized P&L.**
+`self._settled_ids.add(position_id)` ran right after the dedup check, BEFORE the
+raising convention-gate. So a NO settlement that raised (`combo_no_pays_complement`
+not yet verified) was permanently marked settled — a replay after the convention
+was verified would hit the dedup `return 0` and be **silently dropped**,
+under-counting realized P&L with no error. Fix: move the `add` to AFTER every
+raising guard, so a raised settlement stays replayable and is booked once the
+guard clears (idempotency without a poison pill). Regression:
+`test_raised_settlement_is_not_poison_pilled` — unverified tracker raises and
+leaves `settled_count == 0`; a verified tracker then books the same settlement
+cleanly (5000cc).
 
 ## NEXT STEPS
 
