@@ -47,7 +47,7 @@ from typing import Protocol
 
 from combomaker.core.clock import Clock
 from combomaker.ops.logging import get_logger
-from combomaker.risk.heartbeat import HeartbeatReader, ReconcileMarker
+from combomaker.risk.heartbeat import Heartbeat, HeartbeatReader, ReconcileMarker
 
 log = get_logger(__name__)
 
@@ -57,6 +57,17 @@ log = get_logger(__name__)
 ENV_SUPERVISOR_API_KEY_ID = "KALSHI_SUPERVISOR_API_KEY_ID"
 ENV_SUPERVISOR_PRIVATE_KEY_PATH = "KALSHI_SUPERVISOR_PRIVATE_KEY_PATH"
 ENV_SUPERVISOR_PRIVATE_KEY_PEM = "KALSHI_SUPERVISOR_PRIVATE_KEY_PEM"
+
+# The supervisor writes its OWN heartbeat here (under the shared data_dir) so the
+# bot's preflight can verify a RUNNING, RECENTLY-BEATING watcher — not merely a
+# configured credential. Filename is stable so both processes agree without
+# passing paths between them.
+SUPERVISOR_HEARTBEAT_FILENAME = "supervisor_heartbeat.txt"
+
+
+def supervisor_heartbeat_path(data_dir: Path) -> Path:
+    """The path the supervisor beats and the bot's preflight reads."""
+    return data_dir / SUPERVISOR_HEARTBEAT_FILENAME
 
 
 class SupervisorExchange(Protocol):
@@ -162,6 +173,7 @@ class SupervisorConfig:
         poll_interval_s: float = 1.0,
         write_budget_capacity: int = 200,
         write_budget_refill_s: float = 10.0,
+        own_heartbeat_path: Path | None = None,
     ) -> None:
         self.heartbeat_path = heartbeat_path
         self.kill_file = kill_file
@@ -170,6 +182,14 @@ class SupervisorConfig:
         self.poll_interval_s = poll_interval_s
         self.write_budget_capacity = write_budget_capacity
         self.write_budget_refill_s = write_budget_refill_s
+        # Where the supervisor writes its OWN heartbeat (the bot's preflight reads
+        # it to prove a RUNNING watcher). Defaults next to the bot's heartbeat so
+        # a caller that only knows the data_dir gets the right path for free.
+        self.own_heartbeat_path = (
+            own_heartbeat_path
+            if own_heartbeat_path is not None
+            else heartbeat_path.parent / SUPERVISOR_HEARTBEAT_FILENAME
+        )
 
 
 class SafetySupervisor:
@@ -194,6 +214,11 @@ class SafetySupervisor:
         self._exchange = exchange
         self._reader = HeartbeatReader(clock, config.heartbeat_path)
         self._marker = ReconcileMarker(config.reconcile_marker_path)
+        # The supervisor's OWN heartbeat: it beats this every poll cycle so the
+        # bot's preflight can verify a RUNNING, RECENTLY-BEATING watcher (not just
+        # a configured credential). Independent of the bot's heartbeat — the
+        # kill path must not depend on the bot being healthy.
+        self._own_heartbeat = Heartbeat(clock, config.own_heartbeat_path)
         self._budget = WriteBudget.create(
             clock,
             capacity=config.write_budget_capacity,
@@ -302,11 +327,20 @@ class SafetySupervisor:
         Fail-closed (an unreadable heartbeat is wedged)."""
         return self._reader.is_wedged(self._config.heartbeat_timeout_s)
 
+    def beat_own_heartbeat(self) -> None:
+        """Record the supervisor's OWN liveness. Beaten every poll cycle (and
+        after a kill — the supervisor stays up as the latch, and a live latch
+        must keep proving it's alive). The bot's preflight reads this to confirm
+        a RUNNING watcher before it risks a cent."""
+        self._own_heartbeat.beat()
+
     async def check_once(self) -> KillResult | None:
-        """One watchdog cycle: if the heartbeat is wedged and we haven't already
-        killed, emergency-cancel + KILL. Returns the ``KillResult`` on a kill,
-        else ``None``. Idempotent: once killed, further checks are no-ops (the
-        KILL file + marker persist; re-cancelling adds nothing)."""
+        """One watchdog cycle: beat our own heartbeat, then — if the BOT's
+        heartbeat is wedged and we haven't already killed — emergency-cancel +
+        KILL. Returns the ``KillResult`` on a kill, else ``None``. Idempotent:
+        once killed, further checks are no-ops (the KILL file + marker persist;
+        re-cancelling adds nothing) EXCEPT we keep beating our own heartbeat."""
+        self.beat_own_heartbeat()
         if self._killed:
             return None
         if self.heartbeat_wedged():
@@ -330,9 +364,13 @@ class SafetySupervisor:
         log.info(
             "supervisor_starting",
             heartbeat_path=str(self._config.heartbeat_path),
+            own_heartbeat_path=str(self._config.own_heartbeat_path),
             timeout_s=self._config.heartbeat_timeout_s,
             has_credential=self.has_kill_credential,
         )
+        # Beat immediately so the bot's preflight sees a fresh watcher from t=0,
+        # not a gap until the first poll cycle.
+        self.beat_own_heartbeat()
         while not self._stop.is_set():
             try:
                 await self.check_once()
@@ -356,6 +394,30 @@ def supervisor_credential_configured() -> bool:
     has_pem = bool(os.environ.get(ENV_SUPERVISOR_PRIVATE_KEY_PEM, "").strip())
     has_path = bool(os.environ.get(ENV_SUPERVISOR_PRIVATE_KEY_PATH, "").strip())
     return has_pem or has_path
+
+
+def supervisor_heartbeat_reachable(
+    data_dir: Path, clock: Clock, *, max_age_s: float
+) -> bool:
+    """True iff the external kill path is ACTUALLY operative right now: a
+    supervisor process is RUNNING and RECENTLY BEATING its own heartbeat AND the
+    dedicated cancel credential is present.
+
+    This is the preflight's ``external_kill_reachable`` gate. It is deliberately
+    STRONGER than ``supervisor_credential_configured`` (mere env presence): a
+    credential in the environment with NO watcher process running is a dead kill
+    path — exactly the shadow/dead-process gap the audit flagged. We require a
+    live, recently-beating watcher so the external cancel can genuinely fire.
+
+    Fail-closed on every UNKNOWN: a missing/unreadable/stale supervisor heartbeat
+    (``read_age_s`` None or age > ``max_age_s``) ⇒ False, and an absent credential
+    ⇒ False (a beating watcher with no cancel credential is KILL-only, which is
+    not a reachable CANCEL path). Wall-clock based (two processes share only wall
+    time); a future-skewed beat reads as stale (heartbeat reader's contract)."""
+    if not supervisor_credential_configured():
+        return False
+    reader = HeartbeatReader(clock, supervisor_heartbeat_path(data_dir))
+    return not reader.is_wedged(max_age_s)
 
 
 class KalshiSupervisorExchange:
@@ -424,6 +486,7 @@ async def _run_supervisor_cli(env: str, config_path: Path | None) -> int:
         poll_interval_s=app_config.supervisor.poll_interval_s,
         write_budget_capacity=app_config.supervisor.write_budget_capacity,
         write_budget_refill_s=app_config.supervisor.write_budget_refill_s,
+        own_heartbeat_path=supervisor_heartbeat_path(app_config.data_dir),
     )
     clock = SystemClock()
 

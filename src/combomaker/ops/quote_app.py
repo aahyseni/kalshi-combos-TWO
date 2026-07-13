@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import sys
 from decimal import Decimal
 from fractions import Fraction
 from typing import Any
@@ -26,7 +27,7 @@ from combomaker.exchange.auth import Credentials, RequestSigner
 from combomaker.exchange.rest import KalshiApiError, KalshiRestClient, RateLimitedError
 from combomaker.exchange.ws import WsManager
 from combomaker.marketdata.feed import OrderbookFeed
-from combomaker.marketdata.metadata import MetadataCache
+from combomaker.marketdata.metadata import MarketMeta, MetadataCache
 from combomaker.ops.config import AppConfig, Env, Mode
 from combomaker.ops.logging import configure_logging, get_logger
 from combomaker.ops.metrics import Metrics
@@ -37,13 +38,22 @@ from combomaker.ops.preflight import (
     evaluate_preflight,
 )
 from combomaker.ops.report import build_report, format_report
-from combomaker.ops.supervisor import supervisor_credential_configured
+from combomaker.ops.supervisor import (
+    ENV_SUPERVISOR_API_KEY_ID,
+    ENV_SUPERVISOR_PRIVATE_KEY_PATH,
+    ENV_SUPERVISOR_PRIVATE_KEY_PEM,
+    supervisor_credential_configured,
+    supervisor_heartbeat_path,
+    supervisor_heartbeat_reachable,
+)
 from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
+from combomaker.pricing.grouping import game_key
+from combomaker.pricing.tripwire import taxonomy_impossible
 from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.intake import RfqIntake
 from combomaker.rfq.lifecycle import LifecycleConfig, QuoteLifecycle
-from combomaker.rfq.models import Rfq
+from combomaker.rfq.models import Rfq, RfqLeg
 from combomaker.risk.balance import BalanceTracker, StaleBalanceError
 from combomaker.risk.breakers import BreakerInputs, CircuitBreakers, RateLimitWindow
 from combomaker.risk.exposure import ExposureBook
@@ -139,6 +149,59 @@ class PaperSender:
         raise RuntimeError("paper quotes cannot be accepted — confirm is unreachable")
 
 
+class RateLimitRecordingSender:
+    """A thin ``QuoteSender`` decorator that records a 429 into the rate-limit
+    burst window on EVERY write endpoint the lifecycle drives — create, delete,
+    confirm — then re-raises unchanged.
+
+    Why: the 429-burst circuit breaker only saw the balance / exchange-status /
+    settlement / reservation POLL 429s (recorded straight in those loops). A
+    real rate-limit storm shows up FIRST on the write path (create/confirm), so
+    counting only the polls under-counts the burst and the breaker fires late.
+    Wrapping the sender (rather than the REST client or the lifecycle) keeps
+    both of those modules PRISTINE (hard rule 8): the lifecycle's control flow
+    is untouched — the 429 still propagates exactly as before (create/confirm
+    already treat it as a failure), we only tap it on the way past. Paper mode
+    is never wrapped (a PaperSender never 429s)."""
+
+    def __init__(self, inner: object, rate_limit_window: RateLimitWindow) -> None:
+        self._inner = inner
+        self._window = rate_limit_window
+
+    async def create_quote(
+        self,
+        rfq_id: str,
+        *,
+        yes_bid_cc: CentiCents,
+        no_bid_cc: CentiCents,
+        rest_remainder: bool = False,
+    ) -> JsonDict:
+        try:
+            return await self._inner.create_quote(  # type: ignore[attr-defined,no-any-return]
+                rfq_id,
+                yes_bid_cc=yes_bid_cc,
+                no_bid_cc=no_bid_cc,
+                rest_remainder=rest_remainder,
+            )
+        except RateLimitedError:
+            self._window.record()
+            raise
+
+    async def delete_quote(self, quote_id: str) -> JsonDict:
+        try:
+            return await self._inner.delete_quote(quote_id)  # type: ignore[attr-defined,no-any-return]
+        except RateLimitedError:
+            self._window.record()
+            raise
+
+    async def confirm_quote(self, quote_id: str) -> JsonDict:
+        try:
+            return await self._inner.confirm_quote(quote_id)  # type: ignore[attr-defined,no-any-return]
+        except RateLimitedError:
+            self._window.record()
+            raise
+
+
 class QuoteApp:
     def __init__(self, config: AppConfig) -> None:
         if config.mode not in (Mode.PAPER, Mode.QUOTE):
@@ -171,6 +234,17 @@ class QuoteApp:
         # Set once the startup reconcile succeeds and the marker is clear — the
         # book-reconciled preflight gate reads this.
         self._book_reconciled = config.mode is not Mode.QUOTE
+        # Metadata-change breaker baseline: the last sampled settlement-relevant
+        # fingerprint per market ticker (close_time / status / event / expiry).
+        # The breaker sampler compares the current metadata cache against this and
+        # trips HALT_METADATA_CHANGE if a market the risk path touches changed
+        # settlement-relevant metadata tick-over-tick. First sighting seeds the
+        # baseline (no trip); it is off the hot path (status loop, 15s cadence).
+        self._metadata_fingerprints: dict[str, str] = {}
+        # The external SafetySupervisor subprocess (launched on startup in quote
+        # mode). A SEPARATE OS process so its kill path survives the bot's own
+        # host deadlocking; None until launched / when launch is skipped.
+        self._supervisor_proc: asyncio.subprocess.Process | None = None
 
     async def run(self) -> None:
         config = self._config
@@ -253,10 +327,12 @@ class QuoteApp:
             widen_params = WidenPolicyParams(
                 enabled=widen_cfg.enabled, util_threshold=widen_cfg.util_threshold
             )
+            # Quote mode: wrap the REST sender so create/delete/confirm 429s feed
+            # the rate-limit-burst breaker (not just the polls). Paper never 429s.
             sender = (
                 PaperSender()
                 if config.mode is Mode.PAPER
-                else rest
+                else RateLimitRecordingSender(rest, self._rate_limit_window)
             )
             # Real fee model for the fill fee the ledger books at execution
             # (defense #3): $0 for our combo maker quadratic fills, correct for a
@@ -355,6 +431,13 @@ class QuoteApp:
                 # NOT resume quoting until it reconciles its book. The startup
                 # reconcile is the exchange-first pass that satisfies it.
                 await self._block_restart_until_reconciled(rest, reservation)
+                # LAUNCH THE EXTERNAL SUPERVISOR (separate OS process) BEFORE the
+                # preflight so its own-heartbeat is beating when external_kill_
+                # reachable is graded. The bot beats its heartbeat first so the
+                # supervisor has a file to watch from t=0.
+                self._heartbeat.beat()
+                await self._launch_supervisor()
+                await self._await_supervisor_heartbeat()
                 # PROD PREFLIGHT: every go-live condition must be green before the
                 # first quote. Refuses to start on any red gate.
                 self._run_prod_preflight()
@@ -428,7 +511,9 @@ class QuoteApp:
                 asyncio.create_task(retry_pending(), name="rfq-retry"),
                 asyncio.create_task(self._maintenance_loop(lifecycle), name="maintenance"),
                 asyncio.create_task(
-                    self._status_loop(rest, lifecycle, killswitch, breakers, feed),
+                    self._status_loop(
+                        rest, lifecycle, killswitch, breakers, feed, exposure, metadata
+                    ),
                     name="exchange-status",
                 ),
                 asyncio.create_task(
@@ -464,6 +549,11 @@ class QuoteApp:
                     log.exception("shutdown_cancel_all_failed")
                 await ws.stop()
                 await killswitch.stop()
+                # Tear down the external supervisor subprocess (best-effort).
+                try:
+                    await self._stop_supervisor()
+                except Exception:
+                    log.exception("supervisor_stop_failed")
                 await store.close()
                 log.info("quote_app_stopped", metrics=self._metrics.snapshot())
 
@@ -686,6 +776,106 @@ class QuoteApp:
                 open_tickers=len(open_by_ticker),
             )
 
+    async def _launch_supervisor(self) -> None:
+        """Launch the external SafetySupervisor as a SEPARATE OS subprocess so its
+        kill path survives the bot's own host deadlocking (an in-process watcher
+        can't). It runs ``python -m combomaker.ops.supervisor --env <env>`` with
+        the SAME data_dir (so it finds the bot's heartbeat, KILL, and reconcile
+        marker at the shared paths) and beats its OWN heartbeat, which the prod
+        preflight then verifies (external_kill_reachable).
+
+        The supervisor loads its OWN env-only KALSHI_SUPERVISOR_* credential; when
+        that credential is ABSENT the supervisor runs KILL-only (it still writes
+        KILL on a wedge — the credential-free half — but has no cancel path) and
+        logs a loud warning. We emit the warning bot-side too so a missing kill
+        credential is impossible to miss.
+
+        The subprocess inherits the bot's environment (secrets stay env-only,
+        never passed on the command line, never logged). Idempotent-safe: only one
+        is launched per run; failure to launch logs and leaves _supervisor_proc
+        None (the preflight's external_kill_reachable then fails closed, refusing
+        to quote on prod — a missing watcher is never waved through)."""
+        if not supervisor_credential_configured():
+            log.warning(
+                "supervisor_launch_no_credential",
+                detail=(
+                    f"{ENV_SUPERVISOR_API_KEY_ID} / "
+                    f"{ENV_SUPERVISOR_PRIVATE_KEY_PATH}|{ENV_SUPERVISOR_PRIVATE_KEY_PEM} "
+                    "absent — supervisor will run KILL-only (no cancel path); the "
+                    "prod preflight external_kill_reachable gate will refuse to quote"
+                ),
+            )
+        cmd = [
+            sys.executable,
+            "-m",
+            "combomaker.ops.supervisor",
+            "--env",
+            str(self._config.env),
+        ]
+        try:
+            self._supervisor_proc = await asyncio.create_subprocess_exec(*cmd)
+        except OSError as exc:
+            log.error("supervisor_launch_failed", error=repr(exc))
+            self._supervisor_proc = None
+            return
+        log.info(
+            "supervisor_launched",
+            pid=self._supervisor_proc.pid,
+            env=str(self._config.env),
+            has_credential=supervisor_credential_configured(),
+        )
+
+    async def _await_supervisor_heartbeat(self) -> None:
+        """Give the freshly-launched supervisor subprocess a bounded moment to
+        write its FIRST heartbeat before the preflight grades external_kill_
+        reachable — otherwise a genuinely-launched watcher would race the gate and
+        the bot would (wrongly) refuse to start. Bounded (never blocks forever); if
+        the beat never lands, the preflight simply fails closed as it should (a
+        watcher that can't even beat once is not a working kill path). Skipped when
+        the launch didn't produce a process."""
+        if self._supervisor_proc is None:
+            return
+        path = supervisor_heartbeat_path(self._config.data_dir)
+        deadline_beats = 50  # ~5s at 0.1s cadence — well inside a 1s poll launch
+        for _ in range(deadline_beats):
+            if self._supervisor_proc.returncode is not None:
+                log.error(
+                    "supervisor_exited_before_heartbeat",
+                    returncode=self._supervisor_proc.returncode,
+                )
+                return
+            try:
+                if path.exists():
+                    return
+            except OSError:  # pragma: no cover - exotic FS failure
+                pass
+            await asyncio.sleep(0.1)
+        log.warning(
+            "supervisor_heartbeat_not_established",
+            detail="supervisor did not beat within the startup window — preflight "
+            "external_kill_reachable will fail closed",
+        )
+
+    async def _stop_supervisor(self) -> None:
+        """Terminate the supervisor subprocess on shutdown. Best-effort: SIGTERM
+        (terminate), then a bounded wait, then kill. A supervisor that already
+        exited is a no-op."""
+        proc = self._supervisor_proc
+        if proc is None:
+            return
+        if proc.returncode is not None:
+            return
+        try:
+            proc.terminate()
+        except ProcessLookupError:  # pragma: no cover - already gone
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except TimeoutError:  # pragma: no cover - stubborn child
+            proc.kill()
+            await proc.wait()
+        log.info("supervisor_stopped", returncode=proc.returncode)
+
     def _run_prod_preflight(self) -> None:
         """PROD GO-LIVE PREFLIGHT (Phase 6). Every live go-live condition must be
         green before the first quote. On demo this is a no-op (no real money);
@@ -694,9 +884,12 @@ class QuoteApp:
 
         The supervisor gates check that (a) the bot has beaten its heartbeat at
         least once (the file the external supervisor reads exists) and (b) the
-        external kill path is reachable (the dedicated supervisor credential is
-        configured) — so the external kill can actually fire before we risk a
-        cent."""
+        external kill path is reachable — a supervisor process is RUNNING and
+        RECENTLY BEATING its own heartbeat AND its dedicated cancel credential is
+        present. (b) is deliberately stronger than mere credential presence: a
+        credential with no watcher running is a DEAD kill path (the shadow-process
+        gap the audit flagged). So the external kill can actually fire before we
+        risk a cent."""
         config = self._config
         if config.env is not Env.PROD:
             return
@@ -704,7 +897,14 @@ class QuoteApp:
         # watch from t=0 (rather than a gap until the first maintenance tick).
         self._heartbeat.beat()
         heartbeat_established = self._heartbeat.path.exists()
-        kill_reachable = supervisor_credential_configured()
+        # external_kill_reachable requires a LIVE, recently-beating supervisor
+        # (not just a configured credential) — verified against the supervisor's
+        # OWN heartbeat file. Fail-closed: no running watcher ⇒ red.
+        kill_reachable = supervisor_heartbeat_reachable(
+            config.data_dir,
+            self._clock,
+            max_age_s=config.supervisor.heartbeat_timeout_s,
+        )
         conditions = PreflightConditions(
             limits_configured=config.safety.prod_limits_configured,
             whitelist_non_empty=bool(config.filters.allowed_leg_series_prefixes),
@@ -819,6 +1019,8 @@ class QuoteApp:
         killswitch: KillSwitch,
         breakers: CircuitBreakers,
         feed: OrderbookFeed,
+        exposure: ExposureBook,
+        metadata: MetadataCache,
     ) -> None:
         while True:
             try:
@@ -840,12 +1042,20 @@ class QuoteApp:
             # the kill switch (cancel-all + stop via on_halt). Fail-closed inside
             # ``evaluate`` — a detector that can't run trips HALT_BREAKER_ERROR.
             try:
-                await breakers.evaluate_and_halt(self._sample_breaker_inputs(feed))
+                await breakers.evaluate_and_halt(
+                    self._sample_breaker_inputs(feed, lifecycle, exposure, metadata)
+                )
             except Exception:
                 log.exception("breaker_evaluation_failed")
             await asyncio.sleep(15.0)
 
-    def _sample_breaker_inputs(self, feed: OrderbookFeed) -> BreakerInputs:
+    def _sample_breaker_inputs(
+        self,
+        feed: OrderbookFeed,
+        lifecycle: QuoteLifecycle,
+        exposure: ExposureBook,
+        metadata: MetadataCache,
+    ) -> BreakerInputs:
         """Snapshot the live signals the circuit breakers evaluate off the hot
         path. Each field is a REAL measurement:
 
@@ -862,16 +1072,28 @@ class QuoteApp:
           the all-time histogram max — one historical slow confirm must not latch
           the human-only kill switch forever). None ⇒ no recent sample ⇒ the
           spike breaker clears (nothing current to judge).
-        - ``rate_limit_count``: the rolling 429-burst window.
+        - ``rate_limit_count``: the rolling 429-burst window (polls AND writes).
+        - ``marginals``: the CURRENT per-leg P(YES) for every leg the risk path
+          touches (legs of every open quote + open position), from the SAME
+          marginal provider the pricer/exposure use. The coordinator diffs each
+          against its own last-seen baseline ⇒ ``detect_marginal_jump`` fires on
+          a real move (and on a leg that became unreadable after we priced it).
+        - ``game_keys``: the resolved ``pricing.grouping.game_key`` for each of
+          those legs ⇒ ``detect_unmapped_game`` fires on a None/unresolved key
+          (a leg that would escape the game/slate cluster caps).
+        - ``tripwire_hit`` / ``changed_markets``: the taxonomy tripwire re-run
+          over the legs in the book + a settlement-relevant metadata diff of the
+          same markets tick-over-tick ⇒ ``detect_metadata_change`` fires if a
+          pinned-impossible shape became constructible or a market's
+          close_time/status/settlement metadata changed under us.
 
-        NOTE (Phase 6 scope): the marginal-jump, unmapped-game, and
-        metadata-change breakers are BUILT + unit-tested but are NOT yet sampled
-        here — wiring their live signals (per-leg marginal map, resolved
-        game-key map, taxonomy tripwire / settlement-metadata diff) reaches into
-        the pricing/lifecycle hot path and is deferred. They only fire when a
-        caller supplies those inputs; this sampler leaves them at their CLEAR
-        defaults, so those three are not claimed live yet.
+        Fail-closed by construction: a leg on the risk path whose marginal can't
+        be read surfaces as ``None`` (jump breaker trips), and an event_ticker
+        we can't resolve surfaces as a ``None`` game key (unmapped breaker trips)
+        — UNKNOWN is never a convenient pass. Runs off the hot path (status loop,
+        15s cadence), never in the 0.5s maintenance/status hot path.
         """
+        marginals, game_keys, book_legs = self._book_leg_signals(exposure, lifecycle)
         return BreakerInputs(
             rx_age_s=feed.rx_age_s,
             feed_warm=feed.warm,
@@ -880,6 +1102,114 @@ class QuoteApp:
                 "confirm.rtt_ms", self._config.breakers.latency_spike_window_s
             ),
             rate_limit_count=self._rate_limit_window.count(),
+            marginals=marginals,
+            game_keys=game_keys,
+            tripwire_hit=self._book_tripwire(book_legs),
+            changed_markets=self._metadata_changes(book_legs, metadata),
+        )
+
+    def _book_leg_signals(
+        self, exposure: ExposureBook, lifecycle: QuoteLifecycle
+    ) -> tuple[dict[str, float | None], dict[str, str | None], tuple[RfqLeg, ...]]:
+        """Extract, from the legs the risk path actually touches (every open
+        quote + every open position), the per-leg marginal map, the per-leg
+        game-key map, and the deduped legs (as ``RfqLeg`` for the tripwire).
+
+        The marginal map keys on ``market_ticker`` and reads the SAME provider
+        the pricer/exposure use (``lifecycle._marginals`` → feed microprice); a
+        leg whose book is missing/invalid surfaces as ``None`` (fail-closed: the
+        jump breaker trips a leg we priced against that we can no longer read).
+        The game-key map resolves ``pricing.grouping.game_key`` on each leg's
+        ``event_ticker`` — a leg with no event_ticker resolves to ``None`` so the
+        unmapped-game breaker trips (a leg that would escape the cluster caps)."""
+        marginals: dict[str, float | None] = {}
+        game_keys: dict[str, str | None] = {}
+        legs: dict[str, RfqLeg] = {}  # market_ticker → RfqLeg (deduped)
+        marginal_of = lifecycle.marginal_of
+        for leg_refs in self._book_leg_refs(exposure):
+            for leg in leg_refs:
+                ticker = leg.market_ticker
+                if ticker not in marginals:
+                    marginals[ticker] = marginal_of(ticker)
+                    game_keys[ticker] = (
+                        game_key(leg.event_ticker) if leg.event_ticker else None
+                    )
+                    legs[ticker] = RfqLeg(
+                        market_ticker=ticker,
+                        event_ticker=leg.event_ticker,
+                        side=leg.side,
+                        # Settlement value is irrelevant to the taxonomy tripwire
+                        # (it matches on series/side/line/team, not settlement);
+                        # None is the pre-determination value.
+                        yes_settlement_value_cc=None,
+                    )
+        return marginals, game_keys, tuple(legs.values())
+
+    @staticmethod
+    def _book_leg_refs(exposure: ExposureBook) -> list[tuple[Any, ...]]:
+        """The leg tuples of every open position + every open quote — the legs on
+        the risk path. Positions first (real exposure), then resting quotes."""
+        refs: list[tuple[Any, ...]] = [
+            position.legs for position in exposure.positions.values()
+        ]
+        refs.extend(quote.legs for quote in exposure.open_quotes.values())
+        return refs
+
+    @staticmethod
+    def _book_tripwire(legs: tuple[RfqLeg, ...]) -> tuple[str, str] | None:
+        """Re-run the taxonomy-impossible tripwire over the legs in the book. The
+        classifier already declines an impossible combo at PRICING time, so the
+        book should never carry one; this is the live belt-and-braces re-check —
+        if a pinned exchange-blocked impossible shape is ever resting (validator
+        loosened after we quoted), ``detect_metadata_change`` HALTs. Same-game
+        pairs only, matching the classifier's call (cross-game never matches)."""
+        if len(legs) < 2:
+            return None
+        game_keys = [
+            game_key(leg.event_ticker) if leg.event_ticker else leg.market_ticker
+            for leg in legs
+        ]
+        return taxonomy_impossible(list(legs), game_keys)
+
+    def _metadata_changes(
+        self, legs: tuple[RfqLeg, ...], metadata: MetadataCache
+    ) -> tuple[str, ...]:
+        """Diff each in-book market's settlement-relevant metadata against the
+        last sampled fingerprint. A market whose fingerprint changed
+        tick-over-tick (close_time / status / event / expected expiry moved under
+        us) is returned so ``detect_metadata_change`` trips — our settlement model
+        of that market is stale. First sighting SEEDS the baseline (no trip): a
+        newly-quoted market is not a change. Peek-only (no network, hot-path
+        safe); a market with no cached metadata yet is skipped (nothing to
+        fingerprint — the staleness/no-quote gates cover an unpriceable market)."""
+        changed: list[str] = []
+        for leg in legs:
+            meta = metadata.peek(leg.market_ticker)
+            if meta is None:
+                continue
+            fingerprint = self._settlement_fingerprint(meta)
+            prior = self._metadata_fingerprints.get(leg.market_ticker)
+            if prior is not None and prior != fingerprint:
+                changed.append(leg.market_ticker)
+            self._metadata_fingerprints[leg.market_ticker] = fingerprint
+        return tuple(changed)
+
+    @staticmethod
+    def _settlement_fingerprint(meta: MarketMeta) -> str:
+        """A stable string of the settlement-relevant metadata fields. Any change
+        here means our model of when/how the market settles moved: close_time,
+        exchange status (e.g. active→settled/closed), the parent event, and the
+        expected expiration time. NOT the grid or the price — those move every
+        tick and are not settlement-relevant."""
+        return "|".join(
+            (
+                meta.status,
+                meta.event_ticker or "",
+                meta.close_time.isoformat() if meta.close_time else "",
+                meta.expected_expiration_time.isoformat()
+                if meta.expected_expiration_time
+                else "",
+            )
         )
 
     async def _report_loop(

@@ -11,13 +11,16 @@ from typing import Any
 
 from combomaker.core.clock import FakeClock
 from combomaker.ops.supervisor import (
+    SUPERVISOR_HEARTBEAT_FILENAME,
     KalshiSupervisorExchange,
     SafetySupervisor,
     SupervisorConfig,
     WriteBudget,
     supervisor_credential_configured,
+    supervisor_heartbeat_path,
+    supervisor_heartbeat_reachable,
 )
-from combomaker.risk.heartbeat import Heartbeat, ReconcileMarker
+from combomaker.risk.heartbeat import Heartbeat, HeartbeatReader, ReconcileMarker
 
 
 class FakeExchange:
@@ -309,3 +312,95 @@ async def test_run_loop_kills_dying_bot(tmp_path: Path) -> None:
     assert (tmp_path / "KILL").exists()
     assert sorted(exchange.cancelled) == ["q1", "q2"]
     assert ReconcileMarker(tmp_path / "needs_reconcile").is_set()
+
+
+# --------------------------------------------------------------------------- #
+# The supervisor beats its OWN heartbeat so the bot's preflight can verify a
+# RUNNING, RECENTLY-BEATING watcher (not just a configured credential).
+# --------------------------------------------------------------------------- #
+
+
+def test_supervisor_beats_own_heartbeat_on_check(tmp_path: Path) -> None:
+    # A bot heartbeat exists and is fresh (no kill); check_once must still beat
+    # the supervisor's OWN heartbeat every cycle so the preflight sees it alive.
+    bot_clock = FakeClock()
+    Heartbeat(bot_clock, tmp_path / "heartbeat.txt").beat()
+    sup_clock = FakeClock()
+    supervisor = SafetySupervisor(_config(tmp_path), sup_clock, exchange=None)
+    own = supervisor_heartbeat_path(tmp_path)
+    assert not own.exists()
+    import asyncio
+
+    asyncio.run(supervisor.check_once())
+    assert own.exists()  # the supervisor proved its OWN liveness
+    # And it is fresh against the supervisor's clock (age ~0).
+    reader = HeartbeatReader(sup_clock, own)
+    assert reader.is_wedged(15.0) is False
+
+
+def test_supervisor_beats_own_heartbeat_even_after_kill(tmp_path: Path) -> None:
+    # After a kill the supervisor stays up as the latch — a LIVE latch must keep
+    # proving it's alive, so it keeps beating its own heartbeat.
+    Heartbeat(FakeClock(), tmp_path / "heartbeat.txt").beat()
+    sup_clock = FakeClock()
+    supervisor = SafetySupervisor(_config(tmp_path), sup_clock, exchange=None)
+    import asyncio
+
+    sup_clock.advance(20.0)  # bot went silent ⇒ first check kills
+    asyncio.run(supervisor.check_once())
+    own = supervisor_heartbeat_path(tmp_path)
+    # Wipe the own-heartbeat to prove the NEXT check re-beats it post-kill.
+    own.unlink()
+    asyncio.run(supervisor.check_once())  # idempotent no-op EXCEPT the beat
+    assert own.exists()
+
+
+# --------------------------------------------------------------------------- #
+# supervisor_heartbeat_reachable: the preflight gate. Stronger than mere
+# credential presence — requires a LIVE, recently-beating watcher.
+# --------------------------------------------------------------------------- #
+
+
+def test_reachable_false_without_credential(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # A beating supervisor but NO credential ⇒ KILL-only, not a reachable CANCEL
+    # path ⇒ False (conftest strips the credential env).
+    clock = FakeClock()
+    Heartbeat(clock, supervisor_heartbeat_path(tmp_path)).beat()
+    assert supervisor_heartbeat_reachable(tmp_path, clock, max_age_s=15.0) is False
+
+
+def test_reachable_false_when_no_supervisor_beating(
+    tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+) -> None:
+    # Credential present but NO supervisor heartbeat on disk ⇒ dead kill path.
+    monkeypatch.setenv("KALSHI_SUPERVISOR_API_KEY_ID", "sup")
+    monkeypatch.setenv("KALSHI_SUPERVISOR_PRIVATE_KEY_PEM", "-----PEM-----")
+    clock = FakeClock()
+    assert supervisor_heartbeat_reachable(tmp_path, clock, max_age_s=15.0) is False
+
+
+def test_reachable_false_when_supervisor_heartbeat_stale(
+    tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+) -> None:
+    # Credential present, supervisor beat once but then went stale ⇒ False.
+    monkeypatch.setenv("KALSHI_SUPERVISOR_API_KEY_ID", "sup")
+    monkeypatch.setenv("KALSHI_SUPERVISOR_PRIVATE_KEY_PEM", "-----PEM-----")
+    beat_clock = FakeClock()
+    Heartbeat(beat_clock, supervisor_heartbeat_path(tmp_path)).beat()
+    read_clock = FakeClock()
+    read_clock.advance(20.0)  # 20s > 15s timeout ⇒ stale
+    assert supervisor_heartbeat_reachable(tmp_path, read_clock, max_age_s=15.0) is False
+
+
+def test_reachable_true_when_credential_and_beating(
+    tmp_path: Path, monkeypatch  # type: ignore[no-untyped-def]
+) -> None:
+    monkeypatch.setenv("KALSHI_SUPERVISOR_API_KEY_ID", "sup")
+    monkeypatch.setenv("KALSHI_SUPERVISOR_PRIVATE_KEY_PEM", "-----PEM-----")
+    clock = FakeClock()
+    Heartbeat(clock, supervisor_heartbeat_path(tmp_path)).beat()
+    assert supervisor_heartbeat_reachable(tmp_path, clock, max_age_s=15.0) is True
+
+
+def test_supervisor_heartbeat_path_is_under_data_dir(tmp_path: Path) -> None:
+    assert supervisor_heartbeat_path(tmp_path) == tmp_path / SUPERVISOR_HEARTBEAT_FILENAME

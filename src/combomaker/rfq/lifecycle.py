@@ -1136,6 +1136,15 @@ class QuoteLifecycle:
     def has_open_quote(self, rfq_id: str) -> bool:
         return rfq_id in self._by_rfq
 
+    def marginal_of(self, market_ticker: str) -> float | None:
+        """Public read accessor for a leg's current P(YES) — the SAME provider
+        (feed microprice) the pricer and exposure book use. ``None`` when the
+        book is missing/invalid (fail-closed: an unreadable leg is UNKNOWN, never
+        a guessed value). Exposed so the risk-breaker sampler (quote_app's
+        _sample_breaker_inputs) can feed the marginal-jump breaker the exact
+        marginals we priced on, without reaching into a private name."""
+        return self._marginals(market_ticker)
+
     # ---------------------------------------------------------------- helpers
 
     def _price(
