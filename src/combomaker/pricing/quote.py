@@ -126,6 +126,7 @@ def construct_quote(
     yes_cap_cc: CentiCents | None,
     no_cap_cc: CentiCents | None,
     inventory_skew_cc: int = 0,
+    markup_cc: int = 0,
     width_multiplier: float = 1.0,
     basket_extra_applies: bool = False,
     params: QuoteParams | None = None,
@@ -158,6 +159,11 @@ def construct_quote(
         # (or below) disables it.
         width["basket"] = p.basket_width_extra_cc
     half = sum(width.values()) // 2
+    # Maker markup (profit margin over fair) from MarkupPolicy — the tier/sport
+    # edge. The defensive width is the FLOOR (uncertainty protection); the markup
+    # drives the margin when larger. margin == half when markup_cc == 0 (the
+    # default), so an un-set markup is BIT-IDENTICAL to the pre-markup pricer.
+    margin = max(half, markup_cc)
 
     # The fill happens at the BID, not at fair, and the quadratic fee peaks at
     # $0.50 — computing it at fair under-charges the side whose bid sits
@@ -175,7 +181,7 @@ def construct_quote(
                 multiplier=fee_multiplier,
             )
         )
-        lower = max(0, side_fair_cc - half - abs(inventory_skew_cc) - fee_peak)
+        lower = max(0, side_fair_cc - margin - abs(inventory_skew_cc) - fee_peak)
         nearest_to_peak = min(max(CC_PER_DOLLAR // 2, lower), side_fair_cc)
         fee_in_range = int(
             fee_model.fee_per_contract_cc(
@@ -192,8 +198,8 @@ def construct_quote(
 
     # Inventory skew: positive = we are long the joint event, so bid less for
     # YES and more for NO (attract the flow that flattens us).
-    yes_raw = fair_cc - half - fee_yes - inventory_skew_cc
-    no_raw = (CC_PER_DOLLAR - fair_cc) - half - fee_no + inventory_skew_cc
+    yes_raw = fair_cc - margin - fee_yes - inventory_skew_cc
+    no_raw = (CC_PER_DOLLAR - fair_cc) - margin - fee_no + inventory_skew_cc
 
     clamped_free_money = False
     if yes_cap_cc is not None and yes_raw > yes_cap_cc - p.free_money_margin_cc:

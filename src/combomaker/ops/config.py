@@ -1874,10 +1874,36 @@ class MlbRunsConfig(StrictModel):
     misfit_uncertainty_scale: float = 1.0
 
 
+class SportMarkupConfig(StrictModel):
+    """Per-sport maker markup. A FLAT (uniform) markup over fair. Because a taker
+    only fills us when the combo clears at >= our ask (= fair + markup), the
+    markup itself SELF-SELECTS the FAT tier (room >= markup) and auto-declines
+    competitive/NORMAL flow — no room classifier needed for v1. The explicit
+    FAT/NORMAL room-predictor tiering slots in later behind the same MarkupPolicy.
+    """
+
+    enabled: bool = False
+    markup_cc: int = 0  # centi-cents over fair (400 = 4¢); self-selects FAT
+
+
+class MarkupConfig(StrictModel):
+    """Maker profit markup, applied in construct_quote as margin=max(width, markup).
+    DARK by default (enabled=False, every sport off) so an un-set markup is
+    BIT-IDENTICAL to the pre-markup pricer. Numbers come from POOLED settlement
+    evidence (game-clustered lower-CI bound), NEVER a single-window P&L refit
+    (feedback_no_refit_on_pnl). WC-FAT is the first validated tier (reality test
+    2026-07-13: WC longshot parlays settle 13.8% vs priced 19.6%)."""
+
+    enabled: bool = False  # master switch
+    soccer: SportMarkupConfig = Field(default_factory=SportMarkupConfig)
+    mlb: SportMarkupConfig = Field(default_factory=SportMarkupConfig)
+
+
 class PricingConfig(StrictModel):
     fee: FeeConfig = Field(default_factory=FeeConfig)
     correlation: CorrelationConfig = Field(default_factory=CorrelationConfig)
     quote: QuoteConfig = Field(default_factory=QuoteConfig)
+    markup: MarkupConfig = Field(default_factory=MarkupConfig)
     structural: StructuralConfig = Field(default_factory=StructuralConfig)
     margin_total: MarginTotalConfig = Field(default_factory=MarginTotalConfig)
     mlb_runs: MlbRunsConfig = Field(default_factory=MlbRunsConfig)

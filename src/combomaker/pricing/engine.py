@@ -31,6 +31,7 @@ from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
 from combomaker.pricing.joint import JointEstimate, price_containment, price_joint_matrices
 from combomaker.pricing.legs import KalshiBookSource, LegBelief, OddsSource, blend_beliefs
 from combomaker.pricing.legtypes import LegType, classify_leg
+from combomaker.pricing.markup import MarkupPolicy
 from combomaker.pricing.quote import (
     ConstructedQuote,
     NoQuote,
@@ -137,6 +138,10 @@ class PricingEngine:
         }
         self._quote_params = QuoteParams(**quote_fields)
         self._archetype = config.quote
+        # Maker markup (profit margin over fair). DARK by default; when a sport is
+        # enabled, a flat markup self-selects the FAT tier via the market. Applied
+        # in construct_quote as margin = max(defensive width, markup).
+        self._markup = MarkupPolicy.from_config(config.markup)
         if self._quote_params.sell_parlays_only and conventions.combo_no_pays_complement is None:
             # Sell-only makes EVERY fill a NO position, but the lifecycle declines
             # every NO-side confirm until this convention is verified (Phase 2.5
@@ -262,6 +267,15 @@ class PricingEngine:
         leg_books = [self._feed.book(leg.market_ticker) for leg in rfq.legs]
         yes_cap, no_cap = free_money_caps(leg_books, sides)
 
+        markup_sport, markup_cc = self._markup.markup_for(
+            leg.market_ticker for leg in rfq.legs
+        )
+        if markup_cc:
+            log.debug(
+                "markup_applied", sport=markup_sport, markup_cc=markup_cc,
+                market=rfq.market_ticker,
+            )
+
         quote = construct_quote(
             joint=joint,
             n_legs=len(rfq.legs),
@@ -275,6 +289,7 @@ class PricingEngine:
             yes_cap_cc=yes_cap,
             no_cap_cc=no_cap,
             inventory_skew_cc=inventory_skew_cc,
+            markup_cc=markup_cc,
             width_multiplier=self._width_multiplier(beliefs, sides),
             basket_extra_applies=is_single_family_no_basket(list(rfq.legs), sides),
             params=self._quote_params,

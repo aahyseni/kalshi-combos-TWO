@@ -40,3 +40,7 @@ Thumbs.db
 .idea/
 .vscode/
 .claude/worktrees/
+
+# Local armed configs — never commit (committed prod.yaml stays disarmed)
+*.local.yaml
+config/*.local.yaml

@@ -647,3 +647,39 @@ class TestSkewNoArb:
         )
         assert isinstance(clamped, ConstructedQuote)
         assert int(clamped.no_bid_cc) <= 7_000 - 100
+
+
+class TestMarkup:
+    """Maker markup: margin = max(defensive width, markup_cc). markup==0 is
+    BIT-IDENTICAL to pre-markup (parity); a markup below the width floor is a
+    no-op; above it, it lowers the seller's no_bid (widens the sale, more edge);
+    a markup that exceeds fair declines the side."""
+
+    def test_zero_markup_is_identical(self) -> None:
+        # The parity guarantee: an un-set markup does not move any bid.
+        assert build_quote(markup_cc=0) == build_quote()
+
+    def test_markup_below_width_floor_is_noop(self) -> None:
+        # build_quote's defensive half-width is 250cc; 100cc sits under the floor,
+        # so margin stays 250 and the quote is unchanged.
+        base = build_quote()
+        floored = build_quote(markup_cc=100)
+        assert isinstance(base, ConstructedQuote) and isinstance(floored, ConstructedQuote)
+        assert int(floored.no_bid_cc) == int(base.no_bid_cc)
+
+    def test_markup_above_floor_lowers_no_bid(self) -> None:
+        base = build_quote()
+        wide = build_quote(markup_cc=400)  # 4¢ > 2.5¢ floor => margin becomes 400
+        assert isinstance(base, ConstructedQuote) and isinstance(wide, ConstructedQuote)
+        assert int(wide.no_bid_cc) < int(base.no_bid_cc)
+
+    def test_markup_is_monotonic(self) -> None:
+        bids = [int(q.no_bid_cc) for q in (
+            build_quote(markup_cc=m) for m in (0, 300, 500, 700)
+        ) if isinstance(q, ConstructedQuote)]
+        assert len(bids) == 4
+        assert bids == sorted(bids, reverse=True)  # more markup => lower no_bid
+
+    def test_markup_exceeding_fair_declines(self) -> None:
+        # A markup wider than the fair on both sides rounds every raw <= 0.
+        assert isinstance(build_quote(markup_cc=9_000), NoQuote)
