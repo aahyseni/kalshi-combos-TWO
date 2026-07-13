@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Any, Protocol
 
 from combomaker.core.clock import Clock
@@ -38,6 +39,7 @@ from combomaker.ops.logging import get_logger
 from combomaker.ops.metrics import Metrics
 from combomaker.ops.persistence import Store
 from combomaker.pricing.engine import PricingEngine
+from combomaker.pricing.fees import FeeModel, FeeType, FeeUnknownError
 from combomaker.pricing.quote import ConstructedQuote, NoQuote
 from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.models import Rfq
@@ -139,6 +141,9 @@ class QuoteLifecycle:
         skew_limits: SkewLimits | None = None,
         skew_cache: GameSkewCache | None = None,
         widen_params: WidenPolicyParams | None = None,
+        fee_model: FeeModel | None = None,
+        fee_type: FeeType = FeeType.QUADRATIC,
+        fee_multiplier: Fraction = Fraction(1),
     ) -> None:
         self._clock = clock
         self._sender = sender
@@ -183,6 +188,13 @@ class QuoteLifecycle:
         # Widen-vs-DECLINE policy (R3 Part R2), SHADOW by default. Needs the same
         # snapshot + candidate the skew builds, so it is computed alongside it.
         self._widen_params = widen_params
+        # Fee model for the REAL fill fee booked at execution (defense #3): our
+        # combo maker quadratic fills compute $0 (pricing/fees.py + ground truth),
+        # correct for any nonzero-fee series. None ⇒ book fee UNKNOWN (None) — the
+        # pre-Phase-6 behaviour — rather than a guessed 0.
+        self._fee_model = fee_model
+        self._fee_type = fee_type
+        self._fee_multiplier = fee_multiplier
         self._markouts = MarkoutTracker(store.record_markout)
         self._open: dict[str, OpenQuoteState] = {}       # quote_id → state
         self._by_rfq: dict[str, str] = {}                # rfq_id → quote_id
@@ -642,12 +654,35 @@ class QuoteLifecycle:
             our_side=str(our_side),
             contracts_centi=int(qty),
             price_cc=int(bid),
-            fee_cc=None,  # reconciled from the exchange ledger (defense #3)
+            # Real fill fee from the fee model (defense #3): $0 for our combo maker
+            # quadratic fills, correct for any nonzero-fee series. None only when no
+            # fee model is wired (pre-Phase-6 behaviour) or the fee is UNKNOWN.
+            fee_cc=self._fill_fee_cc(bid, qty),
             expected_edge_cc=expected_edge_cc,
             raw=msg,
         )
         self._metrics.inc("fill.count")
         self._track_markout(f"fill:{quote_id}", state)
+
+    def _fill_fee_cc(self, bid: CentiCents, qty: CentiContracts) -> int | None:
+        """The fee our fill is charged, in cc, from the real fee model
+        (pricing/fees.py — never reimplemented). $0 for our combo maker quadratic
+        maker fill; correct for a nonzero-fee series. None when no fee model is
+        wired OR the fee is genuinely UNKNOWN (flat/unknown fee_type) — an honest
+        ledger records UNKNOWN, never a guessed 0 (defense #2)."""
+        if self._fee_model is None:
+            return None
+        try:
+            return int(
+                self._fee_model.trade_fee_cc(
+                    price_cc=bid,
+                    qty=qty,
+                    fee_type=self._fee_type,
+                    multiplier=self._fee_multiplier,
+                )
+            )
+        except FeeUnknownError:
+            return None
 
     # ------------------------------------------------------------ maintenance
 
@@ -663,37 +698,76 @@ class QuoteLifecycle:
         """Settlement/fee reconciliation feeds realized P&L here (Phase 6)."""
         self._realized_pnl_cc += delta_cc
 
-    async def reconcile_combo_settlement(self, combo_ticker: str, *, settled_yes: bool) -> None:
-        """Settlement guard for FARMED impossible combos (defense #3).
+    async def reconcile_combo_settlement(
+        self,
+        combo_ticker: str,
+        *,
+        settled_yes: bool,
+        settled_value: float | None = None,
+        expected_revenue_cc: int | None = None,
+    ) -> None:
+        """Settlement reconciliation for a settled combo market (defense #3).
 
-        A combo we farmed is short-YES / long the certain-NO side: it can ONLY
-        settle NO. If it EVER settles YES, our impossibility classification (or
-        the settlement window we assumed) was wrong on a position — the exact
-        misclassification loss path farming is gated against. That is not a
-        loggable event: it HALTS with HALT_RECONCILIATION_MISMATCH, exactly like
-        any other predicted-vs-ledger mismatch.
+        Two guards, both HALTing ``HALT_RECONCILIATION_MISMATCH`` (never a log):
 
-        TODO(farm-reconcile): this is the settlement seam, but the full
-        combo-settlement path is not built yet (Phase 6; conventions
-        .combo_no_pays_complement is still None / UNVERIFIED). When it lands,
-        (a) CALL this from the real settlement-message handler for every farmed
-        combo, and (b) extend the reconciliation to the cent — expected NO
-        payout ($1×contracts − cost) vs the exchange ledger — not just the
-        settle-YES tripwire below. See NOTES.md "Impossible-combo farming".
+        1. **Farmed settle-YES tripwire.** A combo we farmed is short-YES / long
+           the certain-NO side: it can ONLY settle NO. If it EVER settles YES, our
+           impossibility classification (or the settlement window we assumed) was
+           wrong on a position — the exact misclassification loss path farming is
+           gated against.
+
+        2. **FULL to-the-cent reconcile (Phase 6, code audit 2026-07-13).** When
+           the settlement handler supplies ``settled_value`` (V) and the exchange's
+           booked ``expected_revenue_cc``, reconcile EVERY settled position on this
+           ticker: our predicted gross settlement credit (Σ contracts·payout —
+           LONG NO pays $1−V, LONG YES pays V) must equal the exchange ledger's
+           revenue TO THE CENT. Any mismatch means our model of the settlement
+           (sign / value / convention) is wrong → HALT. Omitting those args keeps
+           the farmed-only tripwire (the pre-Phase-6 callers read unchanged).
         """
-        farmed = [
+        on_ticker = [
             pos
             for pos in self._exposure.positions.values()
-            if pos.farmed and pos.combo_ticker == combo_ticker
+            if pos.combo_ticker == combo_ticker
         ]
-        if not farmed:
-            return
-        if settled_yes:
+        farmed = [pos for pos in on_ticker if pos.farmed]
+        if farmed and settled_yes:
             await self._killswitch.halt(
                 ReasonCode.HALT_RECONCILIATION_MISMATCH,
                 f"farmed impossible combo {combo_ticker} settled YES on "
                 f"{len(farmed)} position(s) — classification/settlement-window failure",
             )
+            return
+        if expected_revenue_cc is None or settled_value is None:
+            return  # farmed-only tripwire path (no ledger figures supplied)
+        if not on_ticker:
+            return  # nothing we hold on this ticker to reconcile
+        predicted_credit_cc = sum(
+            self._predicted_settlement_credit_cc(pos, settled_value) for pos in on_ticker
+        )
+        if predicted_credit_cc != expected_revenue_cc:
+            await self._killswitch.halt(
+                ReasonCode.HALT_RECONCILIATION_MISMATCH,
+                f"combo {combo_ticker}: predicted settlement credit "
+                f"{predicted_credit_cc}cc != exchange revenue {expected_revenue_cc}cc "
+                f"(V={settled_value}) — settlement model mismatch",
+            )
+
+    def _predicted_settlement_credit_cc(
+        self, position: OpenPosition, settled_value: float
+    ) -> int:
+        """Our PREDICTED gross settlement credit for one position, in cc — the
+        payout the side we hold receives (contracts · payout_per_contract),
+        matching the ledger booking and the exchange ``revenue``. LONG NO pays
+        $1 − V; LONG YES pays V (same convention frame as balance.apply_settlement,
+        DNP "rounded down" via round-to-grid)."""
+        contracts = int(position.contracts)
+        v_cc = round(settled_value * CC_PER_DOLLAR)
+        if position.our_side is Side.NO:
+            payout_per_ct = CC_PER_DOLLAR - v_cc
+        else:
+            payout_per_ct = v_cc
+        return contracts * payout_per_ct // 100
 
     def _refresh_daily_pnl(self) -> None:
         """Mark open positions at current leg mids so the daily-loss limit

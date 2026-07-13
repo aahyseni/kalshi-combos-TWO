@@ -285,3 +285,16 @@ class KalshiRestClient:
 
     async def get_positions(self, **params: str | int) -> JsonDict:
         return await self._request("GET", "/portfolio/positions", params=dict(params))
+
+    async def get_settlements(self, **params: str | int) -> JsonDict:
+        """Settled markets the account held (GET /portfolio/settlements).
+
+        Response ``{cursor, settlements: Settlement[]}``. Each Settlement carries
+        ``ticker``, ``market_result`` (enum ``yes``|``no``|``scalar``),
+        ``yes_count_fp``/``no_count_fp``, ``*_total_cost_dollars``, ``revenue``
+        (int CENTS), ``fee_cost`` (string dollars), ``settled_time``, and
+        ``value`` (int CENTS, nullable — payout per YES contract). Filter with
+        ``ticker``/``event_ticker``/``min_ts``/``max_ts``; omit ``subaccount`` for
+        all subaccounts (docs/api-notes/index-scan.md §portfolio).
+        """
+        return await self._request("GET", "/portfolio/settlements", params=dict(params))

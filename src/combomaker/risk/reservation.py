@@ -53,9 +53,12 @@ Money stays integer centi-cents; no binary floats (hard rule 5).
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
+from combomaker.core.conventions import Side
+from combomaker.core.quantity import qty_from_fp_str
 from combomaker.ops.logging import get_logger
 from combomaker.risk.exposure import ExposureBook, MarginalProvider, OpenPosition
 from combomaker.risk.limits import (
@@ -67,6 +70,61 @@ from combomaker.risk.limits import (
 )
 
 log = get_logger(__name__)
+
+
+def open_combo_tickers_from_positions(positions_payload: dict[str, Any]) -> dict[str, Side]:
+    """Map a ``GET /portfolio/positions`` payload to ``{combo_ticker: our Side}``
+    for every market the exchange reports OPEN with a nonzero position.
+
+    ``MarketPosition.position_fp`` is a SIGNED count (docs/api-notes/index-scan.md
+    §portfolio positions): NEGATIVE = a NO position, POSITIVE = a YES position, 0 =
+    flat (netted out — not open). Fail-closed: an unparseable ``position_fp`` is
+    SKIPPED (treated as no-open-position), which makes the reconcile RELEASE a
+    reservation we can't prove is backed — the conservative direction (a released
+    reservation frees headroom only if the exchange really isn't holding it; if it
+    IS, the periodic reconcile re-commits on the next clean parse). The exchange
+    ledger is the one ruler we can't bend (defense #3).
+    """
+    rows = positions_payload.get("market_positions") or positions_payload.get("positions") or []
+    out: dict[str, Side] = {}
+    for row in rows:
+        ticker = str(row.get("ticker") or row.get("market_ticker") or "")
+        if not ticker:
+            continue
+        raw = row.get("position_fp")
+        if raw is None:
+            continue
+        try:
+            signed = int(qty_from_fp_str(str(raw)))
+        except ValueError:
+            continue  # fail-closed: unreadable count ⇒ not a provable open position
+        if signed > 0:
+            out[ticker] = Side.YES
+        elif signed < 0:
+            out[ticker] = Side.NO
+        # signed == 0 ⇒ flat, not open
+    return out
+
+
+def reservation_ids_backed_by_exchange(
+    outstanding: Sequence[Reservation | OpenPosition],
+    open_by_ticker: dict[str, Side],
+) -> set[str]:
+    """Given the outstanding reservations (or their positions) and the exchange's
+    open ``{combo_ticker: Side}`` map, return the reservation ids the exchange
+    CONFIRMS landed — an outstanding reservation whose combo_ticker is open on the
+    SAME side we hold. Everything else is treated as not-landed (released).
+
+    Side match matters: a sell-only fill leaves us LONG NO, so the exchange must
+    report a NO (negative) position on that ticker to confirm our fill. A position
+    on the opposite side is NOT our reservation landing (fail-closed → release)."""
+    backed: set[str] = set()
+    for item in outstanding:
+        position = item.position if isinstance(item, Reservation) else item
+        exch_side = open_by_ticker.get(position.combo_ticker)
+        if exch_side is not None and exch_side is position.our_side:
+            backed.add(position.position_id)
+    return backed
 
 # A splitter turns the raw breach list from ``LimitChecker.check`` into the
 # ENFORCED-only list (dropping SHADOW breaches, logging them). The lifecycle's

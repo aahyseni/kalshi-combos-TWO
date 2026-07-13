@@ -10,7 +10,10 @@ from typing import Any
 import pytest
 
 from combomaker.core.clock import FakeClock
-from combomaker.core.conventions import load_conventions
+from combomaker.core.conventions import Side, load_conventions
+from combomaker.core.money import CentiCents
+from combomaker.core.quantity import CentiContracts
+from combomaker.core.reasons import ReasonCode
 from combomaker.exchange.rest import KalshiApiError
 from combomaker.ops.config import (
     AppConfig,
@@ -23,18 +26,23 @@ from combomaker.ops.config import (
 from combomaker.ops.metrics import Metrics
 from combomaker.ops.preflight import PreflightError
 from combomaker.ops.quote_app import QuoteApp
-from combomaker.risk.exposure import ExposureBook
+from combomaker.risk.exposure import ExposureBook, LegRef, OpenPosition
 from combomaker.risk.heartbeat import ReconcileMarker
-from combomaker.risk.limits import LimitChecker, RiskLimits
+from combomaker.risk.killswitch import HaltEvent
+from combomaker.risk.limits import DailyPnl, LimitChecker, RiskLimits
 from combomaker.risk.reservation import RiskReservationService
 
 
 class FakeRest:
     """Minimal REST double for the startup reconcile. ``fail`` makes the calls
-    raise KalshiApiError (exchange unreachable)."""
+    raise KalshiApiError (exchange unreachable). ``positions`` sets the
+    /portfolio/positions payload for the reservation reconcile."""
 
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(
+        self, *, fail: bool = False, positions: dict[str, Any] | None = None
+    ) -> None:
         self._fail = fail
+        self._positions = positions or {"market_positions": []}
         self.deleted: list[str] = []
 
     async def get_quotes(self, **params: Any) -> dict[str, Any]:
@@ -49,7 +57,7 @@ class FakeRest:
     async def get_positions(self, **params: Any) -> dict[str, Any]:
         if self._fail:
             raise KalshiApiError(503, "unavailable", "down")
-        return {"market_positions": []}
+        return self._positions
 
 
 def _demo_app(tmp_path: Path) -> QuoteApp:
@@ -248,3 +256,107 @@ def test_sampler_latency_is_recent_window_not_all_time(tmp_path: Path) -> None:
     feed = FakeFeed(rx_age_s=0.1, warm=True, seq_gap=False)
     inputs = app._sample_breaker_inputs(feed)  # type: ignore[arg-type]
     assert inputs.latency_ms == 12.0  # recent, not the 9,999ms all-time max
+
+
+# --------------------------------------------------------------------------- #
+# RESTART SAFETY: an in-process HARD halt drops the needs_reconcile marker so a
+# bare restart is blocked; a soft/manual halt does not.
+# --------------------------------------------------------------------------- #
+
+
+def _halt(reason: ReasonCode) -> HaltEvent:
+    return HaltEvent(reason=reason, detail="test", at_iso="2026-07-13T00:00:00+00:00")
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        ReasonCode.HALT_HARD_TRIP,
+        ReasonCode.HALT_RECONCILIATION_MISMATCH,
+        ReasonCode.HALT_FILL_VELOCITY,
+        ReasonCode.HALT_DRAWDOWN,
+        ReasonCode.HALT_DATA_STALE,
+        ReasonCode.HALT_LATENCY_SPIKE,
+        ReasonCode.HALT_BREAKER_ERROR,
+    ],
+)
+def test_hard_halt_drops_reconcile_marker(tmp_path: Path, reason: ReasonCode) -> None:
+    app = _demo_app(tmp_path)
+    marker = ReconcileMarker(tmp_path / "needs_reconcile")
+    assert marker.is_set() is False
+    app.mark_reconcile_on_hard_halt(_halt(reason))
+    assert marker.is_set() is True          # restart is now BLOCKED until reconciled
+    assert app._book_reconciled is False
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        ReasonCode.HALT_MANUAL,
+        ReasonCode.HALT_KILL_FILE,
+        ReasonCode.HALT_SUPERVISOR,
+        ReasonCode.HALT_EXCHANGE_STATUS,
+        ReasonCode.HALT_DAILY_LOSS,
+        ReasonCode.HALT_WS_UNHEALTHY,
+    ],
+)
+def test_soft_or_manual_halt_leaves_marker_alone(
+    tmp_path: Path, reason: ReasonCode
+) -> None:
+    app = _demo_app(tmp_path)
+    marker = ReconcileMarker(tmp_path / "needs_reconcile")
+    app.mark_reconcile_on_hard_halt(_halt(reason))
+    assert marker.is_set() is False         # a soft/manual halt does not block restart
+
+
+# --------------------------------------------------------------------------- #
+# reconcile-with-real-positions: a confirm-timeout reservation is resolved by the
+# exchange's actual open positions, not left leaking headroom.
+# --------------------------------------------------------------------------- #
+
+
+def _outstanding_position(pid: str, ticker: str) -> OpenPosition:
+    return OpenPosition(
+        position_id=pid,
+        combo_ticker=ticker,
+        collection=None,
+        our_side=Side.NO,
+        contracts=CentiContracts(10_000),
+        entry_price_cc=CentiCents(5_000),
+        legs=(LegRef("A", "SER-GAME1", "no"),),
+    )
+
+
+async def test_reconcile_reservations_commits_landed_releases_leaked(
+    tmp_path: Path,
+) -> None:
+    app = _demo_app(tmp_path)
+    reservation = _reservation()
+    # Two reservations whose confirms timed out (mark_unconfirmed).
+    reservation.try_reserve(
+        "fill:q1", _outstanding_position("fill:q1", "C1"),
+        marginals=lambda _t: 0.5, daily_pnl=DailyPnl(),
+    )
+    reservation.try_reserve(
+        "fill:q2", _outstanding_position("fill:q2", "C2"),
+        marginals=lambda _t: 0.5, daily_pnl=DailyPnl(),
+    )
+    reservation.mark_unconfirmed("fill:q1")
+    reservation.mark_unconfirmed("fill:q2")
+    # Exchange reports ONLY C1 open (NO). The reconcile commits q1, releases q2.
+    rest = FakeRest(positions={"market_positions": [{"ticker": "C1", "position_fp": "-100.00"}]})
+    await app._reconcile_reservations(rest, reservation)  # type: ignore[arg-type]
+    assert reservation.is_outstanding("fill:q1") is False  # committed (booked)
+    assert reservation.is_outstanding("fill:q2") is False  # released (headroom freed)
+    assert reservation.outstanding_count == 0
+
+
+async def test_reconcile_reservations_noop_when_nothing_outstanding(
+    tmp_path: Path,
+) -> None:
+    app = _demo_app(tmp_path)
+    reservation = _reservation()
+    rest = FakeRest()
+    await app._reconcile_reservations(rest, reservation)  # type: ignore[arg-type]
+    # No outstanding reservations ⇒ the positions endpoint is never even hit.
+    assert reservation.outstanding_count == 0

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+from decimal import Decimal
+from fractions import Fraction
 from typing import Any
 
 from combomaker.core.clock import SystemClock
@@ -37,6 +39,7 @@ from combomaker.ops.preflight import (
 from combomaker.ops.report import build_report, format_report
 from combomaker.ops.supervisor import supervisor_credential_configured
 from combomaker.pricing.engine import PricingEngine
+from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
 from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.intake import RfqIntake
 from combomaker.rfq.lifecycle import LifecycleConfig, QuoteLifecycle
@@ -49,7 +52,12 @@ from combomaker.risk.inplay import InPlayDetector
 from combomaker.risk.killswitch import HaltEvent, KillSwitch
 from combomaker.risk.lastlook import LastLookPolicy
 from combomaker.risk.limits import LimitChecker, StarvationWatchdog
-from combomaker.risk.reservation import RiskReservationService
+from combomaker.risk.reservation import (
+    RiskReservationService,
+    open_combo_tickers_from_positions,
+    reservation_ids_backed_by_exchange,
+)
+from combomaker.risk.settlement import SettlementHandler, SettlementPoller
 from combomaker.risk.skew import SkewLimits, SkewParams, WidenPolicyParams
 
 log = get_logger(__name__)
@@ -61,6 +69,41 @@ JsonDict = dict[str, Any]
 # caps fail closed (SKIP_BANKROLL_UNAVAILABLE). Poll interval is well inside it.
 BALANCE_STALE_AFTER_S = 30.0
 BALANCE_POLL_INTERVAL_S = 10.0
+# Settlement poll cadence: combos settle at game end, so a slow poll is fine — the
+# handler is idempotent per position, so a re-poll never double-books. Kept modest
+# so realized P&L lands promptly for the enforced daily-loss cap.
+SETTLEMENT_POLL_INTERVAL_S = 30.0
+# Reservation-vs-exchange reconcile cadence: resolves a confirm-timeout
+# mark_unconfirmed reservation against the exchange's real open positions before it
+# leaks headroom until restart. Only touches the network when a reservation is
+# outstanding.
+RESERVATION_RECONCILE_INTERVAL_S = 15.0
+
+# HARD-class halts: an in-process trip on any of these means our local book /
+# money model is provably wrong or under stress, so a restart MUST reconcile
+# against the exchange before quoting again — we drop the needs_reconcile marker
+# (block-restart-until-reconciled). Give-back KILLs (drawdown / hard-trip),
+# fill-velocity, the reconcile mismatch, and EVERY circuit breaker (fail-closed
+# detectors — a book that tripped one is a book to re-prove). SOFT/manual halts
+# (HALT_MANUAL, HALT_KILL_FILE, HALT_SUPERVISOR, HALT_EXCHANGE_STATUS,
+# HALT_DAILY_LOSS soft-cap, WS/clock/error-rate/confirm-timeout) are a deliberate
+# or transient stop and do NOT force a reconcile on the next start.
+_HARD_HALT_REASONS: frozenset[ReasonCode] = frozenset(
+    {
+        ReasonCode.HALT_HARD_TRIP,
+        ReasonCode.HALT_RECONCILIATION_MISMATCH,
+        ReasonCode.HALT_FILL_VELOCITY,
+        ReasonCode.HALT_DRAWDOWN,
+        # Circuit breakers (risk/breakers.py): fail-closed known-failure signatures.
+        ReasonCode.HALT_DATA_STALE,
+        ReasonCode.HALT_LATENCY_SPIKE,
+        ReasonCode.HALT_RATE_LIMIT_BURST,
+        ReasonCode.HALT_MARGINAL_JUMP,
+        ReasonCode.HALT_METADATA_CHANGE,
+        ReasonCode.HALT_UNMAPPED_GAME,
+        ReasonCode.HALT_BREAKER_ERROR,
+    }
+)
 
 
 class PaperSender:
@@ -213,6 +256,16 @@ class QuoteApp:
                 if config.mode is Mode.PAPER
                 else rest
             )
+            # Real fee model for the fill fee the ledger books at execution
+            # (defense #3): $0 for our combo maker quadratic fills, correct for a
+            # nonzero-fee series. Built from the SAME config the engine uses.
+            fee_cfg = config.pricing.fee
+            fee_model = FeeModel(
+                FeeSchedule.from_strings(fee_cfg.taker_coef, fee_cfg.maker_coef),
+                conventions,
+            )
+            fee_type = FeeType.parse(fee_cfg.default_fee_type)
+            fee_multiplier = Fraction(Decimal(fee_cfg.default_multiplier))
             lifecycle = QuoteLifecycle(
                 clock=self._clock,
                 sender=sender,
@@ -242,6 +295,10 @@ class QuoteApp:
                 skew_params=skew_params,
                 skew_limits=skew_limits,
                 widen_params=widen_params,
+                # Real fill fee at execution (defense #3).
+                fee_model=fee_model,
+                fee_type=fee_type,
+                fee_multiplier=fee_multiplier,
             )
             # R3 Phase 3: single-writer risk-reservation service. Wired AFTER the
             # lifecycle (it reuses the lifecycle's shadow splitter, so a %-cap
@@ -254,6 +311,23 @@ class QuoteApp:
                 breach_splitter=lifecycle.partition_breaches,
             )
             lifecycle.attach_reservation(reservation)
+
+            # SETTLEMENT handler (Phase 6, code audit 2026-07-13 §3): the live
+            # wiring that makes the realized-P&L ledger + exchange-first settlement
+            # reconciliation ACTIVE. Polled by _settlement_loop; books each settled
+            # position we HOLD, feeds realized P&L into the ENFORCED daily-loss cap,
+            # and HALTs HALT_RECONCILIATION_MISMATCH on any to-the-cent mismatch.
+            settlement_handler = SettlementHandler(
+                exposure=exposure,
+                balance_tracker=balance_tracker,
+                lifecycle=lifecycle,
+                killswitch=killswitch,
+            )
+            settlement_poller = SettlementPoller(
+                source=rest,
+                handler=settlement_handler,
+                poll_interval_s=SETTLEMENT_POLL_INTERVAL_S,
+            )
 
             # Phase 6 circuit breakers: fail-closed detectors that trip the kill
             # switch on the known failure signatures. Evaluated in the status
@@ -320,6 +394,11 @@ class QuoteApp:
             feed.on_invalidate(on_invalidate)
 
             async def on_halt(event: HaltEvent) -> None:
+                # RESTART SAFETY (Phase 6, code audit 2026-07-13 §3): on an
+                # in-process HARD-class halt, DROP the needs_reconcile marker so a
+                # bare restart is BLOCKED (HALT_NEEDS_RECONCILE) until the book is
+                # reconciled against the exchange. Soft/manual halts do NOT need it.
+                self.mark_reconcile_on_hard_halt(event)
                 await lifecycle.cancel_all(event.reason)
                 self._stop.set()
 
@@ -346,6 +425,13 @@ class QuoteApp:
                 asyncio.create_task(
                     self._balance_loop(rest, balance_tracker), name="balance-poll"
                 ),
+                asyncio.create_task(
+                    self._settlement_loop(settlement_poller), name="settlement-poll"
+                ),
+                asyncio.create_task(
+                    self._reservation_reconcile_loop(rest, reservation),
+                    name="reservation-reconcile",
+                ),
             ]
             if external is not None:
                 _, poller, sgo_client = external
@@ -368,6 +454,24 @@ class QuoteApp:
 
     def request_stop(self) -> None:
         self._stop.set()
+
+    def mark_reconcile_on_hard_halt(self, event: HaltEvent) -> None:
+        """RESTART SAFETY (Phase 6): drop the ``needs_reconcile`` marker on an
+        in-process HARD-class halt so a bare restart is BLOCKED
+        (HALT_NEEDS_RECONCILE) until the book reconciles against the exchange. The
+        marker survives the restart on disk (like the KILL file), so an
+        auto-restarter can't skip it. Soft/manual halts (a deliberate human stop,
+        an exchange-status pause, a soft daily-loss cap) are NOT hard-class — they
+        leave the marker alone so a normal restart resumes cleanly."""
+        if event.reason not in _HARD_HALT_REASONS:
+            return
+        self._reconcile_marker.set(str(event.reason))
+        self._book_reconciled = False
+        log.error(
+            "needs_reconcile_marker_dropped",
+            reason=str(event.reason),
+            detail="in-process hard halt — a restart must reconcile before quoting",
+        )
 
     def _kill_file_present(self) -> bool:
         """True if the KILL file is on disk. Fail-closed: any stat error is
@@ -525,14 +629,47 @@ class QuoteApp:
             )
             self._book_reconciled = False
             return
-        # Exchange-first: no local reservations survive a restart (the service is
-        # fresh in-process), so an empty reconcile is the correct startup state —
-        # nothing to commit, nothing to release. The call is the exchange-first
-        # pass regardless (Phase 3 semantics) and is a no-op on a fresh service.
-        reservation.reconcile(set())
+        # Exchange-first reconcile against the exchange's ACTUAL open positions
+        # (not an empty set): map GET /portfolio/positions → the reservation ids
+        # the exchange confirms open, so any stale/unconfirmed reservation is
+        # committed-or-released against the ledger, never left leaking headroom. On
+        # a fresh service this is a no-op (nothing outstanding); it becomes load-
+        # bearing on the periodic reconcile after a confirm timeout.
+        await self._reconcile_reservations(rest, reservation)
         self._reconcile_marker.clear()
         self._book_reconciled = True
         log.info("book_reconciled", detail="startup reconcile complete; quoting unblocked")
+
+    async def _reconcile_reservations(
+        self, rest: KalshiRestClient, reservation: RiskReservationService
+    ) -> None:
+        """Reconcile outstanding risk reservations against the exchange's ACTUAL
+        open positions (RISK_BUILD_PLAN Phase 3; code audit 2026-07-13 §3
+        "reconcile(real positions)"). Fetches ``GET /portfolio/positions``, maps it
+        to ``{combo_ticker: Side}``, and commits the reservations the exchange
+        confirms open / releases the ones it does not — so a confirm-timeout
+        ``mark_unconfirmed`` reservation is RESOLVED instead of leaking headroom
+        until restart.
+
+        Called from the maintenance loop (periodic) AND from the startup pass.
+        Best-effort: a failed positions poll leaves reservations outstanding (still
+        counting against the caps — the conservative direction), retried next
+        tick. No reservations outstanding ⇒ a no-op that skips the network call."""
+        if reservation.outstanding_count == 0:
+            return
+        positions = await rest.get_positions()
+        open_by_ticker = open_combo_tickers_from_positions(positions)
+        backed = reservation_ids_backed_by_exchange(
+            reservation.outstanding_positions(), open_by_ticker
+        )
+        outcome = reservation.reconcile(backed)
+        if outcome.committed or outcome.released:
+            log.info(
+                "reservations_reconciled_with_exchange",
+                committed=outcome.committed,
+                released=outcome.released,
+                open_tickers=len(open_by_ticker),
+            )
 
     def _run_prod_preflight(self) -> None:
         """PROD GO-LIVE PREFLIGHT (Phase 6). Every live go-live condition must be
@@ -624,6 +761,41 @@ class QuoteApp:
             except Exception as exc:
                 log.warning("balance_poll_failed", error=repr(exc))
             await asyncio.sleep(BALANCE_POLL_INTERVAL_S)
+
+    async def _settlement_loop(self, poller: SettlementPoller) -> None:
+        """Poll GET /portfolio/settlements and book+reconcile each settled
+        position we HOLD (realized P&L → the enforced daily-loss cap; to-the-cent
+        mismatch → HALT_RECONCILIATION_MISMATCH). Idempotent per position, so a
+        re-poll never double-books. Errors retry next interval; a real mismatch
+        HALTs inside the handler (the loop then stops with the app). A fresh
+        paper/demo start with no positions is a pure no-op — demo is unaffected."""
+        while True:
+            try:
+                await poller.poll_once()
+            except RateLimitedError as exc:
+                self._rate_limit_window.record()
+                log.warning("settlement_poll_rate_limited", error=str(exc))
+            except Exception as exc:
+                log.warning("settlement_poll_failed", error=repr(exc))
+            await asyncio.sleep(SETTLEMENT_POLL_INTERVAL_S)
+
+    async def _reservation_reconcile_loop(
+        self, rest: KalshiRestClient, reservation: RiskReservationService
+    ) -> None:
+        """Periodically reconcile outstanding risk reservations against the
+        exchange's ACTUAL open positions, so a confirm-timeout mark_unconfirmed
+        reservation is committed-or-released instead of leaking headroom until
+        restart. Skips the network entirely when nothing is outstanding, so a
+        fresh paper/demo start with no reservations is a pure no-op."""
+        while True:
+            try:
+                await self._reconcile_reservations(rest, reservation)
+            except RateLimitedError as exc:
+                self._rate_limit_window.record()
+                log.warning("reservation_reconcile_rate_limited", error=str(exc))
+            except Exception as exc:
+                log.warning("reservation_reconcile_failed", error=repr(exc))
+            await asyncio.sleep(RESERVATION_RECONCILE_INTERVAL_S)
 
     async def _status_loop(
         self,

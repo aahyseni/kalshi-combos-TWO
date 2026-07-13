@@ -18,7 +18,12 @@ from combomaker.core.money import CentiCents
 from combomaker.core.quantity import CentiContracts
 from combomaker.risk.exposure import ExposureBook, LegRef, OpenPosition
 from combomaker.risk.limits import Breach, DailyPnl, LimitChecker, RiskLimits
-from combomaker.risk.reservation import ReserveResult, RiskReservationService
+from combomaker.risk.reservation import (
+    ReserveResult,
+    RiskReservationService,
+    open_combo_tickers_from_positions,
+    reservation_ids_backed_by_exchange,
+)
 
 CC = CentiCents
 Q = CentiContracts
@@ -341,3 +346,89 @@ def test_outstanding_positions_exposed_for_folding() -> None:
     reserve(svc, "r2", position("r2"))
     ids = {p.position_id for p in svc.outstanding_positions()}
     assert ids == {"r1", "r2"}
+
+
+# ------------------------------------- exchange-position → reservation mapping
+
+
+def _combo_position(pid: str, ticker: str, our_side: Side = Side.NO) -> OpenPosition:
+    return OpenPosition(
+        position_id=pid,
+        combo_ticker=ticker,
+        collection=None,
+        our_side=our_side,
+        contracts=Q(10_000),
+        entry_price_cc=CC(5_000),
+        legs=LEG_G1,
+    )
+
+
+class TestOpenComboTickersFromPositions:
+    def test_signed_position_fp_maps_to_side(self) -> None:
+        # position_fp signed: negative = NO, positive = YES, 0 = flat (not open).
+        payload = {
+            "market_positions": [
+                {"ticker": "C-NO", "position_fp": "-5.00"},
+                {"ticker": "C-YES", "position_fp": "3.00"},
+                {"ticker": "C-FLAT", "position_fp": "0.00"},
+            ]
+        }
+        got = open_combo_tickers_from_positions(payload)
+        assert got == {"C-NO": Side.NO, "C-YES": Side.YES}  # flat excluded
+
+    def test_accepts_positions_alias_and_market_ticker(self) -> None:
+        payload = {"positions": [{"market_ticker": "C-NO", "position_fp": "-1.00"}]}
+        assert open_combo_tickers_from_positions(payload) == {"C-NO": Side.NO}
+
+    def test_unparseable_count_is_skipped_fail_closed(self) -> None:
+        # A bad position_fp is treated as no-provable-open-position (skip), not a
+        # guessed side — the conservative direction (a released reservation).
+        payload = {"market_positions": [{"ticker": "C", "position_fp": "junk"}]}
+        assert open_combo_tickers_from_positions(payload) == {}
+
+    def test_missing_ticker_or_fp_skipped(self) -> None:
+        payload = {
+            "market_positions": [
+                {"position_fp": "-1.00"},        # no ticker
+                {"ticker": "C", "position_fp": None},  # no count
+            ]
+        }
+        assert open_combo_tickers_from_positions(payload) == {}
+
+
+class TestReservationIdsBackedByExchange:
+    def test_commits_side_match_releases_the_rest(self) -> None:
+        outstanding = [
+            _combo_position("fill:q1", "C1", Side.NO),
+            _combo_position("fill:q2", "C2", Side.NO),
+            _combo_position("fill:q3", "C3", Side.NO),
+        ]
+        # Exchange holds C1 NO (our fill landed), C2 YES (opposite side — NOT ours),
+        # C3 absent (did not land).
+        open_by_ticker = {"C1": Side.NO, "C2": Side.YES}
+        backed = reservation_ids_backed_by_exchange(outstanding, open_by_ticker)
+        assert backed == {"fill:q1"}  # only the side-matching open position
+
+    def test_end_to_end_confirm_timeout_reconcile(self) -> None:
+        # A reservation whose confirm timed out (mark_unconfirmed) is RESOLVED by a
+        # reconcile against the exchange's real open positions — committed if the
+        # exchange holds it, released if not — instead of leaking headroom.
+        limits = loose()
+        svc, book = service(limits=limits)
+        landed = _combo_position("fill:q1", "C1", Side.NO)
+        leaked = _combo_position("fill:q2", "C2", Side.NO)
+        reserve(svc, "fill:q1", landed)
+        reserve(svc, "fill:q2", leaked)
+        svc.mark_unconfirmed("fill:q1")
+        svc.mark_unconfirmed("fill:q2")
+        # Exchange reports ONLY C1 open (as NO). Map → the backed id, reconcile.
+        positions_payload = {"market_positions": [{"ticker": "C1", "position_fp": "-100.00"}]}
+        open_by_ticker = open_combo_tickers_from_positions(positions_payload)
+        backed = reservation_ids_backed_by_exchange(
+            svc.outstanding_positions(), open_by_ticker
+        )
+        outcome = svc.reconcile(backed)
+        assert outcome.committed == ["fill:q1"]  # landed ⇒ booked
+        assert outcome.released == ["fill:q2"]   # not open ⇒ headroom freed
+        assert set(book.positions) == {"fill:q1"}
+        assert svc.outstanding_count == 0
