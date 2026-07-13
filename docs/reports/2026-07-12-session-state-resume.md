@@ -7,8 +7,8 @@ The operator memory (`project_kct_resume_state`) mirrors this.**
 
 ## Repo state
 
-- `main` @ `72ba72b` (pushed; check `git log --oneline -5`), tree clean,
-  **suite 1427 passed / 0 failed** (`uv run pytest -q`).
+- `main` @ `a64b8c9` (pushed; check `git log --oneline -5`), tree clean,
+  **suite 1462 passed / 0 failed** (`uv run pytest -q`).
 - Engine UNCHANGED from 2026-07-11 (MLB props + WC containment complete,
   pregame-only gate + leg-series allowlist MLB/WC ACTIVE, sell-only book
   un-gated). The current thread is the **RISK ENGINE build**, not pricing.
@@ -65,13 +65,28 @@ challenger → quoting policy → external watchdog → go live at $2,000.
   Report: `2026-07-13-risk-phase3-reservation-service.md`. DEFERRED: automatic
   reconcile LOOP (needs the Phase-6 exchange position-id map), fill-velocity
   enforcement (commit is its natural feed).
-- **PHASE 4 — portfolio MC + challenger overlay: NEXT.** Wire the portfolio MC
-  (`sim/` game-keyed block copula + NO-side correlation) → VaR/CVaR, P(ruin),
-  per-game/leg tail attribution, marginal ΔCVaR; ADD a challenger/stress overlay
-  (operative risk = max(production-copula ES, challenger ES, deterministic
-  stress)); feeds drawdown/hard-trip halts + the skew. Off the hot path. (See
-  RISK_BUILD_PLAN Phase 4.)
-- **PHASES 5–6:** skew/widen-vs-decline/pregame precision → external watchdog +
+- **PHASE 4 — portfolio MC + challenger overlay: DONE, MERGED `a64b8c9` (judge
+  PASS, ZERO findings).** Feeds the existing `sim/engine.py` MC the REAL book +
+  REAL pricing corr, retiring the `report._portfolio_mc` np.eye-independence bug.
+  NO-side fix (`ComboPosition.leg_sides`, `1−value` for NO legs, default None =
+  byte-identical). `sim/book_model.py` (block-diagonal-by-GAME corr the pricer's
+  way, fail-closed on missing marginal) — **PARITY GATE PASSES** (1-combo book
+  reproduces the copula joint, YES+NO). `sim/book_risk.py` (VaR/CVaR₀.₉₉ high
+  band, P(ruin) 10/25/60%, per-game+leg tail attribution Σ=CVaR, challenger/stress
+  overlay `operative_es = max(copula, corr-inflated challenger, deterministic
+  all-hit stress)`). SHADOW `SKIP_PORTFOLIO_CVAR` cap (`portfolio_cvar_frac`
+  0.15, reads snapshot, never re-runs MC in check, fail-closed). Report:
+  `2026-07-13-risk-phase4-portfolio-mc-challenger.md`. DEFERRED to P5+: ΔCVaR→
+  inventory-skew, the maintenance-tick snapshot loop, Glasserman-Li importance
+  sampling. Operator: confirm `portfolio_cvar_frac`=0.15 before enforce.
+- **PHASE 5 — quoting policy: NEXT.** Feed the built-but-zeroed inventory-skew
+  seam (tighter on balancing flow, wider on concentrating; consume the Phase-4
+  ΔCVaR); widen-vs-DECLINE (on NORMAL/uncertain flow near a cap, DECLINE rather
+  than widen — widening attracts hitters, our own finding); pregame precision
+  ladder (schedule feed → quote to ~2min before kickoff, recover near-kickoff
+  flow) with strict confirm-cutoff. Off the hot path where possible; SHADOW-grade
+  the skew + pregame markouts. (See RISK_BUILD_PLAN Phase 5.)
+- **PHASE 6:** external watchdog (out-of-process supervisor, circuit breakers) +
   go-live gates.
 
 ## RUNNING processes (verify before assuming!)
