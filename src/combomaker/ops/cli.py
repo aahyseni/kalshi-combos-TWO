@@ -84,20 +84,22 @@ async def _report(env: Env, db_override: Path | None) -> int:
 async def _cancel_all(env: Env) -> int:
     from combomaker.core.clock import SystemClock
     from combomaker.exchange.auth import Credentials, RequestSigner
+    from combomaker.exchange.quote_query import list_open_quotes, open_quote_ids
     from combomaker.exchange.rest import KalshiApiError, KalshiRestClient
 
     config = load_config(_config_path(env, None), env=env)
-    signer = RequestSigner(Credentials.from_env(), SystemClock())
+    clock = SystemClock()
+    # PER-ENV credentials: prod REQUIRES the KALSHI_PROD_* keys. `from_env()` loads
+    # the DEMO keys, which 401 against the prod endpoint — the panic button was
+    # broken on prod (2026-07-13). Mirror the app's `for_env(str(config.env))`.
+    signer = RequestSigner(Credentials.for_env(str(env)), clock)
     cancelled = failed = 0
     async with KalshiRestClient(config.endpoints.rest_base_url, signer) as rest:
-        # Ground truth: listing quotes REQUIRES a creator filter (bare list
-        # → 403); user_filter=self scopes to our own quotes.
-        payload = await rest.get_quotes(user_filter="self", status="open")
-        quotes = payload.get("quotes", []) or []
-        for quote in quotes:
-            quote_id = str(quote.get("id") or quote.get("quote_id") or "")
-            if not quote_id:
-                continue
+        # SHARED windowed+retrying enumeration — a bare/unbounded get_quotes scans
+        # the full quote history and trips Kalshi's midland circuit-breaker
+        # (500/504). Same helper the startup reconcile + supervisor kill-path use.
+        quotes = await list_open_quotes(rest, int(clock.now().timestamp()))
+        for quote_id in open_quote_ids(quotes):
             try:
                 await rest.delete_quote(quote_id)
                 cancelled += 1
