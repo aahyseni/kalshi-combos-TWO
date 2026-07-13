@@ -1670,6 +1670,7 @@ class RiskConfig(StrictModel):
     daily_loss_frac: str = "0.06"         # soft daily-loss halt
     drawdown_frac: str = "0.10"           # peak-drawdown halt
     hard_trip_frac: str = "0.12"          # hard-trip KILL
+    portfolio_cvar_frac: str = "0.15"     # portfolio joint-tail (operative ES_0.99)
     absolute_notional_multiple: int = 3   # utilization backstop (× bankroll)
     fill_velocity_window_s: float = 2.0
     fill_velocity_soft_frac: str = "0.05"
@@ -1691,6 +1692,7 @@ class RiskConfig(StrictModel):
         "daily_loss_frac",
         "drawdown_frac",
         "hard_trip_frac",
+        "portfolio_cvar_frac",
         "fill_velocity_soft_frac",
         "fill_velocity_hard_frac",
     )
@@ -1740,6 +1742,7 @@ class RiskConfig(StrictModel):
             daily_loss_frac=Fraction(Decimal(self.daily_loss_frac)),
             drawdown_frac=Fraction(Decimal(self.drawdown_frac)),
             hard_trip_frac=Fraction(Decimal(self.hard_trip_frac)),
+            portfolio_cvar_frac=Fraction(Decimal(self.portfolio_cvar_frac)),
             absolute_notional_multiple=self.absolute_notional_multiple,
             fill_velocity_window_s=self.fill_velocity_window_s,
             fill_velocity_soft_frac=Fraction(Decimal(self.fill_velocity_soft_frac)),

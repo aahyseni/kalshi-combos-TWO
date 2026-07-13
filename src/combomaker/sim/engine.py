@@ -76,6 +76,18 @@ class ComboPosition:
 
     ``price_cc`` is the entry price paid per contract (0..10_000 cc);
     ``fee_cc`` is the TOTAL fee for the position, subtracted from P&L once.
+
+    ``leg_sides`` (optional) selects, PER LEG, whether the combo needs that leg's
+    YES value or its NO value (``1 − value``) inside the payout product. The
+    default (``None``) means every leg contributes its YES value — the historical
+    behaviour, byte-for-byte. This is the copula's latent-sign-flip expressed on
+    the sampled value instead of the latent Z (``1 − 1[Z≤t] = 1[−Z ≤ −t]``);
+    algebraically identical for a binary leg and correct for a graded settlement
+    leg too. It lets a NO-selected leg keep its within-game correlation with the
+    rest of its game (the M1 fix) instead of being modeled as an independent
+    complement pseudo-leg. NOTE ``side`` is the whole POSITION's side (YES/NO
+    contract we hold); ``leg_sides`` is the per-leg selection INSIDE the combo —
+    the two are orthogonal.
     """
 
     leg_indices: tuple[int, ...]
@@ -83,6 +95,7 @@ class ComboPosition:
     contracts: int
     price_cc: int
     fee_cc: int = 0
+    leg_sides: tuple[Literal["yes", "no"], ...] | None = None
 
     def __post_init__(self) -> None:
         if not self.leg_indices:
@@ -97,6 +110,15 @@ class ComboPosition:
             raise ValueError(f"price_cc out of [0, {CC_PER_DOLLAR}]: {self.price_cc}")
         if self.fee_cc < 0:
             raise ValueError(f"fee_cc must be >= 0: {self.fee_cc}")
+        if self.leg_sides is not None:
+            if len(self.leg_sides) != len(self.leg_indices):
+                raise ValueError(
+                    f"leg_sides length {len(self.leg_sides)} != leg_indices length "
+                    f"{len(self.leg_indices)}"
+                )
+            for s in self.leg_sides:
+                if s not in ("yes", "no"):
+                    raise ValueError(f"leg side must be 'yes' or 'no': {s!r}")
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -173,6 +195,16 @@ def _position_pnl(
 ) -> NDArray[np.float64]:
     """Per-scenario total P&L of one position in float cc; fee subtracted once."""
     cols = values[:, list(position.leg_indices)]
+    if position.leg_sides is not None:
+        # Per-leg selected-side: a NO-selected leg contributes (1 − value) to the
+        # payout product, keeping its correlation with the rest of its game (the
+        # sampled `cols` already carry the copula dependence). YES-selected legs
+        # are untouched, so an all-"yes" leg_sides reproduces the default exactly.
+        flip = np.array(
+            [s == "no" for s in position.leg_sides], dtype=bool
+        )
+        if flip.any():
+            cols = np.where(flip[np.newaxis, :], 1.0 - cols, cols)
     payout_cc = np.minimum(np.prod(cols, axis=1), 1.0) * float(CC_PER_DOLLAR)
     if position.side == "yes":
         per_contract = payout_cc - float(position.price_cc)
@@ -190,6 +222,25 @@ def _book_pnl(
     for position in positions:
         pnl += _position_pnl(values, position)
     return pnl
+
+
+# Public aliases so the book-risk / tail-attribution layer (sim/book_risk.py) can
+# reuse the EXACT per-position and whole-book P&L math on the SAME sampled value
+# matrix — no reimplementation of the payout/fee/side arithmetic (hard rule 8).
+def position_pnl(
+    values: NDArray[np.float64], position: ComboPosition
+) -> NDArray[np.float64]:
+    """Per-scenario P&L of one position (float cc); public alias of the engine's
+    payout math for tail attribution (restrict ``values`` to the tail rows to get
+    that position's contribution to the tail loss)."""
+    return _position_pnl(values, position)
+
+
+def book_pnl(
+    values: NDArray[np.float64], positions: Sequence[ComboPosition]
+) -> NDArray[np.float64]:
+    """Per-scenario P&L of the whole book (float cc); public alias."""
+    return _book_pnl(values, positions)
 
 
 def _stats_from_pnl(

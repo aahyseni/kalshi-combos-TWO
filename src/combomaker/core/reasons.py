@@ -53,6 +53,12 @@ class ReasonCode(StrEnum):
     # (multiple × bankroll). A stale bankroll fails closed (SKIP_BANKROLL_
     # UNAVAILABLE) instead — a stricter block than a loose multiple.
     SKIP_UTILIZATION_BACKSTOP = "skip_utilization_backstop"
+    # Portfolio joint-tail cap (Phase 4 / M1 §5): the book's operative ES_0.99
+    # (max of production-copula ES at the corr-high band, the correlation-inflated
+    # challenger ES, and the exact all-hit deterministic stress) exceeds its
+    # %-of-bankroll ceiling. Read off the LATEST full-MC BookRiskSnapshot (never
+    # re-run in check); a stale/UNKNOWN snapshot fails closed. SHADOW in Phase 4.
+    SKIP_PORTFOLIO_CVAR = "skip_portfolio_cvar"
     # The %-of-bankroll caps cannot be computed because the live bankroll reading
     # is unavailable/stale (BalanceTracker fails closed → None). UNKNOWN bankroll
     # ⇒ fail-closed (widen-or-no-quote), NEVER a convenient default. In shadow

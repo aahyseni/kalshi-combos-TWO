@@ -40,6 +40,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from fractions import Fraction
+from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from combomaker.core.money import CC_PER_DOLLAR
@@ -124,6 +125,15 @@ class RiskLimits:
     drawdown_frac: Fraction = Fraction(10, 100)
     # Hard-trip KILL: deeper give-back → human-only clear. 12%.
     hard_trip_frac: Fraction = Fraction(12, 100)
+    # Portfolio joint-tail cap (Phase 4 / M1 §5): the book's OPERATIVE ES_0.99
+    # (max of production-copula ES at corr-high, challenger ES, deterministic
+    # stress) as a %-of-bankroll ceiling (LOSS axis — ES is a loss magnitude).
+    # 15% START: looser than the daily-loss halt because ES_0.99 is a rare-tail
+    # figure the book is expected to sit well inside; it bites only when the
+    # correlated joint tail (many shared games breaking together) approaches a
+    # meaningful slice of bankroll. Read off the latest BookRiskSnapshot (never
+    # re-run MC in check); a stale/UNKNOWN snapshot fails closed.
+    portfolio_cvar_frac: Fraction = Fraction(15, 100)
     # Absolute-$ utilization backstop: gross_settlement_notional (utilization
     # axis), whole book, as a MULTIPLE of bankroll. Loose backstop ABOVE the %
     # caps; binds even when the bankroll poll is stale. 3×.
@@ -216,6 +226,21 @@ class HaltInputs:
     current_equity_cc: int | None = None
 
 
+class PortfolioRisk(Protocol):
+    """The subset of a ``sim.book_risk.BookRiskSnapshot`` the CVaR cap reads.
+
+    Structural (a Protocol) so ``limits`` never imports ``sim.book_risk`` (which
+    imports ``risk.exposure`` — a cycle). The caller passes the LATEST full-MC
+    snapshot; ``check`` never re-runs MC (kept cheap + pure). ``usable`` False (an
+    UNKNOWN/empty snapshot) ⇒ the CVaR cap fails closed."""
+
+    @property
+    def usable(self) -> bool: ...
+
+    @property
+    def operative_es_99_cc(self) -> float: ...
+
+
 class LimitChecker:
     def __init__(self, limits: RiskLimits) -> None:
         self._limits = limits
@@ -231,6 +256,7 @@ class LimitChecker:
         risk_bankroll_cc: int | None = None,
         start_time_provider: StartTimeProvider | None = None,
         halt_inputs: HaltInputs | None = None,
+        book_risk: PortfolioRisk | None = None,
     ) -> list[Breach]:
         """All current breaches, mass-acceptance included.
 
@@ -244,6 +270,12 @@ class LimitChecker:
         market ticker to its game start for the slate bucket. ``halt_inputs``
         carries the intraday peak/current equity for the give-back halts. All R2
         breaches carry ``shadow=caps_shadow_mode`` (default True = log-only).
+
+        Phase 4: ``book_risk`` is the LATEST full-MC ``BookRiskSnapshot`` (built
+        off the hot path); the portfolio-CVaR cap reads its operative ES here
+        WITHOUT re-running MC (keeps ``check`` cheap). None ⇒ the CVaR cap is
+        simply not evaluated (no snapshot yet); a present-but-unusable snapshot
+        fails closed (a breach), matching UNKNOWN-is-never-safe.
         """
         limits = self._limits
         breaches: list[Breach] = []
@@ -350,6 +382,7 @@ class LimitChecker:
                 risk_bankroll_cc=risk_bankroll_cc,
                 start_time_provider=start_time_provider,
                 halt_inputs=halt_inputs,
+                book_risk=book_risk,
             )
         )
         return breaches
@@ -366,6 +399,7 @@ class LimitChecker:
         risk_bankroll_cc: int | None,
         start_time_provider: StartTimeProvider | None,
         halt_inputs: HaltInputs | None,
+        book_risk: PortfolioRisk | None = None,
     ) -> list[Breach]:
         """The additive %-of-bankroll caps. Every breach carries
         ``shadow=caps_shadow_mode`` so Phase 2 is log-only. Kept in its own method
@@ -535,6 +569,35 @@ class LimitChecker:
                         ReasonCode.HALT_DRAWDOWN,
                         f"give-back {give_back_cc}cc >= {limits.drawdown_frac} "
                         f"bankroll = {draw_thr}cc",
+                        shadow=shadow,
+                    )
+                )
+
+        # (8) Portfolio joint-tail cap (Phase 4 / M1 §5): the book's OPERATIVE
+        # ES_0.99 (max of copula-high ES, challenger ES, deterministic stress),
+        # read off the latest full-MC snapshot, vs a %-of-bankroll ceiling. This
+        # is the joint-tail backstop the analytic per-game worst case cannot see
+        # (the analytic sums worst cases as if independent; this counts the
+        # correlated joint tail — many shared games breaking together). A
+        # present-but-unusable snapshot (UNKNOWN marginal / empty) fails closed.
+        if book_risk is not None:
+            cvar_thr = threshold_cc(limits.portfolio_cvar_frac, bankroll)
+            if not book_risk.usable:
+                out.append(
+                    Breach(
+                        ReasonCode.SKIP_PORTFOLIO_CVAR,
+                        "portfolio book-risk snapshot unusable (UNKNOWN marginal / "
+                        "empty) — joint-tail cap fails closed",
+                        shadow=shadow,
+                    )
+                )
+            elif book_risk.operative_es_99_cc > cvar_thr:
+                out.append(
+                    Breach(
+                        ReasonCode.SKIP_PORTFOLIO_CVAR,
+                        f"portfolio operative ES_0.99 "
+                        f"{int(book_risk.operative_es_99_cc)}cc > "
+                        f"{limits.portfolio_cvar_frac} bankroll = {cvar_thr}cc",
                         shadow=shadow,
                     )
                 )

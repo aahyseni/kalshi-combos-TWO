@@ -11,6 +11,7 @@ notional axis, the game-loss cap on the loss axis, with the SAME positions).
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from fractions import Fraction
 
@@ -133,8 +134,19 @@ LOOSE: dict[str, object] = {
     "daily_loss_frac": Fraction(99, 100),
     "drawdown_frac": Fraction(99, 100),
     "hard_trip_frac": Fraction(99, 100),
+    "portfolio_cvar_frac": Fraction(99, 100),
     "absolute_notional_multiple": 999,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class FakeBookRisk:
+    """Minimal PortfolioRisk stand-in for the CVaR cap tests (a real
+    ``BookRiskSnapshot`` is heavier to build; only ``usable`` +
+    ``operative_es_99_cc`` are read by the cap)."""
+
+    usable: bool
+    operative_es_99_cc: float
 
 
 class TestThresholdExactness:
@@ -615,3 +627,74 @@ class TestConfigFractionExactness:
         ):
             with pytest.raises(ValidationError):
                 RiskConfig(**{field: 0})
+
+
+class TestPortfolioCvarCap:
+    """The Phase-4 portfolio joint-tail cap: operative ES_0.99 vs %-of-bankroll.
+
+    Reads the latest BookRiskSnapshot (a FakeBookRisk here); NEVER re-runs MC.
+    Fires when operative ES exceeds the ceiling; fails closed on an unusable
+    snapshot; not evaluated when no snapshot is supplied (None)."""
+
+    def _check(
+        self, book_risk: object | None, frac: Fraction
+    ) -> list[ReasonCode]:
+        # Isolate the CVaR cap: all other R2 fracs loose, this one under test.
+        limits = {**LOOSE, "portfolio_cvar_frac": frac}
+        breaches = LimitChecker(RiskLimits(**limits)).check(  # type: ignore[arg-type]
+            empty_book(),
+            MARG,
+            DailyPnl(),
+            risk_bankroll_cc=BANKROLL_2K,
+            book_risk=book_risk,  # type: ignore[arg-type]
+        )
+        return r2_reasons(breaches)
+
+    def test_fires_when_operative_es_over_ceiling(self) -> None:
+        # 15% of $2,000 = $300 = 3_000_000 cc. ES 3_000_001 → fires.
+        thr = threshold_cc(Fraction(15, 100), BANKROLL_2K)
+        risk = FakeBookRisk(usable=True, operative_es_99_cc=float(thr + 1))
+        assert ReasonCode.SKIP_PORTFOLIO_CVAR in self._check(risk, Fraction(15, 100))
+
+    def test_passes_at_or_below_ceiling(self) -> None:
+        thr = threshold_cc(Fraction(15, 100), BANKROLL_2K)
+        risk = FakeBookRisk(usable=True, operative_es_99_cc=float(thr))
+        assert ReasonCode.SKIP_PORTFOLIO_CVAR not in self._check(risk, Fraction(15, 100))
+
+    def test_unusable_snapshot_fails_closed(self) -> None:
+        # An UNKNOWN/empty snapshot ⇒ breach regardless of the ES value.
+        risk = FakeBookRisk(usable=False, operative_es_99_cc=0.0)
+        assert ReasonCode.SKIP_PORTFOLIO_CVAR in self._check(risk, Fraction(15, 100))
+
+    def test_no_snapshot_not_evaluated(self) -> None:
+        # None (no MC yet) ⇒ the cap simply doesn't run; no CVaR breach.
+        assert ReasonCode.SKIP_PORTFOLIO_CVAR not in self._check(None, Fraction(15, 100))
+
+    def test_shadow_flag_set_in_shadow_mode(self) -> None:
+        # In caps_shadow_mode (default True), the CVaR breach is log-only.
+        thr = threshold_cc(Fraction(15, 100), BANKROLL_2K)
+        risk = FakeBookRisk(usable=True, operative_es_99_cc=float(thr + 1))
+        limits = RiskLimits(**{**LOOSE, "portfolio_cvar_frac": Fraction(15, 100)})  # type: ignore[arg-type]
+        breaches = LimitChecker(limits).check(
+            empty_book(),
+            MARG,
+            DailyPnl(),
+            risk_bankroll_cc=BANKROLL_2K,
+            book_risk=risk,
+        )
+        cvar = [b for b in breaches if b.reason is ReasonCode.SKIP_PORTFOLIO_CVAR]
+        assert cvar and all(b.shadow for b in cvar)
+
+    def test_config_wires_portfolio_cvar_frac(self) -> None:
+        from combomaker.ops.config import RiskConfig
+
+        limits = RiskConfig(portfolio_cvar_frac="0.20").to_risk_limits()
+        assert limits.portfolio_cvar_frac == Fraction(20, 100)
+
+    def test_config_rejects_bad_cvar_frac(self) -> None:
+        from pydantic import ValidationError
+
+        from combomaker.ops.config import RiskConfig
+
+        with pytest.raises(ValidationError):
+            RiskConfig(portfolio_cvar_frac="1.5")

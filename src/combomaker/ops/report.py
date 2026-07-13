@@ -10,12 +10,10 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
-
-from combomaker.core.conventions import Side
 from combomaker.ops.persistence import Store
 from combomaker.risk.exposure import ExposureBook, MarginalProvider
-from combomaker.sim.engine import ComboPosition, LegModel, simulate
+from combomaker.sim.book_model import WithinGameRhoProvider, build_book_model
+from combomaker.sim.book_risk import compute_book_risk
 
 JsonDict = dict[str, Any]
 
@@ -27,6 +25,8 @@ async def build_report(
     exposure: ExposureBook | None = None,
     marginals: MarginalProvider | None = None,
     mc_samples: int = 100_000,
+    within_game_rho: WithinGameRhoProvider | None = None,
+    bankroll_cc: int | None = None,
 ) -> JsonDict:
     report: JsonDict = {
         "env": env,
@@ -43,67 +43,69 @@ async def build_report(
         "markouts": await store.markout_summary(),
     }
     if exposure is not None and marginals is not None:
-        report["portfolio_mc"] = _portfolio_mc(exposure, marginals, mc_samples)
+        report["portfolio_mc"] = _portfolio_mc(
+            exposure,
+            marginals,
+            mc_samples,
+            within_game_rho=within_game_rho,
+            bankroll_cc=bankroll_cc,
+        )
     return report
 
 
 def _portfolio_mc(
-    exposure: ExposureBook, marginals: MarginalProvider, n_samples: int
+    exposure: ExposureBook,
+    marginals: MarginalProvider,
+    n_samples: int,
+    *,
+    within_game_rho: WithinGameRhoProvider | None = None,
+    bankroll_cc: int | None = None,
 ) -> JsonDict:
-    """Monte Carlo over open positions (independence corr for the report; the
-    pricing-side correlation lives in quotes, this is the standing risk view)."""
+    """Standing portfolio-risk MC over open positions, built the PRICER's way
+    (Phase 4 / M1): a block-diagonal game-keyed correlation and per-position NO
+    handling, NOT the old independence ``np.eye`` + complement pseudo-legs (F8).
+
+    The correlation view now matches the fair we quoted — the risk sim and the
+    pricer share a joint (parity-gated in ``test_sim_book_model``). CVaR is at the
+    ``high`` band (correlation uncertainty widens risk), and the operative ES is
+    the max-of-three challenger/stress overlay (§5). UNKNOWN marginals ⇒ the
+    snapshot is flagged unusable (fail-closed) — never a silent 0.5 placeholder in
+    the stats (the old report's live UNKNOWN-is-never-safe violation)."""
     positions = list(exposure.positions.values())
     if not positions:
         return {"positions": 0}
-    leg_index: dict[str, int] = {}
-    legs: list[LegModel] = []
-    unknown = False
-    for position in positions:
-        for leg in position.legs:
-            if leg.market_ticker not in leg_index:
-                p = marginals(leg.market_ticker)
-                if p is None:
-                    unknown = True
-                    p = 0.5  # placeholder; flagged below, stats marked unusable
-                leg_index[leg.market_ticker] = len(legs)
-                legs.append(LegModel(p=p))
-    sim_positions = []
-    for position in positions:
-        # NOTE: sim legs are YES-side; a "no" selected side is a complement —
-        # handled by flipping the leg probability into a dedicated leg model
-        # is not possible per-position, so map: use the position's selected
-        # sides via per-position leg list of (index, side). The v1 sim models
-        # the AND of YES legs only; NO legs are approximated by complementary
-        # pseudo-legs.
-        indices = []
-        for leg in position.legs:
-            if leg.side == "yes":
-                indices.append(leg_index[leg.market_ticker])
-            else:
-                pseudo = f"~{leg.market_ticker}"
-                if pseudo not in leg_index:
-                    base = legs[leg_index[leg.market_ticker]]
-                    leg_index[pseudo] = len(legs)
-                    legs.append(LegModel(p=1.0 - base.p))
-                indices.append(leg_index[pseudo])
-        sim_positions.append(
-            ComboPosition(
-                leg_indices=tuple(indices),
-                side="yes" if position.our_side is Side.YES else "no",
-                contracts=max(1, int(position.contracts) // 100),
-                price_cc=int(position.entry_price_cc),
-            )
-        )
-    corr = np.eye(len(legs))
-    stats = simulate(legs, corr, sim_positions, n_samples=n_samples, seed=7)
-    return {
+    model = build_book_model(
+        positions, marginals=marginals, within_game_rho=within_game_rho
+    )
+    snap = compute_book_risk(
+        model,
+        n_samples=n_samples,
+        seed=7,
+        band="high",
+        bankroll_cc=bankroll_cc,
+    )
+    out: JsonDict = {
         "positions": len(positions),
-        "unknown_marginals": unknown,
-        "ev_cc": round(stats.ev_cc, 1),
-        "p_profit": round(stats.p_profit, 4),
-        "var_cc": {str(k): round(v, 1) for k, v in stats.var_cc.items()},
-        "es_cc": {str(k): round(v, 1) for k, v in stats.es_cc.items()},
+        "unknown_marginals": snap.unknown,
+        "usable": snap.usable,
+        "band": snap.band,
+        "ev_cc": round(snap.ev_cc, 1),
+        "ev_stderr_cc": round(snap.ev_stderr_cc, 2),
+        "p_profit": round(snap.p_profit, 4),
+        "var_99_cc": round(snap.var_99_cc, 1),
+        "es_99_cc": round(snap.es_99_cc, 1),
+        "challenger_es_99_cc": round(snap.challenger_es_99_cc, 1),
+        "deterministic_stress_cc": round(snap.deterministic_stress_cc, 1),
+        "operative_es_99_cc": round(snap.operative_es_99_cc, 1),
+        "per_game_tail_cc": {
+            c.key: round(c.loss_cc, 1) for c in snap.per_game_tail_cc[:10]
+        },
     }
+    if snap.p_loss_worse_than:
+        out["p_loss_worse_than"] = {
+            str(int(k)): round(v, 4) for k, v in snap.p_loss_worse_than.items()
+        }
+    return out
 
 
 def format_report(report: JsonDict) -> str:
