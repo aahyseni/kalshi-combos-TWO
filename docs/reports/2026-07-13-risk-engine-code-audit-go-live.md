@@ -1,5 +1,23 @@
 # Risk engine — code-grounded audit (phases 1-6) + go-live verdict
 
+> **⚠️ SUPERSEDED for the ENFORCE/SHADOW state (2026-07-13, later same day).**
+> This audit describes the code at `2f39812` — BEFORE the "wire it all live"
+> change merged at `3aabae5`. The findings here that say the risk engine is
+> "shadow / dead / inert" and that `caps_shadow_mode=True` are **NO LONGER TRUE**:
+> the wiring change flipped `caps_shadow_mode` to **False (ENFORCED)** in
+> paper/quote mode, wired the settlement→ledger→reconcile-HALT chain, armed the
+> portfolio-CVaR MC, implemented fill-velocity, fed the breakers, and launched the
+> supervisor. The re-audit of `3aabae5` found **41 ENFORCED / 9 SHADOW / 6
+> BUILT-NOT-CALLED** (was 23 / 24 / 14). See
+> `2026-07-13-risk-engine-reaudit-after-wiring.md` for the current state. The §5
+> "must-be-true before live" list here has been largely built; what REMAINS is:
+> the default shipped mode is `observe` (zero enforcement until `--mode quote`),
+> the settlement/reconcile-HALT path is proven in TESTS only (never a real Kalshi
+> settlement), the supervisor needs its `KALSHI_SUPERVISOR_*` credential + a
+> separate host, prod is gated by design, and — the real gate — **the markup/edge
+> is unvalidated** (pooled multi-week, never on one window). Read this file only
+> as the historical pre-wiring snapshot.
+
 **Date:** 2026-07-13. Method: six parallel per-phase auditors read the **actual
 merged code** on `main` (`2f39812`), classifying every component as
 ENFORCED-LIVE / SHADOW-LOGGED / BUILT-NOT-CALLED, grounded in file:line — plus my
