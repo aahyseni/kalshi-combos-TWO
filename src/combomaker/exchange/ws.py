@@ -173,7 +173,17 @@ class WsManager:
                 try:
                     headers = self._signer.headers("GET", _WS_HANDSHAKE_PATH)
                     async with session.ws_connect(
-                        self._url, headers=headers, autoping=True, heartbeat=None
+                        # heartbeat=10s: aiohttp sends a client Ping every 10s and
+                        # CLOSES the socket if no Pong returns in the interval —
+                        # giving an independent liveness timer + fast dead-peer
+                        # detection into the clean reconnect path. `heartbeat=None`
+                        # (the old value) sent no client keepalive, so a half-dead
+                        # connection (TCP up, peer silent) hung until the 30s
+                        # silence budget → the ~11-min drop cadence seen live
+                        # 2026-07-13. Kalshi pings every 10s AND accepts a client
+                        # ping (docs/api-notes/asyncapi-ws.md §2); autoping still
+                        # Pongs Kalshi's server pings.
+                        self._url, headers=headers, autoping=True, heartbeat=10.0
                     ) as ws:
                         self._ws = ws
                         self._last_rx_mono_ns = self._clock.monotonic_ns()
