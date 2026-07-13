@@ -309,6 +309,12 @@ class CircuitBreakers:
         ReasonCode.HALT_MARGINAL_JUMP: 30.0,     # one-off move re-baselines; halt on churn
     }
 
+    # Consecutive fully-clear status ticks required before a transient grace timer
+    # is forgiven. A SINGLE clear tick must NOT reset the timer, or a condition
+    # that FLAPS (bad/clear/bad/clear around a threshold) would evade escalation
+    # forever while effectively broken (review finding, 2026-07-13).
+    _RECOVERY_CLEARS = 2
+
     def __init__(
         self, killswitch: KillSwitch, thresholds: BreakerThresholds, clock: Clock
     ) -> None:
@@ -316,7 +322,10 @@ class CircuitBreakers:
         self._thr = thresholds
         self._clock = clock
         self._last_marginal: dict[str, float] = {}
-        self._bad_since: dict[ReasonCode, float] = {}
+        # per-reason first-bad MONOTONIC-ns timestamp (a wall-clock step must never
+        # move a safety escalation) + the recovery streak for flap resistance.
+        self._bad_since: dict[ReasonCode, int] = {}
+        self._clear_streak: int = 0
 
     def evaluate(self, inputs: BreakerInputs) -> BreakerVerdict:
         """Run all detectors; return the FIRST trip (or clear). Never halts.
@@ -395,17 +404,24 @@ class CircuitBreakers:
         Returns the verdict so the caller can log/meter it. WIRED call site (status
         loop)."""
         verdict = self.evaluate(inputs)
-        now = self._clock.now().timestamp()
+        now_ns = self._clock.monotonic_ns()
         if not verdict.tripped:
-            if self._bad_since:  # recovered before escalating — resume, reset timers
-                log.info(
-                    "circuit_breaker_recovered", held=[str(r) for r in self._bad_since]
-                )
-                self._bad_since = {}
+            if self._bad_since:  # holding a timer — forgive only after sustained clear
+                self._clear_streak += 1
+                if self._clear_streak >= self._RECOVERY_CLEARS:
+                    log.info(
+                        "circuit_breaker_recovered",
+                        held=[str(r) for r in self._bad_since],
+                    )
+                    self._bad_since = {}
+                    self._clear_streak = 0
+                # else: HOLD the timer through a brief clear (flap resistance) —
+                # a bad/clear/bad flapper must still accumulate toward escalation.
             return verdict
 
         reason = verdict.reason
         assert reason is not None  # a trip always carries a reason
+        self._clear_streak = 0  # any trip breaks a recovery streak
         grace = self._GRACE_S.get(reason)
         if grace is None:
             # structural / genuine → hard-halt immediately (unchanged behaviour)
@@ -416,15 +432,17 @@ class CircuitBreakers:
             return verdict
 
         # transient → hold for the grace window; keep only THIS reason's timer so a
-        # different reason on the next tick can't inherit a stale start time.
-        since = self._bad_since.get(reason, now)
-        self._bad_since = {reason: since}
-        elapsed = now - since
-        if elapsed < grace:
+        # different reason on the next tick can't inherit a stale start time (a
+        # same-reason re-trip preserves the first-bad instant, so a sustained or
+        # flapping condition still accumulates toward the hard halt).
+        since_ns = self._bad_since.get(reason, now_ns)
+        self._bad_since = {reason: since_ns}
+        elapsed_s = (now_ns - since_ns) / 1e9
+        if elapsed_s < grace:
             log.warning(
                 "circuit_breaker_transient_holding",
                 reason=str(reason),
-                elapsed_s=round(elapsed, 1),
+                elapsed_s=round(elapsed_s, 1),
                 grace_s=grace,
                 detail=verdict.detail,
             )
@@ -432,10 +450,10 @@ class CircuitBreakers:
         log.error(
             "circuit_breaker_tripped_sustained",
             reason=str(reason),
-            elapsed_s=round(elapsed, 1),
+            elapsed_s=round(elapsed_s, 1),
             detail=verdict.detail,
         )
         await self._killswitch.halt(
-            reason, f"{verdict.detail} (sustained {elapsed:.0f}s > {grace:.0f}s grace)"
+            reason, f"{verdict.detail} (sustained {elapsed_s:.0f}s > {grace:.0f}s grace)"
         )
         return verdict

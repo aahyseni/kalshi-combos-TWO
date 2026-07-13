@@ -93,6 +93,15 @@ class RfqFilter:
 
         if not self._feed.feed_healthy:
             reasons.append(ReasonCode.SKIP_WS_UNHEALTHY)
+        else:
+            # Connected, but require the feed be RECENT enough to price against: a
+            # book stale enough that the HALT_DATA_STALE breaker is (transiently)
+            # HOLDING must never produce a live quote on stale prices. Mirrors the
+            # last-look freshness bar (rx-age is connection-level; None ⇒ already
+            # SKIP_WS_UNHEALTHY above).
+            rx = self._feed.rx_age_s
+            if rx is not None and rx > cfg.max_feed_age_s:
+                reasons.append(ReasonCode.SKIP_LEG_STALE)
 
         reasons.extend(self._leg_book_reasons(rfq))
         reasons.extend(self._timing_reasons(rfq))

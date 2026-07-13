@@ -19,6 +19,9 @@ class FakeWs:
         self.subscriptions: list[dict[str, Any]] = []
         self.commands: list[tuple[str, dict[str, Any]]] = []
         self._healthy = True
+        # Tests can pin a specific rx-age (e.g. "connected but stale"); None ⇒ the
+        # default 0.1s-when-healthy behaviour.
+        self.rx_age_s_override: float | None = None
 
     def on_message(self, msg_type: str, handler: Callable[[JsonDict], Awaitable[None]]) -> None:
         self.handlers.setdefault(msg_type, []).append(handler)
@@ -47,6 +50,8 @@ class FakeWs:
 
     @property
     def last_rx_age_s(self) -> float | None:
+        if self.rx_age_s_override is not None:
+            return self.rx_age_s_override
         return 0.1 if self._healthy else None
 
     # test drivers

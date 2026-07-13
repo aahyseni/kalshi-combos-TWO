@@ -189,6 +189,13 @@ class FiltersConfig(StrictModel):
     # empty list blocks ALL combos (fail-closed).
     allowed_leg_series_prefixes: list[str] | None = ["KXWC", "KXMLB"]
     combos_only: bool = True          # skip single-market RFQs
+    # Quote-time feed-freshness gate: refuse to POST a quote when the WS feed's
+    # rx-age exceeds this. Keep it >= breakers.max_rx_age_s (5s) so that a feed
+    # stale enough for the HALT_DATA_STALE breaker to be (transiently) HOLDING can
+    # never produce a live quote on stale prices — closes the gap between "feed
+    # connected (feed_healthy, <=30s)" and "fresh enough to price" (review finding
+    # 2026-07-13). rx-age None (disconnected) is already caught by feed_healthy.
+    max_feed_age_s: float = 5.0
     min_legs: int = 2
     max_legs: int = 6
     min_contracts: float = 1.0        # whole contracts

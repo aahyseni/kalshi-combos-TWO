@@ -255,18 +255,33 @@ async def test_data_stale_precedence_over_later_breakers() -> None:
     assert v.reason is ReasonCode.HALT_DATA_STALE
 
 
-async def test_transient_recovers_within_grace_never_halts() -> None:
-    # The core WS-reconnect fix: a stale feed that comes back fresh within the
-    # grace window never hard-kills, and a LATER stale starts a fresh timer.
+async def test_transient_recovers_after_sustained_clear_never_halts() -> None:
+    # The WS-reconnect fix: a stale feed that stays fresh for RECOVERY_CLEARS ticks
+    # is forgiven, and a much-later stale starts a FRESH timer (not the old blip's).
     breakers, ks, clock = _breakers()
     await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=None))  # stale — held
     assert not ks.halted
-    clock.advance(10.0)  # feed reconnects within grace
-    v = await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=1.0))  # fresh again
-    assert not v.tripped and not ks.halted  # recovered, timer reset
+    clock.advance(10.0)
+    await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=1.0))  # clear 1 (held)
+    clock.advance(1.0)
+    v = await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=1.0))  # clear 2 ⇒ reset
+    assert not v.tripped and not ks.halted
     clock.advance(100.0)  # a much later, separate stale
     await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=None))
-    assert not ks.halted  # fresh timer — not escalated by the earlier blip
+    assert not ks.halted  # fresh timer — ~0s elapsed, the earlier blip was forgiven
+
+
+async def test_flapping_transient_still_escalates() -> None:
+    # bad/clear/bad/clear around the threshold must NOT evade escalation: a SINGLE
+    # clear does not reset the timer (RECOVERY_CLEARS=2), so a flapper accumulates.
+    breakers, ks, clock = _breakers()
+    await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=None))  # bad, since=t0
+    for _ in range(4):
+        clock.advance(15.0)
+        await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=1.0))   # clear (streak 1)
+        clock.advance(1.0)
+        await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=None))  # bad again
+    assert ks.halted  # timer accumulated past the 30s grace despite the flapping
 
 
 async def test_metadata_change_hard_halts_immediately_no_grace() -> None:

@@ -97,6 +97,20 @@ async def test_clean_combo_passes() -> None:
     assert h.filter.evaluate(combo_rfq()) == []
 
 
+async def test_stale_feed_within_health_window_declines_quote() -> None:
+    # Quote-time freshness gate (review finding 2026-07-13): a feed that is
+    # CONNECTED (feed_healthy, rx-age <= 30s) but past max_feed_age_s (5s) must
+    # DECLINE — a quote must never post on data stale enough that the HALT_DATA_STALE
+    # breaker is (transiently) holding.
+    h = await ready_harness()
+    assert h.filter.evaluate(combo_rfq()) == []  # fresh ⇒ quotable
+    h.ws.rx_age_s_override = 6.0  # connected (healthy) but 6s > the 5s quote bar
+    assert h.feed.feed_healthy  # still "connected"
+    reasons = h.filter.evaluate(combo_rfq())
+    assert ReasonCode.SKIP_LEG_STALE in reasons
+    assert ReasonCode.SKIP_WS_UNHEALTHY not in reasons  # not a disconnect — just stale
+
+
 async def test_halted_skips() -> None:
     h = await ready_harness()
     await h.killswitch.halt(ReasonCode.HALT_MANUAL)

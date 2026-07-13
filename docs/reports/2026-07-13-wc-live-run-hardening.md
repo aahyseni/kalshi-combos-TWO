@@ -55,14 +55,26 @@ crash at a time is the wrong approach (rushes safety edits, burns launches).
 **What IS proven:** pricing, correlation, the validated WC-FAT edge, the markup,
 and quote posting all work live. The gap is purely breaker **tuning for live**.
 
+## RESOLUTION — breaker live-hardening pass (commit `8e2b197`)
+
+Done. `CircuitBreakers.evaluate_and_halt` now holds a per-reason **grace timer**:
+TRANSIENT reasons (`HALT_DATA_STALE` 30s / `HALT_LATENCY_SPIKE` 90s /
+`HALT_RATE_LIMIT_BURST` 30s / `HALT_MARGINAL_JUMP` 30s) are **held** across the
+grace window and only escalate to the hard kill if the condition stays bad past it;
+a clear tick resets the timer (recovered). STRUCTURAL reasons (`HALT_METADATA_
+CHANGE`, `HALT_UNMAPPED_GAME`, `HALT_BREAKER_ERROR`) keep the immediate hard-halt.
+Safe during the hold because the EXISTING safeguards already engage — `feed.
+on_invalidate` cancels resting quotes, the WS force-reconnects, and the pricer
+declines on stale legs (`max_leg_age_s` ~2s → `SKIP_LEG_STALE`). Windows are
+multiples of the 15s status cadence so a reconnect gets ≥1 full tick to heal.
+Tests: hold-then-halt-when-sustained, recover-within-grace-never-halt, structural=
+immediate. Suite 1718/0. Adversarial review in flight before the next live run.
+
 ## NEXT STEPS
 
-- **Owner: bot (the gating work).** A **breaker live-hardening pass** — audit all
-  7 breakers so each **degrades gracefully** (pause quoting + auto-resume on the
-  feed/heartbeat coming back; only fatally kill on a *sustained genuine* failure,
-  not a sub-second transient), tested, before any further live run. Specifically
-  data-stale: tolerate a WS-reconnect grace window; the bot ALREADY cancels quotes
-  on disconnect, so the fatal kill is redundant.
+- **Owner: bot.** After the review passes: relaunch + supervise; the book should
+  now ride through WS reconnects / transient blips and only hard-halt on a
+  sustained genuine failure.
 - **Owner: operator.** Decide: do the breaker pass now, or bank the WC learnings +
   wait for the pooled multi-week data (shadow recorder on the new server) and a
   bigger live window. 2 WC games + 0 fills = low ROI to rush.
