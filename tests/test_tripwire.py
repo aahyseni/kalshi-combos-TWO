@@ -33,6 +33,7 @@ from pathlib import Path
 import pytest
 
 from combomaker.core.reasons import ReasonCode
+from combomaker.ops.quote_app import QuoteApp
 from combomaker.pricing import tripwire
 from combomaker.pricing.quote import NoQuote
 from combomaker.pricing.relationships import (
@@ -345,3 +346,31 @@ def test_load_failure_makes_tripwire_inert_with_warning(
     rel = classify_legs((_leg(TOT1, "no"), _leg(ML_TIE, "no")), ExplodingProvider())
     assert rel.kind is RelationshipKind.OK  # pre-tripwire behavior, unchanged
     assert tripwire._CACHE == ()  # cached inert after the single warning
+
+
+# --- Book-level tripwire (2026-07-13 live false-kill): the maintenance-tick
+# re-check must run PER resting quote/position, never over the union of all book
+# legs (which pairs legs across SEPARATE legitimate combos and halts the book). ---
+
+_ADV_FRA = leg("KXWCADVANCE-26JUL14FRAESP-FRA", "KXWCADVANCE-26JUL14FRAESP", "yes")
+_WIN_ESP = leg("KXWCGAME-26JUL14FRAESP-ESP", "KXWCGAME-26JUL14FRAESP", "yes")
+
+
+def test_book_tripwire_does_not_pair_legs_across_separate_quotes() -> None:
+    # Two SEPARATE valid quotes whose UNION forms the pinned-impossible
+    # {FRA advance × ESP reg-win} pair (S18) must NOT halt — the exact live
+    # false-kill. Fillers are a different game so no in-group pair can match.
+    f1 = leg("KXWCTOTAL-26JUL10ESPBEL-1", "KXWCTOTAL-26JUL10ESPBEL", "yes")
+    f2 = leg("KXWCTOTAL-26JUL10ESPBEL-2", "KXWCTOTAL-26JUL10ESPBEL", "yes")
+    quote_a = (_ADV_FRA, f1)  # a valid FRA-advance combo
+    quote_b = (_WIN_ESP, f2)  # a valid ESP-win combo
+    assert QuoteApp._book_tripwire([quote_a, quote_b]) is None
+
+
+def test_book_tripwire_still_flags_a_single_impossible_resting_combo() -> None:
+    # Belt-and-braces preserved: if a SINGLE resting combo IS the impossible pair
+    # (which the pricing classifier prevents, but re-check anyway), it still halts.
+    hit = QuoteApp._book_tripwire([(_ADV_FRA, _WIN_ESP)])
+    assert hit is not None
+    shape, _detail = hit
+    assert shape  # the pinned shape id fired

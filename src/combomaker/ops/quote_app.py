@@ -1091,7 +1091,7 @@ class QuoteApp:
             rate_limit_count=self._rate_limit_window.count(),
             marginals=marginals,
             game_keys=game_keys,
-            tripwire_hit=self._book_tripwire(book_legs),
+            tripwire_hit=self._book_tripwire(self._book_leg_refs(exposure)),
             changed_markets=self._metadata_changes(book_legs, metadata),
         )
 
@@ -1143,20 +1143,41 @@ class QuoteApp:
         return refs
 
     @staticmethod
-    def _book_tripwire(legs: tuple[RfqLeg, ...]) -> tuple[str, str] | None:
-        """Re-run the taxonomy-impossible tripwire over the legs in the book. The
-        classifier already declines an impossible combo at PRICING time, so the
-        book should never carry one; this is the live belt-and-braces re-check —
-        if a pinned exchange-blocked impossible shape is ever resting (validator
-        loosened after we quoted), ``detect_metadata_change`` HALTs. Same-game
-        pairs only, matching the classifier's call (cross-game never matches)."""
-        if len(legs) < 2:
-            return None
-        game_keys = [
-            game_key(leg.event_ticker) if leg.event_ticker else leg.market_ticker
-            for leg in legs
-        ]
-        return taxonomy_impossible(list(legs), game_keys)
+    def _book_tripwire(leg_groups: list[tuple[Any, ...]]) -> tuple[str, str] | None:
+        """Re-run the taxonomy-impossible tripwire PER resting quote / position
+        (each ``leg_groups`` entry is one combo's legs) — NOT over the union of
+        every book leg. The per-RFQ classifier already DECLINES an impossible combo
+        at pricing time (relationships.py → RelationshipKind.IMPOSSIBLE), so a
+        single resting combo can never be impossible; this is the live
+        belt-and-braces for exactly that.
+
+        Scanning the UNION instead pairs legs ACROSS SEPARATE legitimate combos on
+        the same game and false-halts the whole book — 2026-07-13 live: two valid
+        ENG-ARG quotes ({ARG advance} in one, {ENG win} in another) formed the
+        pinned impossible {advance × opponent-win} pair and killed the live book,
+        even though Kalshi STILL blocks that combo (the validator did NOT loosen;
+        an exchange-blocked shape is declined at pricing, never a book-wide kill).
+        Same-game pairs only, matching the classifier."""
+        for leg_refs in leg_groups:
+            if len(leg_refs) < 2:
+                continue
+            rfq_legs = [
+                RfqLeg(
+                    market_ticker=leg.market_ticker,
+                    event_ticker=leg.event_ticker,
+                    side=leg.side,
+                    yes_settlement_value_cc=None,
+                )
+                for leg in leg_refs
+            ]
+            game_keys = [
+                game_key(leg.event_ticker) if leg.event_ticker else leg.market_ticker
+                for leg in rfq_legs
+            ]
+            hit = taxonomy_impossible(rfq_legs, game_keys)
+            if hit is not None:
+                return hit
+        return None
 
     def _metadata_changes(
         self, legs: tuple[RfqLeg, ...], metadata: MetadataCache
