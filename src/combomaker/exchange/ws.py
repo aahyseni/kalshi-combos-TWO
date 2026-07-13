@@ -173,17 +173,32 @@ class WsManager:
                 try:
                     headers = self._signer.headers("GET", _WS_HANDSHAKE_PATH)
                     async with session.ws_connect(
-                        # heartbeat=10s: aiohttp sends a client Ping every 10s and
-                        # CLOSES the socket if no Pong returns in the interval —
-                        # giving an independent liveness timer + fast dead-peer
-                        # detection into the clean reconnect path. `heartbeat=None`
-                        # (the old value) sent no client keepalive, so a half-dead
-                        # connection (TCP up, peer silent) hung until the 30s
-                        # silence budget → the ~11-min drop cadence seen live
-                        # 2026-07-13. Kalshi pings every 10s AND accepts a client
-                        # ping (docs/api-notes/asyncapi-ws.md §2); autoping still
-                        # Pongs Kalshi's server pings.
-                        self._url, headers=headers, autoping=True, heartbeat=10.0
+                        # Liveness via receive_timeout, NOT a client heartbeat.
+                        # `heartbeat=10.0` (tried 2026-07-13) made aiohttp send its
+                        # own client Pings; Kalshi's response to unsolicited client
+                        # pings is UNDOCUMENTED (docs/api-notes/asyncapi-ws.md §2 +
+                        # open-question list) and empirically the socket then died
+                        # clean every ~22s (11 reconnects/5min) vs ~11min with
+                        # heartbeat off — so every RFQ closed before our quote POST
+                        # landed. Reverted to heartbeat=None.
+                        #
+                        # receive_timeout=25s replaces it as an ACTIVE half-dead-peer
+                        # probe that keys off Kalshi's DOCUMENTED server ping (every
+                        # 10s, §2). Verified in aiohttp 3.14.1 client_ws.receive():
+                        # the receive_timeout wraps each reader.read() and a PING/PONG
+                        # frame `continue`s the loop → re-arms a fresh timeout, so any
+                        # frame (incl. server pings) resets it. It therefore fires
+                        # ONLY on a genuinely silent peer (no data AND no ping for
+                        # 25s) → raises TimeoutError → clean logged reconnect, never
+                        # the 30s-silence→data_stale→halt hang. 25s > 2×10s ping (no
+                        # false-trip on a quiet market) and < the breaker's 30s
+                        # data_stale grace (reconnect wins the race, no hard halt).
+                        # autoping=True still Pongs Kalshi's server pings.
+                        self._url,
+                        headers=headers,
+                        autoping=True,
+                        heartbeat=None,
+                        receive_timeout=25.0,
                     ) as ws:
                         self._ws = ws
                         self._last_rx_mono_ns = self._clock.monotonic_ns()
