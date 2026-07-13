@@ -85,13 +85,21 @@ def empty_book() -> ExposureBook:
 
 
 def enforced(breaches: list[Breach]) -> list[Breach]:
-    """Only the ENFORCED (non-shadow) breaches. The R2 %-of-bankroll cap layer
-    (Phase 2) is SHADOW by default: when no ``risk_bankroll_cc`` is passed it
-    always appends a shadow ``SKIP_BANKROLL_UNAVAILABLE`` (fail-closed, log-only).
-    These existing tests exercise the ENFORCED hard-dollar caps, whose behaviour
-    is unchanged, so they assert on the enforced subset. Shadow behaviour has its
-    own dedicated tests in test_limits_caps.py + test_risk_shadow_mode.py."""
-    return [b for b in breaches if not b.shadow]
+    """Only the ENFORCED hard-dollar-cap breaches these tests exercise.
+
+    These tests target the pre-R2 hard-dollar caps and never wire a bankroll
+    source, so the R2 %-of-bankroll cap LAYER must not intrude. Two ways it could:
+    a shadow breach (when caps_shadow_mode is True), and — now that the wire-live
+    default ENFORCES the caps — the fail-closed ``SKIP_BANKROLL_UNAVAILABLE`` the
+    R2 layer appends when a bankroll is expected but absent. Both are filtered
+    here so the hard-dollar-cap assertions stay isolated. (The R2 layer's own
+    behaviour — shadow, enforced, and the no-source-inactive path — is covered by
+    test_limits_caps.py + test_caps_enforced.py + test_risk_shadow_mode.py.)"""
+    return [
+        b
+        for b in breaches
+        if not b.shadow and b.reason is not ReasonCode.SKIP_BANKROLL_UNAVAILABLE
+    ]
 
 
 def reasons(breaches: list[Breach]) -> list[ReasonCode]:

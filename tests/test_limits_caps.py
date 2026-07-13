@@ -120,13 +120,28 @@ def r2_reasons(breaches: list[Breach]) -> list[ReasonCode]:
 # A checker whose caps are LOOSE except the one under test, so exactly one R2 cap
 # fires. Base uses tiny fracs where we want no fire, big where we do. We build
 # per-test to keep intent local.
+#
+# These tests validate the R2 cap layer's THRESHOLD-firing semantics through the
+# ``r2()`` helper (which filters ``b.shadow``), so they run the checker in SHADOW
+# mode by default — the layer produces exactly the same breaches enforced or not,
+# only the ``shadow`` flag differs. The wire-live default flipped
+# caps_shadow_mode to ENFORCE (False); these tests pin it True unless a test
+# explicitly overrides it to exercise enforced mode. Enforced-mode behaviour is
+# covered by the ``*_enforced_when_shadow_off`` tests here (which pass False) and
+# by the lifecycle wiring tests in ``test_risk_shadow_mode.py`` / the new
+# ``test_caps_enforced.py``.
 def checker(**overrides: object) -> LimitChecker:
+    overrides.setdefault("caps_shadow_mode", True)
     return LimitChecker(RiskLimits(**overrides))  # type: ignore[arg-type]
 
 
 # All-loose R2 fracs so a specific cap can be isolated; the enforced hard-dollar
 # caps are left at defaults (huge relative to the tiny test books).
 LOOSE: dict[str, object] = {
+    # SHADOW so the ``r2()`` helper (filters b.shadow) sees the layer's breaches;
+    # the wire-live default is now ENFORCE (False). Enforced mode is covered by
+    # the explicit ``*_enforced_when_shadow_off`` tests + ``test_caps_enforced``.
+    "caps_shadow_mode": True,
     "game_loss_frac": Fraction(99, 100),
     "per_combo_loss_frac": Fraction(99, 100),
     "directional_frac": Fraction(99, 100),
@@ -362,7 +377,8 @@ class TestFailClosed:
         assert r2_reasons(breaches) == [ReasonCode.SKIP_BANKROLL_UNAVAILABLE]
 
     def test_fail_closed_is_shadow_in_phase2(self) -> None:
-        # Default caps_shadow_mode=True ⇒ the fail-closed breach is log-only.
+        # In SHADOW mode (checker() pins it True) ⇒ the fail-closed breach is
+        # log-only. (Enforced-mode fail-closed is the next test.)
         breaches = checker().check(empty_book(), MARG, DailyPnl(), risk_bankroll_cc=None)
         fc = next(b for b in breaches if b.reason is ReasonCode.SKIP_BANKROLL_UNAVAILABLE)
         assert fc.shadow is True
@@ -588,7 +604,7 @@ class TestConfigFractionExactness:
         assert rl.drawdown_frac == Fraction(10, 100)
         assert rl.hard_trip_frac == Fraction(12, 100)
         assert rl.absolute_notional_multiple == 3
-        assert rl.caps_shadow_mode is True  # SHADOW by default in Phase 2
+        assert rl.caps_shadow_mode is False  # ENFORCED by default (wire-live)
 
     def test_cap_fraction_out_of_range_rejected(self) -> None:
         # A percentage is a FRACTION of bankroll: "8" (typo for 8%) would parse
@@ -671,7 +687,7 @@ class TestPortfolioCvarCap:
         assert ReasonCode.SKIP_PORTFOLIO_CVAR not in self._check(None, Fraction(15, 100))
 
     def test_shadow_flag_set_in_shadow_mode(self) -> None:
-        # In caps_shadow_mode (default True), the CVaR breach is log-only.
+        # In caps_shadow_mode (LOOSE pins it True), the CVaR breach is log-only.
         thr = threshold_cc(Fraction(15, 100), BANKROLL_2K)
         risk = FakeBookRisk(usable=True, operative_es_99_cc=float(thr + 1))
         limits = RiskLimits(**{**LOOSE, "portfolio_cvar_frac": Fraction(15, 100)})  # type: ignore[arg-type]

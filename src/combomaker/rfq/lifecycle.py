@@ -221,12 +221,24 @@ class QuoteLifecycle:
     def _risk_bankroll_cc(self) -> int | None:
         """The live risk-capital denominator in cc for the %-of-bankroll caps,
         or None when unavailable/stale (fail-closed — the checker then emits
-        SKIP_BANKROLL_UNAVAILABLE, shadow in Phase 2). Uses the NON-raising
-        accessor so a stale poll never throws on the hot path."""
+        SKIP_BANKROLL_UNAVAILABLE when a source is configured). Uses the
+        NON-raising accessor so a stale poll never throws on the hot path."""
         if self._balance is None:
             return None
         got = self._balance.risk_bankroll_cc_or_none()
         return None if got is None else int(got)
+
+    def _bankroll_source_configured(self) -> bool:
+        """Whether a bankroll SOURCE (balance tracker) is wired at all.
+
+        Fail-closed-without-bricking: when a source IS configured but its reading
+        is stale (``_risk_bankroll_cc`` → None), the checker fails the %-caps
+        CLOSED (a no-quote, the dark-poll runaway defense). When NO source is
+        wired (demo/paper without a balance tracker), the R2 %-cap layer is simply
+        INACTIVE — a fresh start still quotes off the enforced hard-dollar caps
+        rather than bricking. The prod/paper app ALWAYS wires the tracker
+        (quote_app.py), so this is False only in minimal embeddings / unit rigs."""
+        return self._balance is not None
 
     def _halt_inputs(self) -> HaltInputs:
         """Give-back inputs (intraday peak + current equity) for the drawdown /
@@ -302,6 +314,7 @@ class QuoteLifecycle:
             marginals=self._marginals,
             daily_pnl=self.daily_pnl,
             risk_bankroll_cc=self._risk_bankroll_cc(),
+            bankroll_source_configured=self._bankroll_source_configured(),
             start_time_provider=self._start_time_provider,
             halt_inputs=self._halt_inputs(),
         )
@@ -386,6 +399,7 @@ class QuoteLifecycle:
             candidate_positions=quote_risk.hypothetical_positions(self._conventions),
             adding_quote=True,
             risk_bankroll_cc=self._risk_bankroll_cc(),
+            bankroll_source_configured=self._bankroll_source_configured(),
             start_time_provider=self._start_time_provider,
             halt_inputs=self._halt_inputs(),
         )
@@ -805,6 +819,7 @@ class QuoteLifecycle:
                     self._marginals,
                     self.daily_pnl,
                     risk_bankroll_cc=self._risk_bankroll_cc(),
+                    bankroll_source_configured=self._bankroll_source_configured(),
                     start_time_provider=self._start_time_provider,
                     halt_inputs=self._halt_inputs(),
                 )
@@ -1072,6 +1087,7 @@ class QuoteLifecycle:
                 self.daily_pnl,
                 candidate_positions=[candidate],
                 risk_bankroll_cc=self._risk_bankroll_cc(),
+                bankroll_source_configured=self._bankroll_source_configured(),
                 start_time_provider=self._start_time_provider,
                 halt_inputs=self._halt_inputs(),
             )

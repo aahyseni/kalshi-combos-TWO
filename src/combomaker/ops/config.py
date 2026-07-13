@@ -1912,15 +1912,20 @@ class RiskConfig(StrictModel):
     update_count_threshold: int = 25
     in_play_cooldown_s: float = 30.0
 
-    # --- R2 %-of-bankroll cap layer (Phase 2). SHADOW by DEFAULT: the new caps
-    # run in parallel with the enforced caps above and are LOG-ONLY (zero quote
-    # impact) until the operator sets caps_shadow_mode: false to enforce. The
+    # --- R2 %-of-bankroll cap layer (Phase 2). ENFORCED by DEFAULT (wire-live
+    # 2026-07-13): the new caps run in parallel with the enforced caps above and
+    # now actually block a quote/confirm and arm the give-back KILL. Set
+    # caps_shadow_mode: true in YAML to re-SHADOW them (LOG-ONLY, zero quote
+    # impact) when comparing a new cap against the tape before enforcing it. The
     # percentages are decimal STRINGS parsed to exact Fractions (the established
     # FeeConfig pattern — YAML can't hold a Fraction and floats are banned for
     # thresholds); thresholds are computed at check time from the live bankroll.
     # Defaults are the researched $2,000 START values
-    # (docs/research/CAP_recommendation_2000.md). ---
-    caps_shadow_mode: bool = True
+    # (docs/research/CAP_recommendation_2000.md). A fresh demo start with no
+    # balance/positions still quotes normally: the %-caps fail closed to a
+    # no-quote on a stale bankroll (never a permanent halt) and the give-back
+    # halts skip when peak/current equity is unavailable (no invented peak). ---
+    caps_shadow_mode: bool = False
     game_loss_frac: str = "0.08"          # %-of-GAME correlated loss
     per_combo_loss_frac: str = "0.01"     # single position max_loss
     directional_frac: str = "0.10"        # net one-directional / theme

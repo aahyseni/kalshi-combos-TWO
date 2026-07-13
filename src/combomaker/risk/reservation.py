@@ -226,6 +226,7 @@ class RiskReservationService:
         marginals: MarginalProvider,
         daily_pnl: DailyPnl,
         risk_bankroll_cc: int | None = None,
+        bankroll_source_configured: bool = True,
         start_time_provider: StartTimeProvider | None = None,
         halt_inputs: HaltInputs | None = None,
     ) -> ReserveResult:
@@ -269,6 +270,7 @@ class RiskReservationService:
             daily_pnl,
             candidate_positions=[*outstanding, candidate],
             risk_bankroll_cc=risk_bankroll_cc,
+            bankroll_source_configured=bankroll_source_configured,
             start_time_provider=start_time_provider,
             halt_inputs=halt_inputs,
         )

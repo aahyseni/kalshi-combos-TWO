@@ -106,7 +106,14 @@ class RiskLimits:
     # thresholds are computed at check time from the live risk bankroll. Defaults
     # are the researched $2,000 START values (docs/research/CAP_recommendation_
     # 2000.md); the axis each binds on is documented at its check site. ---
-    caps_shadow_mode: bool = True  # Phase 2 default: new caps are LOG-ONLY.
+    # ENFORCED by default (wire-live 2026-07-13): the R2 caps + give-back KILL now
+    # actually block/halt. Flip to True only to re-shadow a new cap for a tape
+    # comparison before enforcing it. Fail-closed-without-bricking is preserved by
+    # the check sites: a stale bankroll fails the %-caps closed (no-quote via
+    # SKIP_BANKROLL_UNAVAILABLE, not a permanent halt), and the give-back halts
+    # SKIP when peak/current equity is unavailable (no invented peak), so a fresh
+    # demo start with no balance/positions still quotes normally.
+    caps_shadow_mode: bool = False
     # %-of-GAME correlated LOSS, on worst_case_loss_by_game_cc (LOSS axis). 8%.
     game_loss_frac: Fraction = Fraction(8, 100)
     # Per-COMBO max LOSS, on a single candidate position's max_loss_cc (LOSS axis
@@ -254,6 +261,7 @@ class LimitChecker:
         candidate_positions: list[OpenPosition] | None = None,
         adding_quote: bool = False,
         risk_bankroll_cc: int | None = None,
+        bankroll_source_configured: bool = True,
         start_time_provider: StartTimeProvider | None = None,
         halt_inputs: HaltInputs | None = None,
         book_risk: PortfolioRisk | None = None,
@@ -269,7 +277,20 @@ class LimitChecker:
         (caller catches StaleBalanceError). ``start_time_provider`` maps a leg's
         market ticker to its game start for the slate bucket. ``halt_inputs``
         carries the intraday peak/current equity for the give-back halts. All R2
-        breaches carry ``shadow=caps_shadow_mode`` (default True = log-only).
+        breaches carry ``shadow=caps_shadow_mode``.
+
+        ``bankroll_source_configured`` distinguishes two None-bankroll cases the
+        %-cap denominator cannot tell apart (fail-closed-without-bricking):
+          - True (default) + None ⇒ a bankroll SOURCE exists but its reading is
+            STALE/absent ⇒ the %-caps FAIL CLOSED (SKIP_BANKROLL_UNAVAILABLE),
+            the dark-poll runaway defense (hard rule 6).
+          - False + None ⇒ NO bankroll source is wired at all (this deployment
+            didn't opt into %-of-bankroll caps) ⇒ the R2 %-cap layer is simply
+            INACTIVE (no breach), so a fresh demo/paper start with no balance
+            tracker still quotes normally off the enforced hard-dollar caps. This
+            is NOT inventing a bankroll — it is not running the layer whose
+            denominator is structurally absent.
+        A present ``risk_bankroll_cc`` ignores this flag (the caps compute).
 
         Phase 4: ``book_risk`` is the LATEST full-MC ``BookRiskSnapshot`` (built
         off the hot path); the portfolio-CVaR cap reads its operative ES here
@@ -372,7 +393,7 @@ class LimitChecker:
                 )
             )
 
-        # --- R2 %-of-bankroll cap layer (Phase 2; shadow by default) ----------
+        # --- R2 %-of-bankroll cap layer (Phase 2; ENFORCED by default) --------
         breaches.extend(
             self._r2_breaches(
                 book,
@@ -380,6 +401,7 @@ class LimitChecker:
                 candidates,
                 daily_pnl,
                 risk_bankroll_cc=risk_bankroll_cc,
+                bankroll_source_configured=bankroll_source_configured,
                 start_time_provider=start_time_provider,
                 halt_inputs=halt_inputs,
                 book_risk=book_risk,
@@ -397,13 +419,14 @@ class LimitChecker:
         daily_pnl: DailyPnl,
         *,
         risk_bankroll_cc: int | None,
+        bankroll_source_configured: bool = True,
         start_time_provider: StartTimeProvider | None,
         halt_inputs: HaltInputs | None,
         book_risk: PortfolioRisk | None = None,
     ) -> list[Breach]:
         """The additive %-of-bankroll caps. Every breach carries
-        ``shadow=caps_shadow_mode`` so Phase 2 is log-only. Kept in its own method
-        so the enforced-cap logic above is untouched and independently testable."""
+        ``shadow=caps_shadow_mode``. Kept in its own method so the enforced-cap
+        logic above is untouched and independently testable."""
         limits = self._limits
         shadow = limits.caps_shadow_mode
         out: list[Breach] = []
@@ -413,12 +436,23 @@ class LimitChecker:
 
         assert isinstance(snapshot, ExposureSnapshot)
 
-        # Fail-closed FIRST (hard rule 6): a missing (stale ⇒ None) OR non-positive
-        # bankroll means the whole risk-capital denominator is UNKNOWN/broken — we
-        # CANNOT compute any %-cap, and a zero denominator would collapse every
-        # threshold to 0 (a wall of spurious breaches). Emit ONE
-        # SKIP_BANKROLL_UNAVAILABLE (shadow in Phase 2) and stop — never invent a
-        # bankroll, never a convenient default.
+        # NO bankroll source wired at all (bankroll_source_configured False) and no
+        # reading ⇒ this deployment did not opt into %-of-bankroll caps, so the
+        # whole R2 %-cap + give-back layer is INACTIVE (no breach) — the enforced
+        # hard-dollar caps still bind above. This is the do-not-brick path: a fresh
+        # demo/paper start with no balance tracker still quotes normally. It is NOT
+        # a convenient default (no bankroll is invented); the layer whose
+        # denominator is structurally absent simply does not run.
+        if risk_bankroll_cc is None and not bankroll_source_configured:
+            return out
+
+        # Fail-closed FIRST (hard rule 6): a bankroll SOURCE is configured but its
+        # reading is missing (stale ⇒ None) OR non-positive — the risk-capital
+        # denominator is UNKNOWN/broken, so we CANNOT compute any %-cap (a zero
+        # denominator would collapse every threshold to 0, a wall of spurious
+        # breaches). Emit ONE SKIP_BANKROLL_UNAVAILABLE (enforced ⇒ a no-quote, the
+        # dark-poll runaway defense) and stop — never invent a bankroll, never a
+        # convenient default.
         if risk_bankroll_cc is None:
             out.append(
                 Breach(
