@@ -27,6 +27,8 @@ PRESENT ⇒ block). No secrets ever touch these files.
 from __future__ import annotations
 
 import os
+import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -36,15 +38,42 @@ from combomaker.ops.logging import get_logger
 log = get_logger(__name__)
 
 
-def _atomic_write(path: Path, text: str) -> None:
+def _atomic_write(
+    path: Path,
+    text: str,
+    *,
+    retries: int = 6,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
     """Write-temp-then-rename so a concurrent reader never sees a partial file.
 
-    ``os.replace`` is atomic on both POSIX and Windows for same-directory moves.
+    ``os.replace`` is atomic on POSIX and Windows. On WINDOWS, though, the rename
+    fails with ``PermissionError`` if another process has the TARGET file open —
+    which the supervisor's heartbeat READ does for a sub-millisecond window on
+    every poll. Retry the rename a few times (tiny backoff) to ride through that
+    window. This does NOT weaken fail-closed: a genuinely stuck disk still
+    exhausts the retries and re-raises, so the beat goes stale and the supervisor
+    still presumes the bot wedged — exactly as before. (POSIX never hits the
+    retry; the first ``os.replace`` succeeds.)
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    last: OSError | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as exc:  # Windows: target briefly open by a reader
+            last = exc
+            if attempt < retries - 1:
+                sleep(0.02 * (attempt + 1))
+    try:
+        tmp.unlink(missing_ok=True)  # don't leak temps when we give up
+    except OSError:
+        pass
+    assert last is not None
+    raise last
 
 
 class Heartbeat:
@@ -82,14 +111,26 @@ class HeartbeatReader:
         self._clock = clock
         self._path = path
 
-    def read_age_s(self) -> float | None:
+    def read_age_s(
+        self, *, retries: int = 3, sleep: Callable[[float], None] = time.sleep
+    ) -> float | None:
         """Seconds since the last beat, or ``None`` if the heartbeat is missing,
         unreadable, unparseable, or implausibly in the future. ``None`` means
         "cannot establish liveness" and the caller MUST treat it as wedged
-        (fail-closed) — it is never "probably fine"."""
-        try:
-            raw = self._path.read_text(encoding="utf-8").strip()
-        except OSError:
+        (fail-closed) — it is never "probably fine". A transient read error (the
+        Windows read-vs-rename race) is retried; a persistently missing/unreadable
+        file still returns None, so a truly wedged bot is never masked."""
+        raw: str | None = None
+        for attempt in range(max(1, retries)):
+            try:
+                raw = self._path.read_text(encoding="utf-8").strip()
+                break
+            except OSError:
+                if attempt < retries - 1:
+                    sleep(0.01)
+                    continue
+                return None
+        if raw is None:
             return None
         try:
             beat_at = datetime.fromisoformat(raw)

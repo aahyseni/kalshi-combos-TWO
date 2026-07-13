@@ -4,8 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+import combomaker.risk.heartbeat as heartbeat_mod
 from combomaker.core.clock import FakeClock
-from combomaker.risk.heartbeat import Heartbeat, HeartbeatReader, ReconcileMarker
+from combomaker.risk.heartbeat import (
+    Heartbeat,
+    HeartbeatReader,
+    ReconcileMarker,
+    _atomic_write,
+)
 
 
 def test_beat_writes_readable_fresh_age(tmp_path: Path) -> None:
@@ -97,3 +105,68 @@ def test_beat_overwrites_previous(tmp_path: Path) -> None:
     hb.beat()
     reader = HeartbeatReader(clock, tmp_path / "heartbeat.txt")
     assert reader.read_age_s() == 0.0  # reads the LATEST beat, not the first
+
+
+# --- Windows read-vs-rename race (2026-07-13 live go-live bug): the supervisor's
+# read momentarily holds heartbeat.txt open, and Windows os.replace then denies
+# the bot's write. Retry rides through it WITHOUT weakening fail-closed. ---
+
+
+def test_atomic_write_retries_replace_on_permission_error(tmp_path, monkeypatch) -> None:
+    real_replace = heartbeat_mod.os.replace
+    n = {"calls": 0}
+
+    def flaky(src: str, dst: str) -> None:
+        n["calls"] += 1
+        if n["calls"] < 3:  # deny twice (Windows: target open by the reader)
+            raise PermissionError(13, "Access is denied")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(heartbeat_mod.os, "replace", flaky)
+    slept: list[float] = []
+    p = tmp_path / "heartbeat.txt"
+    _atomic_write(p, "hello", sleep=slept.append)
+    assert p.read_text(encoding="utf-8") == "hello"
+    assert n["calls"] == 3  # 2 denials + 1 success
+    assert len(slept) == 2  # backoff between the two retries
+
+
+def test_atomic_write_exhausts_retries_and_fails_closed(tmp_path, monkeypatch) -> None:
+    def always_denied(src: str, dst: str) -> None:
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(heartbeat_mod.os, "replace", always_denied)
+    p = tmp_path / "heartbeat.txt"
+    with pytest.raises(PermissionError):  # re-raises => beat() logs, next tick retries
+        _atomic_write(p, "x", retries=3, sleep=lambda _s: None)
+    assert list(tmp_path.glob("heartbeat.txt.tmp*")) == []  # no leaked temp
+    assert not p.exists()  # target never written => reader sees stale => wedged (fail-closed)
+
+
+def test_read_age_retries_transient_read_error(tmp_path, monkeypatch) -> None:
+    Heartbeat(FakeClock(), tmp_path / "heartbeat.txt").beat()
+    reader = HeartbeatReader(FakeClock(), tmp_path / "heartbeat.txt")
+    orig = heartbeat_mod.Path.read_text
+    n = {"calls": 0}
+
+    def flaky_read(self, *a, **k):  # type: ignore[no-untyped-def]
+        n["calls"] += 1
+        if n["calls"] == 1:
+            raise PermissionError(13, "Access is denied")
+        return orig(self, *a, **k)
+
+    monkeypatch.setattr(heartbeat_mod.Path, "read_text", flaky_read)
+    age = reader.read_age_s(sleep=lambda _s: None)
+    assert age is not None and age >= 0.0  # transient error retried, then read
+    assert n["calls"] == 2
+
+
+def test_read_age_persistent_read_error_is_wedged(tmp_path, monkeypatch) -> None:
+    reader = HeartbeatReader(FakeClock(), tmp_path / "heartbeat.txt")
+
+    def always_error(self, *a, **k):  # type: ignore[no-untyped-def]
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(heartbeat_mod.Path, "read_text", always_error)
+    # A persistently unreadable heartbeat still fails closed => None => wedged.
+    assert reader.read_age_s(retries=3, sleep=lambda _s: None) is None
