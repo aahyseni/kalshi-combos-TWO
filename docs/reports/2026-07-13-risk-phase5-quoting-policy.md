@@ -170,6 +170,41 @@ M_q/M_c fields + validators), `ops/quote_app.py` (wire params, all dark),
 
 ---
 
+## Adversarial judge + orchestrator review (2026-07-13)
+
+The pipeline judge FAILED the first cut and its findings were fixed + re-judged;
+the orchestrator then closed the one re-judge residual and the doc root cause.
+
+- **CRITICAL — inventory-skew SIGN was INVERTED** (traced to an error in
+  `docs/research/R3_hedging_pregame.md §A0`, propagated into the build brief).
+  As first built, a CONCENTRATING candidate returned positive skew, which at the
+  pricer (`no_raw = ($1−fair) − half − fee_no + skew`) RAISES `no_bid` ⇒ LOWERS
+  the taker's YES cost ($1−no_bid) ⇒ we'd sell MORE of what we're loaded on
+  (book concentrates). **Fixed:** the classifier keeps the intuitive convention
+  (concentrating `skew_cc ≥ 0`, offsetting `≤ 0`) and NEGATES at the single
+  pricer boundary (`InventorySkew.applied_cc = −skew_cc` when enabled), plus a
+  dark-independent `shadow_applied_cc` so the enable-authorizing markout study
+  sees the correctly-signed signal. Verified against the REAL `construct_quote`
+  (`test_skew.py::TestPricerBoundarySign`: concentrating ⇒ strictly HIGHER YES
+  ask ⇒ sell less) and a re-judge mutation test (reverting to `+skew_cc` fails 4
+  tests). Zero live impact regardless (dark), but the fix was essential so the
+  shadow signal that will authorize enabling isn't inverted. The R3 doc now
+  carries a prominent SIGN-CORRECTION banner.
+- **HIGH — the NO-ARB property test exercised the wrong direction** (negative
+  skew moves AWAY from the free-money cap, a vacuous pass). Fixed to stress the
+  clamp with POSITIVE skew (the no_bid-raising, arb-dangerous side).
+- **MEDIUM — the `M_c ≥ M_q` per-prefix validator** used exact-key resolution
+  while the runtime `pregame._prefix_lookup` uses `startswith`/first-match, so
+  overlapping prefixes (`{"KXMLB","KXMLBGAME"}` in differing insertion order)
+  could pass validation yet invert the fail-closed invariant at runtime.
+  **Fixed (orchestrator):** the validator now resolves through the SAME
+  `_prefix_lookup` (lazy-imported to avoid the config↔pregame cycle), so it can
+  never drift from the gate it guards; regression test
+  `test_overlapping_prefixes_differing_order_rejected`.
+
+Final: suite **1515/0**, mypy strict + ruff clean on every touched file; both
+prior verdicts' findings closed.
+
 ## NEXT STEPS
 
 - **Owner: operator** — decide whether to merge this DARK branch to `main` (no

@@ -143,6 +143,29 @@ class TestPregameMarginInvariant:
         )
         assert cfg.pregame_confirm_margin_s_by_prefix["KXMLB"] == 300.0
 
+    def test_overlapping_prefixes_differing_order_rejected(self) -> None:
+        # Verdict-2 residual: exact-key validation PASSED these (each key resolves
+        # 200/200 and 50/50), but the RUNTIME resolver (startswith, first
+        # insertion-order match) gives a ticker "KXMLBGAME-..." M_q via "KXMLB"
+        # (200, first in the quote table) and M_c via "KXMLBGAME" (50, first in
+        # the confirm table) — the last-look confirm gate 150s LOOSER than the
+        # quote gate, the exact inversion the invariant forbids. The validator now
+        # resolves via the same _prefix_lookup and rejects it.
+        with pytest.raises(ValueError, match="per-prefix"):
+            FiltersConfig(
+                pregame_quote_margin_s_by_prefix={"KXMLB": 200.0, "KXMLBGAME": 50.0},
+                pregame_confirm_margin_s_by_prefix={"KXMLBGAME": 50.0, "KXMLB": 200.0},
+            )
+
+    def test_overlapping_prefixes_consistent_order_ok(self) -> None:
+        # Same overlapping prefixes but ordered so the runtime never inverts:
+        # both tables put the longer, stricter-confirm prefix first.
+        cfg = FiltersConfig(
+            pregame_quote_margin_s_by_prefix={"KXMLBGAME": 50.0, "KXMLB": 100.0},
+            pregame_confirm_margin_s_by_prefix={"KXMLBGAME": 60.0, "KXMLB": 200.0},
+        )
+        assert cfg.pregame_confirm_margin_s_by_prefix["KXMLBGAME"] == 60.0
+
     def test_defaults_construct_clean(self) -> None:
         # All margin tables default empty ⇒ no per-prefix rows ⇒ invariant holds.
         cfg = FiltersConfig()

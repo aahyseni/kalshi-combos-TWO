@@ -176,16 +176,28 @@ class FiltersConfig(StrictModel):
         # default). For EVERY prefix appearing in EITHER table, resolve the
         # effective quote margin (prefix override, else scalar) and confirm
         # margin (likewise) and reject if the effective confirm is looser.
+        # Resolve effective margins the SAME WAY the live gate does — via
+        # rfq.pregame._prefix_lookup (startswith, first-insertion-order match) —
+        # NOT by exact dict key. Exact-key resolution let an operator pass
+        # validation with OVERLAPPING prefixes (e.g. {"KXMLB", "KXMLBGAME"} in
+        # differing insertion order) that invert M_c >= M_q at RUNTIME. Lazy
+        # import breaks the config <-> pregame cycle; reusing the real resolver
+        # means the validator can never drift from the gate it guards.
+        from combomaker.rfq.pregame import _prefix_lookup
+
         prefixes = (
             self.pregame_quote_margin_s_by_prefix.keys()
             | self.pregame_confirm_margin_s_by_prefix.keys()
         )
         for prefix in sorted(prefixes):
-            q_eff = self.pregame_quote_margin_s_by_prefix.get(
-                prefix, self.pregame_quote_margin_s
+            # Feed the prefix itself as a representative ticker: a ticker that IS
+            # (or starts with) this prefix resolves to the first table entry it
+            # startswith — exactly what the live gate computes for such a ticker.
+            q_eff = _prefix_lookup(
+                prefix, self.pregame_quote_margin_s_by_prefix, self.pregame_quote_margin_s
             )
-            c_eff = self.pregame_confirm_margin_s_by_prefix.get(
-                prefix, self.pregame_confirm_margin_s
+            c_eff = _prefix_lookup(
+                prefix, self.pregame_confirm_margin_s_by_prefix, self.pregame_confirm_margin_s
             )
             if c_eff < q_eff:
                 raise ValueError(

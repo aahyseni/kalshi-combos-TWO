@@ -27,6 +27,22 @@ any hedge IS the correlation position (CLAUDE.md:247).
 | Hedge planner (leg-market lay-off) | `hedging/planner.py` | **Scaffold, `plan()` raises NotImplementedError, phase-gated OFF** |
 | Skew test proving direction | `tests/test_quote.py:298-304` (positive skew ⇒ yes_bid↓, no_bid↑) | Green |
 
+> **⚠️ SIGN CORRECTION (2026-07-13, Phase 5 build — this section below was
+> WRONG and was caught by the adversarial judge).** The arithmetic in the
+> paragraph that follows is inverted. Correct economics for a sell-only NO
+> maker: `no_raw = ($1 − fair) − half − fee_no + skew`, and the taker's YES cost
+> = `$1 − no_bid`. **RAISING `no_bid` (positive skew) LOWERS the taker's YES
+> price ⇒ we sell MORE. LOWERING `no_bid` (negative skew) ⇒ we sell LESS.**
+> Therefore: **CONCENTRATING combo (want LESS) ⇒ NEGATIVE skew (lower no_bid);
+> OFFSETTING combo (want MORE) ⇒ POSITIVE skew (higher no_bid).** This is the
+> INVERSE of the blockquote below. The shipped code (`risk/skew.py`) keeps the
+> intuitive classifier convention (concentrating `skew_cc ≥ 0`, offsetting
+> `≤ 0`) and NEGATES at the pricer boundary (`InventorySkew.applied_cc =
+> −skew_cc`), verified against the real `construct_quote` in
+> `tests/test_skew.py::TestPricerBoundarySign`. See
+> `docs/reports/2026-07-13-risk-phase5-quoting-policy.md`. Read the rest of this
+> section for context only; trust this banner for the sign.
+
 **Key discovered fact — the sign is already correct for a NO-seller.**
 `quote.py:195-196`:
 ```
