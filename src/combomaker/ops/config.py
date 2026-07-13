@@ -1700,10 +1700,13 @@ class RiskConfig(StrictModel):
             d = Decimal(v)
         except InvalidOperation as exc:
             raise ValueError(f"cap fraction {v!r} is not a decimal") from exc
-        if not (Decimal(0) < d <= Decimal(1)):
+        # `not d.is_finite()` catches NaN/sNaN/±Infinity BEFORE the range compare:
+        # a signaling-NaN comparison would itself raise decimal.InvalidOperation
+        # (an opaque, field-less crash) rather than a clean ValidationError.
+        if not d.is_finite() or not (Decimal(0) < d <= Decimal(1)):
             raise ValueError(
-                f"cap fraction {v!r} must be in (0, 1] — a percentage of bankroll "
-                f"(e.g. '0.08' = 8%), not {d}"
+                f"cap fraction {v!r} must be a finite fraction in (0, 1] — a "
+                f"percentage of bankroll (e.g. '0.08' = 8%), not {d}"
             )
         return v
 

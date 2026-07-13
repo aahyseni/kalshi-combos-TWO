@@ -244,10 +244,29 @@ can't hold a `Fraction` and floats are banned for thresholds — parsed via
    multiple, so the intent (nothing runs away in the dark) is met more
    conservatively. Documented in the module docstring + reason-code comment.
 
+## Enforce-time notes for the operator (both SAFE/conservative; know before flipping)
+
+- **Give-back halts fire slightly EARLIER than "% of account equity" reads.** The
+  give-back is measured on raw exchange equity (peak − current) but compared to
+  `frac × risk_bankroll`, and `risk_bankroll` is haircut (≤ equity) whenever
+  capital is deployed into positions. So a drawdown of 10% of the (smaller)
+  risk-bankroll trips before 10% of full equity — safe (more conservative), but
+  expect the halt to bite sooner than "$200 off $2,000" when positions are open.
+  When flat/all-cash, risk-bankroll = equity and it's exactly the researched
+  10%/12%. (This denominator choice is in the certified base, not the follow-up;
+  flagged for enforce-time sign-off — switch to a peak/SOD-equity denominator if
+  you want it measured on equity.)
+- **An enforced give-back stops the book from THREE directions at once:** it
+  blocks new quotes (pre-quote check), declines fresh confirms (last look), AND
+  escalates to the killswitch (maintenance tick). Intended and conservative — in
+  a kill-class drawdown you want to add no risk, take no fresh fill, and cancel
+  all — but know it's not only the kill.
+
 ## NEXT STEPS
 
-- **Owner: orchestrator + adversarial judge** — reviewed (PASS) + orchestrator
-  follow-up closed the peak-latch + config-validation latents; then merge.
+- **Owner: orchestrator + adversarial judge** — reviewed (2× PASS: base +
+  follow-up delta) + orchestrator closed the peak-latch, give-back-escalation,
+  config-validation, and NaN-config-guard latents; then merge.
 - **Owner: eng (next pass)** — wire fill-velocity enforcement with the Phase-3
   reservation service; optionally give hard-trip a distinct KILL-file latch
   (both give-back halts already stop quoting).

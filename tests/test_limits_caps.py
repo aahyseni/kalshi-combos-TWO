@@ -586,7 +586,10 @@ class TestConfigFractionExactness:
 
         from combomaker.ops.config import RiskConfig
 
-        for bad in ("8", "1.5", "0", "-0.08"):
+        # "NaN"/"Infinity" parse as Decimals but are not finite fractions — they
+        # must raise a clean ValidationError (a NaN range-compare would otherwise
+        # raise an opaque decimal.InvalidOperation). Still fails closed either way.
+        for bad in ("8", "1.5", "0", "-0.08", "NaN", "Infinity", "-Infinity"):
             with pytest.raises(ValidationError):
                 RiskConfig(game_loss_frac=bad)
         # "1" (= 100% of bankroll) is the inclusive upper bound and is allowed.
