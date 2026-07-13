@@ -9,7 +9,11 @@ logging:
   level: INFO
 
 safety:
-  prod_limits_configured: false
+  # Operator sign-off 2026-07-13: researched $2,000-start caps reviewed and
+  # accepted (per_combo 1% ~$20, daily-soft 6% $120, drawdown 10% $200,
+  # hard-trip KILL 12% $240; docs/research/CAP_recommendation_2000.md). This
+  # flag + --confirm-live are the two loud gates that arm live quoting.
+  prod_limits_configured: true
 
 pricing:
   quote:
