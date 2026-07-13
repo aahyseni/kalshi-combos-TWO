@@ -67,14 +67,31 @@ class BreakerVerdict:
 
 
 def detect_data_stale(
-    rx_age_s: float | None, *, seq_gap: bool, max_rx_age_s: float
+    rx_age_s: float | None,
+    *,
+    seq_gap: bool,
+    max_rx_age_s: float,
+    feed_warm: bool = True,
 ) -> BreakerVerdict:
     """Market-data staleness / sequence gap.
 
     Fail-closed: a ``None`` rx-age (feed never received, or age unknowable) is
     STALE — we cannot prove the book is fresh. A WS sequence gap flag trips
     regardless of age (a gap means the mirror is provably wrong until re-synced).
+
+    Cold-start exemption (``feed_warm=False``): during warmup — BEFORE the feed
+    has produced its first frame — the feed is legitimately not-yet-fresh, and
+    tripping here would self-halt the bot before it ever quotes. So while the
+    feed is cold we do NOT judge staleness (there is nothing to prove yet). The
+    latch is one-way: once warm, ``feed_warm`` is True forever, and a later
+    disconnect (rx_age None) or seq gap still fails closed. ``feed_warm``
+    defaults True so every existing caller keeps the strict fail-closed contract.
     """
+    if not feed_warm:
+        # Feed not established yet: no fresh state to judge, and no way for it to
+        # be stale-relative-to-a-baseline. Warmup is the ONLY time None is not a
+        # trip; the moment the first frame lands the latch flips permanently.
+        return BreakerVerdict.clear()
     if seq_gap:
         return BreakerVerdict.trip(
             ReasonCode.HALT_DATA_STALE, "ws sequence gap — orderbook mirror unreliable"
@@ -225,6 +242,10 @@ class BreakerThresholds:
 
     max_rx_age_s: float = 5.0
     max_latency_ms: float = 2_000.0
+    # Trailing window the latency-spike breaker samples over (see quote_app's
+    # _sample_breaker_inputs): the breaker judges the worst round-trip in this
+    # window, so a single historical slow confirm cannot latch it forever.
+    latency_spike_window_s: float = 60.0
     rate_limit_window_s: float = 10.0
     max_rate_limit_in_window: int = 10
     max_marginal_jump: float = 0.25
@@ -240,6 +261,10 @@ class BreakerInputs:
     seq_gap: bool = False
     latency_ms: float | None = None
     rate_limit_count: int = 0
+    # False only during feed warmup (before the first frame). While cold, the
+    # data-staleness breaker does not judge (cold-start self-halt exemption).
+    # Defaults True: every non-live caller keeps the strict fail-closed contract.
+    feed_warm: bool = True
     # ticker -> current P(YES); the coordinator compares against its own
     # last-seen map to detect jumps and unreadable-now legs.
     marginals: Mapping[str, float | None] = field(default_factory=dict)
@@ -277,7 +302,10 @@ class CircuitBreakers:
         failure ⇒ fail-closed trip (HALT_BREAKER_ERROR)."""
         try:
             verdict = detect_data_stale(
-                inputs.rx_age_s, seq_gap=inputs.seq_gap, max_rx_age_s=self._thr.max_rx_age_s
+                inputs.rx_age_s,
+                seq_gap=inputs.seq_gap,
+                max_rx_age_s=self._thr.max_rx_age_s,
+                feed_warm=inputs.feed_warm,
             )
             if verdict.tripped:
                 return verdict

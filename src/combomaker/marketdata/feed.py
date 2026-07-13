@@ -72,6 +72,17 @@ class OrderbookFeed:
         self._sid_last_seq: dict[int, int] = {}
         self._sid_tickers: dict[int, tuple[str, ...]] = {}
         self._on_invalidate: list[InvalidateHandler] = []
+        # Warmth latch: False until the feed has applied its FIRST snapshot. The
+        # data-staleness breaker must not treat pre-connect None/unhealthy as
+        # STALE during warmup (cold-start self-halt); it starts judging only once
+        # the feed is established. Latches True forever after the first frame — a
+        # disconnect AFTER warmup still fails closed (rx_age None ⇒ STALE).
+        self._warm = False
+        # Real in-stream sequence-gap signal: set on any gap event, consumed
+        # (popped) by the breaker sampler. This is a GENUINE seq gap — distinct
+        # from WS traffic silence (feed_healthy) — so the data-staleness breaker
+        # fires on the advertised signal.
+        self._seq_gap_since_sample = False
 
         ws.on_message("orderbook_snapshot", self._handle_snapshot)
         ws.on_message("orderbook_delta", self._handle_delta)
@@ -125,6 +136,22 @@ class OrderbookFeed:
         """Seconds since server traffic — the freshness proof for last look."""
         return self._ws.last_rx_age_s
 
+    @property
+    def warm(self) -> bool:
+        """True once the feed has applied its first snapshot. Before that, the
+        data-staleness breaker must not treat the not-yet-connected feed as STALE
+        (cold-start self-halt). Latches True permanently on the first frame."""
+        return self._warm
+
+    def pop_seq_gap(self) -> bool:
+        """Return-and-clear the real in-stream sequence-gap flag. True iff a seq
+        gap fired since the last call. The breaker sampler consumes this so the
+        data-staleness breaker fires on an ACTUAL gap (not on WS traffic silence,
+        which is what feed_healthy reflects)."""
+        gap = self._seq_gap_since_sample
+        self._seq_gap_since_sample = False
+        return gap
+
     def all_valid(self, tickers: Sequence[str]) -> bool:
         return self.feed_healthy and all(
             t in self._books and self._books[t].valid for t in tickers
@@ -152,6 +179,7 @@ class OrderbookFeed:
             book.invalidate("unparseable_snapshot")
             return
         book.apply_snapshot(yes, no)
+        self._warm = True  # first applied frame ⇒ feed established (warmth latch)
         self._metrics.inc("book.snapshot")
 
     async def _handle_delta(self, envelope: JsonDict) -> None:
@@ -214,6 +242,10 @@ class OrderbookFeed:
 
     async def _gap(self, sid: int, reason: str) -> None:
         self._metrics.inc(f"book.gap.{reason}")
+        # Latch the real seq-gap signal for the breaker sampler: a gap means the
+        # mirror is provably wrong until re-synced (the affected books are
+        # invalidated below). Distinct from feed_healthy (WS traffic silence).
+        self._seq_gap_since_sample = True
         tickers = self._sid_tickers.get(sid, ())
         log.warning("book_feed_gap", sid=sid, reason=reason, tickers=list(tickers))
         for ticker in tickers:

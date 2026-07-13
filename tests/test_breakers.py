@@ -41,6 +41,32 @@ def test_data_stale_seq_gap_trips_regardless_of_age() -> None:
     assert v.tripped and v.reason is ReasonCode.HALT_DATA_STALE
 
 
+def test_data_stale_cold_feed_does_not_trip() -> None:
+    # Feed not warm yet (no first frame): pre-connect None rx-age + seq_gap must
+    # NOT self-halt the bot during warmup. The cold-start exemption clears.
+    assert (
+        detect_data_stale(
+            None, seq_gap=True, max_rx_age_s=5.0, feed_warm=False
+        ).tripped
+        is False
+    )
+    assert (
+        detect_data_stale(
+            None, seq_gap=False, max_rx_age_s=5.0, feed_warm=False
+        ).tripped
+        is False
+    )
+
+
+def test_data_stale_after_warmup_still_fails_closed() -> None:
+    # Once warm, a disconnect (None rx-age) or a seq gap still trips (the latch
+    # only exempts the warmup window, never a post-warmup failure).
+    v = detect_data_stale(None, seq_gap=False, max_rx_age_s=5.0, feed_warm=True)
+    assert v.tripped and v.reason is ReasonCode.HALT_DATA_STALE
+    v2 = detect_data_stale(0.0, seq_gap=True, max_rx_age_s=5.0, feed_warm=True)
+    assert v2.tripped and v2.reason is ReasonCode.HALT_DATA_STALE
+
+
 def test_latency_spike_fires_over_not_at() -> None:
     assert detect_latency_spike(2_000.0, max_latency_ms=2_000.0).tripped is False
     v = detect_latency_spike(2_000.1, max_latency_ms=2_000.0)
@@ -175,6 +201,27 @@ async def test_detector_exception_fails_closed_to_breaker_error() -> None:
         BreakerInputs(rx_age_s=1.0, marginals=Exploding())
     )
     assert v.tripped and v.reason is ReasonCode.HALT_BREAKER_ERROR
+    assert ks.halted
+
+
+async def test_cold_feed_inputs_do_not_halt() -> None:
+    # The live cold-start signature: rx_age None + seq_gap True while feed_warm
+    # is still False. The coordinator must NOT halt (regression for the
+    # cold-start self-halt that bricked the process before its first quote).
+    breakers, ks = _breakers()
+    v = await breakers.evaluate_and_halt(
+        BreakerInputs(rx_age_s=None, seq_gap=True, feed_warm=False)
+    )
+    assert v.tripped is False
+    assert not ks.halted
+
+
+async def test_warm_feed_stale_still_halts() -> None:
+    # After warmup (feed_warm True, the BreakerInputs default), a stale/None feed
+    # trips as before — the exemption is warmup-only.
+    breakers, ks = _breakers()
+    v = await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=None, seq_gap=True))
+    assert v.tripped and v.reason is ReasonCode.HALT_DATA_STALE
     assert ks.halted
 
 

@@ -7,9 +7,11 @@ we age out by advancing the supervisor's clock.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from combomaker.core.clock import FakeClock
 from combomaker.ops.supervisor import (
+    KalshiSupervisorExchange,
     SafetySupervisor,
     SupervisorConfig,
     WriteBudget,
@@ -218,6 +220,54 @@ async def test_credential_presence_helper(monkeypatch) -> None:  # type: ignore[
 # --------------------------------------------------------------------------- #
 # Full kill-drill through the run() loop: a dying bot ⇒ the loop kills it.
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# Production adapter: list_open_quote_ids must paginate to exhaustion so an
+# emergency cancel-all never leaves resting quotes beyond the first page.
+# --------------------------------------------------------------------------- #
+
+
+class PagingRest:
+    """Fake KalshiRestClient serving /communications/quotes in cursor pages of
+    ``page_size``. Records the cursors it was asked for so we can assert the
+    adapter looped."""
+
+    def __init__(self, quote_ids: list[str], *, page_size: int) -> None:
+        self._ids = quote_ids
+        self._page_size = page_size
+        self.cursors_seen: list[str] = []
+
+    async def get_quotes(self, **params: Any) -> dict[str, Any]:
+        cursor = str(params.get("cursor", ""))
+        self.cursors_seen.append(cursor)
+        start = int(cursor) if cursor else 0
+        page = self._ids[start : start + self._page_size]
+        next_start = start + self._page_size
+        next_cursor = str(next_start) if next_start < len(self._ids) else ""
+        return {
+            "quotes": [{"id": qid} for qid in page],
+            "cursor": next_cursor,
+        }
+
+
+async def test_list_open_quote_ids_paginates_to_exhaustion() -> None:
+    # 25 open quotes across pages of 10: the adapter must return ALL of them, not
+    # just the first page (regression for the single-page cancel-all miss).
+    ids = [f"q{i}" for i in range(25)]
+    rest = PagingRest(ids, page_size=10)
+    adapter = KalshiSupervisorExchange(rest)
+    got = await adapter.list_open_quote_ids()
+    assert got == ids
+    assert len(rest.cursors_seen) == 3  # looped: page 1 (""), page 2, page 3
+
+
+async def test_list_open_quote_ids_single_page_when_no_cursor() -> None:
+    ids = ["q1", "q2"]
+    rest = PagingRest(ids, page_size=100)  # everything fits ⇒ empty next cursor
+    adapter = KalshiSupervisorExchange(rest)
+    assert await adapter.list_open_quote_ids() == ids
+    assert rest.cursors_seen == [""]  # one request, no follow-up page
 
 
 async def test_run_loop_kills_dying_bot(tmp_path: Path) -> None:

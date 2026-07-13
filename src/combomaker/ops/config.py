@@ -131,12 +131,21 @@ class BreakerConfig(StrictModel):
 
     max_rx_age_s: float = 5.0             # feed staleness (HALT_DATA_STALE)
     max_latency_ms: float = 2_000.0       # confirm/round-trip (HALT_LATENCY_SPIKE)
+    # The latency-spike breaker judges the worst round-trip in THIS trailing
+    # window, not the all-time max — one historical slow confirm must not latch
+    # the human-only kill switch forever. A spike self-clears once no slow
+    # sample has landed within the window.
+    latency_spike_window_s: float = 60.0  # recent-window for HALT_LATENCY_SPIKE
     rate_limit_window_s: float = 10.0     # 429-burst window (HALT_RATE_LIMIT_BURST)
     max_rate_limit_in_window: int = 10    # 429s at/over ⇒ burst
     max_marginal_jump: float = 0.25       # prob jump between ticks (HALT_MARGINAL_JUMP)
 
     @field_validator(
-        "max_rx_age_s", "max_latency_ms", "rate_limit_window_s", "max_marginal_jump"
+        "max_rx_age_s",
+        "max_latency_ms",
+        "latency_spike_window_s",
+        "rate_limit_window_s",
+        "max_marginal_jump",
     )
     @classmethod
     def _positive(cls, v: float) -> float:
@@ -157,6 +166,7 @@ class BreakerConfig(StrictModel):
         return BreakerThresholds(
             max_rx_age_s=self.max_rx_age_s,
             max_latency_ms=self.max_latency_ms,
+            latency_spike_window_s=self.latency_spike_window_s,
             rate_limit_window_s=self.rate_limit_window_s,
             max_rate_limit_in_window=self.max_rate_limit_in_window,
             max_marginal_jump=self.max_marginal_jump,

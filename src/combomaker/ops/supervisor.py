@@ -368,13 +368,30 @@ class KalshiSupervisorExchange:
         self._rest = rest
 
     async def list_open_quote_ids(self) -> list[str]:
-        payload = await self._rest.get_quotes(user_filter="self", status="open")  # type: ignore[attr-defined]
-        quotes = payload.get("quotes", []) or []
+        # Cursor-paginate to exhaustion: an emergency cancel-all must see EVERY
+        # resting quote, not just the first page. Kalshi paginates
+        # /communications/quotes via a top-level ``cursor`` that comes back
+        # empty/absent when there are no more pages (docs/api-notes/index-scan.md).
+        # A bounded loop (belt-and-braces vs a server that never terminates the
+        # cursor) capped well above any realistic open-quote count.
         ids: list[str] = []
-        for quote in quotes:
-            quote_id = str(quote.get("id") or quote.get("quote_id") or "")
-            if quote_id:
-                ids.append(quote_id)
+        cursor: str = ""
+        for _ in range(1000):
+            params: dict[str, str | int] = {
+                "user_filter": "self",
+                "status": "open",
+                "limit": 1000,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            payload = await self._rest.get_quotes(**params)  # type: ignore[attr-defined]
+            for quote in payload.get("quotes", []) or []:
+                quote_id = str(quote.get("id") or quote.get("quote_id") or "")
+                if quote_id:
+                    ids.append(quote_id)
+            cursor = str(payload.get("cursor") or "")
+            if not cursor:
+                break
         return ids
 
     async def cancel_quote(self, quote_id: str) -> None:

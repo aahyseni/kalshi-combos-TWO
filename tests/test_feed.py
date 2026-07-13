@@ -194,3 +194,35 @@ async def test_all_valid_requires_feed_health() -> None:
     assert feed.all_valid(["A"])
     ws._healthy = False
     assert not feed.all_valid(["A"])
+
+
+async def test_warm_latch_flips_on_first_snapshot_and_stays() -> None:
+    # Cold before the first frame (the cold-start breaker exemption reads this),
+    # warm forever after — a disconnect does NOT flip it back.
+    feed, ws, _ = await make_feed(["A"])
+    assert feed.warm is False
+    await ws.deliver(snapshot_env(7, 1, "A"))
+    assert feed.warm is True
+    await ws.drop_connection()
+    assert feed.warm is True  # latch is one-way; post-warmup failures fail closed
+
+
+async def test_pop_seq_gap_reports_real_gap_and_clears() -> None:
+    # The real in-stream seq-gap signal the breaker sampler consumes — set on an
+    # actual gap, distinct from WS traffic silence (feed_healthy).
+    feed, ws, _ = await make_feed(["A"])
+    await ws.deliver(snapshot_env(7, 1, "A"))
+    assert feed.pop_seq_gap() is False  # no gap yet
+    await ws.deliver(delta_env(7, 5, "A", "0.2300", "50.00", "yes"))  # gap 1 -> 5
+    assert feed.pop_seq_gap() is True   # gap latched
+    assert feed.pop_seq_gap() is False  # consumed (return-and-clear)
+
+
+async def test_seq_gap_flag_independent_of_traffic_silence() -> None:
+    # feed_healthy dropping (WS silence) must NOT set the seq-gap flag: the two
+    # signals are distinct (regression for the mis-wired seq_gap=not feed_healthy).
+    feed, ws, _ = await make_feed(["A"])
+    await ws.deliver(snapshot_env(7, 1, "A"))
+    ws._healthy = False
+    assert feed.feed_healthy is False
+    assert feed.pop_seq_gap() is False  # silence is not an in-stream seq gap

@@ -106,7 +106,10 @@ class QuoteApp:
                 raise RuntimeError("quote mode requires a non-empty collection whitelist")
         self._config = config
         self._clock = SystemClock()
-        self._metrics = Metrics()
+        # Clock-backed metrics so the latency-spike breaker can sample a
+        # recent-window max (not the all-time histogram max, which one historical
+        # slow confirm would latch forever).
+        self._metrics = Metrics(self._clock)
         self._watched: set[str] = set()
         self._stop = asyncio.Event()
         # Phase 6 out-of-process safety plumbing. The heartbeat file is what the
@@ -137,6 +140,13 @@ class QuoteApp:
             conventions=conventions.source,
         )
 
+        # KILL FILE SURVIVES RESTART (CLAUDE.md hard rule): consult it
+        # SYNCHRONOUSLY before any quoting can begin. A supervisor kill (or a
+        # human) leaves KILL on disk; the async watcher below only notices it on
+        # its ~1s poll, which a revived bot could beat to the first quote. This
+        # up-front check closes that race — a revived bot with KILL present
+        # refuses to start, full stop.
+        self._refuse_if_kill_file_present()
         signer = RequestSigner(Credentials.for_env(str(config.env)), self._clock)
         killswitch = KillSwitch(self._clock, kill_file=config.kill_file)
         store = await Store.open(
@@ -359,6 +369,35 @@ class QuoteApp:
     def request_stop(self) -> None:
         self._stop.set()
 
+    def _kill_file_present(self) -> bool:
+        """True if the KILL file is on disk. Fail-closed: any stat error is
+        treated as PRESENT (a filesystem we can't read is one we can't trust to
+        say 'no kill')."""
+        try:
+            return self._config.kill_file.exists()
+        except OSError:  # pragma: no cover - exotic FS failure ⇒ fail closed
+            return True
+
+    def _refuse_if_kill_file_present(self) -> None:
+        """Synchronous KILL-file gate (Phase 6, CLAUDE.md fail-closed). The KILL
+        file is written by the external supervisor (or a human) and SURVIVES a
+        process restart on disk. If it is present at startup, the bot must refuse
+        to run — do NOT rely solely on the async watcher (``start_kill_file_watch``
+        polls ~1s and a revived bot could emit the first quote before it fires).
+        Raises ``PreflightError`` (fail-closed refusal) so no code path reaches a
+        quote. The operator clears a kill by REMOVING the KILL file deliberately."""
+        kill_file = self._config.kill_file
+        if self._kill_file_present():
+            log.error(
+                "kill_file_present_at_startup",
+                kill_file=str(kill_file),
+                detail="KILL file on disk — refusing to start; remove it to clear",
+            )
+            raise PreflightError(
+                f"KILL file present at startup ({kill_file}) — the bot refuses to "
+                "run until it is deliberately removed (kill switch survives restart)"
+            )
+
     def _build_external_odds(self) -> tuple[Any, Any, Any] | None:
         """(source, poller, client) when enabled + key present, else None."""
         cfg = self._config.pricing.external_odds
@@ -452,6 +491,20 @@ class QuoteApp:
                 "startup_reconcile_incomplete",
                 detail="exchange unreachable — book NOT reconciled; the bot will "
                 "refuse to quote (needs_reconcile stays in force)",
+            )
+            self._book_reconciled = False
+            return
+        # A KILL file outranks a successful reconcile: while it is on disk the
+        # bot is deliberately stopped, so do NOT clear the needs_reconcile marker
+        # or mark the book reconciled (that would let a later restart resume once
+        # KILL is removed WITHOUT re-reconciling). The operator clears a kill by
+        # removing KILL; the marker then clears on the next clean reconcile.
+        # Defense-in-depth: run()'s synchronous gate already refuses to start
+        # with KILL present, but this keeps the invariant local to the method.
+        if self._kill_file_present():
+            log.error(
+                "reconcile_blocked_by_kill_file",
+                detail="KILL file present — marker stays set, book stays unreconciled",
             )
             self._book_reconciled = False
             return
@@ -589,14 +642,39 @@ class QuoteApp:
             await asyncio.sleep(15.0)
 
     def _sample_breaker_inputs(self, feed: OrderbookFeed) -> BreakerInputs:
-        """Snapshot the live signals the circuit breakers evaluate. A seq gap /
-        disconnect surfaces as ``feed_healthy=False`` (the feed re-baselines a
-        gap and drops health); confirm latency is the worst observed round-trip;
-        the 429 count is the rolling burst window."""
+        """Snapshot the live signals the circuit breakers evaluate off the hot
+        path. Each field is a REAL measurement:
+
+        - ``rx_age_s`` / ``feed_warm``: the feed's freshness age plus its warmth
+          latch. While the feed is cold (no first frame yet), ``feed_warm=False``
+          exempts the data-staleness breaker so a slow initial WS connect can't
+          self-halt the bot before it quotes; once warm, a disconnect (rx_age
+          None) still fails closed.
+        - ``seq_gap``: the feed's ACTUAL in-stream sequence-gap event since the
+          last sample (``pop_seq_gap`` — return-and-clear), NOT WS traffic
+          silence. A genuine gap means the mirror is provably wrong until
+          re-synced.
+        - ``latency_ms``: the worst confirm round-trip in a RECENT window (not
+          the all-time histogram max — one historical slow confirm must not latch
+          the human-only kill switch forever). None ⇒ no recent sample ⇒ the
+          spike breaker clears (nothing current to judge).
+        - ``rate_limit_count``: the rolling 429-burst window.
+
+        NOTE (Phase 6 scope): the marginal-jump, unmapped-game, and
+        metadata-change breakers are BUILT + unit-tested but are NOT yet sampled
+        here — wiring their live signals (per-leg marginal map, resolved
+        game-key map, taxonomy tripwire / settlement-metadata diff) reaches into
+        the pricing/lifecycle hot path and is deferred. They only fire when a
+        caller supplies those inputs; this sampler leaves them at their CLEAR
+        defaults, so those three are not claimed live yet.
+        """
         return BreakerInputs(
             rx_age_s=feed.rx_age_s,
-            seq_gap=not feed.feed_healthy,
-            latency_ms=self._metrics.histogram_max_ms("confirm.rtt_ms"),
+            feed_warm=feed.warm,
+            seq_gap=feed.pop_seq_gap(),
+            latency_ms=self._metrics.recent_max_ms(
+                "confirm.rtt_ms", self._config.breakers.latency_spike_window_s
+            ),
             rate_limit_count=self._rate_limit_window.count(),
         )
 

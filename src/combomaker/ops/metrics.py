@@ -9,8 +9,10 @@ most important series here.
 from __future__ import annotations
 
 import bisect
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
+
+from combomaker.core.clock import Clock
 
 _DEFAULT_BUCKETS_MS: tuple[float, ...] = (
     1, 2, 5, 10, 20, 50, 100, 200, 500, 1_000, 2_000, 3_000, 5_000,
@@ -54,9 +56,14 @@ class Histogram:
 
 
 class Metrics:
-    def __init__(self) -> None:
+    def __init__(self, clock: Clock | None = None) -> None:
         self._counters: dict[str, int] = defaultdict(int)
         self._histograms: dict[str, Histogram] = {}
+        # Recent-window latency samples per series (monotonic-ns timestamp, ms).
+        # Only populated when a clock is present — the recent-window breaker
+        # sampler needs one; every other consumer uses the histogram.
+        self._clock = clock
+        self._recent_ms: dict[str, deque[tuple[int, float]]] = defaultdict(deque)
 
     def inc(self, name: str, by: int = 1) -> None:
         self._counters[name] += by
@@ -65,19 +72,41 @@ class Metrics:
         if name not in self._histograms:
             self._histograms[name] = Histogram()
         self._histograms[name].observe(value_ms)
+        if self._clock is not None:
+            self._recent_ms[name].append((self._clock.monotonic_ns(), value_ms))
 
     def counter(self, name: str) -> int:
         return self._counters.get(name, 0)
 
     def histogram_max_ms(self, name: str) -> float | None:
         """The worst observed latency for a series, or None if never observed.
-        Used by the latency-spike circuit breaker (Phase 6) to sample the
-        worst confirm/round-trip so far — a spike must not hide behind a good
-        mean/median."""
+        This is the ALL-TIME max (never decays) — for reports/snapshots, NOT for
+        the latency-spike breaker (a single historical slow round-trip would
+        latch it forever). The breaker uses ``recent_max_ms``."""
         h = self._histograms.get(name)
         if h is None or h.total == 0:
             return None
         return h.max_ms
+
+    def recent_max_ms(self, name: str, window_s: float) -> float | None:
+        """Worst latency observed in the last ``window_s`` seconds, or None if no
+        sample landed in the window. Used by the latency-spike circuit breaker
+        (Phase 6): a CURRENT spike, not the all-time max — one historical slow
+        confirm must not permanently latch the human-only kill switch. Requires a
+        clock (fail-closed None when unmetered: no recent sample ⇒ nothing to
+        judge, mirroring detect_latency_spike's no-measurement-clears contract).
+        """
+        if self._clock is None:
+            return None
+        events = self._recent_ms.get(name)
+        if not events:
+            return None
+        cutoff = self._clock.monotonic_ns() - int(window_s * 1e9)
+        while events and events[0][0] < cutoff:
+            events.popleft()
+        if not events:
+            return None
+        return max(value for _, value in events)
 
     def snapshot(self) -> dict[str, object]:
         return {
