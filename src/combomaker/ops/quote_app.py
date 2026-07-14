@@ -467,8 +467,18 @@ class QuoteApp:
             # (live 2026-07-14). The on_rfq handler now only ENQUEUES (put_nowait,
             # fast); a small pool of workers prices concurrently. The lifecycle +
             # single-writer reservation service were built for concurrent RFQs.
-            RFQ_WORKERS = 8
-            rfq_work: asyncio.Queue[Rfq] = asyncio.Queue(maxsize=500)
+            # 2 workers, NOT 8: pricing is CPU-bound (~hundreds of ms/RFQ, Decimal
+            # + structural model) and the GIL serializes CPU, so extra workers give
+            # ~zero throughput but SATURATE the event loop → the heartbeat wedges →
+            # the external supervisor emergency-kills (live 2026-07-14: 8 workers,
+            # 19,832 backpressure drops, heartbeat 15.7s > 15s). The exchange sends
+            # ~170 WC/MLB RFQs/s (bots spamming the 2 live games); we can only price
+            # a few/s, so 2 workers overlap I/O (SQLite + POST) without starving the
+            # loop, a small queue drops the rest FAST (rfq.work_dropped_backpressure),
+            # and the loop keeps breathing for the heartbeat + WS pongs. Real
+            # throughput lift = faster pricing / process-pool offload (next session).
+            RFQ_WORKERS = 2
+            rfq_work: asyncio.Queue[Rfq] = asyncio.Queue(maxsize=40)
 
             async def handle_rfq(rfq: Rfq) -> None:
                 await store.record_rfq(rfq, source="ws")
@@ -488,6 +498,9 @@ class QuoteApp:
                         log.exception("rfq_worker_failed", rfq_id=rfq.rfq_id)
                     finally:
                         rfq_work.task_done()
+                        # Yield unconditionally between RFQs so a full queue can
+                        # never monopolise the loop away from the heartbeat / pongs.
+                        await asyncio.sleep(0)
 
             async def on_rfq_enqueue(rfq: Rfq) -> None:
                 # Non-blocking: the WS dispatcher must NOT stall on pricing, or the
