@@ -1,86 +1,88 @@
-# RESUME STATE — 2026-07-13 (read first)
+# RESUME STATE — 2026-07-13/14 overnight (read first)
 
 Fresh-session chain: **this doc → `docs/reports/README.md` newest-first →
-`CLAUDE.md` CURRENT STATE block**. What's done, what's armed, what's next.
+`CLAUDE.md` CURRENT STATE**. Supersedes all earlier resume headlines.
 
 ## Headline
 
-- **WC-FAT is LIVE on prod and STABLE.** First-ever maker markup in the pricer;
-  the bot quotes WC-FAT combos at a **3¢** markup and, after a **breaker
-  live-hardening pass**, now RIDES THROUGH transient WS blips (data-stale
-  trip→hold→recover, observed repeatedly live) instead of hard-killing the book.
-- **0 fills so far** — 3 WC games over ~6 days, sparse is expected. What's proven
-  live is the **plumbing** (pricing, markup, quoting, safety-that-degrades-
-  gracefully), **NOT profitability** — that stays gated on real fills → settlements
-  → pooled multi-week (never a P&L refit).
-- **Running IN-SESSION (ephemeral):** the bot dies if this session ends; a durable
-  server is needed for a multi-day run. Supervision monitors active (rolling book
-  + critical events). Edge validated for WC FAT only (reality-test, one week);
-  markup provisional.
+- **Live on prod: WC + MLB, flat `fair + 2¢`, sell-only, arb-safe, 0 fills.**
+- **The night's arc:** a long, deep WS/throughput debugging session. The bot went
+  from dying every ~22s / quoting ~1% → holding minutes and quoting flat 2¢ at a
+  higher (but still modest, ~3–6% noisy) rate. **Remaining wall:** Kalshi closes
+  our socket every ~90–150s ("write-dead"), each reconnect wipes book
+  subscriptions faster than we rebuild → most quotable combos still decline
+  `skip_leg_stale`. This is the #1 thing between us and a high quote rate.
 
-## What shipped this session (all on `main`, pushed)
+## What shipped tonight (all on `main`, pushed, suite 1725/0)
 
-| Commit | What |
+| Commit | Fix |
 |---|---|
-| `2a141b9` | **get_quotes 500/504 fix** — `exchange/quote_query.list_open_quotes` (windowed + 5xx-retry + fail-closed); startup reconcile AND supervisor kill-path. |
-| `0c4afc6` | **Maker markup mechanism** — `pricing/markup.py` MarkupPolicy + `construct_quote` `margin=max(width,markup)` (parity-proven, reviewed). prod.yaml stays DISARMED (test-enforced); arm via gitignored `*.local.yaml`. |
-| `2934fa4` | **Windows heartbeat fix** — `_atomic_write` retries `os.replace` through the supervisor's read (was false-killing the book ~14s in); fail-closed preserved. |
-| `a0b178b` | **Book-tripwire per-combo** — was pairing legs ACROSS separate quotes → false whole-book kill on a phantom impossible combo; now per resting combo (declines, never kills). |
-| `8e2b197` | **Breaker grace/hysteresis** — transient reasons (data-stale/latency/429/marginal-jump) HELD across a grace window + only hard-halt if SUSTAINED; structural reasons immediate. |
-| `4ec432e` | **Breaker review fixes** — quote-time freshness gate (no quoting on stale data during a hold), monotonic escalation timer, flap-resistant recovery (all from the adversarial review). |
+| `2776013` | **WS churn**: `heartbeat=10`→`None` + `receive_timeout=25s`. heartbeat=10 (unsolicited client pings, undocumented) killed the socket every ~22s. |
+| `8e2b197`+`4ec432e` (earlier) / config | **Breaker retune**: `data_stale` false-halted on quiet pregame books. `breakers.max_rx_age_s` 5→45 (halt only on a DEAD feed), `filters.max_feed_age_s` 5→12→**30** (decline, stay up). No more stop-and-go halts. |
+| `01566fd` (config) | **Flat maker model**: quote = `fair + 2¢`, flat. Zeroed mechanical base/per-leg/size WIDTH (it dominated the 2¢ markup → 5-leg was ~5.3¢, uncompetitive). Kept uncertainty + longshot floor. Operator directive; re-grade validated flat markup. |
+| `815acc5` | **WS write-dead → force reconnect**: a write failing ("Cannot write to closing transport") while the read side is alive (pings/deltas) → receive_timeout can't catch it → 80 `live_subscribe_failed`, only 4 books. Now: catch the write error, force ONE reconnect. |
+| `3bdeaa5` | **Subscription allowlist**: `_ensure_watched` ran before the filter and subscribed a book feed for EVERY leg incl. WNBA/ATP/crypto in cross-category RFQs we decline → flooded us → slow-consumer kills. Now skip watching for any out-of-allowlist-leg combo. HALVED reconnect churn (~4→2 per 5min). |
 
-## The edge verdict (report: `2026-07-13-wc-mlb-markup-regrade.md`)
+## Analyses shipped (reports in `docs/reports/`)
 
-Re-graded the one-week prod shadow (2026-07-06→12) vs REAL Kalshi settlements
-(now 73%/79% resolved). Reality test (fair-independent):
-- **Soccer FAT = REAL SELLER EDGE** — settles 13.8% vs priced 19.6% (+5.8pp,
-  day-clustered CI5 +4.2). Retail overpays for longshot parlays.
-- Soccer NORMAL adverse; MLB negative-but-confounded (stub fair) → re-price +
-  more-weeks item, not broken.
-- WC-FAT markup: +EV from 2.2¢; provisional **3¢** for go-live (CI5 +2.1, ~77%
-  competitive, wins more of the closing window). **DECISION stays pooled-multi-
-  week — never a P&L refit.**
+- **Same-game vs multi-game edge** (`2026-07-13-samegame-vs-multigame-edge-split`):
+  the +5.8pp soccer FAT edge is **entirely SAME-GAME** (+10.1pp); multi-game
+  exotics (what we mostly quote) have **no edge** (−1.2pp). **Same-game gate is an
+  open recommendation.**
+- **Padding audit** (`2026-07-13-wc-mlb-2c-restart-and-padding-audit`): HRR/corners
+  "padding" is already in the FAIR (measured ρ tables) + defensive width + DO-6
+  basket buffer — NOT a markup knob; did not add one.
+- **Pricing-consistency proof**: identical *displayed* combos differ by hidden
+  truncated legs; identical FULL leg-sets price within 0.7¢. The wild prices the
+  operator saw in Kalshi's combo view are the WHOLE MARKET, not our quotes (only
+  ~1–5 of ours ever rest at once).
 
-## LIVE — the run + how to relaunch
+## LIVE run + relaunch
 
-Config: `config/prod-live-wc.local.yaml` (gitignored, NOT committed). WC-ONLY
-(`allowed_leg_series_prefixes:[KXWC]` + `collection_whitelist:[KXMVESPORTS…,
-KXMVECROSSCATEGORY]`), soccer 3¢, MLB off, caps enforced, isolated live DB
-`data/combomaker-prod-live-wc.sqlite3` (NEVER the read-only shadow).
+Config: `config/prod-live-wc.local.yaml` (gitignored). WC+MLB @2¢, flat width,
+freshness 30s, breaker 45s, allowlist `[KXWC,KXMLB]`, isolated DB
+`data/combomaker-prod-live-wc.sqlite3`.
 ```
 combomaker run --env prod --mode quote --confirm-live --config config/prod-live-wc.local.yaml
 ```
-Kill: `combomaker halt` · panic: `combomaker cancel-all --env prod`. Bot
-auto-launches its supervisor (needs `KALSHI_SUPERVISOR_*`, present) + runs a
-5-gate prod preflight that fails closed.
+Kill `combomaker halt` · panic `combomaker cancel-all --env prod`. **Restart ritual:**
+halt → confirm `quote_app_stopped` + 0 open quotes → clear `KILL data/needs_reconcile
+data/heartbeat.txt data/supervisor_heartbeat.txt` → relaunch to a fresh log.
+NOTE: launching with a trailing `&` detaches it from the bash task wrapper (still
+runs; just no completion notification). **Operator tool:** `tools/live_viewer.py`
+(read-only tail showing OUR actual `fair+2¢` bids per RFQ + decline tally).
 
-## Running processes
+## THE NEXT BIG ITEM — write-dead root cause (the quote-rate unlock)
 
-- **LIVE bot: RUNNING in-session** — quoting WC-FAT, preflight green, riding
-  through data-stale trip→recover, 0 fills. **EPHEMERAL: dies with this session.**
-  To relaunch after a clean stop: kill any `python … combomaker` procs, clear stale
-  `data/heartbeat.txt` / `data/supervisor_heartbeat.txt` / `KILL` /
-  `data/needs_reconcile`, then the command above. Book poller +
-  critical-events monitor in `$CLAUDE_JOB_DIR/tmp/{poll_book.py,live_wc.log}`.
-- **Shadow recorder: operator restarting on a NEW SERVER** for weeks 2–4
-  (`combomaker run --env prod --mode observe`, durable). B harness runs complete.
+Kalshi closes our socket every ~90–150s (variable, load-correlated → likely
+slow-consumer / buffer overflow per their error-25 docs, or a per-connection cap).
+Each reconnect wipes all books → warmup burst (`skip_ws_unhealthy`+`skip_leg_stale`)
+→ books never accumulate (stuck ~4–14 distinct). Investigate + fix:
+1. **Confirm the cause** — is it error 25 / a market cap (docs/api-notes/asyncapi-ws.md
+   §17), or a connection policy? (No `ws_server_error` seen — Kalshi closes silently.)
+2. **Reduce delta-processing latency** — move book-delta handling off the WS read
+   loop so we never fall behind (slow-consumer).
+3. **Lazy / on-demand leg subscription** — subscribe a leg's book only when an RFQ
+   we'd quote needs it, and UNSUBSCRIBE when done (currently `_watched` only grows).
+4. **Shard subscriptions** across multiple WS connections (Kalshi supports shard_factor).
 
-## NEXT STEPS
+## Open operator decisions
 
-1. **Owner: bot.** Keep supervising the LIVE book (rolling book + critical events);
-   surface any fill instantly, report on any halt. Fills expected sparse (games
-   over ~6 days). Durable host needed to survive past this session.
-2. **Owner: operator.** (a) restart the shadow recorder on the new server; (b)
-   confirm run host for the live bot (supervised in-session now; durable server
-   for multi-day).
-3. **Owner: bot (deferred).** Re-price the graded universe with the LIVE engine
-   (de-confound MLB); explicit FAT/NORMAL room predictor + per-tier markup +
-   toggles once weeks pool; adaptive markup behind the MarkupPolicy seam.
-4. **Owner: measurement.** Pooled multi-week markup = the real gate.
+1. **Shadow recorder** — DOWN since 2026-07-12 19:28 (`combomaker-prod.sqlite3` not
+   written; no `--mode observe` proc). No weeks-2-4 backtest data accumulating.
+   Restart in-session (stopgap) vs durable server.
+2. **Same-game gate** — target the +EV pond (multi-game has no edge). Small filter.
 
-## Doctrine (unchanged, load-bearing)
+## Running processes (ephemeral — die with the session)
 
-Never touch `kalshi-combos` w/o `-TWO`. Prod DB `combomaker-prod.sqlite3`
-READ-ONLY (`mode=ro`). Secrets env-only. Verify Kalshi facts vs API/tape, never
-memory. Money int centi-cents. Missing/stale ⇒ no-quote. NEVER refit on a P&L
-window. Dated report per finding + README index + this resume doc, kept current.
+- LIVE bot (latest launch `bxlxqhvl6` → live_wc8.log; may relaunch). Monitors:
+  critical-events + 5-min health, rolling book (`poll_book.py`).
+
+## Doctrine (unchanged)
+
+Never touch `kalshi-combos` w/o `-TWO`. Prod shadow DB `combomaker-prod.sqlite3`
+READ-ONLY (`mode=ro`). Secrets env-only. Verify Kalshi facts vs API/tape/source
+(tonight: read aiohttp 3.14.1 source + Kalshi WS docs directly). Money int
+centi-cents. Missing/stale ⇒ decline. NEVER refit on a P&L window (markup =
+pooled multi-week; flat-2¢ is an operator directive + re-grade-validated model,
+tested by fills→settlement). Dated report per finding + README index + this doc.
