@@ -107,3 +107,46 @@ async def test_quote_events_fan_out() -> None:
     intake.on_quote_event(on_quote)
     await ws.deliver(envelope("quote_accepted", {"quote_id": "q1", "accepted_side": "yes"}))
     assert events == [("quote_accepted", {"quote_id": "q1", "accepted_side": "yes"})]
+
+
+async def test_series_prefix_gate_drops_before_parse() -> None:
+    """Firehose gate: an RFQ with any out-of-prefix leg is dropped pre-parse
+    (no registry entry, no handler); an all-allowed RFQ flows normally."""
+    ws = FakeWs()
+    intake = RfqIntake(ws, series_prefixes=("KXWC", "KXMLB"))
+    seen: list[Rfq] = []
+
+    async def on_rfq(rfq: Rfq) -> None:
+        seen.append(rfq)
+
+    intake.on_rfq(on_rfq)
+    await ws.deliver(envelope("rfq_created", RFQ_MSG))  # legs M1 = disallowed
+    assert seen == [] and intake.open_rfqs == {}
+
+    allowed = dict(RFQ_MSG)
+    allowed["id"] = "rfq_2"
+    allowed["mve_selected_legs"] = [
+        {"market_ticker": "KXWCADVANCE-26JUL14FRAESP-FRA", "side": "yes"},
+        {"market_ticker": "KXMLBGAME-26JUL13NYYBOS-NYY", "side": "no"},
+    ]
+    await ws.deliver(envelope("rfq_created", allowed))
+    assert [r.rfq_id for r in seen] == ["rfq_2"]
+
+    legless = dict(RFQ_MSG)
+    legless["id"] = "rfq_3"
+    legless["mve_selected_legs"] = []
+    await ws.deliver(envelope("rfq_created", legless))  # no legs ⇒ unknowable ⇒ drop
+    assert [r.rfq_id for r in seen] == ["rfq_2"]
+
+
+async def test_no_prefix_gate_keeps_record_everything() -> None:
+    ws = FakeWs()
+    intake = RfqIntake(ws)  # observe mode: no gate
+    seen: list[Rfq] = []
+
+    async def on_rfq(rfq: Rfq) -> None:
+        seen.append(rfq)
+
+    intake.on_rfq(on_rfq)
+    await ws.deliver(envelope("rfq_created", RFQ_MSG))
+    assert [r.rfq_id for r in seen] == ["rfq_1"]

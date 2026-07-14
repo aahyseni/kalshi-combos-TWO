@@ -34,9 +34,26 @@ ChannelLostHandler = Callable[[str], Awaitable[None]]
 
 
 class RfqIntake:
-    def __init__(self, ws: WsLike, metrics: Metrics | None = None) -> None:
+    def __init__(
+        self,
+        ws: WsLike,
+        metrics: Metrics | None = None,
+        *,
+        series_prefixes: tuple[str, ...] | None = None,
+    ) -> None:
+        """``series_prefixes``: PRE-PARSE firehose gate (quote mode only). The
+        communications channel is the WHOLE exchange's RFQ stream — measured
+        ~600 msgs/s sustained (crypto RFQ bots) 2026-07-14 — and full
+        ``Rfq.from_ws`` parsing (Decimal money per leg) caps consumption at
+        ~80-100/s, which made us a genuine slow consumer (server closed the
+        socket every ~90-150s; then the bounded dispatch queue overflowed every
+        ~35s). An RFQ whose raw legs aren't ALL on these prefixes is dropped on
+        a cheap string check BEFORE any parsing (metric only) — those would
+        decline SKIP_SERIES_NOT_ALLOWED anyway. None (observe mode / default)
+        keeps the record-everything behavior."""
         self._ws = ws
         self._metrics = metrics or Metrics()
+        self._series_prefixes = series_prefixes
         self._on_rfq: list[RfqHandler] = []
         self._on_rfq_deleted: list[RfqDeletedHandler] = []
         self._on_quote_event: list[QuoteEventHandler] = []
@@ -83,6 +100,16 @@ class RfqIntake:
 
     async def _handle_rfq_created(self, envelope: JsonDict) -> None:
         msg = envelope.get("msg", {})
+        if self._series_prefixes is not None:
+            # Firehose gate: raw string check BEFORE Rfq.from_ws (see __init__).
+            legs = msg.get("mve_selected_legs") or []
+            if not legs or any(
+                not str(leg.get("market_ticker", "")).startswith(self._series_prefixes)
+                for leg in legs
+                if isinstance(leg, dict)
+            ):
+                self._metrics.inc("rfq.dropped_series_fastpath")
+                return
         try:
             rfq = Rfq.from_ws(msg)
         except RfqParseError as exc:

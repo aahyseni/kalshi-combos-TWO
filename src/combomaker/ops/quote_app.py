@@ -274,7 +274,15 @@ class QuoteApp:
         )
         ws = WsManager(config.endpoints.ws_url, signer, self._clock, self._metrics)
         feed = OrderbookFeed(ws, self._clock, self._metrics)
-        intake = RfqIntake(ws, self._metrics)
+        # Quote mode: gate the exchange-wide RFQ firehose PRE-PARSE on the series
+        # allowlist (intake docstring has the measured numbers). Observe mode
+        # (app.py) passes no prefixes and keeps recording everything.
+        allowed = config.filters.allowed_leg_series_prefixes
+        intake = RfqIntake(
+            ws,
+            self._metrics,
+            series_prefixes=tuple(allowed) if allowed is not None else None,
+        )
         inplay = InPlayDetector(self._clock)
 
         external = self._build_external_odds()
