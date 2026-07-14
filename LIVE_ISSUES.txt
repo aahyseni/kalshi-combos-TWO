@@ -1,0 +1,133 @@
+================================================================================
+kalshi-combos-TWO  —  LIVE ISSUES (current)
+Snapshot: 2026-07-14 03:31 UTC   |   Run: live_wc15, stable on ONE connection 6+ min
+================================================================================
+
+*** THE ~90-150s WEBSOCKET WALL IS FIXED. *** After a long chain of fixes, the bot
+now holds a single WS connection indefinitely (0 overflows, 0 write-deads, 0
+supervisor kills, 0 halts). skip_leg_stale collapsed from hundreds/window to ~11.
+The user's "Reg Time" (KXWCGAME) combos now QUOTE. Quote rate of priced RFQs: 13%.
+Remaining issues are throughput + strategy, not connection stability.
+
+WHAT IS RUNNING
+  - Prod, WC + MLB, sell-only, flat markup = fair + 2c.
+  - Config: config/prod-live-wc.local.yaml (gitignored, armed).
+  - Isolated DB: data/combomaker-prod-live-wc.sqlite3.
+  - Ephemeral (in-session; needs a durable host to run multi-day).
+
+CURRENT NUMBERS (stable run)
+  - Connection: 1, held 6+ min (was: died every 3-35s all session).
+  - Books subscribed: 10 across 5 series (KXWCGAME/BTTS/TOTAL/SPREAD/1HTOTAL).
+  - Of RFQs we PRICE: quote rate 13%.  KXWCGAME (reg-time) combos: quoting.
+  - Fills: 0 (conditions finally in place: stable + fair+2c + your combo quoting).
+  - Top declines now: skip_game_loss_cap, skip_per_combo_loss_cap (the CAPS),
+    skip_classifier_unknown (some reg-time variants). skip_leg_stale ~gone.
+
+================================================================================
+ISSUES (ranked by impact) — post-WS-fix
+================================================================================
+
+--------------------------------------------------------------------------------
+ISSUE 1  [HIGH — the new ceiling]  Pricing throughput << RFQ arrival rate
+--------------------------------------------------------------------------------
+SYMPTOM:  We receive ~170 WC/MLB RFQs/sec (RFQ bots spamming the 2 live games)
+          but can only PRICE ~1/sec. The rest are backpressure-dropped
+          (rfq.work_dropped_backpressure). So we act on <1% of eligible RFQs.
+CAUSE:    Each price is ~600ms of CPU (Decimal money + structural Dixon-Coles /
+          MC model), and Python's GIL serializes CPU — so more workers give ~zero
+          extra throughput and instead saturate the event loop (that caused the
+          supervisor "heartbeat wedged" kill; now capped at 2 workers + backpressure
+          + a per-RFQ yield to keep the loop and WS pongs alive).
+IMPACT:   Caps how many fillable RFQs we can catch. This is now the #1 lever for
+          MORE fills.
+FIX (fresh-session work):
+   (a) Profile handle_rfq / the pricer; cache the per-game structural fit so each
+       RFQ is a cheap lookup, not a re-fit (likely the big win).
+   (b) Offload CPU-bound pricing to a ProcessPoolExecutor (true parallelism,
+       bypasses the GIL) — pricing is pure/stateless given leg books + config.
+   (c) Cheap pre-price reject (obvious declines) before the expensive model.
+
+--------------------------------------------------------------------------------
+ISSUE 2  [MEDIUM]  Caps still bind on the bigger combos
+--------------------------------------------------------------------------------
+skip_game_loss_cap + skip_per_combo_loss_cap are now the top declines. We already
+raised max_legs 6->12, max_contracts_per_quote 100->2000, per_combo_loss 1%->3%.
+The game-cluster (8%) and per-combo (3%) caps still decline large parlays. Tunable
+further on the $2k bankroll if desired (ladder must stay: combo<daily<game<dir).
+NOTE from Kalshi docs: makers CANNOT quote partial size ("each quote is implicitly
+for the full RFQ amount") — so the caps are the ONLY lever for large RFQs; we
+cannot partial-fill.
+
+--------------------------------------------------------------------------------
+ISSUE 3  [MEDIUM]  skip_classifier_unknown on WC moneyline×spread SGPs (NOT a
+                   leg-classifier gap — a JOINT-LAYER gap, closeable exactly)
+--------------------------------------------------------------------------------
+DIAGNOSED 2026-07-14 (100% of the WC skip_classifier_unknown): the leg classifiers
+are COMPLETE + correct (KXWCGAME->moneyline, KXWCSPREAD->spread, TOTAL/BTTS/1H all
+map). The decline is the relationship/correlation layer, one shape:
+   detail = "nested band game <G> carries other legs: band-vs-neighbour
+             correlation unmodeled"  (relationships.py:1024,1040)
+A combo has a moneyline x spread CONTAINMENT WINDOW in one game ("France wins" ⊇
+"France wins by 3+") AND a 3rd leg in that SAME game (a total or BTTS). The engine
+collapses the win/margin pair into a WINDOW super-leg, then needs its correlation
+to the 3rd same-game leg and FAIL-CLOSES rather than guess (doctrine: never a
+copula guess on an unmeasured ρ). ~11% of priced WC RFQs.
+FIX (principled, NOT a guess): because win-by-3 ⊆ win, the band's joint with the
+neighbour is EXACT arithmetic from pairs we ALREADY measure:
+   P(win-without-cover ∧ total) = P(win ∧ total) − P(cover ∧ total)
+        [moneyline×total ρ]           [spread×total ρ]   ← both already in config
+So the "unmeasured factor" is derivable exactly. Wire the containment-window ×
+same-game-neighbour derivation in the joint layer (prototype-in-test -> parity to
+the cent -> suite), turning these WC declines into quotes. Real joint-layer work,
+not a hack.
+
+--------------------------------------------------------------------------------
+ISSUE 4  [STRATEGY]  We quote the no-edge multi-game pond
+--------------------------------------------------------------------------------
+The validated soccer FAT edge is SAME-GAME only (+10.1pp); multi-game exotics have
+none. A per-combo same-game gate targets the +EV flow. (Open decision.)
+Report: docs/reports/2026-07-13-samegame-vs-multigame-edge-split.md.
+
+--------------------------------------------------------------------------------
+ISSUE 5  [OPS]  Basic API tier / durable host / shadow recorder
+--------------------------------------------------------------------------------
+  - We're on the BASIC rate tier: write 100 tokens/s (GET /account/limits).
+    Free self-serve upgrade to Advanced (300/300) before scaling quote volume.
+  - Bot + shadow recorder are in-session (ephemeral); need a durable server.
+  - Shadow recorder DOWN since 2026-07-12 19:28 (no weeks-2-4 backtest data).
+
+--------------------------------------------------------------------------------
+ISSUE 6  [KNOWN GAP]  Profitability unproven
+--------------------------------------------------------------------------------
+0 fills -> 0 settlements. Flat fair+2c is an operator directive + re-grade-validated
+model; the live proof needs fills -> settlements -> pooled multi-week (never a P&L
+refit). Conditions for fills are now finally met (stable + competitive + quoting).
+
+================================================================================
+WHAT WAS FIXED THIS SESSION (context) — all committed + tested, suite 1729/0
+================================================================================
+1  WS churn: heartbeat=10 (undocumented client-ping bet) -> None + receive_timeout.
+2  Breaker retune: data_stale 5->45s halt / freshness 5->30s decline (no false halts).
+3  Flat maker model: zeroed mechanical width so 2c markup IS the spread (fair+2c).
+4  WS write-dead -> force reconnect (half-dead socket recovery).
+5  Subscription allowlist: don't subscribe book feeds for combos we decline.
+6  Caps raised: max_legs 6->12, contracts 100->2000, per_combo_loss 1%->3%.
+7  Pong-decouple: handler work off the WS read loop (killed the ~90-150s closes).
+8  Firehose pre-parse gate: drop ~90% non-WC/MLB RFQs before Rfq.from_ws.
+9  RFQ worker pool: 2 workers + backpressure + yield (stop event-loop starvation).
+Docs sweep (getting_started/rfqs, rate_limits, orderbook_responses, pagination):
+confirmed NO server-side RFQ filter, combos are HVM (3s window), no partial quotes.
+
+================================================================================
+OPERATOR DECISIONS OWED
+================================================================================
+  1. Pricing-throughput optimization (ISSUE 1) — keep going now vs fresh session.
+  2. Same-game gate (ISSUE 4) — target the +EV pond?
+  3. Shadow recorder restart / durable host (ISSUE 5).
+  4. API tier upgrade Basic->Advanced (ISSUE 5) — free, before scaling.
+
+RELAUNCH / KILL
+  combomaker run --env prod --mode quote --confirm-live --config config/prod-live-wc.local.yaml
+  combomaker halt   |   combomaker cancel-all --env prod   |   tools/live_viewer.py
+Full handoff: docs/reports/2026-07-13-session-state-resume.md
+================================================================================

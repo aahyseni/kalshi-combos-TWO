@@ -6,12 +6,19 @@ Fresh-session chain: **this doc → `docs/reports/README.md` newest-first →
 ## Headline
 
 - **Live on prod: WC + MLB, flat `fair + 2¢`, sell-only, arb-safe, 0 fills.**
-- **The night's arc:** a long, deep WS/throughput debugging session. The bot went
-  from dying every ~22s / quoting ~1% → holding minutes and quoting flat 2¢ at a
-  higher (but still modest, ~3–6% noisy) rate. **Remaining wall:** Kalshi closes
-  our socket every ~90–150s ("write-dead"), each reconnect wipes book
-  subscriptions faster than we rebuild → most quotable combos still decline
-  `skip_leg_stale`. This is the #1 thing between us and a high quote rate.
+- **✅ THE ~90–150s WEBSOCKET WALL IS FIXED (2026-07-14 ~03:30 UTC).** The bot now
+  holds ONE connection indefinitely (6+ min sustained, 0 overflows / write-deads /
+  supervisor-kills / halts). `skip_leg_stale` collapsed from hundreds/window to
+  ~11; the operator's `KXWCGAME` reg-time combos now QUOTE; quote rate of priced
+  RFQs ~13%. Root cause (docs-confirmed): the communications channel is the WHOLE
+  exchange's RFQ firehose (~600/s, no server-side filter), and our per-RFQ
+  parse+price starved Kalshi's ping-pong → it closed us. Fixed by: pong-decouple
+  (handler work off the read loop) + firehose pre-parse gate + a 2-worker pricing
+  pool with backpressure. See `LIVE_ISSUES.txt` (repo root, current).
+- **NEW ceiling = pricing throughput.** ~170 WC/MLB RFQs/s arrive; each price is
+  ~600ms CPU (GIL-bound) so we price ~1/s and backpressure-drop the rest. That's
+  the #1 lever for MORE fills now — a fresh-session optimization (cache the
+  per-game structural fit / ProcessPool offload).
 
 ## What shipped tonight (all on `main`, pushed, suite 1725/0)
 
@@ -52,19 +59,29 @@ NOTE: launching with a trailing `&` detaches it from the bash task wrapper (stil
 runs; just no completion notification). **Operator tool:** `tools/live_viewer.py`
 (read-only tail showing OUR actual `fair+2¢` bids per RFQ + decline tally).
 
-## THE NEXT BIG ITEM — write-dead root cause (the quote-rate unlock)
+## ✅ WS WALL — RESOLVED (2026-07-14). Root cause: pong starvation from the RFQ
+firehose. Fixed by pong-decouple (dispatcher off read loop, `2776013`-lineage) +
+firehose pre-parse gate (`5c17c66`) + a 2-worker pricing pool w/ backpressure
+(`f87ac42`/`cb72109`). Docs sweep (getting_started/{rfqs,rate_limits,...}) confirmed
+NO server-side RFQ filter, combos are HVM (3s window), no partial quotes, we're on
+the Basic tier (write 100/s). Bot now holds ONE connection indefinitely.
 
-Kalshi closes our socket every ~90–150s (variable, load-correlated → likely
-slow-consumer / buffer overflow per their error-25 docs, or a per-connection cap).
-Each reconnect wipes all books → warmup burst (`skip_ws_unhealthy`+`skip_leg_stale`)
-→ books never accumulate (stuck ~4–14 distinct). Investigate + fix:
-1. **Confirm the cause** — is it error 25 / a market cap (docs/api-notes/asyncapi-ws.md
-   §17), or a connection policy? (No `ws_server_error` seen — Kalshi closes silently.)
-2. **Reduce delta-processing latency** — move book-delta handling off the WS read
-   loop so we never fall behind (slow-consumer).
-3. **Lazy / on-demand leg subscription** — subscribe a leg's book only when an RFQ
-   we'd quote needs it, and UNSUBSCRIBE when done (currently `_watched` only grows).
-4. **Shard subscriptions** across multiple WS connections (Kalshi supports shard_factor).
+## THE NEXT ITEMS (post-WS-fix — see `LIVE_ISSUES.txt` for the full ranked list)
+
+1. **Pricing throughput = the new ceiling.** ~170 WC/MLB RFQs/s arrive; each price
+   is ~600ms CPU (GIL-bound) → we price ~1/s + backpressure-drop the rest. #1 lever
+   for MORE fills: cache the per-game structural fit (cheap lookup, not a re-fit) OR
+   ProcessPool-offload the pricer (pure given leg books + config).
+2. **WC skip_classifier_unknown = a JOINT-layer gap, NOT a leg-classifier gap** (leg
+   classifiers are complete). Combos with a moneyline×spread containment WINDOW +
+   a 3rd same-game leg fail-close ("nested band game … band-vs-neighbour correlation
+   unmodeled", relationships.py:1040). CLOSEABLE EXACTLY: win-by-3 ⊆ win, so
+   P(win-without-cover ∧ total) = P(win∧total) − P(cover∧total), both ρ's already in
+   config. Wire the window×same-game-neighbour derivation (prototype→parity→suite).
+3. **Caps** now the top decline (game-loss 8% / per-combo 3%); tunable. Note (docs):
+   makers CANNOT quote partial size — caps are the only lever for large RFQs.
+4. **Same-game gate** (edge is same-game only); **API tier** Basic→Advanced (free);
+   **durable host**; **shadow recorder** restart.
 
 ## Open operator decisions
 
