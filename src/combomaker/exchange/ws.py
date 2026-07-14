@@ -80,6 +80,7 @@ class WsManager:
         self._last_rx_mono_ns: int | None = None
         self._run_task: asyncio.Task[None] | None = None
         self._stopping = False
+        self._force_reconnecting = False
 
     # --- registration (all before start) ---
 
@@ -149,10 +150,18 @@ class WsManager:
         """Close the socket; the run loop reconnects and resubscribes.
 
         For terminal channel errors (codes 10/17/25) where the subscription is
-        dead but the connection may look healthy.
+        dead but the connection may look healthy, AND for a WRITE-DEAD socket (a
+        ``send`` raising ClientConnectionResetError while the read side is still
+        alive, so receive_timeout can't catch it). Reentrancy-guarded: a burst of
+        failed writes triggers exactly ONE reconnect; the guard clears when the run
+        loop establishes the next socket.
         """
-        if self._ws is not None and not self._ws.closed:
-            await self._ws.close()
+        if self._force_reconnecting:
+            return
+        self._force_reconnecting = True
+        ws = self._ws
+        if ws is not None and not ws.closed:
+            await ws.close()
 
     async def stop(self) -> None:
         self._stopping = True
@@ -201,6 +210,7 @@ class WsManager:
                         receive_timeout=25.0,
                     ) as ws:
                         self._ws = ws
+                        self._force_reconnecting = False  # fresh socket — clear guard
                         self._last_rx_mono_ns = self._clock.monotonic_ns()
                         self._metrics.inc(f"{self._name}.connect")
                         log.info("ws_connected", name=self._name)
@@ -291,8 +301,22 @@ class WsManager:
             self._pending_sub_acks[cmd_id] = sub
 
     async def send_command(self, cmd: str, params: dict[str, Any]) -> int:
-        if self._ws is None or self._ws.closed:
+        ws = self._ws
+        if ws is None or ws.closed:
             raise RuntimeError("ws not connected")
         self._cmd_id += 1
-        await self._ws.send_str(json.dumps({"id": self._cmd_id, "cmd": cmd, "params": params}))
+        try:
+            await ws.send_str(json.dumps({"id": self._cmd_id, "cmd": cmd, "params": params}))
+        except (aiohttp.ClientError, ConnectionError) as exc:
+            # WRITE side dead ("Cannot write to closing transport") while the READ
+            # side is still alive (server pings + book deltas keep arriving), so
+            # receive_timeout never fires and we'd sit half-dead forever, silently
+            # failing EVERY new leg-book subscription (2026-07-13 live: 80
+            # live_subscribe_failed / only 4 books subscribed → combos on the
+            # unsubscribed legs, e.g. KXWCGAME reg-time-win, all decline
+            # skip_leg_stale). Force ONE reconnect to rebuild full duplex and
+            # re-send every subscription; re-raise so the caller still logs the fail.
+            log.warning("ws_write_failed_forcing_reconnect", name=self._name, error=repr(exc))
+            await self.force_reconnect()
+            raise
         return self._cmd_id
