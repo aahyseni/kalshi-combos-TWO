@@ -458,27 +458,19 @@ class QuoteApp:
             # a one-shot RFQ must not be starved by lazy subscriptions.
             pending: dict[str, tuple[Rfq, int]] = {}
 
-            # FAST-PATH DROP (2026-07-14, slow-consumer root cause): the
-            # communications channel is the WHOLE exchange's RFQ firehose
-            # (~750+ msg/s bursts, every sport + crypto RFQ bots). Per-message
-            # SQLite (record_rfq + a no_quote decision row) capped consumption
-            # at ~90/s → we were a GENUINE slow consumer → Kalshi killed the
-            # socket every ~90-150s (the write-dead loop). ~90% of the firehose
-            # has a leg outside the series allowlist and would decline
-            # SKIP_SERIES_NOT_ALLOWED anyway — drop those on a cheap prefix
-            # check BEFORE any DB work (metric only, no rfqs row, no decision
-            # row). Consumption now outruns arrival; WC/MLB flow unaffected.
-            # NOTE: in quote mode the rfqs/decisions tape no longer records
-            # other-sport RFQs (the observe-mode recorder is untouched).
-            fast_allowed = self._config.filters.allowed_leg_series_prefixes
-            fast_prefixes = tuple(fast_allowed) if fast_allowed is not None else None
+            # RFQ WORK POOL (2026-07-14). The intake pre-parse gate (RfqIntake
+            # series_prefixes) already drops the ~90% non-allowlist firehose before
+            # it reaches here, so handle_rfq runs only for WC/MLB combos — but
+            # pricing + metadata fetch + the quote POST are slow (10s-100s ms) and
+            # the WS dispatcher is single-threaded, so running handle_rfq INLINE on
+            # it blocked the dispatch-queue drain and overflowed it every ~35s
+            # (live 2026-07-14). The on_rfq handler now only ENQUEUES (put_nowait,
+            # fast); a small pool of workers prices concurrently. The lifecycle +
+            # single-writer reservation service were built for concurrent RFQs.
+            RFQ_WORKERS = 8
+            rfq_work: asyncio.Queue[Rfq] = asyncio.Queue(maxsize=500)
 
             async def handle_rfq(rfq: Rfq) -> None:
-                if fast_prefixes is not None and any(
-                    not t.startswith(fast_prefixes) for t in rfq.leg_tickers
-                ):
-                    self._metrics.inc("rfq.dropped_series_fastpath")
-                    return
                 await store.record_rfq(rfq, source="ws")
                 if not rfq.is_combo:
                     return
@@ -486,6 +478,27 @@ class QuoteApp:
                 await lifecycle.handle_rfq(rfq)
                 if not lifecycle.has_open_quote(rfq.rfq_id):
                     pending[rfq.rfq_id] = (rfq, 0)
+
+            async def rfq_worker() -> None:
+                while True:
+                    rfq = await rfq_work.get()
+                    try:
+                        await handle_rfq(rfq)
+                    except Exception:
+                        log.exception("rfq_worker_failed", rfq_id=rfq.rfq_id)
+                    finally:
+                        rfq_work.task_done()
+
+            async def on_rfq_enqueue(rfq: Rfq) -> None:
+                # Non-blocking: the WS dispatcher must NOT stall on pricing, or the
+                # dispatch queue backs up behind the firehose and overflows.
+                try:
+                    rfq_work.put_nowait(rfq)
+                except asyncio.QueueFull:
+                    # Behind on WC/MLB PRICING itself (not the firehose). A combo
+                    # RFQ is one-shot (requester re-RFQs); drop + count so the
+                    # worker count can be sized from evidence.
+                    self._metrics.inc("rfq.work_dropped_backpressure")
 
             async def retry_pending() -> None:
                 while True:
@@ -509,7 +522,7 @@ class QuoteApp:
                 elif kind == "quote_executed":
                     await lifecycle.on_quote_executed(msg)
 
-            intake.on_rfq(handle_rfq)
+            intake.on_rfq(on_rfq_enqueue)
             intake.on_rfq_deleted(lifecycle.on_rfq_deleted)
             intake.on_rfq_deleted(on_rfq_deleted_cleanup)
             intake.on_quote_event(on_quote_event)
@@ -540,6 +553,10 @@ class QuoteApp:
             ws.start()
             tasks = [
                 asyncio.create_task(retry_pending(), name="rfq-retry"),
+                *[
+                    asyncio.create_task(rfq_worker(), name=f"rfq-worker-{i}")
+                    for i in range(RFQ_WORKERS)
+                ],
                 asyncio.create_task(self._maintenance_loop(lifecycle), name="maintenance"),
                 asyncio.create_task(
                     self._status_loop(
