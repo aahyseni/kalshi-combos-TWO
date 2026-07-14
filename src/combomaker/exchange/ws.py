@@ -48,10 +48,15 @@ class _Subscription:
 
 
 class WsManager:
-    # Dispatcher backlog bound: ~20s of a heavy 100-frame/s book burst. Overflow
-    # ⇒ we are a genuine slow consumer ⇒ reconnect (fail-closed), never fall
-    # silently behind the mirrored books.
-    _QUEUE_MAX = 2000
+    # Dispatcher backlog bound. Sized for the BOOT SNAPSHOT: on communications
+    # subscribe Kalshi dumps every open RFQ (observed ~650 msgs/s for several
+    # seconds, 2026-07-14) while the dispatcher drains at ~300/s (per-RFQ SQLite
+    # + REST metadata) — a 2,000 cap overflowed in 3.1s and the close→reconnect
+    # →fresh-snapshot cycle looped 107×. 20,000 absorbs the burst (peak backlog
+    # ~2-5k, drained in ~10-20s while receive() keeps answering server pings);
+    # steady state is single-digit msgs/s. Overflow ⇒ genuine runaway ⇒
+    # reconnect (fail-closed), never silently lag the mirrored books.
+    _QUEUE_MAX = 20_000
 
     def __init__(
         self,
