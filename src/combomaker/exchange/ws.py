@@ -48,6 +48,11 @@ class _Subscription:
 
 
 class WsManager:
+    # Dispatcher backlog bound: ~20s of a heavy 100-frame/s book burst. Overflow
+    # ⇒ we are a genuine slow consumer ⇒ reconnect (fail-closed), never fall
+    # silently behind the mirrored books.
+    _QUEUE_MAX = 2000
+
     def __init__(
         self,
         url: str,
@@ -81,6 +86,21 @@ class WsManager:
         self._run_task: asyncio.Task[None] | None = None
         self._stopping = False
         self._force_reconnecting = False
+        # PONG-STARVATION FIX (2026-07-14, root cause of the ~90-150s server-side
+        # closes): aiohttp answers Kalshi's 10s server Pings INSIDE receive() —
+        # i.e. only while the read loop is actually reading. The old read loop
+        # awaited every handler INLINE (incl. RFQ pricing + the REST create_quote
+        # round trip), so an RFQ burst stalled receive() for seconds, Pongs went
+        # out late, and after ~9-15 missed pings the server closed us (silent,
+        # load-correlated, read-alive/write-dead — all four live symptoms; Kalshi
+        # docs: connection-keep-alive.md "Clients should respond with Pong").
+        # Now the read loop ONLY reads + enqueues; a single long-lived dispatcher
+        # task consumes IN ORDER (seq continuity per sid is preserved by FIFO).
+        # Bounded: a full queue means we are genuinely slower than the feed for
+        # ~QUEUE_MAX frames — fail closed by forcing a reconnect (books re-snap)
+        # rather than silently falling behind.
+        self._msg_queue: asyncio.Queue[JsonDict] = asyncio.Queue(maxsize=self._QUEUE_MAX)
+        self._dispatch_task: asyncio.Task[None] | None = None
 
     # --- registration (all before start) ---
 
@@ -144,6 +164,9 @@ class WsManager:
         if self._run_task is not None:
             raise RuntimeError("already started")
         self._stopping = False
+        self._dispatch_task = asyncio.create_task(
+            self._dispatch_loop(), name=f"{self._name}-dispatch"
+        )
         self._run_task = asyncio.create_task(self._run(), name=f"{self._name}-run")
 
     async def force_reconnect(self) -> None:
@@ -174,6 +197,19 @@ class WsManager:
             except asyncio.CancelledError:
                 pass
             self._run_task = None
+        if self._dispatch_task is not None:
+            # Drain what's already queued (handlers may hold cleanup state),
+            # then cancel. join() would hang if a handler stalls — bound it.
+            try:
+                await asyncio.wait_for(self._msg_queue.join(), timeout=0.1)
+            except (TimeoutError, asyncio.TimeoutError):
+                pass
+            self._dispatch_task.cancel()
+            try:
+                await self._dispatch_task
+            except asyncio.CancelledError:
+                pass
+            self._dispatch_task = None
 
     async def _run(self) -> None:
         backoff = self._backoff_initial_s
@@ -241,6 +277,10 @@ class WsManager:
                 await asyncio.sleep(delay)
 
     async def _read_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        # READ + ENQUEUE ONLY — never await handlers here. Staying inside
+        # ws.receive() is what lets aiohttp answer Kalshi's 10s server Pings
+        # promptly (autoping replies during receive()); awaiting slow handlers
+        # inline starved the Pongs and got us server-closed every ~90-150s.
         async for frame in ws:
             self._last_rx_mono_ns = self._clock.monotonic_ns()
             if frame.type == aiohttp.WSMsgType.TEXT:
@@ -249,10 +289,33 @@ class WsManager:
                 except ValueError:
                     log.warning("ws_bad_json", name=self._name, data=frame.data[:200])
                     continue
-                await self._dispatch(message)
+                try:
+                    self._msg_queue.put_nowait(message)
+                except asyncio.QueueFull:
+                    # Genuine slow consumer: ~QUEUE_MAX frames behind. Fail
+                    # closed — reconnect re-snapshots every book — rather than
+                    # quoting off a mirror we KNOW lags the exchange.
+                    self._metrics.inc(f"{self._name}.dispatch_queue_overflow")
+                    log.error("ws_dispatch_queue_overflow", name=self._name)
+                    await ws.close()
+                    return
             elif frame.type == aiohttp.WSMsgType.ERROR:
                 log.warning("ws_frame_error", name=self._name)
                 return
+
+    async def _dispatch_loop(self) -> None:
+        """Single long-lived consumer: handlers run here, IN ORDER (FIFO keeps
+        per-sid seq continuity), off the read loop. Messages from a dead
+        connection self-drop downstream (sid no longer registered), so the queue
+        safely spans reconnects. Cancelled only by stop()."""
+        while True:
+            message = await self._msg_queue.get()
+            try:
+                await self._dispatch(message)
+            except Exception:  # a handler bug must not kill the dispatcher
+                log.exception("ws_dispatch_failed", name=self._name)
+            finally:
+                self._msg_queue.task_done()
 
     async def _dispatch(self, message: JsonDict) -> None:
         msg_type = str(message.get("type", ""))
