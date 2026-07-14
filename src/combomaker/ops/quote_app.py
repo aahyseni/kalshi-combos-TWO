@@ -916,6 +916,21 @@ class QuoteApp:
     async def _ensure_watched(
         self, rfq: Rfq, feed: OrderbookFeed, metadata: MetadataCache
     ) -> None:
+        # Only subscribe book feeds (+ fetch metadata) for combos we COULD quote.
+        # A combo with any leg outside the series allowlist WILL decline
+        # (SKIP_SERIES_NOT_ALLOWED, ~half of all declines), so subscribing its
+        # legs' books floods us with irrelevant deltas (WNBA/ATP/UFC/crypto legs
+        # in cross-category RFQs) → we fall behind → Kalshi slow-consumer-kills the
+        # socket (~90s write-dead loop live 2026-07-13, capping distinct books at
+        # ~5 → most quotable combos then decline stale). Skip watching entirely;
+        # the decline is still recorded cheaply downstream (series check needs no
+        # book). Legs shared with an all-allowed combo get watched when THAT
+        # arrives, so no quotable leg is missed.
+        allowed = self._config.filters.allowed_leg_series_prefixes
+        if allowed is not None and any(
+            not t.startswith(tuple(allowed)) for t in rfq.leg_tickers
+        ):
+            return
         new = [t for t in rfq.leg_tickers if t not in self._watched]
         if new:
             self._watched.update(new)

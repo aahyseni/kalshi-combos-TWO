@@ -113,6 +113,56 @@ async def test_startup_reconcile_returns_success_flag(tmp_path: Path) -> None:
     assert await app._startup_reconcile(FakeRest(fail=True)) is False  # type: ignore[arg-type]
 
 
+async def test_ensure_watched_skips_out_of_allowlist_combos(tmp_path: Path) -> None:
+    """Only subscribe book feeds for combos we could quote: a combo with any
+    out-of-allowlist leg (declined anyway) must NOT trigger book subscriptions —
+    else its irrelevant legs (WNBA/ATP/crypto) flood the WS → slow-consumer kill.
+    """
+    from tests.test_filters import combo_rfq
+
+    class _RecordingFeed:
+        def __init__(self) -> None:
+            self.watched: list[str] = []
+
+        def watch(self, tickers: Any) -> None:
+            self.watched.extend(tickers)
+
+    class _StubMeta:
+        def peek(self, ticker: str) -> Any:
+            return object()  # non-None ⇒ combo market not re-fetched
+
+        async def market(self, ticker: str) -> Any:
+            class _M:
+                event_ticker = None
+
+            return _M()
+
+    app = _demo_app(tmp_path)  # default filters allowlist = ["KXWC", "KXMLB"]
+    feed = _RecordingFeed()
+    meta = _StubMeta()
+
+    mixed = combo_rfq(
+        mve_selected_legs=[
+            {"market_ticker": "KXWCADVANCE-26JUL14FRAESP-FRA", "side": "yes"},
+            {"market_ticker": "KXWNBAGAME-26JUL13LAATL-ATL", "side": "yes"},
+        ]
+    )
+    await app._ensure_watched(mixed, feed, meta)  # type: ignore[arg-type]
+    assert feed.watched == []  # out-of-allowlist leg ⇒ skipped entirely
+
+    allowed = combo_rfq(
+        mve_selected_legs=[
+            {"market_ticker": "KXWCADVANCE-26JUL14FRAESP-FRA", "side": "yes"},
+            {"market_ticker": "KXMLBGAME-26JUL13NYYBOS-NYY", "side": "no"},
+        ]
+    )
+    await app._ensure_watched(allowed, feed, meta)  # type: ignore[arg-type]
+    assert set(feed.watched) == {
+        "KXWCADVANCE-26JUL14FRAESP-FRA",
+        "KXMLBGAME-26JUL13NYYBOS-NYY",
+    }
+
+
 def test_prod_preflight_is_noop_on_demo(tmp_path: Path) -> None:
     app = _demo_app(tmp_path)
     app._run_prod_preflight()  # demo ⇒ no-op, no raise
