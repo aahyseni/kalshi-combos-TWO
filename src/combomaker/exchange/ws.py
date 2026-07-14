@@ -269,6 +269,14 @@ class WsManager:
 
                 if self._stopping:
                     return
+                # Discard the dead connection's queued backlog BEFORE reconnect:
+                # stale frames would self-drop downstream anyway (dead sids) but
+                # they occupy queue slots + dispatcher time, and a still-full
+                # queue re-overflows INSTANTLY on the next connect (observed
+                # live 2026-07-14: 107-cycle overflow→reconnect loop). The new
+                # connection re-snapshots everything, so nothing queued from the
+                # old one is load-bearing.
+                self._discard_queued()
                 # Disconnect: notify (cancel-all etc.) BEFORE any reconnect.
                 self._metrics.inc(f"{self._name}.disconnect")
                 log.warning("ws_disconnected", name=self._name)
@@ -307,6 +315,20 @@ class WsManager:
             elif frame.type == aiohttp.WSMsgType.ERROR:
                 log.warning("ws_frame_error", name=self._name)
                 return
+
+    def _discard_queued(self) -> None:
+        """Drop every queued-but-unprocessed message (dead-connection backlog)."""
+        dropped = 0
+        while True:
+            try:
+                self._msg_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self._msg_queue.task_done()
+            dropped += 1
+        if dropped:
+            self._metrics.inc(f"{self._name}.queue_discarded", dropped)
+            log.info("ws_queue_discarded", name=self._name, dropped=dropped)
 
     async def _dispatch_loop(self) -> None:
         """Single long-lived consumer: handlers run here, IN ORDER (FIFO keeps

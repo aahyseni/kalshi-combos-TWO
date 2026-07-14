@@ -450,7 +450,27 @@ class QuoteApp:
             # a one-shot RFQ must not be starved by lazy subscriptions.
             pending: dict[str, tuple[Rfq, int]] = {}
 
+            # FAST-PATH DROP (2026-07-14, slow-consumer root cause): the
+            # communications channel is the WHOLE exchange's RFQ firehose
+            # (~750+ msg/s bursts, every sport + crypto RFQ bots). Per-message
+            # SQLite (record_rfq + a no_quote decision row) capped consumption
+            # at ~90/s → we were a GENUINE slow consumer → Kalshi killed the
+            # socket every ~90-150s (the write-dead loop). ~90% of the firehose
+            # has a leg outside the series allowlist and would decline
+            # SKIP_SERIES_NOT_ALLOWED anyway — drop those on a cheap prefix
+            # check BEFORE any DB work (metric only, no rfqs row, no decision
+            # row). Consumption now outruns arrival; WC/MLB flow unaffected.
+            # NOTE: in quote mode the rfqs/decisions tape no longer records
+            # other-sport RFQs (the observe-mode recorder is untouched).
+            fast_allowed = self._config.filters.allowed_leg_series_prefixes
+            fast_prefixes = tuple(fast_allowed) if fast_allowed is not None else None
+
             async def handle_rfq(rfq: Rfq) -> None:
+                if fast_prefixes is not None and any(
+                    not t.startswith(fast_prefixes) for t in rfq.leg_tickers
+                ):
+                    self._metrics.inc("rfq.dropped_series_fastpath")
+                    return
                 await store.record_rfq(rfq, source="ws")
                 if not rfq.is_combo:
                     return
