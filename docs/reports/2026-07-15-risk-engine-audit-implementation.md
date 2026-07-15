@@ -132,9 +132,15 @@ Implementation order shown; all committed on `risk-audit-overnight`.
 - **P0-1** `bcb89cf` — `evaluate_candidate_book_risk` + `CandidateBookRisk` in
   `book_risk.py`; candidate + reservation positions enter the sampled leg universe with
   common random numbers (concentrating candidate crosses the ruin/ES budget and declines;
-  balancing candidate can pass). `tests/test_candidate_book_risk.py` (417 lines). **This
-  resolves the per-candidate ΔES last-look gate that the 2026-07-15 final report §6
-  explicitly deferred** — see §6 below.
+  balancing candidate can pass). `tests/test_candidate_book_risk.py` (417 lines).
+  **⚠️ CRITICAL WIRING GAP (found in post-run verification):** `evaluate_candidate_book_risk`
+  / `CandidateBookRisk` are **NOT called anywhere in the live decision path** —
+  `grep` finds no reference in `rfq/lifecycle.py`, `risk/limits.py`, or `ops/quote_app.py`
+  (only self-references inside `book_risk.py` + the unit tests). The last-look/confirm path
+  still gates on the **committed-book** snapshot only. So P0-1's machinery is **built and
+  unit-tested but does NOT yet govern any live confirm.** It therefore does **NOT** resolve
+  the per-candidate ΔES last-look gate the 2026-07-15 final report §6 deferred — that gate
+  remains **unwired**. See §6.
 - **P0-2** `15708c7` — book generation counter + immediate invalidation.
 - **P0-3** `33abf6f` — sampled model ES separated from the deterministic all-hit maximum
   loss (two distinct caps). Preserved: ES-vs-deterministic split.
@@ -211,11 +217,19 @@ Stated plainly — do not treat as resolved.
   run did NOT relaunch the bot (SAFETY DEFAULT) and therefore did **not** re-measure live
   exposure, quote count, or the post-fanout cap headroom. All P0-7/P0-8/P0-9/P2-2 claims
   in §4 are **test-asserted**, not live-tape-confirmed.
-- **Per-candidate ΔES last-look gate — previously deferred, now landed but not tape-graded.**
-  The 2026-07-15 final report §6 explicitly deferred this gate. P0-1 (`bcb89cf`,
-  `evaluate_candidate_book_risk`) implements it, but the "concentrating declines / balancing
-  passes" behavior is verified by unit tests, not by a live ENGARG book. The final report's
-  §6 "deferred, not done" note is therefore **superseded by code but not by live evidence.**
+- **Per-candidate ΔES last-look gate — machinery built + unit-tested, but NOT WIRED into the
+  decision path.** The 2026-07-15 final report §6 explicitly deferred this gate. P0-1
+  (`bcb89cf`, `evaluate_candidate_book_risk` / `CandidateBookRisk`) builds and unit-tests the
+  machinery (concentrating declines / balancing passes on shared sampled states), **but the
+  function is never called from `rfq/lifecycle.py`, `risk/limits.py`, or `ops/quote_app.py`**
+  (verified by grep post-run — only self-references in `book_risk.py` + tests). The live
+  last-look/confirm still gates on the committed-book snapshot alone. So the gate is
+  **superseded by code that exists but does not run in production** — it does not yet
+  influence a single confirm. **Wiring `evaluate_candidate_book_risk` into the last-look/
+  confirm decision is the #1 remaining task** and is a consequential live-path change that
+  should be reviewed before it governs real money (recommended: land it as an additive
+  DECLINE-only gate first — it can only make the bot more conservative — before enabling the
+  balancing/hedge-credit path).
 - **`caps_shadow_mode` is a live operator switch.** Default is `False` (enforced). A
   future re-shadow of any new cap flips it to `True`, at which point that cap layer
   observes-only. Verify it is `False` before relaunch.
@@ -237,6 +251,12 @@ Stated plainly — do not treat as resolved.
 
 ## 7. What remains before live
 
+0. **⚠️ WIRE P0-1 INTO LAST-LOOK (the #1 gap).** `evaluate_candidate_book_risk` is built and
+   unit-tested but **not called anywhere in the decision path** — the candidate-aware ΔES /
+   ΔP(ruin) / ΔEV gate does not yet govern any confirm. Until it is wired, P0-1 is inert in
+   production. Recommended sequence: wire it as an additive **decline-only** gate first
+   (strictly more conservative — cannot loosen anything), verify on the live ENGARG book,
+   then enable the balancing/hedge-credit path under review.
 1. **Operator reviews the full diff:** `git diff 45164f1..HEAD` (48 files, +9537 / −303).
    Restore point on any doubt: `git checkout 45164f1`.
 2. **Relaunch decision is the operator's.** This run did **NOT** relaunch the bot and did
@@ -271,6 +291,10 @@ run-to-run — 26–27 — because they arise from `ProcessPoolExecutor` teardow
 
 ## NEXT STEPS
 
+- **⚠️ Agent/operator (owner) — TOP PRIORITY:** wire `evaluate_candidate_book_risk` into the
+  last-look/confirm path (`rfq/lifecycle.py`). It is currently built + tested but unwired, so
+  the candidate-aware gate (the headline of P0-1) does not govern any live decision. Land it
+  decline-only first (cannot loosen anything), then enable balancing credit under review.
 - **Operator (owner):** review `git diff 45164f1..HEAD`; confirm `caps_shadow_mode == False`;
   decide relaunch. Do NOT raise `max_open_quotes` or any cap until post-fanout exposure
   headroom is measured live.
