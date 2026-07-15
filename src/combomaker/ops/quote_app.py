@@ -40,7 +40,7 @@ from combomaker.ops.preflight import (
     PreflightError,
     evaluate_preflight,
 )
-from combomaker.ops.pricing_pool import JointPool
+from combomaker.ops.pricing_pool import BookRiskPool, JointPool
 from combomaker.ops.report import build_report, format_report
 from combomaker.ops.supervisor import (
     ENV_SUPERVISOR_API_KEY_ID,
@@ -440,6 +440,11 @@ class QuoteApp:
             # (deterministic, no process pool). Warmed before any traffic so the
             # first off-loop price doesn't pay a cold-import tail.
             joint_pool: JointPool | None = None
+            # P2-2: full-book portfolio MC off the event loop. Live quote mode only:
+            # a large book's MC runs in a worker process (generation-safe) so it can
+            # never block the maintenance loop long enough to starve the supervisor
+            # heartbeat under the RFQ firehose. Paper/backtests run the MC inline.
+            book_risk_pool: BookRiskPool | None = None
             if config.mode is Mode.QUOTE:
                 joint_pool = JointPool(
                     config.pricing,
@@ -449,6 +454,8 @@ class QuoteApp:
                 )
                 joint_pool.start()
                 await joint_pool.warmup()
+                book_risk_pool = BookRiskPool(workers=1)
+                book_risk_pool.start()
             lifecycle = QuoteLifecycle(
                 clock=self._clock,
                 sender=sender,
@@ -491,6 +498,7 @@ class QuoteApp:
                 fee_type=fee_type,
                 fee_multiplier=fee_multiplier,
                 joint_pool=joint_pool,
+                book_risk_pool=book_risk_pool,
             )
             # R3 Phase 3: single-writer risk-reservation service. Wired AFTER the
             # lifecycle (it reuses the lifecycle's shadow splitter, so a %-cap
@@ -778,6 +786,8 @@ class QuoteApp:
                 await book_ws.stop()
                 if joint_pool is not None:
                     joint_pool.shutdown()
+                if book_risk_pool is not None:
+                    book_risk_pool.shutdown()
                 await killswitch.stop()
                 # Tear down the external supervisor subprocess (best-effort).
                 try:

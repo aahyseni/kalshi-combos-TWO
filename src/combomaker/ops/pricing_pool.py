@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass
 
 from combomaker.core.conventions import Conventions
 from combomaker.ops.config import PricingConfig
@@ -34,6 +35,9 @@ from combomaker.pricing.legs import LegBelief
 from combomaker.pricing.quote import NoQuote
 from combomaker.pricing.relationships import Relationship
 from combomaker.rfq.models import Rfq
+from combomaker.sim.book_model import BookModel
+from combomaker.sim.book_risk import BookRiskSnapshot, compute_book_risk
+from combomaker.sim.structural_book import StructuralConfigView
 
 log = get_logger(__name__)
 
@@ -166,3 +170,114 @@ class JointPool:
 
 def _warm_probe() -> bool:  # pragma: no cover - trivial worker probe
     return _WORKER_ENGINE is not None
+
+
+# --------------------------------------------------------------------------- #
+# P2-2: full-book MC off the event loop, generation-safe.                     #
+# --------------------------------------------------------------------------- #
+#
+# WHY: recompute_book_risk() runs a full portfolio Monte Carlo (tens of thousands
+# of correlated samples over the whole book — GIL-bound numpy). Run inline on the
+# maintenance tick (as it was), under the RFQ firehose a large book's MC blocks
+# the event loop for long enough that the supervisor heartbeat goes stale and the
+# process is emergency-killed (the same starvation class as the inline joint
+# wedge). Threads cannot help (GIL); the structural fix is to run the pure MC in a
+# separate PROCESS so the loop keeps beating the heartbeat while it computes.
+#
+# WHAT: the parent event loop does the cheap on-loop prefix — read the POSITION
+# generation (P0-2) + build the IMMUTABLE BookModel — and ships only that frozen
+# model + the scalar params to a worker. The worker runs the engine's OWN
+# compute_book_risk (no reimplementation — hard rule 8) and returns the
+# BookRiskSnapshot, stamped with the input_generation the parent captured. The
+# parent PUBLISHES the snapshot only while the book's live position generation
+# still equals that stamp; a snapshot computed against a portfolio that a
+# fill/settlement/reconciliation/reservation has since mutated is DISCARDED (never
+# gates a stale book). Determinism: compute_book_risk takes an explicit seed, so a
+# seeded run is byte-identical across processes — the off-loop snapshot equals the
+# inline one on the same immutable model.
+#
+# Only PICKLABLE, immutable values cross the boundary: the frozen BookModel (leg
+# tuple + numpy corr matrices + primitive dicts), the StructuralConfigView, and
+# scalar ints/floats — never a live ExposureBook, marginal provider, or engine.
+
+
+@dataclass(frozen=True, slots=True)
+class BookRiskInputs:
+    """The IMMUTABLE inputs one off-loop book-risk MC run reads.
+
+    ``model`` is the frozen ``BookModel`` (built on-loop from a generation-stamped
+    read of the positions). ``input_generation`` is the ``ExposureBook``
+    position generation captured at that read; the returned snapshot carries it so
+    the publisher can discard a result whose generation has since been superseded
+    (P0-2). Everything here is picklable and frozen, so shipping it to a worker
+    process cannot race a concurrent book mutation."""
+
+    model: BookModel
+    n_samples: int
+    seed: int
+    band: str
+    bankroll_cc: int | None
+    structural_cfg: StructuralConfigView | None
+    current_equity_cc: int | None
+    ruin_floor_frac: float
+    input_generation: int
+
+
+def _worker_book_risk(inputs: BookRiskInputs) -> BookRiskSnapshot:
+    """The function the pool runs. Reuses the engine's OWN compute_book_risk on the
+    immutable BookModel — identical to the inline result (same pure code, same
+    seed). Stamps ``input_generation`` so a stale result is discarded on publish."""
+    return compute_book_risk(
+        inputs.model,
+        n_samples=inputs.n_samples,
+        seed=inputs.seed,
+        band=inputs.band,
+        bankroll_cc=inputs.bankroll_cc,
+        structural_cfg=inputs.structural_cfg,
+        current_equity_cc=inputs.current_equity_cc,
+        ruin_floor_frac=inputs.ruin_floor_frac,
+        input_generation=inputs.input_generation,
+    )
+
+
+class BookRiskPool:
+    """Runs the full-book MC in a worker process so it never blocks the event loop.
+
+    Mirrors ``JointPool``: a small ``ProcessPoolExecutor`` and a single async
+    ``run`` that ``await``s the worker (yielding control to the loop, which keeps
+    beating the supervisor heartbeat while the MC computes). NO deadline: unlike a
+    one-shot RFQ price, the book-risk snapshot is a maintenance artifact — if a run
+    is slow it simply publishes late and the previous snapshot ages out (the
+    freshness guard then fails the CVaR cap CLOSED, never open). One worker is
+    enough (the recompute is throttled to well inside the freshness window)."""
+
+    def __init__(self, *, workers: int = 1) -> None:
+        self._workers = max(1, workers)
+        self._executor: ProcessPoolExecutor | None = None
+        self.calls = 0
+        self.errors = 0
+
+    def start(self) -> None:
+        self._executor = ProcessPoolExecutor(max_workers=self._workers)
+        log.info("book_risk_pool_started", workers=self._workers)
+
+    async def run(self, inputs: BookRiskInputs) -> BookRiskSnapshot:
+        """Run the full-book MC in a worker and return its snapshot. Awaiting the
+        future yields the loop so the heartbeat keeps beating during the MC."""
+        if self._executor is None:
+            raise RuntimeError("BookRiskPool.run before start()")
+        self.calls += 1
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(
+                self._executor, _worker_book_risk, inputs
+            )
+        except Exception:
+            self.errors += 1
+            raise
+
+    def shutdown(self) -> None:
+        if self._executor is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
+            log.info("book_risk_pool_stopped", calls=self.calls, errors=self.errors)

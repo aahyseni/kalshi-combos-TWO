@@ -39,7 +39,7 @@ from combomaker.marketdata.metadata import MetadataCache
 from combomaker.ops.logging import get_logger
 from combomaker.ops.metrics import Metrics
 from combomaker.ops.persistence import Store
-from combomaker.ops.pricing_pool import JointPool
+from combomaker.ops.pricing_pool import BookRiskInputs, BookRiskPool, JointPool
 from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.fees import FeeModel, FeeType, FeeUnknownError
 from combomaker.pricing.quote import ConstructedQuote, NoQuote
@@ -184,6 +184,7 @@ class QuoteLifecycle:
         fee_type: FeeType = FeeType.QUADRATIC,
         fee_multiplier: Fraction = Fraction(1),
         joint_pool: JointPool | None = None,
+        book_risk_pool: BookRiskPool | None = None,
     ) -> None:
         self._clock = clock
         self._sender = sender
@@ -192,6 +193,13 @@ class QuoteLifecycle:
         # expensive joint step in a worker process with a deadline so a cold combo
         # can never wedge the loop. None ⇒ inline pricing (backtests, paper, tests).
         self._joint_pool = joint_pool
+        # P2-2: when set, the full-book portfolio MC runs in a WORKER PROCESS off
+        # the event loop (on the immutable BookModel, generation-safe), so a large
+        # book's MC can never block the maintenance loop long enough to starve the
+        # supervisor heartbeat. None ⇒ the MC runs INLINE on the maintenance tick
+        # (backtests, paper, tests, and any embedding without the pool) — same
+        # numbers, just on-loop.
+        self._book_risk_pool = book_risk_pool
         self._filter = rfq_filter
         self._limits = limits
         self._exposure = exposure
@@ -235,6 +243,13 @@ class QuoteLifecycle:
         # (half of it) so the snapshot stays fresh without running a full MC every
         # 0.5s maintenance tick. None ⇒ never refreshed yet.
         self._book_risk_refresh_mono_ns: int | None = None
+        # P2-2: the in-flight OFF-LOOP recompute task, if any. The maintenance tick
+        # LAUNCHES the off-loop MC as a background task and returns IMMEDIATELY (it
+        # never awaits the MC), so the maintenance loop keeps beating the heartbeat
+        # on its 0.5s cadence while the MC runs in a worker process. A single-flight
+        # guard: a new recompute is not launched while the previous one is still
+        # running (its result publishes when it finishes).
+        self._book_risk_task: asyncio.Task[None] | None = None
         # Fill-velocity governor: a rolling committed-notional + count window over
         # our OWN acceptances, built from the SAME RiskLimits the caps use. A
         # burst over the soft frac / max fills DECLINEs further confirms +
@@ -330,11 +345,94 @@ class QuoteLifecycle:
 
     # ------------------------------------------------ portfolio-CVaR book risk
 
+    def _build_book_risk_inputs(self) -> BookRiskInputs:
+        """Build the IMMUTABLE inputs for one full-book MC run, on the loop.
+
+        This is the ONLY on-loop work of a recompute: capture the position
+        generation (P0-2), read the positions, and build the frozen ``BookModel``.
+        It is cheap relative to the MC itself, so it never starves the loop; the
+        expensive ``compute_book_risk`` runs on the returned frozen model, either
+        inline (``recompute_book_risk``) or in a worker process
+        (``recompute_book_risk_offloop``).
+
+        P0-2: the generation is captured BEFORE reading the positions and stamped
+        into the returned inputs, so the snapshot the MC produces is tagged with
+        the generation of the exact portfolio it prices. If a
+        fill/settlement/rehydration/reconciliation/reservation bumps the position
+        generation while the (off-loop) MC runs, ``_publish_book_risk`` /
+        ``_book_risk_for_check`` discard the result immediately (its
+        ``input_generation`` is stale) rather than trusting a still-time-fresh
+        snapshot of a superseded portfolio. (Bare quote mutations do NOT bump the
+        position generation — the MC prices positions only — so quote churn never
+        spuriously invalidates a still-consistent snapshot.)"""
+        gen = self._exposure.position_generation
+        positions = list(self._exposure.positions.values())
+        model = build_book_model(
+            positions,
+            marginals=self._marginals,
+            within_game_rho=self._within_game_rho,
+        )
+        return BookRiskInputs(
+            model=model,
+            n_samples=self._config.book_risk_mc_samples,
+            seed=self._config.book_risk_seed,
+            band="high",
+            bankroll_cc=self._risk_bankroll_cc(),
+            structural_cfg=self._structural_cfg,
+            current_equity_cc=self._balance.exchange_equity_cc_or_none()
+            if self._balance is not None
+            else None,
+            ruin_floor_frac=self._config.ruin_floor_frac,
+            input_generation=gen,
+        )
+
+    def _publish_book_risk(self, snap: BookRiskSnapshot) -> None:
+        """Publish a fresh MC snapshot — but ONLY if it still describes the CURRENT
+        portfolio (P2-2 generation-safety).
+
+        A snapshot computed off the event loop can finish AFTER a fill/settlement/
+        reconciliation/reservation mutated the book. Its ``input_generation`` is the
+        position generation it was built against; if the live position generation
+        has moved on, the snapshot prices a SUPERSEDED portfolio and is DISCARDED
+        (never published — the previous snapshot then ages out and the freshness
+        guard fails the cap CLOSED, the safe direction). Only a still-current
+        snapshot is stored. Cheap: one generation read + one clock read.
+
+        NOTE ``_book_risk_for_check`` re-checks the generation at READ time too, so
+        even a snapshot that was current at publish is re-invalidated the instant a
+        later fill supersedes it — this publish-time gate simply avoids storing a
+        DOA snapshot in the first place."""
+        if snap.input_generation != self._exposure.position_generation:
+            log.info(
+                "book_risk_snapshot_discarded_stale",
+                snapshot_generation=snap.input_generation,
+                live_generation=self._exposure.position_generation,
+            )
+            return
+        self._book_risk = snap
+        self._book_risk_mono_ns = self._clock.monotonic_ns()
+        if snap.usable:
+            log.info(
+                "book_risk_snapshot",
+                n_positions=snap.n_positions,
+                structural=self._structural_cfg is not None,
+                governing_model_es_99_cc=int(snap.governing_model_es_99_cc),
+                es_99_cc=int(snap.es_99_cc),
+                challenger_es_99_cc=int(snap.challenger_es_99_cc),
+                deterministic_max_loss_cc=int(snap.deterministic_max_loss_cc),
+                p_ruin=round(snap.p_ruin, 4),
+            )
+
     def recompute_book_risk(self) -> None:
         """Arm the portfolio-CVaR cap: build a fresh full-MC ``BookRiskSnapshot``
         over the REAL book and store it (with the monotonic time it was built).
 
-        Runs OFF the hot path (the slow/maintenance loop) — never inside check().
+        INLINE variant — the MC runs on the calling thread. Used by backtests,
+        paper mode, unit tests, and any embedding without a ``book_risk_pool``. The
+        live async loop prefers ``recompute_book_risk_offloop`` so the MC never
+        blocks the loop; this variant is the byte-identical on-loop fallback (same
+        seed, same immutable model ⇒ same snapshot).
+
         The book model threads the PRICER's real ``within_game_rho`` (so the joint
         tail carries the shipped per-pair correlations, not the flat default band)
         and the live ``bankroll_cc`` (so the ruin thresholds populate). An empty
@@ -345,50 +443,48 @@ class QuoteLifecycle:
         (the freshness guard in ``_book_risk_for_check`` then fails the cap closed
         for a non-empty book) rather than crashing the maintenance tick."""
         try:
-            # P0-2: capture the POSITION generation BEFORE reading the positions, so
-            # the snapshot is stamped with the generation of the exact portfolio it
-            # prices. If a fill/settlement/rehydration/reconciliation/reservation
-            # bumps the position generation while this (async, off-loop) MC runs,
-            # ``_book_risk_for_check`` discards the result immediately (its
-            # input_generation is stale), rather than trusting a still-time-fresh
-            # snapshot of a superseded portfolio. (Bare quote mutations do NOT bump
-            # the position generation — the MC prices positions only — so quote churn
-            # never spuriously invalidates a still-consistent snapshot.)
-            gen = self._exposure.position_generation
-            positions = list(self._exposure.positions.values())
-            model = build_book_model(
-                positions,
-                marginals=self._marginals,
-                within_game_rho=self._within_game_rho,
-            )
+            inputs = self._build_book_risk_inputs()
             snap = compute_book_risk(
-                model,
-                n_samples=self._config.book_risk_mc_samples,
-                seed=self._config.book_risk_seed,
-                band="high",
-                bankroll_cc=self._risk_bankroll_cc(),
-                structural_cfg=self._structural_cfg,
-                current_equity_cc=self._balance.exchange_equity_cc_or_none()
-                if self._balance is not None
-                else None,
-                ruin_floor_frac=self._config.ruin_floor_frac,
-                input_generation=gen,
+                inputs.model,
+                n_samples=inputs.n_samples,
+                seed=inputs.seed,
+                band=inputs.band,
+                bankroll_cc=inputs.bankroll_cc,
+                structural_cfg=inputs.structural_cfg,
+                current_equity_cc=inputs.current_equity_cc,
+                ruin_floor_frac=inputs.ruin_floor_frac,
+                input_generation=inputs.input_generation,
             )
-            self._book_risk = snap
-            self._book_risk_mono_ns = self._clock.monotonic_ns()
-            if snap.usable:
-                log.info(
-                    "book_risk_snapshot",
-                    n_positions=snap.n_positions,
-                    structural=self._structural_cfg is not None,
-                    governing_model_es_99_cc=int(snap.governing_model_es_99_cc),
-                    es_99_cc=int(snap.es_99_cc),
-                    challenger_es_99_cc=int(snap.challenger_es_99_cc),
-                    deterministic_max_loss_cc=int(snap.deterministic_max_loss_cc),
-                    p_ruin=round(snap.p_ruin, 4),
-                )
+            # Inline path builds the model and runs the MC without yielding, so the
+            # generation cannot move between build and store; the publish gate is a
+            # harmless no-op here (and keeps the store logic in one place).
+            self._publish_book_risk(snap)
         except Exception:
             log.exception("book_risk_recompute_failed")
+
+    async def recompute_book_risk_offloop(self) -> None:
+        """OFF-LOOP variant (P2-2): run the full-book MC in a worker PROCESS on the
+        immutable ``BookModel`` so it never blocks the event loop / heartbeat.
+
+        The cheap prefix (capture generation + build the frozen model) runs on the
+        loop; the expensive ``compute_book_risk`` is shipped to ``book_risk_pool``
+        and ``await``ed — yielding control so the maintenance loop keeps beating the
+        supervisor heartbeat while the MC computes. The returned snapshot is stamped
+        with the generation it was built against and passed through
+        ``_publish_book_risk``, which DISCARDS it if a fill/settlement/reservation
+        superseded the book since (generation-safe).
+
+        Falls back to the inline path when no pool is wired. Never raises on the
+        loop (any failure ages out the last snapshot ⇒ fail-closed)."""
+        if self._book_risk_pool is None:
+            self.recompute_book_risk()
+            return
+        try:
+            inputs = self._build_book_risk_inputs()
+            snap = await self._book_risk_pool.run(inputs)
+            self._publish_book_risk(snap)
+        except Exception:
+            log.exception("book_risk_recompute_offloop_failed")
 
     def _book_risk_for_check(self) -> PortfolioRisk | None:
         """The book-risk snapshot to feed ``check()``'s portfolio-CVaR cap.
@@ -1163,21 +1259,45 @@ class QuoteLifecycle:
     def _maybe_recompute_book_risk(self) -> None:
         """Refresh the portfolio-CVaR snapshot off the maintenance tick, throttled
         to half the freshness window so it stays fresh without running a full MC
-        every 0.5s. The MC itself is off the hot path (never inside check())."""
+        every 0.5s.
+
+        With a ``book_risk_pool`` (live async loop): the MC runs in a WORKER PROCESS
+        and this LAUNCHES it as a background task, returning IMMEDIATELY — the
+        maintenance tick NEVER awaits the MC, so the maintenance loop keeps beating
+        the supervisor heartbeat on its 0.5s cadence no matter how long the MC
+        takes. A single-flight guard skips launching a new run while the previous
+        one is still in flight. Without a pool (paper/backtests/tests): the MC runs
+        INLINE (it is fast there) and this stays synchronous.
+
+        The throttle timestamp is set only when a run is actually
+        launched/performed, so a skipped tick (still in flight, or inside the
+        throttle window) does not slide the window forward."""
         now = self._clock.monotonic_ns()
         interval_ns = int(self._config.book_risk_stale_after_s / 2 * 1e9)
         last = self._book_risk_refresh_mono_ns
         if last is not None and now - last < interval_ns:
             return
+        if self._book_risk_pool is None:
+            # No worker pool ⇒ the MC is cheap enough to run inline (paper/tests).
+            self._book_risk_refresh_mono_ns = now
+            self.recompute_book_risk()
+            return
+        # Single-flight: never stack a second off-loop MC on top of a running one.
+        if self._book_risk_task is not None and not self._book_risk_task.done():
+            return
         self._book_risk_refresh_mono_ns = now
-        self.recompute_book_risk()
+        # Fire-and-forget: the task publishes its (generation-checked) result when
+        # the worker finishes; the maintenance tick returns now and keeps beating.
+        self._book_risk_task = asyncio.ensure_future(self.recompute_book_risk_offloop())
 
     async def maintenance_tick(self) -> None:
         """TTL expiry + reprice + P&L mark + daily-loss halt. Every few 100ms."""
         self._refresh_daily_pnl()
         # Arm/refresh the portfolio-CVaR book-risk snapshot (throttled, off the hot
         # path) BEFORE the check below reads it, so the maintenance-driven halt
-        # escalation sees a current joint-tail figure.
+        # escalation sees a current joint-tail figure. With a book_risk_pool this
+        # LAUNCHES the MC in a worker and returns immediately (never blocks the tick
+        # / heartbeat); without one it runs inline (fast in paper/tests).
         self._maybe_recompute_book_risk()
         if not self._killswitch.halted:
             breaches = self._partition_breaches(
