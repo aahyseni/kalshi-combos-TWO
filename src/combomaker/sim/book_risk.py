@@ -56,6 +56,7 @@ from combomaker.sim.engine import (
     sample_leg_values,
 )
 from combomaker.sim.structural_book import (
+    GamePlan,
     StructuralConfigView,
     build_game_plans,
     sample_structural_values,
@@ -140,7 +141,19 @@ class BookRiskSnapshot:
     # structural/same-game hedge — a balancing fill can lower them.
     production_es_99_cc: float = 0.0  # production-copula CVaR (mirror of es_99_cc)
     challenger_es_99_cc: float = 0.0  # correlation-inflated challenger CVaR
-    governing_model_es_99_cc: float = 0.0  # max(production, challenger) — the model gate
+    # P0-7: full-copula same-game dependence-bridge challenger CVaR. The structural
+    # split samples a game's structural block and its copula-only block SEPARATELY,
+    # discarding their same-game cross-block dependence. When a game straddles both
+    # blocks, the book is ALSO re-sampled full-copula (all same-game pairs coupled
+    # through the block correlation, at the CHALLENGER-inflated matrix) and its ES is
+    # folded into the governing model tail (gate on the WORSE tail). 0.0 when no game
+    # straddles both blocks (no bridge needed) or structural sampling is off.
+    bridge_es_99_cc: float = 0.0
+    # True iff the full-copula bridge challenger ran (a game held both a structural
+    # and a copula leg) — observability that the interim worse-tail gate is active,
+    # NOT a claim of exact all-leg hedging across the two blocks.
+    bridge_active: bool = False
+    governing_model_es_99_cc: float = 0.0  # max(production, challenger, bridge) — model gate
     # DETERMINISTIC maximum loss: exact all-hit premium-at-risk (+ reserved
     # holdings). A hard upper bound the sampled ES can never exceed — gated as its
     # OWN axis (premium-at-risk cap), never maxed into the ES number.
@@ -330,19 +343,77 @@ _Sampler = Callable[
 ]
 
 
+@dataclass(frozen=True, slots=True)
+class _SamplerBundle:
+    """The value sampler for a model PLUS the structural/copula split it was built
+    from — enough for P0-7's same-game dependence bridge to decide whether the
+    structural split is discarding cross-block dependence (and therefore whether a
+    full-copula challenger must be run and gated on the worse tail).
+
+    ``sampler`` is the (legs, corr, n, rng) callable ``compute_book_risk`` /
+    ``evaluate_candidate_book_risk`` already use. ``structural`` is True iff the
+    sampler is the STRUCTURAL split (some game inverted); False ⇒ the whole book is
+    Gaussian-copula sampled and no bridge is needed (the copula ALREADY carries
+    every same-game cross-block pair through the block correlation).
+    ``bridge_needed`` is True iff at least one game holds BOTH a structural leg and
+    a copula leg — the exact case the structural split samples SEPARATELY (its two
+    blocks draw from independent rng calls), discarding that game's structural↔
+    copula dependence. When True the caller runs a full-copula challenger and gates
+    on the worse tail (P0-7 interim)."""
+
+    sampler: _Sampler
+    structural: bool
+    bridge_needed: bool
+
+
+def _bridge_needed(
+    model: BookModel, plans: Sequence[GamePlan], copula_idx: Sequence[int]
+) -> bool:
+    """True iff some game has BOTH a structural leg (in a plan) and a copula leg.
+
+    The structural split samples the structural block (per game, from the scoreline
+    model) and the copula block (the remaining legs) from SEPARATE rng calls, so any
+    game that straddles the two blocks — a structural scoreline leg AND a copula-only
+    corners/cards leg on the SAME game — has its cross-block dependence discarded.
+    Grouping uses the pricer's own ``game_key`` on each leg's event ticker (the same
+    key the copula correlates on), so a copula leg with no game (``game_key`` None)
+    can never straddle a structural game (fail-closed: an ungamed copula leg never
+    triggers — nor suppresses — the bridge)."""
+    from combomaker.pricing.grouping import game_key
+
+    structural_games: set[str] = set()
+    for plan in plans:
+        for gidx in plan.global_indices:
+            event = model.event_by_index.get(gidx)
+            if event:
+                structural_games.add(game_key(event))
+    if not structural_games:
+        return False
+    for cidx in copula_idx:
+        event = model.event_by_index.get(cidx)
+        if event and game_key(event) in structural_games:
+            return True
+    return False
+
+
 def _select_sampler(
     model: BookModel, structural_cfg: StructuralConfigView | None
-) -> _Sampler:
-    """The value sampler for this model (A1 structural seam).
+) -> _SamplerBundle:
+    """The value sampler for this model (A1 structural seam) + its P0-7 bridge flag.
 
     With a ``structural_cfg`` the games Dixon-Coles can invert are sampled from the
     joint scoreline (every same-game hedge/exclusion exact, no rho) and only the
     copula legs (corners/cards/other sports) use the Gaussian copula; without it
     the whole book is copula-sampled (byte-identical to before). Extracted verbatim
     from ``compute_book_risk`` so the candidate-aware evaluator reuses the EXACT
-    same seam (hard rule 8) rather than reimplementing the dispatch."""
+    same seam (hard rule 8) rather than reimplementing the dispatch.
+
+    P0-7: also reports whether the structural split is discarding same-game cross-
+    block dependence (``bridge_needed``), so the caller can run a full-copula
+    challenger and gate on the worse tail. The plain copula sampler needs no bridge
+    (it already carries every same-game pair through the block correlation)."""
     if structural_cfg is None:
-        return sample_leg_values
+        return _SamplerBundle(sample_leg_values, structural=False, bridge_needed=False)
     tickers = [""] * len(model.legs)
     for ticker, i in model.leg_index.items():
         tickers[i] = ticker
@@ -358,7 +429,11 @@ def _select_sampler(
     ) -> NDArray[np.float64]:
         return sample_structural_values(plans, copula_idx, leg_models, c, n_draw, r)
 
-    return _structural_sampler
+    return _SamplerBundle(
+        _structural_sampler,
+        structural=bool(plans),
+        bridge_needed=_bridge_needed(model, plans, copula_idx),
+    )
 
 
 def compute_book_risk(
@@ -428,11 +503,15 @@ def compute_book_risk(
         )
 
     corr = model.corr_for_band(band)
-    _sampler = _select_sampler(model, structural_cfg)
-    # Two INDEPENDENT, reproducible RNG substreams (production + challenger) via
-    # SeedSequence.spawn — never `seed`/`seed+1`, which are correlated streams
-    # (M2 §4.3). Both derive deterministically from the single ``seed``.
-    seq_prod, seq_chal = np.random.SeedSequence(seed).spawn(2)
+    bundle = _select_sampler(model, structural_cfg)
+    _sampler = bundle.sampler
+    # THREE INDEPENDENT, reproducible RNG substreams (production + challenger +
+    # P0-7 full-copula bridge) via SeedSequence.spawn — never `seed`/`seed+1`,
+    # which are correlated streams (M2 §4.3). All derive deterministically from the
+    # single ``seed``. The third substream is consumed only when the bridge runs;
+    # spawning it unconditionally keeps the production/challenger streams identical
+    # whether or not the bridge fires (no determinism drift on the common path).
+    seq_prod, seq_chal, seq_bridge = np.random.SeedSequence(seed).spawn(3)
     rng = np.random.default_rng(seq_prod)
     values = _sampler(model.legs, corr, n_samples, rng)
 
@@ -479,6 +558,23 @@ def compute_book_risk(
     book_c = _book_pnl_from_values(values_c, model.positions)
     _, challenger_es = _es_from_pnl(book_c, HEADLINE_LEVEL)
 
+    # --- P0-7: same-game dependence bridge (full-copula challenger) ------------
+    # When the structural split straddles a game (a structural scoreline leg AND a
+    # copula-only corners/cards leg on the SAME game), the split samples those two
+    # blocks from SEPARATE rng calls and discards their same-game cross-block
+    # dependence. Re-sample the WHOLE book full-copula (every same-game pair coupled
+    # through the block correlation, at the challenger-inflated matrix) and gate on
+    # the WORSE tail — the interim bridge (we do NOT claim exact all-leg hedging).
+    # The plain copula path already couples every same-game pair, so no bridge is
+    # needed there.
+    bridge_es = 0.0
+    bridge_active = bundle.bridge_needed
+    if bridge_active:
+        rng_b = np.random.default_rng(seq_bridge)  # spawned substream (M2 §4.3)
+        values_b = sample_leg_values(model.legs, challenger_corr, n_samples, rng_b)
+        book_b = _book_pnl_from_values(values_b, model.positions)
+        _, bridge_es = _es_from_pnl(book_b, HEADLINE_LEVEL)
+
     # --- deterministic stress: exact all-hit worst case -----------------------
     # P0-4: add the CONSERVATIVELY-RESERVED holdings' exact premium as a
     # deterministic reserve OUTSIDE model ES. The sampled ES/challenger cover only
@@ -490,8 +586,10 @@ def compute_book_risk(
     # P0-3: the governing MODEL tail is the worst SAMPLED CVaR across scenarios —
     # NOT maxed with the deterministic maximum. The deterministic maximum is a
     # separate axis (deterministic_max_loss_cc), gated independently, so it can no
-    # longer dominate and silence the sampled ES.
-    governing_model_es = max(es_99, challenger_es)
+    # longer dominate and silence the sampled ES. P0-7: the full-copula bridge ES
+    # (present only when a game straddles both blocks) joins the max — gate on the
+    # worse of the structural-split and full-copula tails.
+    governing_model_es = max(es_99, challenger_es, bridge_es)
 
     return BookRiskSnapshot(
         unknown=False,
@@ -510,6 +608,8 @@ def compute_book_risk(
         p_ruin=p_ruin,
         production_es_99_cc=es_99,
         challenger_es_99_cc=challenger_es,
+        bridge_es_99_cc=bridge_es,
+        bridge_active=bridge_active,
         governing_model_es_99_cc=governing_model_es,
         deterministic_max_loss_cc=deterministic_max,
         per_game_tail_cc=per_game_tail,
@@ -610,16 +710,29 @@ def _tail_axes_from_pnl(
     challenger_pnl: NDArray[np.float64] | None,
     current_equity_cc: int | None,
     ruin_floor_cc: float | None,
+    bridge_pnl: NDArray[np.float64] | None = None,
 ) -> _TailAxes:
     """Roll a per-scenario book P&L vector (and its correlation-inflated
-    challenger re-sample) into the separated tail axes (P0-3 separation preserved:
-    the sampled model ES is NEVER max'd with the deterministic maximum)."""
+    challenger re-sample, plus the optional P0-7 full-copula bridge re-sample)
+    into the separated tail axes (P0-3 separation preserved: the sampled model ES
+    is NEVER max'd with the deterministic maximum).
+
+    ``bridge_pnl`` (P0-7) is the full-copula same-game dependence-bridge re-sample,
+    present only when the structural split straddles a game (a structural leg AND a
+    copula leg on the SAME game, whose cross-block dependence the split discards).
+    Its ES joins the governing max so the model tail gates on the WORSE of the
+    structural-split and full-copula tails. None ⇒ no bridge (plain copula, or no
+    straddling game) ⇒ it never enters the max."""
     ev = float(pnl.mean()) if pnl.size else 0.0
     _, es = _es_from_pnl(pnl, HEADLINE_LEVEL)
     if challenger_pnl is not None and challenger_pnl.size:
         _, challenger_es = _es_from_pnl(challenger_pnl, HEADLINE_LEVEL)
     else:
         challenger_es = 0.0
+    if bridge_pnl is not None and bridge_pnl.size:
+        _, bridge_es = _es_from_pnl(bridge_pnl, HEADLINE_LEVEL)
+    else:
+        bridge_es = 0.0
     p_ruin = 0.0
     if current_equity_cc is not None and ruin_floor_cc is not None and pnl.size:
         p_ruin = float(np.mean(current_equity_cc + pnl < ruin_floor_cc))
@@ -627,7 +740,7 @@ def _tail_axes_from_pnl(
         ev_cc=ev,
         es_99_cc=es,
         challenger_es_99_cc=challenger_es,
-        governing_model_es_99_cc=max(es, challenger_es),
+        governing_model_es_99_cc=max(es, challenger_es, bridge_es),
         deterministic_max_loss_cc=deterministic_max_loss_cc,
         gross_settlement_notional_cc=gross_cc,
         p_ruin=p_ruin,
@@ -766,14 +879,21 @@ def evaluate_candidate_book_risk(
     # the merged universe has no sampleable legs (e.g. an all-reserved book plus a
     # reserved candidate) there is nothing to sample: PRE/POST P&L are empty and the
     # tail axes fall back to their deterministic reserves only.
+    pre_bridge_pnl: NDArray[np.float64] | None = None
+    post_bridge_pnl: NDArray[np.float64] | None = None
     if model.legs:
         corr = model.corr_for_band(band)
         # P0-8: same-game-only inflation; cross-game rho preserved.
         challenger_corr = _inflate_corr(
             corr, challenger_inflation, _same_game_mask(model)
         )
-        sampler = _select_sampler(model, structural_cfg)
-        seq_prod, seq_chal = np.random.SeedSequence(seed).spawn(2)
+        bundle = _select_sampler(model, structural_cfg)
+        sampler = bundle.sampler
+        # THREE substreams (production + challenger + P0-7 bridge). The bridge
+        # substream is spawned unconditionally so the production/challenger streams
+        # match whether or not the bridge fires (no determinism drift), and consumed
+        # only when the structural split straddles a game.
+        seq_prod, seq_chal, seq_bridge = np.random.SeedSequence(seed).spawn(3)
         values = sampler(
             model.legs, corr, n_samples, np.random.default_rng(seq_prod)
         )
@@ -784,6 +904,17 @@ def evaluate_candidate_book_risk(
         post_pnl = book_pnl(values, post_combos)
         pre_pnl_c = book_pnl(values_c, pre_combos)
         post_pnl_c = book_pnl(values_c, post_combos)
+        # P0-7: full-copula bridge (only when a game straddles both blocks). Scores
+        # PRE and POST on the SAME full-copula matrix (common random numbers) so the
+        # candidate's marginal effect on the bridge tail is measured directly; the
+        # bridge ES then joins each book's governing max (gate on the worse tail).
+        if bundle.bridge_needed:
+            values_b = sample_leg_values(
+                model.legs, challenger_corr, n_samples,
+                np.random.default_rng(seq_bridge),
+            )
+            pre_bridge_pnl = book_pnl(values_b, pre_combos)
+            post_bridge_pnl = book_pnl(values_b, post_combos)
     else:
         empty_pnl = np.zeros(0, dtype=np.float64)
         pre_pnl = post_pnl = pre_pnl_c = post_pnl_c = empty_pnl
@@ -798,6 +929,7 @@ def evaluate_candidate_book_risk(
         challenger_pnl=pre_pnl_c,
         current_equity_cc=current_equity_cc,
         ruin_floor_cc=ruin_floor_cc,
+        bridge_pnl=pre_bridge_pnl,
     )
     post_axes = _tail_axes_from_pnl(
         post_pnl,
@@ -806,6 +938,7 @@ def evaluate_candidate_book_risk(
         challenger_pnl=post_pnl_c,
         current_equity_cc=current_equity_cc,
         ruin_floor_cc=ruin_floor_cc,
+        bridge_pnl=post_bridge_pnl,
     )
     candidate_ev = post_axes.ev_cc - pre_axes.ev_cc
 
