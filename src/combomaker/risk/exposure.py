@@ -40,6 +40,7 @@ when a side of our quote is hit).
 
 from __future__ import annotations
 
+import hashlib
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -97,6 +98,30 @@ class LegRef:
     market_ticker: str
     event_ticker: str | None
     side: str  # selected side, "yes"|"no" (validated upstream)
+
+
+def leg_set_hash(legs: Iterable[LegRef]) -> str:
+    """Stable, order-independent identity of a combo's leg SET for the durable
+    position ledger (P1.10). Two positions are the same combo iff their sets of
+    ``(market_ticker, side)`` selections are identical — so we canonicalise by
+    sorting the ``market_ticker|side`` pairs and hashing the joined string. This
+    is deterministic across processes/restarts (SHA-256, no salt), unlike Python's
+    hash randomisation, so the ledger's ``leg_set_hash`` is a durable join key.
+
+    Fail-closed (CLAUDE.md hard rule 6, defense #2): a combo with NO legs has no
+    identity to record, so we RAISE rather than emit a hash of the empty set that
+    would silently collide every leg-less write. The caller must have legs.
+
+    ``event_ticker`` is intentionally EXCLUDED: the market_ticker already uniquely
+    identifies the outcome market, and event_ticker is nullable on a ``LegRef``, so
+    including it would let a present/absent event split one real combo into two
+    ledger identities. Side IS included — YES M1 and NO M1 are different positions.
+    """
+    pairs = sorted(f"{leg.market_ticker}|{leg.side}" for leg in legs)
+    if not pairs:
+        raise ValueError("leg_set_hash: empty leg set has no durable identity")
+    joined = "\n".join(pairs)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)

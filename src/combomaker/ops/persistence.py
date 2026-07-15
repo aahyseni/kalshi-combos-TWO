@@ -25,6 +25,7 @@ from combomaker.rfq.models import Rfq
 
 if TYPE_CHECKING:
     from combomaker.pricing.fit_challenge import FitChallenge
+    from combomaker.risk.exposure import OpenPosition
 
 log = get_logger(__name__)
 
@@ -141,6 +142,36 @@ CREATE TABLE IF NOT EXISTS structural_fits (
 );
 CREATE INDEX IF NOT EXISTS idx_structural_fits_verdict ON structural_fits (verdict);
 CREATE INDEX IF NOT EXISTS idx_structural_fits_rfq ON structural_fits (rfq_id);
+
+-- P1.10 DURABLE POSITION LEDGER. One row per position (keyed on the exchange
+-- position_id) carrying the fields the audit plan mandates: exchange
+-- quantity/side, cost, fees, subaccount, status, settlement value, reconcile
+-- time, and the order-independent leg-set hash. This is the SOURCE OF TRUTH for
+-- what we hold and how it settled — distinct from the append-only `fills` tape
+-- (which can hold many fills per position). Money/quantities are int centi-
+-- units; a position is OPEN until a settlement row reconciles it to SETTLED.
+CREATE TABLE IF NOT EXISTS position_ledger (
+    position_id TEXT PRIMARY KEY,
+    opened_at TEXT NOT NULL,
+    combo_ticker TEXT NOT NULL,
+    collection_ticker TEXT,
+    subaccount TEXT NOT NULL,
+    our_side TEXT NOT NULL,            -- "yes" | "no" (exchange side we hold)
+    contracts_centi INTEGER NOT NULL, -- exchange quantity, centi-contracts
+    entry_price_cc INTEGER NOT NULL,  -- cost basis per contract, centi-cents
+    cost_cc INTEGER NOT NULL,         -- total premium PAID = max loss, centi-cents
+    fees_cc INTEGER NOT NULL,         -- fees paid to date, centi-cents
+    leg_set_hash TEXT NOT NULL,       -- durable order-independent combo identity
+    legs_json TEXT NOT NULL,
+    status TEXT NOT NULL,             -- "open" | "settled"
+    settled_value REAL,               -- V in [0,1], NULL until settled
+    realized_pnl_cc INTEGER,          -- NULL until settled
+    settlement_fee_cc INTEGER,        -- NULL until settled
+    reconciled_at TEXT                -- reconciliation time, NULL until settled
+);
+CREATE INDEX IF NOT EXISTS idx_position_ledger_ticker ON position_ledger (combo_ticker);
+CREATE INDEX IF NOT EXISTS idx_position_ledger_status ON position_ledger (status);
+CREATE INDEX IF NOT EXISTS idx_position_ledger_leghash ON position_ledger (leg_set_hash);
 """
 
 
@@ -361,6 +392,128 @@ class Store:
         )
         await self._db.commit()
 
+    async def record_position_open(
+        self,
+        position: OpenPosition,
+        *,
+        subaccount: str,
+        fees_cc: int = 0,
+    ) -> None:
+        """P1.10. Durably record an OPEN position in the ledger: exchange
+        quantity/side, cost basis, fees so far, subaccount, status, and the
+        order-independent leg-set hash. Keyed on ``position_id`` — an UPSERT so a
+        re-recorded open (rehydration / re-poll) is idempotent and never
+        duplicates a row NOR clobbers an already-SETTLED status back to open.
+
+        Fail-closed (defense #2): the leg-set hash is derived from the position's
+        REAL legs; a leg-less position raises rather than getting a placeholder
+        identity. Synchronous & committed like other risk-relevant records — this
+        is the source of truth for what we hold, not droppable tape."""
+        from combomaker.risk.exposure import leg_set_hash
+
+        lset_hash = leg_set_hash(position.legs)
+        legs_json = json.dumps(
+            [
+                {
+                    "market_ticker": leg.market_ticker,
+                    "event_ticker": leg.event_ticker,
+                    "side": leg.side,
+                }
+                for leg in position.legs
+            ]
+        )
+        cost_cc = int(position.max_loss_cc)
+        # UPSERT: on a replayed open, refresh mutable open-state (fees/legs) but
+        # PRESERVE any settlement already recorded — never regress SETTLED→open.
+        await self._db.execute(
+            "INSERT INTO position_ledger (position_id, opened_at, combo_ticker,"
+            " collection_ticker, subaccount, our_side, contracts_centi,"
+            " entry_price_cc, cost_cc, fees_cc, leg_set_hash, legs_json, status,"
+            " settled_value, realized_pnl_cc, settlement_fee_cc, reconciled_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, NULL, NULL)"
+            " ON CONFLICT(position_id) DO UPDATE SET"
+            "   fees_cc=excluded.fees_cc,"
+            "   legs_json=excluded.legs_json,"
+            "   leg_set_hash=excluded.leg_set_hash",
+            (
+                position.position_id,
+                self._now(),
+                position.combo_ticker,
+                position.collection,
+                subaccount,
+                position.our_side.value,
+                int(position.contracts),
+                int(position.entry_price_cc),
+                cost_cc,
+                int(fees_cc),
+                lset_hash,
+                legs_json,
+            ),
+        )
+        await self._db.commit()
+
+    async def record_position_settled(
+        self,
+        position_id: str,
+        *,
+        settled_value: float,
+        realized_pnl_cc: int,
+        settlement_fee_cc: int,
+    ) -> None:
+        """P1.10. Mark a ledger position SETTLED with the exchange settlement:
+        value V, realized P&L, settlement fee, and the reconciliation TIME (now).
+        Only transitions an existing OPEN row — an unknown/already-settled
+        position_id is a no-op (idempotent re-poll), matching the settlement
+        handler's own per-id dedup. Synchronous & committed (audit trail)."""
+        await self._db.execute(
+            "UPDATE position_ledger SET status='settled', settled_value=?,"
+            " realized_pnl_cc=?, settlement_fee_cc=?,"
+            " fees_cc=fees_cc + ?, reconciled_at=?"
+            " WHERE position_id=? AND status='open'",
+            (
+                float(settled_value),
+                int(realized_pnl_cc),
+                int(settlement_fee_cc),
+                int(settlement_fee_cc),
+                self._now(),
+                position_id,
+            ),
+        )
+        await self._db.commit()
+
+    async def ledger_position(self, position_id: str) -> JsonDict | None:
+        """Read one ledger row by position_id (reports/tests). None if absent."""
+        async with self._db.execute(
+            "SELECT position_id, opened_at, combo_ticker, collection_ticker,"
+            " subaccount, our_side, contracts_centi, entry_price_cc, cost_cc,"
+            " fees_cc, leg_set_hash, legs_json, status, settled_value,"
+            " realized_pnl_cc, settlement_fee_cc, reconciled_at"
+            " FROM position_ledger WHERE position_id = ?",
+            (position_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "position_id": row[0],
+            "opened_at": row[1],
+            "combo_ticker": row[2],
+            "collection_ticker": row[3],
+            "subaccount": row[4],
+            "our_side": row[5],
+            "contracts_centi": int(row[6]),
+            "entry_price_cc": int(row[7]),
+            "cost_cc": int(row[8]),
+            "fees_cc": int(row[9]),
+            "leg_set_hash": row[10],
+            "legs": json.loads(row[11]),
+            "status": row[12],
+            "settled_value": row[13],
+            "realized_pnl_cc": None if row[14] is None else int(row[14]),
+            "settlement_fee_cc": None if row[15] is None else int(row[15]),
+            "reconciled_at": row[16],
+        }
+
     async def record_fill(
         self,
         fill_ref: str,
@@ -481,6 +634,7 @@ class Store:
             "markouts",
             "ev_ledger",
             "structural_fits",
+            "position_ledger",
         }:
             raise ValueError(f"unknown table {table!r}")
         async with self._db.execute(f"SELECT COUNT(*) FROM {table}") as cursor:  # noqa: S608
