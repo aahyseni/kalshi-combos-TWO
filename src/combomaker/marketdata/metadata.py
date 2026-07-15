@@ -80,6 +80,27 @@ class MetadataCache:
         """In-memory lookup only — hot-path safe, no network ever."""
         return self._markets.get(ticker)
 
+    def put_combo_grid(self, ticker: str, grid: PriceGrid) -> None:
+        """Inject a combo market's grid WITHOUT a network fetch (throughput fix,
+        2026-07-14). Combo market tickers are UNIQUE per RFQ, so fetching each
+        combo's grid is a per-RFQ REST read that blows the read-rate budget (live
+        429 storm). But every combo in a collection shares one grid structure, so
+        the quote app fetches the grid ONCE per collection and injects it here for
+        the collection's other combos. Only the grid is read downstream
+        (construct_quote); the combo's own event/close metadata is never used (the
+        pregame gate keys on LEG metadata, and the metadata-change breaker samples
+        the book's LEG markets, not the combo)."""
+        self._markets[ticker] = MarketMeta(
+            ticker=ticker,
+            status="active",
+            grid=grid,
+            event_ticker=None,
+            close_time=None,
+            expected_expiration_time=None,
+            raw={},
+            fetched_mono_ns=self._clock.monotonic_ns(),
+        )
+
     async def market(self, ticker: str, *, max_age_s: float | None = None) -> MarketMeta:
         cached = self._markets.get(ticker)
         budget = self._ttl_s if max_age_s is None else max_age_s

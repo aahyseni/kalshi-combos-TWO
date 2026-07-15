@@ -87,6 +87,8 @@ def _rfq(rfq_id: str):  # noqa: ANN202 (test helper; returns Rfq)
 
 
 def _accept(quote_id: str, *, contracts_fp: str = "10.00") -> dict[str, object]:
+    # Real Kalshi quote_accepted WS shape: contracts-mode carries the count in
+    # contracts_accepted_fp (docs.kalshi.com/websockets/communications).
     return {
         "quote_id": quote_id,
         "rfq_id": "rfq",

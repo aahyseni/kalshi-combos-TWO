@@ -148,6 +148,8 @@ class RfqFilter:
             reasons.append(ReasonCode.SKIP_INPLAY_LEG)
         if status.any_unknown:
             reasons.append(ReasonCode.SKIP_START_TIME_UNKNOWN)
+        if status.any_too_far:
+            reasons.append(ReasonCode.SKIP_GAME_TOO_FAR)
         return reasons
 
     def _size_reasons(self, rfq: Rfq) -> list[ReasonCode]:

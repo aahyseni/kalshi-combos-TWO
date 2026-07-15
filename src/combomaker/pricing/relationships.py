@@ -116,6 +116,16 @@ class Relationship:
     # bare 2-leg pair itself never records here (it keeps the OK/sgp path,
     # bit-identical). Empty for every other kind.
     conditionals: tuple[tuple[int, int], ...] = ()
+    # NESTED_BAND with a same-game NEIGHBOUR (2026-07-14). A containment WINDOW
+    # (ml×spread / ladder rung) whose game ALSO carries a 3rd same-game leg used to
+    # decline UNKNOWN: the super-leg collapse can't correlate a non-monotone window
+    # with a same-game neighbour (its ρ is the rung's, attenuated by an unmeasured
+    # factor). But the STRUCTURAL scoreline model prices P(window ∧ neighbour)
+    # DIRECTLY (a scoreline region — validated: FRA win ∧ ¬cover ∧ total priced
+    # exact + arb-safe). So the engine routes these to structural and declines only
+    # if structural can't represent the legs (corners / MLB / multi-game), never a
+    # copula guess. Set only on that NESTED_BAND return.
+    band_with_neighbour: bool = False
 
 
 # Team-corners ticker suffix = team code + the over-line digits (…-COL5 -> COL, 5).
@@ -1033,11 +1043,21 @@ def classify_legs(
         for low_i, _high_i in all_bands:
             game = game_keys[low_i]
             if sum(1 for k in game_keys if k == game) != 2:
+                # Band/window + same-game neighbour. The super-leg collapse can't
+                # correlate a window with a same-game neighbour, but the STRUCTURAL
+                # scoreline model prices P(window ∧ neighbour) natively — route
+                # there (engine declines only if structural can't represent it).
                 notes.append(
-                    f"nested band game {game} carries other legs: "
-                    "band-vs-neighbour correlation unmodeled"
+                    f"band+same-game-neighbour game {game}: routing to structural "
+                    "(scoreline prices window×neighbour natively)"
                 )
-                return Relationship(RelationshipKind.UNKNOWN, (), tuple(notes))
+                return Relationship(
+                    RelationshipKind.NESTED_BAND,
+                    tuple(groups),
+                    tuple(notes),
+                    bands=tuple(all_bands),
+                    band_with_neighbour=True,
+                )
         return Relationship(
             RelationshipKind.NESTED_BAND,
             tuple(groups),

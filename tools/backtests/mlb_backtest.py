@@ -582,6 +582,15 @@ def _build_pricer():
         if rel.kind is RelationshipKind.UNKNOWN:
             return None, "unknown"
         beliefs = [LegBelief(p=y, uncertainty=0.005, source="bt") for y in yes]
+        if rel.kind is RelationshipKind.NESTED_BAND and rel.band_with_neighbour:
+            # Keep in sync with PricingEngine (2026-07-14 band×neighbour): route to
+            # structural; decline if it can't represent the legs — never the
+            # super-leg collapse or a copula guess.
+            if structural_applicable(list(legs), rel.same_event_groups):
+                j, r = pricer.try_price(list(legs), beliefs, sides)
+                return ((j.p, "structural-band-nbr") if j is not None
+                        else (None, f"band-nbr-declined:{r}"))
+            return None, "band-nbr-not-structural"
         if rel.kind is RelationshipKind.CONTAINMENT and rel.containment is not None:
             return price_containment(beliefs, sides, rel.containment).p, "containment"
         if rel.kind in (RelationshipKind.NESTED_BAND, RelationshipKind.CONTAINMENT):

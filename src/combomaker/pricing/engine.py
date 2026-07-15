@@ -15,7 +15,9 @@ UNVERIFIED (Phase 2.5 list); the estimate here feeds only the size-width adder
 
 from __future__ import annotations
 
-from dataclasses import replace
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from fractions import Fraction
 
@@ -51,6 +53,30 @@ log = get_logger(__name__)
 # 8-16-leg all-NO basket drawn from ONE single prop family — >= 8 legs, every
 # leg NO-side, all legs the same family below. The width itself is the
 # config-tunable QuoteParams.basket_width_extra_cc (0 disables).
+# A coroutine that runs the (expensive, pure) joint estimation for one combo —
+# inline on the loop, or off-loaded to a ProcessPool with a deadline. Injected
+# into PricingEngine.price_offloaded so the engine stays agnostic to HOW the joint
+# is computed; the result is identical either way (same pure code).
+JointRunner = Callable[
+    [Rfq, list[LegBelief], list[str], Relationship],
+    Awaitable["JointEstimate | NoQuote"],
+]
+
+# Joint-layer memo (2026-07-14 throughput fix). The joint estimation
+# (structural invert / copula MVN CDF) is the ~99% of pricing cost and is a PURE,
+# DETERMINISTIC function of (legs, sides, per-leg beliefs, relationship) — proven
+# bit-identical on re-price. So we memoise its result on those exact inputs: under
+# the RFQ firehose the same same-game combos are re-quoted hundreds of times
+# between order-book ticks, and each repeat becomes an O(1) dict lookup instead of
+# a multi-hundred-ms (up to ~7s) re-computation. EXACT (parity to the cent): the
+# key carries the exact float beliefs + the (frozen, hashable) Relationship, so a
+# changed book or a re-classification is a different key, never a stale hit.
+# 8192→65536 (2026-07-14): the memo was SATURATED at 8192 during big-game bursts
+# (hit rate flat ~0.23), so ~77% of RFQs cold-priced through the process pool and
+# the slow tail hit the deadline (skip_price_deadline). A larger LRU holds more of
+# the recurring combo/belief keys → higher hit rate → fewer cold pool prices.
+_DEFAULT_JOINT_MEMO_MAXSIZE = 65536
+
 _BASKET_MIN_LEGS = 8
 _BASKET_PROP_FAMILIES = frozenset(
     {
@@ -77,6 +103,19 @@ def is_single_family_no_basket(legs: list[RfqLeg], sides: list[str]) -> bool:
     return len(families) == 1 and next(iter(families)) in _BASKET_PROP_FAMILIES
 
 
+@dataclass(slots=True)
+class _JointInputs:
+    """Carrier for the loop-side prefix result: everything the joint estimation
+    needs (relationship + per-leg beliefs + selected sides) once the cheap
+    classify/beliefs work is done. Lets price() (sync, inline) and price_offloaded
+    (async, ProcessPool) share ONE prefix and ONE suffix — the joint step is the
+    only thing that differs (inline vs off-loop), so there is no logic to drift."""
+
+    relationship: Relationship
+    beliefs: list[LegBelief]
+    sides: list[str]
+
+
 class PricingEngine:
     def __init__(
         self,
@@ -86,10 +125,20 @@ class PricingEngine:
         config: PricingConfig,
         *,
         extra_sources: list[tuple[OddsSource, float]] | None = None,
+        joint_memo_maxsize: int = _DEFAULT_JOINT_MEMO_MAXSIZE,
     ) -> None:
         self._feed = feed
         self._metadata = metadata
         self._config = config
+        # Bounded LRU of the joint-estimation result keyed on its exact pure
+        # inputs (see _DEFAULT_JOINT_MEMO_MAXSIZE). maxsize<=0 disables it (used by
+        # the parity check to prove memo-on == memo-off to the cent).
+        self._joint_memo_maxsize = joint_memo_maxsize
+        self._joint_cache: OrderedDict[
+            tuple, JointEstimate | NoQuote
+        ] = OrderedDict()
+        self._joint_cache_hits = 0
+        self._joint_cache_misses = 0
         self._book_source = KalshiBookSource(feed)
         # External providers (devig quarantined inside their adapters) blended
         # against the Kalshi book at weight 1.0. A source returning None just
@@ -179,8 +228,67 @@ class PricingEngine:
         in_play: bool = False,
         inventory_skew_cc: int = 0,
     ) -> ConstructedQuote | NoQuote:
+        # Sync inline path (backtests, tests, and the warm hit path). Structure:
+        # cheap loop-side prefix (classify + beliefs) → memoised joint → cheap
+        # suffix (grid/qty/caps/construct). price_offloaded() shares this exact
+        # prefix + suffix and only swaps the joint step for a ProcessPool call.
+        pre = self._price_prefix(rfq)
+        if not isinstance(pre, _JointInputs):
+            return pre
+        joint_or = self._joint_cached(rfq, pre.beliefs, pre.sides, pre.relationship)
+        if isinstance(joint_or, NoQuote):
+            return joint_or
+        return self._price_suffix(
+            rfq,
+            joint_or,
+            pre.beliefs,
+            pre.sides,
+            time_to_close_s=time_to_close_s,
+            in_play=in_play,
+            inventory_skew_cc=inventory_skew_cc,
+        )
+
+    async def price_offloaded(
+        self,
+        rfq: Rfq,
+        *,
+        time_to_close_s: float,
+        in_play: bool = False,
+        inventory_skew_cc: int = 0,
+        run_joint: JointRunner,
+    ) -> ConstructedQuote | NoQuote:
+        """Async pricing that runs the expensive joint step via ``run_joint`` (a
+        ProcessPool-backed, deadline-bounded coroutine) on a memo MISS, while warm
+        hits and the cheap prefix/suffix stay inline on the event loop. Identical
+        output to ``price`` for the same inputs (the joint computation is the same
+        pure code, just off-loop) — proven by the tape parity harness. The wedge
+        guarantee: no multi-second CPU ever runs on the loop thread."""
+        pre = self._price_prefix(rfq)
+        if not isinstance(pre, _JointInputs):
+            return pre
+        joint_or = await self._joint_cached_async(
+            rfq, pre.beliefs, pre.sides, pre.relationship, run_joint
+        )
+        if isinstance(joint_or, NoQuote):
+            return joint_or
+        return self._price_suffix(
+            rfq,
+            joint_or,
+            pre.beliefs,
+            pre.sides,
+            time_to_close_s=time_to_close_s,
+            in_play=in_play,
+            inventory_skew_cc=inventory_skew_cc,
+        )
+
+    def _price_prefix(self, rfq: Rfq) -> ConstructedQuote | NoQuote | _JointInputs:
+        """Loop-side, CHEAP pre-joint work: well-formedness, relationship
+        classification (+ farm/impossible/unknown dispositions), and per-leg
+        beliefs. Returns a final ConstructedQuote/NoQuote when the combo resolves
+        before the joint, else the _JointInputs the joint step consumes. Reads
+        feed/metadata (must stay on the loop); never does the expensive joint."""
         if not rfq.is_combo or not rfq.all_leg_sides_known:
-            return NoQuote(ReasonCode.SKIP_CLASSIFIER_UNKNOWN, "not a well-formed combo")
+            return NoQuote(ReasonCode.SKIP_MALFORMED_COMBO, "not a well-formed combo")
 
         relationship = classify_legs(rfq.legs, self._metadata)
         if relationship.kind is RelationshipKind.IMPOSSIBLE:
@@ -200,69 +308,32 @@ class PricingEngine:
         if isinstance(beliefs, NoQuote):
             return beliefs
         sides = [leg.side for leg in rfq.legs]
+        return _JointInputs(relationship, beliefs, sides)
 
-        joint: JointEstimate | None = None
-        fallback_note: str | None = None
-        if (
-            relationship.kind is RelationshipKind.CONTAINMENT
-            and relationship.containment is not None
-        ):
-            # Logical containment (1H-BTTS ⟹ FT-BTTS): joint = P(subset), pinned
-            # here so it never reaches the copula (which would price the pair at
-            # a pairwise ρ and under-quote the certain part).
-            joint = price_containment(beliefs, sides, relationship.containment)
-        elif relationship.kind is RelationshipKind.CONTAINMENT:
-            # CONTAINMENT/CONDITIONAL-IN-LARGER-COMBO collapse (2026-07-11):
-            # the classifier recorded ≥1 containment and/or same-player
-            # conditional pair inside a >2-leg combo (the shapes that used to
-            # decline UNKNOWN "not modeled"). Same mechanical template as
-            # nested bands — drop each implied superset leg / collapse each
-            # window pair into a band super-leg / collapse each conditional
-            # pair into its bare-path 2-leg joint — dispatched before
-            # structural/copula. Any failure declines.
-            collapsed = self._price_nested_bands(rfq, beliefs, sides, relationship)
-            if isinstance(collapsed, NoQuote):
-                return collapsed
-            joint = collapsed
-        elif relationship.kind is RelationshipKind.NESTED_BAND:
-            # Nested-band arithmetic is EXACT (P(low) − P(high)); it must never
-            # fall to the copula (flat-0.6 overprices live match-corner bands by
-            # +1.8c to +6.6c of fair, 2026-07-09 prod mids). Collapse each band
-            # pair into a super-leg, then price the reduced set as usual. Any
-            # failure declines — never a copula guess on a band shape.
-            banded = self._price_nested_bands(rfq, beliefs, sides, relationship)
-            if isinstance(banded, NoQuote):
-                return banded
-            joint = banded
-        elif self._structural is not None and structural_applicable(
-            list(rfq.legs), relationship.same_event_groups
-        ):
-            joint, reason = self._structural.try_price(list(rfq.legs), beliefs, sides)
-            if joint is None:
-                fallback_note = f"structural fallback: {reason}"
-        if joint is None:
-            sgp = build_sgp_correlation(
-                list(rfq.legs),
-                relationship.same_event_groups,
-                self._sgp_params,
-                marginals=[b.p for b in beliefs],
-            )
-            notes = (*sgp.notes, fallback_note) if fallback_note else sgp.notes
-            joint = price_joint_matrices(
-                beliefs, sides, sgp.corr, sgp.corr_low, sgp.corr_high, extra_notes=notes
-            )
-        joint = self._apply_longshot_floor(joint)
-
+    def _price_suffix(
+        self,
+        rfq: Rfq,
+        joint: JointEstimate,
+        beliefs: list[LegBelief],
+        sides: list[str],
+        *,
+        time_to_close_s: float,
+        in_play: bool,
+        inventory_skew_cc: int,
+    ) -> ConstructedQuote | NoQuote:
+        """Loop-side, CHEAP post-joint work: combo grid + size resolution + free-
+        money caps + markup + quote construction + the sell-only guarantee. Reads
+        feed/metadata (must stay on the loop). Extracted verbatim from price()."""
         combo_meta = self._metadata.peek(rfq.market_ticker)
         if combo_meta is None or combo_meta.grid is None:
             return NoQuote(
-                ReasonCode.SKIP_CLASSIFIER_UNKNOWN,
+                ReasonCode.SKIP_NO_COMBO_GRID,
                 f"no price grid for combo market {rfq.market_ticker}",
             )
 
         qty = self._resolve_qty(rfq, fair_prob=joint.p)
         if qty is None:
-            return NoQuote(ReasonCode.SKIP_CLASSIFIER_UNKNOWN, "unresolvable RFQ size")
+            return NoQuote(ReasonCode.SKIP_SIZE_UNRESOLVABLE, "unresolvable RFQ size")
 
         leg_books = [self._feed.book(leg.market_ticker) for leg in rfq.legs]
         yes_cap, no_cap = free_money_caps(leg_books, sides)
@@ -295,6 +366,179 @@ class PricingEngine:
             params=self._quote_params,
         )
         return self._enforce_sell_only(quote)
+
+    @property
+    def joint_cache_stats(self) -> tuple[int, int, int]:
+        """(hits, misses, size) of the joint memo — observability seam for the
+        quote app to log the live hit rate (the throughput lever)."""
+        return self._joint_cache_hits, self._joint_cache_misses, len(self._joint_cache)
+
+    def _joint_cached(
+        self,
+        rfq: Rfq,
+        beliefs: list[LegBelief],
+        sides: list[str],
+        relationship: Relationship,
+    ) -> JointEstimate | NoQuote:
+        """Memoised joint estimation (2026-07-14 throughput fix). Key = the exact
+        pure inputs that determine the joint: ordered (ticker, side, event) per
+        leg, the exact (p, uncertainty) belief per leg, and the frozen/hashable
+        Relationship. Same key ⇒ bit-identical result, so a hit is EXACT (parity
+        to the cent); a changed book or re-classification is a different key, never
+        a stale hit. maxsize<=0 disables it (parity harness proves memo==no-memo)."""
+        if self._joint_memo_maxsize <= 0:
+            return self._joint_or_noquote(rfq, beliefs, sides, relationship)
+        key = self._joint_key(rfq, beliefs, relationship)
+        cached = self._joint_cache_get(key)
+        if cached is not None:
+            return cached
+        result = self._joint_or_noquote(rfq, beliefs, sides, relationship)
+        self._joint_cache_put(key, result)
+        return result
+
+    async def _joint_cached_async(
+        self,
+        rfq: Rfq,
+        beliefs: list[LegBelief],
+        sides: list[str],
+        relationship: Relationship,
+        run_joint: JointRunner,
+    ) -> JointEstimate | NoQuote:
+        """Async twin of _joint_cached: memo check + LRU bookkeeping run on the
+        loop; only a MISS awaits ``run_joint`` (the off-loop compute). Shares the
+        exact key + get/put helpers with the sync path so a hit is identical and
+        there is no logic to drift. If ``run_joint`` raises (e.g. deadline
+        exceeded) nothing is cached and the error propagates to the caller."""
+        if self._joint_memo_maxsize <= 0:
+            return await run_joint(rfq, beliefs, sides, relationship)
+        key = self._joint_key(rfq, beliefs, relationship)
+        cached = self._joint_cache_get(key)
+        if cached is not None:
+            return cached
+        result = await run_joint(rfq, beliefs, sides, relationship)
+        self._joint_cache_put(key, result)
+        return result
+
+    @staticmethod
+    def _joint_key(
+        rfq: Rfq, beliefs: list[LegBelief], relationship: Relationship
+    ) -> tuple:
+        """The exact pure inputs that determine the joint (see _joint_cached)."""
+        return (
+            tuple((leg.market_ticker, leg.side, leg.event_ticker) for leg in rfq.legs),
+            tuple((b.p, b.uncertainty) for b in beliefs),
+            relationship,
+        )
+
+    def _joint_cache_get(self, key: tuple) -> JointEstimate | NoQuote | None:
+        cached = self._joint_cache.get(key)
+        if cached is not None:
+            self._joint_cache.move_to_end(key)
+            self._joint_cache_hits += 1
+        return cached
+
+    def _joint_cache_put(self, key: tuple, result: JointEstimate | NoQuote) -> None:
+        self._joint_cache_misses += 1
+        self._joint_cache[key] = result
+        if len(self._joint_cache) > self._joint_memo_maxsize:
+            self._joint_cache.popitem(last=False)
+
+    def compute_joint(
+        self,
+        rfq: Rfq,
+        beliefs: list[LegBelief],
+        sides: list[str],
+        relationship: Relationship,
+    ) -> JointEstimate | NoQuote:
+        """Public entry for the ProcessPool worker (ops/pricing_pool.py) to run the
+        pure joint step off the event loop. Delegates to _joint_or_noquote — the
+        SAME code the inline path runs, so the off-loop result is identical."""
+        return self._joint_or_noquote(rfq, beliefs, sides, relationship)
+
+    def _joint_or_noquote(
+        self,
+        rfq: Rfq,
+        beliefs: list[LegBelief],
+        sides: list[str],
+        relationship: Relationship,
+    ) -> JointEstimate | NoQuote:
+        """Pure joint estimation (dispatch: containment / collapse / nested-band /
+        structural / copula), longshot-floored. Extracted verbatim from price() so
+        it can be memoised — control flow unchanged. A NoQuote here is only the
+        band/collapse decline, which is deterministic and safe to cache."""
+        joint: JointEstimate | None = None
+        fallback_note: str | None = None
+        if (
+            relationship.kind is RelationshipKind.CONTAINMENT
+            and relationship.containment is not None
+        ):
+            # Logical containment (1H-BTTS ⟹ FT-BTTS): joint = P(subset), pinned
+            # here so it never reaches the copula (which would price the pair at
+            # a pairwise ρ and under-quote the certain part).
+            joint = price_containment(beliefs, sides, relationship.containment)
+        elif relationship.kind is RelationshipKind.CONTAINMENT:
+            # CONTAINMENT/CONDITIONAL-IN-LARGER-COMBO collapse (2026-07-11): the
+            # classifier recorded ≥1 containment and/or same-player conditional
+            # pair inside a >2-leg combo. Same mechanical template as nested bands
+            # — drop each implied superset leg / collapse each window pair into a
+            # band super-leg / collapse each conditional pair into its bare-path
+            # 2-leg joint — dispatched before structural/copula. Any failure declines.
+            collapsed = self._price_nested_bands(rfq, beliefs, sides, relationship)
+            if isinstance(collapsed, NoQuote):
+                return collapsed
+            joint = collapsed
+        elif relationship.kind is RelationshipKind.NESTED_BAND:
+            if relationship.band_with_neighbour:
+                # Window/band + same-game NEIGHBOUR (2026-07-14). The super-leg
+                # collapse can't correlate a non-monotone window with a same-game
+                # neighbour, but the STRUCTURAL scoreline model prices
+                # P(window ∧ neighbour) DIRECTLY (validated exact + arb-safe). Route
+                # there; decline (never a copula guess) if structural can't represent
+                # the legs (corners / MLB / multi-game span).
+                if self._structural is not None and structural_applicable(
+                    list(rfq.legs), relationship.same_event_groups
+                ):
+                    joint, reason = self._structural.try_price(
+                        list(rfq.legs), beliefs, sides
+                    )
+                    if joint is None:
+                        return NoQuote(
+                            ReasonCode.SKIP_CLASSIFIER_UNKNOWN,
+                            f"band×neighbour not structural-representable: {reason}",
+                        )
+                else:
+                    return NoQuote(
+                        ReasonCode.SKIP_CLASSIFIER_UNKNOWN,
+                        "band×neighbour not structural-representable",
+                    )
+            else:
+                # Nested-band arithmetic is EXACT (P(low) − P(high)); it must never
+                # fall to the copula (flat-0.6 overprices live match-corner bands by
+                # +1.8c to +6.6c of fair, 2026-07-09 prod mids). Collapse each band
+                # pair into a super-leg, then price the reduced set as usual. Any
+                # failure declines — never a copula guess on a band shape.
+                banded = self._price_nested_bands(rfq, beliefs, sides, relationship)
+                if isinstance(banded, NoQuote):
+                    return banded
+                joint = banded
+        elif self._structural is not None and structural_applicable(
+            list(rfq.legs), relationship.same_event_groups
+        ):
+            joint, reason = self._structural.try_price(list(rfq.legs), beliefs, sides)
+            if joint is None:
+                fallback_note = f"structural fallback: {reason}"
+        if joint is None:
+            sgp = build_sgp_correlation(
+                list(rfq.legs),
+                relationship.same_event_groups,
+                self._sgp_params,
+                marginals=[b.p for b in beliefs],
+            )
+            notes = (*sgp.notes, fallback_note) if fallback_note else sgp.notes
+            joint = price_joint_matrices(
+                beliefs, sides, sgp.corr, sgp.corr_low, sgp.corr_high, extra_notes=notes
+            )
+        return self._apply_longshot_floor(joint)
 
     def _enforce_sell_only(
         self, quote: ConstructedQuote | NoQuote

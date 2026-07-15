@@ -89,6 +89,7 @@ class Rig:
         *,
         fee_model: FeeModel | None = None,
         fee_type: FeeType = FeeType.QUADRATIC,
+        joint_pool: Any = None,
     ) -> None:
         self.h = h
         self.sender = FakeSender()
@@ -119,6 +120,7 @@ class Rig:
             config=LifecycleConfig(quote_ttl_s=30.0, reprice_threshold_cc=100),
             fee_model=fee_model,
             fee_type=fee_type,
+            joint_pool=joint_pool,
         )
 
 
@@ -159,6 +161,11 @@ def rfq() -> Rfq:
 
 
 def accepted_msg(quote_id: str, side: str = "yes") -> JsonDict:
+    # Real Kalshi quote_accepted WS shape (docs.kalshi.com/websockets/
+    # communications): a CONTRACTS-mode accept carries the count in
+    # contracts_accepted_fp. A TARGET-COST accept has contracts_accepted_fp=null
+    # and carries yes/no_contracts_offered_fp instead — see
+    # test_ground_truth_accept_fields_size_target_cost_rfq for that path.
     return {
         "quote_id": quote_id,
         "rfq_id": "rfq_1",

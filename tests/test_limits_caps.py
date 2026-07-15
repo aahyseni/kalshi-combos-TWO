@@ -156,12 +156,13 @@ LOOSE: dict[str, object] = {
 
 @dataclass(frozen=True, slots=True)
 class FakeBookRisk:
-    """Minimal PortfolioRisk stand-in for the CVaR cap tests (a real
-    ``BookRiskSnapshot`` is heavier to build; only ``usable`` +
-    ``operative_es_99_cc`` are read by the cap)."""
+    """Minimal PortfolioRisk stand-in for the CVaR + ruin cap tests (a real
+    ``BookRiskSnapshot`` is heavier to build; the caps read ``usable`` +
+    ``operative_es_99_cc`` + ``p_ruin``)."""
 
     usable: bool
     operative_es_99_cc: float
+    p_ruin: float = 0.0
 
 
 class TestThresholdExactness:
@@ -685,6 +686,38 @@ class TestPortfolioCvarCap:
     def test_no_snapshot_not_evaluated(self) -> None:
         # None (no MC yet) ⇒ the cap simply doesn't run; no CVaR breach.
         assert ReasonCode.SKIP_PORTFOLIO_CVAR not in self._check(None, Fraction(15, 100))
+
+
+class TestPortfolioRuinCap:
+    """A2 P(ruin) cap: the structural-MC ``p_ruin`` (P(equity < ruin floor this
+    settlement wave)) vs a probability budget. Reads the latest snapshot, never
+    re-runs MC; fails closed with the CVaR cap on an unusable snapshot."""
+
+    def _check(self, p_ruin: float, budget: Fraction) -> list[ReasonCode]:
+        limits = {**LOOSE, "portfolio_ruin_prob_budget": budget}
+        risk = FakeBookRisk(usable=True, operative_es_99_cc=0.0, p_ruin=p_ruin)
+        breaches = LimitChecker(RiskLimits(**limits)).check(  # type: ignore[arg-type]
+            empty_book(), MARG, DailyPnl(), risk_bankroll_cc=BANKROLL_2K,
+            book_risk=risk,  # type: ignore[arg-type]
+        )
+        return r2_reasons(breaches)
+
+    def test_fires_over_budget(self) -> None:
+        assert ReasonCode.SKIP_PORTFOLIO_RUIN in self._check(0.06, Fraction(5, 100))
+
+    def test_passes_at_or_below_budget(self) -> None:
+        assert ReasonCode.SKIP_PORTFOLIO_RUIN not in self._check(0.05, Fraction(5, 100))
+
+    def test_unusable_snapshot_no_ruin_breach(self) -> None:
+        # An unusable snapshot fails closed via SKIP_PORTFOLIO_CVAR; the ruin cap is
+        # guarded by ``usable`` so it does not also fire on a stale p_ruin.
+        limits = {**LOOSE, "portfolio_ruin_prob_budget": Fraction(1, 100)}
+        risk = FakeBookRisk(usable=False, operative_es_99_cc=0.0, p_ruin=0.9)
+        breaches = LimitChecker(RiskLimits(**limits)).check(  # type: ignore[arg-type]
+            empty_book(), MARG, DailyPnl(), risk_bankroll_cc=BANKROLL_2K,
+            book_risk=risk,  # type: ignore[arg-type]
+        )
+        assert ReasonCode.SKIP_PORTFOLIO_RUIN not in r2_reasons(breaches)
 
     def test_shadow_flag_set_in_shadow_mode(self) -> None:
         # In caps_shadow_mode (LOOSE pins it True), the CVaR breach is log-only.

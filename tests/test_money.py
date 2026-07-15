@@ -94,3 +94,28 @@ class TestTickRounding:
     def test_full_dollar_is_whole_number_of_common_ticks(self) -> None:
         assert CC_PER_DOLLAR % 100 == 0
         assert CC_PER_DOLLAR % 25 == 0
+
+
+class TestFeeCcFromDollarsStr:
+    """Fees can be SUB-centi-cent on the Kalshi wire (observed live: a combo
+    settlement ``fee_cost='0.000080'`` = 0.8 cc). Prices/revenue stay exact; a fee
+    is booked at cc granularity, rounded UP so we never understate a cost we paid."""
+
+    def test_sub_cc_fee_rounds_up(self) -> None:
+        from combomaker.core.money import fee_cc_from_dollars_str
+
+        assert int(fee_cc_from_dollars_str("0.000080")) == 1   # 0.8 cc → 1
+        assert int(fee_cc_from_dollars_str("0.00011")) == 2    # 1.1 cc → 2
+        assert int(fee_cc_from_dollars_str("0.0001")) == 1     # exactly 1 cc
+        assert int(fee_cc_from_dollars_str("0")) == 0
+        assert int(fee_cc_from_dollars_str("0.5600")) == 5600  # whole cc unchanged
+
+    def test_negative_or_garbage_raises(self) -> None:
+        import pytest
+
+        from combomaker.core.money import MoneyParseError, fee_cc_from_dollars_str
+
+        with pytest.raises(MoneyParseError):
+            fee_cc_from_dollars_str("-0.01")
+        with pytest.raises(MoneyParseError):
+            fee_cc_from_dollars_str("abc")

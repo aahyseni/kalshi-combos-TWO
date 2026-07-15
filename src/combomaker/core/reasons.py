@@ -31,6 +31,9 @@ class ReasonCode(StrEnum):
     # Pregame-only gate: no usable start-time source for a leg. UNKNOWN means
     # decline, never "probably pregame" (quiet-failure defense #2).
     SKIP_START_TIME_UNKNOWN = "skip_start_time_unknown"
+    # Too-far horizon gate: a leg's game is beyond the per-prefix max horizon
+    # (uninformed far-out book ⇒ adverse-selection risk). Per max_pregame_hours.
+    SKIP_GAME_TOO_FAR = "skip_game_too_far"
     SKIP_EXCHANGE_INACTIVE = "skip_exchange_inactive"
     SKIP_RISK_HEADROOM = "skip_risk_headroom"
     SKIP_MASS_ACCEPTANCE_BREACH = "skip_mass_acceptance_breach"
@@ -59,6 +62,9 @@ class ReasonCode(StrEnum):
     # %-of-bankroll ceiling. Read off the LATEST full-MC BookRiskSnapshot (never
     # re-run in check); a stale/UNKNOWN snapshot fails closed. SHADOW in Phase 4.
     SKIP_PORTFOLIO_CVAR = "skip_portfolio_cvar"
+    # A2: P(this settlement wave drops equity below the ruin floor) exceeds the
+    # probability budget (structural-MC book-risk snapshot).
+    SKIP_PORTFOLIO_RUIN = "skip_portfolio_ruin"
     # The %-of-bankroll caps cannot be computed because the live bankroll reading
     # is unavailable/stale (BalanceTracker fails closed → None). UNKNOWN bankroll
     # ⇒ fail-closed (widen-or-no-quote), NEVER a convenient default. In shadow
@@ -74,13 +80,34 @@ class ReasonCode(StrEnum):
     SKIP_WIDEN_AVOIDED = "skip_widen_avoided"
     SKIP_HALTED = "skip_halted"
     SKIP_PRICING_FAILED = "skip_pricing_failed"
+    # The off-loop joint pricing exceeded its latency DEADLINE — we DELIBERATELY
+    # dropped a combo too slow to price-and-POST inside its RFQ window (the
+    # throughput/wedge guard). NOT a pricer failure; distinct so "pricing failed"
+    # only ever means a genuine error.
+    SKIP_PRICE_DEADLINE = "skip_price_deadline"
+    # The RFQ's window closed before our quote POST landed — a normal taker-race
+    # loss (we were not first to the taker), not an error.
+    SKIP_RFQ_CLOSED = "skip_rfq_closed"
     SKIP_NEGATIVE_MARGINAL_EV = "skip_negative_marginal_ev"
     SKIP_SOURCES_DISAGREE = "skip_sources_disagree"
     SKIP_NO_FREE_MONEY_CHECK = "skip_no_free_money_check"
     SKIP_WS_UNHEALTHY = "skip_ws_unhealthy"
     # A classifier (leg relationship, settlement rules, market family) returned
     # UNKNOWN. UNKNOWN always means widen-or-no-quote, never a convenient default.
+    # NOTE (2026-07-14): this MUST mean a genuine relationship-UNKNOWN only. The
+    # three below used to share this code (no combo grid, unresolvable size,
+    # malformed combo), inflating the "classifier unknown" tally with non-classifier
+    # causes — now split out so the count is honest.
     SKIP_CLASSIFIER_UNKNOWN = "skip_classifier_unknown"
+    # We have no PRICE GRID for the combo market (metadata not fetched / no grid on
+    # an RFQ-generated multi-game market). Missing data ⇒ no-quote (rule 6); NOT a
+    # classifier failure.
+    SKIP_NO_COMBO_GRID = "skip_no_combo_grid"
+    # The RFQ size could not be resolved (target-cost→contracts conversion). NOT a
+    # classifier failure.
+    SKIP_SIZE_UNRESOLVABLE = "skip_size_unresolvable"
+    # The RFQ is not a well-formed combo (not a combo, or a leg side is unknown).
+    SKIP_MALFORMED_COMBO = "skip_malformed_combo"
     # The combo is logically impossible (e.g. two YES legs of a mutually
     # exclusive event). v1 policy: no-quote, don't try to arb it.
     SKIP_LOGICALLY_IMPOSSIBLE = "skip_logically_impossible"

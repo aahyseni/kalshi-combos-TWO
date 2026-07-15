@@ -12,6 +12,7 @@ DDL statements here; the schema is append-only by convention.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any, Self
@@ -19,7 +20,10 @@ from typing import Any, Self
 import aiosqlite
 
 from combomaker.core.clock import Clock
+from combomaker.ops.logging import get_logger
 from combomaker.rfq.models import Rfq
+
+log = get_logger(__name__)
 
 JsonDict = dict[str, Any]
 
@@ -39,6 +43,7 @@ CREATE TABLE IF NOT EXISTS rfqs (
 );
 CREATE INDEX IF NOT EXISTS idx_rfqs_rfq_id ON rfqs (rfq_id);
 CREATE INDEX IF NOT EXISTS idx_rfqs_collection ON rfqs (collection_ticker);
+CREATE INDEX IF NOT EXISTS idx_rfqs_market_ticker ON rfqs (market_ticker);
 
 CREATE TABLE IF NOT EXISTS rfq_deletions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,23 +129,121 @@ class Store:
     def __init__(self, db: aiosqlite.Connection, clock: Clock) -> None:
         self._db = db
         self._clock = clock
+        # Optional background writer for NON-critical tape (rfqs, decisions,
+        # deletions). OFF by default → writes are SYNCHRONOUS (tests + read-after-
+        # write stay correct, no leaked task). The app calls start_writer() so the
+        # hot RFQ path ENQUEUES instead of awaiting a commit — otherwise a WAL
+        # auto-checkpoint on the ~2GB DB runs INLINE on the awaited commit and
+        # freezes the WHOLE event loop (34s+ intake stalls; 2026-07-14 audit).
+        # Fills/markouts/settlement stay synchronous & durable. Bounded queue:
+        # drop tape on overflow, never block the loop.
+        self._write_q: asyncio.Queue[tuple[str, tuple[Any, ...]]] | None = None
+        self._writer_task: asyncio.Task[None] | None = None
+        self._dropped_writes = 0
 
     @classmethod
     async def open(cls, path: Path, clock: Clock) -> Self:
         path.parent.mkdir(parents=True, exist_ok=True)
         db = await aiosqlite.connect(path)
+        # WAL + relaxed sync (2026-07-14 throughput fix). The hot RFQ path awaits
+        # a commit per RFQ + per decision (~300+/s during big-game bursts) to a
+        # ~2GB DB; the default rollback-journal + synchronous=FULL fsyncs on EVERY
+        # commit, and those fsyncs periodically STALLED the event loop → the RFQ
+        # queue backed up → whole-minute quote blocks. WAL appends without a full
+        # rewrite and synchronous=NORMAL fsyncs only at CHECKPOINT (not per commit),
+        # so a commit is now ~microseconds and the write path can't stall the loop.
+        # busy_timeout absorbs the brief checkpoint lock on the large DB.
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA synchronous=NORMAL")
+        await db.execute("PRAGMA busy_timeout=5000")
+        # autocheckpoint OFF (2026-07-14): with it ON, a 2000-page checkpoint
+        # fired INLINE on every writer commit that crossed the threshold — on the
+        # ~2GB DB that ran near-continuously during bursts, so the background
+        # writer fell behind and DROPPED ~96% of the tape (18,759 quotes posted,
+        # 603 recorded) → the live viewer went blind → PHANTOM blocks. The writer
+        # now runs a BOUNDED manual checkpoint every ~5000 writes instead.
+        await db.execute("PRAGMA wal_autocheckpoint=0")
         await db.executescript(_DDL)
         await db.commit()
         return cls(db, clock)
 
+    def start_writer(self) -> None:
+        """Enable the off-hot-path background writer (the app calls this; tests
+        don't, so their tape writes stay synchronous & immediately readable)."""
+        if self._writer_task is not None:
+            return
+        self._write_q = asyncio.Queue(maxsize=200000)
+        self._writer_task = asyncio.create_task(
+            self._writer_loop(), name="store-writer"
+        )
+
     async def close(self) -> None:
+        if self._writer_task is not None:
+            q = self._write_q
+            try:  # drain queued tape before shutdown (bounded)
+                if q is not None:
+                    await asyncio.wait_for(q.join(), timeout=2.0)
+            except TimeoutError:
+                pass
+            self._writer_task.cancel()
+            try:
+                await self._writer_task
+            except asyncio.CancelledError:
+                pass
         await self._db.close()
+
+    async def _write(self, sql: str, params: tuple[Any, ...]) -> None:
+        """A NON-critical tape write. Async mode (writer running) → enqueue,
+        NEVER blocks the hot path (drops on overflow). Sync mode (tests) → write
+        immediately so read-after-write is correct."""
+        q = self._write_q
+        if q is None:
+            await self._db.execute(sql, params)
+            await self._db.commit()
+            return
+        try:
+            q.put_nowait((sql, params))
+        except asyncio.QueueFull:
+            self._dropped_writes += 1
+
+    async def _writer_loop(self) -> None:
+        """Drain the tape queue and commit in BATCHES off the hot path — a WAL
+        checkpoint here stalls only THIS task, never the intake/worker loop."""
+        assert self._write_q is not None
+        q = self._write_q
+        writes_since_checkpoint = 0
+        while True:
+            first = await q.get()
+            batch = [first]
+            while len(batch) < 1000:
+                try:
+                    batch.append(q.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            try:
+                for sql, params in batch:
+                    await self._db.execute(sql, params)
+                await self._db.commit()
+                # Bounded manual checkpoint OFF the hot path (autocheckpoint=0):
+                # a TRUNCATE every ~5000 writes keeps the WAL small without an
+                # inline checkpoint stalling every commit (which starved the writer
+                # and dropped 96% of the tape during bursts). PASSIVE-then-TRUNCATE
+                # via TRUNCATE is fine here — it runs on the writer task, never the
+                # intake/worker loop, so a brief stall only delays tape, not quotes.
+                writes_since_checkpoint += len(batch)
+                if writes_since_checkpoint >= 5000:
+                    writes_since_checkpoint = 0
+                    await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                log.exception("store_writer_batch_failed", n=len(batch))
+            for _ in batch:
+                q.task_done()
 
     def _now(self) -> str:
         return self._clock.now().isoformat()
 
     async def record_rfq(self, rfq: Rfq, *, source: str) -> None:
-        await self._db.execute(
+        await self._write(
             "INSERT INTO rfqs (rfq_id, seen_at, source, market_ticker, collection_ticker,"
             " contracts_centi, target_cost_cc, n_legs, legs_json, raw_json)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -166,24 +269,21 @@ class Store:
                 json.dumps(rfq.raw),
             ),
         )
-        await self._db.commit()
 
     async def record_rfq_deleted(self, rfq_id: str, raw: JsonDict) -> None:
-        await self._db.execute(
+        await self._write(
             "INSERT INTO rfq_deletions (rfq_id, seen_at, raw_json) VALUES (?, ?, ?)",
             (rfq_id, self._now(), json.dumps(raw)),
         )
-        await self._db.commit()
 
     async def record_decision(
         self, kind: str, rfq_id: str | None, reasons: list[str], context: JsonDict
     ) -> None:
-        await self._db.execute(
+        await self._write(
             "INSERT INTO decisions (at, kind, rfq_id, reasons_json, context_json)"
             " VALUES (?, ?, ?, ?, ?)",
             (self._now(), kind, rfq_id, json.dumps(reasons), json.dumps(context)),
         )
-        await self._db.commit()
 
     async def record_would_quote(
         self,
@@ -334,6 +434,57 @@ class Store:
         async with self._db.execute(f"SELECT COUNT(*) FROM {table}") as cursor:  # noqa: S608
             row = await cursor.fetchone()
         return int(row[0]) if row else 0
+
+    async def held_positions(self, combo_tickers: list[str]) -> list[JsonDict]:
+        """Rehydration source for the exposure book on restart (#33). For each combo
+        ticker still OPEN on the exchange, aggregate our recorded fills (summed
+        contracts + a max-loss-preserving entry price) and attach the combo's legs
+        from the rfqs tape (``fills.combo_ticker == rfqs.market_ticker``). Only
+        tickers we have BOTH a fill AND an rfq for are returned; an exchange
+        position with no local record is surfaced by the caller, never modeled from
+        a guess. Entry price is chosen so ``contracts × entry_price // 100`` equals
+        the summed per-fill max loss (the loss axis the caps bind on)."""
+        tickers = list(dict.fromkeys(combo_tickers))
+        if not tickers:
+            return []
+        placeholders = ",".join("?" * len(tickers))
+        # The rfqs tape holds MANY rows per combo_ticker (one per re-quote — up to
+        # tens of thousands). A naive ``fills JOIN rfqs`` fans each fill out by that
+        # count BEFORE the SUM, inflating contracts_centi (and every risk cap that
+        # scales with it) by the fanout factor. Aggregate fills and de-dup the rfqs
+        # legs lookup into 1-row-per-combo derived tables so the join is strictly
+        # 1:1. (entry_price was fanout-safe before — numerator and denominator
+        # scaled together — but contracts_centi was not; this is the fix.)
+        query = (
+            "SELECT a.combo_ticker, a.our_side, a.ctr, a.loss_num,"
+            " r.legs_json, r.collection_ticker"
+            " FROM (SELECT combo_ticker, our_side, SUM(contracts_centi) AS ctr,"
+            "       SUM(contracts_centi * price_cc) AS loss_num"
+            f"      FROM fills WHERE combo_ticker IN ({placeholders})"  # noqa: S608 - ints-only placeholders
+            "       GROUP BY combo_ticker, our_side) a"
+            " LEFT JOIN (SELECT market_ticker, MAX(legs_json) AS legs_json,"
+            "            MAX(collection_ticker) AS collection_ticker"
+            f"           FROM rfqs WHERE market_ticker IN ({placeholders})"  # noqa: S608 - ints-only placeholders
+            "            GROUP BY market_ticker) r"
+            " ON r.market_ticker = a.combo_ticker"
+        )
+        out: list[JsonDict] = []
+        async with self._db.execute(query, tuple(tickers) * 2) as cursor:
+            async for row in cursor:
+                combo_ticker, our_side, ctr, loss_num, legs_json, collection = row
+                if not ctr or not legs_json:
+                    continue
+                out.append(
+                    {
+                        "combo_ticker": combo_ticker,
+                        "our_side": our_side,
+                        "contracts_centi": int(ctr),
+                        "entry_price_cc": int(loss_num) // int(ctr),
+                        "collection": collection,
+                        "legs": json.loads(legs_json),
+                    }
+                )
+        return out
 
     async def decision_reason_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}

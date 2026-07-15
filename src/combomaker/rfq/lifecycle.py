@@ -33,11 +33,13 @@ from combomaker.core.conventions import Conventions, Side
 from combomaker.core.money import CC_PER_CENT, CC_PER_DOLLAR, CentiCents
 from combomaker.core.quantity import CentiContracts, qty_from_fp_str
 from combomaker.core.reasons import ReasonCode
+from combomaker.exchange.rest import KalshiApiError
 from combomaker.marketdata.feed import OrderbookFeed
 from combomaker.marketdata.metadata import MetadataCache
 from combomaker.ops.logging import get_logger
 from combomaker.ops.metrics import Metrics
 from combomaker.ops.persistence import Store
+from combomaker.ops.pricing_pool import JointPool
 from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.fees import FeeModel, FeeType, FeeUnknownError
 from combomaker.pricing.quote import ConstructedQuote, NoQuote
@@ -75,6 +77,7 @@ from combomaker.risk.skew import (
 )
 from combomaker.sim.book_model import WithinGameRhoProvider, build_book_model
 from combomaker.sim.book_risk import BookRiskSnapshot, compute_book_risk
+from combomaker.sim.structural_book import StructuralConfigView
 
 log = get_logger(__name__)
 
@@ -113,6 +116,10 @@ class LifecycleConfig:
     book_risk_mc_samples: int = 20_000
     book_risk_stale_after_s: float = 30.0
     book_risk_seed: int = 7
+    # A2 ruin floor: equity below this fraction of bankroll is "ruin". Operator
+    # directive 2026-07-15: −30% ⇒ 0.70. Feeds compute_book_risk's p_ruin, which
+    # the P(ruin) cap gates against ``portfolio_ruin_prob_budget``.
+    ruin_floor_frac: float = 0.70
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +131,7 @@ class _StaleBookRisk:
 
     usable: bool = False
     operative_es_99_cc: float = 0.0
+    p_ruin: float = 0.0
 
 
 @dataclass
@@ -163,6 +171,7 @@ class QuoteLifecycle:
         start_time_provider: StartTimeProvider | None = None,
         starvation_watchdog: StarvationWatchdog | None = None,
         within_game_rho: WithinGameRhoProvider | None = None,
+        structural_cfg: StructuralConfigView | None = None,
         reservation: RiskReservationService | None = None,
         skew_params: SkewParams | None = None,
         skew_limits: SkewLimits | None = None,
@@ -171,10 +180,15 @@ class QuoteLifecycle:
         fee_model: FeeModel | None = None,
         fee_type: FeeType = FeeType.QUADRATIC,
         fee_multiplier: Fraction = Fraction(1),
+        joint_pool: JointPool | None = None,
     ) -> None:
         self._clock = clock
         self._sender = sender
         self._engine = engine
+        # Off-loop pricing (Phase 1): when set, the async hot path runs the
+        # expensive joint step in a worker process with a deadline so a cold combo
+        # can never wedge the loop. None ⇒ inline pricing (backtests, paper, tests).
+        self._joint_pool = joint_pool
         self._filter = rfq_filter
         self._limits = limits
         self._exposure = exposure
@@ -202,6 +216,12 @@ class QuoteLifecycle:
         # the MC falls back to the flat band (the pre-wire behaviour); the cap
         # still arms, just off a coarser correlation view.
         self._within_game_rho = within_game_rho
+        # A1: the Dixon-Coles constants for the STRUCTURAL portfolio-risk MC. When
+        # set, recompute_book_risk samples same-game legs from the joint scoreline
+        # (every hedge/exclusion exact, no rho) instead of the Gaussian copula; the
+        # copula path still carries corners/cards/other-sport legs. None ⇒ the
+        # pre-A1 copula-only MC (byte-identical).
+        self._structural_cfg = structural_cfg
         # Latest full-MC book-risk snapshot + the monotonic time it was built.
         # Armed by recompute_book_risk() off the slow loop; READ (never recomputed)
         # inside check() via _book_risk_for_check(), which keeps check() cheap. A
@@ -334,6 +354,11 @@ class QuoteLifecycle:
                 seed=self._config.book_risk_seed,
                 band="high",
                 bankroll_cc=self._risk_bankroll_cc(),
+                structural_cfg=self._structural_cfg,
+                current_equity_cc=self._balance.exchange_equity_cc_or_none()
+                if self._balance is not None
+                else None,
+                ruin_floor_frac=self._config.ruin_floor_frac,
             )
             self._book_risk = snap
             self._book_risk_mono_ns = self._clock.monotonic_ns()
@@ -341,10 +366,12 @@ class QuoteLifecycle:
                 log.info(
                     "book_risk_snapshot",
                     n_positions=snap.n_positions,
+                    structural=self._structural_cfg is not None,
                     operative_es_99_cc=int(snap.operative_es_99_cc),
                     es_99_cc=int(snap.es_99_cc),
                     challenger_es_99_cc=int(snap.challenger_es_99_cc),
                     deterministic_stress_cc=int(snap.deterministic_stress_cc),
+                    p_ruin=round(snap.p_ruin, 4),
                 )
         except Exception:
             log.exception("book_risk_recompute_failed")
@@ -538,7 +565,7 @@ class QuoteLifecycle:
         if reasons:
             await self._record_skip(rfq, reasons, self._pregame_flow_context(rfq, reasons))
             return
-        result = self._price(rfq)
+        result = await self._price_async(rfq)
         if isinstance(result, NoQuote):
             await self._record_skip(rfq, [result.reason], {"detail": result.detail})
             return
@@ -565,7 +592,7 @@ class QuoteLifecycle:
             await self._record_skip(rfq, [ReasonCode.SKIP_WIDEN_AVOIDED], {})
             return
         if applied_skew_cc != 0:
-            reskewed = self._price(rfq, inventory_skew_cc=applied_skew_cc)
+            reskewed = await self._price_async(rfq, inventory_skew_cc=applied_skew_cc)
             if isinstance(reskewed, NoQuote):
                 await self._record_skip(
                     rfq, [reskewed.reason], {"detail": reskewed.detail}
@@ -606,11 +633,26 @@ class QuoteLifecycle:
             )
             return
 
-        response = await self._sender.create_quote(
-            rfq.rfq_id,
-            yes_bid_cc=result.yes_bid_cc,
-            no_bid_cc=result.no_bid_cc,
-        )
+        try:
+            response = await self._sender.create_quote(
+                rfq.rfq_id,
+                yes_bid_cc=result.yes_bid_cc,
+                no_bid_cc=result.no_bid_cc,
+            )
+        except KalshiApiError as exc:
+            # rfq_closed / 409: the RFQ's ~1s window closed before our POST landed
+            # — a NORMAL taker-race loss (we were not first), NOT a failure. Count
+            # it (the win-the-taker signal) and decline quietly; any other API
+            # error is real and propagates to the worker's error path.
+            if exc.code == "rfq_closed" or exc.status == 409:
+                self._metrics.inc("quote.rfq_closed_before_post")
+                await self._record_skip(
+                    rfq,
+                    [ReasonCode.SKIP_RFQ_CLOSED],
+                    {"detail": "rfq window closed before our quote POST landed"},
+                )
+                return
+            raise
         quote_id = str(response.get("id") or response.get("quote_id") or "")
         if not quote_id:
             log.warning("quote_created_without_id", rfq_id=rfq.rfq_id, response=response)
@@ -657,6 +699,16 @@ class QuoteLifecycle:
             log.warning("accept_for_unknown_quote", quote_id=quote_id)
             return
         state.accepted = True
+        # Fill-path visibility (2026-07-14 fill-killer diagnosis): accepts are
+        # rare (~tens/day), so log the size-bearing fields of every accept. This
+        # confirms the live wire shape and surfaces any field-name drift from the
+        # log alone — the accepted size lives in no_contracts_fp/yes_contracts_fp.
+        log.info(
+            "quote_accepted",
+            quote_id=quote_id,
+            msg_keys=sorted(msg.keys()),
+            msg=msg,
+        )
         accepted_raw = str(msg.get("accepted_side", ""))
         if accepted_raw not in ("yes", "no"):
             # Can't know which side we'd be filling — lapse, never guess.
@@ -685,13 +737,24 @@ class QuoteLifecycle:
             self._metrics.inc(f"confirm.declined.{ReasonCode.DECLINE_SIDE_NOT_QUOTED}")
             self._drop_quote(quote_id)
             return
-        qty = self._accepted_qty(state, msg)
+        qty = self._accepted_qty(state, accepted_side, msg)
         if qty is None:
             # Unknown accepted size (defense #2): never confirm a fill we
-            # cannot size — deliberate lapse.
+            # cannot size — deliberate lapse. Record EVERY size field we know
+            # about so wire-field drift is diagnosable from the ledger alone
+            # (this exact read was the 2026-07-14 fill-killer).
+            size_fields = {
+                k: msg.get(k)
+                for k in (
+                    "contracts_accepted_fp",
+                    "no_contracts_offered_fp",
+                    "yes_contracts_offered_fp",
+                    "rfq_target_cost_dollars",
+                )
+            }
             await self._record_confirm_decision(
                 state, confirm=False, reason=ReasonCode.DECLINE_SIZE_UNKNOWN,
-                detail=f"contracts_accepted_fp unreadable: {msg.get('contracts_accepted_fp')!r}",
+                detail=f"no readable accepted size; fields={size_fields}",
                 decision_ms=(self._clock.monotonic_ns() - t0) / 1e6,
             )
             self._metrics.inc(f"confirm.declined.{ReasonCode.DECLINE_SIZE_UNKNOWN}")
@@ -851,6 +914,14 @@ class QuoteLifecycle:
 
     async def on_quote_executed(self, msg: JsonDict) -> None:
         quote_id = str(msg.get("quote_id", ""))
+        # Full-message capture (2026-07-14): the LIVE combo quote_accepted carries
+        # NO contract-count field, so the accepted size may only be knowable here.
+        log.info(
+            "quote_executed_msg",
+            quote_id=quote_id,
+            msg_keys=sorted(msg.keys()),
+            msg=msg,
+        )
         state = self._executed_states.get(quote_id) or self._open.get(quote_id)
         if state is None:
             log.warning("execution_for_unknown_quote", quote_id=quote_id)
@@ -1128,7 +1199,7 @@ class QuoteLifecycle:
             if age_s > self._config.quote_ttl_s:
                 await self._delete_quote(quote_id, ReasonCode.DELETE_TTL_EXPIRED)
                 continue
-            result = self._price(state.rfq)
+            result = await self._price_async(state.rfq)
             if isinstance(result, NoQuote):
                 await self._delete_quote(quote_id, ReasonCode.DELETE_LEG_STALE)
                 continue
@@ -1175,6 +1246,25 @@ class QuoteLifecycle:
 
     # ---------------------------------------------------------------- helpers
 
+    def pricing_stats(self) -> dict[str, float | int]:
+        """Live throughput observability (2026-07-14): the joint-memo hit rate and
+        off-loop pool counters. The hit rate is the signal that decides whether the
+        pre-warm pump (Phase 4) is even needed — a high same-game hit rate means the
+        exact memo already covers the hot flow. Logged every status tick."""
+        hits, misses, size = self._engine.joint_cache_stats
+        total = hits + misses
+        stats: dict[str, float | int] = {
+            "memo_hits": hits,
+            "memo_misses": misses,
+            "memo_size": size,
+            "memo_hit_rate": round(hits / total, 4) if total else 0.0,
+        }
+        if self._joint_pool is not None:
+            stats["pool_calls"] = self._joint_pool.calls
+            stats["pool_timeouts"] = self._joint_pool.timeouts
+            stats["pool_errors"] = self._joint_pool.errors
+        return stats
+
     def _price(
         self, rfq: Rfq, *, inventory_skew_cc: int = 0
     ) -> ConstructedQuote | NoQuote:
@@ -1185,6 +1275,35 @@ class QuoteLifecycle:
             in_play=self._inplay.any_anomalous(list(rfq.leg_tickers)),
             inventory_skew_cc=inventory_skew_cc,
         )
+
+    async def _price_async(
+        self, rfq: Rfq, *, inventory_skew_cc: int = 0
+    ) -> ConstructedQuote | NoQuote:
+        """Async pricing for the hot RFQ path. With a joint pool configured the
+        expensive joint step runs off-loop with a deadline (warm memo hits stay
+        inline); without one it is exactly ``_price``. Identical $ output to
+        ``_price`` — the pool runs the same pure joint code (pool_parity_check).
+        A deadline breach or worker error is a fail-closed decline (no wedge)."""
+        if self._joint_pool is None:
+            return self._price(rfq, inventory_skew_cc=inventory_skew_cc)
+        time_to_close = self._min_time_to_close_s(rfq)
+        try:
+            return await self._engine.price_offloaded(
+                rfq,
+                time_to_close_s=time_to_close if time_to_close is not None else -1.0,
+                in_play=self._inplay.any_anomalous(list(rfq.leg_tickers)),
+                inventory_skew_cc=inventory_skew_cc,
+                run_joint=self._joint_pool.run_joint,
+            )
+        except TimeoutError:
+            self._metrics.inc("price.pool_deadline_drop")
+            return NoQuote(
+                ReasonCode.SKIP_PRICE_DEADLINE, "joint pricing exceeded the off-loop deadline"
+            )
+        except Exception:
+            log.exception("price_pool_error", rfq_id=rfq.rfq_id)
+            self._metrics.inc("price.pool_error")
+            return NoQuote(ReasonCode.SKIP_PRICING_FAILED, "off-loop pricing error")
 
     def _quoting_policy(
         self, rfq: Rfq, constructed: ConstructedQuote, risk_qty: CentiContracts
@@ -1319,19 +1438,51 @@ class QuoteLifecycle:
             legs=self._leg_refs(rfq),
         )
 
-    def _accepted_qty(self, state: OpenQuoteState, msg: JsonDict) -> CentiContracts | None:
+    def _accepted_qty(
+        self, state: OpenQuoteState, accepted_side: Side, msg: JsonDict
+    ) -> CentiContracts | None:
         """Accepted size; None = unknowable = deliberate lapse (defense #2).
 
-        Missing ``contracts_accepted_fp`` on a contracts-mode RFQ falls back
-        to the RFQ's own full size (a quote covers the full size by wire
-        contract); on a target-cost RFQ there is nothing safe to assume.
+        Kalshi's ``quote_accepted`` communications-WS message conveys size via
+        (docs.kalshi.com/websockets/communications, verified against the live
+        tape 2026-07-14):
+          - ``contracts_accepted_fp`` — the accepted count, populated for a
+            CONTRACTS-mode RFQ (taker specified a contract count).
+          - ``no_contracts_offered_fp`` / ``yes_contracts_offered_fp`` — the
+            contracts WE offered per side. On a TARGET-COST RFQ (taker specified
+            DOLLARS, 95% of live flow) ``contracts_accepted_fp`` is null, so the
+            accepted size is the contracts we offered on the ACCEPTED side — the
+            taker accepted our firm quote for the size we offered, which our
+            sizing computed to cover ``rfq_target_cost_dollars``.
+        We read the accepted count first, then fall back to the accepted side's
+        offered count, then to the RFQ's own contracts (contracts-mode wire
+        default). Missing all three ⇒ None ⇒ lapse (defense #2).
+
+        2026-07-14 fill-killer: the old code read ``contracts_accepted_fp`` ONLY,
+        which is null on every target-cost accept, so 95% of WON auctions lapsed
+        DECLINE_SIZE_UNKNOWN at confirm. (The demo ground-truth's contracts_fp /
+        no_contracts_fp were a quote-TERMINAL record, not the accept message —
+        they do not appear on the live quote_accepted wire.) A present-but-
+        unparseable field still lapses (never guess); "0.00" ⇒ try next.
         """
-        raw = msg.get("contracts_accepted_fp")
-        if raw is not None:
+        side_offered = (
+            "no_contracts_offered_fp" if accepted_side is Side.NO
+            else "yes_contracts_offered_fp"
+        )
+        for key in ("contracts_accepted_fp", side_offered):
+            raw = msg.get(key)
+            if raw is None:
+                continue
             try:
-                return qty_from_fp_str(str(raw))
+                qty = qty_from_fp_str(str(raw))
             except ValueError:
+                # Present-but-unparseable size = corrupt message: lapse, never
+                # guess (defense #2). Do not fall through to another field.
+                log.warning("accept_size_unparseable", field=key, raw=str(raw))
                 return None
+            if qty > 0:
+                return qty
+            # qty == 0 ⇒ "not this side"; try the next candidate.
         return state.rfq.contracts
 
     def _last_look_inputs(

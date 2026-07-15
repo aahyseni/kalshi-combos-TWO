@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -42,9 +43,15 @@ from numpy.typing import NDArray
 from combomaker.sim.book_model import BookModel
 from combomaker.sim.engine import (
     ComboPosition,
+    LegModel,
     PortfolioStats,
     position_pnl,
     sample_leg_values,
+)
+from combomaker.sim.structural_book import (
+    StructuralConfigView,
+    build_game_plans,
+    sample_structural_values,
 )
 
 # Headline tail level. CVaR here = expected loss at/beyond the 0.99 VaR quantile.
@@ -92,6 +99,11 @@ class BookRiskSnapshot:
     var_99_cc: float = 0.0
     es_99_cc: float = 0.0  # production-copula CVaR at ``band``
     p_loss_worse_than: dict[float, float] = field(default_factory=dict)
+    # A2: P(this settlement wave drops equity BELOW the ruin floor) =
+    # P(current_equity + book_pnl < ruin_floor_frac·bankroll). 0.0 when equity/
+    # bankroll unavailable (the ruin cap then does not evaluate). Computed on the
+    # SAME sampled book P&L, so it reflects the structural hedge (not a comonotone).
+    p_ruin: float = 0.0
 
     # Challenger / stress overlay (§5).
     challenger_es_99_cc: float = 0.0
@@ -228,6 +240,9 @@ def compute_book_risk(
     bankroll_cc: int | None = None,
     ruin_fractions: tuple[float, ...] = (0.10, 0.25, 0.60),
     challenger_inflation: float = DEFAULT_CHALLENGER_INFLATION,
+    structural_cfg: StructuralConfigView | None = None,
+    current_equity_cc: int | None = None,
+    ruin_floor_frac: float = 0.70,
 ) -> BookRiskSnapshot:
     """Run the full book-risk MC and build the halt-feeding snapshot.
 
@@ -250,12 +265,40 @@ def compute_book_risk(
         )
 
     corr = model.corr_for_band(band)
+    # A1 STRUCTURAL SEAM: with a structural config, games the Dixon-Coles model can
+    # invert are sampled from the joint scoreline (every same-game hedge/exclusion
+    # exact, no rho), and only the copula legs (corners/cards/other sports) use the
+    # Gaussian copula. Without it, the whole book is copula-sampled (byte-identical
+    # to before). The challenger's correlation inflation still stresses the copula
+    # legs; structural legs carry their exact scoreline dependence.
+    if structural_cfg is not None:
+        tickers = [""] * len(model.legs)
+        for ticker, i in model.leg_index.items():
+            tickers[i] = ticker
+        events = [model.event_by_index.get(i) for i in range(len(model.legs))]
+        marginals = [leg.p for leg in model.legs]
+        plans, copula_idx = build_game_plans(tickers, events, marginals, structural_cfg)
+
+        def _structural_sampler(
+            leg_models: Sequence[LegModel],
+            c: NDArray[np.float64],
+            n_draw: int,
+            r: np.random.Generator,
+        ) -> NDArray[np.float64]:
+            return sample_structural_values(plans, copula_idx, leg_models, c, n_draw, r)
+
+        _sampler: Callable[
+            [Sequence[LegModel], NDArray[np.float64], int, np.random.Generator],
+            NDArray[np.float64],
+        ] = _structural_sampler
+    else:
+        _sampler = sample_leg_values
     # Two INDEPENDENT, reproducible RNG substreams (production + challenger) via
     # SeedSequence.spawn — never `seed`/`seed+1`, which are correlated streams
     # (M2 §4.3). Both derive deterministically from the single ``seed``.
     seq_prod, seq_chal = np.random.SeedSequence(seed).spawn(2)
     rng = np.random.default_rng(seq_prod)
-    values = sample_leg_values(model.legs, corr, n_samples, rng)
+    values = _sampler(model.legs, corr, n_samples, rng)
 
     # Book P&L per scenario (float cc) + engine-consistent stats.
     loss_thresholds_cc = (
@@ -272,6 +315,17 @@ def compute_book_risk(
     p_loss_worse_than = {
         float(t): float(np.mean(book < -float(t))) for t in loss_thresholds_cc
     }
+    # A2 P(RUIN): P(current_equity + wave P&L < ruin floor). Uses live equity so it
+    # tightens as we draw down (a fixed loss-threshold would understate ruin once
+    # equity < bankroll). Reflects the structural hedge (same sampled ``book``).
+    p_ruin = 0.0
+    if (
+        current_equity_cc is not None
+        and bankroll_cc is not None
+        and bankroll_cc > 0
+    ):
+        floor_cc = ruin_floor_frac * bankroll_cc
+        p_ruin = float(np.mean(current_equity_cc + book < floor_cc))
 
     # Tail attribution on the 0.99 tail set (same cut es_99 uses).
     cut = float(np.quantile(book, 1.0 - HEADLINE_LEVEL))
@@ -281,7 +335,7 @@ def compute_book_risk(
     # --- challenger: correlation-inflated re-sample (anti-monoculture) --------
     challenger_corr = _inflate_corr(corr, challenger_inflation)
     rng_c = np.random.default_rng(seq_chal)  # spawned substream (M2 §4.3)
-    values_c = sample_leg_values(model.legs, challenger_corr, n_samples, rng_c)
+    values_c = _sampler(model.legs, challenger_corr, n_samples, rng_c)
     book_c = _book_pnl_from_values(values_c, model.positions)
     _, challenger_es = _es_from_pnl(book_c, HEADLINE_LEVEL)
 
@@ -303,6 +357,7 @@ def compute_book_risk(
         var_99_cc=var_99,
         es_99_cc=es_99,
         p_loss_worse_than=p_loss_worse_than,
+        p_ruin=p_ruin,
         challenger_es_99_cc=challenger_es,
         deterministic_stress_cc=stress,
         operative_es_99_cc=operative_es,

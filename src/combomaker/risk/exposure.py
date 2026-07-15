@@ -205,9 +205,113 @@ class ExposureSnapshot:
         return self.worst_case_loss_by_game_cc
 
 
+# --- Stage B: mutual-exclusion-aware per-game worst-case loss ---------------
+# ``entries`` = (legs_on_this_game, loss_cc, requires_all) per position/hypothetical
+# touching a game. ``requires_all`` is True iff the position LOSES iff every one of
+# its legs is satisfied (a long-NO combo — every sell-only fill). A non-NO / unknown
+# side passes False ⇒ treated as COMMON (loses in every branch) ⇒ conservative.
+#
+# DESIGN NOTE — why a SINGLE ME event, max-over-branches, else comonotone (and NOT
+# min-over-many-dimensions): the E2 MASS-ACCEPTANCE DOMINANCE invariant requires the
+# per-game bound to be MONOTONIC (adding an open quote never lowers it, so the mass
+# snapshot dominates every realized acceptance). Recognizing MORE mutual-exclusion
+# structure (a second ME event, or a binary yes/no market) REFINES the partition and
+# LOWERS the bound — non-monotonic — so an open quote that introduces a hedge could
+# push the mass bound BELOW a realized subset that doesn't hold that hedge. That is a
+# real safety hole (a taker can accept only the concentrated side and decline the
+# hedge). So B nets exactly ONE mutually-exclusive event (the result: advance / 1X2)
+# via max-over-branches — provably monotonic + ≤ comonotone — and FAILS CLOSED to the
+# comonotone sum on 0 or ≥2 ME events. Full all-legs hedging (BTTS yes/no, corners
+# over/under, goalscorers) lives in the structural MC (A1), where the joint state is
+# sampled and the bound is a probability, not a monotone worst-case cap.
+_MutexEntry = tuple[tuple["LegRef", ...], int, bool]
+
+
+def _mutex_required(
+    legs: tuple[LegRef, ...], requires: bool, event: str
+) -> tuple[str, str] | None:
+    """The outcome this entry REQUIRES to lose on the ME ``event``: ("is", market)
+    | ("not", market) | None (COMMON — loses in every branch). A YES leg on outcome
+    m requires m; a NO leg on m requires NOT-m; prefer a YES leg (tightest)."""
+    if not requires:
+        return None
+    yes = [g.market_ticker for g in legs if g.event_ticker == event and g.side == "yes"]
+    if yes:
+        return ("is", yes[0])
+    no = [g.market_ticker for g in legs if g.event_ticker == event and g.side == "no"]
+    if no:
+        return ("not", no[0])
+    return None
+
+
+def _mutex_event_bound_cc(entries: list[_MutexEntry], event: str) -> int:
+    """Max over the ME event's branches of the Σ loss of entries that can lose in
+    that branch. Branches = every required YES-outcome + an ``__OTHER__`` catch-all
+    (so a NO-leg's 'some other outcome' is always counted — never under-stated when
+    an outcome is absent from the book). Monotonic in the entry set."""
+    reqs = [(_mutex_required(legs, req, event), loss) for legs, loss, req in entries]
+    outs = {r[1] for r, _l in reqs if r is not None and r[0] == "is"}
+    branches = (*outs, "__OTHER__")
+    best = 0
+    for b in branches:
+        s = 0
+        for r, loss in reqs:
+            if r is None:                       # common — loses in every branch
+                s += loss
+            elif r[0] == "is":
+                if b == r[1]:
+                    s += loss
+            elif b != r[1]:                     # ("not", m) — every branch except m
+                s += loss
+        if s > best:
+            best = s
+    return best
+
+
+def _mutex_game_worst_cc(
+    entries: list[_MutexEntry], is_me_event: Callable[[str], bool | None] | None
+) -> int:
+    """Mutual-exclusion-aware upper bound on a game's worst-case loss (Stage B).
+
+    Nets the game's single RESULT mutually-exclusive event (advance / moneyline) via
+    max-over-branches; fails closed to the comonotone sum on 0 or ≥2 ME events (so
+    the bound is MONOTONIC — E2 mass-acceptance dominance holds; see the design note
+    above). Always ≤ comonotone and ≥ the largest single entry. Parity-tested against
+    tools/proto_mutex_game_cap.py."""
+    comonotone = sum(loss for _legs, loss, _r in entries)
+    if not entries or is_me_event is None:
+        return comonotone
+    me_events: list[str] = []
+    seen: set[str] = set()
+    for legs, _loss, requires in entries:
+        if not requires:
+            continue
+        for leg in legs:
+            e = leg.event_ticker
+            if e and e not in seen:
+                seen.add(e)
+                if is_me_event(e) is True:
+                    me_events.append(e)
+    if len(me_events) != 1:                     # 0 ⇒ no ME; ≥2 ⇒ fail-closed
+        return comonotone
+    return _mutex_event_bound_cc(entries, me_events[0])
+
+
 class ExposureBook:
-    def __init__(self, conventions: Conventions) -> None:
+    def __init__(
+        self,
+        conventions: Conventions,
+        is_me_event: Callable[[str], bool | None] | None = None,
+    ) -> None:
         self._conventions = conventions
+        # Stage B (2026-07-15): the per-GAME worst-case loss is a MUTUAL-EXCLUSION-
+        # AWARE bound, not the old comonotone sum. ``is_me_event`` answers "is this
+        # event's market family mutually exclusive?" (MetadataCache.
+        # event_mutually_exclusive). None ⇒ no ME-event dimension is used (the cap
+        # falls back to the comonotone sum + binary-market splits only) — a
+        # fresh/paper build with no metadata is byte-identical to the old cap on
+        # non-ME books. See ``_mutex_game_worst_cc`` and tools/proto_mutex_game_cap.py.
+        self._is_me_event = is_me_event
         self.positions: dict[str, OpenPosition] = {}
         self.open_quotes: dict[str, OpenQuoteRisk] = {}
 
@@ -254,26 +358,47 @@ class ExposureBook:
         """
         delta_market: dict[str, float] = defaultdict(float)
         delta_game: dict[str, float] = defaultdict(float)
-        game_worst: dict[str, int] = defaultdict(int)      # LOSS axis (premium)
+        # LOSS axis (premium): collect per-game entries, then fold each game with
+        # the MUTUAL-EXCLUSION-AWARE bound (Stage B) instead of a comonotone sum.
+        game_entries: dict[str, list[_MutexEntry]] = defaultdict(list)
         game_notional: dict[str, int] = defaultdict(int)   # NOTIONAL axis ($1/ct)
         gross_cc = 0
         unknown = False
 
-        real_positions = list(self.positions.values()) + list(extra_positions)
-        for position in real_positions:
+        committed = list(self.positions.values())
+        n_committed = len(committed)
+        for i, position in enumerate(committed + list(extra_positions)):
+            is_committed = i < n_committed
             gross_cc += position.max_loss_cc
             deltas = analytic_leg_deltas(position, marginals)
             if deltas is None:
-                unknown = True
+                # A HELD (committed) position whose live marginal is temporarily
+                # unavailable — e.g. a rehydrated position's leg book not yet
+                # subscribed after a restart — still contributes its KNOWN max_loss
+                # to the loss/notional/game caps (below), but has no computable
+                # delta. It must NOT set ``unknown_marginals``: that flag fail-closes
+                # the WHOLE check (SKIP_CLASSIFIER_UNKNOWN), so one un-pricable held
+                # position would veto ALL quoting (verified live 2026-07-15). Only a
+                # CANDIDATE / open-quote we cannot decompose is a genuine
+                # "can't assess this fill" and fails closed.
+                if not is_committed:
+                    unknown = True
             else:
                 for ticker, delta in deltas.items():
                     delta_market[ticker] += delta
-            games = {
-                game_key(leg.event_ticker) for leg in position.legs if leg.event_ticker
-            }
-            for game in games:
-                game_worst[game] += position.max_loss_cc
+            # Partition the position's legs by game; each game it touches gets an
+            # entry carrying ONLY that game's legs (so the per-game mutex partition
+            # sees only this game's outcomes) + the FULL position loss (a combo
+            # loses fully, attributed to each game's worst case as before).
+            pos_legs_by_game: dict[str, list[LegRef]] = defaultdict(list)
+            for leg in position.legs:
+                if leg.event_ticker:
+                    pos_legs_by_game[game_key(leg.event_ticker)].append(leg)
+            for game, glegs in pos_legs_by_game.items():
                 game_notional[game] += position.gross_settlement_notional_cc
+                game_entries[game].append(
+                    (tuple(glegs), position.max_loss_cc, position.our_side is Side.NO)
+                )
             if deltas is not None:
                 # Leg market tickers are unique within a position (duplicate
                 # legs are rejected by the relationship classifier upstream).
@@ -292,13 +417,19 @@ class ExposureBook:
                 # notional worst sides are the same side here, but computed per
                 # axis so the invariant never depends on that coincidence).
                 gross_cc += max(h.max_loss_cc for h in hypos)
-                worst_loss = max(h.max_loss_cc for h in hypos)
+                worst_hypo = max(hypos, key=lambda h: h.max_loss_cc)
+                worst_loss = worst_hypo.max_loss_cc
                 worst_notional = max(h.gross_settlement_notional_cc for h in hypos)
-                for game in {
-                    game_key(leg.event_ticker) for leg in quote.legs if leg.event_ticker
-                }:
-                    game_worst[game] += worst_loss
+                # requires_all: a long-NO hypothetical loses iff every leg is
+                # satisfied → the mutex partition applies; any other side ⇒ COMMON.
+                requires_all = worst_hypo.our_side is Side.NO
+                q_legs_by_game: dict[str, list[LegRef]] = defaultdict(list)
+                for leg in quote.legs:
+                    if leg.event_ticker:
+                        q_legs_by_game[game_key(leg.event_ticker)].append(leg)
+                for game, glegs in q_legs_by_game.items():
                     game_notional[game] += worst_notional
+                    game_entries[game].append((tuple(glegs), worst_loss, requires_all))
                 # Sign-aligned delta bound per market/game.
                 per_market: dict[str, float] = defaultdict(float)
                 for hypo in hypos:
@@ -323,11 +454,16 @@ class ExposureBook:
                             else -per_market[leg.market_ticker]
                         )
 
+        # Fold each game's entries with the mutual-exclusion-aware bound (Stage B).
+        game_worst = {
+            game: _mutex_game_worst_cc(entries, self._is_me_event)
+            for game, entries in game_entries.items()
+        }
         return ExposureSnapshot(
             delta_by_market=dict(delta_market),
             delta_by_game=dict(delta_game),
             gross_notional_cc=gross_cc,
-            worst_case_loss_by_game_cc=dict(game_worst),
+            worst_case_loss_by_game_cc=game_worst,
             gross_settlement_notional_by_game_cc=dict(game_notional),
             open_quote_count=len(self.open_quotes),
             unknown_marginals=unknown,

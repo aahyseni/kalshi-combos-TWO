@@ -20,14 +20,16 @@ from fractions import Fraction
 from typing import Any
 
 from combomaker.core.clock import SystemClock
-from combomaker.core.conventions import load_conventions
+from combomaker.core.conventions import Side, load_conventions
 from combomaker.core.money import CentiCents
+from combomaker.core.quantity import CentiContracts
 from combomaker.core.reasons import ReasonCode
 from combomaker.exchange.auth import Credentials, RequestSigner
 from combomaker.exchange.quote_query import list_open_quotes, open_quote_ids
 from combomaker.exchange.rest import KalshiApiError, KalshiRestClient, RateLimitedError
 from combomaker.exchange.ws import WsManager
 from combomaker.marketdata.feed import OrderbookFeed
+from combomaker.marketdata.grid import PriceGrid
 from combomaker.marketdata.metadata import MarketMeta, MetadataCache
 from combomaker.ops.config import AppConfig, Env, Mode
 from combomaker.ops.logging import configure_logging, get_logger
@@ -38,6 +40,7 @@ from combomaker.ops.preflight import (
     PreflightError,
     evaluate_preflight,
 )
+from combomaker.ops.pricing_pool import JointPool
 from combomaker.ops.report import build_report, format_report
 from combomaker.ops.supervisor import (
     ENV_SUPERVISOR_API_KEY_ID,
@@ -57,7 +60,7 @@ from combomaker.rfq.lifecycle import LifecycleConfig, QuoteLifecycle
 from combomaker.rfq.models import Rfq, RfqLeg
 from combomaker.risk.balance import BalanceTracker, StaleBalanceError
 from combomaker.risk.breakers import BreakerInputs, CircuitBreakers, RateLimitWindow
-from combomaker.risk.exposure import ExposureBook
+from combomaker.risk.exposure import ExposureBook, LegRef, OpenPosition
 from combomaker.risk.heartbeat import Heartbeat, ReconcileMarker
 from combomaker.risk.inplay import InPlayDetector
 from combomaker.risk.killswitch import HaltEvent, KillSwitch
@@ -71,6 +74,7 @@ from combomaker.risk.reservation import (
 from combomaker.risk.settlement import SettlementHandler, SettlementPoller
 from combomaker.risk.skew import SkewLimits, SkewParams, WidenPolicyParams
 from combomaker.sim.book_model import WithinGameRhoProvider
+from combomaker.sim.structural_book import StructuralConfigView
 from combomaker.sim.within_game_rho import sgp_within_game_rho_provider
 
 log = get_logger(__name__)
@@ -91,6 +95,35 @@ SETTLEMENT_POLL_INTERVAL_S = 30.0
 # leaks headroom until restart. Only touches the network when a reservation is
 # outstanding.
 RESERVATION_RECONCILE_INTERVAL_S = 15.0
+
+# Off-loop joint pricing (Phase 1 — the wedge guarantee). Cold combo pricing runs
+# in worker PROCESSES (escaping the GIL) with a hard per-call deadline so a
+# multi-second cold combo can never stall the event loop / heartbeat / WS pongs
+# (the 04:20 UTC 2026-07-14 supervisor kill). Warm memo hits stay inline. 8
+# workers (2026-07-14 throughput fix): the prod host has 16 cores and the joint
+# MVN is the bottleneck under RFQ bursts — at 2 workers, skip_price_deadline +
+# skip_rfq_closed caused minute-long quote STOPS (verified: zero-quote minutes
+# lined up with rfq_closed spikes of 400-560/min). 8 pricing processes = 4x cold
+# throughput, in SEPARATE processes so they add ZERO event-loop pressure; the
+# deadline is set safely above the post-fix cold-combo cost so only a
+# pathological tail is dropped.
+POOL_WORKERS = 8
+# 0.8→2.0 (2026-07-14): after the WAL persistence fix killed the rfq_closed stall,
+# skip_price_deadline became the top skip (~150/min) — the slow-combo tail hit the
+# 0.8s cutoff and we threw away winnable quotes. rfq_closed is now ~0 and combo
+# RFQs live ~11s, so there is ample latency headroom; 2.0s lets that tail finish
+# pricing and post (a worker AWAITS the pool, so the longer deadline adds no
+# event-loop pressure).
+POOL_DEADLINE_S = 2.0
+
+# Quote resting TTL (2026-07-14, RFQ-lifecycle research). Kalshi RFQs have no fixed
+# exchange TTL — our quote rests, swipeable at its posted price, until the RFQ
+# closes or we pull it, with NO server-side book-move auto-void. Live tape: median
+# combo RFQ lives ~11s, p90 ~24s, only 3.3% past 30s. The old 30s default left
+# quotes resting ~3x the median RFQ life on moved books (stale-book exposure) for
+# almost no late-swipe upside. 20s ≈ the RFQ p90: catches ~97% of realistic swipes,
+# cuts stale exposure, frees capacity to price more. Re-validate once we have fills.
+QUOTE_TTL_S = 20.0
 
 # HARD-class halts: an in-process trip on any of these means our local book /
 # money model is provably wrong or under stress, so a restart MUST reconcile
@@ -220,6 +253,12 @@ class QuoteApp:
         # slow confirm would latch forever).
         self._metrics = Metrics(self._clock)
         self._watched: set[str] = set()
+        # Per-COLLECTION combo-grid cache (throughput, 2026-07-14). Combo market
+        # tickers are UNIQUE per RFQ, so fetching each combo's grid was a per-RFQ
+        # REST read that blew the read-rate budget (live 429 storm). Every combo in
+        # a collection shares one grid, so we fetch it ONCE per collection and reuse
+        # it (metadata.put_combo_grid) for every other combo of that collection.
+        self._collection_grid: dict[str, PriceGrid] = {}
         self._stop = asyncio.Event()
         # Phase 6 out-of-process safety plumbing. The heartbeat file is what the
         # external supervisor reads; the reconcile marker enforces
@@ -272,8 +311,24 @@ class QuoteApp:
         store = await Store.open(
             config.data_dir / config.observe.db_name_for(config.env), self._clock
         )
+        # Move tape writes (rfqs/decisions) OFF the hot path: an inline WAL
+        # checkpoint on the ~2GB DB was freezing the whole event loop 34s+ during
+        # RFQ bursts (2026-07-14 pipeline audit). Fills stay synchronous & durable.
+        store.start_writer()
         ws = WsManager(config.endpoints.ws_url, signer, self._clock, self._metrics)
-        feed = OrderbookFeed(ws, self._clock, self._metrics)
+        # DEDICATED order-book socket (2026-07-14 fix). The communications firehose
+        # (~650 msg/s exchange-wide RFQ stream on `ws`) and the orderbook_delta feed
+        # MUST NOT share a connection: the firehose saturates the dispatcher and
+        # STARVES book snapshots + subscribe-acks, so leg mirrors stay empty and
+        # every combo reads skip_leg_book_thin in bursts (main markets with millions
+        # of contracts of depth looked "thin"). PROVEN: a dedicated book socket pulls
+        # the deep books instantly (ADVANCE-ENG mid 54.5¢, 2.27B ct valid) while the
+        # shared socket subscribed exactly ONE book all run. Own socket, shared
+        # signer/clock/metrics.
+        book_ws = WsManager(
+            config.endpoints.ws_url, signer, self._clock, self._metrics
+        )
+        feed = OrderbookFeed(book_ws, self._clock, self._metrics)
         # Quote mode: gate the exchange-wide RFQ firehose PRE-PARSE on the series
         # allowlist (intake docstring has the measured numbers). Observe mode
         # (app.py) passes no prefixes and keeps recording everything.
@@ -297,7 +352,14 @@ class QuoteApp:
                     [(external[0], config.pricing.external_odds.weight)] if external else []
                 ),
             )
-            exposure = ExposureBook(conventions)
+            # Stage B: the per-game loss cap is mutual-exclusion-aware; it asks the
+            # metadata cache whether an event's market family is mutually exclusive
+            # (advance(ARG) ⊥ advance(ENG)) so opposite-side same-event positions
+            # net instead of comonotone-summing. event_mutually_exclusive reads the
+            # cache synchronously (None when unfetched ⇒ that dimension is skipped).
+            exposure = ExposureBook(
+                conventions, is_me_event=metadata.event_mutually_exclusive
+            )
             risk_cfg = config.risk
             # RiskLimits now carries the R2 %-of-bankroll cap layer (Phase 2,
             # SHADOW by default); to_risk_limits() parses the decimal-string
@@ -358,6 +420,34 @@ class QuoteApp:
             # by the lifecycle's portfolio-CVaR MC AND the observability report MC
             # so BOTH use the same per-pair correlations we quote on.
             within_game_rho = sgp_within_game_rho_provider(engine.sgp_params)
+            # A1: the SAME Dixon-Coles constants the pricer uses, as a decoupled
+            # view for the structural portfolio-risk MC (recompute_book_risk samples
+            # same-game legs from the joint scoreline instead of the copula).
+            _sc = config.pricing.structural
+            structural_cfg = StructuralConfigView(
+                dc_rho=_sc.dc_rho,
+                et_factor=_sc.et_factor,
+                pens_win_a=_sc.pens_win_prob,
+                half_share=_sc.half_share,
+                max_goals=_sc.max_goals,
+                knockout_series=tuple(_sc.knockout_series),
+                enabled=_sc.enabled,
+            )
+            # Off-loop joint pricing (Phase 1). Live quote mode only: cold-combo
+            # CPU runs in worker processes with a deadline so it can never wedge
+            # the loop. Warm memo hits stay inline. Paper/backtests price inline
+            # (deterministic, no process pool). Warmed before any traffic so the
+            # first off-loop price doesn't pay a cold-import tail.
+            joint_pool: JointPool | None = None
+            if config.mode is Mode.QUOTE:
+                joint_pool = JointPool(
+                    config.pricing,
+                    conventions,
+                    workers=POOL_WORKERS,
+                    deadline_s=POOL_DEADLINE_S,
+                )
+                joint_pool.start()
+                await joint_pool.warmup()
             lifecycle = QuoteLifecycle(
                 clock=self._clock,
                 sender=sender,
@@ -377,7 +467,7 @@ class QuoteApp:
                     joint_move_tolerance_cc=risk_cfg.joint_move_tolerance_cc,
                     max_leg_age_s=risk_cfg.max_leg_age_s,
                 ),
-                config=LifecycleConfig(),
+                config=LifecycleConfig(quote_ttl_s=QUOTE_TTL_S),
                 balance_tracker=balance_tracker,
                 # Slate cap's per-leg game-start source — the exact pregame gate
                 # the filter already uses (peek-only, hot-path safe, no network).
@@ -388,6 +478,9 @@ class QuoteApp:
                 # build_sgp_correlation) so the book-risk joint tail uses the same
                 # per-pair correlations we quote on, not the flat default band.
                 within_game_rho=within_game_rho,
+                # A1/A2: structural portfolio-risk MC (joint-scoreline sampling +
+                # P(ruin)); same Dixon-Coles constants the pricer uses.
+                structural_cfg=structural_cfg,
                 # Phase 5 quoting policies (DARK by default; see above).
                 skew_params=skew_params,
                 skew_limits=skew_limits,
@@ -396,6 +489,7 @@ class QuoteApp:
                 fee_model=fee_model,
                 fee_type=fee_type,
                 fee_multiplier=fee_multiplier,
+                joint_pool=joint_pool,
             )
             # R3 Phase 3: single-writer risk-reservation service. Wired AFTER the
             # lifecycle (it reuses the lifecycle's shadow splitter, so a %-cap
@@ -442,6 +536,12 @@ class QuoteApp:
                 # NOT resume quoting until it reconciles its book. The startup
                 # reconcile is the exchange-first pass that satisfies it.
                 await self._block_restart_until_reconciled(rest, reservation)
+                # #33: rehydrate the exposure book from the exchange's open positions
+                # (+ our fills for legs/price) so the caps + portfolio MC see what we
+                # already hold — a restarted bot must NOT quote on an empty book.
+                await self._rehydrate_exposure_book(
+                    rest, store, exposure, config.filters.allowed_leg_series_prefixes
+                )
                 # LAUNCH THE EXTERNAL SUPERVISOR (separate OS process) BEFORE the
                 # preflight so its own-heartbeat is beating when external_kill_
                 # reachable is graded. The bot beats its heartbeat first so the
@@ -456,7 +556,7 @@ class QuoteApp:
             # RFQs skipped for transient reasons (books warming up on first
             # sighting) get retried until quoted, dead, or out of attempts —
             # a one-shot RFQ must not be starved by lazy subscriptions.
-            pending: dict[str, tuple[Rfq, int]] = {}
+            pending: dict[str, tuple[Rfq, int, int]] = {}  # rfq_id → (rfq, attempts, recv_mono_ns)
 
             # RFQ WORK POOL (2026-07-14). The intake pre-parse gate (RfqIntake
             # series_prefixes) already drops the ~90% non-allowlist firehose before
@@ -467,33 +567,56 @@ class QuoteApp:
             # (live 2026-07-14). The on_rfq handler now only ENQUEUES (put_nowait,
             # fast); a small pool of workers prices concurrently. The lifecycle +
             # single-writer reservation service were built for concurrent RFQs.
-            # 2 workers, NOT 8: pricing is CPU-bound (~hundreds of ms/RFQ, Decimal
-            # + structural model) and the GIL serializes CPU, so extra workers give
-            # ~zero throughput but SATURATE the event loop → the heartbeat wedges →
-            # the external supervisor emergency-kills (live 2026-07-14: 8 workers,
-            # 19,832 backpressure drops, heartbeat 15.7s > 15s). The exchange sends
-            # ~170 WC/MLB RFQs/s (bots spamming the 2 live games); we can only price
-            # a few/s, so 2 workers overlap I/O (SQLite + POST) without starving the
-            # loop, a small queue drops the rest FAST (rfq.work_dropped_backpressure),
-            # and the loop keeps breathing for the heartbeat + WS pongs. Real
-            # throughput lift = faster pricing / process-pool offload (next session).
-            RFQ_WORKERS = 2
-            rfq_work: asyncio.Queue[Rfq] = asyncio.Queue(maxsize=40)
+            # 8 workers (2026-07-14 throughput fix). The EARLIER 8-worker wedge
+            # (heartbeat 15.7s > 15s → supervisor kill) was with pricing INLINE:
+            # CPU-bound joints monopolised the loop. That heavy phase is now
+            # OFFLOADED to the POOL_WORKERS process pool, so a worker AWAITS the pool
+            # (yields control → the maintenance loop beats the heartbeat) and only
+            # the light prefix/suffix (book microprice + quote construction) runs
+            # inline. So 8 async workers now FEED the 8 pool processes without
+            # starving the loop. At 2 workers + an 8-deep queue the bot STOPPED for
+            # whole minutes under RFQ bursts (skip_rfq_closed 400-560/min,
+            # skip_price_deadline steady): the queue backed up and RFQs closed / hit
+            # the deadline before we posted. WATCH the heartbeat on the first run —
+            # if it wedges, the offload assumption is wrong; drop back to 4.
+            RFQ_WORKERS = 8
+            # WIN-THE-TAKER FRESHNESS (2026-07-14 P1). A combo RFQ has a ~1s window;
+            # an RFQ that sat in our queue too long can only rfq_closed AFTER wasting
+            # pool budget on it — starving the fresh RFQs we could still win. Now the
+            # queue is SHALLOW and holds (rfq, recv_mono_ns): on overflow we evict the
+            # OLDEST and keep the freshest (was: dropped the newest — backwards), and
+            # a worker SKIPS any RFQ whose queue dwell already exceeds the budget
+            # before spending a pool slot. Off-loop pricing means CPU never wedges the
+            # loop regardless, so the levers here are purely about answering FRESH.
+            RFQ_QUEUE_MAX = 32           # buffer RFQ bursts (was 8 → dropped bursts)
+            # Price RFQs up to 1.5s old. Combo RFQs live ~11s median, so the old 0.4s
+            # SKIPPED still-winnable fresh RFQs during bursts — a stop driver. 1.5s
+            # is still well inside the window and, with 8 pool workers, the queue
+            # drains fast enough that few RFQs ever dwell this long.
+            RFQ_MAX_QUEUE_DWELL_S = 1.5
+            RFQ_RETRY_WINDOW_S = 2.0     # stop retrying a pending RFQ once it's this old
+            rfq_work: asyncio.Queue[tuple[Rfq, int]] = asyncio.Queue(maxsize=RFQ_QUEUE_MAX)
 
-            async def handle_rfq(rfq: Rfq) -> None:
+            async def handle_rfq(rfq: Rfq, recv_mono: int) -> None:
                 await store.record_rfq(rfq, source="ws")
                 if not rfq.is_combo:
                     return
                 await self._ensure_watched(rfq, feed, metadata)
                 await lifecycle.handle_rfq(rfq)
                 if not lifecycle.has_open_quote(rfq.rfq_id):
-                    pending[rfq.rfq_id] = (rfq, 0)
+                    pending[rfq.rfq_id] = (rfq, 0, recv_mono)
 
             async def rfq_worker() -> None:
                 while True:
-                    rfq = await rfq_work.get()
+                    rfq, recv_mono = await rfq_work.get()
                     try:
-                        await handle_rfq(rfq)
+                        dwell_s = (self._clock.monotonic_ns() - recv_mono) / 1e9
+                        if dwell_s > RFQ_MAX_QUEUE_DWELL_S:
+                            # Already too stale to win its window — don't spend a
+                            # pool slot on a combo that will just rfq_closed.
+                            self._metrics.inc("rfq.skipped_stale_in_queue")
+                        else:
+                            await handle_rfq(rfq, recv_mono)
                     except Exception:
                         log.exception("rfq_worker_failed", rfq_id=rfq.rfq_id)
                     finally:
@@ -503,37 +626,73 @@ class QuoteApp:
                         await asyncio.sleep(0)
 
             async def on_rfq_enqueue(rfq: Rfq) -> None:
-                # Non-blocking: the WS dispatcher must NOT stall on pricing, or the
-                # dispatch queue backs up behind the firehose and overflows.
+                # Non-blocking: the WS dispatcher must NOT stall on pricing. Keep the
+                # FRESHEST: on a full queue, evict the oldest queued RFQ and enqueue
+                # this one (drop-oldest), so workers always price recent RFQs.
+                item = (rfq, self._clock.monotonic_ns())
                 try:
-                    rfq_work.put_nowait(rfq)
+                    rfq_work.put_nowait(item)
                 except asyncio.QueueFull:
-                    # Behind on WC/MLB PRICING itself (not the firehose). A combo
-                    # RFQ is one-shot (requester re-RFQs); drop + count so the
-                    # worker count can be sized from evidence.
-                    self._metrics.inc("rfq.work_dropped_backpressure")
+                    try:
+                        rfq_work.get_nowait()
+                        rfq_work.task_done()
+                        self._metrics.inc("rfq.evicted_oldest_for_fresh")
+                    except asyncio.QueueEmpty:  # pragma: no cover - racy drain
+                        pass
+                    try:
+                        rfq_work.put_nowait(item)
+                    except asyncio.QueueFull:  # pragma: no cover - still full
+                        self._metrics.inc("rfq.work_dropped_backpressure")
 
             async def retry_pending() -> None:
                 while True:
                     await asyncio.sleep(1.0)
-                    for rfq_id, (rfq, attempts) in list(pending.items()):
-                        if lifecycle.has_open_quote(rfq_id) or attempts >= 10:
+                    for rfq_id, (rfq, attempts, recv_mono) in list(pending.items()):
+                        age_s = (self._clock.monotonic_ns() - recv_mono) / 1e9
+                        # Drop once quoted, out of attempts, OR past the RFQ window
+                        # (retrying a closed RFQ just wastes a pool slot on a certain
+                        # rfq_closed — the win-the-taker anti-pattern).
+                        if (
+                            lifecycle.has_open_quote(rfq_id)
+                            or attempts >= 5
+                            or age_s > RFQ_RETRY_WINDOW_S
+                        ):
                             pending.pop(rfq_id, None)
                             continue
                         try:
                             await lifecycle.handle_rfq(rfq)
                         except Exception:
                             log.exception("pending_retry_failed", rfq_id=rfq_id)
-                        pending[rfq_id] = (rfq, attempts + 1)
+                        pending[rfq_id] = (rfq, attempts + 1, recv_mono)
 
             async def on_rfq_deleted_cleanup(rfq_id: str, msg: JsonDict) -> None:
                 pending.pop(rfq_id, None)
 
+            # Confirm path OFF the dispatch loop (2026-07-14 audit). on_quote_accepted
+            # awaits confirm_quote (REST POST) + record_fill (sync DB commit); running
+            # that INLINE on the single communications dispatch loop head-of-line-blocks
+            # NEW rfq_created intake during a fill burst → the 8 workers drain rfq_work
+            # and go idle → a quote block. Enqueue instead; ONE worker drains FIFO
+            # (preserves per-quote accept→execute order) so confirms never block the
+            # firehose consumer. Unbounded + never-drop: quote events are rare (not the
+            # firehose) and losing one = a missed confirm / an unbooked fill.
+            quote_event_q: asyncio.Queue[tuple[str, JsonDict]] = asyncio.Queue()
+
             async def on_quote_event(kind: str, msg: JsonDict) -> None:
-                if kind == "quote_accepted":
-                    await lifecycle.on_quote_accepted(msg)
-                elif kind == "quote_executed":
-                    await lifecycle.on_quote_executed(msg)
+                quote_event_q.put_nowait((kind, msg))
+
+            async def quote_event_worker() -> None:
+                while True:
+                    kind, msg = await quote_event_q.get()
+                    try:
+                        if kind == "quote_accepted":
+                            await lifecycle.on_quote_accepted(msg)
+                        elif kind == "quote_executed":
+                            await lifecycle.on_quote_executed(msg)
+                    except Exception:
+                        log.exception("quote_event_worker_failed", kind=kind)
+                    finally:
+                        quote_event_q.task_done()
 
             intake.on_rfq(on_rfq_enqueue)
             intake.on_rfq_deleted(lifecycle.on_rfq_deleted)
@@ -564,8 +723,10 @@ class QuoteApp:
             intake.on_channel_lost(on_channel_lost)
 
             ws.start()
+            book_ws.start()  # dedicated order-book socket (see construction note)
             tasks = [
                 asyncio.create_task(retry_pending(), name="rfq-retry"),
+                asyncio.create_task(quote_event_worker(), name="quote-event-worker"),
                 *[
                     asyncio.create_task(rfq_worker(), name=f"rfq-worker-{i}")
                     for i in range(RFQ_WORKERS)
@@ -609,6 +770,9 @@ class QuoteApp:
                 except Exception:
                     log.exception("shutdown_cancel_all_failed")
                 await ws.stop()
+                await book_ws.stop()
+                if joint_pool is not None:
+                    joint_pool.shutdown()
                 await killswitch.stop()
                 # Tear down the external supervisor subprocess (best-effort).
                 try:
@@ -728,15 +892,107 @@ class QuoteApp:
             log.info("startup_reconciled", leftover_quotes=len(leftover))
             positions = await rest.get_positions()
             if positions.get("market_positions") or positions.get("positions"):
-                log.warning(
+                log.info(
                     "startup_existing_positions",
-                    detail="existing positions found — exposure book starts EMPTY; "
-                    "reconcile manually before trusting limits",
+                    detail="existing positions found — the exposure book is rehydrated "
+                    "from them next (_rehydrate_exposure_book, #33)",
                 )
             return True
         except KalshiApiError as exc:
             log.warning("startup_reconcile_failed", error=str(exc))
             return False
+
+    async def _rehydrate_exposure_book(
+        self,
+        rest: KalshiRestClient,
+        store: Store,
+        exposure: ExposureBook,
+        allowed_series: list[str] | None = None,
+    ) -> None:
+        """#33 (over-book reconciliation gap): after a restart the in-memory exposure
+        book starts EMPTY, so the risk caps (game/slate loss, mass-acceptance, the
+        portfolio MC) can't see positions we still hold and the book would
+        over-commit on top of live exposure. Rehydrate from the exchange's ACTUAL
+        open positions (ground truth of what we hold) joined to our recorded fills
+        (legs + a max-loss-preserving entry price). Best-effort: an unreachable
+        exchange leaves the book empty — the conservative-but-blind state the prior
+        code left SILENTLY; this only ever ADDS real positions. An exchange position
+        with no local fill/rfq record is logged, never modeled from a guess (rule 6).
+
+        ``allowed_series``: rehydrate ONLY positions whose every leg is on a quoted
+        (allow-listed) series. A position on a GATED-OFF series (e.g. MLB while the
+        allowlist is [KXWC]) has no subscribed leg books, so its marginals are
+        unavailable — and a committed position with an unavailable marginal makes the
+        exposure snapshot ``unknown_marginals`` on EVERY check, declining EVERY quote
+        via SKIP_CLASSIFIER_UNKNOWN (verified live 2026-07-15: 2 rehydrated MLB
+        positions blocked all WC quoting). Such positions don't interact with the
+        quoted sport's caps (different games) and are already filled, so they are
+        skipped-with-a-log, never modeled blind."""
+        try:
+            payload = await rest.get_positions()
+        except KalshiApiError as exc:
+            log.warning("rehydrate_positions_failed", error=str(exc))
+            return
+        open_by_ticker = open_combo_tickers_from_positions(payload)
+        if not open_by_ticker:
+            return
+        held = await store.held_positions(list(open_by_ticker))
+
+        def _quoted(mt: str) -> bool:
+            if allowed_series is None:
+                return True
+            series = mt.split("-", 1)[0]
+            return any(series.startswith(p) for p in allowed_series)
+
+        modeled: set[str] = set()
+        games: set[str] = set()
+        gated: set[str] = set()
+        for h in held:
+            legs = tuple(
+                LegRef(
+                    market_ticker=leg["market_ticker"],
+                    event_ticker=leg.get("event_ticker"),
+                    side=leg.get("side", "yes"),
+                )
+                for leg in h["legs"]
+            )
+            if not all(_quoted(leg.market_ticker) for leg in legs):
+                gated.add(h["combo_ticker"])  # gated-off series → no marginals → skip
+                continue
+            exposure.add_position(
+                OpenPosition(
+                    position_id=f"rehydrate:{h['combo_ticker']}",
+                    combo_ticker=h["combo_ticker"],
+                    collection=h["collection"],
+                    our_side=Side.NO if h["our_side"] == "no" else Side.YES,
+                    contracts=CentiContracts(int(h["contracts_centi"])),
+                    entry_price_cc=CentiCents(int(h["entry_price_cc"])),
+                    legs=legs,
+                )
+            )
+            modeled.add(h["combo_ticker"])
+            games.update(game_key(leg.event_ticker) for leg in legs if leg.event_ticker)
+        if gated:
+            log.info(
+                "rehydrate_skipped_gated_series",
+                count=len(gated),
+                detail="positions on non-allow-listed series (no subscribed leg books "
+                "→ unavailable marginals) — not added to the risk book",
+            )
+        unmodeled = sorted(set(open_by_ticker) - modeled - gated)
+        log.info(
+            "exposure_rehydrated",
+            positions=len(modeled),
+            games=sorted(games),
+            unmodeled_open=len(unmodeled),
+        )
+        if unmodeled:
+            log.warning(
+                "rehydrate_unmodeled_positions",
+                detail="open exchange positions with no local fill/rfq record — NOT "
+                "in the risk book; reconcile manually before trusting the caps",
+                tickers=unmodeled,
+            )
 
     async def _block_restart_until_reconciled(
         self, rest: KalshiRestClient, reservation: RiskReservationService
@@ -883,6 +1139,18 @@ class QuoteApp:
         if self._supervisor_proc is None:
             return
         path = supervisor_heartbeat_path(self._config.data_dir)
+        # Wait for the heartbeat to be (re)written AFTER launch, not merely to
+        # exist. A stale file from a PRIOR (now-dead) supervisor must not
+        # short-circuit this: it would return on mere existence while the
+        # preflight grades external_kill_reachable on FRESHNESS and (correctly)
+        # fails red — the stale-file race that blocked a full-tree cold restart
+        # 2026-07-14. Baselining the pre-launch mtime makes "a NEW beat landed"
+        # the release condition; a pre-existing LIVE supervisor still releases on
+        # its very next beat (~0.1s), so the healthy path is unchanged.
+        try:
+            baseline_mtime_ns = path.stat().st_mtime_ns if path.exists() else -1
+        except OSError:  # pragma: no cover - exotic FS failure
+            baseline_mtime_ns = -1
         deadline_beats = 50  # ~5s at 0.1s cadence — well inside a 1s poll launch
         for _ in range(deadline_beats):
             if self._supervisor_proc.returncode is not None:
@@ -892,7 +1160,7 @@ class QuoteApp:
                 )
                 return
             try:
-                if path.exists():
+                if path.exists() and path.stat().st_mtime_ns > baseline_mtime_ns:
                     return
             except OSError:  # pragma: no cover - exotic FS failure
                 pass
@@ -993,18 +1261,34 @@ class QuoteApp:
         if new:
             self._watched.update(new)
             feed.watch(new)
-        # The COMBO market's metadata carries the price grid the quote must
-        # land on — without it the engine (correctly) refuses to price.
-        to_fetch = list(new)
-        if metadata.peek(rfq.market_ticker) is None:
-            to_fetch.append(rfq.market_ticker)
-        for ticker in to_fetch:
+        # LEG metadata: legs are SHARED real markets, so a fetch caches and is
+        # reused across combos — no per-RFQ storm.
+        for ticker in new:
             try:
                 meta = await metadata.market(ticker)
                 if meta.event_ticker:
                     await metadata.event(meta.event_ticker)
             except KalshiApiError as exc:
                 log.warning("metadata_fetch_failed", ticker=ticker, error=str(exc))
+        # COMBO market grid: the combo ticker is UNIQUE per RFQ, so fetching it per
+        # combo blew the read-rate budget (429 storm, 2026-07-14). Every combo in a
+        # collection shares one grid, so fetch ONCE per collection and inject the
+        # cached grid for the rest (no per-combo fetch, no combo-event fetch — the
+        # engine only needs the grid). Only the FIRST unseen combo of a collection
+        # hits the network.
+        combo = rfq.market_ticker
+        if metadata.peek(combo) is None:
+            collection = rfq.mve_collection_ticker
+            cached = self._collection_grid.get(collection) if collection else None
+            if cached is not None:
+                metadata.put_combo_grid(combo, cached)
+            else:
+                try:
+                    meta = await metadata.market(combo)
+                    if meta.grid is not None and collection:
+                        self._collection_grid[collection] = meta.grid
+                except KalshiApiError as exc:
+                    log.warning("metadata_fetch_failed", ticker=combo, error=str(exc))
 
     async def _maintenance_loop(self, lifecycle: QuoteLifecycle) -> None:
         while True:
@@ -1109,6 +1393,12 @@ class QuoteApp:
                 )
             except Exception:
                 log.exception("breaker_evaluation_failed")
+            # Throughput observability: joint-memo hit rate + off-loop pool
+            # counters (the Phase-3/4 decision signal). Off the hot path.
+            try:
+                log.info("pricing_stats", **lifecycle.pricing_stats())
+            except Exception:
+                log.exception("pricing_stats_log_failed")
             await asyncio.sleep(15.0)
 
     def _sample_breaker_inputs(

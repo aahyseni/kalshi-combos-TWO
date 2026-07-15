@@ -198,12 +198,17 @@ class TestEachLimitIndependently:
         assert "worst-case loss" in breaches[0].detail
 
     def test_unknown_marginals(self) -> None:
-        book = empty_book()
-        book.add_position(
-            make_position("p1", (LegRef("ZZZ", "EV9", "yes"),), contracts=1_000, entry_price=100)
+        # A CANDIDATE we cannot decompose (unavailable marginal) fails closed. NOTE
+        # a HELD position's missing marginal does NOT block — that would veto ALL
+        # quoting on one un-pricable held position (the 2026-07-15 rehydration
+        # regression); see tests/test_exposure.py.
+        candidate = make_position(
+            "cand", (LegRef("ZZZ", "EV9", "yes"),), contracts=100, entry_price=100
         )
-        breaches = LimitChecker(RiskLimits()).check(book, MARG, DailyPnl())
-        assert reasons(breaches) == [ReasonCode.SKIP_CLASSIFIER_UNKNOWN]
+        breaches = LimitChecker(RiskLimits()).check(
+            empty_book(), MARG, DailyPnl(), candidate_positions=[candidate]
+        )
+        assert ReasonCode.SKIP_CLASSIFIER_UNKNOWN in reasons(breaches)
 
 
 class TestDailyLoss:

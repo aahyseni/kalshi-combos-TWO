@@ -141,6 +141,10 @@ class RiskLimits:
     # meaningful slice of bankroll. Read off the latest BookRiskSnapshot (never
     # re-run MC in check); a stale/UNKNOWN snapshot fails closed.
     portfolio_cvar_frac: Fraction = Fraction(15, 100)
+    # A2: max acceptable P(this settlement wave drops equity below the ruin floor).
+    # Read off the structural-MC snapshot's ``p_ruin`` (floor set on the MC side,
+    # -30% ⇒ equity < 0.70·bankroll). A probability budget, not a $ cap.
+    portfolio_ruin_prob_budget: Fraction = Fraction(5, 100)
     # Absolute-$ utilization backstop: gross_settlement_notional (utilization
     # axis), whole book, as a MULTIPLE of bankroll. Loose backstop ABOVE the %
     # caps; binds even when the bankroll poll is stale. 3×.
@@ -246,6 +250,9 @@ class PortfolioRisk(Protocol):
 
     @property
     def operative_es_99_cc(self) -> float: ...
+
+    @property
+    def p_ruin(self) -> float: ...
 
 
 class LimitChecker:
@@ -640,6 +647,23 @@ class LimitChecker:
                         f"portfolio operative ES_0.99 "
                         f"{int(book_risk.operative_es_99_cc)}cc > "
                         f"{limits.portfolio_cvar_frac} bankroll = {cvar_thr}cc",
+                        shadow=shadow,
+                    )
+                )
+            # (9) A2 P(RUIN) cap: P(this settlement wave drops equity below the ruin
+            # floor, e.g. −30% ⇒ equity < 0.70·bankroll) vs a probability budget.
+            # Reads the STRUCTURAL-MC ``p_ruin`` (which reflects same-game hedges,
+            # unlike the comonotone deterministic stress baked into operative_es), so
+            # a book-balancing fill that LOWERS the joint tail lowers p_ruin and is
+            # admitted. Co-equal with the analytic (mutex) + gross backstops — an
+            # addition, never a demotion. Fail-closed via the ``usable`` guard above.
+            ruin_budget = float(limits.portfolio_ruin_prob_budget)
+            if book_risk.usable and book_risk.p_ruin > ruin_budget:
+                out.append(
+                    Breach(
+                        ReasonCode.SKIP_PORTFOLIO_RUIN,
+                        f"P(ruin) {book_risk.p_ruin:.4f} > budget {ruin_budget:.4f} "
+                        f"(equity below ruin floor this settlement wave)",
                         shadow=shadow,
                     )
                 )

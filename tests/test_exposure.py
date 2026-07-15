@@ -285,15 +285,31 @@ class TestSnapshotWithoutMassAcceptance:
         assert snap.delta_by_market == pytest.approx({"AAA": 0.6, "BBB": 0.0, "CCC": -1.2})
         assert snap.open_quote_count == 1
 
-    def test_unknown_marginal_sets_flag_but_keeps_gross(self) -> None:
+    def test_committed_unknown_marginal_keeps_gross_but_does_not_block(self) -> None:
+        # A HELD (committed) position whose marginal is unavailable keeps its gross/
+        # loss but must NOT set unknown_marginals — that flag fail-closes the WHOLE
+        # check (SKIP_CLASSIFIER_UNKNOWN), so one un-pricable held position would veto
+        # ALL quoting (the 2026-07-15 rehydration regression).
         marg = provider({"AAA": 0.5, "BBB": 0.6})  # CCC unavailable
         snap = two_position_book().snapshot(marg, mass_acceptance=False)
-        assert snap.unknown_marginals is True
+        assert snap.unknown_marginals is False
         # pos2's deltas are dropped (not zeroed into the aggregate)...
         assert snap.delta_by_market == pytest.approx({"AAA": 0.6, "BBB": 0.5})
         # ...but its notional risk still counts — missing data never shrinks gross.
         assert snap.gross_notional_cc == 11_600
         assert snap.worst_case_loss_by_event_cc == {"EV1": 11_600, "EV2": 6_000}
+
+    def test_candidate_unknown_marginal_fails_closed(self) -> None:
+        # A CANDIDATE (extra_positions) we cannot decompose IS a genuine "can't
+        # assess this fill" → unknown_marginals True (fail closed, blocks the quote).
+        marg = provider({"AAA": 0.5, "BBB": 0.6})  # CCC unavailable
+        candidate = make_position(
+            "cand", (LegRef("CCC", "EV2", "yes"),), our_side=Side.NO, contracts=100
+        )
+        snap = ExposureBook(CONVENTIONS).snapshot(
+            marg, mass_acceptance=True, extra_positions=[candidate]
+        )
+        assert snap.unknown_marginals is True
 
 
 # --- B2: aggregation keys on the GAME, not the raw event ---------------------

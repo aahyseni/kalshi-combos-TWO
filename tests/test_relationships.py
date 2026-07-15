@@ -390,17 +390,20 @@ def test_three_cross_game_bands_all_detected() -> None:
     assert set(rel.bands) == {(0, 1), (2, 3), (4, 5)}
 
 
-def test_band_with_same_game_companion_is_unknown() -> None:
-    """A band sharing its game with ANY other leg is UNKNOWN: the band is a
-    window event, its correlation to a neighbour is NOT the rung's rho
-    (attenuation unmeasured) — widen-or-no-quote, never a copula guess."""
+def test_band_with_same_game_companion_routes_to_structural() -> None:
+    """A band sharing its game with a neighbour ROUTES TO STRUCTURAL (2026-07-14):
+    the scoreline model prices P(window ∧ neighbour) natively. This is a CORNERS
+    band, which the DC model can't represent, so the ENGINE still declines (never a
+    copula guess) — but as a structural-can't-represent decline, not a blanket
+    classifier UNKNOWN. The relationship carries the routing signal."""
     tot_ev = "KXWCTOTAL-26JUL10ESPBEL"
     legs = (
         leg(MC_8, MC_EV, "yes"), leg(MC_11, MC_EV, "no"),
         leg("KXWCTOTAL-26JUL10ESPBEL-3", tot_ev, "yes"),
     )
     rel = classify_legs(legs, MappingProvider({MC_EV: False, tot_ev: False}))
-    assert rel.kind is RelationshipKind.UNKNOWN
+    assert rel.kind is RelationshipKind.NESTED_BAND
+    assert rel.band_with_neighbour is True
 
 
 def test_band_with_cross_game_companion_is_priced() -> None:

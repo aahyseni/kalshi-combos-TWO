@@ -41,7 +41,7 @@ from combomaker.core.money import (
     ZERO,
     CentiCents,
     MoneyParseError,
-    cc_from_dollars_str,
+    fee_cc_from_dollars_str,
 )
 from combomaker.core.reasons import ReasonCode
 from combomaker.ops.logging import get_logger
@@ -180,13 +180,16 @@ def _parse_cents_field(row: JsonDict, key: str, ticker: str) -> CentiCents:
 
 
 def _parse_dollars_field(row: JsonDict, key: str, ticker: str) -> CentiCents:
-    """Fixed-point ``*_dollars`` string field → cc. Absent ⇒ $0 (many rows omit a
-    zero fee), but a PRESENT unparseable value raises (never guess)."""
+    """Fixed-point ``*_dollars`` string FEE field → cc. Absent ⇒ $0 (many rows omit
+    a zero fee). A present value is booked at cc granularity, rounding UP a sub-cc
+    fee (Kalshi can charge one, e.g. ``"0.000080"`` = 0.8 cc — observed live on a
+    combo settlement) so we never understate a cost we paid; a genuinely
+    unparseable value still raises (never guess). Used only for ``fee_cost``."""
     raw = row.get(key)
     if raw is None:
         return ZERO
     try:
-        return cc_from_dollars_str(str(raw))
+        return fee_cc_from_dollars_str(str(raw))
     except MoneyParseError as exc:
         raise SettlementReconcileError(
             f"settlement {ticker}: bad {key} {raw!r}: {exc}"

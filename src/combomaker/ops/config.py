@@ -235,6 +235,12 @@ class FiltersConfig(StrictModel):
     # normally wins for KXMLB*; API-measured expected_expiration = start+3h,
     # so 4.0 lands 1h before first pitch).
     pregame_start_offset_hours_by_prefix: dict[str, float] = {"KXMLB": 4.0}
+    # MAX pregame horizon per prefix (hours): decline a combo whose leg game is
+    # more than this far out. Far-out Kalshi leg books are UNINFORMED and diverge
+    # from the sharp consensus, so pricing off them invites adverse selection
+    # (2026-07-14: an MLB leg priced 41% vs 58% true, ~3 days out, got picked off).
+    # Empty default = no horizon limit; the armed config sets KXMLB: 24.0.
+    max_pregame_hours_by_prefix: dict[str, float] = {}
 
     # --- Precision ladder margins (Phase 5, R3 Part B) -----------------------
     # Split the single start buffer into TWO margins applied to a PRECISE start
@@ -1967,6 +1973,7 @@ class RiskConfig(StrictModel):
     drawdown_frac: str = "0.10"           # peak-drawdown halt
     hard_trip_frac: str = "0.12"          # hard-trip KILL
     portfolio_cvar_frac: str = "0.15"     # portfolio joint-tail (operative ES_0.99)
+    portfolio_ruin_prob_budget: str = "0.05"  # A2: max P(equity < ruin floor this wave)
     absolute_notional_multiple: int = 3   # utilization backstop (× bankroll)
     fill_velocity_window_s: float = 2.0
     fill_velocity_soft_frac: str = "0.05"
@@ -1989,6 +1996,7 @@ class RiskConfig(StrictModel):
         "drawdown_frac",
         "hard_trip_frac",
         "portfolio_cvar_frac",
+        "portfolio_ruin_prob_budget",
         "fill_velocity_soft_frac",
         "fill_velocity_hard_frac",
     )
@@ -2039,6 +2047,7 @@ class RiskConfig(StrictModel):
             drawdown_frac=Fraction(Decimal(self.drawdown_frac)),
             hard_trip_frac=Fraction(Decimal(self.hard_trip_frac)),
             portfolio_cvar_frac=Fraction(Decimal(self.portfolio_cvar_frac)),
+            portfolio_ruin_prob_budget=Fraction(Decimal(self.portfolio_ruin_prob_budget)),
             absolute_notional_multiple=self.absolute_notional_multiple,
             fill_velocity_window_s=self.fill_velocity_window_s,
             fill_velocity_soft_frac=Fraction(Decimal(self.fill_velocity_soft_frac)),

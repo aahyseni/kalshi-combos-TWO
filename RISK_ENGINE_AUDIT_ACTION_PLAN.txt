@@ -1,0 +1,354 @@
+﻿RISK ENGINE RE-AUDIT AND EXECUTION PLAN — UPDATED AFTER FANOUT FIX
+=================================================================
+
+Date: 2026-07-15
+Repository: kalshi-combos-TWO
+Purpose: Decision-complete handoff for another engineer or LLM.
+
+CURRENT AUTHORITY ORDER
+-----------------------
+
+1. Current source code and tests.
+2. docs/reports/README.md, newest first.
+3. docs/reports/2026-07-15-rfq-tape-fanout-zero-quotes-fix.md.
+4. docs/reports/2026-07-15-risk-engine-upgrade-final-report.md for history.
+5. LIVE_ISSUES.txt is stale (snapshot 2026-07-14 03:31 UTC).
+
+MAJOR UPDATE SINCE THE PRIOR AUDIT
+----------------------------------
+
+The final risk report''s conclusion that productive quoting remained blocked by
+legitimate enforced caps was superseded. The zero-quote cause was a SQL fanout
+in Store.held_positions: fills were directly joined to an RFQ tape containing
+up to 12,456 repeated rows per combo before SUM(contracts_centi). This inflated
+435 real contracts to 552,393 and ARG-advance delta to -259,302.
+
+The fix now on disk pre-aggregates fills, de-duplicates RFQ metadata, joins the
+two one-row-per-combo tables, adds idx_rfqs_market_ticker, and includes a fanout
+regression test. Reported verification: 435 correct contracts, ARG delta about
+47.7, suite 1789/0, and live quoting recovered from zero to 228+ quotes in about
+3.5 minutes on both ARG and ENG flow.
+
+Do not tune caps from pre-fix exposure measurements. Do not repeat that the bot
+is still at zero quotes.
+
+CURRENT STATE
+-------------
+
+Validated:
+- Stage B''s single-event mutex loss bound is conservative and property-tested
+  for monotonic mass-acceptance dominance.
+- Rehydration no longer multiplies fills by RFQ tape fanout.
+- The structural scoreline sampler is coherent for supported soccer legs and
+  makes opposing advance outcomes mutually exclusive.
+- Target-cost accepted-size parsing and sub-cent fee parsing have fixes.
+- Productive quoting resumed after the fanout fix.
+
+Current live sole blockers after the fix:
+- skip_directional_cap: dominant, reflecting a genuinely one-sided ENGARG book;
+- skip_max_open_quotes: resting capacity reaches 20;
+- skip_portfolio_cvar: MC snapshot unusable due unavailable held-leg marginals;
+- skip_price_deadline: pricing latency;
+- smaller skip_classifier_unknown joint-layer gaps.
+
+RESOLVED — PRESERVE THESE FIXES
+-------------------------------
+
+1. RFQ tape fanout in held_positions.
+- Preserve fill pre-aggregation, RFQ de-duplication, the market_ticker index,
+  and test_held_positions_not_inflated_by_rfq_tape_fanout.
+- Never restore a direct fills JOIN rfqs aggregate.
+
+2. Target-cost accepted size.
+- Preserve accepted-count -> accepted-side offered-count -> RFQ-contract fallback.
+- Malformed present values still fail closed.
+
+3. Analytic committed-marginal poisoning is partially fixed.
+- An unmarkable held position contributes known loss/notional without setting
+  candidate unknown_marginals.
+- Candidate/open-quote unknowns still fail closed.
+- The separate MC book-model unknown path remains unresolved below.
+
+P0 — CORRECTNESS AND SAFETY
+---------------------------
+
+P0-1. Candidate- and reservation-aware portfolio risk
+
+Defect:
+- BookRiskSnapshot contains committed positions only.
+- Candidate positions affect analytic caps but not stored ES or P(ruin).
+- A concentrating candidate can pass using the safer old book; a balancing
+  candidate receives no MC credit in its own decision.
+
+Implement:
+- Evaluate committed and post-candidate P&L on common sampled states.
+- Include outstanding reservations and simultaneously executable accepts.
+- Support candidates introducing new games.
+- Compute pre/post EV, model ES99, P(ruin), deterministic loss, and gross.
+- Confirm only when candidate EV is positive, post-risk budgets pass, and all
+  analytic/gross/burst controls pass.
+- Do not accept negative-EV hedges without an explicit enabled hedge-cost budget.
+
+P0-2. Book generations and immediate invalidation
+
+Defect:
+- A snapshot can remain time-fresh for about 15 seconds after fills change the
+  portfolio.
+
+Implement:
+- Add ExposureBook generation; increment on position, settlement, rehydration,
+  reconciliation, reservation, and relevant quote mutations.
+- Store input_generation in BookRiskSnapshot.
+- Invalidate on fills and settlements.
+- Publish async results only when their generation remains current.
+- Time age is a secondary guard, not the consistency proof.
+
+P0-3. Separate ES from deterministic maximum loss
+
+Defect:
+- operative_es=max(model ES, challenger ES, deterministic maximum).
+- The deterministic maximum normally dominates all sampled ES by construction,
+  reducing the CVaR gate to a premium-at-risk cap.
+
+Implement separate fields and gates:
+- production_es_99_cc;
+- challenger_es_99_cc by scenario;
+- governing_model_es_99_cc=max(production, challengers);
+- deterministic_max_loss_cc.
+- Gate model ES and deterministic maximum independently.
+- Remove or rename operative_es_99_cc so maximum loss is not called ES.
+
+P0-4. Usable MC without hiding unmodeled holdings
+
+Defect:
+- Portfolio MC fails the whole book UNKNOWN when any held marginal is absent.
+- Rehydration skips gated-off positions to avoid poisoning WC quoting, removing
+  their real whole-account risk.
+
+Implement:
+- Rehydrate every exchange-held position regardless of quote eligibility.
+- Distinguish quote_eligible, risk_modeled, and conservatively reserved.
+- Always include exact premium loss, gross, and known concentration.
+- Preferred: subscribe/fetch held-leg books. Interim: deterministic unmodeled
+  reserve outside model ES. Never score missing marginals as ordinary p=0.5.
+- Missing held data must not poison unrelated candidate decomposition or vanish
+  from global capital accounting.
+
+P0-5. Exact exchange-quantity reconciliation
+
+What remains after fanout fix:
+- Exchange positions identify open tickers, while local fills still determine
+  reconstructed quantity.
+
+Implement:
+- Exchange ticker, side, position_fp, and subaccount are authoritative.
+- Local fills supply cost basis, legs, fees, and provenance only.
+- On local/exchange mismatch, block quoting or reserve the larger exposure and
+  emit a dedicated reconciliation halt/no-quote reason.
+- Exclude settled/zero positions; pin all account endpoints to one subaccount.
+- Reconcile unexpected opposite-side/manual holdings explicitly.
+
+P0-6. Fractional contracts in MC
+
+Defect:
+- max(1, centi_contracts // 100) turns 37.27 into 37 and 0.40 into 1.
+
+Implement:
+- Preserve integer centi-contracts through ComboPosition or convert exactly by
+  dividing by 100 in simulator arithmetic.
+- Remove the forced one-contract minimum.
+- Prove analytic/simulated max-loss parity.
+
+P0-7. Structural/fallback same-game dependence
+
+Defect:
+- Structural scoreline legs and copula-only corners/cards are sampled separately,
+  discarding same-game cross-block dependence.
+
+Implement:
+- Preferred: condition fallback legs on the structural game state/shared factor.
+- Interim: structural-split and full-copula challengers, gate on worse tail.
+- Do not claim exact all-leg hedging until the bridge exists.
+
+P0-8. Challenger correlation scope
+
+Defect:
+- _inflate_corr changes all off-diagonals, including cross-game 0 -> 0.5.
+- Universal positive correlation is not always conservative for hedged books.
+
+Implement:
+- Inflate only intended same-game pairs with a game mask.
+- Preserve cross-game values.
+- Add separate named cross-game regime scenarios if required.
+
+P0-9. Directional-cap hedge semantics
+
+Current state:
+- skip_directional_cap is the largest legitimate blocker post-fanout.
+- analytic deltas are independence proxies and do not fully recognize opposing
+  advance hedges.
+
+Implement carefully:
+- Do not simply raise delta limits.
+- Define them as monotonic hard directional/model-sensitivity backstops.
+- Prototype mutex-aware direction on the actual ENGARG book.
+- Prove the all-accepted snapshot dominates every realizable accepted subset.
+- If richer credit breaks monotonicity, keep a loose hard delta backstop and
+  award richer hedge credit only through candidate-aware MC.
+
+P1 — HARDENING
+--------------
+
+1. Compute production and challenger P(ruin); gate on the worst credible model.
+2. Add confidence bounds/adaptive samples near the ruin budget and common random
+   numbers for candidate comparisons.
+3. Prove the equity/P&L basis does not add entry-to-terminal P&L to already
+   marked current equity and double count position value.
+4. Persist structural inversion residuals; reject/challenge inconsistent fits.
+5. Expose a public parse/invert/sample/settle structural API instead of importing
+   private pricing functions into risk.
+6. Add tape-derived parity for regulation/advance, halves/full-time, spread
+   windows, multiple scorers, NO legs, real tickers, and enabled series.
+7. Audit mutex metadata, retain explicit-True-only netting, and add settlement
+   tripwires.
+8. Label analytic_leg_deltas as independence proxies; use structural scenario
+   sensitivities where available.
+9. Add independent challengers for goal rates, DC rho, marginals, settlement
+   rules, mutex metadata, feed errors, and explicit cross-game regimes.
+10. Build a durable position ledger with exchange quantity/side, cost, fees,
+    subaccount, status, settlement, reconciliation time, and leg-set hash.
+11. Replace MAX(legs_json) provenance with exact originating RFQ/leg-set identity;
+    reject conflicting definitions.
+
+P2 — OPERATIONS
+---------------
+
+1. Prevent orphaned worker processes with parent-owned process groups/Windows
+   Job Objects, parent-death detection, finally close/join, and startup cleanup.
+2. Run full-book MC off the event loop on immutable inputs and discard stale
+   generation results.
+3. Refresh on fills, settlements, reconciliation, material marginal/balance
+   changes, new games, and reservations; periodic refresh is fallback.
+4. Log book/snapshot generation, age, candidate EV, pre/post ES/P(ruin),
+   deterministic loss, gross, direction, reservations, model split/residual,
+   fallback reason, and binding cap for every quote/confirm.
+5. Treat max_open_quotes as an operator risk decision. Do not raise it until
+   reservation/mass-acceptance headroom is measured on sane post-fanout exposure.
+6. Continue pricing-deadline work separately; do not weaken freshness or risk
+   controls to improve throughput.
+
+MANDATORY TESTS
+---------------
+
+Fanout and reconstruction:
+- Repeated RFQ rows never multiply quantity.
+- Multiple fills plus repeated RFQs preserve exact weighted cost/quantity.
+- Conflicting leg definitions fail reconciliation.
+- Production-like fanout remains performant with the new index.
+
+Candidate risk:
+- Concentrating candidate crosses ruin/ES budget and declines.
+- Balancing candidate lowers post-risk and can pass.
+- Negative-EV hedge declines absent explicit authorization.
+- New-game candidate and outstanding reservations are included.
+
+Snapshot consistency:
+- Fill, settlement, rehydration, and reconciliation increment generation.
+- Old-generation results are discarded.
+- Multiple fills cannot reuse pre-fill risk.
+
+Unmodeled holdings:
+- Gated holdings remain in global deterministic/gross risk.
+- Missing held marginal does not poison unrelated candidate decomposition.
+- Missing marginal never becomes an ordinary usable p=0.5 MC score.
+
+Fractional quantities:
+- Exact P&L at 0.01, 0.40, 1.25, 37.27, and 100.99 contracts.
+- Analytic and simulated maximum losses match.
+
+Mixed dependence and challengers:
+- Corner covariance with ML/total/spread/advance follows calibration.
+- Unsupported coupling invokes conservative challenger.
+- Same-game inflation leaves cross-game rho unchanged.
+- Include a book where indiscriminate positive correlation reduces tail risk.
+
+ES/stress:
+- Model ES and deterministic maximum remain distinct.
+- Hedge lowers model ES without lowering the deterministic backstop.
+- Each gate fires independently.
+
+Directional/mutex:
+- ARG concentration increases direction; ENG balance gets justified credit.
+- All-accepted bound dominates every accepted subset.
+- Unproven multiple-ME structure fails closed.
+
+Reconciliation:
+- Exact match, exchange smaller/larger, missing local fill, manual trade,
+  opposite side, settled ticker, wrong subaccount, and conflicting legs.
+
+Capital accounting:
+- Current equity plus incremental terminal P&L reconciles without double count.
+- Deposit/withdrawal and stale marks behave fail-closed.
+
+DOCUMENTATION CORRECTIONS
+-------------------------
+
+- Mark the final risk-engine report superseded on the zero-quote root cause.
+- State that the fanout fix restored 228+ live quotes.
+- Current blockers: directional concentration, max open quotes, unusable MC
+  snapshots, price deadline, and smaller classifier gaps.
+- "structural MC governing constraint" should say "committed-book monitor pending
+  candidate-aware post-fill wiring."
+- "all same-game hedges exact" must exclude mixed fallback-leg dependence.
+- Do not call max(ES, deterministic maximum) portfolio CVaR.
+- Limit "fully unit-tested" to enumerated properties.
+- Label LIVE_ISSUES.txt historical or refresh it; its "current" snapshot predates
+  the risk upgrade, accepted-size fix, fanout fix, and live quote recovery.
+
+IMPLEMENTATION ORDER
+--------------------
+
+1. Preserve fanout fix; add exact exchange-quantity reconciliation.
+2. Keep every held position in exact global risk with unmodeled reserves.
+3. Fix fractional MC sizing.
+4. Separate model ES/challengers from deterministic maximum.
+5. Add generation invalidation.
+6. Build candidate/reservation-aware post-fill EV/ES/P(ruin).
+7. Prototype directional mutex credit with subset-dominance proof.
+8. Restrict challenger inflation.
+9. Repair structural/fallback dependence.
+10. Move MC off-loop with generation-safe publication.
+11. Add mandatory tests and refresh status documentation.
+12. Only then reconsider max-open-quotes or delta thresholds on a fresh slate.
+
+ACCEPTANCE CRITERIA
+-------------------
+
+Complete only when:
+- every exchange holding is represented or conservatively reserved;
+- local exposure reconciles to exact exchange quantity/side/subaccount;
+- RFQ tape repetition cannot affect quantity;
+- fractional quantities are exact;
+- each candidate is evaluated in its post-fill portfolio state with reservations;
+- enforced snapshots match current generation;
+- model ES is distinct from deterministic maximum;
+- production/challenger ruin estimates include uncertainty;
+- mixed structural/fallback dependence is modeled or conservatively challenged;
+- cross-game shocks are explicit scenarios;
+- directional hedge credit preserves mass-acceptance subset safety;
+- mandatory tests pass;
+- shadow logs show pre/post risk evidence;
+- a fresh-slate tiny live run quotes for correct documented reasons;
+- fills and settlements reconcile exactly to exchange quantity, fees, balance,
+  and realized P&L.
+
+SAFETY DEFAULT
+--------------
+
+Keep Stage B mutex loss, gross utilization, per-game loss, mass acceptance,
+fill velocity, deterministic loss, reconciliation, and kill switches enforced.
+Treat current structural MC ES/P(ruin) as committed-book diagnostic/backstop
+outputs, not proof that a specific fill is safe. Do not raise directional,
+max-open-quotes, or gross caps merely to increase flow before candidate-aware
+risk and exact reconciliation are complete.
+

@@ -36,8 +36,16 @@ _MVN_SEED = 20260705
 # At or below this dimension we request a tight absolute tolerance from the
 # integrator (this module is the small-n exact path); above it, scipy's
 # defaults apply.
+#
+# THROUGHPUT (2026-07-14, Phase 2): was 1e-10 — 6 orders of magnitude tighter than
+# a cent (1e-4 in prob) needs, and the entire p99 latency tail (the small-n MVN CDF
+# was ~84% of price() cost). Re-graded to 1e-7 (error bound 0.001c, 100x inside a
+# cent) over 690 real tape combos: ZERO quote-cent changes vs the old 1e-10, while
+# collapsing the small-n integration cost (tools/tolerance_regrade.py). scipy's
+# raw default flipped a cent (1/450) so we keep an explicit, seeded, pinned abseps
+# — deterministic and guarded by the rule-8c parity harness on any scipy upgrade.
 _TIGHT_ABSEPS_MAX_DIM = 4
-_TIGHT_ABSEPS = 1e-10
+_TIGHT_ABSEPS = 1e-7
 
 # Eigenvalue floor for nearest_psd's clip: keeps the repaired matrix strictly
 # away from numerical indefiniteness so downstream Cholesky/CDF calls succeed.
