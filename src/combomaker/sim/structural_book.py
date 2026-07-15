@@ -45,7 +45,14 @@ from dataclasses import dataclass, replace
 import numpy as np
 from numpy.typing import NDArray
 
-from combomaker.pricing.dixon_coles import (
+from combomaker.pricing.grouping import game_key
+
+# P1.5: the risk MC reconstructs the pricer's structural model through the PUBLIC
+# parse/invert/sample/settle contract (``pricing.structural_api``), never the
+# private internals of ``pricing.structural`` / ``pricing.dixon_coles``. The API
+# names are the same objects as those internals, so parity is byte-identical
+# (``test_structural_api`` pins the identity).
+from combomaker.pricing.structural_api import (
     Advance,
     HalfBtts,
     HalfDraw,
@@ -56,17 +63,17 @@ from combomaker.pricing.dixon_coles import (
     MatchFormat,
     ModelParams,
     PlayerScores,
+    States as _States,
     StructuralError,
     Team,
-    _half_indicator,
-    _States,
-    _states,
-    _team_goals,
-    _team_indicator,
+    half_indicator as _half_indicator,
     invert,
+    parse_leg as _parse_leg,
+    parse_match as _parse_match,
+    states as _states,
+    team_goals as _team_goals,
+    team_indicator as _team_indicator,
 )
-from combomaker.pricing.grouping import game_key
-from combomaker.pricing.structural import _parse_leg, _parse_match
 from combomaker.sim.engine import LegModel, sample_leg_values
 
 _FloatMatrix = NDArray[np.float64]
