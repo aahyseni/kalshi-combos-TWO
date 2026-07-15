@@ -39,7 +39,13 @@ from combomaker.marketdata.metadata import MetadataCache
 from combomaker.ops.logging import get_logger
 from combomaker.ops.metrics import Metrics
 from combomaker.ops.persistence import Store
-from combomaker.ops.pricing_pool import BookRiskInputs, BookRiskPool, JointPool
+from combomaker.ops.pricing_pool import (
+    BookRiskInputs,
+    BookRiskPool,
+    CandidateBookRiskInputs,
+    JointPool,
+    _worker_candidate_book_risk,
+)
 from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.fees import FeeModel, FeeType, FeeUnknownError
 from combomaker.pricing.quote import ConstructedQuote, NoQuote
@@ -134,6 +140,20 @@ class LifecycleConfig:
     # 1.645 for a one-sided 95% level to decline a fill whose ruin p̂ only just
     # clears the budget by luck of the draw.
     ruin_prob_ci_z: float = 0.0
+    # P0-1 candidate-aware portfolio-risk gate at CONFIRM. When True (default), a
+    # confirm the existing analytic/gross/burst gates already ADMIT runs an ADDITIONAL
+    # candidate-aware ~20k-sample portfolio MC (off the loop via the BookRiskPool):
+    # confirm ONLY when the candidate's marginal EV is positive AND the POST-book
+    # joint-tail / ruin / deterministic / gross budgets pass. STRICTLY ADDITIVE — it
+    # can only DECLINE a fill the other gates admit, never admit one they decline. An
+    # UNKNOWN merged marginal, an over-budget POST book, or ANY error in the off-loop
+    # eval declines (fail-closed). False ⇒ the gate is skipped entirely (prior
+    # behaviour preserved) and is the kill switch for this gate.
+    candidate_gate_enabled: bool = True
+    # P0-1 candidate MC sample count (smaller than the maintenance full-book MC's
+    # 20k default is fine — a confirm is one-shot and the window is 3s). Kept
+    # explicit + deterministic (seeded) for auditability.
+    candidate_gate_mc_samples: int = 20_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -847,6 +867,143 @@ class QuoteLifecycle:
                 enforced.append(breach)
         return enforced
 
+    async def _candidate_gate_verdict(
+        self, quote_id: str, state: OpenQuoteState
+    ) -> tuple[bool, str]:
+        """P0-1 candidate-aware portfolio-risk gate for ONE contemplated fill.
+
+        Returns ``(True, "")`` to PROCEED to the existing fill-velocity / reservation
+        / confirm flow, or ``(False, detail)`` to DECLINE with
+        ``DECLINE_CANDIDATE_RISK``. STRICTLY ADDITIVE — reachable only after the
+        existing gates ADMIT the fill, and it can only DECLINE, never admit.
+
+        Builds the candidate ``OpenPosition`` via the SHARED ``_fill_position``
+        builder (the exact position a confirmed fill produces — no reinvented
+        sign/side/max-loss) and evaluates it against the committed positions + all
+        outstanding reservations on COMMON sampled states. Runs OFF the loop via
+        ``BookRiskPool.run_candidate`` when a pool is wired (the CPU-bound MC never
+        blocks the heartbeat); falls back to an INLINE eval otherwise (paper /
+        backtests / tests — fast there). FAIL-CLOSED: an UNKNOWN merged marginal, an
+        over-budget POST book, OR ANY exception in the off-loop eval declines (an
+        unmeasured or errored joint tail is never safe — never confirm on it)."""
+        try:
+            inputs = self._build_candidate_gate_inputs(quote_id, state)
+            if self._book_risk_pool is not None:
+                result = await self._book_risk_pool.run_candidate(inputs)
+            else:
+                # Inline fallback (no pool): reuse the pool's OWN worker fn on the
+                # loop so the result is byte-identical to the off-loop path.
+                result = _worker_candidate_book_risk(inputs)
+        except Exception as exc:  # noqa: BLE001 — any error declines (fail-closed)
+            log.error(
+                "candidate_gate_errored", quote_id=quote_id, error=repr(exc)
+            )
+            return False, f"candidate gate errored: {exc!r}"
+        if result.unknown:
+            return False, f"candidate gate UNKNOWN: {result.decline_reason}"
+        if not result.confirm:
+            return False, (
+                f"candidate gate declined: {result.decline_reason} "
+                f"(cand_ev_cc={result.candidate_ev_cc:.1f}, "
+                f"post_es_cc={result.post.governing_model_es_99_cc:.0f}, "
+                f"post_det_cc={result.post.deterministic_max_loss_cc:.0f}, "
+                f"post_p_ruin={result.post.p_ruin:.4f})"
+            )
+        log.info(
+            "candidate_gate_confirm",
+            quote_id=quote_id,
+            candidate_ev_cc=round(result.candidate_ev_cc, 1),
+            post_governing_es_cc=int(result.post.governing_model_es_99_cc),
+            post_deterministic_max_cc=int(result.post.deterministic_max_loss_cc),
+            post_p_ruin=round(result.post.p_ruin, 4),
+            n_pre=result.n_pre_positions,
+        )
+        return True, ""
+
+    def _build_candidate_gate_inputs(
+        self, quote_id: str, state: OpenQuoteState
+    ) -> CandidateBookRiskInputs:
+        """Build the IMMUTABLE, picklable inputs for one off-loop candidate MC.
+
+        On-loop work only: build the candidate position (shared builder), read the
+        committed positions + outstanding reservations, resolve every candidate-
+        universe leg marginal and within-game pair rho into plain dicts (the live
+        feed / SgpParams providers do not pickle), and snapshot the RiskLimits
+        budgets. A leg whose marginal is missing is OMITTED from the dict, so the
+        worker's provider returns None for it ⇒ the merged model is UNKNOWN ⇒ the
+        gate declines (fail-closed — a missing marginal is never a usable p=0.5)."""
+        candidate = self._fill_position(quote_id, state)
+        committed = tuple(self._exposure.positions.values())
+        reservations = (
+            tuple(self._reservation.outstanding_positions())
+            if self._reservation is not None
+            else ()
+        )
+        # Universe of distinct leg tickers across the merged book.
+        tickers: set[str] = set()
+        for pos in (*committed, *reservations, candidate):
+            for leg in pos.legs:
+                tickers.add(leg.market_ticker)
+        # Resolve marginals ON-LOOP; a missing marginal is OMITTED (⇒ None in the
+        # worker ⇒ UNKNOWN model ⇒ decline). Never fabricate a p=0.5 (defense #2).
+        marginals: dict[str, float] = {}
+        for ticker in tickers:
+            p = self._marginals(ticker)
+            if p is not None:
+                marginals[ticker] = float(p)
+        # Resolve within-game pair rho ON-LOOP for every distinct unordered pair
+        # (build_book_model queries only same-game pairs; resolving all is a
+        # harmless superset). Only the pairs with a band are stored; a pair the
+        # provider maps to None is omitted (the worker provider then returns None
+        # for it, exactly as the live provider would).
+        rho_pairs: dict[frozenset[str], tuple[float, float, float]] = {}
+        if self._within_game_rho is not None:
+            ordered = sorted(tickers)
+            for i in range(len(ordered)):
+                for j in range(i + 1, len(ordered)):
+                    band = self._within_game_rho(ordered[i], ordered[j])
+                    if band is not None:
+                        rho_pairs[frozenset((ordered[i], ordered[j]))] = band
+        limits = self._limits.limits
+        bankroll_cc = self._risk_bankroll_cc()
+        # COST-basis equity for P(ruin) — the same basis recompute_book_risk uses,
+        # but computed on the MERGED (committed + reservations + candidate) model so
+        # the ruin floor is measured against the post-fill portfolio's cost basis.
+        merged_model = build_book_model(
+            [*committed, *reservations, candidate],
+            marginals=self._marginals,
+            within_game_rho=self._within_game_rho,
+        )
+        current_equity_cc = self._ruin_equity_basis_cc(merged_model)
+        return CandidateBookRiskInputs(
+            committed=committed,
+            candidate=candidate,
+            reservations=reservations,
+            marginals=marginals,
+            within_game_rho_pairs=rho_pairs,
+            structural_cfg=self._structural_cfg,
+            n_samples=self._config.candidate_gate_mc_samples,
+            seed=self._config.book_risk_seed,
+            band="high",
+            bankroll_cc=bankroll_cc,
+            current_equity_cc=current_equity_cc,
+            ruin_floor_frac=self._config.ruin_floor_frac,
+            ruin_prob_ci_z=self._config.ruin_prob_ci_z,
+            # The SAME %-of-bankroll / probability budgets the analytic caps use
+            # (RiskLimits). None-safe: a None fraction simply is not gated here (the
+            # LimitChecker still enforces the full set — this only ADDS the joint tail
+            # credit/charge, never loosens a cap).
+            portfolio_cvar_frac=float(limits.portfolio_cvar_frac),
+            portfolio_det_max_frac=float(limits.portfolio_det_max_frac),
+            portfolio_ruin_prob_budget=float(limits.portfolio_ruin_prob_budget),
+            absolute_notional_multiple=limits.absolute_notional_multiple,
+            # Negative-EV hedges are DISABLED here (no explicit enabled hedge-cost
+            # budget) — the spec's SAFETY DEFAULT (P0-1: do not accept negative-EV
+            # hedges without an explicit enabled budget).
+            hedge_cost_budget_cc=0,
+            allow_negative_ev_hedge=False,
+        )
+
     def _reserve_headroom(
         self, reservation_id: str, quote_id: str, state: OpenQuoteState
     ) -> bool:
@@ -1146,6 +1303,38 @@ class QuoteLifecycle:
             # eventual quote_executed must find this state and book the fill.
             state.pending_fill = (accepted_side, bid, qty)
             self._executed_states[quote_id] = state
+            # P0-1 CANDIDATE-AWARE PORTFOLIO-RISK GATE (last look). The existing
+            # analytic/gross/burst gates have ADMITTED this fill; now run an
+            # ADDITIONAL candidate-aware ~20k-sample portfolio MC over the merged
+            # PRE (committed + outstanding reservations) + candidate book and confirm
+            # ONLY when the candidate's marginal EV is positive AND the POST-book
+            # joint-tail / ruin / deterministic / gross budgets pass. STRICTLY
+            # ADDITIVE: reachable only inside `if decision.confirm`, so it can only
+            # flip an ADMIT to a DECLINE, never a decline to an admit. Runs OFF the
+            # loop (BookRiskPool.run_candidate) so the CPU-bound MC never blocks the
+            # heartbeat; confirms are rare and the confirm window is 3s, so awaiting
+            # it here is fine. UNKNOWN merged marginal / over-budget POST book / ANY
+            # off-loop error ⇒ DECLINE_CANDIDATE_RISK (fail-closed — an unmeasured or
+            # errored joint tail is never safe). Disabled by config ⇒ skipped (kill
+            # switch + prior behaviour).
+            if self._config.candidate_gate_enabled:
+                gate_ok, gate_detail = await self._candidate_gate_verdict(
+                    quote_id, state
+                )
+                if not gate_ok:
+                    self._metrics.inc(
+                        f"confirm.declined.{ReasonCode.DECLINE_CANDIDATE_RISK}"
+                    )
+                    self._track_markout(f"declined:{quote_id}", state)
+                    await self._record_confirm_decision(
+                        state, confirm=False,
+                        reason=ReasonCode.DECLINE_CANDIDATE_RISK,
+                        detail=gate_detail, decision_ms=decision_ms,
+                    )
+                    self._executed_states.pop(quote_id, None)
+                    state.pending_fill = None
+                    self._drop_quote(quote_id)
+                    return
             # FILL-VELOCITY GOVERNOR (wire-live): record this acceptance's
             # committed notional in the rolling window (the point pending_fill is
             # set), then evaluate the rate. A burst over the SOFT frac / max fills

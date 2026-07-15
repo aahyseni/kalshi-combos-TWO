@@ -1994,6 +1994,14 @@ class RiskConfig(StrictModel):
     # no-quote on a stale bankroll (never a permanent halt) and the give-back
     # halts skip when peak/current equity is unavailable (no invented peak). ---
     caps_shadow_mode: bool = False
+    # P0-1 candidate-aware portfolio-risk gate at CONFIRM. ENFORCED by default: a
+    # confirm the existing analytic/gross/burst gates already admit runs an
+    # ADDITIONAL candidate-aware ~20k-sample portfolio MC (off the loop) and confirms
+    # ONLY when the candidate's marginal EV is positive AND the POST-book joint-tail
+    # / ruin / deterministic / gross budgets pass. STRICTLY ADDITIVE (only ever
+    # DECLINES a fill the other gates admit). Set candidate_gate_enabled: false in
+    # YAML to disable it (the kill switch for this gate; preserves prior behaviour).
+    candidate_gate_enabled: bool = True
     game_loss_frac: str = "0.08"          # %-of-GAME correlated loss
     per_combo_loss_frac: str = "0.01"     # single position max_loss
     directional_frac: str = "0.10"        # net one-directional / theme

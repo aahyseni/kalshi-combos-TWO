@@ -169,6 +169,16 @@ class ReasonCode(StrEnum):
     # (a per-leg market-motion signal); this is our OWN acceptance rate.
     DECLINE_FILL_VELOCITY = "decline_fill_velocity"
     DECLINE_RISK_LIMIT = "decline_risk_limit"
+    # P0-1 candidate-aware portfolio-risk gate (last look). AFTER the existing
+    # analytic/gross/burst gates ADMIT a confirm, a candidate-aware ~20k-sample
+    # portfolio MC scores the PRE (committed + reservations) and POST (+ this fill)
+    # books on COMMON sampled states: confirm ONLY when the candidate's marginal EV
+    # is positive, the POST joint-tail / ruin / deterministic / gross budgets pass,
+    # and no fail-closed condition tripped. STRICTLY ADDITIVE — it can only DECLINE
+    # a fill the other gates admit, never turn a decline into an admit. An UNKNOWN
+    # merged marginal, an over-budget POST book, or ANY error in the off-loop eval
+    # DECLINES here (fail-closed; an unmeasured/errored joint tail is never safe).
+    DECLINE_CANDIDATE_RISK = "decline_candidate_risk"
     DECLINE_MASS_ACCEPTANCE = "decline_mass_acceptance"
     DECLINE_KILL_SWITCH = "decline_kill_switch"
     DECLINE_EXCHANGE_INACTIVE = "decline_exchange_inactive"

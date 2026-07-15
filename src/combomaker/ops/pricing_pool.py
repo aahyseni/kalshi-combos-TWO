@@ -42,8 +42,14 @@ from combomaker.pricing.legs import LegBelief
 from combomaker.pricing.quote import NoQuote
 from combomaker.pricing.relationships import Relationship
 from combomaker.rfq.models import Rfq
+from combomaker.risk.exposure import OpenPosition
 from combomaker.sim.book_model import BookModel
-from combomaker.sim.book_risk import BookRiskSnapshot, compute_book_risk
+from combomaker.sim.book_risk import (
+    BookRiskSnapshot,
+    CandidateBookRisk,
+    compute_book_risk,
+    evaluate_candidate_book_risk,
+)
 from combomaker.sim.structural_book import StructuralConfigView
 
 log = get_logger(__name__)
@@ -303,6 +309,124 @@ def _worker_book_risk(inputs: BookRiskInputs) -> BookRiskSnapshot:
     )
 
 
+# --------------------------------------------------------------------------- #
+# P0-1: candidate- and reservation-aware portfolio risk, OFF the event loop.  #
+# --------------------------------------------------------------------------- #
+#
+# WHY: the P0-1 candidate gate (book_risk.evaluate_candidate_book_risk) runs a
+# ~20k-sample portfolio MC over the merged PRE + candidate book at CONFIRM time.
+# Confirms are RARE (only when we win an auction) and the confirm window is 3s, so
+# awaiting an off-loop MC here is fine — but running the MC INLINE on the event loop
+# would block it (GIL-bound numpy), the same starvation class as the inline joint /
+# book-risk wedges. So it runs in the SAME worker-process pool as the full-book MC.
+#
+# WHAT crosses the process boundary is only PICKLABLE, immutable values: the frozen
+# OpenPositions (committed / candidate / reservations — primitive fields + LegRef
+# tuples), the StructuralConfigView, the scalar budgets, AND two DICT-BACKED provider
+# snapshots resolved ON-LOOP. The live MarginalProvider (a feed closure) and the
+# WithinGameRhoProvider (a SgpParams closure) are NOT picklable, so the parent reads
+# every candidate-universe leg marginal and every within-game pair rho ON THE LOOP
+# into plain dicts, and the worker reconstructs pure lookup providers from them. A
+# marginal absent from the dict resolves to None in the worker exactly as the live
+# provider would return None ⇒ the merged model is UNKNOWN ⇒ confirm forced False
+# (fail-closed, hard rule 6 — a missing marginal is NEVER scored as a usable p=0.5).
+# The reconstructed providers are pure functions of the shipped dicts, so the
+# off-loop verdict is byte-identical to the inline one on the same inputs + seed.
+
+
+class _DictMarginals:
+    """A picklable ``MarginalProvider`` backed by a ticker→marginal dict resolved
+    on the loop. A ticker ABSENT from the dict (its live marginal was missing/stale)
+    returns None — exactly what the live provider returns for an unpriceable leg —
+    so the merged candidate model goes UNKNOWN and the gate declines (fail-closed)."""
+
+    def __init__(self, marginals: dict[str, float]) -> None:
+        self._marginals = marginals
+
+    def __call__(self, market_ticker: str) -> float | None:
+        return self._marginals.get(market_ticker)
+
+
+class _DictWithinGameRho:
+    """A picklable ``WithinGameRhoProvider`` backed by an unordered-pair→band dict
+    resolved on the loop (the pricer's real ``build_sgp_correlation`` band per pair,
+    computed on-loop by the live SgpParams provider). A pair absent from the dict
+    (e.g. an identical-ticker self-pair, which the live provider maps to None)
+    returns None, so ``build_book_model`` leaves that block to its own flat default —
+    identical to the live provider's own None handling."""
+
+    def __init__(self, pairs: dict[frozenset[str], tuple[float, float, float]]) -> None:
+        self._pairs = pairs
+
+    def __call__(
+        self, ticker_a: str, ticker_b: str
+    ) -> tuple[float, float, float] | None:
+        return self._pairs.get(frozenset((ticker_a, ticker_b)))
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateBookRiskInputs:
+    """The IMMUTABLE, picklable inputs for one off-loop CANDIDATE book-risk MC.
+
+    Built on the loop from a generation-stamped read of the committed positions +
+    outstanding reservations + the contemplated ``candidate`` fill, with the leg
+    marginals and within-game pair rhos resolved into plain dicts (the live feed /
+    SgpParams closures do not pickle). Everything here is frozen + picklable, so
+    shipping it to a worker cannot race a concurrent book mutation. The scalar
+    budgets are the SAME ones the analytic caps use (RiskLimits), passed as floats /
+    fractions so the worker gate is byte-identical to an inline call."""
+
+    committed: tuple[OpenPosition, ...]
+    candidate: OpenPosition
+    reservations: tuple[OpenPosition, ...]
+    marginals: dict[str, float]
+    within_game_rho_pairs: dict[frozenset[str], tuple[float, float, float]]
+    structural_cfg: StructuralConfigView | None
+    n_samples: int
+    seed: int
+    band: str
+    bankroll_cc: int | None
+    current_equity_cc: int | None
+    ruin_floor_frac: float
+    ruin_prob_ci_z: float
+    portfolio_cvar_frac: float | None
+    portfolio_det_max_frac: float | None
+    portfolio_ruin_prob_budget: float | None
+    absolute_notional_multiple: int | None
+    hedge_cost_budget_cc: int
+    allow_negative_ev_hedge: bool
+
+
+def _worker_candidate_book_risk(
+    inputs: CandidateBookRiskInputs,
+) -> CandidateBookRisk:
+    """The function the pool runs. Reconstructs the dict-backed providers and reuses
+    the engine's OWN ``evaluate_candidate_book_risk`` (no reimplementation — hard
+    rule 8). Identical to an inline call (same pure code, same seed ⇒ deterministic
+    across processes)."""
+    return evaluate_candidate_book_risk(
+        inputs.committed,
+        inputs.candidate,
+        marginals=_DictMarginals(inputs.marginals),
+        reservations=inputs.reservations,
+        within_game_rho=_DictWithinGameRho(inputs.within_game_rho_pairs),
+        structural_cfg=inputs.structural_cfg,
+        n_samples=inputs.n_samples,
+        seed=inputs.seed,
+        band=inputs.band,
+        bankroll_cc=inputs.bankroll_cc,
+        current_equity_cc=inputs.current_equity_cc,
+        ruin_floor_frac=inputs.ruin_floor_frac,
+        ruin_prob_ci_z=inputs.ruin_prob_ci_z,
+        portfolio_cvar_frac=inputs.portfolio_cvar_frac,
+        portfolio_det_max_frac=inputs.portfolio_det_max_frac,
+        portfolio_ruin_prob_budget=inputs.portfolio_ruin_prob_budget,
+        absolute_notional_multiple=inputs.absolute_notional_multiple,
+        hedge_cost_budget_cc=inputs.hedge_cost_budget_cc,
+        allow_negative_ev_hedge=inputs.allow_negative_ev_hedge,
+    )
+
+
 class BookRiskPool:
     """Runs the full-book MC in a worker process so it never blocks the event loop.
 
@@ -361,6 +485,31 @@ class BookRiskPool:
             raise
         # The worker has now spawned (lazy on first submit): bind it to the kill
         # group + register its PID. Cheap + idempotent (registry dedupes).
+        self.register_workers()
+        return result
+
+    async def run_candidate(
+        self, inputs: CandidateBookRiskInputs
+    ) -> CandidateBookRisk:
+        """Run the P0-1 CANDIDATE book-risk MC in a worker and return its verdict.
+
+        Awaiting the future yields the loop so the heartbeat keeps beating during the
+        ~20k-sample MC. Confirms are rare and the confirm window is 3s, so awaiting
+        off-loop here is fine — what matters is that the CPU-bound MC never runs
+        INLINE on the loop. NO deadline (unlike a one-shot RFQ price): the confirm
+        path awaits the verdict, and any exception propagates to the caller, which
+        DECLINES the confirm (fail-closed — an errored gate never confirms)."""
+        if self._executor is None:
+            raise RuntimeError("BookRiskPool.run_candidate before start()")
+        self.calls += 1
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(
+                self._executor, _worker_candidate_book_risk, inputs
+            )
+        except Exception:
+            self.errors += 1
+            raise
         self.register_workers()
         return result
 

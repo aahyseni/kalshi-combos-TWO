@@ -484,7 +484,15 @@ class QuoteApp:
                     joint_move_tolerance_cc=risk_cfg.joint_move_tolerance_cc,
                     max_leg_age_s=risk_cfg.max_leg_age_s,
                 ),
-                config=LifecycleConfig(quote_ttl_s=QUOTE_TTL_S),
+                config=LifecycleConfig(
+                    quote_ttl_s=QUOTE_TTL_S,
+                    # P0-1: candidate-aware portfolio-risk gate at confirm (ENFORCED
+                    # by default; YAML `risk.candidate_gate_enabled: false` is the
+                    # kill switch). The gate reads the SAME %-of-bankroll / ruin
+                    # budgets from RiskLimits the analytic caps use — it only ADDS the
+                    # joint-tail credit/charge, never loosens a cap.
+                    candidate_gate_enabled=risk_cfg.candidate_gate_enabled,
+                ),
                 balance_tracker=balance_tracker,
                 # Slate cap's per-leg game-start source — the exact pregame gate
                 # the filter already uses (peek-only, hot-path safe, no network).

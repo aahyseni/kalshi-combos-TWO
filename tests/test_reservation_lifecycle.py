@@ -73,7 +73,15 @@ def _build(
         store=store,
         metrics=metrics,
         lastlook_policy=LastLookPolicy(),
-        config=LifecycleConfig(quote_ttl_s=30.0, reprice_threshold_cc=100),
+        # These tests isolate the RESERVATION path (reserve → commit/release/mark-
+        # unconfirmed) — NOT the P0-1 candidate gate, which has its own dedicated
+        # wiring tests (test_candidate_gate_wiring.py) and would otherwise fire on
+        # the deliberately TINY-bankroll shadow case (a $720 POST book vs a $0.01
+        # bankroll) and mask the reservation behaviour under test. Disabled here to
+        # keep this suite pristine to its intent.
+        config=LifecycleConfig(
+            quote_ttl_s=30.0, reprice_threshold_cc=100, candidate_gate_enabled=False
+        ),
         balance_tracker=_FixedBankroll(bankroll_cc),  # type: ignore[arg-type]
         start_time_provider=rfq_filter.leg_start_time,
     )
