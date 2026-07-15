@@ -2002,6 +2002,15 @@ class RiskConfig(StrictModel):
     # DECLINES a fill the other gates admit). Set candidate_gate_enabled: false in
     # YAML to disable it (the kill switch for this gate; preserves prior behaviour).
     candidate_gate_enabled: bool = True
+    # P1 EV VISIBILITY (audit "+EV IS PRODUCTION-MODEL EV, NOT ROBUST EV"). The
+    # candidate gate always LOGS the production candidate EV alongside the
+    # challenger / bridge / split candidate EVs. This OPTIONAL tolerance (float cc)
+    # ONLY ADDS a decline: a +production-EV candidate whose WORST credible challenger
+    # EV falls below it is declined too. DEFAULTS to −inf ⇒ no behaviour change
+    # (worst >= −inf is always true); set a finite NEGATIVE value in YAML (e.g.
+    # -50.0 to allow the worst challenger EV down to −0.50 of edge) to opt in.
+    # Strictly additive — it can only flip an already-admitted confirm to a decline.
+    worst_challenger_ev_tolerance_cc: float = float("-inf")
     game_loss_frac: str = "0.08"          # %-of-GAME correlated loss
     per_combo_loss_frac: str = "0.01"     # single position max_loss
     directional_frac: str = "0.10"        # net one-directional / theme

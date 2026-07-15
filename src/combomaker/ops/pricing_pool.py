@@ -23,6 +23,7 @@ the sides, and the (frozen) Relationship — never a feed/metadata/engine object
 from __future__ import annotations
 
 import asyncio
+import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -395,6 +396,11 @@ class CandidateBookRiskInputs:
     absolute_notional_multiple: int | None
     hedge_cost_budget_cc: int
     allow_negative_ev_hedge: bool
+    # P1 EV VISIBILITY (audit "+EV IS PRODUCTION-MODEL EV"): the OPTIONAL worst-
+    # challenger-EV tolerance. Defaults to −inf ⇒ the gate is production-model-EV
+    # only (no behaviour change); the operator sets a finite (negative) tolerance to
+    # ALSO decline a candidate whose worst credible challenger EV falls below it.
+    worst_challenger_ev_tolerance: float = float("-inf")
     # P0-2 (candidate MC atomic with reservations). The ExposureBook POSITION
     # generation and the RiskReservationService VERSION captured on the loop at the
     # instant these inputs were read. They are NOT consumed by the worker (the MC
@@ -407,6 +413,25 @@ class CandidateBookRiskInputs:
     # single-loop confirm cannot race and so needs no version check.
     input_generation: int = -1
     reservation_version: int = -1
+
+
+def _timed_worker_candidate_book_risk(
+    inputs: CandidateBookRiskInputs,
+) -> tuple[CandidateBookRisk, float]:
+    """``_worker_candidate_book_risk`` wrapped with an IN-WORKER compute timer.
+
+    Returns ``(verdict, compute_ms)`` where ``compute_ms`` is the wall time the MC
+    itself took INSIDE the worker process (``perf_counter`` — a within-process
+    duration, safe across the boundary as a scalar). The pool subtracts this from the
+    total submit→return wall time to derive the QUEUE DWELL (time the submission
+    waited for a free worker) — the audit's "MC worker queue dwell" metric, measured
+    without assuming a shared cross-process clock (only durations cross the boundary,
+    never absolute timestamps)."""
+    import time as _time
+
+    t0 = _time.perf_counter()
+    verdict = _worker_candidate_book_risk(inputs)
+    return verdict, (_time.perf_counter() - t0) * 1e3
 
 
 def _worker_candidate_book_risk(
@@ -436,6 +461,7 @@ def _worker_candidate_book_risk(
         absolute_notional_multiple=inputs.absolute_notional_multiple,
         hedge_cost_budget_cc=inputs.hedge_cost_budget_cc,
         allow_negative_ev_hedge=inputs.allow_negative_ev_hedge,
+        worst_challenger_ev_tolerance=inputs.worst_challenger_ev_tolerance,
     )
 
 
@@ -457,6 +483,13 @@ class BookRiskPool:
         self._kill_job: WindowsKillJob | None = None
         self.calls = 0
         self.errors = 0
+        # P1 LATENCY: the MOST-RECENT candidate MC's in-worker compute time and the
+        # queue dwell (total submit→return wall time − in-worker compute = time the
+        # submission waited for a free worker). The caller reads these after each
+        # ``run_candidate`` to record the audit's queue-dwell / runtime metrics. None
+        # until the first candidate MC runs.
+        self.last_candidate_compute_ms: float | None = None
+        self.last_candidate_dwell_ms: float | None = None
 
     def start(self) -> None:
         # Straggler reap is done ONCE at app startup (see JointPool.start note).
@@ -515,13 +548,20 @@ class BookRiskPool:
             raise RuntimeError("BookRiskPool.run_candidate before start()")
         self.calls += 1
         loop = asyncio.get_running_loop()
+        submit_ns = time.monotonic_ns()
         try:
-            result = await loop.run_in_executor(
-                self._executor, _worker_candidate_book_risk, inputs
+            result, compute_ms = await loop.run_in_executor(
+                self._executor, _timed_worker_candidate_book_risk, inputs
             )
         except Exception:
             self.errors += 1
             raise
+        # P1 LATENCY: total submit→return wall (parent monotonic) minus the in-worker
+        # compute = queue dwell (time the submission waited for a free worker). Clamped
+        # at 0 (float noise / a compute_ms marginally above the coarse parent wall).
+        total_ms = (time.monotonic_ns() - submit_ns) / 1e6
+        self.last_candidate_compute_ms = compute_ms
+        self.last_candidate_dwell_ms = max(0.0, total_ms - compute_ms)
         self.register_workers()
         return result
 

@@ -492,6 +492,14 @@ class QuoteApp:
                     # budgets from RiskLimits the analytic caps use — it only ADDS the
                     # joint-tail credit/charge, never loosens a cap.
                     candidate_gate_enabled=risk_cfg.candidate_gate_enabled,
+                    # P1 EV VISIBILITY: the OPTIONAL worst-challenger-EV tolerance.
+                    # −inf by default (the gate stays production-model-EV only, no
+                    # behaviour change); a finite operator value ALSO declines a
+                    # +production-EV candidate whose worst credible challenger EV
+                    # falls below it (strictly additive).
+                    worst_challenger_ev_tolerance_cc=(
+                        risk_cfg.worst_challenger_ev_tolerance_cc
+                    ),
                 ),
                 balance_tracker=balance_tracker,
                 # Slate cap's per-leg game-start source — the exact pregame gate

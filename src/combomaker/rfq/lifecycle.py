@@ -172,6 +172,17 @@ class LifecycleConfig:
     # / a pathological churn storm). Both are conservative: exceeding either DECLINES.
     candidate_gate_deadline_s: float = 2.0
     candidate_gate_max_retries: int = 3
+    # P1 EV VISIBILITY (audit "+EV IS PRODUCTION-MODEL EV, NOT ROBUST EV"). The
+    # candidate gate LOGS the production candidate EV AND the challenger / bridge /
+    # split candidate EV (and the worst-credible EV) so a candidate that is +EV under
+    # production yet −EV under a challenger is visible. The ADMISSION policy stays
+    # production-model-EV based; this OPTIONAL tolerance ONLY ADDS a decline: a
+    # +production-EV candidate whose WORST credible challenger EV falls below the
+    # tolerance is declined too. DEFAULTS to −inf ⇒ no behaviour change (worst >= −inf
+    # is always true); the operator sets a finite negative tolerance in cc (e.g.
+    # -50.0 ⇒ allow the worst challenger EV down to −0.50 of edge) to opt in. Strictly
+    # additive — it can only flip an already-admitted confirm to a decline.
+    worst_challenger_ev_tolerance_cc: float = float("-inf")
 
 
 @dataclass(frozen=True, slots=True)
@@ -963,7 +974,16 @@ class QuoteLifecycle:
             # (First attempt: last_mc_ns is 0, so this never blocks the first run.)
             elapsed_ns = self._clock.monotonic_ns() - start_ns
             if elapsed_ns + last_mc_ns > deadline_ns:
+                # LIVE CANDIDATE-GATE LATENCY: the confirm window expired (too little
+                # deadline remains for another MC) BEFORE a stable verdict — an accept
+                # LOST because the exchange window ran out. Count both the deadline
+                # trip and the window-expired-before-confirm axis the audit enumerates.
                 self._metrics.inc("candidate_gate.deadline_exceeded")
+                self._metrics.inc("candidate_gate.window_expired_before_confirm")
+                self._metrics.observe_ms(
+                    "candidate_gate.runtime_ms", elapsed_ns / 1e6
+                )
+                self._metrics.observe_ms("candidate_gate.remaining_window_ms", 0.0)
                 log.warning(
                     "candidate_gate_deadline",
                     quote_id=quote_id,
@@ -983,6 +1003,21 @@ class QuoteLifecycle:
                 )
                 return False, f"candidate gate errored: {exc!r}"
             last_mc_ns = self._clock.monotonic_ns() - mc0_ns
+            # LIVE CANDIDATE-GATE LATENCY: one observation per MC attempt feeds the
+            # candidate-gate p50/p90/p99 runtime histogram; the MC worker queue dwell
+            # (submit→worker-start, decomposed by the pool from total await − in-worker
+            # compute) is recorded when a pool ran it (inline runs have no queue).
+            self._metrics.observe_ms("candidate_gate.mc_ms", last_mc_ns / 1e6)
+            if self._book_risk_pool is not None:
+                # ``getattr`` so a pool double without the dwell field (test stubs)
+                # simply records no queue-dwell sample rather than raising.
+                dwell_ms = getattr(
+                    self._book_risk_pool, "last_candidate_dwell_ms", None
+                )
+                if dwell_ms is not None:
+                    self._metrics.observe_ms(
+                        "candidate_gate.queue_dwell_ms", dwell_ms
+                    )
             # P0-2: verify the book did not move under the (possibly off-loop) MC. The
             # reservation version moves on a concurrent accept's reserve/release even
             # when the position generation does not, so BOTH must be unchanged.
@@ -1007,13 +1042,24 @@ class QuoteLifecycle:
                     live_reservation_version=live_ver,
                 )
                 continue
-            # Stable verdict: the book the MC priced is still the live book.
+            # Stable verdict: the book the MC priced is still the live book. Record
+            # the LIVE CANDIDATE-GATE LATENCY completion metrics (total gate runtime +
+            # remaining confirm-window time at completion) whatever the verdict.
+            self._record_gate_completion_latency(start_ns)
+            # P1 EV VISIBILITY: log the production candidate EV DISTINCTLY from the
+            # challenger / bridge / split candidate EVs (and the worst-credible EV), so
+            # a candidate that is +EV under production yet −EV under a challenger is
+            # visible in the logs even when it is ADMITTED (the admission policy stays
+            # production-model-EV based).
+            self._log_candidate_gate_ev(quote_id, attempt, result)
             if result.unknown:
                 return False, f"candidate gate UNKNOWN: {result.decline_reason}"
             if not result.confirm:
                 return False, (
                     f"candidate gate declined: {result.decline_reason} "
                     f"(cand_ev_cc={result.candidate_ev_cc:.1f}, "
+                    f"worst_challenger_ev_cc="
+                    f"{result.worst_credible_candidate_ev_cc:.1f}, "
                     f"post_es_cc={result.post.governing_model_es_99_cc:.0f}, "
                     f"post_det_cc={result.post.deterministic_max_loss_cc:.0f}, "
                     f"post_p_ruin={result.post.p_ruin:.4f})"
@@ -1032,6 +1078,7 @@ class QuoteLifecycle:
         # Retry budget exhausted without a stable verdict: the book kept moving under
         # every attempt. FAIL CLOSED (a never-settling book is never safe to confirm).
         self._metrics.inc("candidate_gate.retries_exhausted")
+        self._record_gate_completion_latency(start_ns)
         log.warning(
             "candidate_gate_unstable",
             quote_id=quote_id,
@@ -1039,6 +1086,55 @@ class QuoteLifecycle:
             detail="book moved under every candidate-MC attempt — declining",
         )
         return False, "candidate gate unstable: reservation/book moved every retry"
+
+    def _record_gate_completion_latency(self, start_ns: int) -> None:
+        """LIVE CANDIDATE-GATE LATENCY: at a terminal gate outcome record the total
+        gate runtime (all attempts) and the remaining confirm-window time — the
+        deadline budget left when the verdict landed. A negative remainder (the gate
+        overran the wall budget) is clamped to 0 (no time left)."""
+        elapsed_ns = self._clock.monotonic_ns() - start_ns
+        deadline_ns = int(self._config.candidate_gate_deadline_s * 1e9)
+        self._metrics.observe_ms("candidate_gate.runtime_ms", elapsed_ns / 1e6)
+        self._metrics.observe_ms(
+            "candidate_gate.remaining_window_ms",
+            max(0.0, (deadline_ns - elapsed_ns) / 1e6),
+        )
+
+    def _log_candidate_gate_ev(
+        self, quote_id: str, attempt: int, result: CandidateBookRisk
+    ) -> None:
+        """P1 EV VISIBILITY (audit "+EV IS PRODUCTION-MODEL EV, NOT ROBUST EV").
+
+        Log the PRODUCTION candidate EV — the number the admission policy gates on —
+        DISTINCTLY from the correlation-inflated challenger, full-copula bridge, and
+        unconditioned-split candidate EVs, plus the worst-credible EV (the min over
+        production + every challenger that ran). This makes a candidate that is +EV
+        under the production model yet −EV under a challenger visible in the logs even
+        when it is ADMITTED. Bridge / split EVs are None when that path did not run
+        (never coerced to a convenient 0). Money stays float cc (simulator domain)."""
+        log.info(
+            "candidate_gate_ev",
+            quote_id=quote_id,
+            attempt=attempt,
+            production_candidate_ev_cc=round(result.candidate_ev_cc, 2),
+            challenger_candidate_ev_cc=round(result.challenger_candidate_ev_cc, 2),
+            bridge_candidate_ev_cc=(
+                round(result.bridge_candidate_ev_cc, 2)
+                if result.bridge_candidate_ev_cc is not None
+                else None
+            ),
+            split_candidate_ev_cc=(
+                round(result.split_candidate_ev_cc, 2)
+                if result.split_candidate_ev_cc is not None
+                else None
+            ),
+            worst_credible_candidate_ev_cc=round(
+                result.worst_credible_candidate_ev_cc, 2
+            ),
+            worst_challenger_ev_tolerance_cc=(
+                self._config.worst_challenger_ev_tolerance_cc
+            ),
+        )
 
     def _build_candidate_gate_inputs(
         self,
@@ -1160,6 +1256,11 @@ class QuoteLifecycle:
             # hedges without an explicit enabled budget).
             hedge_cost_budget_cc=0,
             allow_negative_ev_hedge=False,
+            # P1 EV VISIBILITY: the OPTIONAL worst-challenger-EV tolerance. −inf by
+            # default (no behaviour change — the gate stays production-model-EV only);
+            # a finite operator value ALSO declines a +production-EV candidate whose
+            # worst credible challenger EV falls below it (strictly additive).
+            worst_challenger_ev_tolerance=self._config.worst_challenger_ev_tolerance_cc,
             # P0-2 staleness stamps (see _build_candidate_gate_inputs docstring).
             input_generation=input_generation,
             reservation_version=reservation_version,

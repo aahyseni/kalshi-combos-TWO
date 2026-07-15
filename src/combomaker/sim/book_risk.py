@@ -1182,6 +1182,18 @@ class _TailAxes:
     # estimate, so a p̂ that is only statistically-indistinguishable-from-safe near
     # the budget is declined (fail-closed against MC sampling error).
     p_ruin_upper: float = 0.0
+    # P1 EV VISIBILITY (audit "+EV IS PRODUCTION-MODEL EV"): the mean book P&L under
+    # each CHALLENGER book state, mirroring ``ev_cc`` (the production EV). ``ev_cc``
+    # is the production-model EV the ADMISSION policy still gates on; these are the
+    # SAME-book EV under the correlation-inflated challenger / full-copula bridge /
+    # unconditioned-split re-samples, so the caller can DIFFERENCE post−pre per book
+    # and see a candidate that is +EV under production yet −EV under a challenger.
+    # None ⇒ that path did not run for this book (bridge/split are conditional), so
+    # its candidate EV is undefined (never a convenient 0). ``challenger_ev_cc``
+    # ALWAYS runs alongside ``ev_cc``, so it is a plain float.
+    challenger_ev_cc: float = 0.0
+    bridge_ev_cc: float | None = None
+    split_ev_cc: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1218,12 +1230,27 @@ class CandidateBookRisk:
     pre: _TailAxes
     post: _TailAxes
 
-    # The candidate's marginal EV = post.ev − pre.ev (float cc). POSITIVE ⇒ the
-    # fill is expected-profitable on the shared states.
+    # The candidate's marginal EV = post.ev − pre.ev (float cc) under the PRODUCTION
+    # model. POSITIVE ⇒ the fill is expected-profitable on the shared states. This is
+    # the EV the ADMISSION policy gates on (production_candidate_ev > 0) — see the
+    # audit "positive expected value under the production model".
     candidate_ev_cc: float
 
+    # P1 EV VISIBILITY (audit "+EV IS PRODUCTION-MODEL EV, NOT ROBUST EV"): the SAME
+    # candidate's marginal EV (post−pre) measured under each CHALLENGER book state
+    # that ran, on COMMON random numbers. A candidate can be +EV under production yet
+    # −EV under a challenger; these make that visible in the logs. The correlation-
+    # inflated challenger ALWAYS runs (plain float); the full-copula bridge and the
+    # unconditioned-split guard run CONDITIONALLY (None when that path did not run —
+    # never a convenient 0). ``worst_credible_candidate_ev_cc`` is the MIN over the
+    # production EV and every challenger EV that ran — the most adverse credible EV.
+    challenger_candidate_ev_cc: float = 0.0
+    bridge_candidate_ev_cc: float | None = None
+    split_candidate_ev_cc: float | None = None
+    worst_credible_candidate_ev_cc: float = 0.0
+
     # The final gate verdict + the first reason it was declined (empty ⇒ confirm).
-    confirm: bool
+    confirm: bool = False
     decline_reason: str = ""
 
     @property
@@ -1263,18 +1290,28 @@ def _tail_axes_from_pnl(
     only fatten, never thin). None ⇒ not conditioned ⇒ never enters the max."""
     ev = float(pnl.mean()) if pnl.size else 0.0
     _, es = _es_from_pnl(pnl, HEADLINE_LEVEL)
+    # P1 EV VISIBILITY: the SAME-book mean P&L under each challenger re-sample, so
+    # the caller can difference post−pre per book and surface a candidate that is
+    # +EV under production yet −EV under a challenger. A path that did not run leaves
+    # its EV None (undefined, never a convenient 0); the challenger always runs.
     if challenger_pnl is not None and challenger_pnl.size:
         _, challenger_es = _es_from_pnl(challenger_pnl, HEADLINE_LEVEL)
+        challenger_ev = float(challenger_pnl.mean())
     else:
         challenger_es = 0.0
+        challenger_ev = 0.0
     if bridge_pnl is not None and bridge_pnl.size:
         _, bridge_es = _es_from_pnl(bridge_pnl, HEADLINE_LEVEL)
+        bridge_ev: float | None = float(bridge_pnl.mean())
     else:
         bridge_es = 0.0
+        bridge_ev = None
     if split_pnl is not None and split_pnl.size:
         _, split_es = _es_from_pnl(split_pnl, HEADLINE_LEVEL)
+        split_ev: float | None = float(split_pnl.mean())
     else:
         split_es = 0.0
+        split_ev = None
     # P1-1: gate ruin on the WORST credible model — production vs the
     # correlation-inflated challenger vs the optional full-copula bridge — exactly
     # as the governing ES does. A single correlation error must not understate ruin.
@@ -1320,6 +1357,9 @@ def _tail_axes_from_pnl(
         gross_settlement_notional_cc=gross_cc,
         p_ruin=p_ruin,
         p_ruin_upper=p_ruin_upper,
+        challenger_ev_cc=challenger_ev,
+        bridge_ev_cc=bridge_ev,
+        split_ev_cc=split_ev,
     )
 
 
@@ -1368,6 +1408,7 @@ def evaluate_candidate_book_risk(
     absolute_notional_multiple: int | None = None,
     hedge_cost_budget_cc: int = 0,
     allow_negative_ev_hedge: bool = False,
+    worst_challenger_ev_tolerance: float = float("-inf"),
 ) -> CandidateBookRisk:
     """Candidate- and reservation-aware portfolio risk on COMMON sampled states.
 
@@ -1417,7 +1458,15 @@ def evaluate_candidate_book_risk(
         within_game_rho=within_game_rho,
     )
 
-    empty = _TailAxes(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    empty = _TailAxes(
+        ev_cc=0.0,
+        es_99_cc=0.0,
+        challenger_es_99_cc=0.0,
+        governing_model_es_99_cc=0.0,
+        deterministic_max_loss_cc=0.0,
+        gross_settlement_notional_cc=0.0,
+        p_ruin=0.0,
+    )
     if model.unknown:
         # Fail-closed: a missing marginal anywhere in the merged decomposition ⇒
         # no usable tail, no confirm (UNKNOWN joint tail is never safe).
@@ -1537,10 +1586,37 @@ def evaluate_candidate_book_risk(
         split_pnl=post_split_pnl,
         ruin_prob_ci_z=ruin_prob_ci_z,
     )
+    # PRODUCTION-model candidate EV — the number the admission policy gates on.
     candidate_ev = post_axes.ev_cc - pre_axes.ev_cc
+    # P1 EV VISIBILITY: the SAME marginal EV under each challenger book that ran, on
+    # common random numbers. The challenger always runs; the bridge/split are
+    # conditional (None ⇒ that path did not run for this book). ``worst_credible`` is
+    # the MIN over the production EV + every challenger EV that ran — the most adverse
+    # credible EV. Only differences of EVs that BOTH ran are defined (post and pre
+    # share the same book states / substreams, so a path that runs for post runs for
+    # pre too); a None on either side leaves that challenger EV None.
+    challenger_candidate_ev = post_axes.challenger_ev_cc - pre_axes.challenger_ev_cc
+    bridge_candidate_ev: float | None = None
+    if post_axes.bridge_ev_cc is not None and pre_axes.bridge_ev_cc is not None:
+        bridge_candidate_ev = post_axes.bridge_ev_cc - pre_axes.bridge_ev_cc
+    split_candidate_ev: float | None = None
+    if post_axes.split_ev_cc is not None and pre_axes.split_ev_cc is not None:
+        split_candidate_ev = post_axes.split_ev_cc - pre_axes.split_ev_cc
+    worst_credible_candidate_ev = min(
+        ev
+        for ev in (
+            candidate_ev,
+            challenger_candidate_ev,
+            bridge_candidate_ev,
+            split_candidate_ev,
+        )
+        if ev is not None
+    )
 
     confirm, reason = _candidate_gate(
         candidate_ev=candidate_ev,
+        worst_credible_candidate_ev=worst_credible_candidate_ev,
+        worst_challenger_ev_tolerance=worst_challenger_ev_tolerance,
         post=post_axes,
         bankroll_cc=bankroll_cc,
         portfolio_cvar_frac=portfolio_cvar_frac,
@@ -1561,6 +1637,10 @@ def evaluate_candidate_book_risk(
         pre=pre_axes,
         post=post_axes,
         candidate_ev_cc=candidate_ev,
+        challenger_candidate_ev_cc=challenger_candidate_ev,
+        bridge_candidate_ev_cc=bridge_candidate_ev,
+        split_candidate_ev_cc=split_candidate_ev,
+        worst_credible_candidate_ev_cc=worst_credible_candidate_ev,
         confirm=confirm,
         decline_reason=reason,
     )
@@ -1569,6 +1649,8 @@ def evaluate_candidate_book_risk(
 def _candidate_gate(
     *,
     candidate_ev: float,
+    worst_credible_candidate_ev: float,
+    worst_challenger_ev_tolerance: float,
     post: _TailAxes,
     bankroll_cc: int | None,
     portfolio_cvar_frac: float | None,
@@ -1581,19 +1663,31 @@ def _candidate_gate(
     """The confirm/decline decision from the candidate EV + POST tail axes.
 
     Order (first failing reason wins): EV sign (with the explicit hedge-budget
-    exception), then each supplied POST budget. Returns ``(confirm, reason)``;
-    ``reason`` is "" iff confirmed. Any budget whose fraction is None is skipped —
-    the lifecycle's LimitChecker still enforces the full control set; this is the
-    ADDED joint-tail gate, never a demotion of those caps."""
-    # (1) EV sign. A negative-EV fill is DECLINED unless it is an explicitly
-    # authorized hedge whose EV cost stays within the enabled budget (default
-    # disabled ⇒ no negative-EV hedges). A positive-EV candidate passes this gate.
+    exception), the OPTIONAL worst-challenger-EV tolerance, then each supplied POST
+    budget. Returns ``(confirm, reason)``; ``reason`` is "" iff confirmed. Any budget
+    whose fraction is None is skipped — the lifecycle's LimitChecker still enforces
+    the full control set; this is the ADDED joint-tail gate, never a demotion of
+    those caps."""
+    # (1) EV sign — the PRODUCTION-model admission policy, UNCHANGED. A negative-EV
+    # fill is DECLINED unless it is an explicitly authorized hedge whose EV cost stays
+    # within the enabled budget (default disabled ⇒ no negative-EV hedges). A
+    # positive-EV candidate passes this gate.
     if candidate_ev <= 0.0:
         if not allow_negative_ev_hedge:
             return False, "negative_ev_no_hedge_budget"
         # The hedge's cost is the EV we give up = −candidate_ev (a positive $).
         if -candidate_ev > float(hedge_cost_budget_cc):
             return False, "negative_ev_exceeds_hedge_budget"
+
+    # (1b) OPTIONAL worst-challenger-EV tolerance (audit "+EV IS PRODUCTION-MODEL EV").
+    # The admission policy above stays production-model-EV based; this ONLY ADDS a
+    # decline: a candidate that is +EV under production yet whose WORST credible
+    # challenger EV falls below the operator's tolerance is declined. The tolerance
+    # DEFAULTS to −inf, so ``worst >= −inf`` is always True and NO behaviour changes
+    # unless the operator opts a finite (negative) tolerance in. Strictly additive —
+    # it can only flip an already-admitted confirm to a decline, never the reverse.
+    if worst_credible_candidate_ev < worst_challenger_ev_tolerance:
+        return False, "worst_challenger_ev_below_tolerance"
 
     # (2) POST governing model ES_0.99 vs the %-of-bankroll CVaR ceiling.
     if (
