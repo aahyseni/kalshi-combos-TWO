@@ -43,7 +43,6 @@ from fractions import Fraction
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
-from combomaker.core.money import CC_PER_DOLLAR
 from combomaker.core.reasons import ReasonCode
 from combomaker.risk.exposure import (
     ExposureBook,
@@ -551,24 +550,30 @@ class LimitChecker:
                     )
                 )
 
-        # (4) One-directional / theme cap. INTERPRETATION: the largest net
-        # directional exposure to a single leg outcome, aggregated per GAME
-        # (delta_by_game — the signed contracts-equivalent, worst-side under mass
-        # acceptance). |delta| is in CONTRACTS-equivalent; the loss-equivalent
-        # ceiling of that directional bet is |delta| × $1 (a full adverse
-        # resolution moves the position by $1/contract), so convert to cc via
-        # ×CC_PER_DOLLAR and compare against the LOSS-axis threshold. This holds
-        # near the game cap (a theme ≈ same-game-correlated on a losing night).
+        # (4) One-directional / theme cap (P0-9: mutex-aware hedge semantics).
+        # INTERPRETATION: the net directional exposure to a game's single RESULT
+        # outcome, aggregated per GAME, in LOSS-equivalent cc. Binds on
+        # ``directional_by_game_cc`` — the MUTUAL-EXCLUSION-AWARE directional bound
+        # (worst-side under mass acceptance) — NOT the raw ``delta_by_game`` sum of
+        # independence proxies. Opposing-advance long-NO positions (short two
+        # mutually-exclusive outcomes) NET here, so a genuine same-game HEDGE gets
+        # justified credit instead of tripping skip_directional_cap; concentration
+        # on ONE outcome still sums and still trips. The bound is a MONOTONIC HARD
+        # directional/model-sensitivity backstop (>= the largest single directional
+        # entry, <= the summed magnitude; adding a quote never lowers it — so the
+        # all-accepted mass snapshot dominates every accepted subset). It is NOT a
+        # raised limit: the same directional_frac threshold applies. The loose
+        # summed-magnitude ``delta_by_game`` bound stays the HARD backstop the
+        # enforced max_event_delta mass-acceptance cap binds on (limits above);
+        # richer all-legs hedge credit lives in the candidate-aware MC (P0-1).
         directional_thr = threshold_cc(limits.directional_frac, bankroll)
-        for game, delta in snapshot.delta_by_game.items():
-            directional_cc = int(abs(delta) * CC_PER_DOLLAR)
+        for game, directional_cc in snapshot.directional_by_game_cc.items():
             if directional_cc > directional_thr:
                 out.append(
                     Breach(
                         ReasonCode.SKIP_DIRECTIONAL_CAP,
-                        f"game {game} directional {directional_cc}cc "
-                        f"(|delta| {abs(delta):.1f} ct) > {limits.directional_frac} "
-                        f"bankroll = {directional_thr}cc",
+                        f"game {game} mutex-aware directional {directional_cc}cc > "
+                        f"{limits.directional_frac} bankroll = {directional_thr}cc",
                         shadow=shadow,
                     )
                 )

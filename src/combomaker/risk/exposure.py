@@ -201,6 +201,14 @@ class ExposureSnapshot:
     # consume it. NEVER summed with the loss axis (R1/R2 correctness invariant
     # #2). New in B2.
     gross_settlement_notional_by_game_cc: dict[str, int]
+    # P0-9: MUTUAL-EXCLUSION-AWARE directional bound per game, in LOSS-equivalent
+    # centi-cents (contracts-equivalent × $1). Opposing-advance long-NO positions
+    # NET here (the hedge credit ``delta_by_game`` cannot see, since it sums
+    # independence proxies). Monotonic (mass-acceptance dominance preserved) and
+    # ≤ the summed-magnitude directional bound; fails closed to that sum on 0 or ≥2
+    # ME events. The R2 directional cap binds on THIS; ``delta_by_game`` stays the
+    # loose HARD monotone directional backstop for the enforced max_event_delta cap.
+    directional_by_game_cc: dict[str, int]
     open_quote_count: int
     unknown_marginals: bool                 # any delta was uncomputable
 
@@ -308,6 +316,91 @@ def _mutex_game_worst_cc(
     if len(me_events) != 1:                     # 0 ⇒ no ME; ≥2 ⇒ fail-closed
         return comonotone
     return _mutex_event_bound_cc(entries, me_events[0])
+
+
+# --- P0-9: mutual-exclusion-aware DIRECTIONAL bound ------------------------
+# ``_DirEntry`` = (legs_on_this_game, magnitude, requires_all) per position/
+# hypothetical touching a game. ``magnitude`` is that entry's DIRECTIONAL
+# magnitude on the game — |Σ this-game leg deltas| in contracts-equivalent (a
+# nonneg magnitude). ``requires_all`` is True iff the entry loses iff every one
+# of its legs is satisfied (a long-NO combo); any other side is COMMON.
+#
+# WHY A MUTEX-AWARE DIRECTIONAL CAP (P0-9). The R2 directional cap used to bind on
+# ``delta_by_game`` — a sum of ``analytic_leg_deltas``, which are INDEPENDENCE
+# proxies. Summed independence deltas do NOT recognize an opposing-advance HEDGE:
+# long-NO on ARG-advance + long-NO on ENG-advance is short two mutually-exclusive
+# outcomes (exactly ONE team advances), so both cannot resolve adverse the
+# concentrated way — yet the independence sum treats them as ordinary same-game
+# concentration and over-states the directional bet. That made skip_directional_cap
+# the largest LEGITIMATE quote blocker post-fanout. The fix does NOT raise the
+# limit: it awards hedge credit through the SAME monotone single-ME-event
+# max-over-branches fold the LOSS axis uses (``_mutex_game_worst_cc``). Opposing
+# advances land in DIFFERENT branches ⇒ they NET (max) instead of summing. It is
+# provably >= the largest single directional entry and <= the summed magnitude, and
+# adding any entry never lowers it — so the all-accepted mass-acceptance snapshot
+# DOMINATES every realizable accepted subset (E2). Richer all-legs / cross-market
+# hedge credit that would BREAK monotonicity stays in the candidate-aware MC (P0-1),
+# NEVER here. Parity-tested against tools/proto_mutex_directional.py.
+#
+# The plain summed magnitude (``delta_by_game`` × $1) REMAINS the loose HARD
+# monotone directional/model-sensitivity BACKSTOP (the enforced max_event_delta
+# mass-acceptance cap still binds on it); this bound is the tighter, hedge-crediting
+# measure the %-of-bankroll directional cap binds on.
+_DirEntry = tuple[tuple["LegRef", ...], float, bool]
+
+
+def _mutex_directional_event_bound(entries: list[_DirEntry], event: str) -> float:
+    """Max over the ME event's branches of the Σ directional magnitude of entries
+    that can lose in that branch. Same partition as ``_mutex_event_bound_cc`` (the
+    loss axis) but on the directional magnitude. Monotonic in the entry set."""
+    reqs = [
+        (_mutex_required(legs, req, event), mag) for legs, mag, req in entries
+    ]
+    outs = {r[1] for r, _m in reqs if r is not None and r[0] == "is"}
+    branches = (*outs, "__OTHER__")
+    best = 0.0
+    for b in branches:
+        s = 0.0
+        for r, mag in reqs:
+            if r is None:                       # common — pressures every branch
+                s += mag
+            elif r[0] == "is":
+                if b == r[1]:
+                    s += mag
+            elif b != r[1]:                     # ("not", m) — every branch except m
+                s += mag
+        if s > best:
+            best = s
+    return best
+
+
+def _mutex_directional_game_cc(
+    entries: list[_DirEntry], is_me_event: Callable[[str], bool | None] | None
+) -> float:
+    """Mutual-exclusion-aware upper bound on a game's DIRECTIONAL magnitude (P0-9).
+
+    Nets the game's single RESULT mutually-exclusive event (advance / moneyline) via
+    max-over-branches; fails closed to the SUMMED magnitude on 0 or ≥2 ME events (so
+    the bound is MONOTONIC — E2 mass-acceptance dominance holds, exactly as the loss
+    axis). Always ≤ the summed magnitude and ≥ the largest single entry. Parity-tested
+    against tools/proto_mutex_directional.py."""
+    summed = sum(mag for _legs, mag, _r in entries)
+    if not entries or is_me_event is None:
+        return summed
+    me_events: list[str] = []
+    seen: set[str] = set()
+    for legs, _mag, requires in entries:
+        if not requires:
+            continue
+        for leg in legs:
+            e = leg.event_ticker
+            if e and e not in seen:
+                seen.add(e)
+                if is_me_event(e) is True:
+                    me_events.append(e)
+    if len(me_events) != 1:                     # 0 ⇒ no ME; ≥2 ⇒ fail-closed
+        return summed
+    return _mutex_directional_event_bound(entries, me_events[0])
 
 
 class ExposureBook:
@@ -439,6 +532,10 @@ class ExposureBook:
         # LOSS axis (premium): collect per-game entries, then fold each game with
         # the MUTUAL-EXCLUSION-AWARE bound (Stage B) instead of a comonotone sum.
         game_entries: dict[str, list[_MutexEntry]] = defaultdict(list)
+        # DIRECTIONAL axis (P0-9): per-game directional entries, each carrying the
+        # entry's |Σ this-game leg deltas| magnitude, folded with the SAME monotone
+        # mutex bound so opposing-advance hedges net (mass-acceptance dominance kept).
+        game_dir_entries: dict[str, list[_DirEntry]] = defaultdict(list)
         game_notional: dict[str, int] = defaultdict(int)   # NOTIONAL axis ($1/ct)
         gross_cc = 0
         unknown = False
@@ -481,10 +578,11 @@ class ExposureBook:
             for leg in position.legs:
                 if leg.event_ticker:
                     pos_legs_by_game[game_key(leg.event_ticker)].append(leg)
+            requires_all = position.our_side is Side.NO
             for game, glegs in pos_legs_by_game.items():
                 game_notional[game] += position.gross_settlement_notional_cc
                 game_entries[game].append(
-                    (tuple(glegs), position.max_loss_cc, position.our_side is Side.NO)
+                    (tuple(glegs), position.max_loss_cc, requires_all)
                 )
             if deltas is not None:
                 # Leg market tickers are unique within a position (duplicate
@@ -494,6 +592,18 @@ class ExposureBook:
                         delta_game[game_key(leg.event_ticker)] += deltas.get(
                             leg.market_ticker, 0.0
                         )
+                # P0-9 directional entry per game: the entry's DIRECTIONAL magnitude
+                # on the game is |Σ this-game leg deltas| (contracts-equivalent),
+                # carried as LOSS-equivalent cc (× $1). Only priced positions
+                # contribute a computable direction; an un-pricable held/reserved
+                # holding (deltas is None) carries no directional sensitivity (its
+                # whole-account risk is already held by the loss/notional/det caps).
+                for game, glegs in pos_legs_by_game.items():
+                    game_delta = sum(deltas.get(g.market_ticker, 0.0) for g in glegs)
+                    magnitude = abs(game_delta) * CC_PER_DOLLAR
+                    game_dir_entries[game].append(
+                        (tuple(glegs), magnitude, requires_all)
+                    )
 
         if mass_acceptance:
             for quote in self.open_quotes.values():
@@ -540,11 +650,32 @@ class ExposureBook:
                             if current >= 0
                             else -per_market[leg.market_ticker]
                         )
+                # P0-9 directional entry for the open quote (mass acceptance): the
+                # per-game magnitude is the WORST-SIDE |delta| bound (per_market, the
+                # sign-aligned upper bound) summed over this game's legs — a
+                # conservative per-quote directional magnitude, mirroring the loss
+                # axis's ``worst_loss`` choice. Folded with the SAME monotone mutex
+                # bound so an opposing-advance quote nets against a held hedge while
+                # the mass snapshot still dominates every realizable accepted subset.
+                for game, glegs in q_legs_by_game.items():
+                    magnitude = (
+                        sum(per_market.get(g.market_ticker, 0.0) for g in glegs)
+                        * CC_PER_DOLLAR
+                    )
+                    game_dir_entries[game].append(
+                        (tuple(glegs), magnitude, requires_all)
+                    )
 
         # Fold each game's entries with the mutual-exclusion-aware bound (Stage B).
         game_worst = {
             game: _mutex_game_worst_cc(entries, self._is_me_event)
             for game, entries in game_entries.items()
+        }
+        # P0-9: fold the directional entries with the SAME monotone mutex bound so
+        # opposing-advance hedges net; round to int cc (loss-equivalent, ints only).
+        game_directional = {
+            game: int(_mutex_directional_game_cc(entries, self._is_me_event))
+            for game, entries in game_dir_entries.items()
         }
         return ExposureSnapshot(
             delta_by_market=dict(delta_market),
@@ -552,6 +683,7 @@ class ExposureBook:
             gross_notional_cc=gross_cc,
             worst_case_loss_by_game_cc=game_worst,
             gross_settlement_notional_by_game_cc=dict(game_notional),
+            directional_by_game_cc=game_directional,
             open_quote_count=len(self.open_quotes),
             unknown_marginals=unknown,
         )
