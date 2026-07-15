@@ -253,15 +253,38 @@ def compute_book_risk(
     P(loss > threshold) thresholds (skipped when no bankroll).
 
     UNKNOWN model or empty book → a no-go snapshot (``unknown``/no positions), no
-    usable stats (fail-closed, hard rule 6)."""
+    usable stats (fail-closed, hard rule 6).
+
+    P0-4: ``model.reserved_loss_cc`` is the exact premium of CONSERVATIVELY-
+    RESERVED holdings (gated-off positions with no sampleable marginals). It is a
+    DETERMINISTIC reserve added OUTSIDE the model ES — folded into the
+    deterministic all-hit stress and hence the operative ES — so a reserved
+    holding's whole-account risk is always represented in the gating tail number,
+    even when the sampled sub-book is empty. A book that is ALL reserved (no
+    risk-modeled position) is therefore still USABLE: it has a real deterministic
+    reserve to gate on, not a no-go."""
     n_positions = len(model.positions)
-    if model.unknown or n_positions == 0:
+    reserve = max(0.0, float(model.reserved_loss_cc))
+    if model.unknown or (n_positions == 0 and reserve <= 0.0):
         return BookRiskSnapshot(
             unknown=model.unknown,
             band=band,
             n_samples=n_samples,
             seed=seed,
             n_positions=n_positions,
+        )
+    if n_positions == 0:
+        # ALL-RESERVED book: no sampled positions, but a real deterministic reserve
+        # (P0-4). Report the reserve as the entire operative tail (outside model
+        # ES) so the caps see the held risk; the sampled stats stay zero.
+        return BookRiskSnapshot(
+            unknown=False,
+            band=band,
+            n_samples=n_samples,
+            seed=seed,
+            n_positions=0,
+            deterministic_stress_cc=reserve,
+            operative_es_99_cc=reserve,
         )
 
     corr = model.corr_for_band(band)
@@ -340,7 +363,12 @@ def compute_book_risk(
     _, challenger_es = _es_from_pnl(book_c, HEADLINE_LEVEL)
 
     # --- deterministic stress: exact all-hit worst case -----------------------
-    stress = _deterministic_all_hit_loss_cc(model)
+    # P0-4: add the CONSERVATIVELY-RESERVED holdings' exact premium as a
+    # deterministic reserve OUTSIDE model ES. The sampled ES/challenger cover only
+    # the risk-modeled sub-book; the reserved holdings (unavailable marginals, not
+    # sampled) add their full premium to the all-hit worst case, so their
+    # whole-account risk is never hidden from the operative tail number.
+    stress = _deterministic_all_hit_loss_cc(model) + reserve
 
     operative_es = max(es_99, challenger_es, stress)
 

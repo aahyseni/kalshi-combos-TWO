@@ -169,10 +169,13 @@ async def test_rehydrate_skips_unmodeled_and_empty(tmp_path: Path) -> None:
         await store.close()
 
 
-async def test_rehydrate_skips_gated_off_series(tmp_path: Path) -> None:
-    """A rehydrated position on a GATED-OFF series (MLB while allowlist=[KXWC]) has
-    no subscribed leg books → unavailable marginals → would poison unknown_marginals
-    and block ALL quoting. It must be skipped (regression fix, verified live)."""
+async def test_rehydrate_reserves_gated_off_series(tmp_path: Path) -> None:
+    """P0-4: a rehydrated position on a GATED-OFF series (MLB while allowlist=[KXWC])
+    has no subscribed leg books → unavailable marginals. It must NOT be dropped — it
+    is RESERVED into the risk book (``risk_modeled=False``): its exact premium loss /
+    gross / per-game concentration STAY in the deterministic caps, but its marginals
+    are never queried (no p=0.5) and it never poisons unknown_marginals, so
+    quote-eligible quoting is not blocked."""
     store = await Store.open(tmp_path / "t.sqlite3", FakeClock())
     await store.record_rfq(_rfq("KXMVE-ARG", "ARG"), source="ws")  # KXWC legs
     mlb = Rfq.from_ws({
@@ -201,12 +204,21 @@ async def test_rehydrate_skips_gated_off_series(tmp_path: Path) -> None:
         exposure = ExposureBook(CONV, is_me_event=IS_ME)
         await QuoteApp._rehydrate_exposure_book(
             cast(Any, None), cast(Any, rest), store, exposure, ["KXWC"])
-        assert {p.combo_ticker for p in exposure.positions.values()} == {"KXMVE-ARG"}
-        # with no allowlist, both come back (default None = keep all)
+        by_ticker = {p.combo_ticker: p for p in exposure.positions.values()}
+        # BOTH are in the book now (P0-4 reserves the gated one, not skips it).
+        assert set(by_ticker) == {"KXMVE-ARG", "KXMVE-MLB"}
+        assert by_ticker["KXMVE-ARG"].risk_modeled is True
+        assert by_ticker["KXMVE-MLB"].risk_modeled is False  # gated → RESERVED
+        # the reserved position uses the reserve: id prefix
+        reserved = next(p for p in exposure.positions.values()
+                        if p.combo_ticker == "KXMVE-MLB")
+        assert reserved.position_id == "reserve:KXMVE-MLB"
+        # with no allowlist, both are risk-modeled (default None = keep all)
         exposure2 = ExposureBook(CONV, is_me_event=IS_ME)
         await QuoteApp._rehydrate_exposure_book(
             cast(Any, None), cast(Any, rest), store, exposure2, None)
         assert len(exposure2.positions) == 2
+        assert all(p.risk_modeled for p in exposure2.positions.values())
     finally:
         await store.close()
 

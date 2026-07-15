@@ -68,6 +68,19 @@ class OpenPosition:
     # ever settles YES, that is a classification/settlement failure the
     # settlement guard turns into HALT_RECONCILIATION_MISMATCH.
     farmed: bool = False
+    # P0-4 (usable MC without hiding unmodeled holdings). ``risk_modeled`` is
+    # True for a position whose leg marginals we can price (deltas + joint MC).
+    # It is FALSE for a CONSERVATIVELY-RESERVED holding — an exchange-held
+    # position on a series we don't subscribe (gated-off allowlist), so its leg
+    # books, and therefore its marginals, are unavailable. A reserved position
+    # STILL counts its EXACT premium loss (``max_loss_cc``), its gross
+    # settlement notional, and its known per-game concentration in every
+    # deterministic/gross cap — its whole-account risk never vanishes — but it
+    # is NEVER decomposed against marginals (so a missing marginal is never
+    # scored as an ordinary usable p=0.5) and it is held OUTSIDE the model ES in
+    # the portfolio MC (a deterministic unmodeled reserve, not a sampled leg).
+    # ``True`` is the default so every existing (priced) position is unchanged.
+    risk_modeled: bool = True
 
     @property
     def max_loss_cc(self) -> int:
@@ -370,15 +383,24 @@ class ExposureBook:
         for i, position in enumerate(committed + list(extra_positions)):
             is_committed = i < n_committed
             gross_cc += position.max_loss_cc
-            deltas = analytic_leg_deltas(position, marginals)
+            # P0-4: a CONSERVATIVELY-RESERVED holding (risk_modeled=False) has no
+            # available marginals — we do NOT even query them (so a missing
+            # marginal is never turned into an ordinary usable p=0.5). Its exact
+            # premium loss, gross notional, and per-game concentration are still
+            # folded below; it simply carries no computable delta.
+            deltas = (
+                None if not position.risk_modeled
+                else analytic_leg_deltas(position, marginals)
+            )
             if deltas is None:
                 # A HELD (committed) position whose live marginal is temporarily
                 # unavailable — e.g. a rehydrated position's leg book not yet
-                # subscribed after a restart — still contributes its KNOWN max_loss
-                # to the loss/notional/game caps (below), but has no computable
-                # delta. It must NOT set ``unknown_marginals``: that flag fail-closes
-                # the WHOLE check (SKIP_CLASSIFIER_UNKNOWN), so one un-pricable held
-                # position would veto ALL quoting (verified live 2026-07-15). Only a
+                # subscribed after a restart, or a conservatively-reserved gated
+                # holding — still contributes its KNOWN max_loss to the loss/
+                # notional/game caps (below), but has no computable delta. It must
+                # NOT set ``unknown_marginals``: that flag fail-closes the WHOLE
+                # check (SKIP_CLASSIFIER_UNKNOWN), so one un-pricable held position
+                # would veto ALL quoting (verified live 2026-07-15). Only a
                 # CANDIDATE / open-quote we cannot decompose is a genuine
                 # "can't assess this fill" and fails closed.
                 if not is_committed:

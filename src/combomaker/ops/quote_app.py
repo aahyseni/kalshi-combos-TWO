@@ -951,9 +951,13 @@ class QuoteApp:
         unavailable — and a committed position with an unavailable marginal makes the
         exposure snapshot ``unknown_marginals`` on EVERY check, declining EVERY quote
         via SKIP_CLASSIFIER_UNKNOWN (verified live 2026-07-15: 2 rehydrated MLB
-        positions blocked all WC quoting). Such positions don't interact with the
-        quoted sport's caps (different games) and are already filled, so they are
-        skipped-with-a-log, never modeled blind."""
+        positions blocked all WC quoting). P0-4: such positions are now RESERVED
+        (``risk_modeled=False``) rather than skipped — their exact premium loss,
+        gross settlement notional, and per-game concentration COUNT in the global
+        deterministic/gross caps, but their (unavailable) marginals are never
+        queried (no p=0.5) and they are held OUTSIDE the portfolio model ES, so
+        their missing data cannot poison quote-eligible candidate decomposition or
+        vanish from global capital accounting."""
         try:
             # P0-5: pin the positions read to ONE subaccount at the QUERY LAYER.
             # subaccount=None ⇒ the exchange default (0/primary); an int pins that
@@ -979,8 +983,8 @@ class QuoteApp:
             return any(series.startswith(p) for p in allowed_series)
 
         modeled: set[str] = set()
+        reserved: set[str] = set()
         games: set[str] = set()
-        gated: set[str] = set()
         mismatched: list[str] = []
         for ticker, exch in exch_by_ticker.items():
             h = held.get(ticker)
@@ -994,9 +998,19 @@ class QuoteApp:
                 )
                 for leg in h["legs"]
             )
-            if not all(_quoted(leg.market_ticker) for leg in legs):
-                gated.add(ticker)  # gated-off series → no marginals → skip
-                continue
+            # P0-4: a position on a GATED-OFF series (no subscribed leg books →
+            # unavailable marginals) is RESERVED, never dropped. We rehydrate EVERY
+            # exchange-held position regardless of quote eligibility so its exact
+            # premium loss, gross settlement notional, and per-game concentration
+            # stay in the global deterministic/gross caps. ``risk_modeled=False``
+            # marks it a conservatively-reserved holding: the exposure snapshot
+            # never queries its (unavailable) marginals — so a missing marginal is
+            # NEVER scored as an ordinary usable p=0.5 — and the portfolio MC holds
+            # it OUTSIDE model ES as a deterministic reserve rather than sampling it
+            # (build_book_model). Its missing data therefore cannot poison the
+            # decomposition of unrelated (quote-eligible) candidates, and it cannot
+            # vanish from global capital accounting.
+            is_reserved = not all(_quoted(leg.market_ticker) for leg in legs)
             local_side = Side.NO if h["our_side"] == "no" else Side.YES
             local_ctr = int(h["contracts_centi"])
             entry_price_cc = int(h["entry_price_cc"])  # cost basis from local fills
@@ -1008,27 +1022,40 @@ class QuoteApp:
             reconcile_mismatch = local_side is not exch.side or local_ctr != exch.contracts_centi
             if reconcile_mismatch:
                 mismatched.append(ticker)
+            if is_reserved:
+                prefix = "reserve"
+            elif reconcile_mismatch:
+                prefix = "reconcile"
+            else:
+                prefix = "rehydrate"
             exposure.add_position(
                 OpenPosition(
-                    position_id=(
-                        f"reconcile:{ticker}" if reconcile_mismatch else f"rehydrate:{ticker}"
-                    ),
+                    position_id=f"{prefix}:{ticker}",
                     combo_ticker=ticker,
                     collection=h["collection"],
                     our_side=side,
                     contracts=CentiContracts(contracts),
                     entry_price_cc=CentiCents(entry_price_cc),
                     legs=legs,
+                    risk_modeled=not is_reserved,
                 )
             )
-            modeled.add(ticker)
-            games.update(game_key(leg.event_ticker) for leg in legs if leg.event_ticker)
-        if gated:
+            if is_reserved:
+                reserved.add(ticker)
+            else:
+                modeled.add(ticker)
+                games.update(game_key(leg.event_ticker) for leg in legs if leg.event_ticker)
+        if reserved:
             log.info(
-                "rehydrate_skipped_gated_series",
-                count=len(gated),
-                detail="positions on non-allow-listed series (no subscribed leg books "
-                "→ unavailable marginals) — not added to the risk book",
+                "rehydrate_reserved_gated_series",
+                count=len(reserved),
+                detail="P0-4: positions on non-allow-listed series (no subscribed leg "
+                "books → unavailable marginals) RESERVED into the risk book — exact "
+                "premium loss / gross / per-game concentration COUNT in the "
+                "deterministic + gross caps, held OUTSIDE model ES; never decomposed "
+                "against marginals (no p=0.5), so they cannot poison quote-eligible "
+                "candidate decomposition",
+                tickers=sorted(reserved),
             )
         if mismatched:
             log.warning(
@@ -1039,10 +1066,11 @@ class QuoteApp:
                 "tagged the position for manual reconciliation",
                 tickers=sorted(mismatched),
             )
-        unmodeled = sorted(set(exch_by_ticker) - modeled - gated)
+        unmodeled = sorted(set(exch_by_ticker) - modeled - reserved)
         log.info(
             "exposure_rehydrated",
             positions=len(modeled),
+            reserved=len(reserved),
             games=sorted(games),
             unmodeled_open=len(unmodeled),
             reconcile_mismatches=len(mismatched),
