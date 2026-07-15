@@ -192,20 +192,76 @@ def _es_from_pnl(pnl: NDArray[np.float64], level: float) -> tuple[float, float]:
     return var, es
 
 
+def _same_game_mask(model: BookModel) -> NDArray[np.bool_]:
+    """Boolean ``(n, n)`` mask: True where legs i and j are in the SAME game.
+
+    The challenger over-correlates ONLY the intended within-game pairs — the
+    block structure ``build_book_model`` already builds (cross-game pairs sit at
+    ``cross_event_rho`` ≈ 0 and MUST stay there). Grouping uses the pricer's own
+    ``game_key`` on each leg's ``event_ticker`` (the same key the copula
+    correlates on and the exposure book aggregates on). A leg with no event
+    ticker (``game_key`` cannot place it in a game) matches ONLY itself, so an
+    ungamed leg never inflates against anything (fail-closed: an unknown game
+    grouping never manufactures a cross-leg shock). The diagonal is left False —
+    ``_inflate_corr`` restores it explicitly."""
+    from combomaker.pricing.grouping import game_key
+
+    n = len(model.legs)
+    games: list[str | None] = [None] * n
+    for idx in range(n):
+        event = model.event_by_index.get(idx)
+        games[idx] = game_key(event) if event else None
+    mask = np.zeros((n, n), dtype=np.bool_)
+    for i in range(n):
+        gi = games[i]
+        if gi is None:
+            continue  # ungamed leg: no same-game partner (never inflated)
+        for j in range(i + 1, n):
+            if games[j] == gi:
+                mask[i, j] = True
+                mask[j, i] = True
+    return mask
+
+
 def _inflate_corr(
-    corr: NDArray[np.float64], inflation: float
+    corr: NDArray[np.float64],
+    inflation: float,
+    same_game_mask: NDArray[np.bool_] | None = None,
 ) -> NDArray[np.float64]:
-    """Push every off-diagonal correlation toward +1 by ``inflation`` fraction
-    (the challenger's over-correlation). ``rho' = rho + inflation·(1 − rho)`` for
-    the off-diagonal; the diagonal stays 1. Repaired to PSD by the engine's
-    Cholesky-with-jitter at sample time (cross-game 0s keep it near-PSD, and
-    pushing toward +1 only fattens the joint tail — the conservative direction)."""
+    """Push SAME-GAME off-diagonal correlations toward +1 by ``inflation``
+    fraction (the challenger's over-correlation), leaving CROSS-GAME values
+    UNCHANGED. ``rho' = rho + inflation·(1 − rho)`` for every entry the
+    ``same_game_mask`` selects; every other off-diagonal (and the diagonal) keeps
+    its original value.
+
+    P0-8: universal positive correlation is NOT always conservative — for a book
+    that is HEDGED across games, forcing cross-game pairs from 0 toward +0.5 can
+    REDUCE the tail rather than fatten it (the challenger would then understate
+    risk, the opposite of its purpose). So the challenger inflates ONLY the
+    intended within-game block (the sell-side tail driver) and preserves the
+    measured cross-game independence. A cross-game shock, if ever wanted, belongs
+    in a SEPARATE named regime scenario, not smuggled in here.
+
+    ``same_game_mask`` None ⇒ NO pair is inflated (the matrix is returned
+    unchanged bar a diagonal repair): with no game grouping the conservative
+    default is to touch nothing rather than inflate blindly (fail-closed). The
+    diagonal is restored exactly so the result is a valid correlation matrix;
+    PSD repair happens in the engine's Cholesky-with-jitter at sample time."""
     if not 0.0 <= inflation <= 1.0:
         raise ValueError(f"inflation must be in [0,1], got {inflation}")
     n = corr.shape[0]
-    out = corr + inflation * (1.0 - corr)
-    # Restore the exact diagonal (rho=1 → 1 + inflation·0 = 1 already, but guard
-    # float noise) so the matrix is a valid correlation matrix.
+    out = corr.astype(np.float64, copy=True)
+    if same_game_mask is not None:
+        if same_game_mask.shape != (n, n):
+            raise ValueError(
+                f"same_game_mask shape {same_game_mask.shape} != corr {(n, n)}"
+            )
+        # Inflate ONLY the masked (same-game, off-diagonal) entries; cross-game
+        # entries are copied through untouched.
+        inflated = out + inflation * (1.0 - out)
+        out = np.where(same_game_mask, inflated, out)
+    # Restore the exact diagonal (guard float noise) so the matrix stays a valid
+    # correlation matrix.
     idx = np.arange(n)
     out[idx, idx] = 1.0
     return out
@@ -413,7 +469,11 @@ def compute_book_risk(
     per_game_tail, per_leg_tail = _tail_attribution(values, model, tail_mask)
 
     # --- challenger: correlation-inflated re-sample (anti-monoculture) --------
-    challenger_corr = _inflate_corr(corr, challenger_inflation)
+    # P0-8: inflate ONLY same-game pairs; cross-game independence is preserved
+    # (universal positive correlation is not conservative for a hedged book).
+    challenger_corr = _inflate_corr(
+        corr, challenger_inflation, _same_game_mask(model)
+    )
     rng_c = np.random.default_rng(seq_chal)  # spawned substream (M2 §4.3)
     values_c = _sampler(model.legs, challenger_corr, n_samples, rng_c)
     book_c = _book_pnl_from_values(values_c, model.positions)
@@ -708,7 +768,10 @@ def evaluate_candidate_book_risk(
     # tail axes fall back to their deterministic reserves only.
     if model.legs:
         corr = model.corr_for_band(band)
-        challenger_corr = _inflate_corr(corr, challenger_inflation)
+        # P0-8: same-game-only inflation; cross-game rho preserved.
+        challenger_corr = _inflate_corr(
+            corr, challenger_inflation, _same_game_mask(model)
+        )
         sampler = _select_sampler(model, structural_cfg)
         seq_prod, seq_chal = np.random.SeedSequence(seed).spawn(2)
         values = sampler(

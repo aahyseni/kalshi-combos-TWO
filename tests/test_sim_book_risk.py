@@ -17,6 +17,7 @@ from combomaker.sim.book_risk import (
     BookRiskSnapshot,
     _deterministic_all_hit_loss_cc,
     _inflate_corr,
+    _same_game_mask,
     compute_book_risk,
 )
 
@@ -103,13 +104,35 @@ class TestDeterministicStress:
 
 
 class TestChallengerOverlay:
-    def test_inflate_corr_pushes_toward_one(self) -> None:
-        corr = np.array([[1.0, 0.2, 0.0], [0.2, 1.0, 0.0], [0.0, 0.0, 1.0]])
-        out = _inflate_corr(corr, 0.5)
-        # off-diagonal 0.2 → 0.2 + 0.5*(1-0.2) = 0.6; the 0.0 cross-game → 0.5.
+    def test_inflate_corr_pushes_same_game_toward_one(self) -> None:
+        # P0-8: legs 0,1 are same-game (masked); leg 2 is cross-game (NOT masked).
+        corr = np.array([[1.0, 0.2, 0.3], [0.2, 1.0, 0.3], [0.3, 0.3, 1.0]])
+        mask = np.array(
+            [
+                [False, True, False],
+                [True, False, False],
+                [False, False, False],
+            ]
+        )
+        out = _inflate_corr(corr, 0.5, mask)
+        # masked same-game 0.2 → 0.2 + 0.5*(1-0.2) = 0.6.
         assert out[0, 1] == pytest.approx(0.6)
-        assert out[0, 2] == pytest.approx(0.5)
+        assert out[1, 0] == pytest.approx(0.6)
+        # cross-game 0.3 entries are UNCHANGED (not inflated to 0.65).
+        assert out[0, 2] == pytest.approx(0.3)
+        assert out[1, 2] == pytest.approx(0.3)
         assert out[0, 0] == 1.0  # diagonal preserved
+        # the input matrix is not mutated in place.
+        assert corr[0, 1] == pytest.approx(0.2)
+
+    def test_inflate_corr_none_mask_touches_nothing(self) -> None:
+        # No game grouping ⇒ conservative default is to inflate NOTHING (never
+        # inflate blindly): off-diagonals returned unchanged.
+        corr = np.array([[1.0, 0.2, 0.0], [0.2, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        out = _inflate_corr(corr, 0.5, None)
+        assert out[0, 1] == pytest.approx(0.2)
+        assert out[0, 2] == pytest.approx(0.0)
+        assert out[0, 0] == 1.0
 
     def test_inflate_rejects_out_of_range(self) -> None:
         with pytest.raises(ValueError):
@@ -133,6 +156,104 @@ class TestChallengerOverlay:
         # challenger over-correlates → its tail loss is at least the production one
         # (allow a small MC slack).
         assert snap.challenger_es_99_cc >= snap.es_99_cc - 50.0
+
+    def test_same_game_mask_groups_by_game(self) -> None:
+        # P0-8 mask: same-game pair True, cross-game pair False, diagonal False.
+        p1 = _pos("p1", (_leg("A", "KXWCGAME-G1"), _leg("B", "KXWCGAME-G1")))
+        p2 = _pos("p2", (_leg("C", "KXWCGAME-G2"),))
+        m = build_book_model([p1, p2], marginals=lambda t: 0.5)
+        mask = _same_game_mask(m)
+        ia, ib, ic = m.leg_index["A"], m.leg_index["B"], m.leg_index["C"]
+        assert mask[ia, ib] and mask[ib, ia]  # A,B same game G1
+        assert not mask[ia, ic]  # A,C different games
+        assert not mask[ib, ic]  # B,C different games
+        assert not mask[ia, ia]  # diagonal is False (restored by _inflate_corr)
+
+    def test_challenger_leaves_cross_game_rho_unchanged(self) -> None:
+        # MANDATORY (P0-8): same-game inflation must leave the cross-game rho
+        # UNCHANGED. Two games, one two-leg same-game position each, so the built
+        # matrix has same-game blocks AND cross-game (≈0) entries.
+        p1 = _pos("p1", (_leg("A", "KXWCGAME-G1"), _leg("B", "KXWCGAME-G1")))
+        p2 = _pos("p2", (_leg("C", "KXWCGAME-G2"), _leg("D", "KXWCGAME-G2")))
+        m = build_book_model(
+            [p1, p2],
+            marginals=lambda t: 0.5,
+            within_game_rho=lambda a, b: (0.1, 0.3, 0.5),
+        )
+        corr = m.corr_for_band("point")
+        mask = _same_game_mask(m)
+        challenger = _inflate_corr(corr, 0.5, mask)
+        ia, ib = m.leg_index["A"], m.leg_index["B"]
+        ic, id_ = m.leg_index["C"], m.leg_index["D"]
+        # same-game entries inflated (0.3 → 0.3 + 0.5*0.7 = 0.65).
+        assert challenger[ia, ib] == pytest.approx(0.65)
+        assert challenger[ic, id_] == pytest.approx(0.65)
+        # EVERY cross-game entry is byte-identical to the production matrix.
+        for i, j in [(ia, ic), (ia, id_), (ib, ic), (ib, id_)]:
+            assert challenger[i, j] == corr[i, j]
+            assert challenger[j, i] == corr[j, i]
+
+    def test_universal_inflation_can_reduce_tail_on_hedged_book(self) -> None:
+        # MANDATORY (P0-8): prove universal positive correlation is NOT always
+        # conservative. Build a CROSS-GAME HEDGED book: long YES on game G1's leg
+        # A (loses only when A MISSES) and long NO on game G2's leg B (loses only
+        # when B HITS). The ONLY book-loss state is (A miss AND B hit). A is likely
+        # to hit and B likely to miss, so under INDEPENDENCE (production) that loss
+        # state has ~2% probability — above the 1% tail, so the 0.99 ES sits at the
+        # full -20000 loss. Forcing a POSITIVE cross-game rho makes A and B
+        # co-move, so A-miss pairs with B-miss (the hedge fires) and the joint
+        # loss state drops BELOW 1% → the 0.99 ES SHRINKS. An indiscriminate
+        # (universal) inflation therefore UNDERSTATES the tail here; the P0-8
+        # same-game-only challenger must not.
+        pyes = _pos(
+            "g1_yes",
+            (_leg("A", "KXWCGAME-G1"),),
+            our_side=Side.YES,
+            contracts=100,
+            price_cc=5_000,
+        )
+        pno = _pos(
+            "g2_no",
+            (_leg("B", "KXWCGAME-G2"),),
+            our_side=Side.NO,
+            contracts=100,
+            price_cc=5_000,
+        )
+        # p(A hit)=0.85, p(B hit)=0.15 ⇒ P(loss)=P(A miss)·P(B hit)=0.15·0.15≈2.25%.
+        marg = {"A": 0.85, "B": 0.15}
+        m = build_book_model([pyes, pno], marginals=lambda t: marg[t])
+        corr = m.corr_for_band("high")  # cross-game rho=0 ⇒ identity (independent)
+
+        from combomaker.sim.book_risk import _book_pnl_from_values, _es_from_pnl
+        from combomaker.sim.engine import sample_leg_values
+
+        rng_p = np.random.default_rng(7)
+        prod_vals = sample_leg_values(list(m.legs), corr, 200_000, rng_p)
+        _, prod_es = _es_from_pnl(
+            _book_pnl_from_values(prod_vals, m.positions), 0.99
+        )
+
+        # UNIVERSAL inflation (the OLD behaviour: every off-diagonal, incl. the
+        # cross-game 0 → 0.5) — the non-conservative construction P0-8 removes.
+        n = len(m.legs)
+        universal_mask = ~np.eye(n, dtype=np.bool_)
+        universal_corr = _inflate_corr(corr, 0.5, universal_mask)
+        rng_u = np.random.default_rng(7)
+        univ_vals = sample_leg_values(list(m.legs), universal_corr, 200_000, rng_u)
+        _, univ_es = _es_from_pnl(
+            _book_pnl_from_values(univ_vals, m.positions), 0.99
+        )
+
+        # The proof: universal positive correlation REDUCED the tail below the
+        # (correct) independent tail — it is NOT conservative on this hedged book.
+        # full loss = 5000 premium at risk on each of the two positions.
+        assert prod_es == pytest.approx(10_000.0)
+        assert univ_es < prod_es - 1_000.0
+
+        # SAME-GAME-ONLY challenger (P0-8): each leg is its own game, so nothing is
+        # inflated — the challenger equals production (never understates it).
+        same_game_corr = _inflate_corr(corr, 0.5, _same_game_mask(m))
+        np.testing.assert_allclose(same_game_corr, corr)
 
 
 class TestTailAttribution:
