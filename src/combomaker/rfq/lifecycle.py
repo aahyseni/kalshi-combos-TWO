@@ -125,12 +125,15 @@ class LifecycleConfig:
 @dataclass(frozen=True, slots=True)
 class _StaleBookRisk:
     """A fail-closed ``PortfolioRisk`` sentinel: a NON-empty book whose book-risk
-    snapshot is stale/absent must still make the CVaR cap BREACH (UNKNOWN joint
-    tail is never safe). ``usable`` False ⇒ the cap fails closed regardless of the
-    ES value; ``operative_es_99_cc`` is 0.0 and never read on the unusable path."""
+    snapshot is stale/absent must still make BOTH the CVaR cap and the
+    deterministic max-loss cap BREACH (an unmeasured joint tail / deterministic
+    maximum is never safe). ``usable`` False ⇒ both caps fail closed regardless of
+    the values below; the tail fields are 0.0 and never read on the unusable
+    path."""
 
     usable: bool = False
-    operative_es_99_cc: float = 0.0
+    governing_model_es_99_cc: float = 0.0
+    deterministic_max_loss_cc: float = 0.0
     p_ruin: float = 0.0
 
 
@@ -367,10 +370,10 @@ class QuoteLifecycle:
                     "book_risk_snapshot",
                     n_positions=snap.n_positions,
                     structural=self._structural_cfg is not None,
-                    operative_es_99_cc=int(snap.operative_es_99_cc),
+                    governing_model_es_99_cc=int(snap.governing_model_es_99_cc),
                     es_99_cc=int(snap.es_99_cc),
                     challenger_es_99_cc=int(snap.challenger_es_99_cc),
-                    deterministic_stress_cc=int(snap.deterministic_stress_cc),
+                    deterministic_max_loss_cc=int(snap.deterministic_max_loss_cc),
                     p_ruin=round(snap.p_ruin, 4),
                 )
         except Exception:

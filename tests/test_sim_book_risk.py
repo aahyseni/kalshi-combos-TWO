@@ -1,6 +1,7 @@
 """Tests for the full book-risk MC + tail attribution + challenger/stress overlay
 (RISK_BUILD_PLAN Phase 4). Covers the five key outputs, the additive tail
-decomposition, the max-of-three operative ES, and the fail-closed UNKNOWN path.
+decomposition, the separated sampled-ES / deterministic-max axes (P0-3), and the
+fail-closed UNKNOWN path.
 """
 
 from __future__ import annotations
@@ -51,7 +52,8 @@ class TestFailClosed:
         assert snap.unknown
         assert not snap.usable
         assert snap.es_99_cc == 0.0
-        assert snap.operative_es_99_cc == 0.0
+        assert snap.governing_model_es_99_cc == 0.0
+        assert snap.deterministic_max_loss_cc == 0.0
 
     def test_empty_book_no_go(self) -> None:
         m = build_book_model([], marginals=lambda t: 0.5)
@@ -61,14 +63,15 @@ class TestFailClosed:
 
 
 class TestDeterminism:
-    def test_same_seed_identical_operative_es(self) -> None:
+    def test_same_seed_identical_governing_model_es(self) -> None:
         pos = _pos("p1", (_leg("A", "KXWCGAME-G1"), _leg("B", "KXWCGAME-G1")))
         m = build_book_model([pos], marginals=lambda t: 0.5)
         a = compute_book_risk(m, n_samples=20_000, seed=42)
         b = compute_book_risk(m, n_samples=20_000, seed=42)
-        assert a.operative_es_99_cc == b.operative_es_99_cc
+        assert a.governing_model_es_99_cc == b.governing_model_es_99_cc
         assert a.es_99_cc == b.es_99_cc
         assert a.challenger_es_99_cc == b.challenger_es_99_cc
+        assert a.deterministic_max_loss_cc == b.deterministic_max_loss_cc
 
 
 class TestDeterministicStress:
@@ -80,14 +83,23 @@ class TestDeterministicStress:
         # contracts floor: 100cc→1 ct, 200cc→2 ct. Premium = 1*5000 + 2*3000 = 11000.
         assert _deterministic_all_hit_loss_cc(m) == pytest.approx(11_000.0)
 
-    def test_operative_es_at_least_stress(self) -> None:
-        # The operative ES is a max over three; it can never be below the exact
-        # deterministic stress (an unconditional upper bound the sampled ES
-        # respects, but the MAX guarantees it dominates regardless of sampling).
+    def test_deterministic_max_equals_all_hit_loss(self) -> None:
+        # P0-3: the deterministic maximum axis is EXACTLY the all-hit premium sum
+        # (no reserve here), reported on its OWN field — never folded into the ES.
         pos = _pos("p1", (_leg("A", "KXWCGAME-G1"),), contracts=100, price_cc=5_000)
         m = build_book_model([pos], marginals=lambda t: 0.5)
         snap = compute_book_risk(m, n_samples=20_000, seed=3)
-        assert snap.operative_es_99_cc >= snap.deterministic_stress_cc - 1e-6
+        assert snap.deterministic_max_loss_cc == pytest.approx(
+            _deterministic_all_hit_loss_cc(m)
+        )
+
+    def test_deterministic_max_upper_bounds_sampled_es(self) -> None:
+        # The exact all-hit maximum is an unconditional upper bound the SAMPLED
+        # model ES can never exceed — even though it is no longer max'd INTO it.
+        pos = _pos("p1", (_leg("A", "KXWCGAME-G1"),), contracts=100, price_cc=5_000)
+        m = build_book_model([pos], marginals=lambda t: 0.5)
+        snap = compute_book_risk(m, n_samples=20_000, seed=3)
+        assert snap.deterministic_max_loss_cc >= snap.governing_model_es_99_cc - 1e-6
 
 
 class TestChallengerOverlay:

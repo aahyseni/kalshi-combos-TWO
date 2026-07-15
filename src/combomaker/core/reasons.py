@@ -56,12 +56,22 @@ class ReasonCode(StrEnum):
     # (multiple × bankroll). A stale bankroll fails closed (SKIP_BANKROLL_
     # UNAVAILABLE) instead — a stricter block than a loose multiple.
     SKIP_UTILIZATION_BACKSTOP = "skip_utilization_backstop"
-    # Portfolio joint-tail cap (Phase 4 / M1 §5): the book's operative ES_0.99
-    # (max of production-copula ES at the corr-high band, the correlation-inflated
-    # challenger ES, and the exact all-hit deterministic stress) exceeds its
-    # %-of-bankroll ceiling. Read off the LATEST full-MC BookRiskSnapshot (never
-    # re-run in check); a stale/UNKNOWN snapshot fails closed. SHADOW in Phase 4.
+    # Portfolio joint-tail cap (Phase 4 / M1 §5): the book's GOVERNING MODEL
+    # ES_0.99 (max of production-copula ES at the corr-high band and the
+    # correlation-inflated challenger ES — the worst SAMPLED CVaR) exceeds its
+    # %-of-bankroll ceiling. P0-3: this is the SAMPLED tail ONLY; the deterministic
+    # all-hit maximum is a SEPARATE axis (SKIP_PORTFOLIO_DET_MAX) so it can no
+    # longer dominate and silence this gate. Read off the LATEST full-MC
+    # BookRiskSnapshot (never re-run in check); a stale/UNKNOWN snapshot fails
+    # closed. SHADOW in Phase 4.
     SKIP_PORTFOLIO_CVAR = "skip_portfolio_cvar"
+    # Portfolio deterministic maximum-loss cap (P0-3): the exact all-hit
+    # premium-at-risk (+ reserved holdings) — an unconditional upper bound the
+    # sampled ES can never exceed — exceeds its %-of-bankroll ceiling. Gated
+    # INDEPENDENTLY of the sampled-ES cap so the deterministic maximum is a hard
+    # premium-at-risk backstop, not folded into the ES axis. Fails closed on a
+    # stale/UNKNOWN snapshot via the shared ``usable`` guard.
+    SKIP_PORTFOLIO_DET_MAX = "skip_portfolio_det_max"
     # A2: P(this settlement wave drops equity below the ruin floor) exceeds the
     # probability budget (structural-MC book-risk snapshot).
     SKIP_PORTFOLIO_RUIN = "skip_portfolio_ruin"

@@ -1991,7 +1991,8 @@ class RiskConfig(StrictModel):
     daily_loss_frac: str = "0.06"         # soft daily-loss halt
     drawdown_frac: str = "0.10"           # peak-drawdown halt
     hard_trip_frac: str = "0.12"          # hard-trip KILL
-    portfolio_cvar_frac: str = "0.15"     # portfolio joint-tail (operative ES_0.99)
+    portfolio_cvar_frac: str = "0.15"     # portfolio joint-tail (governing model ES_0.99)
+    portfolio_det_max_frac: str = "0.15"  # P0-3: deterministic all-hit max-loss cap
     portfolio_ruin_prob_budget: str = "0.05"  # A2: max P(equity < ruin floor this wave)
     absolute_notional_multiple: int = 3   # utilization backstop (× bankroll)
     fill_velocity_window_s: float = 2.0
@@ -2015,6 +2016,7 @@ class RiskConfig(StrictModel):
         "drawdown_frac",
         "hard_trip_frac",
         "portfolio_cvar_frac",
+        "portfolio_det_max_frac",
         "portfolio_ruin_prob_budget",
         "fill_velocity_soft_frac",
         "fill_velocity_hard_frac",
@@ -2066,6 +2068,7 @@ class RiskConfig(StrictModel):
             drawdown_frac=Fraction(Decimal(self.drawdown_frac)),
             hard_trip_frac=Fraction(Decimal(self.hard_trip_frac)),
             portfolio_cvar_frac=Fraction(Decimal(self.portfolio_cvar_frac)),
+            portfolio_det_max_frac=Fraction(Decimal(self.portfolio_det_max_frac)),
             portfolio_ruin_prob_budget=Fraction(Decimal(self.portfolio_ruin_prob_budget)),
             absolute_notional_multiple=self.absolute_notional_multiple,
             fill_velocity_window_s=self.fill_velocity_window_s,

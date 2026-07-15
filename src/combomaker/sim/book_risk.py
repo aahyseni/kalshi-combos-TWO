@@ -81,10 +81,20 @@ class BookRiskSnapshot:
     """The persisted, halt-feeding book-risk view for one MC run.
 
     All money is float cc (simulator domain). ``band`` is the correlation band the
-    stats were computed at ("high" for the gating number). ``operative_es_99_cc``
-    is the max-of-three overlay — the number the drawdown/hard-trip halts and the
-    portfolio-CVaR limit consume. ``unknown`` True ⇒ a missing marginal made the
-    whole snapshot no-go; NO stat below is usable (fail-closed)."""
+    stats were computed at ("high" for the gating number).
+
+    P0-3 separates the SAMPLED model tail from the DETERMINISTIC maximum loss so
+    the all-hit maximum can no longer dominate (and thereby silence) the sampled
+    ES. Two independent axes, gated independently by the portfolio caps:
+      * ``governing_model_es_99_cc = max(production_es_99_cc, challenger_es_99_cc)``
+        — the worst SAMPLED CVaR across scenarios (model joint tail). Reflects
+        same-game hedges: a balancing fill can LOWER it.
+      * ``deterministic_max_loss_cc`` — the exact comonotone all-hit premium-at-
+        risk (+ reserved holdings). An unconditional upper bound the sampled ES
+        can never exceed; a premium-at-risk cap, NOT an ES, so it is no longer
+        maxed INTO the ES number.
+    ``unknown`` True ⇒ a missing marginal made the whole snapshot no-go; NO stat
+    below is usable (fail-closed)."""
 
     unknown: bool
     band: str
@@ -97,7 +107,7 @@ class BookRiskSnapshot:
     std_cc: float = 0.0
     p_profit: float = 0.0
     var_99_cc: float = 0.0
-    es_99_cc: float = 0.0  # production-copula CVaR at ``band``
+    es_99_cc: float = 0.0  # production-copula CVaR at ``band`` (== production_es_99_cc)
     p_loss_worse_than: dict[float, float] = field(default_factory=dict)
     # A2: P(this settlement wave drops equity BELOW the ruin floor) =
     # P(current_equity + book_pnl < ruin_floor_frac·bankroll). 0.0 when equity/
@@ -105,10 +115,16 @@ class BookRiskSnapshot:
     # SAME sampled book P&L, so it reflects the structural hedge (not a comonotone).
     p_ruin: float = 0.0
 
-    # Challenger / stress overlay (§5).
-    challenger_es_99_cc: float = 0.0
-    deterministic_stress_cc: float = 0.0
-    operative_es_99_cc: float = 0.0  # max of the three — the gating number
+    # --- P0-3 separated tail axes (§5) ---------------------------------------
+    # SAMPLED model tail, by scenario, and their governing max. These reflect the
+    # structural/same-game hedge — a balancing fill can lower them.
+    production_es_99_cc: float = 0.0  # production-copula CVaR (mirror of es_99_cc)
+    challenger_es_99_cc: float = 0.0  # correlation-inflated challenger CVaR
+    governing_model_es_99_cc: float = 0.0  # max(production, challenger) — the model gate
+    # DETERMINISTIC maximum loss: exact all-hit premium-at-risk (+ reserved
+    # holdings). A hard upper bound the sampled ES can never exceed — gated as its
+    # OWN axis (premium-at-risk cap), never maxed into the ES number.
+    deterministic_max_loss_cc: float = 0.0
 
     # Tail attribution (§4.4).
     per_game_tail_cc: tuple[TailContribution, ...] = ()
@@ -275,16 +291,16 @@ def compute_book_risk(
         )
     if n_positions == 0:
         # ALL-RESERVED book: no sampled positions, but a real deterministic reserve
-        # (P0-4). Report the reserve as the entire operative tail (outside model
-        # ES) so the caps see the held risk; the sampled stats stay zero.
+        # (P0-4). The reserve is the entire DETERMINISTIC maximum (outside model
+        # ES) so the deterministic-max cap sees the held risk; the sampled model-ES
+        # axis stays zero (nothing sampled ⇒ no model tail).
         return BookRiskSnapshot(
             unknown=False,
             band=band,
             n_samples=n_samples,
             seed=seed,
             n_positions=0,
-            deterministic_stress_cc=reserve,
-            operative_es_99_cc=reserve,
+            deterministic_max_loss_cc=reserve,
         )
 
     corr = model.corr_for_band(band)
@@ -368,9 +384,13 @@ def compute_book_risk(
     # the risk-modeled sub-book; the reserved holdings (unavailable marginals, not
     # sampled) add their full premium to the all-hit worst case, so their
     # whole-account risk is never hidden from the operative tail number.
-    stress = _deterministic_all_hit_loss_cc(model) + reserve
+    deterministic_max = _deterministic_all_hit_loss_cc(model) + reserve
 
-    operative_es = max(es_99, challenger_es, stress)
+    # P0-3: the governing MODEL tail is the worst SAMPLED CVaR across scenarios —
+    # NOT maxed with the deterministic maximum. The deterministic maximum is a
+    # separate axis (deterministic_max_loss_cc), gated independently, so it can no
+    # longer dominate and silence the sampled ES.
+    governing_model_es = max(es_99, challenger_es)
 
     return BookRiskSnapshot(
         unknown=False,
@@ -386,9 +406,10 @@ def compute_book_risk(
         es_99_cc=es_99,
         p_loss_worse_than=p_loss_worse_than,
         p_ruin=p_ruin,
+        production_es_99_cc=es_99,
         challenger_es_99_cc=challenger_es,
-        deterministic_stress_cc=stress,
-        operative_es_99_cc=operative_es,
+        governing_model_es_99_cc=governing_model_es,
+        deterministic_max_loss_cc=deterministic_max,
         per_game_tail_cc=per_game_tail,
         per_leg_tail_cc=per_leg_tail,
     )

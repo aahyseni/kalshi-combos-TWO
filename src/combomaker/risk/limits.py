@@ -132,15 +132,25 @@ class RiskLimits:
     drawdown_frac: Fraction = Fraction(10, 100)
     # Hard-trip KILL: deeper give-back → human-only clear. 12%.
     hard_trip_frac: Fraction = Fraction(12, 100)
-    # Portfolio joint-tail cap (Phase 4 / M1 §5): the book's OPERATIVE ES_0.99
-    # (max of production-copula ES at corr-high, challenger ES, deterministic
-    # stress) as a %-of-bankroll ceiling (LOSS axis — ES is a loss magnitude).
-    # 15% START: looser than the daily-loss halt because ES_0.99 is a rare-tail
-    # figure the book is expected to sit well inside; it bites only when the
-    # correlated joint tail (many shared games breaking together) approaches a
-    # meaningful slice of bankroll. Read off the latest BookRiskSnapshot (never
-    # re-run MC in check); a stale/UNKNOWN snapshot fails closed.
+    # Portfolio joint-tail cap (Phase 4 / M1 §5): the book's GOVERNING MODEL
+    # ES_0.99 (max of production-copula ES at corr-high and challenger ES — the
+    # worst SAMPLED CVaR) as a %-of-bankroll ceiling (LOSS axis — ES is a loss
+    # magnitude). P0-3: SAMPLED tail ONLY; the deterministic all-hit maximum is a
+    # SEPARATE cap below. 15% START: looser than the daily-loss halt because
+    # ES_0.99 is a rare-tail figure the book is expected to sit well inside; it
+    # bites only when the correlated joint tail (many shared games breaking
+    # together) approaches a meaningful slice of bankroll. Read off the latest
+    # BookRiskSnapshot (never re-run MC in check); a stale/UNKNOWN snapshot fails
+    # closed.
     portfolio_cvar_frac: Fraction = Fraction(15, 100)
+    # Portfolio DETERMINISTIC maximum-loss cap (P0-3): the exact all-hit
+    # premium-at-risk (+ reserved holdings) as a %-of-bankroll ceiling. Gated
+    # INDEPENDENTLY of the sampled-ES cap so the deterministic maximum is its own
+    # premium-at-risk backstop rather than folded into (and dominating) the ES
+    # axis. Defaults to the same 15% as the CVaR cap: this preserves the exact
+    # deterministic enforcement the old operative-ES max provided (the all-hit
+    # maximum normally dominated), while the model-ES axis now fires on its own.
+    portfolio_det_max_frac: Fraction = Fraction(15, 100)
     # A2: max acceptable P(this settlement wave drops equity below the ruin floor).
     # Read off the structural-MC snapshot's ``p_ruin`` (floor set on the MC side,
     # -30% ⇒ equity < 0.70·bankroll). A probability budget, not a $ cap.
@@ -249,7 +259,10 @@ class PortfolioRisk(Protocol):
     def usable(self) -> bool: ...
 
     @property
-    def operative_es_99_cc(self) -> float: ...
+    def governing_model_es_99_cc(self) -> float: ...
+
+    @property
+    def deterministic_max_loss_cc(self) -> float: ...
 
     @property
     def p_ruin(self) -> float: ...
@@ -622,16 +635,22 @@ class LimitChecker:
                     )
                 )
 
-        # (8) Portfolio joint-tail cap (Phase 4 / M1 §5): the book's OPERATIVE
-        # ES_0.99 (max of copula-high ES, challenger ES, deterministic stress),
-        # read off the latest full-MC snapshot, vs a %-of-bankroll ceiling. This
-        # is the joint-tail backstop the analytic per-game worst case cannot see
-        # (the analytic sums worst cases as if independent; this counts the
-        # correlated joint tail — many shared games breaking together). A
-        # present-but-unusable snapshot (UNKNOWN marginal / empty) fails closed.
+        # (8) Portfolio joint-tail cap (Phase 4 / M1 §5): the book's GOVERNING
+        # MODEL ES_0.99 (max of copula-high ES and challenger ES — the worst
+        # SAMPLED CVaR), read off the latest full-MC snapshot, vs a %-of-bankroll
+        # ceiling. This is the joint-tail backstop the analytic per-game worst
+        # case cannot see (the analytic sums worst cases as if independent; this
+        # counts the correlated joint tail — many shared games breaking together).
+        # P0-3: the SAMPLED ES and the DETERMINISTIC all-hit maximum are gated as
+        # INDEPENDENT axes below — the deterministic maximum no longer dominates
+        # (and silences) the sampled ES. A present-but-unusable snapshot (UNKNOWN
+        # marginal / empty) fails BOTH closed.
         if book_risk is not None:
             cvar_thr = threshold_cc(limits.portfolio_cvar_frac, bankroll)
+            det_max_thr = threshold_cc(limits.portfolio_det_max_frac, bankroll)
             if not book_risk.usable:
+                # Fail closed on BOTH tail axes — an unmeasured joint tail AND an
+                # unmeasured deterministic maximum are each never safe.
                 out.append(
                     Breach(
                         ReasonCode.SKIP_PORTFOLIO_CVAR,
@@ -640,20 +659,43 @@ class LimitChecker:
                         shadow=shadow,
                     )
                 )
-            elif book_risk.operative_es_99_cc > cvar_thr:
                 out.append(
                     Breach(
-                        ReasonCode.SKIP_PORTFOLIO_CVAR,
-                        f"portfolio operative ES_0.99 "
-                        f"{int(book_risk.operative_es_99_cc)}cc > "
-                        f"{limits.portfolio_cvar_frac} bankroll = {cvar_thr}cc",
+                        ReasonCode.SKIP_PORTFOLIO_DET_MAX,
+                        "portfolio book-risk snapshot unusable (UNKNOWN marginal / "
+                        "empty) — deterministic max-loss cap fails closed",
                         shadow=shadow,
                     )
                 )
+            else:
+                # (8a) SAMPLED model-ES axis — fires on the correlated joint tail.
+                if book_risk.governing_model_es_99_cc > cvar_thr:
+                    out.append(
+                        Breach(
+                            ReasonCode.SKIP_PORTFOLIO_CVAR,
+                            f"portfolio governing model ES_0.99 "
+                            f"{int(book_risk.governing_model_es_99_cc)}cc > "
+                            f"{limits.portfolio_cvar_frac} bankroll = {cvar_thr}cc",
+                            shadow=shadow,
+                        )
+                    )
+                # (8b) DETERMINISTIC maximum-loss axis — the exact all-hit
+                # premium-at-risk, gated INDEPENDENTLY (P0-3).
+                if book_risk.deterministic_max_loss_cc > det_max_thr:
+                    out.append(
+                        Breach(
+                            ReasonCode.SKIP_PORTFOLIO_DET_MAX,
+                            f"portfolio deterministic max loss "
+                            f"{int(book_risk.deterministic_max_loss_cc)}cc > "
+                            f"{limits.portfolio_det_max_frac} bankroll = "
+                            f"{det_max_thr}cc",
+                            shadow=shadow,
+                        )
+                    )
             # (9) A2 P(RUIN) cap: P(this settlement wave drops equity below the ruin
             # floor, e.g. −30% ⇒ equity < 0.70·bankroll) vs a probability budget.
             # Reads the STRUCTURAL-MC ``p_ruin`` (which reflects same-game hedges,
-            # unlike the comonotone deterministic stress baked into operative_es), so
+            # unlike the comonotone deterministic max-loss axis), so
             # a book-balancing fill that LOWERS the joint tail lowers p_ruin and is
             # admitted. Co-equal with the analytic (mutex) + gross backstops — an
             # addition, never a demotion. Fail-closed via the ``usable`` guard above.

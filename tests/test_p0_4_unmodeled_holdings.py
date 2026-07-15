@@ -159,28 +159,30 @@ def test_reserved_holding_does_not_force_whole_book_mc_unknown() -> None:
     assert len(model.positions) == 1  # one sampled ComboPosition (the WC one)
 
 
-def test_reserved_premium_lands_in_operative_es_outside_model() -> None:
-    """The reserved holding's premium must appear in the gating tail number
-    (operative ES) as a DETERMINISTIC reserve, added OUTSIDE the sampled model ES —
-    so a reserved holding's whole-account risk is never hidden from the CVaR cap."""
+def test_reserved_premium_lands_in_deterministic_max_outside_model() -> None:
+    """The reserved holding's premium must appear in the DETERMINISTIC max-loss
+    axis as a reserve, added OUTSIDE the sampled model ES — so a reserved holding's
+    whole-account risk is never hidden from the deterministic-max cap. P0-3: it is
+    NOT folded into the model-ES number."""
     positions = [_wc_position(), _mlb_reserved_position()]
     model = build_book_model(positions, marginals=_mixed_marginals)
     snap = compute_book_risk(model, n_samples=4000, seed=1, band="high")
 
     assert snap.usable  # a risk-modeled position exists ⇒ the snapshot gates
 
-    # The deterministic stress carries BOTH the sampled all-hit worst case AND the
+    # The deterministic maximum carries BOTH the sampled all-hit worst case AND the
     # reserved premium. Rebuild the model with the reserved holding REMOVED and the
-    # deterministic stress must drop by exactly the reserved premium (210_000 cc).
+    # deterministic maximum must drop by exactly the reserved premium (210_000 cc).
     modeled_only = build_book_model([_wc_position()], marginals=_mixed_marginals)
     snap_no_reserve = compute_book_risk(modeled_only, n_samples=4000, seed=1, band="high")
 
     assert (
-        snap.deterministic_stress_cc
-        == snap_no_reserve.deterministic_stress_cc + 210_000.0
+        snap.deterministic_max_loss_cc
+        == snap_no_reserve.deterministic_max_loss_cc + 210_000.0
     )
-    # The reserve widens the operative ES (never hides risk).
-    assert snap.operative_es_99_cc >= snap.deterministic_stress_cc
+    # The deterministic maximum is an unconditional upper bound the sampled model
+    # ES never exceeds (P0-3: separate axes, not max'd together).
+    assert snap.deterministic_max_loss_cc >= snap.governing_model_es_99_cc
 
 
 # --- MANDATORY TEST 3: missing marginal never becomes an ordinary usable p=0.5 ----
@@ -225,14 +227,16 @@ def test_missing_marginal_never_becomes_ordinary_usable_half() -> None:
 
 def test_all_reserved_book_is_still_deterministic_reserve_not_nogo() -> None:
     """A book that is ALL reserved (no risk-modeled position) still has a real
-    deterministic reserve to account for — the MC returns that reserve as the
-    operative tail rather than a no-go zero. (The CVaR cap still fails closed via
-    ``usable`` since there is no sampled position, but the reserve is not lost.)"""
+    deterministic reserve to account for — the MC returns that reserve on the
+    deterministic max-loss axis rather than a no-go zero. (The CVaR cap still fails
+    closed via ``usable`` since there is no sampled position, but the reserve is
+    not lost.)"""
     model = build_book_model([_mlb_reserved_position()], marginals=_mixed_marginals)
     assert model.unknown is False
     assert len(model.positions) == 0
     assert model.reserved_loss_cc == 210_000.0
 
     snap = compute_book_risk(model, n_samples=4000, seed=1, band="high")
-    assert snap.deterministic_stress_cc == 210_000.0
-    assert snap.operative_es_99_cc == 210_000.0
+    assert snap.deterministic_max_loss_cc == 210_000.0
+    # No sampled positions ⇒ the model-ES axis is zero (nothing sampled).
+    assert snap.governing_model_es_99_cc == 0.0

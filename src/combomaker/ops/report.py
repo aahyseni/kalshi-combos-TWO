@@ -94,9 +94,10 @@ def _portfolio_mc(
         "p_profit": round(snap.p_profit, 4),
         "var_99_cc": round(snap.var_99_cc, 1),
         "es_99_cc": round(snap.es_99_cc, 1),
+        "production_es_99_cc": round(snap.production_es_99_cc, 1),
         "challenger_es_99_cc": round(snap.challenger_es_99_cc, 1),
-        "deterministic_stress_cc": round(snap.deterministic_stress_cc, 1),
-        "operative_es_99_cc": round(snap.operative_es_99_cc, 1),
+        "governing_model_es_99_cc": round(snap.governing_model_es_99_cc, 1),
+        "deterministic_max_loss_cc": round(snap.deterministic_max_loss_cc, 1),
         "per_game_tail_cc": {
             c.key: round(c.loss_cc, 1) for c in snap.per_game_tail_cc[:10]
         },
