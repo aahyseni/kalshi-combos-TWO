@@ -144,8 +144,12 @@ def _position_to_combo(
       instead of an independent complement pseudo-leg.
     - ``side`` = the POSITION side we hold (from ``our_side``): a long NO pays
       ``$1 − payout`` per contract (``combo_no_pays_complement``, promoted).
-    - ``contracts`` = centi-contracts → contracts, floored at 1 (a real position
-      never rounds to 0 — the ``max(1, …)`` guard the report MC already used).
+    - ``contracts`` = centi-contracts converted EXACTLY to fractional contracts
+      (``centi_contracts / 100``): 3727 → 37.27, 40 → 0.40 (P0-6). NO forced
+      one-contract minimum — a fractional position is scored at its true size, so
+      the simulated per-contract·contracts P&L matches the analytic
+      ``contracts·entry_price//100`` max loss to the cent. (The old
+      ``max(1, centi//100)`` floored 37.27→37 and inflated 0.40→1.)
     - ``price_cc`` = the premium PAID per contract; fee 0 here (reconciled
       elsewhere).
     """
@@ -156,7 +160,7 @@ def _position_to_combo(
     return ComboPosition(
         leg_indices=indices,
         side="yes" if position.our_side is Side.YES else "no",
-        contracts=max(1, int(position.contracts) // 100),
+        contracts=int(position.contracts) / 100,
         price_cc=int(position.entry_price_cc),
         leg_sides=leg_sides,  # type: ignore[arg-type]  # narrowed to yes|no above
     )

@@ -77,6 +77,14 @@ class ComboPosition:
     ``price_cc`` is the entry price paid per contract (0..10_000 cc);
     ``fee_cc`` is the TOTAL fee for the position, subtracted from P&L once.
 
+    ``contracts`` is the (possibly FRACTIONAL) contract quantity — Kalshi allows
+    fractional fills, so the live book carries centi-contracts (1.00 contract =
+    100 centi-contracts) which ``book_model`` converts EXACTLY to fractional
+    contracts by dividing by 100 (P0-6). There is no one-contract floor: a 0.40
+    contract position is scored as 0.40, not rounded up to 1. Per-scenario P&L is
+    ``per_contract_cc · contracts`` in float cc (probability/float space is fine
+    for money at the simulator interface, hard rule 5).
+
     ``leg_sides`` (optional) selects, PER LEG, whether the combo needs that leg's
     YES value or its NO value (``1 − value``) inside the payout product. The
     default (``None``) means every leg contributes its YES value — the historical
@@ -92,7 +100,7 @@ class ComboPosition:
 
     leg_indices: tuple[int, ...]
     side: Literal["yes", "no"]
-    contracts: int
+    contracts: float
     price_cc: int
     fee_cc: int = 0
     leg_sides: tuple[Literal["yes", "no"], ...] | None = None
