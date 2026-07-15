@@ -197,18 +197,48 @@ def _deterministic_all_hit_loss_cc(model: BookModel) -> float:
     return total
 
 
+def modeled_cost_basis_cc(model: BookModel) -> float:
+    """Total ENTRY COST (premium paid) of the risk-modeled positions, float cc:
+    ``Σ price_cc · contracts`` over ``model.positions``.
+
+    P1-3 (no double count of position value). The ruin check adds the sampled
+    ``book_pnl`` — which is measured ENTRY-to-terminal (``payout − price_cc`` per
+    contract; see ``engine._position_pnl``) — onto a scalar equity basis. The ONLY
+    equity basis that reconciles that entry-based P&L to the true terminal equity
+    without double-counting the position's already-marked value is the COST basis:
+
+        available_cash + Σ price_cc·contracts + book_pnl
+          = available_cash + Σ price_cc·c + Σ(payout − price_cc)·c
+          = available_cash + Σ payout·c                    (= true terminal equity)
+
+    i.e. the entry premium cancels exactly, leaving cash plus realized payout, with
+    NO dependence on the intraday mark. Feeding ``exchange_equity`` (cash +
+    portfolio_value) instead would leave a residual ``portfolio_value −
+    Σ price_cc·c`` = the unrealized mark-to-market ALREADY in equity, double-
+    counting the position value. ``build_book_model`` sets ``fee_cc = 0`` on every
+    ``ComboPosition`` (fees are already debited from live cash and are 0 in
+    ``book_pnl``), so the cost basis is premium only. Reserved (unmodeled) holdings
+    are excluded here exactly as they are from ``book_pnl`` (their risk is the
+    separate deterministic reserve, never in this settlement-wave P&L)."""
+    return float(
+        sum(float(p.price_cc) * p.contracts for p in model.positions)
+    )
+
+
 def _p_ruin_from_pnl(
     pnl: NDArray[np.float64],
     current_equity_cc: int | None,
     ruin_floor_cc: float | None,
 ) -> float:
     """P(this settlement wave drops equity BELOW the ruin floor) on one sampled
-    book P&L vector: ``P(current_equity + book_pnl < ruin_floor)``.
+    book P&L vector: ``P(equity_basis + book_pnl < ruin_floor)``.
 
-    Returns 0.0 when equity/floor are unavailable (the ruin cap then does not
-    evaluate) or the P&L vector is empty. Uses LIVE equity so the probability
-    tightens as we draw down (a fixed loss threshold would understate ruin once
-    equity < bankroll)."""
+    ``current_equity_cc`` is the COST-basis equity for the modeled book
+    (available_cash + ``modeled_cost_basis_cc``), NOT exchange equity — see
+    ``modeled_cost_basis_cc`` for the no-double-count proof. Returns 0.0 when
+    equity/floor are unavailable (the ruin cap then does not evaluate) or the P&L
+    vector is empty. Uses LIVE cash so the probability tightens as we draw down (a
+    fixed loss threshold would understate ruin once equity < bankroll)."""
     if current_equity_cc is None or ruin_floor_cc is None or pnl.size == 0:
         return 0.0
     return float(np.mean(current_equity_cc + pnl < ruin_floor_cc))

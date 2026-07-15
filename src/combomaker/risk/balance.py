@@ -417,6 +417,16 @@ class BalanceTracker:
         when stale."""
         return None if self.is_stale else self._available_cash_cc
 
+    def available_cash_cc_or_none(self) -> CentiCents | None:
+        """Non-raising current AVAILABLE CASH (Kalshi ``balance``), or None when
+        stale. Clearly-named alias of ``bankroll_cc_or_none`` for risk-critical
+        callers: the book-risk ruin basis is built on cash + modeled entry cost
+        (COST basis, not exchange equity) so it never double-counts the already-
+        marked position value (P1-3). None ⇒ the ruin cap simply does not
+        evaluate (fail-closed: a missing cash reading is never an invented
+        equity)."""
+        return None if self.is_stale else self._available_cash_cc
+
     def risk_bankroll_cc_or_none(self) -> CentiCents | None:
         """Non-raising accessor for display/logging: the risk denominator, or
         None when stale / not yet anchored."""

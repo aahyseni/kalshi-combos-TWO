@@ -75,8 +75,16 @@ from combomaker.risk.skew import (
     compute_inventory_skew,
     decide_widen_or_decline,
 )
-from combomaker.sim.book_model import WithinGameRhoProvider, build_book_model
-from combomaker.sim.book_risk import BookRiskSnapshot, compute_book_risk
+from combomaker.sim.book_model import (
+    BookModel,
+    WithinGameRhoProvider,
+    build_book_model,
+)
+from combomaker.sim.book_risk import (
+    BookRiskSnapshot,
+    compute_book_risk,
+    modeled_cost_basis_cc,
+)
 from combomaker.sim.structural_book import StructuralConfigView
 
 log = get_logger(__name__)
@@ -386,13 +394,39 @@ class QuoteLifecycle:
             band="high",
             bankroll_cc=self._risk_bankroll_cc(),
             structural_cfg=self._structural_cfg,
-            current_equity_cc=self._balance.exchange_equity_cc_or_none()
-            if self._balance is not None
-            else None,
+            # P1-3 (no double count of position value): the ruin check adds the
+            # sampled ``book_pnl`` (measured ENTRY-to-terminal, ``payout −
+            # price_cc`` per contract) onto this scalar. We therefore feed the
+            # COST basis — available_cash + Σ price_cc·contracts of the modeled
+            # book — NOT exchange equity (cash + portfolio_value). The entry
+            # premium then cancels exactly against ``book_pnl`` and the sum equals
+            # cash + Σ payout = true terminal equity, independent of the intraday
+            # mark. Feeding exchange equity would leave the unrealized mark-to-
+            # market (portfolio_value − Σ price_cc·c) ADDED on top of an entry-
+            # based P&L, double-counting the already-marked position value. Cash
+            # stale/absent ⇒ None ⇒ the ruin cap simply does not evaluate
+            # (fail-closed; a missing cash reading is never an invented equity).
+            current_equity_cc=self._ruin_equity_basis_cc(model),
             ruin_floor_frac=self._config.ruin_floor_frac,
             ruin_prob_ci_z=self._config.ruin_prob_ci_z,
             input_generation=gen,
         )
+
+    def _ruin_equity_basis_cc(self, model: BookModel) -> int | None:
+        """COST-basis equity for the P(ruin) check (P1-3): live available cash
+        plus the modeled book's entry premium (``modeled_cost_basis_cc``). This
+        is the one basis on which ``equity + book_pnl`` reconciles to the true
+        terminal equity (cash + Σ payout) with NO double count of the already-
+        marked position value — the derivation is in ``modeled_cost_basis_cc``.
+        Returns None (ruin cap does not evaluate) when there is no balance tracker
+        or the cash reading is stale/absent — a missing cash figure is never
+        replaced with a convenient equity default."""
+        if self._balance is None:
+            return None
+        cash_cc = self._balance.available_cash_cc_or_none()
+        if cash_cc is None:
+            return None
+        return int(cash_cc) + int(round(modeled_cost_basis_cc(model)))
 
     def _publish_book_risk(self, snap: BookRiskSnapshot) -> None:
         """Publish a fresh MC snapshot — but ONLY if it still describes the CURRENT
