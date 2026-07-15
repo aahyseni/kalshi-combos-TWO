@@ -1,3 +1,15 @@
+> **⚠ SUPERSEDED (2026-07-15, risk-audit branch) on the zero-quote root cause.**
+> This report attributed the fill/zero-quote block primarily to the **per-game loss
+> cap** (comonotone summing) and to enforced-cap tuning. That framing is superseded.
+> The **root cause of the zero live quotes was a SQL fanout** in the held-positions
+> aggregation (a `fills JOIN rfqs` many-to-many that multiplied/poisoned held
+> positions and their marginals), **not cap tuning**. The **fanout fix restored 228+
+> live quotes**. The current blockers are: directional concentration, max open
+> quotes, unusable MC snapshots, price deadline, and smaller classifier gaps — see
+> `RISK_ENGINE_AUDIT_ACTION_PLAN.txt` and the risk-audit commits (`45164f1..HEAD`).
+> Specific overclaims below are corrected inline with **[CORRECTION …]** notes; the
+> stage narrative is retained for history, not as current truth.
+
 # Risk-engine upgrade — final report (zero-bias, for external review)
 
 **Date:** 2026-07-15 · **Repo:** `kalshi-combos-TWO` (package `combomaker`) · **Author:** build agent
@@ -17,9 +29,12 @@ lose together* (comonotone), which is impossible for mutually-exclusive legs (ex
 advances). This upgrade (a) loosened the interim cap, (b) made the analytic cap **mutual-exclusion
 aware**, (c) fixed a restart bug that left the risk book **blind** to held positions, (d) built a
 **structural Monte-Carlo** portfolio-risk model that samples one game outcome from the *same*
-Dixon-Coles model that prices the legs and settles every leg against it (so all same-game hedges are
-exact, no correlation table), and (e) added a **P(ruin)** cap. It is fully unit-tested (suite
-**1784 → 1787 passing**, mypy-clean, ruff-clean) and was **deployed live successfully**, but at
+Dixon-Coles model that prices the legs and settles every leg against it (so same-game hedges are
+exact **for legs the structural model covers** — see [CORRECTION §3/A1] below; mixed
+structural-plus-fallback-leg dependence in one game is NOT exact and is handled by a worse-tail
+copula challenger, P0-7), and (e) added a **P(ruin)** cap. The enumerated properties in §4 are
+unit-tested (suite **2010 passing** at the risk-audit HEAD, mypy-clean, ruff-clean); this is not a
+claim that every behavior described in prose is exhaustively tested. It was **deployed live**, but at
 deploy time it is **not productively quoting** because of a newly-observed interaction (§8) between
 the restart-rehydration and the fail-closed risk view, compounded by the World Cup being at its final
 stages (little fresh pregame flow).
@@ -47,6 +62,12 @@ Two DB-backed analyses drove the whole design; both are reproducible from the sh
 `game_worst[game] += position.max_loss_cc` — a **comonotone sum** ("every combo on the game loses at
 once"). For a book holding both `ARG-advance` and `ENG-advance` NO combos this is impossible (exactly
 one team advances), so the cap over-stated risk and blocked fills that were, in reality, hedged.
+
+> **[CORRECTION — zero-quote root cause].** The comonotone per-game cap is a real defect
+> that throttled *fills*, but it is **not** the cause of the later **zero live quotes**. That
+> was a **SQL fanout** in `Store.held_positions` (a `fills JOIN rfqs` many-to-many that fanned
+> out / multiplied held positions and poisoned their marginals). The **fanout fix restored 228+
+> live quotes**. Do not read this section as "the cap tuning restored quoting" — it did not.
 
 ---
 
@@ -108,6 +129,16 @@ All changes are on disk; the suite + mypy + ruff numbers below are current.
 - **Live-verified:** on deploy it rebuilt **7 positions** across 3 games, `unmodeled_open=0`.
 - **⚠ It also surfaced the interaction in §8** — this is the most important open issue in this report.
 
+> **[CORRECTION — "all same-game hedges exact"].** The structural MC samples a game's
+> **structural block** and its **copula-only (fallback) block** from *separate* rng draws
+> (`sample_structural_values` = structural columns ⊕ copula columns). Same-game hedges are
+> exact **only among legs the structural model covers**. When one game straddles both blocks
+> (a structural leg + a corners/cards/single-leg fallback leg), that game's structural↔copula
+> dependence is **discarded** by the split and is NOT hedged exactly; P0-7 detects the straddle
+> (`bridge_active`) and runs a full-copula worse-tail challenger (`bridge_es_99_cc`) folded into
+> the governing model tail. So: exact within the structural block; **mixed fallback-leg
+> dependence is bounded, not exact.**
+
 ### A1 — structural portfolio-risk MC  (`sim/structural_book.py`, new)
 - `sample_game_values(params, leg_specs, shares, n, rng)`: samples one game state from the Dixon-Coles
   state PMF (`dixon_coles._states`) + a **shared shootout coin** + a **shared per-team goal
@@ -123,7 +154,18 @@ All changes are on disk; the suite + mypy + ruff numbers below are current.
   copula path; 37 default-path tests unchanged). Threaded into `lifecycle.recompute_book_risk` and
   `ops/quote_app.py` via a decoupled `StructuralConfigView` built from the shipped `StructuralConfig`.
 
-### A2 — P(ruin) + the structural MC as a governing constraint
+### A2 — P(ruin) + the structural MC as a committed-book monitor
+
+> **[CORRECTION — "governing constraint"].** As written in this report (2026-07-15 build),
+> A2 governed only the **whole committed book's** tail + ruin — a backstop monitor — and the
+> per-candidate ΔES/ΔP(ruin) last-look gate was explicitly **deferred** (§6). At that point the
+> honest label was "committed-book monitor pending candidate-aware post-fill wiring," NOT a
+> "structural MC governing constraint." **This gap was subsequently closed on the risk-audit
+> branch by P0-1** (`bcb89cf`, `sim/book_risk.py` `evaluate_candidate_book_risk` /
+> `compute_candidate_book_risk`): the last-look gate now computes PRE (committed + reservations
+> + simultaneously-executable accepts) and POST (+ this candidate) ES / P(ruin) on **common
+> sampled states**, i.e. candidate- and reservation-aware. Read A2 below as the committed-book
+> monitor it shipped as; the candidate-aware constraint is P0-1, not this stage.
 - `BookRiskSnapshot.p_ruin` (`sim/book_risk.py`): `P(current_equity + wave_pnl < ruin_floor_frac ·
   bankroll)`, computed on the same sampled book P&L (so it reflects the structural hedge). Uses **live
   equity** so it tightens as we draw down.
@@ -184,11 +226,14 @@ valid combo holds both advance legs, but it matters for the cross-combo hedge in
   candidate on a *new* game has no cached columns. A2 as built governs the **whole committed book's**
   tail + ruin (a backstop) and lets **Stage B** carry the candidate-level advance hedge. The
   per-candidate ΔES gate is deferred, not done.
-- **`operative_es` masking:** the CVaR cap gates on `operative_es = max(es_99, challenger,
-  deterministic_all_hit)`, and the all-hit stress is **comonotone**, so it *masks* the structural hedge
-  for that particular cap. The **P(ruin) cap** (A2) is the constraint that reflects the hedge; the CVaR
-  cap remains a conservative backstop. This is a real limitation of the current gating, documented not
-  hidden.
+- **`operative_es` masking:** the tail cap gates on `operative_es = max(es_99, challenger,
+  deterministic_all_hit)`. **[CORRECTION]** this quantity is **NOT a portfolio CVaR** — it is the
+  **max of a model ES (a genuine CVaR) and a deterministic comonotone all-hit maximum loss**; a max of
+  a CVaR and a hard maximum is not itself a CVaR and must not be labeled one (P0-3 explicitly split the
+  model ES/challengers from the deterministic maximum for exactly this reason). Because the all-hit
+  stress is **comonotone**, it *masks* the structural hedge for that particular cap. The **P(ruin) cap**
+  (A2) — and now the candidate-aware P0-1 gate — reflect the hedge; the `operative_es` cap remains a
+  conservative backstop. This is a real limitation of the current gating, documented not hidden.
 - **Corners/cards correlation calibration.** Corners stay on the copula rho table (measurable from
   co-settlements — a queued follow-up). Cards have no leg type and should be no-quote at the classifier;
   a flat +0.6 in a *tail* model would be an unmeasured prior.
