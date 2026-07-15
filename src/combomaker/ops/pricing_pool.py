@@ -221,6 +221,11 @@ class BookRiskInputs:
     current_equity_cc: int | None
     ruin_floor_frac: float
     input_generation: int
+    # P1-2: z-score for the one-sided Wilson upper confidence bound the ruin cap
+    # gates on. 0.0 (default) ⇒ the bound == the p̂ point estimate (behaviour
+    # unchanged); a positive z (e.g. 1.645 for a one-sided 95% level) makes the
+    # ruin gate fail-closed against MC sampling error near the budget.
+    ruin_prob_ci_z: float = 0.0
 
 
 def _worker_book_risk(inputs: BookRiskInputs) -> BookRiskSnapshot:
@@ -236,6 +241,7 @@ def _worker_book_risk(inputs: BookRiskInputs) -> BookRiskSnapshot:
         structural_cfg=inputs.structural_cfg,
         current_equity_cc=inputs.current_equity_cc,
         ruin_floor_frac=inputs.ruin_floor_frac,
+        ruin_prob_ci_z=inputs.ruin_prob_ci_z,
         input_generation=inputs.input_generation,
     )
 

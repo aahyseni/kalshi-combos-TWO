@@ -137,6 +137,11 @@ class BookRiskSnapshot:
     # ``max`` over the production, correlation-inflated challenger, and full-copula
     # bridge books (gate on the worst credible model), mirroring the governing ES.
     p_ruin: float = 0.0
+    # P1-2: one-sided Wilson UPPER confidence bound on ``p_ruin`` at the caller's
+    # ``ruin_prob_ci_z`` (0 ⇒ == p_ruin). The ruin CAP in limits.py reads this, not
+    # the point estimate, so a p̂ that only just clears the budget by sampling luck
+    # near the budget is treated as over-budget (fail-closed against MC error).
+    p_ruin_upper: float = 0.0
 
     # --- P0-3 separated tail axes (§5) ---------------------------------------
     # SAMPLED model tail, by scenario, and their governing max. These reflect the
@@ -207,6 +212,66 @@ def _p_ruin_from_pnl(
     if current_equity_cc is None or ruin_floor_cc is None or pnl.size == 0:
         return 0.0
     return float(np.mean(current_equity_cc + pnl < ruin_floor_cc))
+
+
+def wilson_upper_bound(p_hat: float, n: int, z: float) -> float:
+    """One-sided Wilson-score UPPER confidence bound on a binomial proportion.
+
+    P1-2 (confidence bounds near the ruin budget). ``p_ruin`` is a Monte-Carlo
+    estimate ``p̂ = k/n`` of a binomial proportion, so it carries sampling error.
+    When p̂ sits just under the ruin budget the TRUE ruin probability may be over
+    it — gating on the point estimate would then admit a fill whose ruin risk is
+    only statistically-indistinguishable-from-safe. Fail-closed (hard rule 6)
+    means gating on the UPPER end of a confidence interval instead: a p̂ that
+    could plausibly be over-budget is treated as over-budget.
+
+    The Wilson score interval is used (not Wald): it is well-behaved for the small
+    p̂ and finite n we operate at (Wald degenerates to a zero-width interval at
+    p̂ = 0, which would defeat the whole point near a small ruin budget). Closed
+    form for the one-sided upper bound at z standard normal deviations:
+
+        centre = (p̂ + z²/2n) / (1 + z²/n)
+        halfwidth = (z / (1 + z²/n)) · sqrt( p̂(1−p̂)/n + z²/4n² )
+        upper = min(1, centre + halfwidth)
+
+    ``z = 0`` returns p̂ exactly (no widening) — the default everywhere, so the
+    point-estimate behaviour is preserved bit-for-bit unless an operator opts into
+    a positive confidence level. ``n <= 0`` (nothing sampled ⇒ the ruin cap does
+    not evaluate) returns p̂ unchanged. p̂ is clamped to [0,1] defensively."""
+    if z <= 0.0 or n <= 0:
+        return p_hat
+    p = min(1.0, max(0.0, p_hat))
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    centre = (p + z2 / (2.0 * n)) / denom
+    halfwidth = (z / denom) * math.sqrt(p * (1.0 - p) / n + z2 / (4.0 * n * n))
+    return min(1.0, centre + halfwidth)
+
+
+def ruin_samples_for_precision(
+    p_hat: float, target_halfwidth: float, z: float
+) -> int:
+    """Adaptive sample count: the ``n`` a p̂ estimate needs so its z-level Wilson
+    half-width is ``<= target_halfwidth`` near the ruin budget (P1-2).
+
+    Solves the large-n Wald approximation ``z·sqrt(p̂(1−p̂)/n) <= target`` for n
+    (Wald is the right guide for a SAMPLE-SIZE target — it is the limit the Wilson
+    width converges to and is monotone in n, so a conservative n suffices):
+
+        n >= z² · p̂(1−p̂) / target²
+
+    Used to decide whether a first MC pass whose p̂ landed NEAR the budget must be
+    RE-RUN at more samples before its ruin gate is trusted (an under-sampled
+    estimate straddling the budget is exactly the fail-closed case). Returns 0
+    when no widening is requested (``z <= 0`` or ``target_halfwidth <= 0``), and
+    at least 1 otherwise. p̂ is clamped to [0,1]. Worst-case variance (p̂ = 0.5) is
+    NOT assumed — the caller passes the OBSERVED p̂, so a tiny ruin probability does
+    not demand an enormous n."""
+    if z <= 0.0 or target_halfwidth <= 0.0:
+        return 0
+    p = min(1.0, max(0.0, p_hat))
+    n = (z * z * p * (1.0 - p)) / (target_halfwidth * target_halfwidth)
+    return max(1, int(math.ceil(n)))
 
 
 def _es_from_pnl(pnl: NDArray[np.float64], level: float) -> tuple[float, float]:
@@ -467,6 +532,7 @@ def compute_book_risk(
     structural_cfg: StructuralConfigView | None = None,
     current_equity_cc: int | None = None,
     ruin_floor_frac: float = 0.70,
+    ruin_prob_ci_z: float = 0.0,
     input_generation: int = -1,
 ) -> BookRiskSnapshot:
     """Run the full book-risk MC and build the halt-feeding snapshot.
@@ -626,6 +692,11 @@ def compute_book_risk(
     # above; the reported/gated number is the max so a single correlation error
     # cannot understate ruin (fail-closed on the ruin axis).
     p_ruin = max(p_ruin, challenger_p_ruin, bridge_p_ruin)
+    # P1-2: the fail-closed UPPER confidence bound on the governing p̂. All three
+    # books were sampled at ``n_samples``; that is the n of the interval. z == 0
+    # (the default) leaves it == p_ruin, so the committed-book behaviour is
+    # unchanged unless an operator opts into a positive ruin confidence level.
+    p_ruin_upper = wilson_upper_bound(p_ruin, n_samples, ruin_prob_ci_z)
 
     return BookRiskSnapshot(
         unknown=False,
@@ -642,6 +713,7 @@ def compute_book_risk(
         es_99_cc=es_99,
         p_loss_worse_than=p_loss_worse_than,
         p_ruin=p_ruin,
+        p_ruin_upper=p_ruin_upper,
         production_es_99_cc=es_99,
         challenger_es_99_cc=challenger_es,
         bridge_es_99_cc=bridge_es,
@@ -690,6 +762,11 @@ class _TailAxes:
     gross_settlement_notional_cc: float
     # P1-1: GOVERNING ruin = max over production / challenger / bridge (worst model).
     p_ruin: float
+    # P1-2: one-sided Wilson UPPER confidence bound on ``p_ruin`` at the caller's
+    # ``ruin_prob_ci_z`` (0 ⇒ == p_ruin). The ruin GATE reads this, not the point
+    # estimate, so a p̂ that is only statistically-indistinguishable-from-safe near
+    # the budget is declined (fail-closed against MC sampling error).
+    p_ruin_upper: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -748,6 +825,7 @@ def _tail_axes_from_pnl(
     current_equity_cc: int | None,
     ruin_floor_cc: float | None,
     bridge_pnl: NDArray[np.float64] | None = None,
+    ruin_prob_ci_z: float = 0.0,
 ) -> _TailAxes:
     """Roll a per-scenario book P&L vector (and its correlation-inflated
     challenger re-sample, plus the optional P0-7 full-copula bridge re-sample)
@@ -784,6 +862,19 @@ def _tail_axes_from_pnl(
             p_ruin,
             _p_ruin_from_pnl(bridge_pnl, current_equity_cc, ruin_floor_cc),
         )
+    # P1-2: the ruin gate reads the UPPER Wilson bound at the SAME n the governing
+    # p̂ came from — the smallest scenario count across the sampled books (the
+    # widest, most conservative interval), so a p̂ that only just clears the budget
+    # by luck of the draw is treated as over-budget. n = 0 (nothing sampled)
+    # reduces the bound to p̂ itself (the ruin cap does not evaluate then anyway).
+    n_ruin = int(pnl.size)
+    if challenger_pnl is not None and challenger_pnl.size:
+        n_ruin = min(n_ruin, int(challenger_pnl.size)) if n_ruin else int(
+            challenger_pnl.size
+        )
+    if bridge_pnl is not None and bridge_pnl.size:
+        n_ruin = min(n_ruin, int(bridge_pnl.size)) if n_ruin else int(bridge_pnl.size)
+    p_ruin_upper = wilson_upper_bound(p_ruin, n_ruin, ruin_prob_ci_z)
     return _TailAxes(
         ev_cc=ev,
         es_99_cc=es,
@@ -792,6 +883,7 @@ def _tail_axes_from_pnl(
         deterministic_max_loss_cc=deterministic_max_loss_cc,
         gross_settlement_notional_cc=gross_cc,
         p_ruin=p_ruin,
+        p_ruin_upper=p_ruin_upper,
     )
 
 
@@ -833,6 +925,7 @@ def evaluate_candidate_book_risk(
     bankroll_cc: int | None = None,
     current_equity_cc: int | None = None,
     ruin_floor_frac: float = 0.70,
+    ruin_prob_ci_z: float = 0.0,
     portfolio_cvar_frac: float | None = None,
     portfolio_det_max_frac: float | None = None,
     portfolio_ruin_prob_budget: float | None = None,
@@ -888,7 +981,7 @@ def evaluate_candidate_book_risk(
         within_game_rho=within_game_rho,
     )
 
-    empty = _TailAxes(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    empty = _TailAxes(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     if model.unknown:
         # Fail-closed: a missing marginal anywhere in the merged decomposition ⇒
         # no usable tail, no confirm (UNKNOWN joint tail is never safe).
@@ -978,6 +1071,7 @@ def evaluate_candidate_book_risk(
         current_equity_cc=current_equity_cc,
         ruin_floor_cc=ruin_floor_cc,
         bridge_pnl=pre_bridge_pnl,
+        ruin_prob_ci_z=ruin_prob_ci_z,
     )
     post_axes = _tail_axes_from_pnl(
         post_pnl,
@@ -987,6 +1081,7 @@ def evaluate_candidate_book_risk(
         current_equity_cc=current_equity_cc,
         ruin_floor_cc=ruin_floor_cc,
         bridge_pnl=post_bridge_pnl,
+        ruin_prob_ci_z=ruin_prob_ci_z,
     )
     candidate_ev = post_axes.ev_cc - pre_axes.ev_cc
 
@@ -1068,9 +1163,12 @@ def _candidate_gate(
             return False, "post_deterministic_max_over_budget"
 
     # (4) POST P(ruin) vs the probability budget (reflects the same-game hedge —
-    # a balancing candidate LOWERS it and can pass).
+    # a balancing candidate LOWERS it and can pass). P1-2: gate the UPPER Wilson
+    # confidence bound (== p_ruin when ruin_prob_ci_z == 0), so a p̂ that is only
+    # statistically-indistinguishable-from-safe near the budget is declined
+    # (fail-closed against MC sampling error, never a convenient point estimate).
     if portfolio_ruin_prob_budget is not None:
-        if post.p_ruin > portfolio_ruin_prob_budget:
+        if max(post.p_ruin, post.p_ruin_upper) > portfolio_ruin_prob_budget:
             return False, "post_ruin_prob_over_budget"
 
     # (5) POST gross utilization backstop (Σ contracts×$1 ≤ multiple×bankroll).

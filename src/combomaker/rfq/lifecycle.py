@@ -120,6 +120,12 @@ class LifecycleConfig:
     # directive 2026-07-15: −30% ⇒ 0.70. Feeds compute_book_risk's p_ruin, which
     # the P(ruin) cap gates against ``portfolio_ruin_prob_budget``.
     ruin_floor_frac: float = 0.70
+    # P1-2: z-score for the one-sided Wilson UPPER confidence bound the ruin cap
+    # gates on (fail-closed against MC sampling error near the budget). 0.0 (the
+    # default) ⇒ the bound == the p̂ point estimate — behaviour unchanged; set e.g.
+    # 1.645 for a one-sided 95% level to decline a fill whose ruin p̂ only just
+    # clears the budget by luck of the draw.
+    ruin_prob_ci_z: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +141,7 @@ class _StaleBookRisk:
     governing_model_es_99_cc: float = 0.0
     deterministic_max_loss_cc: float = 0.0
     p_ruin: float = 0.0
+    p_ruin_upper: float = 0.0  # P1-2 (never read on the unusable path)
 
 
 @dataclass
@@ -383,6 +390,7 @@ class QuoteLifecycle:
             if self._balance is not None
             else None,
             ruin_floor_frac=self._config.ruin_floor_frac,
+            ruin_prob_ci_z=self._config.ruin_prob_ci_z,
             input_generation=gen,
         )
 
@@ -453,6 +461,7 @@ class QuoteLifecycle:
                 structural_cfg=inputs.structural_cfg,
                 current_equity_cc=inputs.current_equity_cc,
                 ruin_floor_frac=inputs.ruin_floor_frac,
+                ruin_prob_ci_z=inputs.ruin_prob_ci_z,
                 input_generation=inputs.input_generation,
             )
             # Inline path builds the model and runs the MC without yielding, so the

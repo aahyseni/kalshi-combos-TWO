@@ -266,6 +266,13 @@ class PortfolioRisk(Protocol):
     @property
     def p_ruin(self) -> float: ...
 
+    # P1-2: the one-sided Wilson upper confidence bound on ``p_ruin`` the ruin cap
+    # gates on (== p_ruin at the default confidence z of 0). Read via ``getattr``
+    # with a ``p_ruin`` fallback in ``check`` so a snapshot predating this field
+    # degrades to the point estimate (never looser) instead of raising.
+    @property
+    def p_ruin_upper(self) -> float: ...
+
 
 class LimitChecker:
     def __init__(self, limits: RiskLimits) -> None:
@@ -704,12 +711,23 @@ class LimitChecker:
             # a book-balancing fill that LOWERS the joint tail lowers p_ruin and is
             # admitted. Co-equal with the analytic (mutex) + gross backstops — an
             # addition, never a demotion. Fail-closed via the ``usable`` guard above.
+            # P1-2: gate the UPPER Wilson confidence bound on p̂ (``p_ruin_upper``),
+            # not the point estimate, so an MC estimate that only just clears the
+            # budget by sampling luck near it is declined (fail-closed against MC
+            # error). ``max`` with ``p_ruin`` keeps the gate never LOOSER than the
+            # point estimate even for a snapshot from a code path that left the
+            # upper bound at its 0.0 default (z == 0 ⇒ upper bound == p_ruin anyway).
             ruin_budget = float(limits.portfolio_ruin_prob_budget)
-            if book_risk.usable and book_risk.p_ruin > ruin_budget:
+            gated_ruin = max(
+                book_risk.p_ruin,
+                getattr(book_risk, "p_ruin_upper", book_risk.p_ruin),
+            )
+            if book_risk.usable and gated_ruin > ruin_budget:
                 out.append(
                     Breach(
                         ReasonCode.SKIP_PORTFOLIO_RUIN,
-                        f"P(ruin) {book_risk.p_ruin:.4f} > budget {ruin_budget:.4f} "
+                        f"P(ruin) {book_risk.p_ruin:.4f} (upper "
+                        f"{gated_ruin:.4f}) > budget {ruin_budget:.4f} "
                         f"(equity below ruin floor this settlement wave)",
                         shadow=shadow,
                     )
