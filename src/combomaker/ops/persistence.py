@@ -657,29 +657,59 @@ class Store:
         # The rfqs tape holds MANY rows per combo_ticker (one per re-quote — up to
         # tens of thousands). A naive ``fills JOIN rfqs`` fans each fill out by that
         # count BEFORE the SUM, inflating contracts_centi (and every risk cap that
-        # scales with it) by the fanout factor. Aggregate fills and de-dup the rfqs
-        # legs lookup into 1-row-per-combo derived tables so the join is strictly
-        # 1:1. (entry_price was fanout-safe before — numerator and denominator
-        # scaled together — but contracts_centi was not; this is the fix.)
-        query = (
-            "SELECT a.combo_ticker, a.our_side, a.ctr, a.loss_num,"
-            " r.legs_json, r.collection_ticker"
-            " FROM (SELECT combo_ticker, our_side, SUM(contracts_centi) AS ctr,"
-            "       SUM(contracts_centi * price_cc) AS loss_num"
-            f"      FROM fills WHERE combo_ticker IN ({placeholders})"  # noqa: S608 - ints-only placeholders
-            "       GROUP BY combo_ticker, our_side) a"
-            " LEFT JOIN (SELECT market_ticker, MAX(legs_json) AS legs_json,"
-            "            MAX(collection_ticker) AS collection_ticker"
-            f"           FROM rfqs WHERE market_ticker IN ({placeholders})"  # noqa: S608 - ints-only placeholders
-            "            GROUP BY market_ticker) r"
-            " ON r.market_ticker = a.combo_ticker"
+        # scales with it) by the fanout factor. Aggregate fills so the fills side is
+        # exactly one row per (combo_ticker, our_side). (entry_price was fanout-safe
+        # before — numerator and denominator scaled together — but contracts_centi
+        # was not; that de-dup is the earlier fix.)
+        fills_q = (
+            "SELECT combo_ticker, our_side, SUM(contracts_centi) AS ctr,"
+            " SUM(contracts_centi * price_cc) AS loss_num"
+            f" FROM fills WHERE combo_ticker IN ({placeholders})"  # noqa: S608 - ints-only placeholders
+            " GROUP BY combo_ticker, our_side"
         )
-        out: list[JsonDict] = []
-        async with self._db.execute(query, tuple(tickers) * 2) as cursor:
-            async for row in cursor:
-                combo_ticker, our_side, ctr, loss_num, legs_json, collection = row
-                if not ctr or not legs_json:
+        # P1.11 — EXACT ORIGINATING LEG-SET IDENTITY, not MAX(legs_json) provenance.
+        # The old ``MAX(legs_json)`` silently picked the lexicographically-largest
+        # leg definition when the tape held MORE THAN ONE distinct leg-set for a
+        # market_ticker — a provenance guess that could rehydrate a position with the
+        # WRONG legs (poisoning clustering / mutex / marginals) and hide the conflict.
+        # Instead pull the DISTINCT leg-sets per ticker and resolve fail-closed:
+        # exactly one distinct legs_json ⇒ that is the identity; two or more ⇒ the
+        # provenance is ambiguous ⇒ REJECT the ticker (never rehydrated from a guess),
+        # exactly as the exchange-reconcile path drops a position it cannot model.
+        legs_q = (
+            "SELECT market_ticker, legs_json,"
+            " MAX(collection_ticker) AS collection_ticker"
+            f" FROM rfqs WHERE market_ticker IN ({placeholders})"  # noqa: S608 - ints-only placeholders
+            " GROUP BY market_ticker, legs_json"
+        )
+        # market_ticker -> {legs_json: collection_ticker} across DISTINCT leg-sets.
+        legsets: dict[str, dict[str, Any]] = {}
+        async with self._db.execute(legs_q, tuple(tickers)) as cursor:
+            async for market_ticker, legs_json, collection in cursor:
+                if not legs_json:
                     continue
+                legsets.setdefault(market_ticker, {})[legs_json] = collection
+
+        out: list[JsonDict] = []
+        async with self._db.execute(fills_q, tuple(tickers)) as cursor:
+            async for combo_ticker, our_side, ctr, loss_num in cursor:
+                if not ctr:
+                    continue
+                distinct = legsets.get(combo_ticker)
+                if not distinct:
+                    # No leg definition on the tape ⇒ cannot model ⇒ not rehydrated.
+                    continue
+                if len(distinct) > 1:
+                    # CONFLICTING leg definitions for the same combo ticker: the
+                    # originating identity is ambiguous. Fail closed — reject rather
+                    # than guess (surfaced by the caller as an unmodeled position).
+                    log.warning(
+                        "held_positions.conflicting_leg_sets",
+                        combo_ticker=combo_ticker,
+                        distinct_leg_sets=len(distinct),
+                    )
+                    continue
+                legs_json, collection = next(iter(distinct.items()))
                 out.append(
                     {
                         "combo_ticker": combo_ticker,

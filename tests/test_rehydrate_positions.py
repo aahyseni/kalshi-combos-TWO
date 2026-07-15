@@ -116,6 +116,75 @@ async def test_held_positions_not_inflated_by_rfq_tape_fanout(tmp_path: Path) ->
         await store.close()
 
 
+def _rfq_legs(combo: str, rfq_id: str, legs: list[dict[str, str]]) -> Rfq:
+    """An RFQ on ``combo`` carrying an EXPLICIT leg-set (so two RFQs can share a
+    market_ticker while disagreeing on legs — the P1.11 conflict case)."""
+    return Rfq.from_ws({
+        "id": rfq_id, "market_ticker": combo,
+        "created_ts": "2026-07-15T10:00:00Z", "target_cost_dollars": "50.00",
+        "mve_collection_ticker": "KXMVESPORTS",
+        "mve_selected_legs": legs,
+    })
+
+
+async def test_held_positions_rejects_conflicting_leg_sets(tmp_path: Path) -> None:
+    """P1.11: the rfqs tape holds TWO distinct leg definitions for the same
+    combo_ticker (e.g. a re-used/re-issued combo ticker with different legs). The
+    old ``MAX(legs_json)`` silently rehydrated whichever legs sorted largest — a
+    provenance guess that could load the WRONG legs into clustering/mutex/marginals.
+    Exact-identity resolution must instead REJECT the ambiguous ticker (fail-closed,
+    never rehydrated from a guess), exactly like an unmodelable exchange position."""
+    store = await Store.open(tmp_path / "t.sqlite3", FakeClock())
+    try:
+        legs_a = [
+            {"market_ticker": "KXWCADVANCE-26JUL15ENGARG-ARG", "side": "yes",
+             "event_ticker": "KXWCADVANCE-26JUL15ENGARG"},
+            {"market_ticker": "KXWCGOAL-26JUL15ENGARG-ARGP-1", "side": "yes",
+             "event_ticker": "KXWCGOAL-26JUL15ENGARG-ARGP"},
+        ]
+        legs_b = [  # SAME market_ticker, DIFFERENT legs (a 2nd, incompatible def)
+            {"market_ticker": "KXWCADVANCE-26JUL15ENGARG-ENG", "side": "no",
+             "event_ticker": "KXWCADVANCE-26JUL15ENGARG"},
+            {"market_ticker": "KXWCTOTAL-26JUL15ENGARG-3", "side": "yes",
+             "event_ticker": "KXWCTOTAL-26JUL15ENGARG"},
+        ]
+        await store.record_rfq(_rfq_legs("KXMVE-DUP", "r_a", legs_a), source="ws")
+        await store.record_rfq(_rfq_legs("KXMVE-DUP", "r_b", legs_b), source="ws")
+        # a clean, single-definition combo to prove only the ambiguous one is dropped.
+        await store.record_rfq(_rfq("KXMVE-ARG", "ARG"), source="ws")
+        await store.record_fill(
+            "f1", order_id="o1", combo_ticker="KXMVE-DUP", our_side="no",
+            contracts_centi=5000, price_cc=7000, fee_cc=0, expected_edge_cc=1, raw={})
+        await store.record_fill(
+            "f2", order_id="o2", combo_ticker="KXMVE-ARG", our_side="no",
+            contracts_centi=3000, price_cc=7000, fee_cc=0, expected_edge_cc=1, raw={})
+        rows = await store.held_positions(["KXMVE-DUP", "KXMVE-ARG"])
+        # the conflicting ticker is REJECTED; the clean one survives.
+        assert {r["combo_ticker"] for r in rows} == {"KXMVE-ARG"}
+    finally:
+        await store.close()
+
+
+async def test_held_positions_exact_identity_dedups_repeated_definition(
+    tmp_path: Path,
+) -> None:
+    """P1.11 companion: many rfq rows carrying the SAME leg-set are NOT a conflict —
+    they collapse to one exact identity (the legs attach once, no fanout)."""
+    store = await Store.open(tmp_path / "t.sqlite3", FakeClock())
+    try:
+        for i in range(5):  # 5 re-quotes, identical legs each time
+            await store.record_rfq(_rfq("KXMVE-ARG", "ARG"), source="ws")
+        await store.record_fill(
+            "f1", order_id="o1", combo_ticker="KXMVE-ARG", our_side="no",
+            contracts_centi=5000, price_cc=7400, fee_cc=0, expected_edge_cc=1, raw={})
+        rows = await store.held_positions(["KXMVE-ARG"])
+        assert len(rows) == 1
+        assert rows[0]["contracts_centi"] == 5000
+        assert len(rows[0]["legs"]) == 2  # exactly one leg-set attached
+    finally:
+        await store.close()
+
+
 async def test_held_positions_ignores_unrecorded_ticker(tmp_path: Path) -> None:
     store = await _seed_store(tmp_path)
     try:
