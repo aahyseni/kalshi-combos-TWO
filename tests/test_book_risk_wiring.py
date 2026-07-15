@@ -33,7 +33,12 @@ from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.sgp import SgpParams
 from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.lifecycle import LifecycleConfig, QuoteLifecycle, _StaleBookRisk
-from combomaker.risk.exposure import ExposureBook, LegRef, OpenPosition
+from combomaker.risk.exposure import (
+    ExposureBook,
+    LegRef,
+    OpenPosition,
+    OpenQuoteRisk,
+)
 from combomaker.risk.inplay import InPlayDetector
 from combomaker.risk.lastlook import LastLookPolicy
 from combomaker.risk.limits import LimitChecker, RiskLimits
@@ -326,3 +331,195 @@ def test_book_risk_for_check_stale_sentinel_is_unusable() -> None:
         risk_bankroll_cc=20_000_000, book_risk=s,
     )
     assert ReasonCode.SKIP_PORTFOLIO_CVAR in [b.reason for b in breaches]
+
+
+# --------------------------------------------------------------------------- #
+# P0-2: book generations + immediate invalidation. A snapshot that is still
+# TIME-fresh after a fill/settlement changed the portfolio must be invalidated at
+# once (its input_generation is stale) — time age is a secondary guard.
+# --------------------------------------------------------------------------- #
+
+
+def _p0_2_position(pid: str) -> OpenPosition:
+    return OpenPosition(
+        position_id=pid,
+        combo_ticker=f"COMBO-{pid}",
+        collection=None,
+        our_side=Side.NO,
+        contracts=CentiContracts(100),
+        entry_price_cc=CentiCents(5_000),
+        legs=(LegRef("M1", "E1", "yes"), LegRef("M2", "E1", "yes")),
+    )
+
+
+def _p0_2_quote(qid: str) -> OpenQuoteRisk:
+    return OpenQuoteRisk(
+        quote_id=qid,
+        rfq_id=f"RFQ-{qid}",
+        combo_ticker=f"COMBO-{qid}",
+        collection=None,
+        yes_bid_cc=CentiCents(0),
+        no_bid_cc=CentiCents(5_000),
+        contracts=CentiContracts(100),
+        legs=(LegRef("M1", "E1", "yes"), LegRef("M2", "E1", "yes")),
+    )
+
+
+class TestExposureBookGenerations:
+    """The generation counters increment on the mutations P0-2 names."""
+
+    def test_fresh_book_generations_start_at_zero(self) -> None:
+        book = ExposureBook(TEST_CONVENTIONS)
+        assert book.generation == 0
+        assert book.position_generation == 0
+
+    def test_fill_increments_both_generations(self) -> None:
+        # A confirmed FILL, a REHYDRATION, a RECONCILIATION and a RESERVATION all
+        # enter the book through add_position — each bumps the position generation.
+        book = ExposureBook(TEST_CONVENTIONS)
+        book.add_position(_p0_2_position("fill"))
+        assert book.position_generation == 1
+        assert book.generation == 1
+
+    def test_rehydration_and_reconciliation_and_reserve_bump_position_gen(self) -> None:
+        # Rehydration ("rehydrate:*"), reconciliation ("reconcile:*") and reserve
+        # ("reserve:*") holdings all land via add_position in ops.quote_app /
+        # risk.reservation — each is a distinct position id, so each advances the
+        # position generation exactly once.
+        book = ExposureBook(TEST_CONVENTIONS)
+        book.add_position(_p0_2_position("rehydrate:T1"))
+        book.add_position(_p0_2_position("reconcile:T2"))
+        book.add_position(_p0_2_position("reserve:T3"))
+        assert book.position_generation == 3
+
+    def test_settlement_increments_position_generation(self) -> None:
+        book = ExposureBook(TEST_CONVENTIONS)
+        book.add_position(_p0_2_position("held"))
+        gen_after_fill = book.position_generation
+        book.remove_position("held")  # SettlementHandler drops a settled position
+        assert book.position_generation == gen_after_fill + 1
+
+    def test_noop_settlement_does_not_increment(self) -> None:
+        # A missing-id remove is a no-op (idempotent) and must NOT advance the
+        # generation — an in-flight snapshot stays valid across a spurious remove.
+        book = ExposureBook(TEST_CONVENTIONS)
+        book.add_position(_p0_2_position("held"))
+        gen = book.position_generation
+        book.remove_position("nonexistent")
+        assert book.position_generation == gen
+
+    def test_quote_mutation_bumps_full_gen_not_position_gen(self) -> None:
+        # A bare quote upsert/remove is a book mutation (full generation advances)
+        # but NOT a position mutation — the positions-only book-risk MC must not be
+        # invalidated by quote churn. This is the guard against the CVaR cap flapping
+        # closed after every quote goes out.
+        book = ExposureBook(TEST_CONVENTIONS)
+        book.add_position(_p0_2_position("held"))
+        pos_gen = book.position_generation
+        full_gen = book.generation
+        book.upsert_quote(_p0_2_quote("q1"))
+        assert book.position_generation == pos_gen           # unchanged
+        assert book.generation == full_gen + 1               # advanced
+        book.remove_quote("q1")
+        assert book.position_generation == pos_gen           # still unchanged
+        assert book.generation == full_gen + 2
+
+    def test_noop_quote_remove_does_not_increment(self) -> None:
+        book = ExposureBook(TEST_CONVENTIONS)
+        full_gen = book.generation
+        book.remove_quote("nonexistent")
+        assert book.generation == full_gen
+
+
+class TestSnapshotGenerationStamp:
+    """compute_book_risk stamps the position generation it read into the snapshot."""
+
+    def test_snapshot_stamps_supplied_generation(self) -> None:
+        book = ExposureBook(TEST_CONVENTIONS)
+        book.add_position(_p0_2_position("held"))
+        model = build_book_model(
+            list(book.positions.values()), marginals=lambda t: 0.5
+        )
+        snap = compute_book_risk(
+            model, n_samples=2_000, seed=1, bankroll_cc=1_000_000,
+            input_generation=book.position_generation,
+        )
+        assert snap.input_generation == book.position_generation == 1
+
+    def test_unstamped_snapshot_defaults_to_minus_one(self) -> None:
+        # A direct caller that omits input_generation gets -1, which never matches a
+        # real (>= 0) book generation ⇒ the freshness guard fails it closed.
+        book = ExposureBook(TEST_CONVENTIONS)
+        book.add_position(_p0_2_position("held"))
+        model = build_book_model(
+            list(book.positions.values()), marginals=lambda t: 0.5
+        )
+        snap = compute_book_risk(model, n_samples=2_000, seed=1, bankroll_cc=1_000_000)
+        assert snap.input_generation == -1
+
+
+async def test_old_generation_snapshot_is_discarded(
+    harness: tuple[Harness, Store],
+) -> None:
+    # A recomputed snapshot is USABLE until the portfolio mutates; once a NEW fill
+    # bumps the position generation the stale snapshot is discarded IMMEDIATELY
+    # (fail-closed _StaleBookRisk), even though it is still time-fresh (a wide
+    # freshness window). This is the core P0-2 defect: no ~15s time window can hide
+    # a portfolio change from the consistency check.
+    h, store = harness
+    prov = sgp_within_game_rho_provider(_sgp_params())
+    lifecycle, _sender, exposure = _build(
+        h, store, bankroll_cc=100_000_000_000, cvar_frac="0.15",
+        within_game_rho=prov, book_risk_stale_after_s=1_000_000.0,  # never time-stale
+    )
+    _no_position(exposure, contracts=100, price_cc=5_000)
+    lifecycle.recompute_book_risk()
+    # Fresh + generation-matched ⇒ the real snapshot is returned (usable).
+    fresh = lifecycle._book_risk_for_check()
+    assert fresh is lifecycle._book_risk
+    assert fresh is not None and not isinstance(fresh, _StaleBookRisk)
+    assert fresh.usable
+
+    # A NEW fill enters the book (position generation advances) WITHOUT a recompute.
+    exposure.add_position(_p0_2_position("second-fill"))
+    stale = lifecycle._book_risk_for_check()
+    # Still time-fresh, but generation-superseded ⇒ fail-closed sentinel.
+    assert isinstance(stale, _StaleBookRisk)
+    assert stale.usable is False
+
+
+async def test_multiple_fills_cannot_reuse_pre_fill_risk(
+    harness: tuple[Harness, Store],
+) -> None:
+    # Two fills land back-to-back with a recompute BEFORE the second. The snapshot
+    # armed after fill #1 must NOT be reused to clear fill #2's risk: fill #2 bumps
+    # the position generation past the snapshot's input_generation, so the cap
+    # fails closed until a fresh MC prices the post-fill-#2 book.
+    h, store = harness
+    prov = sgp_within_game_rho_provider(_sgp_params())
+    lifecycle, _sender, exposure = _build(
+        h, store, bankroll_cc=100_000_000_000, cvar_frac="0.15",
+        within_game_rho=prov, book_risk_stale_after_s=1_000_000.0,
+    )
+    # Fill #1, then arm the snapshot against the one-position book.
+    _no_position(exposure, contracts=100, price_cc=5_000)
+    lifecycle.recompute_book_risk()
+    snap1 = lifecycle._book_risk
+    assert snap1 is not None
+    assert snap1.input_generation == exposure.position_generation
+    assert lifecycle._book_risk_for_check() is snap1  # consistent, reused
+
+    # Fill #2 arrives. The pre-fill-#2 snapshot is now inconsistent and is refused.
+    exposure.add_position(_p0_2_position("fill-2"))
+    assert snap1.input_generation != exposure.position_generation
+    refused = lifecycle._book_risk_for_check()
+    assert isinstance(refused, _StaleBookRisk)
+    assert refused.usable is False
+
+    # Only a fresh recompute over the TWO-position book restores a usable snapshot,
+    # and it is stamped with the NEW (post-fill-#2) generation.
+    lifecycle.recompute_book_risk()
+    snap2 = lifecycle._book_risk
+    assert snap2 is not None
+    assert snap2.input_generation == exposure.position_generation
+    assert lifecycle._book_risk_for_check() is snap2

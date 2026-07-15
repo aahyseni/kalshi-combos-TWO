@@ -327,11 +327,64 @@ class ExposureBook:
         self._is_me_event = is_me_event
         self.positions: dict[str, OpenPosition] = {}
         self.open_quotes: dict[str, OpenQuoteRisk] = {}
+        # P0-2 book generations: monotonically-increasing counters bumped on EVERY
+        # mutation that can change the portfolio.
+        #
+        # ``_generation`` (the full book generation) increments on ALL mutations —
+        # position add (a confirmed fill / rehydration / reconciliation / reserve),
+        # settlement (remove_position), AND quote mutations (an open quote is a
+        # mass-acceptance input to the live ``check()`` even though it is not priced
+        # by the async MC). This is the plan's "increment on ... and relevant quote
+        # mutations" — a general staleness signal for any consumer that reads the
+        # whole book.
+        #
+        # ``_position_generation`` increments ONLY when the POSITION set changes
+        # (fills/settlements/rehydration/reconciliation/reservation — never a bare
+        # quote upsert/remove). The async book-risk MC prices POSITIONS ONLY (it
+        # reads ``self.positions``, never the open quotes), so this is the exact
+        # consistency proof the plan's "invalidate on fills and settlements" needs:
+        # the snapshot stamps ``input_generation`` from this counter, and the
+        # freshness guard discards any async result whose stamped position-generation
+        # is no longer current. A fill/settlement invalidates the MC IMMEDIATELY;
+        # unrelated quote churn does NOT spuriously invalidate a still-consistent
+        # positions-only snapshot. Time age is thereby a SECONDARY guard: a snapshot
+        # still time-fresh (~15s) after a fill mutated the portfolio is invalidated
+        # at once because its input_generation is stale. Both start at 0 (a fresh
+        # book that never mutated); a never-mutated empty book is self-consistent.
+        self._generation: int = 0
+        self._position_generation: int = 0
+
+    # --- book generations (P0-2) ---
+
+    @property
+    def generation(self) -> int:
+        """Full book generation: increments on EVERY mutation (position add,
+        settlement, rehydration, reconciliation, reservation, and quote upsert/
+        remove). A general staleness signal for any whole-book consumer."""
+        return self._generation
+
+    @property
+    def position_generation(self) -> int:
+        """Position-set generation: increments ONLY on a real position mutation
+        (fill/settlement/rehydration/reconciliation/reservation), never on a bare
+        quote mutation. This is the consistency proof for the async book-risk MC,
+        which prices POSITIONS ONLY: a ``BookRiskSnapshot`` is consistent with the
+        current portfolio iff its ``input_generation`` equals this value."""
+        return self._position_generation
+
+    def _bump_generation(self) -> None:
+        self._generation += 1
+
+    def _bump_position_generation(self) -> None:
+        # A position mutation is also a book mutation, so both counters advance.
+        self._generation += 1
+        self._position_generation += 1
 
     # --- mutation ---
 
     def add_position(self, position: OpenPosition) -> None:
         self.positions[position.position_id] = position
+        self._bump_position_generation()
 
     def remove_position(self, position_id: str) -> None:
         """Drop a position from the live book. Called once a position SETTLES
@@ -341,14 +394,26 @@ class ExposureBook:
         (a) inflate the risk view forever as settlements pile up over a long run,
         and (b) make the settlement reconcile re-sum an already-settled position
         against a re-quote's revenue on the same ticker → a false
-        HALT_RECONCILIATION_MISMATCH. Idempotent: a missing id is a no-op."""
-        self.positions.pop(position_id, None)
+        HALT_RECONCILIATION_MISMATCH. Idempotent: a missing id is a no-op.
+
+        Bumps the position generation only when a position was actually removed (a
+        real settlement mutates the priced book; a no-op removal does not), so an
+        in-flight book-risk snapshot is invalidated by every settlement (P0-2)."""
+        removed = self.positions.pop(position_id, None)
+        if removed is not None:
+            self._bump_position_generation()
 
     def upsert_quote(self, quote: OpenQuoteRisk) -> None:
         self.open_quotes[quote.quote_id] = quote
+        # Quote mutation ⇒ full book generation advances, but NOT the position
+        # generation (the async book-risk MC prices positions only, so quote churn
+        # must not invalidate a still-consistent positions snapshot).
+        self._bump_generation()
 
     def remove_quote(self, quote_id: str) -> None:
-        self.open_quotes.pop(quote_id, None)
+        removed = self.open_quotes.pop(quote_id, None)
+        if removed is not None:
+            self._bump_generation()
 
     # --- snapshots ---
 

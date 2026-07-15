@@ -345,6 +345,16 @@ class QuoteLifecycle:
         (the freshness guard in ``_book_risk_for_check`` then fails the cap closed
         for a non-empty book) rather than crashing the maintenance tick."""
         try:
+            # P0-2: capture the POSITION generation BEFORE reading the positions, so
+            # the snapshot is stamped with the generation of the exact portfolio it
+            # prices. If a fill/settlement/rehydration/reconciliation/reservation
+            # bumps the position generation while this (async, off-loop) MC runs,
+            # ``_book_risk_for_check`` discards the result immediately (its
+            # input_generation is stale), rather than trusting a still-time-fresh
+            # snapshot of a superseded portfolio. (Bare quote mutations do NOT bump
+            # the position generation — the MC prices positions only — so quote churn
+            # never spuriously invalidates a still-consistent snapshot.)
+            gen = self._exposure.position_generation
             positions = list(self._exposure.positions.values())
             model = build_book_model(
                 positions,
@@ -362,6 +372,7 @@ class QuoteLifecycle:
                 if self._balance is not None
                 else None,
                 ruin_floor_frac=self._config.ruin_floor_frac,
+                input_generation=gen,
             )
             self._book_risk = snap
             self._book_risk_mono_ns = self._clock.monotonic_ns()
@@ -385,12 +396,21 @@ class QuoteLifecycle:
         Rules (fail-closed; UNKNOWN joint tail is never safe):
           - EMPTY book (no committed positions) ⇒ None: the CVaR cap is simply not
             evaluated (nothing to cap; an empty book must still quote).
-          - NON-EMPTY book with NO snapshot yet, or a snapshot older than
+          - NON-EMPTY book with NO snapshot yet, or a snapshot whose
+            ``input_generation`` no longer matches the live POSITION generation (a
+            fill/settlement/rehydration/reconciliation/reservation mutated the
+            portfolio since the MC read it — P0-2), or a snapshot older than
             ``book_risk_stale_after_s`` ⇒ a ``_StaleBookRisk`` sentinel
             (``usable=False``) so the cap FAILS CLOSED — the book carries a joint
-            tail we have not measured recently.
+            tail we have not measured against the CURRENT portfolio.
           - Otherwise ⇒ the latest snapshot (which itself fails closed when its
             ``usable`` is False, e.g. an UNKNOWN marginal made the model no-go).
+
+        P0-2: the GENERATION match is the primary consistency proof; TIME AGE is a
+        secondary guard (it still catches a book that mutated in a way the counter
+        somehow missed, and a wall-clock-stale snapshot on a quiet book). A snapshot
+        can be time-fresh yet generation-stale (fills changed the portfolio within
+        the freshness window) — the generation check invalidates it immediately.
         Cheap: reads stored state + one clock read; never runs MC."""
         if not self._exposure.positions:
             return None
@@ -398,9 +418,15 @@ class QuoteLifecycle:
         stamp = self._book_risk_mono_ns
         if snap is None or stamp is None:
             return _StaleBookRisk()  # non-empty book, never measured ⇒ fail closed
+        if snap.input_generation != self._exposure.position_generation:
+            # The PORTFOLIO was mutated (fill / settlement / rehydration /
+            # reconciliation / reservation) since this snapshot's MC read the
+            # positions. Even if it is still time-fresh, it no longer describes the
+            # current portfolio, so the positions-only book-risk MC is inconsistent.
+            return _StaleBookRisk()  # position generation superseded ⇒ fail closed
         age_s = (self._clock.monotonic_ns() - stamp) / 1e9
         if age_s > self._config.book_risk_stale_after_s:
-            return _StaleBookRisk()  # snapshot too old ⇒ fail closed
+            return _StaleBookRisk()  # snapshot too old ⇒ fail closed (secondary)
         return snap
 
     # --------------------------------------------------------- fill velocity

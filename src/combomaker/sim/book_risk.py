@@ -102,6 +102,19 @@ class BookRiskSnapshot:
     seed: int
     n_positions: int
 
+    # P0-2 position generation this snapshot was computed against. The caller
+    # records ``ExposureBook.position_generation`` at the instant it reads the
+    # positions, threads it in here, and — because the MC runs ASYNC off the hot
+    # path — publishes the result only while the book's live position generation
+    # still equals this value. A fill or settlement bumps the position generation
+    # immediately, so a snapshot that is still time-fresh but computed against a
+    # superseded portfolio is discarded (time age becomes a secondary guard, not the
+    # consistency proof). Defaults to -1 for snapshots built without a
+    # generation stamp (unit tests, direct callers): -1 never equals a real
+    # generation (>= 0), so an un-stamped snapshot fails the generation-match guard
+    # closed — the safe direction.
+    input_generation: int = -1
+
     ev_cc: float = 0.0
     ev_stderr_cc: float = 0.0
     std_cc: float = 0.0
@@ -259,6 +272,7 @@ def compute_book_risk(
     structural_cfg: StructuralConfigView | None = None,
     current_equity_cc: int | None = None,
     ruin_floor_frac: float = 0.70,
+    input_generation: int = -1,
 ) -> BookRiskSnapshot:
     """Run the full book-risk MC and build the halt-feeding snapshot.
 
@@ -278,7 +292,14 @@ def compute_book_risk(
     holding's whole-account risk is always represented in the gating tail number,
     even when the sampled sub-book is empty. A book that is ALL reserved (no
     risk-modeled position) is therefore still USABLE: it has a real deterministic
-    reserve to gate on, not a no-go."""
+    reserve to gate on, not a no-go.
+
+    P0-2: ``input_generation`` is the ``ExposureBook.generation`` the caller read
+    the positions at; it is stamped verbatim into every returned snapshot so the
+    async publisher can discard a result computed against a book that has since been
+    mutated by a fill or settlement. Defaults to -1 (un-stamped) for direct/test
+    callers; -1 never equals a live book generation, so an un-stamped snapshot fails
+    a generation-match check closed."""
     n_positions = len(model.positions)
     reserve = max(0.0, float(model.reserved_loss_cc))
     if model.unknown or (n_positions == 0 and reserve <= 0.0):
@@ -288,6 +309,7 @@ def compute_book_risk(
             n_samples=n_samples,
             seed=seed,
             n_positions=n_positions,
+            input_generation=input_generation,
         )
     if n_positions == 0:
         # ALL-RESERVED book: no sampled positions, but a real deterministic reserve
@@ -300,6 +322,7 @@ def compute_book_risk(
             n_samples=n_samples,
             seed=seed,
             n_positions=0,
+            input_generation=input_generation,
             deterministic_max_loss_cc=reserve,
         )
 
@@ -398,6 +421,7 @@ def compute_book_risk(
         n_samples=n_samples,
         seed=seed,
         n_positions=n_positions,
+        input_generation=input_generation,
         ev_cc=ev,
         ev_stderr_cc=ev_stderr,
         std_cc=std,
