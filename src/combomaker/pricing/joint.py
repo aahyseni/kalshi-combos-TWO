@@ -48,6 +48,13 @@ class JointEstimate:
     frechet_lo: float
     frechet_hi: float
     notes: tuple[str, ...]
+    # Max |model − market| over the identifying leg constraints of a structural
+    # inversion (0.0 for copula / containment / exact-identified paths, which
+    # carry no over-identification misfit). Surfaced so the fit can be persisted
+    # and challenged (P1-4): a residual below the hard REJECT bar but elevated is
+    # an *inconsistent-but-priceable* fit — recorded, and widen-flagged, never a
+    # silent accept.
+    residual: float = 0.0
 
 
 def _signed_corr(

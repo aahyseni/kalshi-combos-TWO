@@ -474,6 +474,7 @@ class StructuralPricer:
             uncertainty=uncertainty,
             frechet_lo=lo,
             frechet_hi=hi,
+            residual=base_model.residual,
             notes=(
                 *base_model.notes,
                 f"structural: format={fmt} legs={len(legs)}"
@@ -626,6 +627,7 @@ class StructuralPricer:
             uncertainty=uncertainty,
             frechet_lo=lo,
             frechet_hi=hi,
+            residual=base_inv.residual,
             notes=(
                 *base_inv.notes,
                 f"structural-mt: sport={sport} legs={len(legs)} "
@@ -715,6 +717,7 @@ class StructuralPricer:
             uncertainty=uncertainty,
             frechet_lo=lo,
             frechet_hi=hi,
+            residual=base.residual,
             notes=(
                 *base.notes,
                 f"structural-mlb: legs={len(legs)} "

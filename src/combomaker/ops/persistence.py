@@ -15,13 +15,16 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
 
 import aiosqlite
 
 from combomaker.core.clock import Clock
 from combomaker.ops.logging import get_logger
 from combomaker.rfq.models import Rfq
+
+if TYPE_CHECKING:
+    from combomaker.pricing.fit_challenge import FitChallenge
 
 log = get_logger(__name__)
 
@@ -122,6 +125,22 @@ CREATE TABLE IF NOT EXISTS ev_ledger (
     realized_pnl_cc INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_ev_ref ON ev_ledger (fill_ref);
+
+CREATE TABLE IF NOT EXISTS structural_fits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    rfq_id TEXT,
+    model TEXT NOT NULL,
+    n_legs INTEGER NOT NULL,
+    exactly_identified INTEGER NOT NULL,
+    residual REAL NOT NULL,
+    verdict TEXT NOT NULL,
+    reject_bar REAL NOT NULL,
+    challenge_bar REAL NOT NULL,
+    tickers_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_structural_fits_verdict ON structural_fits (verdict);
+CREATE INDEX IF NOT EXISTS idx_structural_fits_rfq ON structural_fits (rfq_id);
 """
 
 
@@ -310,6 +329,38 @@ class Store:
         )
         await self._db.commit()
 
+    async def record_structural_fit(
+        self,
+        *,
+        rfq_id: str | None,
+        model: str,
+        n_legs: int,
+        tickers: tuple[str, ...],
+        challenge: "FitChallenge",
+    ) -> None:
+        """Durably record a structural inversion's misfit + its challenge verdict
+        (P1-4). Synchronous & committed like other risk-relevant records — this
+        is the audit trail for systematic structural misfit against the live
+        market, so it must not be droppable tape."""
+        await self._db.execute(
+            "INSERT INTO structural_fits (at, rfq_id, model, n_legs,"
+            " exactly_identified, residual, verdict, reject_bar, challenge_bar,"
+            " tickers_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                self._now(),
+                rfq_id,
+                model,
+                n_legs,
+                1 if challenge.exactly_identified else 0,
+                float(challenge.residual),
+                challenge.verdict.value,
+                float(challenge.reject_bar),
+                float(challenge.challenge_bar),
+                json.dumps(list(tickers)),
+            ),
+        )
+        await self._db.commit()
+
     async def record_fill(
         self,
         fill_ref: str,
@@ -429,6 +480,7 @@ class Store:
             "fills",
             "markouts",
             "ev_ledger",
+            "structural_fits",
         }:
             raise ValueError(f"unknown table {table!r}")
         async with self._db.execute(f"SELECT COUNT(*) FROM {table}") as cursor:  # noqa: S608
