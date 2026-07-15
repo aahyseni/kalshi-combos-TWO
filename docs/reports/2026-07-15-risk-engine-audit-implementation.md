@@ -308,3 +308,192 @@ run-to-run — 26–27 — because they arise from `ProcessPoolExecutor` teardow
   mask a real off-loop teardown fault.
 - **Never** refit any cap or markup on a P&L window; changes come from measurement or
   structural evidence only.
+
+---
+
+## Live-ready follow-up (P0-7 conditioning, teardown, P0-1 wiring, kill-switch answer)
+
+*Appended 2026-07-15 after three additional tasks landed on `risk-audit-overnight`.
+No functional code changes were made in **this** append commit; the three tasks below
+were each committed separately (hashes given) with their own tests, and the full suite
+was re-run green afterward (§ "Final suite re-stamp" below).*
+
+### Per-task status
+
+| Task | Commit | State |
+|------|--------|-------|
+| **P0-7-preferred** — preferred structural conditioning (condition fallback legs on the game state) | `1552fb0` | **GREEN + committed** |
+| **teardown-warnings** — remove `ProcessPoolExecutor` teardown `ResourceWarning`s | `09d24ef` | **GREEN + committed** |
+| **P0-1-wiring** — wire candidate-aware gate into last-look/confirm (additive, off-loop) | `36a5a47` | **GREEN + committed** |
+
+All three are on `risk-audit-overnight`, ahead of the `HEAD at this report` (`8f19cf3`)
+stamped at the top; the report header is left as-written for provenance, and the true
+branch tip after this append is the report-commit hash reported in the reply.
+
+### Landed-item detail (change site + tests)
+
+#### P0-7-preferred — condition fallback legs on the sampled game state  (`1552fb0`)
+Upgrades P0-7 from the **interim** worse-tail full-copula *challenger* (§4) to the
+spec's **preferred** approach: where a **defensible, measured** scoreline-state link
+exists, the straddling copula leg's Gaussian latent is **conditioned on the game's
+sampled scoreline intensity** so the covariance enters the **production** tail, not
+just a challenger.
+- **Change sites:**
+  - `src/combomaker/sim/structural_book.py::_shared_structural_factor` — per-sample
+    standardized total sampled goals (incl. ET) → standard-normal latent via
+    empirical-rank PIT.
+  - `src/combomaker/sim/structural_book.py::_sample_copula_conditioned` +
+    `CopulaConditioning` — blend `z' = sqrt(1−β²)·z_copula + β·f_game`; preserves each
+    marginal and the copula-block correlation exactly, adds only the structural-state
+    loading.
+  - `src/combomaker/sim/book_risk.py::_copula_leg_loading` + `_build_conditioning` —
+    map each straddling copula leg → (plan, β); ungamed / cross-game / group-format /
+    no-defensible-link → **β=0** (not conditioned). Governing max folds an
+    **independent-split guard** so the conditioned tail may only fatten, never thin,
+    below the independent split (SAFETY DEFAULT — only adds tail, never removes a
+    decline). The full-copula `bridge_es_99_cc` challenger is **retained** as the
+    backstop for the unconditioned (no-link) part.
+  - `src/combomaker/ops/config.py::StructuralConfig.corners_et_loading` (default
+    **0.10**) + `ops/quote_app.py` wire — the single conservative, width-bearing
+    loading, applied **ONLY** to a knockout total-corners leg (the measured ET-window
+    channel `advance|corners`, dog +0.23 ↔ fav −0.23, pooled ~0). Total corners are
+    measured ⊥ goals (`corners|total = 0.00`); group corners, team corners, and cards
+    get 0 → independence + the challenger. `0.0` ⇒ conditioning off (production sample
+    reverts to the independent split).
+- **Prototype (hard rule 8):** `tools/proto_structural_copula_conditioning.py` — the
+  conditioning blend was prototyped and parity-checked in the test harness before the
+  port; the parity test pins `_sample_copula_conditioned == engine.sample_leg_values`
+  byte-for-byte at β=0.
+- **Tests:** `tests/test_structural_conditioning_p0_7.py` (7 new) — covariance appears
+  in the production sample + marginal preserved; all-loadings-zero copula parity vs the
+  engine sampler; conditioning-off byte-identical to the independent split; governing
+  tail ≥ independent split (never thinner); no-defensible-link leg → not conditioned but
+  challenger still active; per-leg loading nonzero only for knockout total corners;
+  ungamed copula leg unchanged. Full detail:
+  `docs/reports/2026-07-15-p0-7-preferred-conditioned-fallback.md`.
+
+#### teardown-warnings — remove `ProcessPoolExecutor` teardown `ResourceWarning`s  (`09d24ef`)
+Cleans up the benign-but-noisy teardown warnings flagged in §6 (item "P2-2 leaves benign
+teardown warnings") so they cannot mask a real teardown fault.
+- **Change site:** `tests/conftest.py` — **TEST-ONLY.** Adds an autouse async fixture
+  `_close_leaked_aiosqlite_connections` and a `_hard_stop_connection` helper that
+  hard-stops each leaked `aiosqlite` connection's worker thread at test teardown, on the
+  correct side of the event-loop-close ordering (fixture finalizers run LIFO; the fixture
+  is deliberately async so its teardown body runs while the loop is still open, and it
+  never re-enters the async sqlite path so it cannot deadlock the ProcessPool-spawning
+  tests — `test_intake` / lifecycle / book-risk). **No live/runtime module was touched**
+  — the warnings originated from test-process teardown timing, not production teardown.
+- **Tests:** no new test file; the change is validated by the full suite running with the
+  teardown `ResourceWarning`s / `PytestUnhandledThreadExceptionWarning`s removed. Residual
+  warning count is now materially lower (see the re-stamp).
+
+#### P0-1-wiring — candidate-aware gate wired into confirm (additive, off-loop, fail-closed)  (`36a5a47`)
+Closes the §6 "**Per-candidate ΔES last-look gate — machinery built but NOT WIRED**"
+gap. `evaluate_candidate_book_risk` / `CandidateBookRisk` (built in P0-1 `bcb89cf`) now
+**governs live confirms**.
+- **Change sites:**
+  - `src/combomaker/rfq/lifecycle.py::_candidate_gate_verdict` (+ `_build_candidate_gate_inputs`)
+    — for one contemplated fill, builds the **immutable, picklable** candidate inputs
+    (candidate leg-set + resolved marginals + within-game pair-ρ, resolved **on-loop**),
+    ships them off-loop, and returns admit/decline. Called from the confirm path at
+    `rfq/lifecycle.py` **~line 1320**, **only inside `if decision.confirm:`** — i.e. the
+    existing analytic / gross / burst gates have already **ADMITTED** the fill, so this
+    gate can only flip an **admit → decline**, never a decline → admit. **Strictly
+    additive + decline-only-plus-EV:** it confirms only when the candidate's marginal EV
+    is **positive** AND the merged **POST** book's joint-tail / ruin / deterministic /
+    gross budgets pass; otherwise it declines with the new reason code.
+  - `src/combomaker/core/reasons.py::ReasonCode.DECLINE_CANDIDATE_RISK`
+    (`"decline_candidate_risk"`) — the decline reason for this gate.
+  - `src/combomaker/ops/pricing_pool.py::CandidateBookRiskInputs` + `_worker_candidate_book_risk`
+    + `BookRiskPool.run_candidate` — the **off-loop** CPU-bound MC (~20k samples) so the
+    candidate MC never blocks the maintenance-loop heartbeat; falls back to an inline
+    eval for paper/backtest/tests. A seeded off-loop run is byte-identical to inline.
+  - `src/combomaker/ops/config.py::RiskConfig.candidate_gate_enabled` (default **True**,
+    ENFORCED) + `candidate_gate_mc_samples` (default 20_000), wired through
+    `ops/quote_app.py`. `candidate_gate_enabled: false` in YAML is the **kill switch** for
+    this gate (reverts to prior behaviour); it never loosens any other cap.
+  - **Fail-closed:** an UNKNOWN merged marginal (a missing marginal is **omitted**, never
+    fabricated as p=0.5), an over-budget POST book, OR **any** exception in the off-loop
+    eval ⇒ `DECLINE_CANDIDATE_RISK`. An unmeasured/errored joint tail is never confirmed.
+- **Tests:** `tests/test_candidate_gate_wiring.py` (363 lines) — the gate declines a
+  concentrating candidate the other gates admit, admits a balancing/positive-EV candidate,
+  fail-closes on UNKNOWN marginal / over-budget POST / off-loop error, is skipped when
+  `candidate_gate_enabled=False`, and the seeded off-loop verdict matches inline.
+  `tests/test_reservation_lifecycle.py` updated (+10 lines) for the new confirm-path step.
+
+### KILL-SWITCH ANSWER (task #44 — "does P2-2 need a kill switch?")
+
+**No new kill switch is required for P2-2.** The genuine-wedge backstop **already exists**
+and is retained:
+
+- **The supervisor heartbeat kill already exists** — `src/combomaker/ops/supervisor.py`:
+  `heartbeat_wedged()` (fail-closed: a missing/unreadable/stale heartbeat reads as wedged)
+  → `supervisor_emergency_kill` / `KillSwitch` writes the KILL file + cancel-all, with
+  `heartbeat_timeout_s = 15.0`. This stays as the **BACKSTOP** for a genuine wedge and is
+  **not removed**.
+- **P2-2 removed the FALSE TRIGGER, not the backstop.** Before P2-2, the full-book MC ran
+  **on the event loop**; a long MC under an RFQ firehose could age `data/heartbeat.txt`
+  past 15s and trip the supervisor even though the bot was healthy — a false wedge. P2-2
+  moved the full-book MC **off the loop** (`BookRiskPool`, generation-stamped inputs), so
+  the **maintenance loop** (`ops/quote_app.py::_maintenance_loop`, ~line 1413) beats
+  `data/heartbeat.txt` **every 0.5s independent of the MC**. The heartbeat now stays fresh
+  regardless of MC duration → the false trigger is gone at the source.
+- **If a live firehose still wedges the heartbeat**, it would be from some **other**
+  synchronous block (not the MC). The correct fix then is a **modest `heartbeat_timeout_s`
+  bump or a thread-based beat** — **NOT** a new switch. The 15s supervisor kill remains the
+  genuine-wedge safety net either way.
+
+This resolves task #44's "does it need a kill switch" question: **the existing supervisor
+heartbeat kill is the switch; P2-2 eliminated its false trigger and added nothing that
+needs a new one.**
+
+### Correction to the earlier "UNWIRED" caveat
+
+The §6 item **"Per-candidate ΔES last-look gate — machinery built + unit-tested, but NOT
+WIRED into the decision path"** and the §7 item 0 / §4 P0-1 "⚠️ CRITICAL WIRING GAP" are
+now **superseded**: P0-1's candidate-aware gate is **WIRED as of `36a5a47`**. It governs
+live confirms as a **decline-only + positive-EV additive gate** — reachable only after the
+existing analytic/gross/burst gates admit, off-loop (never blocks the heartbeat), and
+fail-closed (UNKNOWN marginal / over-budget POST / any off-loop error ⇒
+`DECLINE_CANDIDATE_RISK`). The gate can only make the bot **more** conservative; it never
+turns a decline into an admit and never loosens any cap. `candidate_gate_enabled: false`
+is its kill switch.
+
+### STILL BEFORE LIVE
+
+1. **Operator diff review + relaunch decision.** This run did NOT relaunch the bot, touch
+   the prod DB / prod YAML / `.env`, or loosen any cap. Restore point on doubt:
+   `git checkout 45164f1`. Confirm `caps_shadow_mode == False` (enforcing) before relaunch.
+2. **Live-tape re-measurement still owed.** Every P0-7-preferred / P0-1-wiring / P2-2 claim
+   is **test-asserted**, not tape-confirmed. On the operator's go, relaunch to a fresh
+   recording and re-measure: contract counts, ARG-advance delta, quote count, per-cap live
+   headroom, and — new here — the **live decline rate of `DECLINE_CANDIDATE_RISK`** (verify
+   the candidate gate declines only concentrating fills and does not choke balancing flow).
+3. **Verify the candidate gate on the live ENGARG book before trusting hedge credit.** It
+   is wired decline-only-plus-EV; watch that the balancing/hedge-credit path admits sane
+   ENG-side fills rather than declining everything (its fail-closed default declines).
+4. **`max_open_quotes` — do NOT raise** until reservation/mass-acceptance headroom is
+   measured on sane post-fanout exposure (not taken this run).
+5. **Heartbeat under live firehose.** The false trigger is fixed (above); if a *genuine*
+   wedge from another synchronous block appears live, apply a modest `heartbeat_timeout_s`
+   bump or a thread-based beat — not a new switch.
+6. **Preserved-fix invariants to re-verify post-relaunch:** no `fills JOIN rfqs` aggregate
+   in `held_positions`; mutex-aware directional cap (P0-9); ES-vs-deterministic split
+   (P0-3); fail-closed on UNKNOWN/missing/stale marginals; `caps_shadow_mode == False`.
+
+### Final suite re-stamp
+
+```
+.venv/Scripts/python.exe -m pytest -q
+2026 passed, 3 deselected in 107.11s (0:01:47)
+```
+
+**Exact counts: 2026 passed, 0 failed, 3 deselected.** Tree green at the branch tip
+after this append. Note the `-q` summary line no longer reports a warnings count — the
+`teardown-warnings` task (`09d24ef`) removed the `ProcessPoolExecutor` /
+`aiosqlite`-teardown `ResourceWarning`s that the earlier §8 stamp reported as
+"27 warnings". Count rose 2010 → **2026** (+16) over the earlier §8 stamp:
++7 from P0-7-preferred (`test_structural_conditioning_p0_7.py`) and +9 net from the
+P0-1-wiring suite (`test_candidate_gate_wiring.py` + the `test_reservation_lifecycle.py`
+update); the teardown task is test-harness-only and adds no test count.
+
