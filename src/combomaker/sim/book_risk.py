@@ -73,6 +73,7 @@ HEADLINE_LEVEL = 0.99
 DEFAULT_CHALLENGER_INFLATION = 0.5
 
 
+
 @dataclass(frozen=True, slots=True)
 class TailContribution:
     """One game's or leg's contribution to the tail (CVaR) loss, float cc.
@@ -550,6 +551,212 @@ def _select_sampler(
     )
 
 
+# ---------------------------------------------------------------------------
+# P1.9: independent STRUCTURAL-PARAMETER challenger.
+#
+# The correlation-inflation challenger (P0-8) stresses the JOINT dependence but
+# takes every structural INPUT — the inverted per-game goal rates, the DC low-score
+# rho, the extra-time / shootout / half-share settlement constants, the knockout
+# (mutex-metadata) classification, the feed marginals — as GROUND TRUTH. That is a
+# monoculture on the structural axis: if a goal rate is mis-inverted, the DC rho is
+# off, a game is mis-classified as knockout (turning on the advance/ET/shootout
+# settlement geometry), or a marginal arrives shocked, the production tail and its
+# correlation challenger are BOTH wrong the same way and neither catches it.
+#
+# This challenger re-inverts and re-samples the structural games under a
+# conservatively-perturbed ``StructuralConfigView`` — each named input shifted to a
+# plausible-but-adverse corner of the model-form band the pricer already publishes —
+# and its ES / P(ruin) fold into the governing model max exactly as the correlation
+# and bridge challengers do (gate on the WORSE tail). It is NOT a second point
+# estimate and NEVER lowers a number: it can only WIDEN the governing tail, so it is
+# purely a fail-closed anti-monoculture check on the structural inputs. Named
+# dimensions it stresses, tied to the plan's item-9 list:
+#   * goal rates      — re-inversion under the shifted rho/ET/half re-fits each
+#                        game's Poisson means, so the challenger goal rates differ
+#                        from production (the goal-rate perturbation IS the re-fit).
+#   * DC rho          — dc_rho shifted by ``rho_band`` toward more low-score mass.
+#   * marginals       — each target marginal shocked toward its combo-adverse edge
+#                        by ``marginal_shock`` before inversion (a feed-error proxy:
+#                        what if the leg books we inverted from were mis-marked?).
+#   * settlement rules— et_factor / pens_win_a / half_share shifted by their bands
+#                        (the extra-time, shootout, and half-split geometry that the
+#                        settlement windows turn on).
+#   * mutex metadata  — the knockout classification decides whether advance/ET/
+#                        shootout settlement (a mutex family: advance(A) ⊥ advance(B))
+#                        is active at all; ``force_knockout`` challenges a GROUP
+#                        classification by ALSO pricing the book as knockout, so a
+#                        mis-tagged group game that is really a knockout is stressed.
+#   * feed errors     — subsumed by ``marginal_shock`` (a shocked marginal is exactly
+#                        a stale/erroneous feed) and the fail-closed skip below (any
+#                        game the challenger cannot re-invert is left to the copula,
+#                        never silently dropped from the tail).
+#   * cross-game regime— unchanged here: cross-game dependence is a SEPARATE named
+#                        regime (P0-8) and is stressed by the correlation challenger,
+#                        never smuggled into the structural re-inversion.
+
+
+@dataclass(frozen=True, slots=True)
+class StructuralChallengerBands:
+    """Half-band shifts for the P1.9 structural-parameter challenger.
+
+    Every field is a signed/again-positive perturbation applied to the production
+    ``StructuralConfigView`` before the structural games are RE-INVERTED and
+    re-sampled. All default 0.0 / False, so a ``StructuralChallengerBands()`` with
+    no fields set perturbs NOTHING — the challenger config equals production and the
+    re-sample is an exact no-op (it can never LOWER the governing tail; a zero-width
+    challenger simply does not move it). A caller opts a real width in to make the
+    challenger bite. Bands mirror ``ops.config.StructuralConfig`` model-form widths
+    (dc_rho_band, et_factor_low/high, pens_band, half_share_band).
+
+    Sign convention — every shift is applied in the TAIL-FATTENING direction for a
+    NO-seller (the sell-side catastrophe is parlays HITTING), so the challenger is
+    monotonically conservative:
+      * ``rho_band``       lowers dc_rho (more low-score / draw mass → BTTS-no, unders,
+                           and same-game exclusion structure shift adversely).
+      * ``et_factor_band`` RAISES et_factor (more extra-time scoring → advance/BTTS/
+                           totals settle differently on level-after-90 states).
+      * ``pens_band``      pushes pens_win_a toward 0.5 (the max-entropy shootout, the
+                           least predictable — most tail — coin) unless already there,
+                           in which case it is left (0.5 is already worst-case).
+      * ``half_share_band``RAISES half_share (more first-half mass → 1H legs settle
+                           against a heavier first half).
+      * ``marginal_shock`` widens each inverted target marginal toward 0.5 by this
+                           fraction (an erroneous/stale feed mark → more uncertain,
+                           tail-fattening leg) before inversion.
+      * ``force_knockout`` also prices GROUP games as KNOCKOUT (challenges a possibly
+                           wrong mutex/settlement classification)."""
+
+    rho_band: float = 0.0
+    et_factor_band: float = 0.0
+    pens_band: float = 0.0
+    half_share_band: float = 0.0
+    marginal_shock: float = 0.0
+    force_knockout: bool = False
+
+    @property
+    def active(self) -> bool:
+        """True iff any band actually perturbs something (else an exact no-op)."""
+        return bool(
+            self.rho_band
+            or self.et_factor_band
+            or self.pens_band
+            or self.half_share_band
+            or self.marginal_shock
+            or self.force_knockout
+        )
+
+
+# Conservative default bands used when the caller opts the structural challenger ON
+# with ``structural_challenger_bands=None``: the config's published model-form widths
+# (StructuralConfig.{dc_rho_band=0.08, et_factor half-width≈0.07, pens_band=0.10,
+# half_share_band=0.03}) plus a small marginal feed shock and the knockout-metadata
+# challenge. These are the SAME uncertainties the pricer already carries; the
+# challenger just re-prices the joint at their adverse corner.
+DEFAULT_STRUCTURAL_CHALLENGER_BANDS = StructuralChallengerBands(
+    rho_band=0.08,
+    et_factor_band=0.07,
+    pens_band=0.10,
+    half_share_band=0.03,
+    marginal_shock=0.05,
+    force_knockout=True,
+)
+
+
+def _challenger_structural_cfg(
+    cfg: StructuralConfigView, bands: StructuralChallengerBands
+) -> StructuralConfigView:
+    """The production ``StructuralConfigView`` shifted to the challenger's adverse
+    corner (P1.9). Each constant is moved by its band in the tail-fattening direction
+    (see ``StructuralChallengerBands`` sign convention) and clamped to a valid range.
+    ``force_knockout`` widens ``knockout_series`` to ``("",)`` — every ticker starts
+    with "" so every game is classified KNOCKOUT (the settlement/mutex-metadata
+    challenge). ``marginal_shock`` is NOT applied here (it perturbs the per-game
+    target marginals at inversion time, not a scalar constant)."""
+    from dataclasses import replace as _replace
+
+    et = min(0.60, cfg.et_factor + max(0.0, bands.et_factor_band))
+    # Push the shootout coin toward the max-entropy 0.5 (most tail), never past it.
+    if cfg.pens_win_a <= 0.5:
+        pens = min(0.5, cfg.pens_win_a + max(0.0, bands.pens_band))
+    else:
+        pens = max(0.5, cfg.pens_win_a - max(0.0, bands.pens_band))
+    half = min(0.55, cfg.half_share + max(0.0, bands.half_share_band))
+    rho = cfg.dc_rho - max(0.0, bands.rho_band)  # lower rho ⇒ more low-score mass
+    knockout = ("",) if bands.force_knockout else cfg.knockout_series
+    return _replace(
+        cfg, dc_rho=rho, et_factor=et, pens_win_a=pens, half_share=half,
+        knockout_series=knockout,
+    )
+
+
+def _shock_marginals(
+    model: BookModel, shock: float
+) -> dict[int, float] | None:
+    """Per-leg-index marginals shifted toward 0.5 by ``shock`` fraction — a
+    feed-error / stale-mark proxy (P1.9). ``p' = p + shock·(0.5 − p)`` widens each
+    leg toward maximum uncertainty (the tail-fattening direction: a less-confident
+    leg contributes more joint-tail mass). Returns None when ``shock <= 0`` (no
+    shock ⇒ the challenger inverts the ORIGINAL marginals, an exact no-op on this
+    axis). Clamped to (0,1) exclusive so inversion never sees a degenerate 0/1."""
+    if shock <= 0.0:
+        return None
+    out: dict[int, float] = {}
+    for i, leg in enumerate(model.legs):
+        p = float(leg.p)
+        shocked = p + shock * (0.5 - p)
+        out[i] = min(0.999, max(0.001, shocked))
+    return out
+
+
+def _structural_challenger_bundle(
+    model: BookModel,
+    structural_cfg: StructuralConfigView,
+    bands: StructuralChallengerBands,
+) -> _SamplerBundle | None:
+    """A sampler that re-inverts + re-samples the structural games under the
+    challenger config + shocked marginals (P1.9), or None when the challenger cannot
+    apply (no structural game inverts under the perturbed config, or ``bands`` is an
+    exact no-op). Reuses the EXACT ``build_game_plans`` seam (hard rule 8) with the
+    perturbed config so the challenger is byte-consistent with the production
+    structural path save for the deliberate perturbation.
+
+    Fail-closed: a game that will not RE-INVERT under the perturbed config (the shift
+    pushed a marginal out of the model's feasible region) is left to the copula for
+    the challenger too — never silently dropped from the tail (the copula still
+    samples it; it just loses the structural coupling in the challenger run, which
+    can only widen or leave the tail, never narrow it below production, because the
+    production ES is folded in via the governing max regardless)."""
+    if not bands.active:
+        return None
+    ch_cfg = _challenger_structural_cfg(structural_cfg, bands)
+    shocked = _shock_marginals(model, bands.marginal_shock)
+    tickers = [""] * len(model.legs)
+    for ticker, i in model.leg_index.items():
+        tickers[i] = ticker
+    events = [model.event_by_index.get(i) for i in range(len(model.legs))]
+    if shocked is not None:
+        marginals: list[float | None] = [shocked.get(i) for i in range(len(model.legs))]
+    else:
+        marginals = [leg.p for leg in model.legs]
+    plans, copula_idx = build_game_plans(tickers, events, marginals, ch_cfg)
+    if not plans:
+        return None  # nothing re-inverts under the perturbed config ⇒ no challenger
+
+    def _sampler(
+        leg_models: Sequence[LegModel],
+        c: NDArray[np.float64],
+        n_draw: int,
+        r: np.random.Generator,
+    ) -> NDArray[np.float64]:
+        return sample_structural_values(plans, copula_idx, leg_models, c, n_draw, r)
+
+    return _SamplerBundle(
+        _sampler,
+        structural=True,
+        bridge_needed=_bridge_needed(model, plans, copula_idx),
+    )
+
+
 def compute_book_risk(
     model: BookModel,
     *,
@@ -560,6 +767,8 @@ def compute_book_risk(
     ruin_fractions: tuple[float, ...] = (0.10, 0.25, 0.60),
     challenger_inflation: float = DEFAULT_CHALLENGER_INFLATION,
     structural_cfg: StructuralConfigView | None = None,
+    structural_challenger: bool = False,
+    structural_challenger_bands: StructuralChallengerBands | None = None,
     current_equity_cc: int | None = None,
     ruin_floor_frac: float = 0.70,
     ruin_prob_ci_z: float = 0.0,
@@ -626,7 +835,11 @@ def compute_book_risk(
     # single ``seed``. The third substream is consumed only when the bridge runs;
     # spawning it unconditionally keeps the production/challenger streams identical
     # whether or not the bridge fires (no determinism drift on the common path).
-    seq_prod, seq_chal, seq_bridge = np.random.SeedSequence(seed).spawn(3)
+    # P1.9: a FOURTH substream for the structural-parameter challenger, spawned
+    # unconditionally (consumed only when that challenger runs) so the production/
+    # correlation-challenger/bridge streams are byte-identical whether or not the
+    # structural challenger is enabled — enabling it never perturbs the other books.
+    seq_prod, seq_chal, seq_bridge, seq_struct = np.random.SeedSequence(seed).spawn(4)
     rng = np.random.default_rng(seq_prod)
     values = _sampler(model.legs, corr, n_samples, rng)
 
@@ -701,6 +914,34 @@ def compute_book_risk(
         # the governing max — the ruin axis gates on the worse of the three books.
         bridge_p_ruin = _p_ruin_from_pnl(book_b, current_equity_cc, ruin_floor_cc)
 
+    # --- P1.9: structural-parameter challenger (anti-monoculture on INPUTS) ----
+    # Re-invert + re-sample the structural games under a conservatively-perturbed
+    # StructuralConfigView (goal rates via the re-fit, DC rho, ET/shootout/half-share
+    # settlement constants, knockout mutex-metadata, and shocked feed marginals) and
+    # fold its tail into the governing max exactly as the correlation and bridge
+    # challengers do — gate on the WORSE tail. Runs ONLY when the caller opts in
+    # (``structural_challenger`` + a structural cfg with a game that re-inverts under
+    # the perturbed config); otherwise it is an exact no-op and the numbers below are
+    # bit-identical to before (safety default: it can only WIDEN the tail).
+    struct_es = 0.0
+    struct_p_ruin = 0.0
+    if structural_challenger and structural_cfg is not None:
+        bands = (
+            structural_challenger_bands
+            if structural_challenger_bands is not None
+            else DEFAULT_STRUCTURAL_CHALLENGER_BANDS
+        )
+        struct_bundle = _structural_challenger_bundle(model, structural_cfg, bands)
+        if struct_bundle is not None:
+            rng_s = np.random.default_rng(seq_struct)  # spawned substream (M2 §4.3)
+            # Sample the perturbed structural book at the SAME band correlation the
+            # production book used (the structural axis is what is being stressed,
+            # not the copula correlation — that is the OTHER challenger's job).
+            values_s = struct_bundle.sampler(model.legs, corr, n_samples, rng_s)
+            book_s = _book_pnl_from_values(values_s, model.positions)
+            _, struct_es = _es_from_pnl(book_s, HEADLINE_LEVEL)
+            struct_p_ruin = _p_ruin_from_pnl(book_s, current_equity_cc, ruin_floor_cc)
+
     # --- deterministic stress: exact all-hit worst case -----------------------
     # P0-4: add the CONSERVATIVELY-RESERVED holdings' exact premium as a
     # deterministic reserve OUTSIDE model ES. The sampled ES/challenger cover only
@@ -714,14 +955,16 @@ def compute_book_risk(
     # separate axis (deterministic_max_loss_cc), gated independently, so it can no
     # longer dominate and silence the sampled ES. P0-7: the full-copula bridge ES
     # (present only when a game straddles both blocks) joins the max — gate on the
-    # worse of the structural-split and full-copula tails.
-    governing_model_es = max(es_99, challenger_es, bridge_es)
+    # worse of the structural-split and full-copula tails. P1.9: the
+    # structural-parameter challenger ES (present only when it ran) joins the max
+    # too — the model tail gates on the worst credible structural INPUT regime.
+    governing_model_es = max(es_99, challenger_es, bridge_es, struct_es)
 
     # P1-1: gate ruin on the WORST credible model (production vs challenger vs
-    # bridge), exactly as the ES axis does. ``p_ruin`` is the production value
-    # above; the reported/gated number is the max so a single correlation error
-    # cannot understate ruin (fail-closed on the ruin axis).
-    p_ruin = max(p_ruin, challenger_p_ruin, bridge_p_ruin)
+    # bridge vs P1.9 structural challenger), exactly as the ES axis does. ``p_ruin``
+    # is the production value above; the reported/gated number is the max so a single
+    # correlation OR structural-input error cannot understate ruin (fail-closed).
+    p_ruin = max(p_ruin, challenger_p_ruin, bridge_p_ruin, struct_p_ruin)
     # P1-2: the fail-closed UPPER confidence bound on the governing p̂. All three
     # books were sampled at ``n_samples``; that is the n of the interval. z == 0
     # (the default) leaves it == p_ruin, so the committed-book behaviour is
