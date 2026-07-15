@@ -403,6 +403,38 @@ def _mutex_directional_game_cc(
     return _mutex_directional_event_bound(entries, me_events[0])
 
 
+# --- P1-7: mutex-metadata settlement tripwire -------------------------------
+# The netting above (loss axis Stage B + directional axis P0-9) trusts ONE fact
+# about an event the metadata flagged ``is_me_event(e) is True``: its outcome
+# markets are MUTUALLY EXCLUSIVE, so AT MOST ONE settles YES. That is the exact
+# assumption that lets opposing-outcome long-NO positions net to the max instead
+# of summing (ARG-advance ⊥ ENG-advance). If the exchange EVER settles two or
+# more distinct outcome markets of the SAME netted event YES, that exclusivity
+# was FALSE — every netting decision that trusted it UNDER-stated risk. Metadata
+# (even explicit-True metadata) is not ground truth; the SETTLEMENT is. This
+# tripwire is the settlement-side proof, mirroring the farmed settle-YES tripwire
+# (lifecycle.reconcile_combo_settlement): a classification/metadata failure on a
+# real position must HALT, never log.
+#
+# ``settled_yes_by_event`` maps a netted ME event → the set of its DISTINCT
+# outcome markets the exchange settled YES. ≥2 ⇒ the exclusivity we netted on was
+# violated. Only events we ACTUALLY netted (explicit-True) are audited; an event
+# whose flag was None/False was never netted (fail-closed → summed), so a
+# multi-YES there was already priced comonotone and is not a tripwire.
+def mutex_exclusivity_violations(
+    settled_yes_by_event: dict[str, set[str]],
+) -> dict[str, set[str]]:
+    """Events whose netted mutual-exclusivity was CONTRADICTED by settlement:
+    ≥2 distinct outcome markets of the same event settled YES. Pure; returns the
+    offending {event: settled-YES markets}. Empty ⇒ every audited event behaved
+    mutually exclusively."""
+    return {
+        event: markets
+        for event, markets in settled_yes_by_event.items()
+        if len(markets) >= 2
+    }
+
+
 class ExposureBook:
     def __init__(
         self,
@@ -495,6 +527,35 @@ class ExposureBook:
         removed = self.positions.pop(position_id, None)
         if removed is not None:
             self._bump_position_generation()
+
+    def audit_mutex_settlements(
+        self, settled_yes_markets: Iterable[str]
+    ) -> dict[str, set[str]]:
+        """P1-7 settlement tripwire. Given the market tickers the exchange settled
+        YES in a batch, return the events whose NETTED mutual-exclusivity was
+        contradicted (≥2 distinct outcome markets of one explicit-True ME event
+        settled YES). Empty ⇒ no violation.
+
+        The market→event map is derived from the legs of positions we HOLD (the
+        only markets our netting ever touched). Only events the metadata flagged
+        ``is_me_event(e) is True`` are audited — the SAME explicit-True gate the
+        loss/directional netting uses, so an event we never netted (None/False ⇒
+        summed comonotone) can never false-trip. Called BEFORE settled positions
+        are removed from the book, so the map is complete."""
+        if self._is_me_event is None:
+            return {}  # no ME dimension was ever used → nothing was netted
+        settled = set(settled_yes_markets)
+        settled_yes_by_event: dict[str, set[str]] = defaultdict(set)
+        for position in self.positions.values():
+            for leg in position.legs:
+                event = leg.event_ticker
+                if (
+                    event
+                    and leg.market_ticker in settled
+                    and self._is_me_event(event) is True
+                ):
+                    settled_yes_by_event[event].add(leg.market_ticker)
+        return mutex_exclusivity_violations(settled_yes_by_event)
 
     def upsert_quote(self, quote: OpenQuoteRisk) -> None:
         self.open_quotes[quote.quote_id] = quote
