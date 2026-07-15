@@ -1,0 +1,364 @@
+RISK ENGINE LIVE BALANCING AND +EV VALIDATION AUDIT
+==================================================
+
+Date: 2026-07-15
+Repository: kalshi-combos-TWO
+Source reviewed:
+- docs/reports/2026-07-15-full-session-changelog-and-live-status.md
+- Current risk, simulation, lifecycle, reservation, persistence, and test code
+
+EXECUTIVE VERDICT
+-----------------
+
+The implementation is substantially improved, but it is not yet fully validated
+to balance the live book correctly or accept only correctly measured +EV hedges.
+
+Most prior audit items are genuinely implemented. The analytic mutex-aware
+directional bound is a reasonable conservative balancing control, and the
+candidate gate requires positive expected value under the production model.
+However, two P0 correctness problems remain in the candidate gate:
+
+1. Candidate/reservation premiums are incorrectly added to the P(ruin) equity
+   basis before they have been paid, understating post-fill ruin risk.
+2. Candidate MC runs before reservation and has no reservation-version validation,
+   allowing concurrent accepts to evaluate against the same old pre-book.
+
+The candidate gate has also processed zero real won auctions since relaunch, so
+its live latency, confirmation behavior, balancing decisions, and fill outcomes
+remain unverified.
+
+Safe current description:
+
+  "The engine is balancing-aware and production-model-positive-EV-gated in
+   synthetic tests, but candidate admission is not yet fully atomic or live-
+   validated."
+
+Do not raise max_open_quotes, directional limits, or gross limits until the P0
+items below are fixed and a real tiny-size candidate is observed end-to-end.
+
+CONFIRMED FIXES
+---------------
+
+1. SQL rehydration fanout
+- Fill aggregation and RFQ metadata de-duplication now occur before their join.
+- Repeated RFQ tape rows no longer multiply position quantity.
+- The regression test covers repeated RFQs.
+- Live quantities/deltas returned to plausible levels and quoting resumed.
+
+2. Exact exchange quantity
+- Exchange position_fp, side, and query-level subaccount are authoritative.
+- Local records provide cost basis and leg provenance.
+
+3. Unmodeled holdings
+- Gated or missing-marginal holdings remain as deterministic premium/gross
+  reserves rather than disappearing or being sampled at fabricated p=0.5.
+
+4. Fractional contracts
+- Whole-contract flooring and the forced one-contract minimum were removed from
+  the updated MC position path.
+
+5. ES versus deterministic maximum
+- Sampled model ES and deterministic maximum loss now have separate fields and
+  separate gates.
+
+6. Position generations
+- Risk snapshots carry exposure generations.
+- Position mutations invalidate older results.
+- Off-loop results are discarded when their generation is stale.
+
+7. Challenger correlation scope
+- Correlation inflation is restricted to same-game pairs rather than forcing
+  cross-game rho=0 to rho=0.5.
+
+8. Structural/fallback handling
+- Conditioned fallback behavior exists where a defensible shared link is known.
+- Independent-split and full-copula challengers remain conservative backstops.
+
+9. Off-loop book risk
+- Full-book MC is run off the event loop, addressing the observed heartbeat
+  starvation from inline MC.
+
+10. Candidate EV sign
+- Live candidate configuration sets:
+    allow_negative_ev_hedge = False
+    hedge_cost_budget_cc = 0
+- Negative-EV candidates are therefore declined.
+- The bot is not currently authorized to buy negative-EV insurance solely for
+  risk reduction.
+
+P0-1: CANDIDATE P(RUIN) EQUITY BASIS IS OVERSTATED
+-------------------------------------------------
+
+Observed implementation:
+
+The candidate input builder constructs one merged model containing:
+- committed positions;
+- outstanding reservations;
+- the contemplated candidate.
+
+It then calculates the ruin equity basis using:
+
+  current available cash
+  + modeled cost basis of the merged model
+
+The merged modeled cost basis includes reservation and candidate premiums even
+though those premiums have not yet been debited from current cash.
+
+The candidate P&L sample already contains:
+
+  candidate terminal payout - candidate entry price
+
+Adding candidate entry price to pre-fill cash and then applying payout-price
+cancels the candidate cost incorrectly:
+
+  current cash + candidate price + (candidate payout - candidate price)
+  = current cash + candidate payout
+
+The correct post-fill terminal value is:
+
+  current cash + candidate payout - candidate price
+
+The existing calculation therefore overstates post-candidate equity by the
+candidate premium. Outstanding reservations produce the same overstatement.
+
+Impact:
+- Post-candidate P(ruin) is understated.
+- Larger/more expensive candidates receive more erroneous equity credit.
+- Multiple outstanding reservations compound the problem.
+
+Required fix:
+- Build the equity basis from committed modeled positions only:
+
+    current available cash
+    + cost basis of committed modeled positions
+
+- Do not add uncommitted reservation or candidate premiums to that basis.
+- Let reservation/candidate sampled P&L include their payout minus purchase cost.
+- Alternatively subtract candidate/reservation premiums from cash before adding
+  their cost basis, but committed-only basis is simpler and less error-prone.
+
+Required tests:
+- One candidate, both terminal outcomes.
+- Multiple outstanding reservations.
+- Prove exactly:
+
+    post terminal equity
+    = current cash
+    + terminal value of committed holdings
+    + candidate terminal payout
+    - candidate premium
+
+- Verify P(ruin) increases appropriately with candidate price at fixed payout
+  distribution.
+
+P0-2: CANDIDATE MC IS NOT ATOMIC WITH RESERVATIONS
+--------------------------------------------------
+
+Observed confirm order:
+
+  analytic last-look decision
+  -> build candidate MC inputs from current reservations
+  -> await candidate MC worker
+  -> fill-velocity check
+  -> create risk reservation
+  -> send confirm
+
+The candidate MC awaits a worker before creating its reservation. During this
+await, another accepted quote can begin its own candidate evaluation.
+
+Unsafe sequence:
+
+  Accept A snapshots zero reservations
+  Accept B snapshots zero reservations
+  A and B run MC concurrently
+  A passes against the old book
+  B passes against the same old book
+  A reserves
+  B reserves later
+
+The later analytic reservation check still protects existing hard analytic and
+mass-acceptance caps, but B's ES/P(ruin) decision did not include A. I found no
+reservation_version in CandidateBookRiskInputs and no version comparison/retry
+after the worker returns.
+
+Impact:
+- Candidate ES and P(ruin) admission are not atomic under simultaneous accepts.
+- Multiple candidates can independently pass even if their combined model tail
+  breaches the portfolio budget.
+
+Required fix, preferred flow:
+
+1. Create a provisional reservation under the analytic hard caps.
+2. Capture ExposureBook generation and RiskReservationService version.
+3. Run candidate MC with all reservations, including the provisional candidate.
+4. On worker return, verify both generation and reservation version.
+5. If either changed, rebuild and retry within a bounded confirm deadline.
+6. If MC declines/errors/times out, release the provisional reservation.
+7. If MC passes, proceed to exchange confirm.
+
+Alternative:
+- Serialize candidate-risk admissions through one queue. This is simpler but can
+  reduce throughput and must still respect the exchange confirm deadline.
+
+Required tests:
+- Two candidate gates launched concurrently cannot both ignore each other.
+- Reservation added during MC causes discard/retry.
+- Reservation release changes the version and causes reevaluation.
+- Combined candidates exceeding ES/P(ruin) admit at most the safe subset.
+- Provisional reservation is released on MC error, timeout, or decline.
+
+P1: "+EV" IS PRODUCTION-MODEL EV, NOT ROBUST EV
+------------------------------------------------
+
+Candidate EV is calculated as:
+
+  post production EV - pre production EV
+
+Challenger, bridge, independent-split, and parameter-stress paths affect
+governing ES and P(ruin), but they do not govern candidate EV.
+
+Therefore a candidate may be positive EV under the production structural model
+while negative under one or more challengers.
+
+This is not necessarily wrong; a maker normally trades from a primary fair
+model. But documentation should say:
+
+  "positive expected value under the production model"
+
+not robustly +EV under all credible model uncertainty.
+
+Recommended improvement:
+- Calculate and log:
+    production candidate EV;
+    bridge candidate EV;
+    parameter-challenger candidate EV;
+    worst credible candidate EV.
+- Suggested policy:
+
+    production_candidate_ev > 0
+    AND worst_challenger_ev >= configurable negative tolerance
+
+- Do not require every extreme stress to be positive EV unless the operator
+  explicitly chooses that highly conservative policy.
+
+BOOK-BALANCING VALIDATION
+-------------------------
+
+Analytic directional balancing:
+
+The mutex-aware directional calculation is a defensible conservative improvement:
+- one explicitly mutually exclusive result event is recognized;
+- opposing advances fall into separate branches;
+- maximum branch exposure replaces the sum of incompatible branches;
+- adding entries cannot lower the bound;
+- zero or multiple ME dimensions fail closed;
+- the original loose delta_by_game backstop remains separately enforced.
+
+This gives justified credit to opposing ARG/ENG advance exposure while retaining
+mass-acceptance subset dominance.
+
+Caveat:
+- This is not exact net delta.
+- It is a branchwise upper bound built from independence-proxy magnitudes.
+- Call it a "mutex-aware directional bound," not exact portfolio direction.
+
+MC balancing:
+
+The structural sampler places opposing advance outcomes in a shared game state,
+so a usable MC should recognize that both cannot resolve adverse simultaneously.
+
+But current validation is incomplete because:
+- concurrent candidates can omit each other;
+- candidate P(ruin) uses an overstated equity basis;
+- the candidate gate has not run on a real won auction;
+- the loose hard max_event_delta proxy can still block balancing flow even when
+  the percentage directional cap gives hedge credit.
+
+Conclusion:
+- The architecture is balancing-aware.
+- Synthetic tests indicate it can credit balancing positions.
+- Live behavior has not yet proven that it admits the correct balancing fills.
+
+LIVE CANDIDATE-GATE LATENCY
+---------------------------
+
+The candidate gate runs during Kalshi's short confirm window and awaits an
+approximately 20,000-sample off-process calculation. Off-loop execution protects
+the heartbeat but does not guarantee that the confirm deadline is met.
+
+The report contains no live candidate-gate latency because no won auction has
+reached the gate since relaunch.
+
+Required metrics:
+- MC worker queue dwell;
+- candidate-gate p50/p90/p99 runtime;
+- remaining confirm-window time at completion;
+- gate timeouts/errors;
+- version-conflict retries;
+- accepts lost because the exchange window expired before confirm.
+
+Required behavior:
+- Bound retries by the actual remaining confirm deadline.
+- Fail closed when insufficient time remains.
+- Do not allow risk computation to silently consume the whole confirmation
+  window.
+
+DOCUMENTATION CORRECTIONS
+-------------------------
+
+The full-session master report should not state or imply that live +EV balancing
+is fully validated. Replace with:
+
+  "The confirm path requires positive production-model candidate EV and post-book
+   risk limits. Synthetic tests show balancing candidates can receive MC credit.
+   The gate has not yet processed a live won auction, and reservation concurrency
+   plus candidate-equity accounting require correction before full validation."
+
+The claim that all P0 items are green is too strong until:
+- candidate/reservation admission is atomic;
+- candidate/reservation premiums are handled correctly in ruin equity;
+- the live candidate gate processes a real auction win within deadline.
+
+REQUIRED IMPLEMENTATION ORDER
+-----------------------------
+
+1. Fix candidate/reservation equity-basis accounting.
+2. Add reservation-version validation or provisional-reservation ordering.
+3. Add concurrent candidate-admission tests.
+4. Log production and challenger candidate EV separately.
+5. Add candidate-gate latency/deadline metrics.
+6. Exercise one real won auction at tiny size.
+7. Verify from logs:
+    candidate EV was positive under the production model;
+    all outstanding reservations were included;
+    exposure generation and reservation version matched;
+    post ES/P(ruin)/deterministic/gross budgets passed;
+    reservation succeeded;
+    confirm landed inside the exchange window;
+    resulting position changed branchwise risk as predicted.
+8. Only then reconsider max_open_quotes or directional thresholds.
+
+ACCEPTANCE CRITERIA
+-------------------
+
+The live balancing/+EV claim is validated only when:
+- candidate ruin equity exactly accounts for all premiums once and only once;
+- concurrent accepts cannot use the same stale reservation state;
+- candidate MC and reservation admission form one version-checked transaction;
+- production candidate EV is positive and challenger EV is visible;
+- post-book ES/P(ruin) includes committed holdings, reservations, and candidate;
+- candidate computation completes within the exchange confirm deadline;
+- at least one real tiny-size won auction passes the gate, confirms, executes,
+  reconciles, and moves risk in the predicted balancing direction;
+- concentrating and balancing live examples produce the correct opposite
+  decisions under identical cap configuration.
+
+FINAL STATUS
+------------
+
+Most of the audit plan was implemented competently, and analytic balancing is
+substantially improved. Two P0 candidate-gate defects remain. Until fixed and
+live-exercised, describe the system as:
+
+  "Balancing-aware and production-model-positive-EV-gated in tests, not yet
+   fully validated for atomic live candidate admission."

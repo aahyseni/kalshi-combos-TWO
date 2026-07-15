@@ -966,15 +966,26 @@ class QuoteLifecycle:
                         rho_pairs[frozenset((ordered[i], ordered[j]))] = band
         limits = self._limits.limits
         bankroll_cc = self._risk_bankroll_cc()
-        # COST-basis equity for P(ruin) — the same basis recompute_book_risk uses,
-        # but computed on the MERGED (committed + reservations + candidate) model so
-        # the ruin floor is measured against the post-fill portfolio's cost basis.
-        merged_model = build_book_model(
-            [*committed, *reservations, candidate],
+        # P0-1 (candidate P(ruin) equity basis must NOT be overstated). The ruin
+        # check adds a sampled POST book_pnl — Σ(payout − price) over committed +
+        # reservation + candidate combos — onto this scalar equity basis. The ONLY
+        # basis that reconciles that to true post-fill terminal equity is the
+        # COMMITTED-ONLY cost basis: available_cash + Σ price·c over committed
+        # modeled positions. Reservation and candidate premiums are NOT yet debited
+        # from `available_cash`, so adding them here (as the earlier MERGED-model
+        # basis did) double-credits the unpaid premium — POST equity became
+        #   cash + cand_price + (cand_payout − cand_price) = cash + cand_payout,
+        # overstated by exactly the premium and understating P(ruin). Feeding the
+        # committed-only basis lets each reservation/candidate combo's sampled
+        # (payout − price) carry its own cost, yielding the correct
+        #   cash + terminal_value(committed) + Σ_resv(payout − price)
+        #     + cand_payout − cand_price.
+        committed_only_model = build_book_model(
+            list(committed),
             marginals=self._marginals,
             within_game_rho=self._within_game_rho,
         )
-        current_equity_cc = self._ruin_equity_basis_cc(merged_model)
+        current_equity_cc = self._ruin_equity_basis_cc(committed_only_model)
         return CandidateBookRiskInputs(
             committed=committed,
             candidate=candidate,
