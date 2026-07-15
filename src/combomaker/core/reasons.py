@@ -111,6 +111,15 @@ class ReasonCode(StrEnum):
     # The combo is logically impossible (e.g. two YES legs of a mutually
     # exclusive event). v1 policy: no-quote, don't try to arb it.
     SKIP_LOGICALLY_IMPOSSIBLE = "skip_logically_impossible"
+    # P0-5 exact exchange-quantity reconciliation: the exchange's authoritative
+    # position (ticker/side/position_fp for the pinned subaccount) disagrees with
+    # our reconstructed local book — a size mismatch, an opposite side, or a
+    # holding with no local fill record (a manual/external trade). The exchange
+    # ledger is ground truth (defense #3): we reserve the LARGER exposure (never a
+    # convenient smaller default) and tag it with this code so the caps bind on the
+    # conservative quantity and the mismatch is diagnosable, never silently
+    # papered over by the local number.
+    SKIP_RECONCILE_QUANTITY_MISMATCH = "skip_reconcile_quantity_mismatch"
     # An unmodeled market regime we deliberately decline (e.g. two-legged-tie
     # UCL/UEL/UECL knockouts, where "advance" != a single-match win and the
     # single-match soccer priors do not apply). Gated off until its own regime

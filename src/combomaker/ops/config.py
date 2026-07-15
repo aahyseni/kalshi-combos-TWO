@@ -90,6 +90,25 @@ class SafetyConfig(StrictModel):
     # checks both). Defaults ON. An operator can only disable it deliberately;
     # everything ships NOT-LIVE, so prod stays off regardless.
     prod_require_supervisor: bool = True
+    # P0-5 (exact exchange-quantity reconciliation): the ONE subaccount all
+    # account endpoints (positions, and by extension order placement) are pinned
+    # to. Kalshi's GET /portfolio/positions takes a ``subaccount`` query param
+    # that DEFAULTS to 0 (=primary); 1–63 are numbered subaccounts
+    # (docs/api-notes/index-scan.md §portfolio). We pin every positions read to
+    # this value so the exposure book reconciles to EXACTLY the exchange's
+    # quantity/side FOR THE ACCOUNT WE TRADE ON — a position held under a
+    # different subaccount must never leak into (nor be missing from) this book.
+    # Default 0 matches the exchange default and the single-account posture; an
+    # operator only sets this if the bot trades under a numbered subaccount.
+    subaccount: int = 0
+
+    @field_validator("subaccount")
+    @classmethod
+    def _valid_subaccount(cls, v: int) -> int:
+        # 0 = primary; 1–63 = numbered subaccounts (Kalshi caps at 64 total).
+        if not (0 <= v <= 63):
+            raise ValueError(f"subaccount must be in 0..63 (0=primary), got {v}")
+        return v
 
 
 class SupervisorConfig(StrictModel):

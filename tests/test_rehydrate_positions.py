@@ -17,6 +17,7 @@ from combomaker.ops.persistence import Store
 from combomaker.ops.quote_app import QuoteApp
 from combomaker.rfq.models import Rfq
 from combomaker.risk.exposure import ExposureBook
+from combomaker.risk.reservation import open_combo_positions_from_positions
 
 CONV = Conventions(
     verified=True, source="test",
@@ -44,8 +45,13 @@ def _rfq(combo: str, team: str) -> Rfq:
 class _StubRest:
     def __init__(self, payload: dict[str, Any]) -> None:
         self._payload = payload
+        self.get_positions_calls: list[dict[str, Any]] = []
 
-    async def get_positions(self, **_: Any) -> dict[str, Any]:
+    async def get_positions(self, **params: Any) -> dict[str, Any]:
+        # Record how the endpoint was queried so tests can assert the QUERY-LAYER
+        # subaccount pin (index-scan §portfolio: GET /portfolio/positions returns
+        # only the queried subaccount's positions — the real pin mechanism).
+        self.get_positions_calls.append(dict(params))
         return self._payload
 
 
@@ -203,3 +209,219 @@ async def test_rehydrate_skips_gated_off_series(tmp_path: Path) -> None:
         assert len(exposure2.positions) == 2
     finally:
         await store.close()
+
+
+# --- P0-5: exact exchange-quantity reconciliation ------------------------------
+#
+# The exchange (ticker / side / position_fp / subaccount) is AUTHORITATIVE for
+# quantity; local fills supply only cost basis, legs, provenance. On mismatch we
+# reserve the LARGER exposure and tag it. The nine mandated cases below.
+
+_GAME = "26JUL15ENGARG"
+
+
+async def _rehydrate(store: Store, payload: dict[str, Any], **kw: Any) -> ExposureBook:
+    exposure = ExposureBook(CONV, is_me_event=IS_ME)
+    await QuoteApp._rehydrate_exposure_book(
+        cast(Any, None), cast(Any, _StubRest(payload)), store, exposure, **kw)
+    return exposure
+
+
+def _arg_max_loss(exposure: ExposureBook) -> int:
+    snap = exposure.snapshot(lambda t: 0.5, mass_acceptance=False)
+    return snap.worst_case_loss_by_game_cc[_GAME]
+
+
+async def test_reconcile_exact_match(tmp_path: Path) -> None:
+    """Exchange -50.00 == local 5000 centi: folded at the local number, no mismatch,
+    positioned as a plain rehydrate (not a reconcile)."""
+    store = await _seed_store(tmp_path)
+    try:
+        exposure = await _rehydrate(store, {"market_positions": [
+            {"ticker": "KXMVE-ARG", "position_fp": "-50.00"}]})
+        ids = {p.position_id for p in exposure.positions.values()}
+        assert ids == {"rehydrate:KXMVE-ARG"}  # exact match ⇒ NOT a reconcile id
+        p = next(iter(exposure.positions.values()))
+        assert int(p.contracts) == 5000
+        assert _arg_max_loss(exposure) == 370_000
+    finally:
+        await store.close()
+
+
+async def test_reconcile_exchange_smaller(tmp_path: Path) -> None:
+    """Exchange -30.00 (3000) < local 5000: reserve the LARGER (local 5000), tag it."""
+    store = await _seed_store(tmp_path)
+    try:
+        exposure = await _rehydrate(store, {"market_positions": [
+            {"ticker": "KXMVE-ARG", "position_fp": "-30.00"}]})
+        ids = {p.position_id for p in exposure.positions.values()}
+        assert ids == {"reconcile:KXMVE-ARG"}
+        p = next(iter(exposure.positions.values()))
+        assert int(p.contracts) == 5000  # LARGER of (exchange 3000, local 5000)
+        assert p.our_side is Side.NO
+        assert _arg_max_loss(exposure) == 370_000  # 5000 * 7400 // 100
+    finally:
+        await store.close()
+
+
+async def test_reconcile_exchange_larger(tmp_path: Path) -> None:
+    """Exchange -80.00 (8000) > local 5000: reserve the LARGER (exchange 8000) at the
+    local cost basis. Exchange quantity is authoritative — the book must reflect it,
+    NOT the smaller local number."""
+    store = await _seed_store(tmp_path)
+    try:
+        exposure = await _rehydrate(store, {"market_positions": [
+            {"ticker": "KXMVE-ARG", "position_fp": "-80.00"}]})
+        ids = {p.position_id for p in exposure.positions.values()}
+        assert ids == {"reconcile:KXMVE-ARG"}
+        p = next(iter(exposure.positions.values()))
+        assert int(p.contracts) == 8000  # LARGER of (exchange 8000, local 5000)
+        # max_loss now binds on the exchange count: 8000 * 7400 // 100 = 592_000.
+        assert _arg_max_loss(exposure) == 592_000
+    finally:
+        await store.close()
+
+
+async def test_reconcile_missing_local_fill(tmp_path: Path) -> None:
+    """Exchange reports a ticker we have NO local fill for. No legs ⇒ can't cluster /
+    model marginals ⇒ NOT added to the book, surfaced as an unmodeled reconciliation
+    gap (never modeled from a guess)."""
+    store = await _seed_store(tmp_path)
+    try:
+        exposure = await _rehydrate(store, {"market_positions": [
+            {"ticker": "KXMVE-ARG", "position_fp": "-50.00"},
+            {"ticker": "KXMVE-NOFILL", "position_fp": "-20.00"}]})
+        assert {p.combo_ticker for p in exposure.positions.values()} == {"KXMVE-ARG"}
+    finally:
+        await store.close()
+
+
+async def test_reconcile_manual_trade(tmp_path: Path) -> None:
+    """A manual/external trade (exchange holds it, no local record at all) is the
+    same fail-closed path: excluded from the modeled book, surfaced for manual
+    reconciliation — never invented into a cap."""
+    store = await _seed_store(tmp_path)
+    try:
+        exposure = await _rehydrate(store, {"market_positions": [
+            {"ticker": "KXMVE-MANUAL", "position_fp": "-10.00"}]})
+        assert len(exposure.positions) == 0
+    finally:
+        await store.close()
+
+
+async def test_reconcile_opposite_side(tmp_path: Path) -> None:
+    """Local fills say we are NO on ARG, but the exchange reports a YES (positive
+    position_fp) — an unexpected opposite-side holding. Exchange side is
+    authoritative: fold as YES, tag reconcile."""
+    store = await _seed_store(tmp_path)
+    try:
+        exposure = await _rehydrate(store, {"market_positions": [
+            {"ticker": "KXMVE-ARG", "position_fp": "50.00"}]})  # POSITIVE ⇒ YES
+        ids = {p.position_id for p in exposure.positions.values()}
+        assert ids == {"reconcile:KXMVE-ARG"}
+        p = next(iter(exposure.positions.values()))
+        assert p.our_side is Side.YES  # exchange side wins over local NO
+        assert int(p.contracts) == 5000
+    finally:
+        await store.close()
+
+
+async def test_reconcile_settled_ticker_excluded(tmp_path: Path) -> None:
+    """A SETTLED / netted-out position reports position_fp == 0 (flat). It is
+    excluded at the source — never rehydrated into the risk book."""
+    store = await _seed_store(tmp_path)
+    try:
+        exposure = await _rehydrate(store, {"market_positions": [
+            {"ticker": "KXMVE-ARG", "position_fp": "0"},        # settled ⇒ flat
+            {"ticker": "KXMVE-ENG", "position_fp": "-40.00"}]})  # still open
+        assert {p.combo_ticker for p in exposure.positions.values()} == {"KXMVE-ENG"}
+    finally:
+        await store.close()
+
+
+async def test_reconcile_subaccount_pinned_at_query_layer(tmp_path: Path) -> None:
+    """P0-5 pin. The subaccount pin is applied at the QUERY LAYER — the documented
+    MarketPosition schema has NO per-row subaccount field, so the endpoint itself is
+    what filters (GET /portfolio/positions returns only the queried subaccount's
+    positions; index-scan §portfolio). We must therefore PASS the pinned subaccount
+    to get_positions; the endpoint then never returns another subaccount's rows.
+
+    Here the stub endpoint (as the real one does) returns only subaccount 0's
+    positions when queried with subaccount=0. The test asserts the pin was threaded
+    to the query, and that every returned row is folded (no fictional row filter)."""
+    store = await _seed_store(tmp_path)
+    try:
+        rest = _StubRest({"market_positions": [
+            {"ticker": "KXMVE-ARG", "position_fp": "-50.00"},
+            {"ticker": "KXMVE-ENG", "position_fp": "-40.00"}]})
+        exposure = ExposureBook(CONV, is_me_event=IS_ME)
+        await QuoteApp._rehydrate_exposure_book(
+            cast(Any, None), cast(Any, rest), store, exposure, subaccount=0)
+        # the pin reached the endpoint (the REAL filter mechanism):
+        assert rest.get_positions_calls == [{"subaccount": 0}]
+        # both rows the pinned endpoint returned are folded (no row-level filter):
+        assert {p.combo_ticker for p in exposure.positions.values()} == {
+            "KXMVE-ARG", "KXMVE-ENG"}
+
+        # a numbered subaccount threads through unchanged:
+        rest3 = _StubRest({"market_positions": [
+            {"ticker": "KXMVE-ARG", "position_fp": "-50.00"}]})
+        await QuoteApp._rehydrate_exposure_book(
+            cast(Any, None), cast(Any, rest3), store,
+            ExposureBook(CONV, is_me_event=IS_ME), subaccount=3)
+        assert rest3.get_positions_calls == [{"subaccount": 3}]
+
+        # subaccount=None ⇒ NO param (the exchange default / all-subaccount posture,
+        # unchanged from the pre-P0-5 call): the helper never invents a pin.
+        rest2 = _StubRest({"market_positions": [
+            {"ticker": "KXMVE-ARG", "position_fp": "-50.00"}]})
+        await QuoteApp._rehydrate_exposure_book(
+            cast(Any, None), cast(Any, rest2), store,
+            ExposureBook(CONV, is_me_event=IS_ME))
+        assert rest2.get_positions_calls == [{}]
+    finally:
+        await store.close()
+
+
+async def test_reconcile_conflicting_legs(tmp_path: Path) -> None:
+    """An unparseable / conflicting position_fp is fail-closed: the helper skips the
+    row (never invents a quantity) so it is treated as no provable open position."""
+    mapped = open_combo_positions_from_positions({"market_positions": [
+        {"ticker": "KXMVE-ARG", "position_fp": "-50.00"},
+        {"ticker": "KXMVE-BAD", "position_fp": "not-a-number"}]})
+    assert set(mapped) == {"KXMVE-ARG"}
+    assert mapped["KXMVE-ARG"].side is Side.NO
+    assert mapped["KXMVE-ARG"].contracts_centi == 5000
+
+
+def test_open_combo_positions_side_and_magnitude() -> None:
+    """The helper keeps BOTH side and magnitude (unlike the side-only reconcile
+    helper): negative ⇒ NO, positive ⇒ YES, magnitude = abs(position_fp)."""
+    mapped = open_combo_positions_from_positions({"market_positions": [
+        {"ticker": "A", "position_fp": "-30.00"},
+        {"ticker": "B", "position_fp": "12.00"},
+        {"ticker": "C", "position_fp": "0"}]})
+    assert mapped["A"].side is Side.NO and mapped["A"].contracts_centi == 3000
+    assert mapped["B"].side is Side.YES and mapped["B"].contracts_centi == 1200
+    assert "C" not in mapped  # flat excluded
+
+
+# --- P0-5: the subaccount pin is a real, threaded config value -----------------
+
+
+def test_safety_config_subaccount_default_and_range() -> None:
+    """P0-5: the pin is a config value (SafetyConfig.subaccount), default 0 =
+    primary (the exchange default), constrained to 0..63 (Kalshi's 64-subaccount
+    cap). This is what makes the query-layer pin threadable — without it the pin
+    could never be set."""
+    import pytest
+    from pydantic import ValidationError
+
+    from combomaker.ops.config import SafetyConfig
+
+    assert SafetyConfig().subaccount == 0  # default = primary
+    assert SafetyConfig(subaccount=7).subaccount == 7
+    assert SafetyConfig(subaccount=63).subaccount == 63
+    for bad in (-1, 64, 100):
+        with pytest.raises(ValidationError):
+            SafetyConfig(subaccount=bad)

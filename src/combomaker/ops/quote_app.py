@@ -68,6 +68,7 @@ from combomaker.risk.lastlook import LastLookPolicy
 from combomaker.risk.limits import LimitChecker, StarvationWatchdog
 from combomaker.risk.reservation import (
     RiskReservationService,
+    open_combo_positions_from_positions,
     open_combo_tickers_from_positions,
     reservation_ids_backed_by_exchange,
 )
@@ -540,7 +541,11 @@ class QuoteApp:
                 # (+ our fills for legs/price) so the caps + portfolio MC see what we
                 # already hold — a restarted bot must NOT quote on an empty book.
                 await self._rehydrate_exposure_book(
-                    rest, store, exposure, config.filters.allowed_leg_series_prefixes
+                    rest,
+                    store,
+                    exposure,
+                    config.filters.allowed_leg_series_prefixes,
+                    subaccount=config.safety.subaccount,
                 )
                 # LAUNCH THE EXTERNAL SUPERVISOR (separate OS process) BEFORE the
                 # preflight so its own-heartbeat is beating when external_kill_
@@ -890,7 +895,8 @@ class QuoteApp:
                 except KalshiApiError as exc:
                     log.warning("startup_cancel_failed", quote_id=quote_id, error=str(exc))
             log.info("startup_reconciled", leftover_quotes=len(leftover))
-            positions = await rest.get_positions()
+            # P0-5: pin the positions read to our one subaccount (query-layer pin).
+            positions = await rest.get_positions(subaccount=self._config.safety.subaccount)
             if positions.get("market_positions") or positions.get("positions"):
                 log.info(
                     "startup_existing_positions",
@@ -908,16 +914,36 @@ class QuoteApp:
         store: Store,
         exposure: ExposureBook,
         allowed_series: list[str] | None = None,
+        subaccount: int | None = None,
     ) -> None:
-        """#33 (over-book reconciliation gap): after a restart the in-memory exposure
-        book starts EMPTY, so the risk caps (game/slate loss, mass-acceptance, the
-        portfolio MC) can't see positions we still hold and the book would
-        over-commit on top of live exposure. Rehydrate from the exchange's ACTUAL
-        open positions (ground truth of what we hold) joined to our recorded fills
-        (legs + a max-loss-preserving entry price). Best-effort: an unreachable
-        exchange leaves the book empty — the conservative-but-blind state the prior
-        code left SILENTLY; this only ever ADDS real positions. An exchange position
-        with no local fill/rfq record is logged, never modeled from a guess (rule 6).
+        """#33 (over-book reconciliation gap) + P0-5 (exact exchange-quantity
+        reconciliation): after a restart the in-memory exposure book starts EMPTY,
+        so the risk caps (game/slate loss, mass-acceptance, the portfolio MC) can't
+        see positions we still hold and the book would over-commit on top of live
+        exposure. Rehydrate from the exchange's ACTUAL open positions.
+
+        P0-5 — the exchange is AUTHORITATIVE for ticker/side/QUANTITY (position_fp);
+        our local fills supply ONLY cost basis (entry price), legs, and provenance.
+        We fold each position at the exchange's quantity, not the reconstructed
+        local one. On a local/exchange MISMATCH — a size delta, an opposite side, or
+        a manual/external holding with no local fill — we do NOT trust the local
+        number: we reserve the LARGER exposure (max of exchange and local
+        contracts), never a convenient smaller default, and tag it
+        ``SKIP_RECONCILE_QUANTITY_MISMATCH`` so the caps bind conservatively and the
+        divergence is diagnosable (defense #3). Settled/zero positions are excluded
+        at the source (``open_combo_positions_from_positions`` drops position_fp==0).
+        ``subaccount`` pins account truth to ONE subaccount AT THE QUERY LAYER —
+        ``GET /portfolio/positions`` takes a ``subaccount`` query param (default 0 =
+        primary; index-scan §portfolio) and returns ONLY that subaccount's
+        positions, so another subaccount's holdings never enter the payload. This is
+        the real pin (the ``MarketPosition`` schema carries no per-row subaccount
+        field to filter on); we pass it straight to ``get_positions``.
+
+        Best-effort: an unreachable exchange leaves the book empty — the
+        conservative-but-blind state the prior code left SILENTLY; this only ever
+        ADDS real positions. An exchange position with no local fill/rfq record has
+        no legs (so it can't be clustered or its marginals modeled) — it is surfaced
+        as an unmodeled reconciliation gap, never modeled from a guess (rule 6).
 
         ``allowed_series``: rehydrate ONLY positions whose every leg is on a quoted
         (allow-listed) series. A position on a GATED-OFF series (e.g. MLB while the
@@ -929,14 +955,22 @@ class QuoteApp:
         quoted sport's caps (different games) and are already filled, so they are
         skipped-with-a-log, never modeled blind."""
         try:
-            payload = await rest.get_positions()
+            # P0-5: pin the positions read to ONE subaccount at the QUERY LAYER.
+            # subaccount=None ⇒ the exchange default (0/primary); an int pins that
+            # subaccount and the endpoint returns ONLY its positions.
+            payload = (
+                await rest.get_positions(subaccount=subaccount)
+                if subaccount is not None
+                else await rest.get_positions()
+            )
         except KalshiApiError as exc:
             log.warning("rehydrate_positions_failed", error=str(exc))
             return
-        open_by_ticker = open_combo_tickers_from_positions(payload)
-        if not open_by_ticker:
+        # EXCHANGE = authoritative side + quantity (P0-5); settled/zero excluded here.
+        exch_by_ticker = open_combo_positions_from_positions(payload)
+        if not exch_by_ticker:
             return
-        held = await store.held_positions(list(open_by_ticker))
+        held = {h["combo_ticker"]: h for h in await store.held_positions(list(exch_by_ticker))}
 
         def _quoted(mt: str) -> bool:
             if allowed_series is None:
@@ -947,7 +981,11 @@ class QuoteApp:
         modeled: set[str] = set()
         games: set[str] = set()
         gated: set[str] = set()
-        for h in held:
+        mismatched: list[str] = []
+        for ticker, exch in exch_by_ticker.items():
+            h = held.get(ticker)
+            if h is None:
+                continue  # no local fill/rfq record → surfaced as unmodeled below
             legs = tuple(
                 LegRef(
                     market_ticker=leg["market_ticker"],
@@ -957,20 +995,33 @@ class QuoteApp:
                 for leg in h["legs"]
             )
             if not all(_quoted(leg.market_ticker) for leg in legs):
-                gated.add(h["combo_ticker"])  # gated-off series → no marginals → skip
+                gated.add(ticker)  # gated-off series → no marginals → skip
                 continue
+            local_side = Side.NO if h["our_side"] == "no" else Side.YES
+            local_ctr = int(h["contracts_centi"])
+            entry_price_cc = int(h["entry_price_cc"])  # cost basis from local fills
+            # P0-5 reconciliation: the exchange side/quantity are authoritative.
+            # Reserve the LARGER exposure on ANY divergence (opposite side or a size
+            # delta), never the convenient local number.
+            side = exch.side
+            contracts = max(local_ctr, exch.contracts_centi)
+            reconcile_mismatch = local_side is not exch.side or local_ctr != exch.contracts_centi
+            if reconcile_mismatch:
+                mismatched.append(ticker)
             exposure.add_position(
                 OpenPosition(
-                    position_id=f"rehydrate:{h['combo_ticker']}",
-                    combo_ticker=h["combo_ticker"],
+                    position_id=(
+                        f"reconcile:{ticker}" if reconcile_mismatch else f"rehydrate:{ticker}"
+                    ),
+                    combo_ticker=ticker,
                     collection=h["collection"],
-                    our_side=Side.NO if h["our_side"] == "no" else Side.YES,
-                    contracts=CentiContracts(int(h["contracts_centi"])),
-                    entry_price_cc=CentiCents(int(h["entry_price_cc"])),
+                    our_side=side,
+                    contracts=CentiContracts(contracts),
+                    entry_price_cc=CentiCents(entry_price_cc),
                     legs=legs,
                 )
             )
-            modeled.add(h["combo_ticker"])
+            modeled.add(ticker)
             games.update(game_key(leg.event_ticker) for leg in legs if leg.event_ticker)
         if gated:
             log.info(
@@ -979,18 +1030,30 @@ class QuoteApp:
                 detail="positions on non-allow-listed series (no subscribed leg books "
                 "→ unavailable marginals) — not added to the risk book",
             )
-        unmodeled = sorted(set(open_by_ticker) - modeled - gated)
+        if mismatched:
+            log.warning(
+                "rehydrate_reconcile_mismatch",
+                reason=str(ReasonCode.SKIP_RECONCILE_QUANTITY_MISMATCH),
+                detail="exchange position (authoritative side/quantity) disagreed with "
+                "the local fill reconstruction — reserved the LARGER exposure and "
+                "tagged the position for manual reconciliation",
+                tickers=sorted(mismatched),
+            )
+        unmodeled = sorted(set(exch_by_ticker) - modeled - gated)
         log.info(
             "exposure_rehydrated",
             positions=len(modeled),
             games=sorted(games),
             unmodeled_open=len(unmodeled),
+            reconcile_mismatches=len(mismatched),
         )
         if unmodeled:
             log.warning(
                 "rehydrate_unmodeled_positions",
-                detail="open exchange positions with no local fill/rfq record — NOT "
-                "in the risk book; reconcile manually before trusting the caps",
+                reason=str(ReasonCode.SKIP_RECONCILE_QUANTITY_MISMATCH),
+                detail="open exchange positions with no local fill/rfq record (a "
+                "manual/external trade) — NOT in the risk book; reconcile manually "
+                "before trusting the caps",
                 tickers=unmodeled,
             )
 
@@ -1065,7 +1128,8 @@ class QuoteApp:
         tick. No reservations outstanding ⇒ a no-op that skips the network call."""
         if reservation.outstanding_count == 0:
             return
-        positions = await rest.get_positions()
+        # P0-5: pin the positions read to our one subaccount (query-layer pin).
+        positions = await rest.get_positions(subaccount=self._config.safety.subaccount)
         open_by_ticker = open_combo_tickers_from_positions(positions)
         backed = reservation_ids_backed_by_exchange(
             reservation.outstanding_positions(), open_by_ticker

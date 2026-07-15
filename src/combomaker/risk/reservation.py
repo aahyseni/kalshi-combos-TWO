@@ -107,6 +107,59 @@ def open_combo_tickers_from_positions(positions_payload: dict[str, Any]) -> dict
     return out
 
 
+@dataclass(frozen=True, slots=True)
+class ExchangePosition:
+    """The exchange's AUTHORITATIVE view of one open market (P0-5): the ticker, the
+    side, and the ABSOLUTE quantity in centi-contracts read off ``position_fp``.
+    Quantity is exchange truth; local fills supply only cost basis/legs/fees."""
+
+    side: Side
+    contracts_centi: int  # ABS(position_fp) in centi-contracts; always > 0 here
+
+
+def open_combo_positions_from_positions(
+    positions_payload: dict[str, Any],
+) -> dict[str, ExchangePosition]:
+    """P0-5 exact exchange-quantity reconciliation. Map a ``GET /portfolio/positions``
+    payload to ``{combo_ticker: ExchangePosition}`` — the exchange's AUTHORITATIVE
+    ticker, side, AND quantity for every market it reports OPEN with a nonzero
+    position. Unlike :func:`open_combo_tickers_from_positions` (side only, used by
+    the reservation reconcile) this keeps the MAGNITUDE so the exposure book can be
+    rehydrated on the exchange's count rather than the reconstructed local one.
+
+    ``position_fp`` is a SIGNED count (index-scan §portfolio): NEGATIVE = a NO
+    position, POSITIVE = a YES position, 0 = flat. A flat/zero position is a
+    SETTLED or netted-out market — EXCLUDED here (never rehydrated). An unparseable
+    ``position_fp`` is SKIPPED (fail-closed: we never invent a quantity we can't
+    read; rule 6 / defense #3).
+
+    Subaccount pinning is NOT done here: the documented ``MarketPosition`` schema
+    (index-scan §portfolio: ticker / total_traded_dollars / position_fp /
+    market_exposure_dollars / realized_pnl_dollars / fees_paid_dollars /
+    last_updated_ts) carries NO per-row subaccount field, so there is nothing to
+    filter on. The pin is applied at the QUERY LAYER instead — the caller passes
+    ``subaccount`` to ``GET /portfolio/positions`` and the endpoint returns ONLY
+    that subaccount's positions (see ``QuoteApp._rehydrate_exposure_book``)."""
+    rows = positions_payload.get("market_positions") or positions_payload.get("positions") or []
+    out: dict[str, ExchangePosition] = {}
+    for row in rows:
+        ticker = str(row.get("ticker") or row.get("market_ticker") or "")
+        if not ticker:
+            continue
+        raw = row.get("position_fp")
+        if raw is None:
+            continue
+        try:
+            signed = int(qty_from_fp_str(str(raw)))
+        except ValueError:
+            continue  # fail-closed: unreadable count ⇒ not a provable open position
+        if signed == 0:
+            continue  # flat ⇒ settled / netted out, not open
+        side = Side.YES if signed > 0 else Side.NO
+        out[ticker] = ExchangePosition(side=side, contracts_centi=abs(signed))
+    return out
+
+
 def reservation_ids_backed_by_exchange(
     outstanding: Sequence[Reservation | OpenPosition],
     open_by_ticker: dict[str, Side],
