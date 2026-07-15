@@ -352,3 +352,15 @@ def combo_positions_for_quotes(
     already in ``leg_index`` raises (the caller builds the universe with the
     quotes included first)."""
     return tuple(_position_to_combo(h, leg_index) for h in hypotheticals)
+
+
+def position_to_combo(
+    position: OpenPosition, leg_index: dict[str, int]
+) -> ComboPosition:
+    """Public alias of :func:`_position_to_combo` (P0-1). Maps ONE risk-modeled
+    ``OpenPosition`` to its engine ``ComboPosition`` against an EXISTING shared
+    ``leg_index``. Used by the candidate-aware evaluator to build the PRE and POST
+    combo lists against the SAME merged leg universe, so both are scored on the
+    SAME sampled leg-value matrix (common random numbers). Any leg not already in
+    ``leg_index`` raises (the caller assembled the merged universe first)."""
+    return _position_to_combo(position, leg_index)

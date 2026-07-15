@@ -40,11 +40,18 @@ from dataclasses import dataclass, field
 import numpy as np
 from numpy.typing import NDArray
 
-from combomaker.sim.book_model import BookModel
+from combomaker.risk.exposure import MarginalProvider, OpenPosition
+from combomaker.sim.book_model import (
+    BookModel,
+    WithinGameRhoProvider,
+    build_book_model,
+    position_to_combo,
+)
 from combomaker.sim.engine import (
     ComboPosition,
     LegModel,
     PortfolioStats,
+    book_pnl,
     position_pnl,
     sample_leg_values,
 )
@@ -260,6 +267,44 @@ def _tail_attribution(
     return _to_contribs(per_game), _to_contribs(per_leg)
 
 
+# Sampler signature: (legs, corr, n, rng) -> (n, len(legs)) leg-value matrix.
+_Sampler = Callable[
+    [Sequence[LegModel], NDArray[np.float64], int, np.random.Generator],
+    NDArray[np.float64],
+]
+
+
+def _select_sampler(
+    model: BookModel, structural_cfg: StructuralConfigView | None
+) -> _Sampler:
+    """The value sampler for this model (A1 structural seam).
+
+    With a ``structural_cfg`` the games Dixon-Coles can invert are sampled from the
+    joint scoreline (every same-game hedge/exclusion exact, no rho) and only the
+    copula legs (corners/cards/other sports) use the Gaussian copula; without it
+    the whole book is copula-sampled (byte-identical to before). Extracted verbatim
+    from ``compute_book_risk`` so the candidate-aware evaluator reuses the EXACT
+    same seam (hard rule 8) rather than reimplementing the dispatch."""
+    if structural_cfg is None:
+        return sample_leg_values
+    tickers = [""] * len(model.legs)
+    for ticker, i in model.leg_index.items():
+        tickers[i] = ticker
+    events = [model.event_by_index.get(i) for i in range(len(model.legs))]
+    marginals = [leg.p for leg in model.legs]
+    plans, copula_idx = build_game_plans(tickers, events, marginals, structural_cfg)
+
+    def _structural_sampler(
+        leg_models: Sequence[LegModel],
+        c: NDArray[np.float64],
+        n_draw: int,
+        r: np.random.Generator,
+    ) -> NDArray[np.float64]:
+        return sample_structural_values(plans, copula_idx, leg_models, c, n_draw, r)
+
+    return _structural_sampler
+
+
 def compute_book_risk(
     model: BookModel,
     *,
@@ -327,34 +372,7 @@ def compute_book_risk(
         )
 
     corr = model.corr_for_band(band)
-    # A1 STRUCTURAL SEAM: with a structural config, games the Dixon-Coles model can
-    # invert are sampled from the joint scoreline (every same-game hedge/exclusion
-    # exact, no rho), and only the copula legs (corners/cards/other sports) use the
-    # Gaussian copula. Without it, the whole book is copula-sampled (byte-identical
-    # to before). The challenger's correlation inflation still stresses the copula
-    # legs; structural legs carry their exact scoreline dependence.
-    if structural_cfg is not None:
-        tickers = [""] * len(model.legs)
-        for ticker, i in model.leg_index.items():
-            tickers[i] = ticker
-        events = [model.event_by_index.get(i) for i in range(len(model.legs))]
-        marginals = [leg.p for leg in model.legs]
-        plans, copula_idx = build_game_plans(tickers, events, marginals, structural_cfg)
-
-        def _structural_sampler(
-            leg_models: Sequence[LegModel],
-            c: NDArray[np.float64],
-            n_draw: int,
-            r: np.random.Generator,
-        ) -> NDArray[np.float64]:
-            return sample_structural_values(plans, copula_idx, leg_models, c, n_draw, r)
-
-        _sampler: Callable[
-            [Sequence[LegModel], NDArray[np.float64], int, np.random.Generator],
-            NDArray[np.float64],
-        ] = _structural_sampler
-    else:
-        _sampler = sample_leg_values
+    _sampler = _select_sampler(model, structural_cfg)
     # Two INDEPENDENT, reproducible RNG substreams (production + challenger) via
     # SeedSequence.spawn — never `seed`/`seed+1`, which are correlated streams
     # (M2 §4.3). Both derive deterministically from the single ``seed``.
@@ -457,3 +475,368 @@ def stats_to_snapshot_fields(stats: PortfolioStats) -> dict[str, float]:
         "std_cc": stats.std_cc,
         "p_profit": stats.p_profit,
     }
+
+
+# ---------------------------------------------------------------------------
+# P0-1: candidate- and reservation-aware portfolio risk (A2 last-look gate).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _TailAxes:
+    """One book state's sampled tail (all float cc, positive loss magnitudes)."""
+
+    ev_cc: float
+    es_99_cc: float  # production-copula CVaR at ``band``
+    challenger_es_99_cc: float
+    governing_model_es_99_cc: float  # max(production, challenger)
+    deterministic_max_loss_cc: float
+    gross_settlement_notional_cc: float
+    p_ruin: float
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateBookRisk:
+    """The candidate-aware portfolio-risk verdict for ONE contemplated fill (P0-1).
+
+    ``BookRiskSnapshot`` prices COMMITTED positions only, so a concentrating
+    candidate can pass on the safer old book and a balancing candidate earns no MC
+    credit in its own decision. This evaluates the PRE book (committed + outstanding
+    reservations + any simultaneously-executable accepts) and the POST book
+    (PRE + this candidate) on the SAME sampled leg-value matrix — common random
+    numbers — so the candidate's marginal effect on the joint tail, ruin, and EV is
+    measured directly (the same shared games are broken in the same scenarios for
+    both, so the difference is the candidate, not sampling noise). New games the
+    candidate introduces enter the shared leg universe automatically.
+
+    All money is float cc (simulator domain). ``unknown`` True ⇒ a missing marginal
+    made the merged model no-go: NOTHING below is usable and ``confirm`` is forced
+    False (fail-closed, hard rule 6). ``confirm`` is True ONLY when the candidate's
+    EV is positive (or a negative-EV hedge is explicitly authorized within budget),
+    the POST tail/ruin/deterministic/gross budgets all pass, and no fail-closed
+    condition tripped. It is an ADVISORY tail verdict layered ON TOP of the
+    analytic/gross/burst controls the lifecycle already enforces — never a loosening
+    of them (safety default: this only ever DECLINES a fill the other gates admit)."""
+
+    unknown: bool
+    band: str
+    n_samples: int
+    seed: int
+    n_pre_positions: int
+    n_post_positions: int
+
+    # PRE (committed + reservations + simultaneous accepts) and POST (+ candidate).
+    pre: _TailAxes
+    post: _TailAxes
+
+    # The candidate's marginal EV = post.ev − pre.ev (float cc). POSITIVE ⇒ the
+    # fill is expected-profitable on the shared states.
+    candidate_ev_cc: float
+
+    # The final gate verdict + the first reason it was declined (empty ⇒ confirm).
+    confirm: bool
+    decline_reason: str = ""
+
+    @property
+    def usable(self) -> bool:
+        return not self.unknown
+
+
+def _tail_axes_from_pnl(
+    pnl: NDArray[np.float64],
+    deterministic_max_loss_cc: float,
+    gross_cc: float,
+    *,
+    challenger_pnl: NDArray[np.float64] | None,
+    current_equity_cc: int | None,
+    ruin_floor_cc: float | None,
+) -> _TailAxes:
+    """Roll a per-scenario book P&L vector (and its correlation-inflated
+    challenger re-sample) into the separated tail axes (P0-3 separation preserved:
+    the sampled model ES is NEVER max'd with the deterministic maximum)."""
+    ev = float(pnl.mean()) if pnl.size else 0.0
+    _, es = _es_from_pnl(pnl, HEADLINE_LEVEL)
+    if challenger_pnl is not None and challenger_pnl.size:
+        _, challenger_es = _es_from_pnl(challenger_pnl, HEADLINE_LEVEL)
+    else:
+        challenger_es = 0.0
+    p_ruin = 0.0
+    if current_equity_cc is not None and ruin_floor_cc is not None and pnl.size:
+        p_ruin = float(np.mean(current_equity_cc + pnl < ruin_floor_cc))
+    return _TailAxes(
+        ev_cc=ev,
+        es_99_cc=es,
+        challenger_es_99_cc=challenger_es,
+        governing_model_es_99_cc=max(es, challenger_es),
+        deterministic_max_loss_cc=deterministic_max_loss_cc,
+        gross_settlement_notional_cc=gross_cc,
+        p_ruin=p_ruin,
+    )
+
+
+def _reserved_loss_of(positions: Sequence[OpenPosition]) -> float:
+    """Exact premium of the CONSERVATIVELY-RESERVED (unmodeled) holdings in a
+    subset — a DETERMINISTIC reserve added OUTSIDE model ES (P0-4)."""
+    return float(sum(p.max_loss_cc for p in positions if not p.risk_modeled))
+
+
+def _det_and_gross(
+    positions: Sequence[OpenPosition], combos: Sequence[ComboPosition]
+) -> tuple[float, float]:
+    """(deterministic all-hit max loss, gross settlement notional) for a subset,
+    in float cc. Deterministic max = Σ (premium + fee) over sampled combos
+    + reserved-holding premium (the exact comonotone all-hit worst case, P0-3/P0-4).
+    Gross = Σ contracts×$1 over EVERY position (modeled AND reserved) — the
+    utilization axis is size-based, so reserved holdings count too."""
+    det = 0.0
+    for combo in combos:
+        det += float(combo.price_cc) * combo.contracts + float(combo.fee_cc)
+    det += _reserved_loss_of(positions)
+    gross = float(sum(p.gross_settlement_notional_cc for p in positions))
+    return det, gross
+
+
+def evaluate_candidate_book_risk(
+    committed: Sequence[OpenPosition],
+    candidate: OpenPosition,
+    *,
+    marginals: MarginalProvider,
+    reservations: Sequence[OpenPosition] = (),
+    simultaneous_accepts: Sequence[OpenPosition] = (),
+    within_game_rho: WithinGameRhoProvider | None = None,
+    structural_cfg: StructuralConfigView | None = None,
+    n_samples: int = 20_000,
+    seed: int = 0,
+    band: str = "high",
+    challenger_inflation: float = DEFAULT_CHALLENGER_INFLATION,
+    bankroll_cc: int | None = None,
+    current_equity_cc: int | None = None,
+    ruin_floor_frac: float = 0.70,
+    portfolio_cvar_frac: float | None = None,
+    portfolio_det_max_frac: float | None = None,
+    portfolio_ruin_prob_budget: float | None = None,
+    absolute_notional_multiple: int | None = None,
+    hedge_cost_budget_cc: int = 0,
+    allow_negative_ev_hedge: bool = False,
+) -> CandidateBookRisk:
+    """Candidate- and reservation-aware portfolio risk on COMMON sampled states.
+
+    Builds ONE merged ``BookModel`` over the PRE book (``committed`` +
+    ``reservations`` + ``simultaneous_accepts``) AND the ``candidate``, so every
+    leg — including games the candidate INTRODUCES — enters a single shared leg
+    universe and correlation matrix. It then samples that universe ONCE per band
+    (production + a correlation-inflated challenger substream, both derived from
+    ``seed`` via ``SeedSequence.spawn``) and scores the PRE and POST books on the
+    SAME sampled matrix (common random numbers). The candidate's effect on EV, the
+    sampled model ES, P(ruin), the deterministic all-hit maximum, and gross is
+    therefore the pure marginal difference, not sampling noise — so a BALANCING
+    candidate (one that hedges a shared game) earns real MC credit in its own
+    decision, and a CONCENTRATING candidate is charged for the joint tail it adds
+    on the SAFER old book it would otherwise pass against.
+
+    Gate (``confirm``): True ONLY when
+      * the candidate's marginal EV (``post.ev − pre.ev``) is POSITIVE — UNLESS a
+        negative-EV HEDGE is explicitly authorized (``allow_negative_ev_hedge``)
+        AND its EV cost stays within ``hedge_cost_budget_cc`` (default disabled:
+        a negative-EV hedge is DECLINED absent an explicit enabled budget); and
+      * every POST-book budget passes — the governing model ES_0.99, deterministic
+        all-hit maximum, and P(ruin) under their %-of-bankroll / probability
+        budgets, plus the gross utilization backstop.
+    A missing marginal makes the merged model UNKNOWN ⇒ ``unknown=True`` and
+    ``confirm=False`` (fail-closed, hard rule 6). Any budget whose fraction is not
+    supplied (None) is simply not evaluated here — the lifecycle's ``LimitChecker``
+    still enforces the full analytic/gross/burst control set; this is the ADDED
+    joint-tail credit/charge, never a replacement for or loosening of those caps
+    (safety default: it can only DECLINE a fill the other gates admit).
+
+    Determinism: the same inputs + ``seed`` always yield the same verdict (auditable
+    last-look). Money is float cc inside the simulator (hard rule 5)."""
+    pre_positions: list[OpenPosition] = [
+        *committed,
+        *reservations,
+        *simultaneous_accepts,
+    ]
+    all_positions: list[OpenPosition] = [*pre_positions, candidate]
+
+    # ONE merged model: shared leg universe + correlation for PRE and POST, so the
+    # SAME sampled matrix scores both (common random numbers). New candidate games
+    # enter the universe here automatically.
+    model = build_book_model(
+        all_positions,
+        marginals=marginals,
+        within_game_rho=within_game_rho,
+    )
+
+    empty = _TailAxes(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    if model.unknown:
+        # Fail-closed: a missing marginal anywhere in the merged decomposition ⇒
+        # no usable tail, no confirm (UNKNOWN joint tail is never safe).
+        return CandidateBookRisk(
+            unknown=True,
+            band=band,
+            n_samples=n_samples,
+            seed=seed,
+            n_pre_positions=len(pre_positions),
+            n_post_positions=len(all_positions),
+            pre=empty,
+            post=empty,
+            candidate_ev_cc=0.0,
+            confirm=False,
+            decline_reason="unknown_marginal",
+        )
+
+    # Split the risk-modeled combos into PRE and POST against the SHARED leg index
+    # (position_to_combo maps each position onto the merged universe, so both lists
+    # index the SAME sampled columns). Reserved (unmodeled) holdings are not sampled
+    # — their premium rides in via _det_and_gross / gross below.
+    leg_index = model.leg_index
+    pre_combos = [
+        position_to_combo(p, leg_index) for p in pre_positions if p.risk_modeled
+    ]
+    cand_combos = (
+        [position_to_combo(candidate, leg_index)] if candidate.risk_modeled else []
+    )
+    post_combos = [*pre_combos, *cand_combos]
+
+    ruin_floor_cc: float | None = None
+    if bankroll_cc is not None and bankroll_cc > 0:
+        ruin_floor_cc = ruin_floor_frac * bankroll_cc
+
+    # Sample the shared universe ONCE per substream (production + challenger). When
+    # the merged universe has no sampleable legs (e.g. an all-reserved book plus a
+    # reserved candidate) there is nothing to sample: PRE/POST P&L are empty and the
+    # tail axes fall back to their deterministic reserves only.
+    if model.legs:
+        corr = model.corr_for_band(band)
+        challenger_corr = _inflate_corr(corr, challenger_inflation)
+        sampler = _select_sampler(model, structural_cfg)
+        seq_prod, seq_chal = np.random.SeedSequence(seed).spawn(2)
+        values = sampler(
+            model.legs, corr, n_samples, np.random.default_rng(seq_prod)
+        )
+        values_c = sampler(
+            model.legs, challenger_corr, n_samples, np.random.default_rng(seq_chal)
+        )
+        pre_pnl = book_pnl(values, pre_combos)
+        post_pnl = book_pnl(values, post_combos)
+        pre_pnl_c = book_pnl(values_c, pre_combos)
+        post_pnl_c = book_pnl(values_c, post_combos)
+    else:
+        empty_pnl = np.zeros(0, dtype=np.float64)
+        pre_pnl = post_pnl = pre_pnl_c = post_pnl_c = empty_pnl
+
+    pre_det, pre_gross = _det_and_gross(pre_positions, pre_combos)
+    post_det, post_gross = _det_and_gross(all_positions, post_combos)
+
+    pre_axes = _tail_axes_from_pnl(
+        pre_pnl,
+        pre_det,
+        pre_gross,
+        challenger_pnl=pre_pnl_c,
+        current_equity_cc=current_equity_cc,
+        ruin_floor_cc=ruin_floor_cc,
+    )
+    post_axes = _tail_axes_from_pnl(
+        post_pnl,
+        post_det,
+        post_gross,
+        challenger_pnl=post_pnl_c,
+        current_equity_cc=current_equity_cc,
+        ruin_floor_cc=ruin_floor_cc,
+    )
+    candidate_ev = post_axes.ev_cc - pre_axes.ev_cc
+
+    confirm, reason = _candidate_gate(
+        candidate_ev=candidate_ev,
+        post=post_axes,
+        bankroll_cc=bankroll_cc,
+        portfolio_cvar_frac=portfolio_cvar_frac,
+        portfolio_det_max_frac=portfolio_det_max_frac,
+        portfolio_ruin_prob_budget=portfolio_ruin_prob_budget,
+        absolute_notional_multiple=absolute_notional_multiple,
+        hedge_cost_budget_cc=hedge_cost_budget_cc,
+        allow_negative_ev_hedge=allow_negative_ev_hedge,
+    )
+
+    return CandidateBookRisk(
+        unknown=False,
+        band=band,
+        n_samples=n_samples,
+        seed=seed,
+        n_pre_positions=len(pre_positions),
+        n_post_positions=len(all_positions),
+        pre=pre_axes,
+        post=post_axes,
+        candidate_ev_cc=candidate_ev,
+        confirm=confirm,
+        decline_reason=reason,
+    )
+
+
+def _candidate_gate(
+    *,
+    candidate_ev: float,
+    post: _TailAxes,
+    bankroll_cc: int | None,
+    portfolio_cvar_frac: float | None,
+    portfolio_det_max_frac: float | None,
+    portfolio_ruin_prob_budget: float | None,
+    absolute_notional_multiple: int | None,
+    hedge_cost_budget_cc: int,
+    allow_negative_ev_hedge: bool,
+) -> tuple[bool, str]:
+    """The confirm/decline decision from the candidate EV + POST tail axes.
+
+    Order (first failing reason wins): EV sign (with the explicit hedge-budget
+    exception), then each supplied POST budget. Returns ``(confirm, reason)``;
+    ``reason`` is "" iff confirmed. Any budget whose fraction is None is skipped —
+    the lifecycle's LimitChecker still enforces the full control set; this is the
+    ADDED joint-tail gate, never a demotion of those caps."""
+    # (1) EV sign. A negative-EV fill is DECLINED unless it is an explicitly
+    # authorized hedge whose EV cost stays within the enabled budget (default
+    # disabled ⇒ no negative-EV hedges). A positive-EV candidate passes this gate.
+    if candidate_ev <= 0.0:
+        if not allow_negative_ev_hedge:
+            return False, "negative_ev_no_hedge_budget"
+        # The hedge's cost is the EV we give up = −candidate_ev (a positive $).
+        if -candidate_ev > float(hedge_cost_budget_cc):
+            return False, "negative_ev_exceeds_hedge_budget"
+
+    # (2) POST governing model ES_0.99 vs the %-of-bankroll CVaR ceiling.
+    if (
+        portfolio_cvar_frac is not None
+        and bankroll_cc is not None
+        and bankroll_cc > 0
+    ):
+        cvar_thr = portfolio_cvar_frac * bankroll_cc
+        if post.governing_model_es_99_cc > cvar_thr:
+            return False, "post_governing_model_es_over_budget"
+
+    # (3) POST deterministic all-hit maximum vs its INDEPENDENT %-of-bankroll
+    # ceiling (P0-3: gated separately from the sampled ES).
+    if (
+        portfolio_det_max_frac is not None
+        and bankroll_cc is not None
+        and bankroll_cc > 0
+    ):
+        det_thr = portfolio_det_max_frac * bankroll_cc
+        if post.deterministic_max_loss_cc > det_thr:
+            return False, "post_deterministic_max_over_budget"
+
+    # (4) POST P(ruin) vs the probability budget (reflects the same-game hedge —
+    # a balancing candidate LOWERS it and can pass).
+    if portfolio_ruin_prob_budget is not None:
+        if post.p_ruin > portfolio_ruin_prob_budget:
+            return False, "post_ruin_prob_over_budget"
+
+    # (5) POST gross utilization backstop (Σ contracts×$1 ≤ multiple×bankroll).
+    if (
+        absolute_notional_multiple is not None
+        and bankroll_cc is not None
+        and bankroll_cc > 0
+    ):
+        backstop = absolute_notional_multiple * bankroll_cc
+        if post.gross_settlement_notional_cc > backstop:
+            return False, "post_gross_over_backstop"
+
+    return True, ""
