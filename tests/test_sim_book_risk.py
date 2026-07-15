@@ -256,6 +256,94 @@ class TestChallengerOverlay:
         np.testing.assert_allclose(same_game_corr, corr)
 
 
+class TestGoverningRuin:
+    """P1-1: P(ruin) is computed for the production AND the challenger (AND, when
+    active, the bridge) book and the snapshot reports/gates on the WORST — mirroring
+    the governing ES. A correlation under-estimate must not understate ruin either."""
+
+    def _correlated_no_book(self):  # type: ignore[no-untyped-def]
+        # Two NO parlays on ONE correlated game: inflating the within-game rho
+        # breaks more of them together, so more mass lands in the deep-loss tail —
+        # the ruin driver for a NO-seller.
+        legs = (_leg("A", "KXWCGAME-G1"), _leg("B", "KXWCGAME-G1"))
+        p1 = _pos("p1", legs, our_side=Side.NO, contracts=100, price_cc=2_000)
+        p2 = _pos("p2", legs, our_side=Side.NO, contracts=100, price_cc=2_000)
+        return build_book_model(
+            [p1, p2],
+            marginals=lambda t: 0.6,
+            within_game_rho=lambda a, b: (0.1, 0.3, 0.5),
+        )
+
+    def test_governing_ruin_is_worst_of_production_and_challenger(self) -> None:
+        # With NO correlation inflation (challenger == production, no bridge) the
+        # governing ruin is the pure production value. Turning the inflation ON can
+        # only RAISE it on this correlated NO book — the governing number must be
+        # >= the production-only baseline (never below), i.e. it tracks the worst
+        # credible model, not the convenient one.
+        m = self._correlated_no_book()
+        # Equity/floor chosen so the deep-loss tail straddles the ruin floor: a
+        # $10k bankroll at 0.70 floor = $7k floor; equity marked just above it so a
+        # multi-parlay break drops us through. Money in centi-cents.
+        common = dict(
+            n_samples=120_000,
+            seed=11,
+            band="point",
+            bankroll_cc=100_000,      # $10.00 nominal bankroll (test scale)
+            current_equity_cc=71_000,  # just above the 70% floor (70_000)
+            ruin_floor_frac=0.70,
+        )
+        prod_only = compute_book_risk(
+            self._correlated_no_book(), challenger_inflation=0.0, **common
+        )
+        governing = compute_book_risk(
+            m, challenger_inflation=0.9, **common
+        )
+        # Sanity: with these settings ruin actually evaluates (non-trivial prob).
+        assert prod_only.p_ruin > 0.0
+        # The governing (worst-model) ruin is at least the production-only ruin.
+        assert governing.p_ruin >= prod_only.p_ruin - 1e-9
+        # And the inflation genuinely moved it up (this book's whole point).
+        assert governing.p_ruin > prod_only.p_ruin
+
+    def test_governing_ruin_never_below_production_alone(self) -> None:
+        # The reported p_ruin can never be LESS than what the production book alone
+        # would give — max() is monotone. Re-derive the production-only ruin from
+        # the same production substream and assert the snapshot is >= it.
+        m = self._correlated_no_book()
+        snap = compute_book_risk(
+            m,
+            n_samples=120_000,
+            seed=11,
+            band="point",
+            bankroll_cc=100_000,
+            current_equity_cc=71_000,
+            ruin_floor_frac=0.70,
+            challenger_inflation=0.9,
+        )
+        # Reproduce ONLY the production substream (seed→spawn(3)[0]) and its p_ruin.
+        from combomaker.sim.book_risk import _book_pnl_from_values, _p_ruin_from_pnl
+        from combomaker.sim.engine import sample_leg_values
+
+        seq_prod, _, _ = np.random.SeedSequence(11).spawn(3)
+        corr = m.corr_for_band("point")
+        prod_vals = sample_leg_values(
+            list(m.legs), corr, 120_000, np.random.default_rng(seq_prod)
+        )
+        prod_ruin = _p_ruin_from_pnl(
+            _book_pnl_from_values(prod_vals, m.positions), 71_000, 0.70 * 100_000
+        )
+        assert snap.p_ruin >= prod_ruin - 1e-9
+
+    def test_no_equity_means_no_ruin_evaluated(self) -> None:
+        # Fail-safe unchanged: without equity/bankroll the ruin axis stays 0.0
+        # across ALL models (nothing to gate on), never a convenient default.
+        m = self._correlated_no_book()
+        snap = compute_book_risk(
+            m, n_samples=40_000, seed=3, band="point", challenger_inflation=0.9
+        )
+        assert snap.p_ruin == 0.0
+
+
 class TestTailAttribution:
     def test_per_game_sum_reconciles_to_cvar(self) -> None:
         # Σ per-game tail contribution == the book CVaR (es_99), an additive

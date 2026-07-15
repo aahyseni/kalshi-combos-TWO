@@ -132,8 +132,10 @@ class BookRiskSnapshot:
     p_loss_worse_than: dict[float, float] = field(default_factory=dict)
     # A2: P(this settlement wave drops equity BELOW the ruin floor) =
     # P(current_equity + book_pnl < ruin_floor_frac·bankroll). 0.0 when equity/
-    # bankroll unavailable (the ruin cap then does not evaluate). Computed on the
-    # SAME sampled book P&L, so it reflects the structural hedge (not a comonotone).
+    # bankroll unavailable (the ruin cap then does not evaluate). Reflects the
+    # structural hedge (not a comonotone). P1-1: this is the GOVERNING ruin number —
+    # ``max`` over the production, correlation-inflated challenger, and full-copula
+    # bridge books (gate on the worst credible model), mirroring the governing ES.
     p_ruin: float = 0.0
 
     # --- P0-3 separated tail axes (§5) ---------------------------------------
@@ -188,6 +190,23 @@ def _deterministic_all_hit_loss_cc(model: BookModel) -> float:
     for pos in model.positions:
         total += float(pos.price_cc) * pos.contracts + float(pos.fee_cc)
     return total
+
+
+def _p_ruin_from_pnl(
+    pnl: NDArray[np.float64],
+    current_equity_cc: int | None,
+    ruin_floor_cc: float | None,
+) -> float:
+    """P(this settlement wave drops equity BELOW the ruin floor) on one sampled
+    book P&L vector: ``P(current_equity + book_pnl < ruin_floor)``.
+
+    Returns 0.0 when equity/floor are unavailable (the ruin cap then does not
+    evaluate) or the P&L vector is empty. Uses LIVE equity so the probability
+    tightens as we draw down (a fixed loss threshold would understate ruin once
+    equity < bankroll)."""
+    if current_equity_cc is None or ruin_floor_cc is None or pnl.size == 0:
+        return 0.0
+    return float(np.mean(current_equity_cc + pnl < ruin_floor_cc))
 
 
 def _es_from_pnl(pnl: NDArray[np.float64], level: float) -> tuple[float, float]:
@@ -533,14 +552,17 @@ def compute_book_risk(
     # A2 P(RUIN): P(current_equity + wave P&L < ruin floor). Uses live equity so it
     # tightens as we draw down (a fixed loss-threshold would understate ruin once
     # equity < bankroll). Reflects the structural hedge (same sampled ``book``).
-    p_ruin = 0.0
+    # P1-1: computed on the PRODUCTION book here, then max'd with the challenger and
+    # bridge P(ruin) below — gate on the WORST credible model, mirroring the
+    # governing ES (a single correlation error must not under-state ruin either).
+    ruin_floor_cc: float | None = None
     if (
         current_equity_cc is not None
         and bankroll_cc is not None
         and bankroll_cc > 0
     ):
-        floor_cc = ruin_floor_frac * bankroll_cc
-        p_ruin = float(np.mean(current_equity_cc + book < floor_cc))
+        ruin_floor_cc = ruin_floor_frac * bankroll_cc
+    p_ruin = _p_ruin_from_pnl(book, current_equity_cc, ruin_floor_cc)
 
     # Tail attribution on the 0.99 tail set (same cut es_99 uses).
     cut = float(np.quantile(book, 1.0 - HEADLINE_LEVEL))
@@ -557,6 +579,10 @@ def compute_book_risk(
     values_c = _sampler(model.legs, challenger_corr, n_samples, rng_c)
     book_c = _book_pnl_from_values(values_c, model.positions)
     _, challenger_es = _es_from_pnl(book_c, HEADLINE_LEVEL)
+    # P1-1: challenger P(ruin) on the SAME equity/floor. The correlation-inflated
+    # book breaks more shared games together, so its ruin probability is the
+    # anti-monoculture check on the ruin axis (folded into the governing max below).
+    challenger_p_ruin = _p_ruin_from_pnl(book_c, current_equity_cc, ruin_floor_cc)
 
     # --- P0-7: same-game dependence bridge (full-copula challenger) ------------
     # When the structural split straddles a game (a structural scoreline leg AND a
@@ -568,12 +594,16 @@ def compute_book_risk(
     # The plain copula path already couples every same-game pair, so no bridge is
     # needed there.
     bridge_es = 0.0
+    bridge_p_ruin = 0.0
     bridge_active = bundle.bridge_needed
     if bridge_active:
         rng_b = np.random.default_rng(seq_bridge)  # spawned substream (M2 §4.3)
         values_b = sample_leg_values(model.legs, challenger_corr, n_samples, rng_b)
         book_b = _book_pnl_from_values(values_b, model.positions)
         _, bridge_es = _es_from_pnl(book_b, HEADLINE_LEVEL)
+        # P1-1: bridge P(ruin) too (full-copula same-game dependence), folded into
+        # the governing max — the ruin axis gates on the worse of the three books.
+        bridge_p_ruin = _p_ruin_from_pnl(book_b, current_equity_cc, ruin_floor_cc)
 
     # --- deterministic stress: exact all-hit worst case -----------------------
     # P0-4: add the CONSERVATIVELY-RESERVED holdings' exact premium as a
@@ -590,6 +620,12 @@ def compute_book_risk(
     # (present only when a game straddles both blocks) joins the max — gate on the
     # worse of the structural-split and full-copula tails.
     governing_model_es = max(es_99, challenger_es, bridge_es)
+
+    # P1-1: gate ruin on the WORST credible model (production vs challenger vs
+    # bridge), exactly as the ES axis does. ``p_ruin`` is the production value
+    # above; the reported/gated number is the max so a single correlation error
+    # cannot understate ruin (fail-closed on the ruin axis).
+    p_ruin = max(p_ruin, challenger_p_ruin, bridge_p_ruin)
 
     return BookRiskSnapshot(
         unknown=False,
@@ -652,6 +688,7 @@ class _TailAxes:
     governing_model_es_99_cc: float  # max(production, challenger)
     deterministic_max_loss_cc: float
     gross_settlement_notional_cc: float
+    # P1-1: GOVERNING ruin = max over production / challenger / bridge (worst model).
     p_ruin: float
 
 
@@ -733,9 +770,20 @@ def _tail_axes_from_pnl(
         _, bridge_es = _es_from_pnl(bridge_pnl, HEADLINE_LEVEL)
     else:
         bridge_es = 0.0
-    p_ruin = 0.0
-    if current_equity_cc is not None and ruin_floor_cc is not None and pnl.size:
-        p_ruin = float(np.mean(current_equity_cc + pnl < ruin_floor_cc))
+    # P1-1: gate ruin on the WORST credible model — production vs the
+    # correlation-inflated challenger vs the optional full-copula bridge — exactly
+    # as the governing ES does. A single correlation error must not understate ruin.
+    p_ruin = _p_ruin_from_pnl(pnl, current_equity_cc, ruin_floor_cc)
+    if challenger_pnl is not None:
+        p_ruin = max(
+            p_ruin,
+            _p_ruin_from_pnl(challenger_pnl, current_equity_cc, ruin_floor_cc),
+        )
+    if bridge_pnl is not None:
+        p_ruin = max(
+            p_ruin,
+            _p_ruin_from_pnl(bridge_pnl, current_equity_cc, ruin_floor_cc),
+        )
     return _TailAxes(
         ev_cc=ev,
         es_99_cc=es,

@@ -149,6 +149,36 @@ class TestConcentratingCandidateDeclines:
         assert not r.confirm
         assert r.decline_reason == "post_governing_model_es_over_budget"
 
+    def test_challenger_governs_post_ruin(self) -> None:
+        # P1-1: the POST ruin the candidate gate sees is the WORST of the
+        # production and the correlation-inflated challenger book — not the
+        # production-only value. On a correlated same-game NO book, turning the
+        # inflation ON can only RAISE the post ruin; a fill's ruin gate must not be
+        # passed on the convenient (production-only) model.
+        leg = (_leg("A", "KXWCGAME-G1"), _leg("B", "KXWCGAME-G1"))
+        committed = [_pos("c1", leg, our_side=Side.NO, contracts=200, price_cc=900)]
+        cand = _pos("cand", leg, our_side=Side.NO, contracts=400, price_cc=900)
+        common = dict(
+            marginals=lambda t: 0.9,
+            within_game_rho=lambda a, b: (0.1, 0.3, 0.5),
+            n_samples=60_000,
+            seed=4,
+            bankroll_cc=200_000,
+            current_equity_cc=145_000,  # floor = 140_000cc
+            ruin_floor_frac=0.70,
+        )
+        prod_only = evaluate_candidate_book_risk(
+            committed, cand, challenger_inflation=0.0, **common
+        )
+        governed = evaluate_candidate_book_risk(
+            committed, cand, challenger_inflation=0.9, **common
+        )
+        assert prod_only.post.p_ruin > 0.0  # ruin actually evaluates
+        # The challenger-governed post ruin is at least the production-only ruin.
+        assert governed.post.p_ruin >= prod_only.post.p_ruin - 1e-9
+        # And the inflation genuinely raised it (this book's whole point).
+        assert governed.post.p_ruin > prod_only.post.p_ruin
+
 
 class TestBalancingCandidatePasses:
     def test_balancing_candidate_lowers_post_ruin_and_can_pass(self) -> None:
