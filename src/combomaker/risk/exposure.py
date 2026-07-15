@@ -17,10 +17,16 @@ Two money axes, NEVER summed (B1, R1/R2 invariant #2):
   NOT capital-at-risk and NOT a cash lock — no cash/loss cap may consume it.
 
 Delta convention: exposure to leg L is in contracts-equivalent — the change in
-portfolio value, in dollars, per +1.00 change in P(L settles YES). Analytic
-independence deltas (∏ of the other selected-side marginals, signed) serve the
-hot path; the conditional-MC deltas in ``sim.engine.leg_deltas`` are for the
-slower full-book refresh.
+portfolio value, in dollars, per +1.00 change in P(L settles YES). There are THREE
+provenances (P1.8), and consumers must know which they hold (``DeltaProvenance``):
+``analytic_leg_deltas`` are INDEPENDENCE PROXIES (∏ of the other selected-side
+marginals, signed) and serve the enforced hot-path directional backstop (they are
+deliberately the loose MONOTONE bound the mass-acceptance cap binds on — see P0-9);
+``structural_leg_deltas`` reads the SAME sensitivity off the coherent Dixon-Coles
+scoreline distribution where a game is structurally modelled, so same-game hedges
+the proxy assumes away are recognised (analysis/telemetry only, NOT a cap loosener);
+and the conditional-MC deltas in ``sim.engine.leg_deltas`` are the slow full-book
+refresh. ``leg_deltas_labeled`` dispatches structural-where-available, else proxy.
 
 Mass acceptance (quiet-failure defense + FIX PreferBetterQuote): every open
 quote is instantly executable at ANY moment — an accept aimed at a competitor
@@ -37,14 +43,53 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from enum import Enum
+from typing import TYPE_CHECKING
 
 from combomaker.core.conventions import Conventions, Side
 from combomaker.core.money import CC_PER_DOLLAR, CentiCents, cc_from_prob
 from combomaker.core.quantity import CentiContracts
 from combomaker.pricing.grouping import game_key
 
+if TYPE_CHECKING:
+    import numpy as np
+    from numpy.typing import NDArray
+
+    from combomaker.pricing.structural_api import LegSpec
+    from combomaker.sim.structural_book import StructuralConfigView
+
 MarginalProvider = Callable[[str], float | None]
 """market_ticker -> current P(YES), or None when unavailable."""
+
+
+class DeltaProvenance(Enum):
+    """How a set of per-leg deltas was derived — its modelling assumption.
+
+    P1.8 (RISK_ENGINE_AUDIT_ACTION_PLAN.txt): leg deltas are NOT all equal. The
+    hot-path ``analytic_leg_deltas`` are INDEPENDENCE PROXIES — the product of the
+    other legs' marginals, which silently assumes every leg is independent. Where a
+    game is structurally modelled (Dixon-Coles), ``structural_leg_deltas`` derives
+    the SAME sensitivity from the coherent scoreline distribution, so same-game
+    dependence (an opposing-advance hedge, a BTTS sign flip, a scorer×win tie) is
+    recognised instead of assumed away. Tagging the provenance forces every consumer
+    to know which it holds — a proxy is a backstop, not a truth.
+    """
+
+    INDEPENDENCE_PROXY = "independence_proxy"
+    STRUCTURAL_SCENARIO = "structural_scenario"
+
+
+@dataclass(frozen=True, slots=True)
+class LabeledLegDeltas:
+    """Per-leg deltas (contracts-equivalent) tagged with their ``DeltaProvenance``.
+
+    ``deltas is None`` iff the deltas were uncomputable (a missing/stale marginal —
+    which fails closed upstream, never a p=0.5 default). Consumers that must not
+    trust an independence proxy where structure was available read ``provenance``.
+    """
+
+    deltas: dict[str, float] | None
+    provenance: DeltaProvenance
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,8 +200,26 @@ class OpenQuoteRisk:
 def analytic_leg_deltas(
     position: OpenPosition, marginals: MarginalProvider
 ) -> dict[str, float] | None:
-    """Independence deltas in contracts-equivalent; None if any marginal is
-    missing (missing data must surface as UNKNOWN upstream, not zero)."""
+    """INDEPENDENCE-PROXY leg deltas in contracts-equivalent (P1.8).
+
+    Each leg's delta is ``position_sign · leg_sign · contracts · ∏(other selected-side
+    marginals)`` — the product form ASSUMES the other legs are INDEPENDENT. It is a
+    fast, monotone *proxy*, NOT a structural sensitivity: it cannot see a same-game
+    hedge or exclusion (two opposing advances, a BTTS yes/no flip, a scorer×win tie),
+    so it OVER-states a hedged directional bet. Provenance is
+    ``DeltaProvenance.INDEPENDENCE_PROXY``; where a game is structurally modelled use
+    ``structural_leg_deltas`` (or the dispatcher ``leg_deltas_labeled``) instead.
+
+    This proxy REMAINS the enforced hot-path directional backstop deliberately: it is
+    the loose HARD monotone bound the mass-acceptance directional cap binds on
+    (P0-9), and a structural refinement would break that monotonicity (the design
+    note above ``_DirEntry`` explains why richer hedge credit lives only in the
+    candidate-aware MC, never in the enforced snapshot cap). ``structural_leg_deltas``
+    is therefore an analysis/telemetry sensitivity, not a cap loosener.
+
+    Returns None if any marginal is missing (missing data must surface as UNKNOWN
+    upstream, never a p=0.5 default — hard rule 6 / quiet-failure defense 2).
+    """
     selected: list[float] = []
     for leg in position.legs:
         p_yes = marginals(leg.market_ticker)
@@ -178,6 +241,225 @@ def analytic_leg_deltas(
             + position_sign * leg_sign * contracts * product_others
         )
     return deltas
+
+
+def structural_leg_deltas(
+    position: OpenPosition, marginals: MarginalProvider,
+    cfg: StructuralConfigView | None = None,
+) -> dict[str, float] | None:
+    """STRUCTURAL scenario-sensitivity leg deltas for a SINGLE structurally-modelled
+    game (P1.8: "use structural scenario sensitivities where available").
+
+    Same units and sign convention as ``analytic_leg_deltas`` — contracts-equivalent
+    dollars of portfolio value per +1.00 in P(leg YES) — but the "other legs
+    satisfied" mass is read from the COHERENT Dixon-Coles scoreline distribution the
+    live pricer inverts, NOT from a product of independent marginals. Concretely, for
+    a long-NO combo the value indicator is ``∏(selected-side leg indicators)`` over
+    the joint state, so the exact delta to leg i is::
+
+        position_sign · leg_sign · contracts · Σ_states w · ∏_{j≠i} indicator_j
+
+    Because the co-satisfaction mass ``Σ_states w · ∏_{j≠i} indicator_j`` uses the
+    real joint (states where an opposing advance CANNOT co-occur contribute 0), this
+    recognises the same-game hedges/exclusions the independence proxy assumes away.
+    In the independence limit (mutually independent legs) it collapses to the product
+    form, so it is a strict refinement, never a contradiction.
+
+    Returns None (⇒ the caller falls back to the labelled proxy — fail-closed, never a
+    default) when the position is not risk-modelled, spans more than one game, is not
+    fully representable by the structural model (any leg the DC parser declines —
+    corners/cards/other sports), the game fails to invert, or ANY marginal is missing.
+    Reuses the live parse/invert/sample/settle contract verbatim through
+    ``pricing.structural_api`` (hard rule 8c), so its per-state settlement is
+    byte-identical to the pricer's and the structural-book parity gate covers it.
+    """
+    if not position.risk_modeled or not position.legs:
+        return None
+
+    # Lazy imports: keep the pricing<-risk seam narrow and avoid an import cycle at
+    # module load; only pay the cost when a structural sensitivity is actually asked.
+    import numpy as np
+
+    from combomaker.pricing.grouping import game_key as _game_key
+    from combomaker.pricing.structural_api import (
+        Advance,
+        HalfBtts,
+        HalfDraw,
+        HalfGoalSpread,
+        HalfResult,
+        HalfTotalOver,
+        MatchFormat,
+        PlayerScores,
+        half_indicator,
+        invert,
+        parse_leg,
+        parse_match,
+        team_goals,
+        team_indicator,
+    )
+    from combomaker.pricing.structural_api import (
+        states as enum_states,
+    )
+    from combomaker.sim.structural_book import StructuralConfigView
+
+    _HALF = (HalfResult, HalfDraw, HalfTotalOver, HalfBtts, HalfGoalSpread)
+    c = cfg if cfg is not None else StructuralConfigView()
+
+    # Single game only — a cross-game position has no single scoreline model.
+    games = {_game_key(leg.event_ticker) for leg in position.legs if leg.event_ticker}
+    if len(games) != 1 or any(leg.event_ticker is None for leg in position.legs):
+        return None
+
+    first_ticker = position.legs[0].market_ticker
+    parts = first_ticker.split("-")
+    if len(parts) < 2:
+        return None
+    match = parse_match(parts[1])
+    if match is None:
+        return None
+    series = first_ticker.split("-", 1)[0].upper()
+    fmt = (
+        MatchFormat.KNOCKOUT
+        if any(series.startswith(p.upper()) for p in c.knockout_series)
+        else MatchFormat.GROUP
+    )
+
+    specs: list[LegSpec] = []
+    targets: list[tuple[LegSpec, float]] = []
+    for leg in position.legs:
+        p_yes = marginals(leg.market_ticker)
+        if p_yes is None:
+            return None
+        spec = parse_leg(leg.market_ticker, match, fmt=fmt)
+        if isinstance(spec, str):          # unrepresentable ⇒ not fully structural
+            return None
+        specs.append(spec)
+        targets.append((spec, float(p_yes)))
+
+    try:
+        model = invert(
+            targets, dc_rho=c.dc_rho, et_factor=c.et_factor, match_format=fmt,
+            max_goals=c.max_goals, pens_win_a=c.pens_win_a, half_share=c.half_share,
+        )
+    except Exception:                      # any StructuralError ⇒ fall back to proxy
+        return None
+
+    params = model.params
+    need_halves = any(isinstance(s, _HALF) for s in specs)
+    if need_halves and not params.with_halves:
+        from dataclasses import replace as _replace
+        params = _replace(params, with_halves=True)
+    st = enum_states(params)
+    w = np.asarray(st.w, dtype=np.float64)
+
+    # Per-leg YES-settlement 0/1 over every enumerated state, then flip to the
+    # SELECTED side (NO leg ⇒ 1 - indicator). Advance/player legs are settled
+    # analytically per state (shootout/scorer coins integrate out to their share:
+    # advance on a level state contributes ``pens_win`` mass; a scorer contributes
+    # its per-team-goal thinning probability), matching the pricer's marginal.
+    sel_ind: list[NDArray[np.float64]] = []
+    for k, (leg, spec) in enumerate(zip(position.legs, specs, strict=True)):
+        if isinstance(spec, Advance):
+            yes = _advance_indicator_mass(st, spec, params)
+        elif isinstance(spec, PlayerScores):
+            share = float(model.shares.get(k, 0.0))
+            n_team = np.asarray(
+                team_goals(st, spec.team, spec.include_et), dtype=np.float64
+            )
+            yes = _player_indicator_mass(n_team, share, spec.min_goals)
+        elif isinstance(spec, _HALF):
+            yes = np.asarray(half_indicator(st, spec), dtype=np.float64)
+        else:
+            yes = np.asarray(team_indicator(st, spec, params), dtype=np.float64)
+        sel = yes if leg.side == "yes" else (1.0 - yes)
+        sel_ind.append(np.clip(sel, 0.0, 1.0))
+
+    contracts = int(position.contracts) / 100
+    position_sign = 1.0 if position.our_side is Side.YES else -1.0
+    deltas: dict[str, float] = {}
+    for i, leg in enumerate(position.legs):
+        product_others = np.ones_like(w)
+        for j, ind in enumerate(sel_ind):
+            if j != i:
+                product_others = product_others * ind
+        co_mass = float(np.dot(w, product_others))   # Σ w · ∏_{j≠i} indicator_j
+        leg_sign = 1.0 if leg.side == "yes" else -1.0
+        deltas[leg.market_ticker] = (
+            deltas.get(leg.market_ticker, 0.0)
+            + position_sign * leg_sign * contracts * co_mass
+        )
+    return deltas
+
+
+def _advance_indicator_mass(
+    states: object, spec: object, params: object
+) -> NDArray[np.float64]:
+    """Per-state YES mass for an advance leg: 1 on a decided win, ``pens_win`` on a
+    level-after-ET state (the shootout coin integrated out to its share — the same
+    marginal the pricer/`_advance_settle` produce in expectation)."""
+    import numpy as np
+
+    from combomaker.pricing.structural_api import Team
+
+    if spec.team is Team.A:  # type: ignore[attr-defined]
+        us90, them90 = states.a90, states.b90        # type: ignore[attr-defined]
+        us_et, them_et = states.a_et, states.b_et    # type: ignore[attr-defined]
+        pens = float(params.pens_win_a)              # type: ignore[attr-defined]
+    else:
+        us90, them90 = states.b90, states.a90        # type: ignore[attr-defined]
+        us_et, them_et = states.b_et, states.a_et    # type: ignore[attr-defined]
+        pens = 1.0 - float(params.pens_win_a)        # type: ignore[attr-defined]
+    us90 = np.asarray(us90)
+    them90 = np.asarray(them90)
+    us_et = np.asarray(us_et)
+    them_et = np.asarray(them_et)
+    win = (us90 > them90) | ((us90 == them90) & (us_et > them_et))
+    level = (us90 == them90) & (us_et == them_et)
+    out: NDArray[np.float64] = win.astype(np.float64) + level.astype(np.float64) * pens
+    return out
+
+
+def _player_indicator_mass(
+    n_team: NDArray[np.float64], share: float, min_goals: int
+) -> NDArray[np.float64]:
+    """Per-state YES mass for a player-scores leg: P(player scores >= min | n team
+    goals) integrated per state = ``1 - (1 - share)**n`` for min_goals==1 (the scorer
+    coin's expectation), the pricer's per-state player marginal."""
+    import numpy as np
+
+    if min_goals <= 1:
+        out: NDArray[np.float64] = 1.0 - np.power(1.0 - share, n_team)
+        return out
+    # min_goals >= 2 is rare; fall back to the exact binomial tail per state.
+    from scipy.stats import binom
+
+    return np.asarray(
+        [1.0 - binom.cdf(min_goals - 1, int(nt), share) for nt in n_team],
+        dtype=np.float64,
+    )
+
+
+def leg_deltas_labeled(
+    position: OpenPosition, marginals: MarginalProvider,
+    prefer_structural: bool = True,
+    cfg: StructuralConfigView | None = None,
+) -> LabeledLegDeltas:
+    """Leg deltas with explicit provenance (P1.8 dispatcher).
+
+    Returns the STRUCTURAL scenario sensitivity where it is available (a single,
+    fully-representable structurally-modelled game) and the labelled INDEPENDENCE
+    PROXY otherwise — "structural where available, proxy elsewhere". ``deltas is
+    None`` only when even the proxy is uncomputable (a missing marginal, which fails
+    closed upstream). This is a telemetry/analysis surface; the enforced hot-path
+    directional cap deliberately keeps binding on the monotone independence proxy
+    (see ``analytic_leg_deltas``), so this dispatcher never loosens a cap.
+    """
+    if prefer_structural:
+        structural = structural_leg_deltas(position, marginals, cfg=cfg)
+        if structural is not None:
+            return LabeledLegDeltas(structural, DeltaProvenance.STRUCTURAL_SCENARIO)
+    proxy = analytic_leg_deltas(position, marginals)
+    return LabeledLegDeltas(proxy, DeltaProvenance.INDEPENDENCE_PROXY)
 
 
 @dataclass
