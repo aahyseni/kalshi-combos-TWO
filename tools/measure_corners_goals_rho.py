@@ -55,6 +55,8 @@ from pathlib import Path
 import numpy as np
 from scipy.optimize import brentq
 from scipy.stats import multivariate_normal, norm
+from scipy.stats import norm as _norm
+from scipy.special import owens_t
 
 # ---------------------------------------------------------------------------
 # Paths / traded lines
@@ -131,26 +133,59 @@ def load_games() -> list[Game]:
 # Bivariate-normal CDF + tetrachoric solver
 # ---------------------------------------------------------------------------
 
-_MVN_SEED = 20260705  # match the live copula's seed for a like-for-like forward
+_MVN_SEED = 20260705  # the live copula's QMC seed (used only in the parity check)
 
 
 def bvn_cdf(za: float, zb: float, rho: float) -> float:
-    """P(Z_A <= za, Z_B <= zb) for standard bivariate normal with corr rho."""
+    """P(Z_A <= za, Z_B <= zb) for standard bivariate normal with corr rho.
+
+    Exact, deterministic, fast: the standard Owen's-T decomposition of the
+    bivariate-normal CDF (used instead of scipy's QMC ``multivariate_normal.cdf``
+    so the bootstrap's ~64k BVN inversions run in seconds, not hours). This is a
+    pure math identity for the SAME BVN the live Gaussian copula integrates -- the
+    import-time parity check asserts it matches ``gaussian_copula_joint_prob`` to
+    < 2e-4, so the tetrachoric rho we solve is on the live config's exact scale.
+
+    L(h,k;rho) = P(X>h, Y>k). BVN_CDF(h,k;rho) = 1 - Phi(-h) - Phi(-k) + L(-h,-k;rho)
+    and L is computed via Owen's T (Owen 1956 / Young-Minder).
+    """
     if rho <= -0.999999:
-        return max(0.0, norm.cdf(za) + norm.cdf(zb) - 1.0)
+        return max(0.0, float(_norm.cdf(za) + _norm.cdf(zb) - 1.0))
     if rho >= 0.999999:
-        return min(norm.cdf(za), norm.cdf(zb))
-    cov = np.array([[1.0, rho], [rho, 1.0]], dtype=np.float64)
-    val = multivariate_normal.cdf(
-        np.array([za, zb], dtype=np.float64),
-        mean=np.zeros(2),
-        cov=cov,
-        allow_singular=True,
-        abseps=1e-8,
-        releps=0.0,
-        rng=np.random.default_rng(_MVN_SEED),
-    )
-    return float(val)
+        return float(min(_norm.cdf(za), _norm.cdf(zb)))
+
+    def _L(h: float, k: float, r: float) -> float:
+        """Upper-orthant P(X>h, Y>k) via Owen's T (handles r sign & h,k signs)."""
+        if abs(r) < 1e-12:
+            return float((1.0 - _norm.cdf(h)) * (1.0 - _norm.cdf(k)))
+        denom = math.sqrt(1.0 - r * r)
+        # a-terms for Owen's T
+        ah = (k / h - r) / denom if h != 0 else None
+        ak = (h / k - r) / denom if k != 0 else None
+        if h != 0 and k != 0:
+            t_h = float(owens_t(h, ah))
+            t_k = float(owens_t(k, ak))
+            delta = 0.0 if (h * k > 0 or (h * k == 0 and (h + k) >= 0)) else 0.5
+            bvn_upper = (
+                0.5 * (1.0 - _norm.cdf(h))
+                + 0.5 * (1.0 - _norm.cdf(k))
+                - t_h
+                - t_k
+                - delta
+            )
+            return float(bvn_upper)
+        # h==0 or k==0 edge cases via the CDF-form directly
+        cov = np.array([[1.0, r], [r, 1.0]], dtype=np.float64)
+        c = float(
+            multivariate_normal.cdf(
+                np.array([-h, -k]), mean=np.zeros(2), cov=cov, allow_singular=True
+            )
+        )
+        return c
+
+    # BVN_CDF(za,zb;rho) = L(-za,-zb;rho)  (survival symmetry of the BVN)
+    val = _L(-za, -zb, rho)
+    return float(min(1.0, max(0.0, val)))
 
 
 def tetrachoric_rho(p_a: float, p_b: float, p_ab: float) -> float | None:

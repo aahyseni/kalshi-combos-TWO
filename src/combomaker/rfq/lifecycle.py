@@ -88,6 +88,7 @@ from combomaker.sim.book_model import (
 )
 from combomaker.sim.book_risk import (
     BookRiskSnapshot,
+    CandidateBookRisk,
     compute_book_risk,
     modeled_cost_basis_cc,
 )
@@ -154,6 +155,23 @@ class LifecycleConfig:
     # 20k default is fine — a confirm is one-shot and the window is 3s). Kept
     # explicit + deterministic (seeded) for auditability.
     candidate_gate_mc_samples: int = 20_000
+    # P0-2 (candidate MC atomic with reservations). The candidate gate reserves a
+    # PROVISIONAL reservation under the analytic hard caps BEFORE it runs the MC, so a
+    # concurrent accept's own MC sees this candidate's held headroom (no two accepts
+    # can each pass against the same old book). It then captures the position
+    # generation AND the reservation version, runs the MC, and on return verifies
+    # BOTH are unchanged; if a fill/settlement/reconciliation or another accept's
+    # reservation moved the book under it, it REBUILDS + RETRIES — bounded by the
+    # remaining confirm deadline below. ``candidate_gate_deadline_s`` is the total
+    # wall budget the atomic gate (all retries) may consume of the exchange confirm
+    # window; when the remaining budget is below one more MC's worth of time the gate
+    # FAILS CLOSED (releases the provisional reservation + declines) rather than
+    # silently consuming the whole window (audit "do not let risk computation silently
+    # consume the confirm window"). ``candidate_gate_max_retries`` bounds the rebuild
+    # loop independently of the clock (belt-and-suspenders for a stuck-clock test env
+    # / a pathological churn storm). Both are conservative: exceeding either DECLINES.
+    candidate_gate_deadline_s: float = 2.0
+    candidate_gate_max_retries: int = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -867,61 +885,167 @@ class QuoteLifecycle:
                 enforced.append(breach)
         return enforced
 
+    async def _run_candidate_mc(
+        self, inputs: CandidateBookRiskInputs
+    ) -> CandidateBookRisk:
+        """Run ONE candidate-MC eval, off the loop via ``BookRiskPool.run_candidate``
+        when a pool is wired (the CPU-bound MC never blocks the heartbeat), else
+        INLINE via the pool's OWN worker fn (paper / backtests / tests — fast there,
+        and byte-identical to the off-loop path). Raises on any pool/worker error;
+        the caller turns that into a fail-closed decline."""
+        if self._book_risk_pool is not None:
+            return await self._book_risk_pool.run_candidate(inputs)
+        return _worker_candidate_book_risk(inputs)
+
     async def _candidate_gate_verdict(
-        self, quote_id: str, state: OpenQuoteState
+        self,
+        quote_id: str,
+        state: OpenQuoteState,
+        *,
+        reservation_id: str | None,
     ) -> tuple[bool, str]:
-        """P0-1 candidate-aware portfolio-risk gate for ONE contemplated fill.
+        """P0-1/P0-2 candidate-aware portfolio-risk gate for ONE contemplated fill,
+        ATOMIC with the reservation book.
 
-        Returns ``(True, "")`` to PROCEED to the existing fill-velocity / reservation
-        / confirm flow, or ``(False, detail)`` to DECLINE with
-        ``DECLINE_CANDIDATE_RISK``. STRICTLY ADDITIVE — reachable only after the
-        existing gates ADMIT the fill, and it can only DECLINE, never admit.
+        Returns ``(True, "")`` to PROCEED to the confirm round-trip (the provisional
+        reservation, if any, stays held for the caller to commit), or
+        ``(False, detail)`` to DECLINE with ``DECLINE_CANDIDATE_RISK``. STRICTLY
+        ADDITIVE — reachable only after the existing gates ADMIT the fill, and it can
+        only DECLINE, never admit.
 
-        Builds the candidate ``OpenPosition`` via the SHARED ``_fill_position``
-        builder (the exact position a confirmed fill produces — no reinvented
-        sign/side/max-loss) and evaluates it against the committed positions + all
-        outstanding reservations on COMMON sampled states. Runs OFF the loop via
-        ``BookRiskPool.run_candidate`` when a pool is wired (the CPU-bound MC never
-        blocks the heartbeat); falls back to an INLINE eval otherwise (paper /
-        backtests / tests — fast there). FAIL-CLOSED: an UNKNOWN merged marginal, an
-        over-budget POST book, OR ANY exception in the off-loop eval declines (an
-        unmeasured or errored joint tail is never safe — never confirm on it)."""
-        try:
-            inputs = self._build_candidate_gate_inputs(quote_id, state)
-            if self._book_risk_pool is not None:
-                result = await self._book_risk_pool.run_candidate(inputs)
-            else:
-                # Inline fallback (no pool): reuse the pool's OWN worker fn on the
-                # loop so the result is byte-identical to the off-loop path.
-                result = _worker_candidate_book_risk(inputs)
-        except Exception as exc:  # noqa: BLE001 — any error declines (fail-closed)
-            log.error(
-                "candidate_gate_errored", quote_id=quote_id, error=repr(exc)
+        P0-2 (candidate MC atomic with reservations). Before this gate runs the caller
+        has ALREADY created a PROVISIONAL reservation for this candidate under the
+        analytic hard caps (``reservation_id``), so a concurrent accept's own MC sees
+        this candidate's held headroom — two accepts can no longer each pass against
+        the same old book. Each MC attempt:
+
+          1. Builds the inputs, STAMPING the ExposureBook position generation AND the
+             RiskReservationService version captured at that on-loop read (the
+             candidate's own provisional reservation is excluded from the PRE
+             reservations so it is not double-counted — it rides as ``candidate``).
+          2. Runs the MC (off the loop; the heartbeat keeps beating while it awaits).
+          3. On return, re-reads the LIVE generation + version. If EITHER moved — a
+             fill/settlement/reconciliation, or another accept's reserve/release ran
+             during the await — the verdict priced a book that no longer exists, so it
+             is DISCARDED and the inputs are REBUILT + retried.
+
+        The retry loop is BOUNDED by BOTH the remaining confirm deadline
+        (``candidate_gate_deadline_s`` wall budget) and ``candidate_gate_max_retries``.
+        If a rebuild is needed but too little deadline remains for one more MC, or the
+        retry budget is exhausted, the gate FAILS CLOSED (declines) rather than
+        silently consuming the whole confirm window (audit LIVE CANDIDATE-GATE
+        LATENCY). FAIL-CLOSED throughout: an UNKNOWN merged marginal, an over-budget
+        POST book, ANY exception in the eval, or an unstable book that never settles
+        within the deadline all DECLINE — an unmeasured, errored, or stale joint tail
+        is never safe. The CALLER releases the provisional reservation on any decline.
+
+        With no reservation service (paper / backtests / tests) ``reservation_id`` is
+        None: there is no provisional reservation and the single-loop confirm cannot
+        race, so the version check is inert (the stamps default to -1 and the live
+        reservation version is -1 too) and the gate runs exactly one MC attempt — the
+        prior behaviour, preserved."""
+        start_ns = self._clock.monotonic_ns()
+        deadline_ns = int(self._config.candidate_gate_deadline_s * 1e9)
+        last_mc_ns = 0  # duration of the most recent MC attempt (for deadline budget)
+        for attempt in range(self._config.candidate_gate_max_retries + 1):
+            # Build inputs (stamps the generation + reservation version at this read).
+            try:
+                inputs = self._build_candidate_gate_inputs(
+                    quote_id, state, exclude_reservation_id=reservation_id
+                )
+            except Exception as exc:  # noqa: BLE001 — any build error declines
+                log.error(
+                    "candidate_gate_errored", quote_id=quote_id, error=repr(exc)
+                )
+                return False, f"candidate gate errored: {exc!r}"
+            # Deadline guard BEFORE the MC: if less time remains than the previous
+            # attempt took, do not start an MC that would overrun the confirm window.
+            # (First attempt: last_mc_ns is 0, so this never blocks the first run.)
+            elapsed_ns = self._clock.monotonic_ns() - start_ns
+            if elapsed_ns + last_mc_ns > deadline_ns:
+                self._metrics.inc("candidate_gate.deadline_exceeded")
+                log.warning(
+                    "candidate_gate_deadline",
+                    quote_id=quote_id,
+                    attempt=attempt,
+                    elapsed_ms=round(elapsed_ns / 1e6, 1),
+                    detail="insufficient confirm deadline remains for another MC",
+                )
+                return False, (
+                    "candidate gate deadline exhausted before a stable verdict"
+                )
+            mc0_ns = self._clock.monotonic_ns()
+            try:
+                result = await self._run_candidate_mc(inputs)
+            except Exception as exc:  # noqa: BLE001 — any error declines (fail-closed)
+                log.error(
+                    "candidate_gate_errored", quote_id=quote_id, error=repr(exc)
+                )
+                return False, f"candidate gate errored: {exc!r}"
+            last_mc_ns = self._clock.monotonic_ns() - mc0_ns
+            # P0-2: verify the book did not move under the (possibly off-loop) MC. The
+            # reservation version moves on a concurrent accept's reserve/release even
+            # when the position generation does not, so BOTH must be unchanged.
+            live_gen = self._exposure.position_generation
+            live_ver = (
+                self._reservation.version if self._reservation is not None else -1
             )
-            return False, f"candidate gate errored: {exc!r}"
-        if result.unknown:
-            return False, f"candidate gate UNKNOWN: {result.decline_reason}"
-        if not result.confirm:
-            return False, (
-                f"candidate gate declined: {result.decline_reason} "
-                f"(cand_ev_cc={result.candidate_ev_cc:.1f}, "
-                f"post_es_cc={result.post.governing_model_es_99_cc:.0f}, "
-                f"post_det_cc={result.post.deterministic_max_loss_cc:.0f}, "
-                f"post_p_ruin={result.post.p_ruin:.4f})"
+            if (
+                live_gen != inputs.input_generation
+                or live_ver != inputs.reservation_version
+            ):
+                # A fill/settlement/reconciliation or a concurrent reservation moved
+                # the book: the verdict priced a stale portfolio. Discard + retry.
+                self._metrics.inc("candidate_gate.version_conflict_retry")
+                log.info(
+                    "candidate_gate_version_conflict",
+                    quote_id=quote_id,
+                    attempt=attempt,
+                    snapshot_generation=inputs.input_generation,
+                    live_generation=live_gen,
+                    snapshot_reservation_version=inputs.reservation_version,
+                    live_reservation_version=live_ver,
+                )
+                continue
+            # Stable verdict: the book the MC priced is still the live book.
+            if result.unknown:
+                return False, f"candidate gate UNKNOWN: {result.decline_reason}"
+            if not result.confirm:
+                return False, (
+                    f"candidate gate declined: {result.decline_reason} "
+                    f"(cand_ev_cc={result.candidate_ev_cc:.1f}, "
+                    f"post_es_cc={result.post.governing_model_es_99_cc:.0f}, "
+                    f"post_det_cc={result.post.deterministic_max_loss_cc:.0f}, "
+                    f"post_p_ruin={result.post.p_ruin:.4f})"
+                )
+            log.info(
+                "candidate_gate_confirm",
+                quote_id=quote_id,
+                attempt=attempt,
+                candidate_ev_cc=round(result.candidate_ev_cc, 1),
+                post_governing_es_cc=int(result.post.governing_model_es_99_cc),
+                post_deterministic_max_cc=int(result.post.deterministic_max_loss_cc),
+                post_p_ruin=round(result.post.p_ruin, 4),
+                n_pre=result.n_pre_positions,
             )
-        log.info(
-            "candidate_gate_confirm",
+            return True, ""
+        # Retry budget exhausted without a stable verdict: the book kept moving under
+        # every attempt. FAIL CLOSED (a never-settling book is never safe to confirm).
+        self._metrics.inc("candidate_gate.retries_exhausted")
+        log.warning(
+            "candidate_gate_unstable",
             quote_id=quote_id,
-            candidate_ev_cc=round(result.candidate_ev_cc, 1),
-            post_governing_es_cc=int(result.post.governing_model_es_99_cc),
-            post_deterministic_max_cc=int(result.post.deterministic_max_loss_cc),
-            post_p_ruin=round(result.post.p_ruin, 4),
-            n_pre=result.n_pre_positions,
+            retries=self._config.candidate_gate_max_retries,
+            detail="book moved under every candidate-MC attempt — declining",
         )
-        return True, ""
+        return False, "candidate gate unstable: reservation/book moved every retry"
 
     def _build_candidate_gate_inputs(
-        self, quote_id: str, state: OpenQuoteState
+        self,
+        quote_id: str,
+        state: OpenQuoteState,
+        *,
+        exclude_reservation_id: str | None = None,
     ) -> CandidateBookRiskInputs:
         """Build the IMMUTABLE, picklable inputs for one off-loop candidate MC.
 
@@ -931,14 +1055,37 @@ class QuoteLifecycle:
         feed / SgpParams providers do not pickle), and snapshot the RiskLimits
         budgets. A leg whose marginal is missing is OMITTED from the dict, so the
         worker's provider returns None for it ⇒ the merged model is UNKNOWN ⇒ the
-        gate declines (fail-closed — a missing marginal is never a usable p=0.5)."""
+        gate declines (fail-closed — a missing marginal is never a usable p=0.5).
+
+        P0-2: ``exclude_reservation_id`` is the candidate's OWN provisional
+        reservation id (created before the MC so a concurrent accept sees this
+        candidate's held headroom). That reservation's position IS the candidate, so
+        it is dropped from the ``reservations`` tuple here — the candidate rides in the
+        MC as the dedicated ``candidate`` argument, and folding its provisional
+        reservation into ``reservations`` too would DOUBLE-COUNT it (once as PRE, once
+        as the candidate). Every OTHER outstanding reservation (concurrent accepts +
+        held fills) still rides in ``reservations``. The returned inputs are stamped
+        with the ExposureBook position generation AND the reservation version captured
+        at this read, so the caller can detect a book move under an off-loop MC."""
         candidate = self._fill_position(quote_id, state)
         committed = tuple(self._exposure.positions.values())
-        reservations = (
-            tuple(self._reservation.outstanding_positions())
-            if self._reservation is not None
-            else ()
-        )
+        # P0-2: capture BOTH staleness signals at the read instant. The position
+        # generation moves on a fill/settlement/reconciliation/commit; the reservation
+        # version moves on EVERY reserve/commit/release/mark_unconfirmed — including a
+        # concurrent accept's provisional reserve, which does NOT bump the position
+        # generation. Both are needed to detect every kind of book move.
+        input_generation = self._exposure.position_generation
+        if self._reservation is not None:
+            reservation_version = self._reservation.version
+            reservations = tuple(
+                pos
+                for pos in self._reservation.outstanding_positions()
+                if exclude_reservation_id is None
+                or pos.position_id != exclude_reservation_id
+            )
+        else:
+            reservation_version = -1
+            reservations = ()
         # Universe of distinct leg tickers across the merged book.
         tickers: set[str] = set()
         for pos in (*committed, *reservations, candidate):
@@ -1013,6 +1160,9 @@ class QuoteLifecycle:
             # hedges without an explicit enabled budget).
             hedge_cost_budget_cc=0,
             allow_negative_ev_hedge=False,
+            # P0-2 staleness stamps (see _build_candidate_gate_inputs docstring).
+            input_generation=input_generation,
+            reservation_version=reservation_version,
         )
 
     def _reserve_headroom(
@@ -1314,38 +1464,6 @@ class QuoteLifecycle:
             # eventual quote_executed must find this state and book the fill.
             state.pending_fill = (accepted_side, bid, qty)
             self._executed_states[quote_id] = state
-            # P0-1 CANDIDATE-AWARE PORTFOLIO-RISK GATE (last look). The existing
-            # analytic/gross/burst gates have ADMITTED this fill; now run an
-            # ADDITIONAL candidate-aware ~20k-sample portfolio MC over the merged
-            # PRE (committed + outstanding reservations) + candidate book and confirm
-            # ONLY when the candidate's marginal EV is positive AND the POST-book
-            # joint-tail / ruin / deterministic / gross budgets pass. STRICTLY
-            # ADDITIVE: reachable only inside `if decision.confirm`, so it can only
-            # flip an ADMIT to a DECLINE, never a decline to an admit. Runs OFF the
-            # loop (BookRiskPool.run_candidate) so the CPU-bound MC never blocks the
-            # heartbeat; confirms are rare and the confirm window is 3s, so awaiting
-            # it here is fine. UNKNOWN merged marginal / over-budget POST book / ANY
-            # off-loop error ⇒ DECLINE_CANDIDATE_RISK (fail-closed — an unmeasured or
-            # errored joint tail is never safe). Disabled by config ⇒ skipped (kill
-            # switch + prior behaviour).
-            if self._config.candidate_gate_enabled:
-                gate_ok, gate_detail = await self._candidate_gate_verdict(
-                    quote_id, state
-                )
-                if not gate_ok:
-                    self._metrics.inc(
-                        f"confirm.declined.{ReasonCode.DECLINE_CANDIDATE_RISK}"
-                    )
-                    self._track_markout(f"declined:{quote_id}", state)
-                    await self._record_confirm_decision(
-                        state, confirm=False,
-                        reason=ReasonCode.DECLINE_CANDIDATE_RISK,
-                        detail=gate_detail, decision_ms=decision_ms,
-                    )
-                    self._executed_states.pop(quote_id, None)
-                    state.pending_fill = None
-                    self._drop_quote(quote_id)
-                    return
             # FILL-VELOCITY GOVERNOR (wire-live): record this acceptance's
             # committed notional in the rolling window (the point pending_fill is
             # set), then evaluate the rate. A burst over the SOFT frac / max fills
@@ -1377,10 +1495,15 @@ class QuoteLifecycle:
                 await self.cancel_all(ReasonCode.DECLINE_FILL_VELOCITY)
                 self._drop_quote(quote_id)
                 return
-            # R3 Phase 3: RESERVE headroom BEFORE the confirm round-trip (atomic +
-            # versioned). If the reservation is ENFORCED-denied — impossible in
-            # Phase-2 SHADOW mode, real once caps are flipped — we do NOT confirm;
-            # we decline instead (the last book of headroom went to another RFQ).
+            # R3 Phase 3 + P0-2: RESERVE headroom BEFORE the confirm round-trip AND
+            # before the candidate MC (atomic + versioned). Creating the PROVISIONAL
+            # reservation FIRST — under the analytic hard caps — is the P0-2 fix: a
+            # concurrent accept's own candidate MC now sees this candidate's HELD
+            # headroom (its reservation is folded into every reserve() check AND its
+            # bump moves the reservation VERSION the candidate gate watches), so two
+            # accepts can no longer each pass their MC against the same old pre-book.
+            # An ENFORCED-denied reservation — impossible in Phase-2 SHADOW mode, real
+            # once caps are flipped — declines here (the last headroom went elsewhere).
             reservation_id = f"fill:{quote_id}"
             reserved = self._reserve_headroom(reservation_id, quote_id, state)
             if not reserved:
@@ -1397,6 +1520,49 @@ class QuoteLifecycle:
                 state.pending_fill = None
                 self._drop_quote(quote_id)
                 return
+            # P0-1/P0-2 CANDIDATE-AWARE PORTFOLIO-RISK GATE (last look), ATOMIC with
+            # the reservation just made. The existing analytic/gross/burst gates AND
+            # the provisional reservation have ADMITTED this fill; now run an
+            # ADDITIONAL candidate-aware ~20k-sample portfolio MC over the merged PRE
+            # (committed + all OTHER outstanding reservations + this candidate's
+            # provisional reservation, folded in as the candidate) and confirm ONLY
+            # when the candidate's marginal EV is positive AND the POST-book joint-tail
+            # / ruin / deterministic / gross budgets pass. The gate captures the book
+            # generation + reservation version with its inputs and rebuilds+retries
+            # (bounded by the confirm deadline) if either moves under the off-loop MC,
+            # so its verdict is atomic with the reservation book. STRICTLY ADDITIVE: it
+            # can only flip an ADMIT to a DECLINE, never a decline to an admit. UNKNOWN
+            # merged marginal / over-budget POST book / ANY error / an unstable book /
+            # insufficient deadline ⇒ DECLINE_CANDIDATE_RISK (fail-closed). On ANY
+            # decline the PROVISIONAL reservation is RELEASED (the headroom must not
+            # linger for a fill we are not making). Disabled by config ⇒ skipped (kill
+            # switch + prior behaviour), and the reservation stays as before.
+            if self._config.candidate_gate_enabled:
+                gate_ok, gate_detail = await self._candidate_gate_verdict(
+                    quote_id, state,
+                    reservation_id=(
+                        reservation_id if self._reservation is not None else None
+                    ),
+                )
+                if not gate_ok:
+                    # Release the provisional reservation: this fill is declined, so
+                    # its held headroom must be freed immediately (fail-closed — never
+                    # confirm, never leave headroom consumed for a non-fill).
+                    if self._reservation is not None:
+                        self._reservation.release(reservation_id)
+                    self._metrics.inc(
+                        f"confirm.declined.{ReasonCode.DECLINE_CANDIDATE_RISK}"
+                    )
+                    self._track_markout(f"declined:{quote_id}", state)
+                    await self._record_confirm_decision(
+                        state, confirm=False,
+                        reason=ReasonCode.DECLINE_CANDIDATE_RISK,
+                        detail=gate_detail, decision_ms=decision_ms,
+                    )
+                    self._executed_states.pop(quote_id, None)
+                    state.pending_fill = None
+                    self._drop_quote(quote_id)
+                    return
             rtt0 = self._clock.monotonic_ns()
             try:
                 await self._sender.confirm_quote(quote_id)

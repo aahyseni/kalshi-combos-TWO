@@ -395,6 +395,18 @@ class CandidateBookRiskInputs:
     absolute_notional_multiple: int | None
     hedge_cost_budget_cc: int
     allow_negative_ev_hedge: bool
+    # P0-2 (candidate MC atomic with reservations). The ExposureBook POSITION
+    # generation and the RiskReservationService VERSION captured on the loop at the
+    # instant these inputs were read. They are NOT consumed by the worker (the MC
+    # prices only the positions handed to it); the CALLER stamps them so that, when
+    # the off-loop worker returns, it can compare them to the LIVE generation/version
+    # and DISCARD+REBUILD a verdict computed against a book a concurrent accept's
+    # reservation, or a fill/settlement/reconciliation, has since moved under it. A
+    # default of -1 (an impossible real generation/version — both start at 0 and only
+    # ever increase) means "not stamped" for the paper/no-reservation path, whose
+    # single-loop confirm cannot race and so needs no version check.
+    input_generation: int = -1
+    reservation_version: int = -1
 
 
 def _worker_candidate_book_risk(
