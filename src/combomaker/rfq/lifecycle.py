@@ -568,6 +568,189 @@ class QuoteLifecycle:
             return _StaleBookRisk()  # snapshot too old ⇒ fail closed (secondary)
         return snap
 
+    # ------------------------------------------------------------- risk audit
+
+    def _risk_audit_fields(
+        self,
+        *,
+        candidate_ev_cc: int | None,
+        binding_cap: str,
+        fallback_reason: str,
+    ) -> dict[str, Any]:
+        """P2-4: assemble the per-quote/confirm risk-audit record from WARM state
+        only (no I/O, no MC, hot-path safe) — every field the audit spec enumerates,
+        in one place, so a single ``risk_audit`` log line explains every decision:
+
+          - book/snapshot generation + age: which portfolio the tail was measured
+            against, whether it still matches the live generation, and how old it is;
+          - candidate EV: this quote/fill's expected edge in cc (None ⇒ UNKNOWN, e.g.
+            an unverified NO-complement — never coerced to a convenient 0);
+          - ES / P(ruin) / deterministic loss: the committed-book tail the caps gate
+            on (the governing model ES, the ruin p̂ and its Wilson upper bound, the
+            deterministic all-hit maximum) — the numbers ``check()`` actually reads;
+          - gross + direction: the mass-acceptance gross premium-at-risk and the
+            mutex-aware worst per-game directional bound (P0-9), the two size axes;
+          - reservations: outstanding pre-confirm headroom reservations;
+          - model split / residual: production vs correlation-inflated challenger vs
+            full-copula bridge ES, whether the bridge fired, and the governing −
+            production residual (how much the challenger/bridge widened the tail);
+          - fallback reason: WHY the tail is unusable when it is (stale generation,
+            aged-out snapshot, never-measured book, UNKNOWN marginal) — the
+            fail-closed path made visible, "" when the snapshot is usable;
+          - binding cap: the cap/decline reason that bound this decision ("" when the
+            quote/confirm went through clean).
+
+        Reads the SAME ``_book_risk_for_check`` view the caps consume (so the audit
+        matches the gate to the number) plus one cheap exposure snapshot. All money
+        stays int cc; probabilities stay float (probability space)."""
+        risk = self._book_risk_for_check()
+        # Snapshot generation vs the live position generation (P0-2 consistency).
+        live_generation = self._exposure.position_generation
+        snap = self._book_risk
+        snap_generation = snap.input_generation if snap is not None else None
+        snap_age_s: float | None = None
+        if self._book_risk_mono_ns is not None:
+            snap_age_s = round(
+                (self._clock.monotonic_ns() - self._book_risk_mono_ns) / 1e9, 3
+            )
+        # Tail axes come from the SAME view the caps read: usable ⇒ the live snapshot
+        # (which _book_risk_for_check returns only when generation-matched + fresh);
+        # unusable ⇒ the caps fail closed and there is no trustworthy tail number, so
+        # the audit reports None (never a stale/convenient value).
+        risk_usable = risk is not None and risk.usable
+        es_99_cc: int | None = None
+        det_loss_cc: int | None = None
+        p_ruin: float | None = None
+        p_ruin_upper: float | None = None
+        if risk is not None and risk.usable:
+            es_99_cc = int(risk.governing_model_es_99_cc)
+            det_loss_cc = int(risk.deterministic_max_loss_cc)
+            p_ruin = round(risk.p_ruin, 4)
+            p_ruin_upper = round(getattr(risk, "p_ruin_upper", risk.p_ruin), 4)
+        # Model split + residual read off the raw snapshot (present iff usable here).
+        production_es_cc: int | None = None
+        challenger_es_cc: int | None = None
+        bridge_es_cc: int | None = None
+        bridge_active = False
+        es_residual_cc: int | None = None
+        if risk_usable and snap is not None and snap.usable:
+            production_es_cc = int(snap.production_es_99_cc)
+            challenger_es_cc = int(snap.challenger_es_99_cc)
+            bridge_es_cc = int(snap.bridge_es_99_cc)
+            bridge_active = bool(snap.bridge_active)
+            # Residual = how much the challenger/bridge widened the governing tail
+            # over the production copula (0 ⇒ production is the governing model).
+            es_residual_cc = int(
+                snap.governing_model_es_99_cc - snap.production_es_99_cc
+            )
+        # Gross + mutex-aware directional bound from one cheap exposure snapshot
+        # (the same mass-acceptance aggregation the directional/gross caps bind on).
+        exposure = self._exposure.snapshot(self._marginals, mass_acceptance=True)
+        gross_cc = int(exposure.gross_notional_cc)
+        direction_cc = (
+            max((abs(v) for v in exposure.directional_by_game_cc.values()), default=0)
+        )
+        reservations = (
+            self._reservation.outstanding_count if self._reservation is not None else 0
+        )
+        # If the caller did not name a fallback but the tail is unusable on a
+        # non-empty book, record the fail-closed reason so the audit never shows a
+        # silently-missing tail without saying why.
+        if not fallback_reason and self._exposure.positions and not risk_usable:
+            if snap is None or self._book_risk_mono_ns is None:
+                fallback_reason = "book_risk_never_measured"
+            elif snap_generation != live_generation:
+                fallback_reason = "book_risk_generation_stale"
+            elif snap_age_s is not None and snap_age_s > self._config.book_risk_stale_after_s:
+                fallback_reason = "book_risk_aged_out"
+            else:
+                fallback_reason = "book_risk_unusable"
+        return {
+            "snapshot_generation": snap_generation,
+            "live_generation": live_generation,
+            "snapshot_age_s": snap_age_s,
+            "candidate_ev_cc": candidate_ev_cc,
+            "es_99_cc": es_99_cc,
+            "p_ruin": p_ruin,
+            "p_ruin_upper": p_ruin_upper,
+            "deterministic_max_loss_cc": det_loss_cc,
+            "gross_cc": gross_cc,
+            "direction_cc": direction_cc,
+            "reservations": reservations,
+            "production_es_99_cc": production_es_cc,
+            "challenger_es_99_cc": challenger_es_cc,
+            "bridge_es_99_cc": bridge_es_cc,
+            "bridge_active": bridge_active,
+            "es_residual_cc": es_residual_cc,
+            "fallback_reason": fallback_reason,
+            "binding_cap": binding_cap,
+        }
+
+    def _candidate_edge_cc(
+        self, fair_cc: int, bid_cc: int, qty: CentiContracts, our_side: Side
+    ) -> int | None:
+        """Expected edge (candidate EV) of taking ``our_side`` at ``bid_cc`` on a
+        combo whose YES fair is ``fair_cc``, for ``qty`` centi-contracts, in int cc.
+
+        YES side: (fair − bid)·contracts. NO side: settles on the COMPLEMENT, so the
+        side-fair is $1 − fair — but ONLY when ``combo_no_pays_complement`` is
+        verified True; unverified ⇒ None (the NO payout is UNKNOWN and is never an
+        assumed complement, defense #5 / hard rule 6). Mirrors the fill ledger's
+        ``expected_edge_cc`` so the audited EV equals the recorded EV to the cent."""
+        contracts = int(qty)
+        if our_side is Side.YES:
+            return (int(fair_cc) - int(bid_cc)) * contracts // 100
+        if self._conventions.combo_no_pays_complement:
+            side_fair = CC_PER_DOLLAR - int(fair_cc)
+            return (side_fair - int(bid_cc)) * contracts // 100
+        return None
+
+    def _quote_candidate_ev_cc(
+        self, result: ConstructedQuote, qty: CentiContracts
+    ) -> int | None:
+        """Candidate EV for a QUOTE (before any accept): the edge of the
+        BETTER-priced quoted side — the side whose cheaper bid buys the most
+        contracts on a target-cost accept and is the likelier take. Skips a declined
+        (0-bid) side; None when neither side is priced (nothing to quote) or the NO
+        side's payout is UNKNOWN (unverified complement — never assumed)."""
+        yes_bid = int(result.yes_bid_cc)
+        no_bid = int(result.no_bid_cc)
+        fair = int(result.fair_cc)
+        candidates: list[int] = []
+        if yes_bid > 0:
+            ev = self._candidate_edge_cc(fair, yes_bid, qty, Side.YES)
+            if ev is not None:
+                candidates.append(ev)
+        if no_bid > 0:
+            ev = self._candidate_edge_cc(
+                fair, no_bid, qty, self._conventions.maker_position_side(Side.NO)
+            )
+            if ev is not None:
+                candidates.append(ev)
+        return max(candidates) if candidates else None
+
+    def _log_quote_risk_audit(
+        self,
+        rfq: Rfq,
+        result: ConstructedQuote,
+        qty: CentiContracts,
+        *,
+        binding_cap: str = "",
+    ) -> None:
+        """P2-4: emit the consolidated ``risk_audit`` line for a quote decision
+        (sent when ``binding_cap`` is "", risk-declined otherwise)."""
+        log.info(
+            "risk_audit",
+            phase="quote",
+            rfq_id=rfq.rfq_id,
+            reason=binding_cap or str(ReasonCode.QUOTE_SENT),
+            **self._risk_audit_fields(
+                candidate_ev_cc=self._quote_candidate_ev_cc(result, qty),
+                binding_cap=binding_cap,
+                fallback_reason="",
+            ),
+        )
+
     # --------------------------------------------------------- fill velocity
 
     def _record_fill_velocity(self, bid: CentiCents, qty: CentiContracts) -> None:
@@ -799,6 +982,12 @@ class QuoteLifecycle:
             await self._record_skip(
                 rfq, [b.reason for b in breaches], {"details": [b.detail for b in breaches]}
             )
+            # P2-4: audit the risk-declined quote — the binding cap is the FIRST
+            # enforced breach (checks are severity-ordered), so the operator sees
+            # exactly which cap blocked the quote alongside the full tail context.
+            self._log_quote_risk_audit(
+                rfq, result, risk_qty, binding_cap=str(breaches[0].reason)
+            )
             return
 
         try:
@@ -856,6 +1045,11 @@ class QuoteLifecycle:
                 "leg_mids_cc": state.leg_mids_cc,
             },
         )
+        # P2-4: one consolidated risk-audit line per quote. The candidate EV is the
+        # BETTER-priced quoted side's edge (the side more likely to be taken; the
+        # cheaper bid buys the most contracts on a target-cost accept). No binding
+        # cap / fallback — this quote cleared every gate to be sent.
+        self._log_quote_risk_audit(rfq, result, risk_qty)
 
     # ------------------------------------------------------- accept → confirm
 
@@ -1850,4 +2044,29 @@ class QuoteLifecycle:
             state.rfq.rfq_id,
             [str(reason)],
             context,
+        )
+        # P2-4: one consolidated risk-audit line per confirm/decline. The candidate
+        # EV comes from the pending fill (side/bid/qty) when we got far enough to set
+        # it — an early lapse (e.g. side-not-quoted) has no sized candidate, so EV is
+        # None. The binding cap is the decline reason on a decline ("" on a confirm).
+        candidate_ev_cc: int | None = None
+        if state.pending_fill is not None:
+            accepted_side, bid, qty = state.pending_fill
+            candidate_ev_cc = self._candidate_edge_cc(
+                int(state.constructed.fair_cc),
+                int(bid),
+                qty,
+                self._conventions.maker_position_side(accepted_side),
+            )
+        log.info(
+            "risk_audit",
+            phase="confirm" if confirm else "decline",
+            rfq_id=state.rfq.rfq_id,
+            quote_id=state.quote_id,
+            reason=str(reason),
+            **self._risk_audit_fields(
+                candidate_ev_cc=candidate_ev_cc,
+                binding_cap="" if confirm else str(reason),
+                fallback_reason="",
+            ),
         )

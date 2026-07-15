@@ -585,3 +585,128 @@ async def test_fill_fee_zero_for_combo_maker_quadratic() -> None:
     )
     assert lc._fill_fee_cc(CentiCents(5_000), CentiContracts(100)) == 0
     await store.close()
+
+
+# --------------------------------------------------------------------------
+# P2-4: per-quote/confirm risk-audit log line (RISK_ENGINE_AUDIT_ACTION_PLAN
+# P2 item 4). One consolidated ``risk_audit`` structured line carries every
+# enumerated field: book/snapshot generation + age, candidate EV, ES/P(ruin),
+# deterministic loss, gross, direction, reservations, model split/residual,
+# fallback reason, and the binding cap.
+# --------------------------------------------------------------------------
+
+import structlog  # noqa: E402
+
+# The exact fields the audit spec enumerates — every one must be present on the
+# line so the operator never has to reconstruct a decision from scattered logs.
+_AUDIT_FIELDS = {
+    "snapshot_generation",
+    "live_generation",
+    "snapshot_age_s",
+    "candidate_ev_cc",
+    "es_99_cc",
+    "p_ruin",
+    "p_ruin_upper",
+    "deterministic_max_loss_cc",
+    "gross_cc",
+    "direction_cc",
+    "reservations",
+    "production_es_99_cc",
+    "challenger_es_99_cc",
+    "bridge_es_99_cc",
+    "bridge_active",
+    "es_residual_cc",
+    "fallback_reason",
+    "binding_cap",
+}
+
+
+def _audit_lines(cap: list[dict[str, Any]], phase: str) -> list[dict[str, Any]]:
+    return [
+        e for e in cap if e.get("event") == "risk_audit" and e.get("phase") == phase
+    ]
+
+
+async def test_quote_emits_risk_audit_line_with_all_fields(rig: Rig) -> None:
+    with structlog.testing.capture_logs() as cap:
+        await rig.lifecycle.handle_rfq(rfq())
+    lines = _audit_lines(cap, "quote")
+    assert len(lines) == 1
+    line = lines[0]
+    # Every enumerated field is present.
+    assert _AUDIT_FIELDS <= set(line.keys())
+    # A cleanly-sent quote has no binding cap / fallback and a real candidate EV.
+    assert line["binding_cap"] == ""
+    assert line["fallback_reason"] == ""
+    assert line["reason"] == str(ReasonCode.QUOTE_SENT)
+    assert isinstance(line["candidate_ev_cc"], int)
+    # No COMMITTED positions ⇒ no committed tail to gate on (fields honestly
+    # None, not 0). The gross axis DOES reflect the just-sent open quote's
+    # mass-acceptance premium (it is upserted into the book before the audit),
+    # so gross_cc is a positive integer, not zero.
+    assert line["es_99_cc"] is None
+    assert line["p_ruin"] is None
+    assert isinstance(line["gross_cc"], int) and line["gross_cc"] > 0
+    assert line["reservations"] == 0
+
+
+async def test_confirm_emits_risk_audit_line(rig: Rig) -> None:
+    await rig.lifecycle.handle_rfq(rfq())
+    with structlog.testing.capture_logs() as cap:
+        await rig.lifecycle.on_quote_accepted(accepted_msg("q1", "yes"))
+    lines = _audit_lines(cap, "confirm")
+    assert len(lines) == 1
+    line = lines[0]
+    assert _AUDIT_FIELDS <= set(line.keys())
+    # The confirmed fill carries a sized candidate EV from side/bid/qty.
+    assert isinstance(line["candidate_ev_cc"], int)
+    assert line["binding_cap"] == ""
+    assert line["quote_id"] == "q1"
+
+
+async def test_risk_declined_quote_audit_reports_binding_cap(rig: Rig) -> None:
+    # A too-big quote is risk-declined; the audit line names the binding cap.
+    big = combo(CROSS_EVENT_LEGS, contracts_fp="9999.00")
+    with structlog.testing.capture_logs() as cap:
+        await rig.lifecycle.handle_rfq(big)
+    lines = _audit_lines(cap, "quote")
+    assert len(lines) == 1
+    line = lines[0]
+    assert line["binding_cap"] != ""  # a cap bound this quote
+    assert line["reason"] == line["binding_cap"]
+
+
+async def test_decline_audit_reports_binding_cap(rig: Rig) -> None:
+    # Kill switch between accept and last look declines the confirm; the audit
+    # line's binding cap is the decline reason.
+    await rig.lifecycle.handle_rfq(rfq())
+    await rig.killswitch.halt(ReasonCode.HALT_MANUAL)
+    with structlog.testing.capture_logs() as cap:
+        await rig.lifecycle.on_quote_accepted(accepted_msg("q1", "yes"))
+    lines = _audit_lines(cap, "decline")
+    assert len(lines) == 1
+    assert lines[0]["binding_cap"] == str(ReasonCode.DECLINE_KILL_SWITCH)
+
+
+async def test_risk_audit_fallback_reason_on_unmeasured_book(rig: Rig) -> None:
+    # A NON-EMPTY book with NO book-risk snapshot must fail closed: the audit
+    # reports the fail-closed FALLBACK reason and honestly None tail numbers
+    # (an unmeasured joint tail is never a convenient value — hard rule 6).
+    rig.exposure.add_position(
+        OpenPosition(
+            position_id="p1",
+            combo_ticker="KXMVE-C1",
+            collection="KXMVE-C1",
+            our_side=Side.YES,
+            contracts=CentiContracts(1_000),
+            entry_price_cc=CentiCents(5_000),
+            legs=(LegRef("M1", "E1", "yes"), LegRef("M2", "E2", "yes")),
+        )
+    )
+    fields = rig.lifecycle._risk_audit_fields(  # noqa: SLF001
+        candidate_ev_cc=None, binding_cap="", fallback_reason=""
+    )
+    assert fields["fallback_reason"] == "book_risk_never_measured"
+    assert fields["es_99_cc"] is None
+    assert fields["deterministic_max_loss_cc"] is None
+    assert fields["p_ruin"] is None
