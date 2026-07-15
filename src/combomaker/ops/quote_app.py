@@ -41,6 +41,7 @@ from combomaker.ops.preflight import (
     evaluate_preflight,
 )
 from combomaker.ops.pricing_pool import BookRiskPool, JointPool
+from combomaker.ops.process_group import cleanup_straggler_workers
 from combomaker.ops.report import build_report, format_report
 from combomaker.ops.supervisor import (
     ENV_SUPERVISOR_API_KEY_ID,
@@ -446,15 +447,22 @@ class QuoteApp:
             # heartbeat under the RFQ firehose. Paper/backtests run the MC inline.
             book_risk_pool: BookRiskPool | None = None
             if config.mode is Mode.QUOTE:
+                # P2-1 layer 4: ONCE, before any pool spawns, reap pool workers a
+                # PRIOR crashed run orphaned (identity-verified — never kills a
+                # stranger) and truncate the registry. Doing it here (not per-pool)
+                # means the second pool's start can't clobber the first pool's
+                # freshly-recorded PIDs; each pool then only APPENDS its own.
+                cleanup_straggler_workers(config.data_dir)
                 joint_pool = JointPool(
                     config.pricing,
                     conventions,
                     workers=POOL_WORKERS,
                     deadline_s=POOL_DEADLINE_S,
+                    data_dir=config.data_dir,
                 )
                 joint_pool.start()
                 await joint_pool.warmup()
-                book_risk_pool = BookRiskPool(workers=1)
+                book_risk_pool = BookRiskPool(workers=1, data_dir=config.data_dir)
                 book_risk_pool.start()
             lifecycle = QuoteLifecycle(
                 clock=self._clock,

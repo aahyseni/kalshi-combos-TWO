@@ -25,10 +25,17 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 
 from combomaker.core.conventions import Conventions
 from combomaker.ops.config import PricingConfig
 from combomaker.ops.logging import get_logger
+from combomaker.ops.process_group import (
+    WindowsKillJob,
+    _ensure_workers_spawned,
+    install_parent_death_signal,
+    record_worker_pids,
+)
 from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.joint import JointEstimate
 from combomaker.pricing.legs import LegBelief
@@ -63,6 +70,10 @@ def _pool_init(config: PricingConfig, conventions: Conventions) -> None:
     from the SAME shipped config so its structural pricer / SGP params / longshot
     floor are byte-for-byte the loop's. Worker memo disabled (maxsize=0): the loop
     owns the authoritative cache and only ever ships misses here."""
+    # P2-1 layer 2: arm parent-death detection INSIDE this worker (Linux
+    # PR_SET_PDEATHSIG; no-op elsewhere) so an abnormal parent exit cannot leave
+    # this worker orphaned. Best-effort, never raises.
+    install_parent_death_signal()
     global _WORKER_ENGINE
     _WORKER_ENGINE = PricingEngine(
         _StubFeed(),  # type: ignore[arg-type]
@@ -95,17 +106,31 @@ class JointPool:
         *,
         workers: int = 2,
         deadline_s: float = 0.8,
+        data_dir: Path | None = None,
     ) -> None:
         self._config = config
         self._conventions = conventions
         self._workers = max(1, workers)
         self._deadline_s = deadline_s
+        # P2-1: where the worker-PID registry lives (for startup straggler reap).
+        # None ⇒ orphan-prevention registry disabled (tests that don't need it);
+        # the Job Object + parent-death signal still apply.
+        self._data_dir = data_dir
         self._executor: ProcessPoolExecutor | None = None
+        self._kill_job: WindowsKillJob | None = None
         self.timeouts = 0
         self.errors = 0
         self.calls = 0
 
     def start(self) -> None:
+        # P2-1 layer 4 (straggler reap from a prior crashed run) is done ONCE at
+        # app startup via ``cleanup_straggler_workers`` BEFORE any pool spawns —
+        # not here — so a second pool's start can't truncate the first pool's
+        # freshly-recorded PIDs. This pool only APPENDS its own PIDs (after warmup).
+        #
+        # P2-1 layer 1: parent-owned kill group (Windows Job Object with
+        # KILL_ON_JOB_CLOSE). Workers are assigned in after warmup spawns them.
+        self._kill_job = WindowsKillJob()
         self._executor = ProcessPoolExecutor(
             max_workers=self._workers,
             initializer=_pool_init,
@@ -128,6 +153,23 @@ class JointPool:
             log.info("joint_pool_warm", workers=self._workers)
         except Exception as exc:  # noqa: BLE001 - warmup is best-effort
             log.warning("joint_pool_warmup_failed", error=repr(exc))
+        # Workers are now spawned: bind them to the parent-owned kill group and
+        # record their PIDs so a future startup can reap them if we die abnormally.
+        self._register_workers()
+
+    def _register_workers(self) -> None:
+        """Assign spawned workers into the Windows kill-job (layer 1) and append
+        their PIDs to the registry (layer 4). Best-effort; safe to call more than
+        once (registry dedupes, re-assigning an already-in-job PID is a harmless
+        no-op)."""
+        if self._executor is None:
+            return
+        pids = _ensure_workers_spawned(self._executor, self._workers)
+        if self._kill_job is not None and self._kill_job.active:
+            for pid in pids:
+                self._kill_job.assign(pid)
+        if self._data_dir is not None and pids:
+            record_worker_pids(self._data_dir, pids)
 
     async def run_joint(
         self,
@@ -157,15 +199,30 @@ class JointPool:
             raise
 
     def shutdown(self) -> None:
-        if self._executor is not None:
-            self._executor.shutdown(wait=False, cancel_futures=True)
-            self._executor = None
-            log.info(
-                "joint_pool_stopped",
-                calls=self.calls,
-                timeouts=self.timeouts,
-                errors=self.errors,
-            )
+        # P2-1 layer 3: finally close/join. Cancel queued futures, then JOIN the
+        # workers (wait=True) so a CLEAN stop reaps its own children deterministically
+        # — the OS-level layers only ever matter on an ABNORMAL parent exit. The
+        # kill-job handle is closed last, in a finally, so it is released even if the
+        # join raises (and on an abnormal exit the OS closes it for us, triggering
+        # KILL_ON_JOB_CLOSE).
+        executor = self._executor
+        self._executor = None
+        try:
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
+                # Block until workers actually exit so none linger post-stop.
+                executor.shutdown(wait=True)
+        finally:
+            if self._kill_job is not None:
+                self._kill_job.close()
+                self._kill_job = None
+            if executor is not None:
+                log.info(
+                    "joint_pool_stopped",
+                    calls=self.calls,
+                    timeouts=self.timeouts,
+                    errors=self.errors,
+                )
 
 
 def _warm_probe() -> bool:  # pragma: no cover - trivial worker probe
@@ -257,15 +314,36 @@ class BookRiskPool:
     freshness guard then fails the CVaR cap CLOSED, never open). One worker is
     enough (the recompute is throttled to well inside the freshness window)."""
 
-    def __init__(self, *, workers: int = 1) -> None:
+    def __init__(self, *, workers: int = 1, data_dir: Path | None = None) -> None:
         self._workers = max(1, workers)
+        self._data_dir = data_dir
         self._executor: ProcessPoolExecutor | None = None
+        self._kill_job: WindowsKillJob | None = None
         self.calls = 0
         self.errors = 0
 
     def start(self) -> None:
-        self._executor = ProcessPoolExecutor(max_workers=self._workers)
+        # Straggler reap is done ONCE at app startup (see JointPool.start note).
+        self._kill_job = WindowsKillJob()
+        # Initializer arms parent-death detection in the worker (layer 2).
+        self._executor = ProcessPoolExecutor(
+            max_workers=self._workers, initializer=install_parent_death_signal
+        )
         log.info("book_risk_pool_started", workers=self._workers)
+
+    def register_workers(self) -> None:
+        """Bind spawned workers to the kill-job (layer 1) + record their PIDs
+        (layer 4). Unlike JointPool there is no warmup, so the caller invokes this
+        after ``start`` (workers spawn lazily on first submit; this polls briefly
+        for them). Best-effort."""
+        if self._executor is None:
+            return
+        pids = _ensure_workers_spawned(self._executor, self._workers, timeout_s=1.0)
+        if self._kill_job is not None and self._kill_job.active:
+            for pid in pids:
+                self._kill_job.assign(pid)
+        if self._data_dir is not None and pids:
+            record_worker_pids(self._data_dir, pids)
 
     async def run(self, inputs: BookRiskInputs) -> BookRiskSnapshot:
         """Run the full-book MC in a worker and return its snapshot. Awaiting the
@@ -275,15 +353,28 @@ class BookRiskPool:
         self.calls += 1
         loop = asyncio.get_running_loop()
         try:
-            return await loop.run_in_executor(
+            result = await loop.run_in_executor(
                 self._executor, _worker_book_risk, inputs
             )
         except Exception:
             self.errors += 1
             raise
+        # The worker has now spawned (lazy on first submit): bind it to the kill
+        # group + register its PID. Cheap + idempotent (registry dedupes).
+        self.register_workers()
+        return result
 
     def shutdown(self) -> None:
-        if self._executor is not None:
-            self._executor.shutdown(wait=False, cancel_futures=True)
-            self._executor = None
-            log.info("book_risk_pool_stopped", calls=self.calls, errors=self.errors)
+        # Layer 3: finally close/join, then release the kill-job handle.
+        executor = self._executor
+        self._executor = None
+        try:
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=True)
+                executor.shutdown(wait=True)
+        finally:
+            if self._kill_job is not None:
+                self._kill_job.close()
+                self._kill_job = None
+            if executor is not None:
+                log.info("book_risk_pool_stopped", calls=self.calls, errors=self.errors)
