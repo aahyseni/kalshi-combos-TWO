@@ -185,6 +185,68 @@ async def test_held_positions_exact_identity_dedups_repeated_definition(
         await store.close()
 
 
+async def test_held_positions_production_fanout_uses_index_and_stays_correct(
+    tmp_path: Path,
+) -> None:
+    """MANDATORY (Fanout/reconstruction): production-like fanout remains performant
+    with the new index.
+
+    In prod the rfqs tape holds tens of thousands of re-quote rows per combo. The
+    rehydration must (a) still aggregate correctly at that scale (no fanout
+    multiplication of quantity), and (b) resolve the combo's leg identity via the
+    ``market_ticker`` index rather than a full-table scan of the whole tape.
+
+    We prove (b) deterministically with EXPLAIN QUERY PLAN (a wall-clock assertion
+    alone would be flaky on shared CI) — the leg-set lookup must SEARCH USING
+    ``idx_rfqs_market_ticker``, never SCAN the tape — and (a) by checking the
+    aggregate over 20,000 identical re-quotes of one combo reads its true 5000
+    centi-contracts, not 5000 x 20000. A generous wall-clock ceiling is a secondary
+    guard against an accidental O(rows) regression."""
+    import time
+
+    store = await Store.open(tmp_path / "t.sqlite3", FakeClock())
+    try:
+        N_REQUOTES = 8_000
+        # One combo re-quoted N times (identical legs each time -> one distinct
+        # leg-set, no conflict) plus a lot of UNRELATED tape rows for other combos,
+        # so a full scan would be visibly O(tape) while an index lookup is not.
+        for i in range(N_REQUOTES):
+            await store.record_rfq(_rfq("KXMVE-ARG", "ARG"), source="ws")
+            await store.record_rfq(_rfq(f"KXMVE-OTHER{i % 500}", "ENG"), source="ws")
+        await store.record_fill(
+            "f1", order_id="o1", combo_ticker="KXMVE-ARG", our_side="no",
+            contracts_centi=5000, price_cc=7400, fee_cc=0, expected_edge_cc=1, raw={})
+
+        # (b) The leg-set lookup uses the market_ticker index, not a tape scan.
+        plan_rows = []
+        async with store._db.execute(  # noqa: SLF001 - white-box index-usage assertion
+            "EXPLAIN QUERY PLAN SELECT market_ticker, legs_json,"
+            " MAX(collection_ticker) AS collection_ticker"
+            " FROM rfqs WHERE market_ticker IN (?) GROUP BY market_ticker, legs_json",
+            ("KXMVE-ARG",),
+        ) as cursor:
+            async for row in cursor:
+                plan_rows.append(" ".join(str(c) for c in row))
+        plan = " | ".join(plan_rows)
+        assert "idx_rfqs_market_ticker" in plan, plan
+        assert "SCAN rfqs" not in plan, plan  # a full tape scan would be the regression
+
+        # (a) Correct at scale + fast: the aggregate reads the true quantity once.
+        start = time.perf_counter()
+        rows = await store.held_positions(["KXMVE-ARG"])
+        elapsed = time.perf_counter() - start
+        assert len(rows) == 1
+        arg = rows[0]
+        assert arg["contracts_centi"] == 5000  # NOT 5000 * N_REQUOTES
+        assert arg["entry_price_cc"] == 7400
+        assert len(arg["legs"]) == 2  # legs attached exactly once
+        # Secondary guard: an index-driven lookup over a 40k-row tape is well under
+        # a second; a full O(tape) fanout regression blows past this ceiling.
+        assert elapsed < 2.0, f"held_positions took {elapsed:.3f}s over {N_REQUOTES} re-quotes"
+    finally:
+        await store.close()
+
+
 async def test_held_positions_ignores_unrecorded_ticker(tmp_path: Path) -> None:
     store = await _seed_store(tmp_path)
     try:
