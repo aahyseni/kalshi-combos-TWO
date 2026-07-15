@@ -1842,6 +1842,16 @@ class StructuralConfig(StrictModel):
     # KXWC match would be misclassified (fine for the current knockout
     # rounds; revisit for the next tournament's group stage).
     knockout_series: list[str] = ["KXWC"]
+    # P0-7 PREFERRED — CONSERVATIVE shared-factor loading for the risk-MC
+    # conditioning of a KNOCKOUT total-corners fallback leg on its game's sampled
+    # scoreline intensity (corners settle including ET, so a level-after-90 scoreline
+    # opens an extra corners window — config ``pair_rho`` ``advance|corners`` measured
+    # a dog +0.23 ↔ fav −0.23 ET strength curve, pooled ~0). Small + width-bearing:
+    # NOT a fabricated strong correlation. 0.0 ⇒ conditioning off (production sample
+    # = the independent structural split). Applied ONLY to knockout total corners;
+    # group-format corners are measured ⊥ goals (``corners|total`` = 0.00) and cards
+    # have no defensible link ⇒ 0 (independence + the worse-tail challenger backstop).
+    corners_et_loading: float = 0.10
 
 
 class MarginTotalConfig(StrictModel):

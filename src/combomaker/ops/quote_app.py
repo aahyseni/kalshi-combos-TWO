@@ -434,6 +434,7 @@ class QuoteApp:
                 max_goals=_sc.max_goals,
                 knockout_series=tuple(_sc.knockout_series),
                 enabled=_sc.enabled,
+                corners_et_loading=_sc.corners_et_loading,
             )
             # Off-loop joint pricing (Phase 1). Live quote mode only: cold-combo
             # CPU runs in worker processes with a deadline so it can never wedge

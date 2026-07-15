@@ -56,6 +56,7 @@ from combomaker.sim.engine import (
     sample_leg_values,
 )
 from combomaker.sim.structural_book import (
+    CopulaConditioning,
     GamePlan,
     StructuralConfigView,
     build_game_plans,
@@ -149,19 +150,26 @@ class BookRiskSnapshot:
     # structural/same-game hedge — a balancing fill can lower them.
     production_es_99_cc: float = 0.0  # production-copula CVaR (mirror of es_99_cc)
     challenger_es_99_cc: float = 0.0  # correlation-inflated challenger CVaR
-    # P0-7: full-copula same-game dependence-bridge challenger CVaR. The structural
-    # split samples a game's structural block and its copula-only block SEPARATELY,
-    # discarding their same-game cross-block dependence. When a game straddles both
-    # blocks, the book is ALSO re-sampled full-copula (all same-game pairs coupled
-    # through the block correlation, at the CHALLENGER-inflated matrix) and its ES is
-    # folded into the governing model tail (gate on the WORSE tail). 0.0 when no game
-    # straddles both blocks (no bridge needed) or structural sampling is off.
+    # P0-7: full-copula same-game dependence-bridge challenger CVaR. P0-7 is now the
+    # CONDITIONED approach where a defensible measured scoreline-state link exists
+    # (the production sample conditions those straddling copula legs on the game's
+    # shared structural factor — see ``sim/structural_book``). This full-copula
+    # bridge REMAINS as the conservative BACKSTOP for leg types with NO defensible
+    # link (their copula-only block is still sampled independently of the structural
+    # block): when a game straddles both blocks the book is ALSO re-sampled
+    # full-copula (all same-game pairs coupled through the block correlation, at the
+    # CHALLENGER-inflated matrix) and its ES is folded into the governing model tail
+    # (gate on the WORSE tail). 0.0 when no game straddles both blocks or structural
+    # sampling is off.
     bridge_es_99_cc: float = 0.0
     # True iff the full-copula bridge challenger ran (a game held both a structural
-    # and a copula leg) — observability that the interim worse-tail gate is active,
-    # NOT a claim of exact all-leg hedging across the two blocks.
+    # and a copula leg) — observability that the worse-tail backstop is active for
+    # the unconditioned (no-defensible-link) part of a straddling game.
     bridge_active: bool = False
-    governing_model_es_99_cc: float = 0.0  # max(production, challenger, bridge) — model gate
+    # max(production[conditioned], challenger, bridge, structural-challenger,
+    # independent-split guard) — the model gate. The independent-split guard ensures
+    # the conditioned production tail is never reported below the independent split.
+    governing_model_es_99_cc: float = 0.0
     # DETERMINISTIC maximum loss: exact all-hit premium-at-risk (+ reserved
     # holdings). A hard upper bound the sampled ES can never exceed — gated as its
     # OWN axis (premium-at-risk cap), never maxed into the ES number.
@@ -479,6 +487,13 @@ class _SamplerBundle:
     sampler: _Sampler
     structural: bool
     bridge_needed: bool
+    # P0-7 PREFERRED: True iff the production ``sampler`` conditions at least one
+    # straddling copula leg on its game's shared structural factor (a defensible
+    # nonzero loading). When True the caller ALSO samples the UNCONDITIONED split
+    # (``split_sampler``) and folds its ES into the governing max, so the conditioned
+    # production tail is never reported below the independent split (never thinner).
+    conditioned: bool = False
+    split_sampler: _Sampler | None = None
 
 
 def _bridge_needed(
@@ -511,6 +526,84 @@ def _bridge_needed(
     return False
 
 
+def _copula_leg_loading(
+    ticker: str, is_knockout: bool, cfg: StructuralConfigView
+) -> float:
+    """The CONSERVATIVE shared-factor loading for ONE copula leg (P0-7 PREFERRED).
+
+    Returns 0 (independence — the fail-closed default) for every copula leg type
+    with NO defensible measured scoreline-state link, and a small positive loading
+    ONLY for a TOTAL-corners leg in a KNOCKOUT game (the one measured link: corners
+    settle including ET, so the extra-time window a level-after-90 scoreline opens
+    adds corners — config ``advance|corners`` ET strength curve). Group-format
+    corners are measured ⊥ goals (config ``corners|total`` = 0.00) ⇒ 0. Cards and any
+    other copula leg type ⇒ 0. A leg left at 0 keeps independence in the production
+    sample and is covered only by the worse-tail full-copula challenger (never
+    underestimating the tail). Loading magnitude is capped conservatively small (the
+    pooled ET effect is weak and orientation-dependent; we do not fabricate a strong
+    correlation)."""
+    from combomaker.pricing.legtypes import LegType, classify_leg
+
+    if cfg.corners_et_loading == 0.0 or not is_knockout:
+        return 0.0
+    if classify_leg(ticker) is LegType.CORNERS:
+        return float(max(0.0, min(0.30, cfg.corners_et_loading)))
+    return 0.0
+
+
+def _build_conditioning(
+    model: BookModel,
+    plans: Sequence[GamePlan],
+    copula_idx: Sequence[int],
+    cfg: StructuralConfigView,
+) -> CopulaConditioning:
+    """Map each straddling copula leg → (its structural game plan, conservative
+    loading) for the P0-7 PREFERRED production-sample conditioning.
+
+    A copula leg is conditioned only when it shares a game (via the pricer's
+    ``game_key``) with a structural plan AND its leg type carries a defensible
+    nonzero loading (``_copula_leg_loading``). Cross-game / ungamed / group-format /
+    no-defensible-link copula legs get plan −1 / loading 0 ⇒ sampled plain-copula
+    (independent of the structural block) exactly as before, and covered by the
+    worse-tail challenger. Empty maps ⇒ conditioning is an exact no-op."""
+    from combomaker.pricing.grouping import game_key
+
+    ticker_of_index = {i: t for t, i in model.leg_index.items()}
+    # game_key(event) -> plan index, for every structural game.
+    plan_of_game: dict[str, int] = {}
+    knockout_of_game: dict[str, bool] = {}
+    for pi, plan in enumerate(plans):
+        for gidx in plan.global_indices:
+            event = model.event_by_index.get(gidx)
+            if not event:
+                continue
+            gk = game_key(event)
+            plan_of_game.setdefault(gk, pi)
+            # A game is knockout iff its structural legs were inverted under the
+            # knockout format — proxied by the leg-series prefix the config lists.
+            series = ticker_of_index.get(gidx, "").split("-", 1)[0].upper()
+            knockout_of_game[gk] = any(
+                series.startswith(p.upper()) for p in cfg.knockout_series
+            )
+    plan_map: dict[int, int] = {}
+    load_map: dict[int, float] = {}
+    for cidx in copula_idx:
+        event = model.event_by_index.get(cidx)
+        if not event:
+            continue
+        gk = game_key(event)
+        pi = plan_of_game.get(gk, -1)
+        if pi < 0:
+            continue
+        ticker = ticker_of_index.get(cidx, "")
+        beta = _copula_leg_loading(ticker, knockout_of_game.get(gk, False), cfg)
+        if beta == 0.0:
+            continue
+        plan_map[cidx] = pi
+        load_map[cidx] = beta
+    return CopulaConditioning(plan_map, load_map)
+
+
 def _select_sampler(
     model: BookModel, structural_cfg: StructuralConfigView | None
 ) -> _SamplerBundle:
@@ -535,6 +628,11 @@ def _select_sampler(
     events = [model.event_by_index.get(i) for i in range(len(model.legs))]
     marginals = [leg.p for leg in model.legs]
     plans, copula_idx = build_game_plans(tickers, events, marginals, structural_cfg)
+    # P0-7 PREFERRED: condition straddling copula legs on their game's shared
+    # structural factor IN THE PRODUCTION SAMPLE (where a defensible measured link
+    # exists); legs with no link stay independent + covered by the worse-tail bridge.
+    conditioning = _build_conditioning(model, plans, copula_idx, structural_cfg)
+    is_conditioned = conditioning.active()
 
     def _structural_sampler(
         leg_models: Sequence[LegModel],
@@ -542,12 +640,26 @@ def _select_sampler(
         n_draw: int,
         r: np.random.Generator,
     ) -> NDArray[np.float64]:
+        return sample_structural_values(
+            plans, copula_idx, leg_models, c, n_draw, r, conditioning=conditioning
+        )
+
+    def _split_sampler(
+        leg_models: Sequence[LegModel],
+        c: NDArray[np.float64],
+        n_draw: int,
+        r: np.random.Generator,
+    ) -> NDArray[np.float64]:
+        # The UNCONDITIONED structural split (independent copula block) — the guard
+        # baseline the conditioned production tail may never be reported below.
         return sample_structural_values(plans, copula_idx, leg_models, c, n_draw, r)
 
     return _SamplerBundle(
         _structural_sampler,
         structural=bool(plans),
         bridge_needed=_bridge_needed(model, plans, copula_idx),
+        conditioned=is_conditioned,
+        split_sampler=_split_sampler if is_conditioned else None,
     )
 
 
@@ -839,7 +951,15 @@ def compute_book_risk(
     # unconditionally (consumed only when that challenger runs) so the production/
     # correlation-challenger/bridge streams are byte-identical whether or not the
     # structural challenger is enabled — enabling it never perturbs the other books.
-    seq_prod, seq_chal, seq_bridge, seq_struct = np.random.SeedSequence(seed).spawn(4)
+    # P0-7 PREFERRED: a FIFTH substream for the independent-split GUARD — the
+    # unconditioned structural split, folded into the governing max ONLY when the
+    # production sample is conditioned, so the conditioned production tail can never
+    # be reported BELOW the independent split (the conditioning may only make the
+    # modeled tail fatter or equal, never thinner — spec P0-7). Spawned uncondition-
+    # ally so the other four streams are byte-identical whether or not it is consumed.
+    seq_prod, seq_chal, seq_bridge, seq_struct, seq_split = (
+        np.random.SeedSequence(seed).spawn(5)
+    )
     rng = np.random.default_rng(seq_prod)
     values = _sampler(model.legs, corr, n_samples, rng)
 
@@ -914,6 +1034,22 @@ def compute_book_risk(
         # the governing max — the ruin axis gates on the worse of the three books.
         bridge_p_ruin = _p_ruin_from_pnl(book_b, current_equity_cc, ruin_floor_cc)
 
+    # --- P0-7 PREFERRED: independent-split GUARD ------------------------------
+    # When the production sample is CONDITIONED (a straddling copula leg loaded onto
+    # its game's shared structural factor), also sample the UNCONDITIONED split and
+    # fold its ES / P(ruin) into the governing max. This enforces the spec invariant
+    # that the conditioning may only make the modeled tail FATTER or equal, never
+    # thinner: even a (hedging) negative-covariance case cannot report a governing
+    # tail below the independent split. A no-op when conditioning is off.
+    split_es = 0.0
+    split_p_ruin = 0.0
+    if bundle.conditioned and bundle.split_sampler is not None:
+        rng_sp = np.random.default_rng(seq_split)  # spawned substream (M2 §4.3)
+        values_sp = bundle.split_sampler(model.legs, corr, n_samples, rng_sp)
+        book_sp = _book_pnl_from_values(values_sp, model.positions)
+        _, split_es = _es_from_pnl(book_sp, HEADLINE_LEVEL)
+        split_p_ruin = _p_ruin_from_pnl(book_sp, current_equity_cc, ruin_floor_cc)
+
     # --- P1.9: structural-parameter challenger (anti-monoculture on INPUTS) ----
     # Re-invert + re-sample the structural games under a conservatively-perturbed
     # StructuralConfigView (goal rates via the re-fit, DC rho, ET/shootout/half-share
@@ -958,13 +1094,19 @@ def compute_book_risk(
     # worse of the structural-split and full-copula tails. P1.9: the
     # structural-parameter challenger ES (present only when it ran) joins the max
     # too — the model tail gates on the worst credible structural INPUT regime.
-    governing_model_es = max(es_99, challenger_es, bridge_es, struct_es)
+    # P0-7 PREFERRED: the independent-split guard ES (present only when the production
+    # sample is conditioned) also joins the max, so the conditioned tail is never
+    # reported below the independent split (conditioning may only fatten, never thin).
+    governing_model_es = max(es_99, challenger_es, bridge_es, struct_es, split_es)
 
     # P1-1: gate ruin on the WORST credible model (production vs challenger vs
-    # bridge vs P1.9 structural challenger), exactly as the ES axis does. ``p_ruin``
-    # is the production value above; the reported/gated number is the max so a single
-    # correlation OR structural-input error cannot understate ruin (fail-closed).
-    p_ruin = max(p_ruin, challenger_p_ruin, bridge_p_ruin, struct_p_ruin)
+    # bridge vs P1.9 structural challenger vs P0-7 independent-split guard), exactly
+    # as the ES axis does. ``p_ruin`` is the production value above; the reported/
+    # gated number is the max so a single correlation OR structural-input error
+    # cannot understate ruin (fail-closed).
+    p_ruin = max(
+        p_ruin, challenger_p_ruin, bridge_p_ruin, struct_p_ruin, split_p_ruin
+    )
     # P1-2: the fail-closed UPPER confidence bound on the governing p̂. All three
     # books were sampled at ``n_samples``; that is the n of the interval. z == 0
     # (the default) leaves it == p_ruin, so the committed-book behaviour is
@@ -1098,19 +1240,27 @@ def _tail_axes_from_pnl(
     current_equity_cc: int | None,
     ruin_floor_cc: float | None,
     bridge_pnl: NDArray[np.float64] | None = None,
+    split_pnl: NDArray[np.float64] | None = None,
     ruin_prob_ci_z: float = 0.0,
 ) -> _TailAxes:
     """Roll a per-scenario book P&L vector (and its correlation-inflated
-    challenger re-sample, plus the optional P0-7 full-copula bridge re-sample)
-    into the separated tail axes (P0-3 separation preserved: the sampled model ES
-    is NEVER max'd with the deterministic maximum).
+    challenger re-sample, plus the optional P0-7 full-copula bridge re-sample and
+    the optional P0-7 PREFERRED unconditioned-split guard) into the separated tail
+    axes (P0-3 separation preserved: the sampled model ES is NEVER max'd with the
+    deterministic maximum).
 
     ``bridge_pnl`` (P0-7) is the full-copula same-game dependence-bridge re-sample,
     present only when the structural split straddles a game (a structural leg AND a
     copula leg on the SAME game, whose cross-block dependence the split discards).
     Its ES joins the governing max so the model tail gates on the WORSE of the
     structural-split and full-copula tails. None ⇒ no bridge (plain copula, or no
-    straddling game) ⇒ it never enters the max."""
+    straddling game) ⇒ it never enters the max.
+
+    ``split_pnl`` (P0-7 PREFERRED) is the UNCONDITIONED structural-split re-sample,
+    present only when the production ``pnl`` is CONDITIONED (a straddling copula leg
+    loaded onto its game's shared factor). Its ES joins the governing max too, so the
+    conditioned tail is never reported below the independent split (conditioning may
+    only fatten, never thin). None ⇒ not conditioned ⇒ never enters the max."""
     ev = float(pnl.mean()) if pnl.size else 0.0
     _, es = _es_from_pnl(pnl, HEADLINE_LEVEL)
     if challenger_pnl is not None and challenger_pnl.size:
@@ -1121,6 +1271,10 @@ def _tail_axes_from_pnl(
         _, bridge_es = _es_from_pnl(bridge_pnl, HEADLINE_LEVEL)
     else:
         bridge_es = 0.0
+    if split_pnl is not None and split_pnl.size:
+        _, split_es = _es_from_pnl(split_pnl, HEADLINE_LEVEL)
+    else:
+        split_es = 0.0
     # P1-1: gate ruin on the WORST credible model — production vs the
     # correlation-inflated challenger vs the optional full-copula bridge — exactly
     # as the governing ES does. A single correlation error must not understate ruin.
@@ -1135,6 +1289,13 @@ def _tail_axes_from_pnl(
             p_ruin,
             _p_ruin_from_pnl(bridge_pnl, current_equity_cc, ruin_floor_cc),
         )
+    if split_pnl is not None:
+        # P0-7 PREFERRED: fold the unconditioned-split ruin so the conditioned tail
+        # never reports a ruin below the independent split.
+        p_ruin = max(
+            p_ruin,
+            _p_ruin_from_pnl(split_pnl, current_equity_cc, ruin_floor_cc),
+        )
     # P1-2: the ruin gate reads the UPPER Wilson bound at the SAME n the governing
     # p̂ came from — the smallest scenario count across the sampled books (the
     # widest, most conservative interval), so a p̂ that only just clears the budget
@@ -1147,12 +1308,14 @@ def _tail_axes_from_pnl(
         )
     if bridge_pnl is not None and bridge_pnl.size:
         n_ruin = min(n_ruin, int(bridge_pnl.size)) if n_ruin else int(bridge_pnl.size)
+    if split_pnl is not None and split_pnl.size:
+        n_ruin = min(n_ruin, int(split_pnl.size)) if n_ruin else int(split_pnl.size)
     p_ruin_upper = wilson_upper_bound(p_ruin, n_ruin, ruin_prob_ci_z)
     return _TailAxes(
         ev_cc=ev,
         es_99_cc=es,
         challenger_es_99_cc=challenger_es,
-        governing_model_es_99_cc=max(es, challenger_es, bridge_es),
+        governing_model_es_99_cc=max(es, challenger_es, bridge_es, split_es),
         deterministic_max_loss_cc=deterministic_max_loss_cc,
         gross_settlement_notional_cc=gross_cc,
         p_ruin=p_ruin,
@@ -1295,6 +1458,8 @@ def evaluate_candidate_book_risk(
     # tail axes fall back to their deterministic reserves only.
     pre_bridge_pnl: NDArray[np.float64] | None = None
     post_bridge_pnl: NDArray[np.float64] | None = None
+    pre_split_pnl: NDArray[np.float64] | None = None
+    post_split_pnl: NDArray[np.float64] | None = None
     if model.legs:
         corr = model.corr_for_band(band)
         # P0-8: same-game-only inflation; cross-game rho preserved.
@@ -1303,11 +1468,15 @@ def evaluate_candidate_book_risk(
         )
         bundle = _select_sampler(model, structural_cfg)
         sampler = bundle.sampler
-        # THREE substreams (production + challenger + P0-7 bridge). The bridge
-        # substream is spawned unconditionally so the production/challenger streams
-        # match whether or not the bridge fires (no determinism drift), and consumed
-        # only when the structural split straddles a game.
-        seq_prod, seq_chal, seq_bridge = np.random.SeedSequence(seed).spawn(3)
+        # FOUR substreams (production + challenger + P0-7 bridge + P0-7 PREFERRED
+        # independent-split guard). All spawned unconditionally so the production/
+        # challenger streams match whether or not the bridge/split fire (no
+        # determinism drift); the bridge stream is consumed only when a game
+        # straddles both blocks, the split stream only when the production sample is
+        # conditioned.
+        seq_prod, seq_chal, seq_bridge, seq_split = (
+            np.random.SeedSequence(seed).spawn(4)
+        )
         values = sampler(
             model.legs, corr, n_samples, np.random.default_rng(seq_prod)
         )
@@ -1329,6 +1498,16 @@ def evaluate_candidate_book_risk(
             )
             pre_bridge_pnl = book_pnl(values_b, pre_combos)
             post_bridge_pnl = book_pnl(values_b, post_combos)
+        # P0-7 PREFERRED: unconditioned-split guard (only when the production sample
+        # is conditioned). PRE and POST scored on the SAME split matrix (common
+        # random numbers); the split ES joins each book's governing max so the
+        # conditioned tail is never reported below the independent split.
+        if bundle.conditioned and bundle.split_sampler is not None:
+            values_sp = bundle.split_sampler(
+                model.legs, corr, n_samples, np.random.default_rng(seq_split)
+            )
+            pre_split_pnl = book_pnl(values_sp, pre_combos)
+            post_split_pnl = book_pnl(values_sp, post_combos)
     else:
         empty_pnl = np.zeros(0, dtype=np.float64)
         pre_pnl = post_pnl = pre_pnl_c = post_pnl_c = empty_pnl
@@ -1344,6 +1523,7 @@ def evaluate_candidate_book_risk(
         current_equity_cc=current_equity_cc,
         ruin_floor_cc=ruin_floor_cc,
         bridge_pnl=pre_bridge_pnl,
+        split_pnl=pre_split_pnl,
         ruin_prob_ci_z=ruin_prob_ci_z,
     )
     post_axes = _tail_axes_from_pnl(
@@ -1354,6 +1534,7 @@ def evaluate_candidate_book_risk(
         current_equity_cc=current_equity_cc,
         ruin_floor_cc=ruin_floor_cc,
         bridge_pnl=post_bridge_pnl,
+        split_pnl=post_split_pnl,
         ruin_prob_ci_z=ruin_prob_ci_z,
     )
     candidate_ev = post_axes.ev_cc - pre_axes.ev_cc
