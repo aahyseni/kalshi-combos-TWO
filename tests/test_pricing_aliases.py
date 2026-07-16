@@ -266,3 +266,73 @@ def test_book_risk_pool_initializer_installs_aliases() -> None:
     assert game_key(CHAMP_EVENT) == GAME
     with pytest.raises(ValueError):
         _book_risk_pool_init({BTTS: SYN_ADV_ARG})  # fails LOUDLY, in-worker too
+
+
+# --- pregame schedule config plumbing (tier a2, the final-day gate fix) ----------
+# The champion market's expected_expiration (14:00Z) precedes the final's ~19:00Z
+# kickoff, so the expiry-minus-offset ESTIMATE declares champion legs in-play
+# from ~09:30Z on final day. The operator-set explicit schedule entry is the
+# designed precision tier for exactly this; here we pin the NEW config plumbing
+# (validation + the gate consuming a config-built cache). Ladder mechanics are
+# covered in tests/test_pregame_precision.py.
+
+
+def test_scheduled_starts_config_validation() -> None:
+    from combomaker.ops.config import FiltersConfig
+
+    ok = FiltersConfig(
+        pregame_scheduled_starts={CHAMP_EVENT: "2026-07-19T19:00:00+00:00"}
+    )
+    assert CHAMP_EVENT in ok.pregame_scheduled_starts
+    with pytest.raises(Exception, match="naive"):
+        FiltersConfig(pregame_scheduled_starts={CHAMP_EVENT: "2026-07-19T19:00:00"})
+    with pytest.raises(Exception, match="unparseable"):
+        FiltersConfig(pregame_scheduled_starts={CHAMP_EVENT: "final kickoff"})
+
+
+def test_schedule_entry_overrides_the_broken_champion_estimate() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from combomaker.marketdata.metadata import MarketMeta, MetadataCache
+    from combomaker.ops.config import FiltersConfig
+    from combomaker.rfq.pregame import PregameGate
+    from combomaker.rfq.schedule import ScheduleCache
+    from tests.test_pregame_precision import FakeClock
+
+    # Final day, 15:00Z: 4h BEFORE the 19:00Z kickoff, but AFTER the champion
+    # market's 14:00Z expected_expiration (the broken anchor).
+    now = datetime(2026, 7, 19, 15, 0, tzinfo=UTC)
+    clock = FakeClock(start=now)
+    meta = MetadataCache(None, clock)  # type: ignore[arg-type]
+    meta._markets[CHAMP_AR] = MarketMeta(  # noqa: SLF001 (test seam)
+        ticker=CHAMP_AR,
+        status="active",
+        grid=None,
+        event_ticker=CHAMP_EVENT,
+        close_time=None,
+        expected_expiration_time=datetime(2026, 7, 19, 14, 0, tzinfo=UTC),
+        raw={},
+        fetched_mono_ns=clock.monotonic_ns(),
+    )
+    cfg = FiltersConfig(
+        pregame_scheduled_starts={CHAMP_EVENT: "2026-07-19T19:00:00+00:00"}
+    )
+    # The same construction quote_app now performs from the config field.
+    cache = ScheduleCache(
+        {
+            ev: datetime.fromisoformat(raw)
+            for ev, raw in cfg.pregame_scheduled_starts.items()
+        }
+    )
+    with_schedule = PregameGate(cfg, meta, clock, cache)
+    resolved = with_schedule.leg_start(CHAMP_AR)
+    assert resolved is not None and resolved.precise is True
+    assert resolved.start == datetime(2026, 7, 19, 19, 0, tzinfo=UTC)
+    assert clock.now() < resolved.start  # 15:00Z is PREGAME again
+
+    # Without the entry the estimate anchors on 14:00Z − offset ⇒ already
+    # "started" hours before kickoff (the bug this plumbing exists to fix).
+    without = PregameGate(cfg, meta, clock, ScheduleCache())
+    est = without.leg_start(CHAMP_AR)
+    assert est is not None and est.precise is False
+    assert est.start < now - timedelta(hours=1)

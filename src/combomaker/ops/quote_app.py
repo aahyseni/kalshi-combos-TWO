@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import sys
+from datetime import datetime
 from decimal import Decimal
 from fractions import Fraction
 from typing import Any
@@ -59,6 +60,7 @@ from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.intake import RfqIntake
 from combomaker.rfq.lifecycle import LifecycleConfig, QuoteLifecycle
 from combomaker.rfq.models import Rfq, RfqLeg
+from combomaker.rfq.schedule import ScheduleCache
 from combomaker.risk.balance import BalanceTracker, StaleBalanceError
 from combomaker.risk.breakers import BreakerInputs, CircuitBreakers, RateLimitWindow
 from combomaker.risk.exposure import ExposureBook, LegRef, OpenPosition
@@ -448,7 +450,19 @@ class QuoteApp:
                 conventions, self._clock, stale_after_s=BALANCE_STALE_AFTER_S
             )
             watchdog = StarvationWatchdog(threshold=risk_cfg.starvation_threshold)
-            rfq_filter = RfqFilter(config.filters, feed, metadata, killswitch, self._clock)
+            # Pregame precision tier a2: an operator-set explicit schedule table
+            # (config-validated tz-aware ISO strings -> ScheduleCache). Empty
+            # default = tier inactive, identical to the always-empty cache the
+            # gate constructed before this plumbing existed.
+            schedule = ScheduleCache(
+                {
+                    event_ticker: datetime.fromisoformat(raw)
+                    for event_ticker, raw in config.filters.pregame_scheduled_starts.items()
+                }
+            )
+            rfq_filter = RfqFilter(
+                config.filters, feed, metadata, killswitch, self._clock, schedule
+            )
             # Phase 5 (R3): inventory skew + widen-vs-decline policies, both DARK
             # by default (SkewConfig.enabled / WidenConfig.enabled False ⇒ computed
             # + logged, passed as 0 / non-blocking). The skew's headroom

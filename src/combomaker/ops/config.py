@@ -260,6 +260,37 @@ class FiltersConfig(StrictModel):
     # (2026-07-14: an MLB leg priced 41% vs 58% true, ~3 days out, got picked off).
     # Empty default = no horizon limit; the armed config sets KXMLB: 24.0.
     max_pregame_hours_by_prefix: dict[str, float] = {}
+    # EXPLICIT scheduled starts (event_ticker -> ISO-8601 UTC datetime string),
+    # the pregame ladder's precision tier a2 (``ScheduleCache``). An OPERATOR-SET
+    # table for exact keys only (defense #2: no fuzzy matching) — for markets
+    # whose expiry-minus-offset estimate is unusable. Motivating case
+    # (2026-07-16): KXMENWORLDCUP-26 expected_expiration is 14:00Z on final day
+    # — 5h BEFORE kickoff — so the estimate declared champion legs in-play from
+    # 09:30Z; a negative offset was rejected as fail-OPEN (Kalshi shifting the
+    # anchor would admit hours of in-play), while a fixed absolute start cannot
+    # drift. Entries must parse tz-aware; naive/invalid ⇒ load error. Empty
+    # default = tier inactive (bit-identical).
+    pregame_scheduled_starts: dict[str, str] = {}
+
+    @field_validator("pregame_scheduled_starts")
+    @classmethod
+    def _validate_scheduled_starts(cls, v: dict[str, str]) -> dict[str, str]:
+        from datetime import datetime
+
+        for event_ticker, raw in v.items():
+            try:
+                parsed = datetime.fromisoformat(raw)
+            except ValueError as exc:
+                raise ValueError(
+                    f"pregame_scheduled_starts[{event_ticker}]: unparseable "
+                    f"datetime {raw!r}"
+                ) from exc
+            if parsed.tzinfo is None:
+                raise ValueError(
+                    f"pregame_scheduled_starts[{event_ticker}]: naive datetime "
+                    f"{raw!r} — no clock, would misgate (must be tz-aware UTC)"
+                )
+        return v
 
     # --- Precision ladder margins (Phase 5, R3 Part B) -----------------------
     # Split the single start buffer into TWO margins applied to a PRECISE start
