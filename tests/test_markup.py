@@ -60,3 +60,70 @@ def test_markup_for_returns_sport_and_cc() -> None:
     assert p.markup_for(["KXNFLGAME-x"]) == ("other", 0)
     # mixed-sport combo => 'other' => no soccer-markup leak onto the MLB leg
     assert p.markup_for(["KXWCADVANCE-x", "KXMLBGAME-y"]) == ("other", 0)
+
+
+# --- #37 corners edge-floor: per-series markup adders -------------------------
+
+
+def _adder_cfg(**kw: object) -> MarkupConfig:
+    return MarkupConfig(
+        enabled=True,
+        soccer=SportMarkupConfig(enabled=True, markup_cc=100),
+        series_adders_cc={"KXWCCORNERS": 300, "KXWCTCORNERS": 300},
+        **kw,  # type: ignore[arg-type]
+    )
+
+
+def test_corners_leg_adds_edge_floor_once() -> None:
+    p = MarkupPolicy.from_config(_adder_cfg())
+    sport, cc = p.markup_for(
+        ["KXWCADVANCE-26JUL19ESPARG-ARG", "KXWCCORNERS-26JUL19ESPARG-9"]
+    )
+    assert (sport, cc) == ("soccer", 400)  # 1c sport markup + 3c corners floor
+
+
+def test_two_corners_series_max_not_sum() -> None:
+    p = MarkupPolicy.from_config(_adder_cfg())
+    _, cc = p.markup_for(
+        ["KXWCCORNERS-26JUL19ESPARG-9", "KXWCTCORNERS-26JUL19ESPARG-ESP5"]
+    )
+    assert cc == 400  # one defensive floor per combo, never 100+300+300
+
+
+def test_no_corners_leg_unchanged() -> None:
+    p = MarkupPolicy.from_config(_adder_cfg())
+    _, cc = p.markup_for(
+        ["KXWCADVANCE-26JUL19ESPARG-ARG", "KXWCTOTAL-26JUL19ESPARG-3"]
+    )
+    assert cc == 100
+
+
+def test_adder_never_wakes_a_dark_sport() -> None:
+    # Sport markup dark (master off) ⇒ adder must NOT apply — dark stays
+    # bit-identical dark (the markup=0 parity invariant).
+    cfg = MarkupConfig(
+        enabled=False,
+        soccer=SportMarkupConfig(enabled=True, markup_cc=100),
+        series_adders_cc={"KXWCCORNERS": 300},
+    )
+    p = MarkupPolicy.from_config(cfg)
+    _, cc = p.markup_for(["KXWCCORNERS-26JUL19ESPARG-9"])
+    assert cc == 0
+
+
+def test_adder_not_applied_when_sport_markup_zero() -> None:
+    cfg = MarkupConfig(
+        enabled=True,
+        soccer=SportMarkupConfig(enabled=True, markup_cc=0),
+        series_adders_cc={"KXWCCORNERS": 300},
+    )
+    p = MarkupPolicy.from_config(cfg)
+    _, cc = p.markup_for(["KXWCCORNERS-26JUL19ESPARG-9"])
+    assert cc == 0
+
+
+def test_adder_rejected_negative() -> None:
+    import pytest
+
+    with pytest.raises(ValueError):
+        MarkupConfig(enabled=True, series_adders_cc={"KXWCCORNERS": -1})

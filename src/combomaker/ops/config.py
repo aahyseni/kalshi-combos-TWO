@@ -1939,6 +1939,25 @@ class MarkupConfig(StrictModel):
     enabled: bool = False  # master switch
     soccer: SportMarkupConfig = Field(default_factory=SportMarkupConfig)
     mlb: SportMarkupConfig = Field(default_factory=SportMarkupConfig)
+    # Per-leg-series defensive markup ADDERS (series ticker prefix -> extra cc on
+    # top of the sport markup). First use: the #37 corners edge-floor — corners
+    # combos measured 3-5c RICH vs our (correct) fair (2026-07-15 rho measurement:
+    # corners⊥goals confirmed at every traded line, so the gap is market richness,
+    # NOT a correlation error) ⇒ quote them fair + markup + 3c instead of leaking
+    # the richness to adverse selection. Applied ONCE per combo (max matching
+    # adder, never summed) and ONLY when the combo's sport markup is enabled —
+    # a dark sport stays bit-identical dark.
+    series_adders_cc: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator("series_adders_cc")
+    @classmethod
+    def _adders_sane(cls, v: dict[str, int]) -> dict[str, int]:
+        for key, cc in v.items():
+            if not key:
+                raise ValueError("series_adders_cc key must be a non-empty prefix")
+            if cc < 0:
+                raise ValueError(f"series_adders_cc[{key}] must be >= 0, got {cc}")
+        return v
 
 
 class PricingConfig(StrictModel):
