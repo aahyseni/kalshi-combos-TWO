@@ -339,7 +339,8 @@ class PricingEngine:
         yes_cap, no_cap = free_money_caps(leg_books, sides)
 
         markup_sport, markup_cc = self._markup.markup_for(
-            leg.market_ticker for leg in rfq.legs
+            (leg.market_ticker for leg in rfq.legs),
+            fair_cc=int(round(joint.p * 10_000)),
         )
         if markup_cc:
             log.debug(

@@ -24,6 +24,7 @@ any resync (feed ordering guarantees that).
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any, Protocol
@@ -44,7 +45,9 @@ from combomaker.ops.pricing_pool import (
     BookRiskPool,
     CandidateBookRiskInputs,
     JointPool,
+    StateWorstCaseInputs,
     _worker_candidate_book_risk,
+    _worker_state_worst_case,
 )
 from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.fees import FeeModel, FeeType, FeeUnknownError
@@ -72,7 +75,7 @@ from combomaker.risk.limits import (
     threshold_cc,
 )
 from combomaker.risk.markouts import MarkoutSubject, MarkoutTracker
-from combomaker.risk.reservation import RiskReservationService
+from combomaker.risk.reservation import ReserveResult, RiskReservationService
 from combomaker.risk.skew import (
     GameSkewCache,
     SkewLimits,
@@ -92,11 +95,26 @@ from combomaker.sim.book_risk import (
     compute_book_risk,
     modeled_cost_basis_cc,
 )
+from combomaker.sim.state_worst_case import (
+    GameWorstCase,
+    entity_from_position,
+    quote_from_open_quote,
+)
 from combomaker.sim.structural_book import StructuralConfigView
 
 log = get_logger(__name__)
 
 JsonDict = dict[str, Any]
+
+# CONFIRM-PATH LAST-LOOK MC WAIVER (handoff Problem A): the ONLY reservation-
+# denial breach reasons the waiver may lift — the two deliberately comonotone-
+# OVERSTATED analytic per-game bounds whose true state-consistent loss the exact
+# scoreline enumeration can certify. ANY other enforced breach in the denial ⇒
+# decline exactly as today (the waiver never touches gross / per-combo / daily /
+# CVaR / ruin / notional / slate caps or any halt).
+WAIVABLE_RESERVATION_BREACHES: frozenset[ReasonCode] = frozenset(
+    {ReasonCode.SKIP_GAME_LOSS_CAP, ReasonCode.SKIP_DIRECTIONAL_CAP}
+)
 
 
 class QuoteSender(Protocol):
@@ -183,6 +201,20 @@ class LifecycleConfig:
     # -50.0 ⇒ allow the worst challenger EV down to −0.50 of edge) to opt in. Strictly
     # additive — it can only flip an already-admitted confirm to a decline.
     worst_challenger_ev_tolerance_cc: float = float("-inf")
+    # LAST-LOOK MC WAIVER (handoff Problem A — CONFIRM-PATH ONLY; see
+    # RiskConfig.lastlook_mc_waiver_enabled for the full rationale). When True, a
+    # confirm-time reservation denial whose enforced breaches are ALL game-loss /
+    # mutex-directional cap breaches (WAIVABLE_RESERVATION_BREACHES) runs the
+    # exact state-consistent per-game worst-case enumeration OFF-LOOP and, ONLY
+    # if every breached game is CERTIFIED within the SAME game-loss budget,
+    # retries the reservation ONCE with the per-game certificates. Default OFF
+    # (byte-identical prior behaviour: the denial declines DECLINE_RISK_LIMIT).
+    lastlook_mc_waiver_enabled: bool = False
+    # Wall budget (seconds) for the WHOLE waiver evaluation (build + off-loop
+    # enumeration + at most one rebuild). Must fit inside the exchange's 3s
+    # confirm window ALONGSIDE the candidate gate's own budget; exceeding it
+    # DECLINES (fail-closed — never let the waiver silently consume the window).
+    lastlook_mc_waiver_deadline_s: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,6 +381,11 @@ class QuoteLifecycle:
         self._fee_type = fee_type
         self._fee_multiplier = fee_multiplier
         self._markouts = MarkoutTracker(store.record_markout)
+        # LAST-LOOK MC WAIVER observability: the per-confirm waiver audit record
+        # ({granted, worst_case_cc, games}), set ONLY when a waiver ATTEMPT ran
+        # for the confirm in flight, emitted on that confirm's ``risk_audit``
+        # line and reset. None ⇒ no waiver attempted (the default fields).
+        self._waiver_audit: dict[str, Any] | None = None
         self._open: dict[str, OpenQuoteState] = {}       # quote_id → state
         self._by_rfq: dict[str, str] = {}                # rfq_id → quote_id
         self._executed_states: dict[str, OpenQuoteState] = {}
@@ -1267,20 +1304,34 @@ class QuoteLifecycle:
         )
 
     def _reserve_headroom(
-        self, reservation_id: str, quote_id: str, state: OpenQuoteState
-    ) -> bool:
+        self,
+        reservation_id: str,
+        quote_id: str,
+        state: OpenQuoteState,
+        *,
+        waived_games: Mapping[str, GameWorstCase] | None = None,
+    ) -> ReserveResult | None:
         """Reserve risk headroom for a contemplated fill BEFORE the confirm
-        round-trip (R3 Phase 3). Returns True to proceed with the confirm, False
-        to decline.
-
-        No reservation service ⇒ always True (behaviour unchanged from Phase 2 —
+        round-trip (R3 Phase 3). Returns the ``ReserveResult`` (granted, or
+        denied WITH its enforced breaches — the last-look MC waiver needs the
+        breach reasons, never just a bool), or None when no reservation service
+        is wired (proceed with the confirm — behaviour unchanged from Phase 2:
         the check already ran at last look; the race only matters under fan-out).
+
         With a service, the reservation re-checks the caps against
         committed + all outstanding reservations + this fill, atomically, and
-        consumes the headroom on grant. Denied ⇒ False (an ENFORCED cap breach —
-        impossible while caps_shadow_mode is True, so SHADOW-mode behaviour is
-        unchanged; real once the operator flips caps to enforce). The reservation
-        SHARES the lifecycle's shadow split, so a shadow breach never denies.
+        consumes the headroom on grant. Denied ⇒ ``granted`` False (an ENFORCED
+        cap breach — impossible while caps_shadow_mode is True, so SHADOW-mode
+        behaviour is unchanged; real once the operator flips caps to enforce).
+        The reservation SHARES the lifecycle's shadow split, so a shadow breach
+        never denies.
+
+        ``waived_games`` (CONFIRM-PATH last-look MC waiver): per-game
+        state-consistent worst-case certificates, passed ONLY by the waiver's
+        single reservation RETRY after a denial whose every enforced breach was
+        a game-loss / mutex-directional cap breach. Forwarded verbatim to the
+        service (which re-validates each certificate against the live game-loss
+        budget at the check site). Every other caller leaves the default None.
 
         NOTE (conservative, intended): this quote's OWN open-quote record is still
         in the exposure book here (it is dropped only at the end of
@@ -1293,9 +1344,9 @@ class QuoteLifecycle:
         transient: after commit + ``_drop_quote`` the book holds the position once
         and the open quote is gone, so the steady-state total is exact."""
         if self._reservation is None:
-            return True
+            return None
         candidate = self._fill_position(quote_id, state)
-        result = self._reservation.try_reserve(
+        return self._reservation.try_reserve(
             reservation_id,
             candidate,
             marginals=self._marginals,
@@ -1305,8 +1356,313 @@ class QuoteLifecycle:
             start_time_provider=self._start_time_provider,
             halt_inputs=self._halt_inputs(),
             book_risk=self._book_risk_for_check(),
+            waived_games=waived_games,
         )
-        return result.granted
+
+    # ------------------------------------------- last-look MC waiver (Problem A)
+
+    async def _lastlook_mc_waiver(
+        self,
+        quote_id: str,
+        state: OpenQuoteState,
+        reservation_id: str,
+        breaches: list[Breach],
+    ) -> tuple[bool, str]:
+        """CONFIRM-PATH LAST-LOOK MC WAIVER (handoff Problem A). Called ONLY when
+        the confirm-path reservation was DENIED. Returns ``(True, "")`` when the
+        waiver was granted AND the single reservation retry succeeded (the
+        headroom is now HELD — the caller proceeds to the candidate gate exactly
+        as after a first-try grant), else ``(False, detail)`` and the caller
+        declines ``DECLINE_RISK_LIMIT`` exactly as today.
+
+        Semantics (design fixed 2026-07-16 — sim/state_worst_case.py):
+          - Runs ONLY when enabled AND EVERY enforced breach in the denial is a
+            game-loss / mutex-directional cap breach carrying its game key
+            (``WAIVABLE_RESERVATION_BREACHES``). ANY other breach ⇒ (False, …)
+            with no waiver attempt — those caps are never waived.
+          - Builds picklable inputs ON-LOOP (committed positions + THE CANDIDATE
+            as fully-netting entities; outstanding reservations as hedge-credit-
+            CLAMPED entities — a released reservation vanishes like an unfilled
+            quote, so its credit never certifies; every resting quote as
+            adversarial max(0, loss) hypotheticals), stamped with the FULL
+            exposure-book generation (position AND quote mutations — the input
+            set includes open quotes, so bare quote churn must invalidate it)
+            + reservation version (the P0-2 pattern, widened), and runs the
+            EXACT scoreline enumeration OFF-LOOP via ``BookRiskPool.
+            run_state_worst_case`` bounded by ``lastlook_mc_waiver_deadline_s``.
+          - If either stamp moved during the enumeration the verdict priced a
+            book that no longer exists: REBUILD ONCE, then fail-closed decline.
+          - Every breached game must come back CERTIFIED with worst_case_cc
+            within the SAME game-loss budget (threshold_cc(game_loss_frac,
+            bankroll) — never a raised one; re-validated AGAIN by the checker at
+            the retry). Then the reservation is retried ONCE with the per-game
+            certificates; a retry denial (a different cap now binds, or the book
+            moved) declines.
+          - ANY error / timeout / uncertified game / over-budget certificate /
+            unstable book / missing structural config or bankroll ⇒ (False, …):
+            the decline path is byte-identical to today's (fail-closed).
+
+        The QUOTE-TIME analytic caps are untouched (E2 mass-acceptance dominance
+        needs them MONOTONE; this state-consistent bound is not — the module
+        docstring carries the warning)."""
+        if not self._config.lastlook_mc_waiver_enabled:
+            return False, ""
+        if self._reservation is None:  # a denial implies a service; belt+braces
+            return False, ""
+        if not breaches or any(
+            b.reason not in WAIVABLE_RESERVATION_BREACHES for b in breaches
+        ):
+            # A non-waivable cap (gross/per-combo/daily/CVaR/ruin/notional/slate/
+            # halt…) is part of the denial: never waived, decline as today.
+            return False, "non-waivable breach in denial"
+        if any(b.game is None for b in breaches):
+            # A per-game breach without its game key cannot be certified.
+            return False, "waivable breach missing its game key (fail-closed)"
+        games = sorted({b.game for b in breaches if b.game is not None})
+        bankroll_cc = self._risk_bankroll_cc()
+        if bankroll_cc is None or bankroll_cc <= 0:
+            # The %-caps needed a bankroll to breach, but it may have gone stale
+            # between the denial and here — an unknowable budget is never waived.
+            return False, "bankroll unavailable for the waiver budget"
+        structural_cfg = self._structural_cfg
+        if structural_cfg is None:
+            return False, "no structural config — state enumeration impossible"
+        game_thr_cc = threshold_cc(self._limits.limits.game_loss_frac, bankroll_cc)
+
+        self._metrics.inc("lastlook_waiver.attempted")
+        audit: dict[str, Any] = {
+            "granted": False,
+            "worst_case_cc": None,
+            "games": games,
+        }
+        self._waiver_audit = audit
+        start_ns = self._clock.monotonic_ns()
+        deadline_ns = int(self._config.lastlook_mc_waiver_deadline_s * 1e9)
+        result: dict[str, GameWorstCase] | None = None
+        # One build + AT MOST ONE rebuild (version moved during the enumeration),
+        # then fail-closed decline — the mandated retry budget.
+        for attempt in range(2):
+            try:
+                inputs = self._build_state_worst_case_inputs(
+                    quote_id, state, structural_cfg
+                )
+            except Exception as exc:  # noqa: BLE001 — any build error declines
+                self._metrics.inc("lastlook_waiver.errored")
+                log.error(
+                    "lastlook_waiver_errored", quote_id=quote_id, error=repr(exc)
+                )
+                return False, f"waiver build errored: {exc!r}"
+            remaining_s = (
+                deadline_ns - (self._clock.monotonic_ns() - start_ns)
+            ) / 1e9
+            if remaining_s <= 0.0:
+                self._metrics.inc("lastlook_waiver.timeout")
+                log.warning(
+                    "lastlook_waiver_deadline",
+                    quote_id=quote_id,
+                    attempt=attempt,
+                    detail="waiver wall budget exhausted before the enumeration",
+                )
+                return False, "waiver deadline exhausted"
+            try:
+                candidate_result = await self._run_state_worst_case(
+                    inputs, deadline_s=remaining_s
+                )
+            except TimeoutError:
+                self._metrics.inc("lastlook_waiver.timeout")
+                log.warning(
+                    "lastlook_waiver_deadline",
+                    quote_id=quote_id,
+                    attempt=attempt,
+                    detail="off-loop enumeration exceeded the waiver deadline",
+                )
+                return False, "waiver enumeration timed out"
+            except Exception as exc:  # noqa: BLE001 — any error declines
+                self._metrics.inc("lastlook_waiver.errored")
+                log.error(
+                    "lastlook_waiver_errored", quote_id=quote_id, error=repr(exc)
+                )
+                return False, f"waiver enumeration errored: {exc!r}"
+            # P0-2 (widened for the waiver): the enumeration awaited off-loop —
+            # verify the book did not move under it. The stamp is the FULL
+            # ExposureBook.generation (not the position generation): the input
+            # set includes every resting open quote, and upsert_quote/
+            # remove_quote bump ONLY the full generation, so a quote landing
+            # (or repricing/expiring) during the await would otherwise be
+            # invisible and the stale certificate would skip the per-game caps
+            # on a book it never priced (findings 1+3, 2026-07-16).
+            live_gen = self._exposure.generation
+            live_ver = self._reservation.version
+            if (
+                live_gen != inputs.book_generation
+                or live_ver != inputs.reservation_version
+            ):
+                self._metrics.inc("lastlook_waiver.version_conflict")
+                log.info(
+                    "lastlook_waiver_version_conflict",
+                    quote_id=quote_id,
+                    attempt=attempt,
+                    snapshot_book_generation=inputs.book_generation,
+                    live_book_generation=live_gen,
+                    snapshot_reservation_version=inputs.reservation_version,
+                    live_reservation_version=live_ver,
+                )
+                continue
+            result = candidate_result
+            break
+        if result is None:
+            return False, "waiver unstable: book moved during every enumeration"
+
+        certs: dict[str, GameWorstCase] = {}
+        for game in games:
+            cert = result.get(game)
+            if cert is None or not cert.certified:
+                self._metrics.inc("lastlook_waiver.declined_uncertified")
+                log.info(
+                    "lastlook_waiver_uncertified",
+                    quote_id=quote_id,
+                    game=game,
+                    reason=None if cert is None else cert.uncertified_reason,
+                )
+                return False, f"game {game} not certifiable"
+            certs[game] = cert
+        worst_cc = max(cert.worst_case_cc for cert in certs.values())
+        audit["worst_case_cc"] = worst_cc
+        if worst_cc > game_thr_cc:
+            self._metrics.inc("lastlook_waiver.declined_over_budget")
+            log.info(
+                "lastlook_waiver_over_budget",
+                quote_id=quote_id,
+                worst_case_cc=worst_cc,
+                budget_cc=game_thr_cc,
+                games=games,
+            )
+            return False, (
+                f"state-consistent worst case {worst_cc}cc > game-loss budget "
+                f"{game_thr_cc}cc"
+            )
+        # Certified within the SAME budget: retry the reservation ONCE with the
+        # certificates. The checker re-validates each one against the LIVE
+        # budget and skips ONLY the game-loss/directional caps for these games;
+        # every other cap is re-checked in full — a new breach still denies.
+        # Synchronous from the version check to here (no await), so the book
+        # cannot have moved since the stamps were verified.
+        retry = self._reserve_headroom(
+            reservation_id, quote_id, state, waived_games=certs
+        )
+        if retry is None or not retry.granted:
+            self._metrics.inc("lastlook_waiver.retry_denied")
+            log.info(
+                "lastlook_waiver_retry_denied",
+                quote_id=quote_id,
+                breaches=[]
+                if retry is None
+                else [str(b.reason) for b in retry.breaches],
+            )
+            return False, "reservation retry denied despite certificates"
+        self._metrics.inc("lastlook_waiver.granted")
+        audit["granted"] = True
+        log.info(
+            "lastlook_waiver_granted",
+            quote_id=quote_id,
+            games=games,
+            worst_case_cc=worst_cc,
+            budget_cc=game_thr_cc,
+            n_states={g: certs[g].n_states for g in games},
+        )
+        return True, ""
+
+    def _build_state_worst_case_inputs(
+        self,
+        quote_id: str,
+        state: OpenQuoteState,
+        structural_cfg: StructuralConfigView,
+    ) -> StateWorstCaseInputs:
+        """Build the IMMUTABLE, picklable inputs for ONE off-loop state-consistent
+        worst-case enumeration (the last-look MC waiver), ON-LOOP.
+
+        Entities = committed positions + ALL outstanding reservations + THE
+        CANDIDATE. Committed positions and the candidate net FULLY per state;
+        outstanding reservations ride with ``earns_credit=False`` (hit-side
+        loss sums, miss-side credit CLAMPED away): a reservation is not a real
+        holding — an explicit decline/lapse ``release`` vanishes it exactly
+        like an unfilled quote, so its hedge credit must never certify a book
+        that outlives it (finding 2, 2026-07-16). Unlike the candidate gate
+        there is no exclusion of this fill's own reservation: the waiver runs
+        only AFTER the reservation was DENIED, so nothing is held for this
+        candidate. Open quotes ride as adversarial hypotheticals (max(0, loss)
+        per state — the E2 rationale at confirm). NOTE (conservative,
+        intended): this quote's OWN open-quote record is still in the book here
+        (dropped only at the end of ``on_quote_accepted``), so the enumeration
+        counts this fill once as the candidate entity and once as its resting
+        quote's clamped hypothetical — the same fail-conservative double-count
+        the analytic reservation check makes (see ``_reserve_headroom``); it
+        can only OVERSTATE the certified bound, never understate it.
+
+        Marginals resolve ON-LOOP into a plain dict (a missing marginal is
+        OMITTED — the enumeration drops that leg from the model INVERSION only;
+        per-state settlement is marginal-free). ``events`` is None: every LegRef
+        carries its event ticker from the RFQ; a leg without one resolves
+        adversarially (never a credit — fail-conservative). Stamped with the
+        FULL exposure-book generation (quote mutations included — this input
+        set prices open quotes, so bare quote churn must invalidate it; see
+        ``StateWorstCaseInputs``) + reservation version at this read (P0-2,
+        widened)."""
+        candidate = self._fill_position(quote_id, state)
+        committed = tuple(self._exposure.positions.values())
+        book_generation = self._exposure.generation
+        if self._reservation is not None:
+            reservation_version = self._reservation.version
+            reservations = tuple(self._reservation.outstanding_positions())
+        else:
+            reservation_version = -1
+            reservations = ()
+        entities = (
+            *(entity_from_position(position) for position in committed),
+            *(
+                entity_from_position(position, earns_credit=False)
+                for position in reservations
+            ),
+            entity_from_position(candidate),
+        )
+        open_quotes = tuple(
+            quote_from_open_quote(quote, self._conventions)
+            for quote in self._exposure.open_quotes.values()
+        )
+        tickers: set[str] = set()
+        for entity in entities:
+            tickers.update(leg.market_ticker for leg in entity.legs)
+        for quote in open_quotes:
+            for hypothetical in quote.hypotheticals:
+                tickers.update(leg.market_ticker for leg in hypothetical.legs)
+        marginals: dict[str, float] = {}
+        for ticker in sorted(tickers):
+            p = self._marginals(ticker)
+            if p is not None:
+                marginals[ticker] = float(p)
+        return StateWorstCaseInputs(
+            entities=entities,
+            open_quotes=open_quotes,
+            marginals=marginals,
+            events=None,
+            structural_cfg=structural_cfg,
+            book_generation=book_generation,
+            reservation_version=reservation_version,
+        )
+
+    async def _run_state_worst_case(
+        self, inputs: StateWorstCaseInputs, *, deadline_s: float
+    ) -> dict[str, GameWorstCase]:
+        """Run one waiver enumeration: in the BookRiskPool worker when wired
+        (bounded by ``deadline_s`` — a timeout propagates and the caller declines
+        fail-closed), else inline (paper/backtests/tests — deterministic exact
+        enumeration, identical result; the caller's pre-run deadline guard still
+        bounds a rebuild). Mirrors ``_run_candidate_mc``."""
+        if self._book_risk_pool is not None:
+            return await self._book_risk_pool.run_state_worst_case(
+                inputs, deadline_s=deadline_s
+            )
+        return _worker_state_worst_case(inputs)
 
     def _note_watchdog(self, *, risk_declined: bool) -> None:
         """Feed the starvation watchdog one quote decision. ``risk_declined`` is
@@ -1480,6 +1836,8 @@ class QuoteLifecycle:
             log.warning("accept_for_unknown_quote", quote_id=quote_id)
             return
         state.accepted = True
+        # Fresh confirm ⇒ fresh waiver audit (set only if a waiver attempt runs).
+        self._waiver_audit = None
         # Fill-path visibility (2026-07-14 fill-killer diagnosis): accepts are
         # rare (~tens/day), so log the size-bearing fields of every accept. This
         # confirms the live wire shape and surfaces any field-name drift from the
@@ -1606,21 +1964,39 @@ class QuoteLifecycle:
             # An ENFORCED-denied reservation — impossible in Phase-2 SHADOW mode, real
             # once caps are flipped — declines here (the last headroom went elsewhere).
             reservation_id = f"fill:{quote_id}"
-            reserved = self._reserve_headroom(reservation_id, quote_id, state)
-            if not reserved:
-                self._metrics.inc(
-                    f"confirm.declined.{ReasonCode.DECLINE_RISK_LIMIT}"
+            reserve_result = self._reserve_headroom(reservation_id, quote_id, state)
+            if reserve_result is not None and not reserve_result.granted:
+                # LAST-LOOK MC WAIVER (handoff Problem A): when enabled AND every
+                # enforced breach in this denial is a game-loss/mutex-directional
+                # cap breach, evaluate the STATE-CONSISTENT per-game worst case by
+                # exact scoreline enumeration OFF-LOOP and retry the reservation
+                # ONCE with the per-game certificates (same game-loss budget,
+                # never a raised one). Granted ⇒ the headroom is HELD and the
+                # confirm proceeds through the candidate gate exactly as after a
+                # first-try grant (the gate can still decline and releases the
+                # reservation). Disabled / any other breach / any error, timeout,
+                # uncertified game, over-budget, or unstable book ⇒ decline
+                # exactly as before (fail-closed).
+                waived, waiver_detail = await self._lastlook_mc_waiver(
+                    quote_id, state, reservation_id, reserve_result.breaches
                 )
-                self._track_markout(f"declined:{quote_id}", state)
-                await self._record_confirm_decision(
-                    state, confirm=False, reason=ReasonCode.DECLINE_RISK_LIMIT,
-                    detail="risk reservation denied at confirm (no headroom)",
-                    decision_ms=decision_ms,
-                )
-                self._executed_states.pop(quote_id, None)
-                state.pending_fill = None
-                self._drop_quote(quote_id)
-                return
+                if not waived:
+                    self._metrics.inc(
+                        f"confirm.declined.{ReasonCode.DECLINE_RISK_LIMIT}"
+                    )
+                    self._track_markout(f"declined:{quote_id}", state)
+                    detail = "risk reservation denied at confirm (no headroom)"
+                    if waiver_detail:
+                        detail = f"{detail}; waiver: {waiver_detail}"
+                    await self._record_confirm_decision(
+                        state, confirm=False, reason=ReasonCode.DECLINE_RISK_LIMIT,
+                        detail=detail,
+                        decision_ms=decision_ms,
+                    )
+                    self._executed_states.pop(quote_id, None)
+                    state.pending_fill = None
+                    self._drop_quote(quote_id)
+                    return
             # P0-1/P0-2 CANDIDATE-AWARE PORTFOLIO-RISK GATE (last look), ATOMIC with
             # the reservation just made. The existing analytic/gross/burst gates AND
             # the provisional reservation have ADMITTED this fill; now run an
@@ -2388,6 +2764,35 @@ class QuoteLifecycle:
                 book_risk=self._book_risk_for_check(),
             )
         )
+        # LAST-LOOK MC WAIVER deferral (handoff Problem A). This advisory check
+        # runs BEFORE the authoritative reservation, on the SAME book minus the
+        # outstanding reservations — so with the waiver armed, a decline whose
+        # EVERY enforced breach is a waivable game-loss/mutex-directional cap
+        # breach must not short-circuit here (it would mask the waiver: the
+        # 2026-07-16 live self-declines fired on THIS path). Defer it to the
+        # reservation deny-site, whose atomic check is a strict SUPERSET of this
+        # one (same candidate + all outstanding reservations): it re-catches the
+        # same breaches, triggers the waiver, and on any waiver failure declines
+        # DECLINE_RISK_LIMIT exactly as this path would have. Guarded on a wired
+        # reservation service — with no service there is no authoritative
+        # re-check downstream, so this path keeps declining as today. Disabled
+        # waiver ⇒ byte-identical prior behaviour. ANY non-waivable breach still
+        # declines right here.
+        if (
+            breaches
+            and self._config.lastlook_mc_waiver_enabled
+            and self._reservation is not None
+            and all(b.reason in WAIVABLE_RESERVATION_BREACHES for b in breaches)
+        ):
+            self._metrics.inc("lastlook_waiver.deferred_to_reservation")
+            log.info(
+                "lastlook_waiver_deferred",
+                quote_id=state.quote_id,
+                breaches=[str(b.reason) for b in breaches],
+                detail="all-waivable last-look breaches deferred to the atomic "
+                "reservation check + MC waiver",
+            )
+            breaches = []
         # Straddle safety (Phase 3): re-run the schedule-based pregame gate —
         # a leg can go in-play between quote and accept. Peek-only, hot-path safe.
         # Phase 5 (R3 §B2): the CONFIRM side uses the stricter M_c margin, so a
@@ -2525,15 +2930,26 @@ class QuoteLifecycle:
                 qty,
                 self._conventions.maker_position_side(accepted_side),
             )
+        # LAST-LOOK MC WAIVER observability: every confirm/decline audit line
+        # carries the waiver axes (attempted/granted/worst-case/games — honest
+        # defaults when no waiver ran), then the per-confirm record is reset.
+        waiver = self._waiver_audit
         log.info(
             "risk_audit",
             phase="confirm" if confirm else "decline",
             rfq_id=state.rfq.rfq_id,
             quote_id=state.quote_id,
             reason=str(reason),
+            waiver_attempted=waiver is not None,
+            waiver_granted=bool(waiver is not None and waiver.get("granted")),
+            waiver_worst_case_cc=(
+                None if waiver is None else waiver.get("worst_case_cc")
+            ),
+            waiver_games=None if waiver is None else waiver.get("games"),
             **self._risk_audit_fields(
                 candidate_ev_cc=candidate_ev_cc,
                 binding_cap="" if confirm else str(reason),
                 fallback_reason="",
             ),
         )
+        self._waiver_audit = None

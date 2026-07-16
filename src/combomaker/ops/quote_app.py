@@ -522,6 +522,14 @@ class QuoteApp:
                     worst_challenger_ev_tolerance_cc=(
                         risk_cfg.worst_challenger_ev_tolerance_cc
                     ),
+                    # LAST-LOOK MC WAIVER (handoff Problem A — CONFIRM-PATH ONLY).
+                    # Committed default OFF; the operator arms it in the local
+                    # YAML. The deadline is validated to fit the 3s confirm
+                    # window alongside the candidate gate (RiskConfig validator).
+                    lastlook_mc_waiver_enabled=risk_cfg.lastlook_mc_waiver_enabled,
+                    lastlook_mc_waiver_deadline_s=(
+                        risk_cfg.lastlook_mc_waiver_deadline_s
+                    ),
                 ),
                 balance_tracker=balance_tracker,
                 # Slate cap's per-leg game-start source — the exact pregame gate

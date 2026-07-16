@@ -53,7 +53,7 @@ Money stays integer centi-cents; no binary floats (hard rule 5).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -68,6 +68,7 @@ from combomaker.risk.limits import (
     LimitChecker,
     PortfolioRisk,
     StartTimeProvider,
+    WaiverCertificate,
 )
 
 log = get_logger(__name__)
@@ -284,6 +285,7 @@ class RiskReservationService:
         start_time_provider: StartTimeProvider | None = None,
         halt_inputs: HaltInputs | None = None,
         book_risk: PortfolioRisk | None = None,
+        waived_games: Mapping[str, WaiverCertificate] | None = None,
     ) -> ReserveResult:
         """Atomically reserve headroom for ``candidate`` if the limits allow it.
 
@@ -292,6 +294,15 @@ class RiskReservationService:
         reservation already holds. On PASS (no ENFORCED breach after the shadow
         split) the reservation is recorded and the version bumped; on FAIL nothing
         is recorded and the ENFORCED breaches are returned.
+
+        ``waived_games`` (CONFIRM-PATH last-look MC waiver): per-game
+        state-consistent worst-case certificates forwarded verbatim to
+        ``LimitChecker.check``, which skips ONLY the game-loss and
+        mutex-directional caps for exactly those games (re-validating each
+        certificate against the live game-loss budget). Passed ONLY by the
+        lifecycle's single waiver RETRY after a denial whose every enforced
+        breach was one of those two caps; every other caller leaves the default
+        None (byte-identical behaviour).
 
         Idempotent by ``reservation_id``: re-reserving an id already held returns
         the existing reservation WITHOUT re-checking or double-counting (a
@@ -329,6 +340,7 @@ class RiskReservationService:
             start_time_provider=start_time_provider,
             halt_inputs=halt_inputs,
             book_risk=book_risk,
+            waived_games=waived_games,
         )
         enforced = self._split(raw)
         if enforced:

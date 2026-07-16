@@ -57,21 +57,38 @@ class MarkupPolicy:
     # stays bit-identical dark. Applied once per combo (max matching adder, never
     # summed — the measured corners richness is per-COMBO, not per-leg).
     series_adders: dict[str, int]
+    # sport -> ((fair_below_cc, markup_cc), ...) ascending. Fair-dependent
+    # markup: the first tier whose bound exceeds the combo fair applies; above
+    # every tier the flat by_sport value applies. Registered only for ENABLED
+    # sports (dark stays dark).
+    tiers_by_sport: dict[str, tuple[tuple[int, int], ...]]
 
     @classmethod
     def from_config(cls, cfg: MarkupConfig) -> MarkupPolicy:
         by: dict[str, int] = {}
         adders: dict[str, int] = {}
+        tiers: dict[str, tuple[tuple[int, int], ...]] = {}
         if cfg.enabled:
             for name, sc in (("soccer", cfg.soccer), ("mlb", cfg.mlb)):
                 if sc.enabled and sc.markup_cc > 0:
                     by[name] = int(sc.markup_cc)
+                    sport_tiers = tuple(
+                        (int(t.fair_below_cc), int(t.markup_cc))
+                        for t in getattr(sc, "tiers", [])
+                    )
+                    if sport_tiers:
+                        tiers[name] = sport_tiers
             adders = {
                 prefix: int(cc)
                 for prefix, cc in getattr(cfg, "series_adders_cc", {}).items()
                 if cc > 0
             }
-        return cls(enabled=bool(cfg.enabled), by_sport=by, series_adders=adders)
+        return cls(
+            enabled=bool(cfg.enabled),
+            by_sport=by,
+            series_adders=adders,
+            tiers_by_sport=tiers,
+        )
 
     def markup_cc(self, sport: str) -> int:
         """Markup in centi-cents over fair for this sport; 0 = no markup (dark)."""
@@ -89,13 +106,22 @@ class MarkupPolicy:
                     best = cc
         return best
 
-    def markup_for(self, leg_tickers: Iterable[str]) -> tuple[str, int]:
-        """(sport, markup_cc) for a combo's legs — the sport markup plus the
-        largest matching series adder. The adder applies ONLY when the sport
-        markup is active (base > 0), so dark stays dark."""
+    def markup_for(
+        self, leg_tickers: Iterable[str], fair_cc: int | None = None
+    ) -> tuple[str, int]:
+        """(sport, markup_cc) for a combo's legs — the sport markup (fair-tiered
+        when ``fair_cc`` is given and tiers are configured) plus the largest
+        matching series adder. The adder and tiers apply ONLY when the sport
+        markup is active (base > 0), so dark stays dark. ``fair_cc`` None (older
+        callers / no fair available) ⇒ the flat base, exactly as before."""
         legs = list(leg_tickers)
         sport = sport_of(legs)
         base = self.markup_cc(sport)
         if base <= 0:
             return sport, base
+        if fair_cc is not None:
+            for below, cc in self.tiers_by_sport.get(sport, ()):
+                if fair_cc < below:
+                    base = cc
+                    break
         return sport, base + self._series_adder_cc(legs)

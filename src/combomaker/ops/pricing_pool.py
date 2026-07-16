@@ -51,6 +51,12 @@ from combomaker.sim.book_risk import (
     compute_book_risk,
     evaluate_candidate_book_risk,
 )
+from combomaker.sim.state_worst_case import (
+    GameWorstCase,
+    WorstCaseEntity,
+    WorstCaseQuote,
+    state_worst_case_by_game,
+)
 from combomaker.sim.structural_book import StructuralConfigView
 
 log = get_logger(__name__)
@@ -415,6 +421,56 @@ class CandidateBookRiskInputs:
     reservation_version: int = -1
 
 
+@dataclass(frozen=True, slots=True)
+class StateWorstCaseInputs:
+    """Picklable inputs for ONE off-loop state-consistent worst-case enumeration
+    (the confirm-path LAST-LOOK MC WAIVER — sim/state_worst_case.py). Built
+    ON-LOOP by the lifecycle at the reservation-denial instant: entities =
+    committed positions (netting fully) + outstanding reservations (hedge-credit
+    clamped, ``earns_credit=False``) + THE CANDIDATE (netting fully),
+    ``open_quotes`` = every resting quote's per-side hypotheticals (clamped
+    adversarially >= 0 per state by the enumeration — E2 rationale at confirm),
+    ``marginals``/``events`` as plain picklable dicts. Stamped with the FULL
+    ``ExposureBook.generation`` and the RiskReservationService VERSION captured
+    at the read (the P0-2 pattern): the worker never consumes them — the CALLER
+    compares them to the live values when the off-loop enumeration returns and
+    rebuilds ONCE (then fails closed) if the book moved under it.
+
+    ⚠ ``book_generation`` is deliberately the WHOLE-BOOK generation, NOT the
+    position generation ``CandidateBookRiskInputs`` stamps: the candidate gate
+    prices POSITIONS ONLY, so bare quote churn cannot stale its verdict — but
+    this input set INCLUDES every resting open quote, and ``upsert_quote``/
+    ``remove_quote`` bump only the full generation. Stamping the position
+    generation here would let a quote land during the awaited enumeration and
+    the stale certificate still skip the per-game caps on a book it never
+    priced (adversarial-review findings 1+3, 2026-07-16 — by the module's own
+    monotonicity property an omitted quote strictly UNDERSTATES the bound)."""
+
+    entities: tuple[WorstCaseEntity, ...]
+    open_quotes: tuple[WorstCaseQuote, ...]
+    marginals: dict[str, float]
+    events: dict[str, str | None] | None
+    structural_cfg: StructuralConfigView
+    book_generation: int = -1
+    reservation_version: int = -1
+
+
+def _worker_state_worst_case(
+    inputs: StateWorstCaseInputs,
+) -> dict[str, GameWorstCase]:
+    """The function the pool runs for the last-look MC waiver. Pure pass-through
+    to the engine's OWN ``state_worst_case_by_game`` (no reimplementation — hard
+    rule 8c). Deterministic (exact enumeration, no sampling), so identical to an
+    inline call."""
+    return state_worst_case_by_game(
+        inputs.entities,
+        inputs.open_quotes,
+        inputs.marginals,
+        inputs.events,
+        inputs.structural_cfg,
+    )
+
+
 def _timed_worker_candidate_book_risk(
     inputs: CandidateBookRiskInputs,
 ) -> tuple[CandidateBookRisk, float]:
@@ -562,6 +618,32 @@ class BookRiskPool:
         total_ms = (time.monotonic_ns() - submit_ns) / 1e6
         self.last_candidate_compute_ms = compute_ms
         self.last_candidate_dwell_ms = max(0.0, total_ms - compute_ms)
+        self.register_workers()
+        return result
+
+    async def run_state_worst_case(
+        self, inputs: StateWorstCaseInputs, *, deadline_s: float
+    ) -> dict[str, GameWorstCase]:
+        """Run the LAST-LOOK MC WAIVER's state-consistent worst-case enumeration
+        in a worker, bounded by ``deadline_s`` (the waiver's REMAINING wall
+        budget, ``risk.lastlook_mc_waiver_deadline_s`` at most).
+
+        Unlike the book-risk snapshot (no deadline — a late snapshot just ages
+        out) this is a confirm-window decision, so it mirrors ``JointPool``'s
+        deadline semantics: on timeout the loop stops waiting (``TimeoutError``
+        propagates and the caller DECLINES fail-closed — never confirm on an
+        unmeasured waiver) while the worker finishes and frees itself. Awaiting
+        yields the loop, so the heartbeat keeps beating during the enumeration."""
+        if self._executor is None:
+            raise RuntimeError("BookRiskPool.run_state_worst_case before start()")
+        self.calls += 1
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(self._executor, _worker_state_worst_case, inputs)
+        try:
+            result = await asyncio.wait_for(fut, timeout=deadline_s)
+        except Exception:
+            self.errors += 1
+            raise
         self.register_workers()
         return result
 

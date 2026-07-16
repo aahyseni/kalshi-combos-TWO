@@ -127,3 +127,74 @@ def test_adder_rejected_negative() -> None:
 
     with pytest.raises(ValueError):
         MarkupConfig(enabled=True, series_adders_cc={"KXWCCORNERS": -1})
+
+
+# --- fair-tiered markup (2026-07-16 operator: pad longshots, keep mains tight) --
+
+
+def _tier_cfg() -> MarkupConfig:
+    from combomaker.ops.config import MarkupTier
+
+    return MarkupConfig(
+        enabled=True,
+        soccer=SportMarkupConfig(
+            enabled=True,
+            markup_cc=100,
+            tiers=[
+                MarkupTier(fair_below_cc=200, markup_cc=500),
+                MarkupTier(fair_below_cc=1000, markup_cc=400),
+                MarkupTier(fair_below_cc=3500, markup_cc=200),
+            ],
+        ),
+        series_adders_cc={"KXWCCORNERS": 300},
+    )
+
+
+LEGS = ["KXWCADVANCE-26JUL19ESPARG-ARG", "KXWCTOTAL-26JUL19ESPARG-3"]
+
+
+def test_tier_selection_by_fair() -> None:
+    p = MarkupPolicy.from_config(_tier_cfg())
+    assert p.markup_for(LEGS, fair_cc=150)[1] == 500    # deep longshot
+    assert p.markup_for(LEGS, fair_cc=948)[1] == 400    # longshot
+    assert p.markup_for(LEGS, fair_cc=2443)[1] == 200   # mid
+    assert p.markup_for(LEGS, fair_cc=4077)[1] == 100   # main -> flat base
+
+
+def test_tier_boundary_is_strict() -> None:
+    # fair == fair_below_cc is NOT below the bound -> next tier / flat.
+    p = MarkupPolicy.from_config(_tier_cfg())
+    assert p.markup_for(LEGS, fair_cc=1000)[1] == 200
+    assert p.markup_for(LEGS, fair_cc=3500)[1] == 100
+
+
+def test_no_fair_falls_back_to_flat() -> None:
+    p = MarkupPolicy.from_config(_tier_cfg())
+    assert p.markup_for(LEGS)[1] == 100
+
+
+def test_tiers_stack_with_series_adder() -> None:
+    p = MarkupPolicy.from_config(_tier_cfg())
+    legs = ["KXWCCORNERS-26JUL19ESPARG-9", "KXWCTOTAL-26JUL19ESPARG-3"]
+    assert p.markup_for(legs, fair_cc=948)[1] == 700  # 4c tier + 3c corners floor
+
+
+def test_tiers_dark_when_disabled() -> None:
+    cfg = _tier_cfg().model_copy(update={"enabled": False})
+    p = MarkupPolicy.from_config(cfg)
+    assert p.markup_for(LEGS, fair_cc=150)[1] == 0
+
+
+def test_tier_validation_rejects_unsorted() -> None:
+    import pytest
+
+    from combomaker.ops.config import MarkupTier
+
+    with pytest.raises(ValueError):
+        SportMarkupConfig(
+            enabled=True, markup_cc=100,
+            tiers=[
+                MarkupTier(fair_below_cc=1000, markup_cc=400),
+                MarkupTier(fair_below_cc=200, markup_cc=500),
+            ],
+        )

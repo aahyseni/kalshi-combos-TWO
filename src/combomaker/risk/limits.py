@@ -36,7 +36,7 @@ dark). UNKNOWN bankroll is never a convenient default.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from fractions import Fraction
@@ -174,6 +174,50 @@ class Breach:
     # them block a quote/confirm or trigger a halt. Only shadow=False breaches
     # affect behaviour. The R2 %-cap layer sets this from caps_shadow_mode.
     shadow: bool = False
+    # The game key (pricing.grouping.game_key) a PER-GAME cap breach is keyed on,
+    # or None for every non-per-game cap. Set ONLY by the game-loss and
+    # mutex-directional cap sites so the confirm-path last-look MC waiver can
+    # identify exactly which games it must certify — never parsed out of the
+    # detail string. Purely additive metadata: no consumer branches on it except
+    # the waiver.
+    game: str | None = None
+
+
+class WaiverCertificate(Protocol):
+    """CONFIRM-PATH last-look waiver certificate for ONE game (structurally
+    ``sim.state_worst_case.GameWorstCase`` — a Protocol so ``limits`` never
+    imports ``sim``). ``worst_case_cc`` is the STATE-CONSISTENT worst case over
+    the merged confirm-time book (committed + reservations + candidate netting
+    fully; open quotes clamped at max(0, loss) per state), computed by EXACT
+    enumeration over the Dixon-Coles scoreline grid. ``certified`` False means
+    the game had no buildable structural plan (the certificate is void and the
+    caps stand). The certificate is honoured ONLY when its worst case fits the
+    game-loss budget — validated again at the check site (fail-closed: a bogus
+    or stale certificate never skips a cap)."""
+
+    @property
+    def worst_case_cc(self) -> int: ...
+
+    @property
+    def certified(self) -> bool: ...
+
+
+def _waiver_covers(
+    waived_games: Mapping[str, WaiverCertificate] | None,
+    game: str,
+    game_thr_cc: int,
+) -> bool:
+    """Whether a confirm-path waiver certificate covers ``game``: present,
+    CERTIFIED, and its state-consistent worst case within the game-loss budget
+    (``game_thr_cc`` — the SAME threshold_cc(game_loss_frac, bankroll) budget the
+    game-loss cap enforces, never a raised one). Re-validated HERE, at the point
+    of enforcement, so a certificate built against a different bankroll can only
+    ever be REJECTED by a tighter live budget (fail-closed), never honoured
+    against a looser one."""
+    if not waived_games:
+        return False
+    cert = waived_games.get(game)
+    return cert is not None and cert.certified and cert.worst_case_cc <= game_thr_cc
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,12 +343,22 @@ class LimitChecker:
         start_time_provider: StartTimeProvider | None = None,
         halt_inputs: HaltInputs | None = None,
         book_risk: PortfolioRisk | None = None,
+        waived_games: Mapping[str, WaiverCertificate] | None = None,
     ) -> list[Breach]:
         """All current breaches, mass-acceptance included.
 
         ``candidate_positions``: hypothetical fills being contemplated (last
         look passes the accepted side here). ``adding_quote``: pre-quote check
         counts one more open quote.
+
+        ``waived_games`` (CONFIRM-PATH ONLY — the last-look MC waiver): per-game
+        state-consistent worst-case certificates. For EXACTLY those games, and
+        ONLY when the certificate is certified and its worst case fits the
+        game-loss budget (re-validated here), the %-of-GAME loss cap and the
+        mutex-directional cap are SKIPPED — every other cap is unchanged.
+        QUOTE-TIME callers must pass nothing (the default None is byte-identical
+        prior behaviour): the quote-time analytic bounds must stay MONOTONE (E2
+        mass-acceptance dominance) and the state-consistent bound is not.
 
         R2 layer (Phase 2): ``risk_bankroll_cc`` is the live risk-capital
         denominator in cc (BalanceTracker.risk_bankroll_cc), or None when stale
@@ -439,6 +493,7 @@ class LimitChecker:
                 start_time_provider=start_time_provider,
                 halt_inputs=halt_inputs,
                 book_risk=book_risk,
+                waived_games=waived_games,
             )
         )
         return breaches
@@ -457,10 +512,13 @@ class LimitChecker:
         start_time_provider: StartTimeProvider | None,
         halt_inputs: HaltInputs | None,
         book_risk: PortfolioRisk | None = None,
+        waived_games: Mapping[str, WaiverCertificate] | None = None,
     ) -> list[Breach]:
         """The additive %-of-bankroll caps. Every breach carries
         ``shadow=caps_shadow_mode``. Kept in its own method so the enforced-cap
-        logic above is untouched and independently testable."""
+        logic above is untouched and independently testable. ``waived_games`` is
+        the confirm-path waiver pass-through (see ``check``); it touches ONLY
+        the game-loss and mutex-directional cap sites below."""
         limits = self._limits
         shadow = limits.caps_shadow_mode
         out: list[Breach] = []
@@ -531,15 +589,22 @@ class LimitChecker:
             )
 
         # (2) %-of-GAME correlated LOSS — worst_case_loss_by_game_cc (LOSS axis).
+        # CONFIRM-PATH waiver: a game whose certificate proves the state-
+        # consistent worst case fits THIS SAME budget skips the (deliberately
+        # comonotone-overstated) analytic bound — quote-time callers pass no
+        # waivers, so their behaviour is byte-identical.
         game_thr = threshold_cc(limits.game_loss_frac, bankroll)
         for game, loss_cc in snapshot.worst_case_loss_by_game_cc.items():
             if loss_cc > game_thr:
+                if _waiver_covers(waived_games, game, game_thr):
+                    continue
                 out.append(
                     Breach(
                         ReasonCode.SKIP_GAME_LOSS_CAP,
                         f"game {game} loss {loss_cc}cc > {limits.game_loss_frac} "
                         f"bankroll = {game_thr}cc",
                         shadow=shadow,
+                        game=game,
                     )
                 )
 
@@ -573,15 +638,23 @@ class LimitChecker:
         # summed-magnitude ``delta_by_game`` bound stays the HARD backstop the
         # enforced max_event_delta mass-acceptance cap binds on (limits above);
         # richer all-legs hedge credit lives in the candidate-aware MC (P0-1).
+        # CONFIRM-PATH waiver: the SAME per-game certificate (state-consistent
+        # worst case within the GAME-LOSS budget — never a raised one) also skips
+        # this game's directional bound: the certificate's exact enumeration IS
+        # the true loss bound the directional proxy overstates. Quote-time
+        # callers pass no waivers — behaviour byte-identical.
         directional_thr = threshold_cc(limits.directional_frac, bankroll)
         for game, directional_cc in snapshot.directional_by_game_cc.items():
             if directional_cc > directional_thr:
+                if _waiver_covers(waived_games, game, game_thr):
+                    continue
                 out.append(
                     Breach(
                         ReasonCode.SKIP_DIRECTIONAL_CAP,
                         f"game {game} mutex-aware directional {directional_cc}cc > "
                         f"{limits.directional_frac} bankroll = {directional_thr}cc",
                         shadow=shadow,
+                        game=game,
                     )
                 )
 

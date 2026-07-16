@@ -1916,16 +1916,46 @@ class MlbRunsConfig(StrictModel):
     misfit_uncertainty_scale: float = 1.0
 
 
+class MarkupTier(StrictModel):
+    """One fair-dependent markup tier: applies when the combo's fair (YES, cc)
+    is strictly below ``fair_below_cc``."""
+
+    fair_below_cc: int
+    markup_cc: int
+
+    @field_validator("fair_below_cc", "markup_cc")
+    @classmethod
+    def _positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"tier values must be > 0, got {v}")
+        return v
+
+
 class SportMarkupConfig(StrictModel):
-    """Per-sport maker markup. A FLAT (uniform) markup over fair. Because a taker
-    only fills us when the combo clears at >= our ask (= fair + markup), the
-    markup itself SELF-SELECTS the FAT tier (room >= markup) and auto-declines
-    competitive/NORMAL flow — no room classifier needed for v1. The explicit
-    FAT/NORMAL room-predictor tiering slots in later behind the same MarkupPolicy.
-    """
+    """Per-sport maker markup. Because a taker only fills us when the combo
+    clears at >= our ask (= fair + markup), the markup itself SELF-SELECTS the
+    FAT tier (room >= markup) and auto-declines competitive/NORMAL flow.
+
+    ``markup_cc`` is the FLAT base. ``tiers`` (optional) make the markup
+    FAIR-DEPENDENT: the first tier whose ``fair_below_cc`` exceeds the combo's
+    fair applies; above every tier the flat base applies. Rationale
+    (2026-07-16 operator directive + measurement): competitors pad longshot
+    parlays fair+2-8c while mains cluster fair+1.5-2.2c — a flat markup is
+    simultaneously too loose on longshots (leaves the pad on the table; every
+    auction we won 2026-07-16 was a longshot at fair+1-1.2c) and as tight as
+    safe on mains. Tiers recapture the longshot pad without touching mains."""
 
     enabled: bool = False
     markup_cc: int = 0  # centi-cents over fair (400 = 4¢); self-selects FAT
+    tiers: list[MarkupTier] = Field(default_factory=list)
+
+    @field_validator("tiers")
+    @classmethod
+    def _tiers_ascending(cls, v: list[MarkupTier]) -> list[MarkupTier]:
+        bounds = [t.fair_below_cc for t in v]
+        if bounds != sorted(bounds) or len(set(bounds)) != len(bounds):
+            raise ValueError("tiers must have strictly ascending fair_below_cc")
+        return v
 
 
 class MarkupConfig(StrictModel):
@@ -2030,6 +2060,29 @@ class RiskConfig(StrictModel):
     # -50.0 to allow the worst challenger EV down to −0.50 of edge) to opt in.
     # Strictly additive — it can only flip an already-admitted confirm to a decline.
     worst_challenger_ev_tolerance_cc: float = float("-inf")
+    # LAST-LOOK MC WAIVER (handoff Problem A — CONFIRM-PATH ONLY). When a
+    # confirm-time risk denial's ENFORCED breaches are ALL game-loss and/or
+    # mutex-directional cap breaches (the two deliberately comonotone-OVERSTATED
+    # analytic per-game bounds; every other cap still declines as today), the
+    # lifecycle computes the STATE-CONSISTENT per-game worst case by EXACT
+    # enumeration over the Dixon-Coles scoreline grid (sim/state_worst_case.py —
+    # finite support, no MC sampling miss) OFF-LOOP, and — ONLY if every breached
+    # game is CERTIFIED and its state-consistent worst case fits the SAME
+    # game-loss budget (threshold_cc(game_loss_frac, bankroll), never a raised
+    # one) — retries the reservation ONCE with a per-game waiver certificate that
+    # skips exactly those two caps for exactly those games. The QUOTE-TIME
+    # analytic caps are UNTOUCHED (the E2 mass-acceptance dominance invariant
+    # requires them to stay monotone); open quotes contribute adversarially
+    # (max(0, loss) per state — a resting unfilled hedge never earns credit).
+    # Any error / timeout / uncertified game / over-budget / version conflict
+    # after one rebuild ⇒ decline exactly as today (fail-closed). Committed
+    # default OFF; the operator arms it in the local YAML.
+    lastlook_mc_waiver_enabled: bool = False
+    # Wall budget (seconds) for the whole waiver evaluation (build + off-loop
+    # enumeration + at most one rebuild). Must fit inside the exchange's 3s
+    # confirm window ALONGSIDE the candidate gate (candidate_gate_deadline_s,
+    # default 2.0s), so it is validated to (0, 3].
+    lastlook_mc_waiver_deadline_s: float = 1.0
     game_loss_frac: str = "0.08"          # %-of-GAME correlated loss
     per_combo_loss_frac: str = "0.01"     # single position max_loss
     directional_frac: str = "0.10"        # net one-directional / theme
@@ -2090,6 +2143,20 @@ class RiskConfig(StrictModel):
     def _positive_int_knob(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"must be >= 1, got {v}")
+        return v
+
+    # The waiver's whole wall budget must FIT INSIDE the exchange's 3s confirm
+    # window (it runs alongside the candidate gate, which has its own 2.0s
+    # budget). NaN fails both comparisons ⇒ rejected too (never a silent
+    # unbounded deadline).
+    @field_validator("lastlook_mc_waiver_deadline_s")
+    @classmethod
+    def _valid_waiver_deadline(cls, v: float) -> float:
+        if not (0.0 < v <= 3.0):
+            raise ValueError(
+                f"lastlook_mc_waiver_deadline_s must be in (0, 3] seconds (the "
+                f"exchange confirm window), got {v}"
+            )
         return v
 
     def to_risk_limits(self) -> RiskLimits:
