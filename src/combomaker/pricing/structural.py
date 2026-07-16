@@ -69,6 +69,7 @@ from combomaker.pricing.legtypes import (
     classify_leg,
     classify_sport,
     is_period_leg,
+    resolve_pricing_alias,
 )
 from combomaker.pricing.margin_total import (
     GameTotalOver,
@@ -191,7 +192,11 @@ def _parse_total_line(raw: str) -> int | None:
 
 def _parse_leg(ticker: str, match: _Match, *, fmt: MatchFormat) -> LegSpec | str:
     """One leg's spec (with its rule-book settlement window), or a reason
-    string when we cannot be certain."""
+    string when we cannot be certain. Pricing aliases resolve HERE (the shared
+    parse boundary): the pricing adapter AND the risk MC's game plans
+    (``sim.structural_book`` reuses this helper) settle an aliased champion
+    leg identically — never one without the other."""
+    ticker = resolve_pricing_alias(ticker)
     parts = ticker.split("-")
     leg_type = classify_leg(ticker)
     knockout = fmt is MatchFormat.KNOCKOUT
@@ -289,7 +294,7 @@ class StructuralPricer:
         self._mlb = mlb_config or MlbRunsConfig()
 
     def _match_format(self, ticker: str) -> MatchFormat:
-        series = ticker.split("-", 1)[0].upper()
+        series = resolve_pricing_alias(ticker).split("-", 1)[0].upper()
         for prefix in self._cfg.knockout_series:
             if series.startswith(prefix.upper()):
                 return MatchFormat.KNOCKOUT
@@ -352,7 +357,7 @@ class StructuralPricer:
 
         matches = []
         for leg in legs:
-            parts = leg.market_ticker.split("-")
+            parts = resolve_pricing_alias(leg.market_ticker).split("-")
             if len(parts) < 2:
                 raise StructuralError(f"malformed ticker {leg.market_ticker!r}")
             match = _parse_match(parts[1])
@@ -539,7 +544,7 @@ class StructuralPricer:
 
         matches = []
         for leg in legs:
-            parts = leg.market_ticker.split("-")
+            parts = resolve_pricing_alias(leg.market_ticker).split("-")
             if len(parts) < 2:
                 raise StructuralError(f"malformed ticker {leg.market_ticker!r}")
             match = _parse_match(parts[1])
@@ -647,7 +652,7 @@ class StructuralPricer:
 
         matches = []
         for leg in legs:
-            parts = leg.market_ticker.split("-")
+            parts = resolve_pricing_alias(leg.market_ticker).split("-")
             if len(parts) < 2:
                 raise StructuralError(f"malformed ticker {leg.market_ticker!r}")
             match = _parse_match(parts[1])

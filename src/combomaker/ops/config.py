@@ -2018,6 +2018,26 @@ class PricingConfig(StrictModel):
     # would-be decision is logged, the quote still goes out.
     widen: WidenConfig = Field(default_factory=WidenConfig)
     max_source_disagreement: float = 0.08
+    # PRICING ALIASES (2026-07-16, operator-directed): exact-ticker aliases the
+    # pricing-classification layer reasons through (classification, same-game
+    # grouping, structural parsing, sgp orientation, markup sport) while the
+    # exchange-facing identity (books, marginals, quoting, settlement) keeps the
+    # REAL ticker. Motivating case: the WC final has no KXWCADVANCE series, so
+    # the champion legs KXMENWORLDCUP-26-{AR,ES} — settlement-identical to
+    # advancing the final (win incl. ET/pens) — alias to synthetic
+    # KXWCADVANCE-26JUL19ESPARG-{ARG,ESP} legs. Committed default {} is
+    # bit-identical to pre-alias behavior. Only UNKNOWN-classifying tickers may
+    # be aliased and the target must be a modeled family (validated below at
+    # load time AND again at install time by ``legtypes.set_pricing_aliases``,
+    # so a programmatic bypass of config still cannot install a bad mapping).
+    leg_pricing_aliases: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_leg_pricing_aliases(self) -> Self:
+        from combomaker.pricing.legtypes import validate_pricing_aliases
+
+        validate_pricing_aliases(self.leg_pricing_aliases)
+        return self
 
 
 class RiskConfig(StrictModel):

@@ -75,6 +75,7 @@ from combomaker.pricing.structural_api import (
     StructuralError,
     Team,
     invert,
+    resolve_pricing_alias,
 )
 from combomaker.pricing.structural_api import (
     States as _States,
@@ -173,7 +174,11 @@ def _try_build_game(
     (corners/cards) or has an unknown marginal is left to the copula (dropped from
     the plan). ``invert`` needs >=2 team-level legs + an orienting leg for scorers,
     else it raises and the game falls back to the copula entirely."""
-    first = tickers[idxs[0]]
+    # Pricing aliases resolve for the game-code/format read exactly as they do
+    # inside ``_parse_leg`` — an aliased champion leg carries the FINAL's game
+    # code only on its synthetic ticker (its raw game segment is a bare season
+    # code that parses to no match, which used to drop the whole game to copula).
+    first = resolve_pricing_alias(tickers[idxs[0]])
     parts = first.split("-")
     if len(parts) < 2:
         return None

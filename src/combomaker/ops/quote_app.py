@@ -557,7 +557,14 @@ class QuoteApp:
                 # window calls a free lane; correctness rests on the P0-2
                 # generation/version stamps (review-verified), not on worker
                 # exclusivity.
-                book_risk_pool = BookRiskPool(workers=2, data_dir=config.data_dir)
+                book_risk_pool = BookRiskPool(
+                    workers=2,
+                    data_dir=config.data_dir,
+                    # Workers must hold the pricing aliases or an aliased
+                    # champion leg prices structurally on the loop but nets
+                    # adversarially in the risk/waiver MC (see BookRiskPool).
+                    pricing_aliases=config.pricing.leg_pricing_aliases,
+                )
                 book_risk_pool.start()
             lifecycle = QuoteLifecycle(
                 clock=self._clock,

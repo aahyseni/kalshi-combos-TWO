@@ -62,6 +62,7 @@ from combomaker.pricing.dixon_coles import (
     Team,
     TeamWin,
     TotalOver,
+    invert,
 )
 from combomaker.pricing.dixon_coles import (
     _half_indicator as half_indicator,
@@ -78,8 +79,13 @@ from combomaker.pricing.dixon_coles import (
 from combomaker.pricing.dixon_coles import (
     _team_indicator as team_indicator,
 )
-from combomaker.pricing.dixon_coles import (
-    invert,
+
+# Pricing-alias resolution is part of the PARSE surface (2026-07-16):
+# ``parse_leg`` resolves internally, and any consumer that reads a game code /
+# match format straight off a ticker (the risk MC's ``_try_build_game``) must
+# resolve the SAME way or an aliased leg would parse in pricing and not in risk.
+from combomaker.pricing.legtypes import (  # noqa: E402  (grouped re-export)
+    resolve_pricing_alias,
 )
 from combomaker.pricing.structural import (
     _Match as Match,
@@ -118,6 +124,7 @@ __all__ = [
     # parse
     "parse_leg",
     "parse_match",
+    "resolve_pricing_alias",
     # sample
     "States",
     "states",

@@ -31,6 +31,18 @@ _SENSITIVE = (
 
 
 @pytest.fixture(autouse=True)
+def _reset_pricing_aliases():  # type: ignore[no-untyped-def]
+    """The pricing-alias registry is process-global (installed by
+    PricingEngine.__init__ / the pool initializers). A test that constructs an
+    engine with aliases must not leak them into the next test — reset after
+    every test; cheap no-op for the overwhelming majority that never install."""
+    yield
+    from combomaker.pricing.legtypes import set_pricing_aliases
+
+    set_pricing_aliases({})
+
+
+@pytest.fixture(autouse=True)
 def hermetic_env(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
     if "tests/integration" in str(request.node.fspath).replace("\\", "/"):
         yield

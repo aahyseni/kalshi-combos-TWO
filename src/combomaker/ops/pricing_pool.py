@@ -40,6 +40,7 @@ from combomaker.ops.process_group import (
 from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.joint import JointEstimate
 from combomaker.pricing.legs import LegBelief
+from combomaker.pricing.legtypes import set_pricing_aliases
 from combomaker.pricing.quote import NoQuote
 from combomaker.pricing.relationships import Relationship
 from combomaker.rfq.models import Rfq
@@ -521,6 +522,16 @@ def _worker_candidate_book_risk(
     )
 
 
+def _book_risk_pool_init(pricing_aliases: dict[str, str]) -> None:
+    """Runs once per book-risk worker process (spawn-safe): arm parent-death
+    detection (layer 2) + install the pricing aliases so game grouping and
+    structural game plans resolve tickers exactly as the loop's pricer does
+    (see BookRiskPool.__init__ note). ``set_pricing_aliases`` re-validates
+    in-worker — a bad mapping fails the pool loudly, never half-installs."""
+    install_parent_death_signal()
+    set_pricing_aliases(pricing_aliases)
+
+
 class BookRiskPool:
     """Runs the full-book MC in a worker process so it never blocks the event loop.
 
@@ -532,9 +543,24 @@ class BookRiskPool:
     freshness guard then fails the CVaR cap CLOSED, never open). One worker is
     enough (the recompute is throttled to well inside the freshness window)."""
 
-    def __init__(self, *, workers: int = 1, data_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        workers: int = 1,
+        data_dir: Path | None = None,
+        pricing_aliases: dict[str, str] | None = None,
+    ) -> None:
         self._workers = max(1, workers)
         self._data_dir = data_dir
+        # Pricing aliases the WORKERS must hold (2026-07-16): the book-risk /
+        # candidate-gate / waiver workers parse leg tickers (game_key grouping +
+        # structural game plans) in their OWN process, where the loop engine's
+        # registry does not exist. Without this, an aliased champion leg would
+        # price structurally on the loop but net adversarially in risk — the
+        # quiet-failure split rule 2 exists to prevent. JointPool needs no
+        # equivalent: its initializer builds a worker PricingEngine from the
+        # same config, which installs the registry itself.
+        self._pricing_aliases = dict(pricing_aliases or {})
         self._executor: ProcessPoolExecutor | None = None
         self._kill_job: WindowsKillJob | None = None
         self.calls = 0
@@ -550,11 +576,18 @@ class BookRiskPool:
     def start(self) -> None:
         # Straggler reap is done ONCE at app startup (see JointPool.start note).
         self._kill_job = WindowsKillJob()
-        # Initializer arms parent-death detection in the worker (layer 2).
+        # Initializer arms parent-death detection in the worker (layer 2) and
+        # installs the pricing aliases (validated in-worker too).
         self._executor = ProcessPoolExecutor(
-            max_workers=self._workers, initializer=install_parent_death_signal
+            max_workers=self._workers,
+            initializer=_book_risk_pool_init,
+            initargs=(self._pricing_aliases,),
         )
-        log.info("book_risk_pool_started", workers=self._workers)
+        log.info(
+            "book_risk_pool_started",
+            workers=self._workers,
+            pricing_aliases=len(self._pricing_aliases),
+        )
 
     def register_workers(self) -> None:
         """Bind spawned workers to the kill-job (layer 1) + record their PIDs

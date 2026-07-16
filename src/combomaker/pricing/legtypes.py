@@ -11,7 +11,113 @@ by itself — it falls back to the flat same-event prior with WIDER uncertainty
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from enum import StrEnum
+
+# --- PRICING ALIASES (2026-07-16, operator-directed) -------------------------
+# Exact-ticker aliases applied ONLY inside the pricing-classification layer:
+# classify_leg / classify_sport / is_period_leg / structural parsing / markup
+# sport tagging. The exchange-facing identity (order-book subscription,
+# marginal source, settlement, metadata, freshness) keeps the REAL ticker.
+# Motivating case: KXMENWORLDCUP-26-AR ("Argentina wins the World Cup") is, at
+# finals time, settlement-identical to winning the final incl. ET/pens — i.e.
+# exactly a KXWCADVANCE leg on the final. Aliasing it to the synthetic ticker
+# KXWCADVANCE-26JUL19ESPARG-ARG makes the leg STRUCTURAL: the Dixon-Coles
+# engine nets it exactly against every other final leg (Messi, corners, BTTS)
+# instead of the flat UNKNOWN prior, and the markup layer sees soccer instead
+# of 'other' (which quoted ZERO markup). Config-driven
+# (PricingConfig.leg_pricing_aliases, committed default {}), installed by
+# PricingEngine.__init__ (per PROCESS: the pricing-pool worker initializer
+# builds a worker engine from the same config, and BookRiskPool's initializer
+# installs the mapping directly — a registry that exists only in the loop
+# process would quietly split pricing from risk); only UNKNOWN-classifying
+# tickers may be aliased (validated — an alias can never override a modeled
+# family, and the target must BE a modeled family).
+#
+# A derived EVENT alias registry rides along: Kalshi market = EVENT-SUFFIX, so
+# {KXMENWORLDCUP-26-AR: KXWCADVANCE-26JUL19ESPARG-ARG} implies the event alias
+# {KXMENWORLDCUP-26: KXWCADVANCE-26JUL19ESPARG}. ``grouping.game_key`` resolves
+# it, which is the ONE seam both the copula same-game regroup AND every risk
+# aggregation (exposure/limits/skew/book-risk game plans) key on — so the
+# champion leg joins the final's game block everywhere at once, with the
+# pricer/risk parity property preserved by construction. Mutual-exclusion
+# metadata lookups (relationships Pass 1) deliberately keep the REAL
+# event_ticker, so exchange ME flags stay authoritative.
+_PRICING_ALIASES: dict[str, str] = {}
+_PRICING_EVENT_ALIASES: dict[str, str] = {}
+
+
+def _event_of(market_ticker: str) -> str:
+    """EVENT-SUFFIX -> EVENT (Kalshi market-ticker convention)."""
+    return market_ticker.rsplit("-", 1)[0]
+
+
+def validate_pricing_aliases(aliases: Mapping[str, str]) -> None:
+    """Raise ValueError unless every alias is safe to install.
+
+    Rules (each guards a real failure mode):
+    - keys/values are hyphenated non-empty strings and key != value (an
+      un-hyphenated ticker has no EVENT prefix to derive, so grouping would
+      silently not follow the market alias);
+    - no value is itself a key (resolution is single-step by design — a chain
+      in config is an intent error, not something to half-honor);
+    - a key must classify UNKNOWN on the RAW tables (an alias may never
+      override a modeled family) and a value must NOT (an UNKNOWN target
+      would re-launder the leg back into the flat prior, defeating the alias);
+    - keys sharing a derived real event must map to ONE synthetic event
+      (otherwise game grouping for that event is ill-defined).
+    """
+    events_seen: dict[str, str] = {}
+    for key, value in aliases.items():
+        if not key or not value or key == value:
+            raise ValueError(f"pricing alias {key!r} -> {value!r}: empty or self-alias")
+        if "-" not in key or "-" not in value:
+            raise ValueError(
+                f"pricing alias {key!r} -> {value!r}: both sides need an "
+                "EVENT-SUFFIX shape to derive the event alias"
+            )
+        if value in aliases:
+            raise ValueError(f"pricing alias chain: {key!r} -> {value!r} is also a key")
+        if _classify_leg_raw(key) is not LegType.UNKNOWN:
+            raise ValueError(
+                f"pricing alias key {key!r} classifies {_classify_leg_raw(key)}, "
+                "not UNKNOWN — an alias may never override a modeled family"
+            )
+        if _classify_leg_raw(value) is LegType.UNKNOWN:
+            raise ValueError(
+                f"pricing alias target {value!r} classifies UNKNOWN — pointless alias"
+            )
+        real_event, synth_event = _event_of(key), _event_of(value)
+        if events_seen.setdefault(real_event, synth_event) != synth_event:
+            raise ValueError(
+                f"pricing aliases map event {real_event!r} to multiple synthetic "
+                f"events ({events_seen[real_event]!r}, {synth_event!r})"
+            )
+
+
+def set_pricing_aliases(aliases: Mapping[str, str]) -> None:
+    """Validate + install the exact-ticker pricing aliases (replaces the
+    registry). The derived event-alias registry is rebuilt atomically with it."""
+    validate_pricing_aliases(aliases)
+    _PRICING_ALIASES.clear()
+    _PRICING_EVENT_ALIASES.clear()
+    _PRICING_ALIASES.update(aliases)
+    for key, value in aliases.items():
+        _PRICING_EVENT_ALIASES[_event_of(key)] = _event_of(value)
+
+
+def resolve_pricing_alias(market_ticker: str) -> str:
+    """The ticker the PRICING layer should reason about (identity when
+    unaliased). Single-step on purpose — no chains."""
+    return _PRICING_ALIASES.get(market_ticker, market_ticker)
+
+
+def resolve_pricing_event_alias(event_ticker: str) -> str:
+    """The event the PRICING layer should group on (identity when unaliased).
+    Derived from the market aliases at install time; consumed by
+    ``grouping.game_key`` so pricing correlation and risk aggregation move
+    together — never resolve one without the other."""
+    return _PRICING_EVENT_ALIASES.get(event_ticker, event_ticker)
 
 
 class LegType(StrEnum):
@@ -141,11 +247,18 @@ def is_period_leg(market_ticker: str) -> bool:
     """True for a period/derived market (first/second half, quarter). Gates the
     structural inverter (no half-time scoreline window) and the same-game
     regroup — matched on the SERIES prefix only."""
-    series = market_ticker.split("-", 1)[0].upper()
+    series = resolve_pricing_alias(market_ticker).split("-", 1)[0].upper()
     return _PERIOD_SERIES.search(series) is not None
 
 
 def classify_leg(market_ticker: str) -> LegType:
+    return _classify_leg_raw(resolve_pricing_alias(market_ticker))
+
+
+def _classify_leg_raw(market_ticker: str) -> LegType:
+    """Classification from the ticker AS GIVEN (no alias resolution) — the
+    public ``classify_leg`` resolves first; the alias validator needs the raw
+    verdict to enforce the only-UNKNOWN rule without registry recursion."""
     series = market_ticker.split("-", 1)[0].upper()
     base = LegType.UNKNOWN
     for keyword, leg_type in _KEYWORDS:
@@ -212,6 +325,7 @@ _SPORT_KEYWORDS: tuple[tuple[str, Sport], ...] = (
 
 
 def classify_sport(market_ticker: str) -> Sport:
+    market_ticker = resolve_pricing_alias(market_ticker)
     series = market_ticker.split("-", 1)[0].upper()
     for keyword, sport in _SPORT_KEYWORDS:
         if keyword in series:

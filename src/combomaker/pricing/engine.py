@@ -32,7 +32,7 @@ from combomaker.ops.logging import get_logger
 from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
 from combomaker.pricing.joint import JointEstimate, price_containment, price_joint_matrices
 from combomaker.pricing.legs import KalshiBookSource, LegBelief, OddsSource, blend_beliefs
-from combomaker.pricing.legtypes import LegType, classify_leg
+from combomaker.pricing.legtypes import LegType, classify_leg, set_pricing_aliases
 from combomaker.pricing.markup import MarkupPolicy
 from combomaker.pricing.quote import (
     ConstructedQuote,
@@ -130,6 +130,14 @@ class PricingEngine:
         self._feed = feed
         self._metadata = metadata
         self._config = config
+        # Install the exact-ticker pricing aliases (process-wide registry;
+        # validated). One engine per process in production: the loop engine and
+        # each pricing-pool worker's engine both pass through here with the SAME
+        # shipped config, so every process that classifies/parses tickers holds
+        # the same mapping (BookRiskPool workers install it via their pool
+        # initializer instead — they have no engine). getattr: duck-typed test
+        # configs without the field mean "no aliases", never a crash.
+        set_pricing_aliases(dict(getattr(config, "leg_pricing_aliases", {}) or {}))
         # Bounded LRU of the joint-estimation result keyed on its exact pure
         # inputs (see _DEFAULT_JOINT_MEMO_MAXSIZE). maxsize<=0 disables it (used by
         # the parity check to prove memo-on == memo-off to the cent).

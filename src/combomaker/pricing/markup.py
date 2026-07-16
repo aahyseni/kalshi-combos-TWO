@@ -22,11 +22,17 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from combomaker.pricing.legtypes import resolve_pricing_alias
+
 if TYPE_CHECKING:  # avoid a runtime pricing->ops import cycle; config is duck-typed
     from combomaker.ops.config import MarkupConfig
 
 
 def _leg_sport(ticker: str) -> str:
+    # Pricing aliases apply (2026-07-16): an aliased champion leg tags as its
+    # structural equivalent's sport — otherwise a KXMENWORLDCUP leg tagged
+    # 'other' and the whole combo quoted with ZERO markup (observed live).
+    ticker = resolve_pricing_alias(ticker)
     if ticker.startswith("KXWC"):
         return "soccer"
     if ticker.startswith("KXMLB"):
