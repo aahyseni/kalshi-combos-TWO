@@ -45,6 +45,19 @@ class TestLoading:
         with pytest.raises(ConfigError):
             load_config(tmp_path / "nope.yaml")
 
+    def test_source_path_records_loaded_file(self, tmp_path: Path) -> None:
+        # The supervisor subprocess re-loads config from this path; without it a
+        # local-override launch config never reaches the watchdog (Problem B).
+        path = write_config(tmp_path, "env: demo\n")
+        config = load_config(path)
+        assert config.source_path == path
+
+    def test_source_path_from_yaml_is_overwritten(self, tmp_path: Path) -> None:
+        # A file cannot spoof having been loaded from somewhere else.
+        path = write_config(tmp_path, "source_path: /elsewhere.yaml\n")
+        config = load_config(path)
+        assert config.source_path == path
+
 
 class TestProdGuard:
     def base(self, env: Env, mode: Mode, *, confirm: bool, limits: bool) -> AppConfig:

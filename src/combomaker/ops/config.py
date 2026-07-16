@@ -2133,6 +2133,12 @@ class AppConfig(StrictModel):
     # confirm_live comes only from the CLI flag --confirm-live, never from YAML:
     # a file can't accidentally arm production.
     confirm_live: bool = Field(default=False, exclude=True)
+    # The YAML file this config was loaded from (recorded by load_config, never
+    # settable from YAML itself). Subprocesses that re-load config (the safety
+    # supervisor) must receive THIS path, not re-derive the base per-env file —
+    # otherwise local-override values (e.g. supervisor.heartbeat_timeout_s) load
+    # in the bot but silently not in the watchdog that enforces them.
+    source_path: Path | None = Field(default=None, exclude=True)
 
     def assert_safe_to_run(self) -> None:
         """Hardcoded production guard (the STATIC go-live gates). Raises
@@ -2200,4 +2206,4 @@ def load_config(
     raw.setdefault("endpoints", EndpointsConfig.for_env(resolved_env).model_dump())
 
     config = AppConfig.model_validate(raw)
-    return config.model_copy(update={"confirm_live": confirm_live})
+    return config.model_copy(update={"confirm_live": confirm_live, "source_path": path})

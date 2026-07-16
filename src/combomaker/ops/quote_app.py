@@ -127,6 +127,28 @@ POOL_DEADLINE_S = 2.0
 # cuts stale exposure, frees capacity to price more. Re-validate once we have fills.
 QUOTE_TTL_S = 20.0
 
+
+def supervisor_launch_cmd(config: AppConfig) -> list[str]:
+    """Argv for the safety-supervisor subprocess.
+
+    Must forward the bot's OWN config file (``--config``): the supervisor
+    re-loads config in its own process, and before this it always fell back to
+    the base per-env YAML — so any supervisor override living only in a local
+    launch config (e.g. ``supervisor.heartbeat_timeout_s: 30`` in the armed
+    ``*.local.yaml``) applied to the bot but silently NOT to the watchdog that
+    enforces it (the 2026-07-15 15s heartbeat kills, handoff Problem B)."""
+    cmd = [
+        sys.executable,
+        "-m",
+        "combomaker.ops.supervisor",
+        "--env",
+        str(config.env),
+    ]
+    if config.source_path is not None:
+        cmd += ["--config", str(config.source_path)]
+    return cmd
+
+
 # HARD-class halts: an in-process trip on any of these means our local book /
 # money model is provably wrong or under stress, so a restart MUST reconcile
 # against the exchange before quoting again — we drop the needs_reconcile marker
@@ -1235,13 +1257,7 @@ class QuoteApp:
                     "prod preflight external_kill_reachable gate will refuse to quote"
                 ),
             )
-        cmd = [
-            sys.executable,
-            "-m",
-            "combomaker.ops.supervisor",
-            "--env",
-            str(self._config.env),
-        ]
+        cmd = supervisor_launch_cmd(self._config)
         try:
             self._supervisor_proc = await asyncio.create_subprocess_exec(*cmd)
         except OSError as exc:
