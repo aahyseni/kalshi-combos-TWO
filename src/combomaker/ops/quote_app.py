@@ -601,6 +601,11 @@ class QuoteApp:
                 # FILL-RECORD RECOVERY (2026-07-16 P1): REST GET handle for the
                 # maintenance sweep (None in paper mode — nothing to recover).
                 quote_getter=quote_getter,
+                # WEDGE FIX (2026-07-16, the 18:13Z kill): the lifecycle beats
+                # this heartbeat per iteration inside its long maintenance
+                # sub-loops (reprice sweep / recovery polls) — progress is not a
+                # wedge; a true event-loop wedge still cannot beat.
+                beat=self._heartbeat.beat,
             )
             # R3 Phase 3: single-writer risk-reservation service. Wired AFTER the
             # lifecycle (it reuses the lifecycle's shadow splitter, so a %-cap

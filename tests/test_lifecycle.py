@@ -710,3 +710,106 @@ async def test_risk_audit_fallback_reason_on_unmeasured_book(rig: Rig) -> None:
     assert fields["es_99_cc"] is None
     assert fields["deterministic_max_loss_cc"] is None
     assert fields["p_ruin"] is None
+
+
+# --- WEDGE-HARDENED reprice sweep (2026-07-16 — the 18:13Z heartbeat kill) ---
+
+
+async def _open_n_quotes(rig: Rig, n: int) -> None:
+    await rig.lifecycle.handle_rfq(rfq())
+    for i in range(2, n + 1):
+        await rig.lifecycle.handle_rfq(combo(CROSS_EVENT_LEGS, id=f"rfq_{i}"))
+    assert rig.lifecycle.open_quote_count == n
+
+
+async def test_reprice_pool_circuit_breaker_trips_and_defers(rig: Rig) -> None:
+    """Two consecutive pool-deadline results presume the pool FROZEN: the
+    tripped quotes get today's fail-safe deletion, the REST of the book defers
+    to the next tick instead of serially burning one pool deadline per quote
+    (the 62s grind that aged the heartbeat into an emergency kill)."""
+    from combomaker.pricing.quote import NoQuote
+
+    await _open_n_quotes(rig, 4)
+    calls = 0
+
+    async def frozen_pool(rfq_, **_: object) -> NoQuote:
+        nonlocal calls
+        calls += 1
+        return NoQuote(ReasonCode.SKIP_PRICE_DEADLINE, "pool frozen (test)")
+
+    rig.lifecycle._price_async = frozen_pool  # type: ignore[method-assign]
+    await rig.lifecycle.maintenance_tick()
+    assert calls == 2  # tripped after _REPRICE_POOL_TRIP consecutive deadlines
+    assert rig.lifecycle.open_quote_count == 2  # remaining book NOT liquidated
+    assert rig.metrics.counter("reprice.pool_trip") == 1
+    # the two swept quotes keep the pre-fix fail-safe deletion
+    assert len(rig.sender.deleted) == 2
+
+
+async def test_reprice_non_deadline_noquote_does_not_trip(rig: Rig) -> None:
+    """A genuine stale-leg NoQuote resets the breaker — the whole book still
+    sweeps in one tick exactly as before the fix."""
+    from combomaker.pricing.quote import NoQuote
+
+    await _open_n_quotes(rig, 4)
+    calls = 0
+
+    async def stale(rfq_, **_: object) -> NoQuote:
+        nonlocal calls
+        calls += 1
+        return NoQuote(ReasonCode.SKIP_LEG_STALE, "stale (test)")
+
+    rig.lifecycle._price_async = stale  # type: ignore[method-assign]
+    await rig.lifecycle.maintenance_tick()
+    assert calls == 4
+    assert rig.lifecycle.open_quote_count == 0
+    assert rig.metrics.counter("reprice.pool_trip") == 0
+
+
+async def test_reprice_sweep_wall_budget_defers_remainder(rig: Rig) -> None:
+    """Many slow-but-not-timeout awaits cannot eat the tick either: past the
+    wall budget the remainder defers to the next tick (0.5s away)."""
+    await _open_n_quotes(rig, 4)
+    calls = 0
+
+    async def slow_but_fine(rfq_, **_: object):  # noqa: ANN202
+        nonlocal calls
+        calls += 1
+        rig.h.clock.advance(1.5)  # each call chews 1.5s of the 2.5s budget
+        state = next(iter(rig.lifecycle._open.values()))
+        return state.constructed  # unchanged fair — no reprice action
+
+    rig.lifecycle._price_async = slow_but_fine  # type: ignore[method-assign]
+    await rig.lifecycle.maintenance_tick()
+    assert calls == 2  # 0s -> price(1.5s) -> price(3.0s) -> budget break
+    assert rig.lifecycle.open_quote_count == 4  # nothing deleted, just deferred
+    assert rig.metrics.counter("reprice.sweep_budget_deferred") == 1
+
+
+async def test_reprice_sweep_beats_heartbeat_per_iteration(rig: Rig) -> None:
+    """The beat callback fires once per swept quote — a loop making progress
+    never reads as a wedge, while a true event-loop wedge still cannot beat."""
+    beats = 0
+
+    def beat() -> None:
+        nonlocal beats
+        beats += 1
+
+    rig.lifecycle._beat_cb = beat
+    await _open_n_quotes(rig, 3)
+    beats = 0
+    await rig.lifecycle.maintenance_tick()
+    assert beats >= 3
+
+
+async def test_beat_failure_never_breaks_the_tick(rig: Rig) -> None:
+    """A heartbeat write failure is logged, never raised: the file going stale
+    IS the fail-closed signal."""
+
+    def broken() -> None:
+        raise OSError("disk full (test)")
+
+    rig.lifecycle._beat_cb = broken
+    await _open_n_quotes(rig, 2)
+    await rig.lifecycle.maintenance_tick()  # must not raise
+    assert rig.lifecycle.open_quote_count == 2

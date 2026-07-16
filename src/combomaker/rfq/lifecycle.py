@@ -24,7 +24,7 @@ any resync (feed ordering guarantees that).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any, Protocol
@@ -153,6 +153,12 @@ class QuoteGetter(Protocol):
 # found the 2026-07-16 proven case) rather than polling forever.
 _FILL_RECOVERY_MAX_POLLS_PER_TICK = 3
 _FILL_RECOVERY_MAX_ATTEMPTS = 10
+
+# REPRICE-SWEEP WEDGE DEFENSES (2026-07-16 — the 18:13Z heartbeat kill; see
+# maintenance_tick). Consecutive pool-deadline results that trip the frozen-pool
+# circuit breaker, and the sweep's total wall budget per tick.
+_REPRICE_POOL_TRIP = 2
+_REPRICE_SWEEP_BUDGET_S = 2.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,6 +332,7 @@ class QuoteLifecycle:
         joint_pool: JointPool | None = None,
         book_risk_pool: BookRiskPool | None = None,
         quote_getter: QuoteGetter | None = None,
+        beat: Callable[[], None] | None = None,
     ) -> None:
         self._clock = clock
         self._sender = sender
@@ -437,6 +444,13 @@ class QuoteLifecycle:
         # the sweep polls. None (paper/backtests/minimal rigs) ⇒ no sweep — the
         # ledger is never patched from a guess (fail-closed).
         self._quote_getter = quote_getter
+        # HEARTBEAT BEAT (2026-07-16 wedge fix): quote_app's Heartbeat.beat,
+        # invoked per iteration inside the long maintenance sub-loops (reprice
+        # sweep, recovery polls) so a loop that is genuinely MAKING PROGRESS
+        # never reads as a wedge to the external supervisor — while a true
+        # event-loop wedge still cannot beat (the fail-closed signal survives).
+        # None (tests/backtests) ⇒ no-op.
+        self._beat_cb = beat
         self._markouts = MarkoutTracker(store.record_markout)
         # LAST-LOOK MC WAIVER observability: the per-confirm waiver audit record
         # ({granted, worst_case_cc, games}), set ONLY when a waiver ATTEMPT ran
@@ -2379,6 +2393,18 @@ class QuoteLifecycle:
         except FeeUnknownError:
             return None
 
+    def _beat(self) -> None:
+        """Beat the external-supervisor heartbeat mid-loop (2026-07-16 wedge
+        fix). A beat-write failure is logged, never raised — the file going
+        stale IS the fail-closed signal; breaking the maintenance tick over it
+        would only make the wedge story worse."""
+        if self._beat_cb is None:
+            return
+        try:
+            self._beat_cb()
+        except Exception:  # noqa: BLE001 — see docstring
+            log.warning("heartbeat_beat_failed_midloop", exc_info=True)
+
     # ---------------------------------------------- fill-record recovery sweep
 
     async def _sweep_unrecorded_fills(self) -> None:
@@ -2440,6 +2466,7 @@ class QuoteLifecycle:
                 continue  # exhausted — already reported loudly below
             polls += 1
             state.fill_recovery_attempts += 1
+            self._beat()  # a REST poll is progress, not a wedge (2026-07-16)
             self._metrics.inc("fill_recovery.swept")
             try:
                 payload = await self._quote_getter.get_quote(quote_id)
@@ -2763,18 +2790,61 @@ class QuoteLifecycle:
             if fv_verdict == "decline" and self._open:
                 log.warning("fill_velocity_cancel_all", detail=fv_detail)
                 await self.cancel_all(ReasonCode.DECLINE_FILL_VELOCITY)
+        # REPRICE SWEEP — WEDGE-HARDENED (2026-07-16, the 18:13Z heartbeat kill).
+        # Under a frozen joint pool (abandoned 5-8s cold-tail futures keep every
+        # worker busy) this loop used to serially burn one full pool deadline PER
+        # open quote (31 × 2.0s = 62s in the killed run) while the heartbeat is
+        # beaten only between ticks — the supervisor read the silence as a wedge
+        # and emergency-killed a LIVE bot. Three bounded defenses, none of which
+        # change what any individual quote decision would have been:
+        #   (1) beat the heartbeat per iteration — the loop IS making progress;
+        #       a genuine event-loop wedge still cannot beat (fail-closed);
+        #   (2) a consecutive pool-deadline CIRCUIT BREAKER: after
+        #       _REPRICE_POOL_TRIP consecutive SKIP_PRICE_DEADLINE results the
+        #       pool is presumed frozen and the REST of the sweep defers to the
+        #       next tick (0.5s away) — un-repriced quotes stay bounded by
+        #       last-look freshness at confirm, and the first tripped quotes
+        #       still get today's fail-safe deletion;
+        #   (3) a wall budget for the whole sweep (_REPRICE_SWEEP_BUDGET_S) as
+        #       belt-and-suspenders against many slow-but-not-timeout awaits.
         now = self._clock.monotonic_ns()
+        sweep_start_ns = now
+        budget_ns = int(_REPRICE_SWEEP_BUDGET_S * 1e9)
+        consecutive_pool_deadline = 0
         for quote_id, state in list(self._open.items()):
+            self._beat()
             if state.accepted:
                 continue
             age_s = (now - state.created_mono_ns) / 1e9
             if age_s > self._config.quote_ttl_s:
                 await self._delete_quote(quote_id, ReasonCode.DELETE_TTL_EXPIRED)
                 continue
+            if self._clock.monotonic_ns() - sweep_start_ns > budget_ns:
+                self._metrics.inc("reprice.sweep_budget_deferred")
+                log.warning(
+                    "reprice_sweep_budget_deferred",
+                    detail="reprice sweep exceeded its wall budget — remaining "
+                    "quotes defer to the next tick",
+                )
+                break
             result = await self._price_async(state.rfq)
             if isinstance(result, NoQuote):
                 await self._delete_quote(quote_id, ReasonCode.DELETE_LEG_STALE)
+                if result.reason is ReasonCode.SKIP_PRICE_DEADLINE:
+                    consecutive_pool_deadline += 1
+                    if consecutive_pool_deadline >= _REPRICE_POOL_TRIP:
+                        self._metrics.inc("reprice.pool_trip")
+                        log.warning(
+                            "reprice_pool_circuit_tripped",
+                            consecutive=consecutive_pool_deadline,
+                            detail="consecutive pool deadlines — pool presumed "
+                            "frozen; remaining reprices defer to the next tick",
+                        )
+                        break
+                else:
+                    consecutive_pool_deadline = 0
                 continue
+            consecutive_pool_deadline = 0
             if abs(int(result.fair_cc) - int(state.constructed.fair_cc)) > (
                 self._config.reprice_threshold_cc
             ):

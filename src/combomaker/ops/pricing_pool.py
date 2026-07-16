@@ -212,19 +212,19 @@ class JointPool:
             raise
 
     def shutdown(self) -> None:
-        # P2-1 layer 3: finally close/join. Cancel queued futures, then JOIN the
-        # workers (wait=True) so a CLEAN stop reaps its own children deterministically
-        # — the OS-level layers only ever matter on an ABNORMAL parent exit. The
-        # kill-job handle is closed last, in a finally, so it is released even if the
-        # join raises (and on an abnormal exit the OS closes it for us, triggering
-        # KILL_ON_JOB_CLOSE).
+        # P2-1 layer 3, NON-BLOCKING since 2026-07-16 (throughput lens 2,
+        # kill-1): the old wait=True join blocked a CLEAN stop behind any worker
+        # grinding a 5-8s cold-tail joint, ageing the heartbeat past the
+        # supervisor timeout — halts ended in a cosmetic emergency kill +
+        # needs_reconcile. Reaping stays deterministic WITHOUT the join: the
+        # kill-job handle close in the finally fires KILL_ON_JOB_CLOSE and the
+        # OS ends every child immediately (the same mechanism that already
+        # covers an abnormal parent exit).
         executor = self._executor
         self._executor = None
         try:
             if executor is not None:
                 executor.shutdown(wait=False, cancel_futures=True)
-                # Block until workers actually exit so none linger post-stop.
-                executor.shutdown(wait=True)
         finally:
             if self._kill_job is not None:
                 self._kill_job.close()
@@ -648,13 +648,14 @@ class BookRiskPool:
         return result
 
     def shutdown(self) -> None:
-        # Layer 3: finally close/join, then release the kill-job handle.
+        # Layer 3, NON-BLOCKING since 2026-07-16 (same kill-1 rationale as
+        # JointPool.shutdown): no wait=True join — the kill-job handle close in
+        # the finally reaps every child deterministically via KILL_ON_JOB_CLOSE.
         executor = self._executor
         self._executor = None
         try:
             if executor is not None:
                 executor.shutdown(wait=False, cancel_futures=True)
-                executor.shutdown(wait=True)
         finally:
             if self._kill_job is not None:
                 self._kill_job.close()
