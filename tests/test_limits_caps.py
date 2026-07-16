@@ -753,3 +753,48 @@ class TestPortfolioRuinCap:
 
         with pytest.raises(ValidationError):
             RiskConfig(portfolio_cvar_frac="1.5")
+
+
+class TestAllReservedBookGating:
+    """P0-4 end-to-end (live blocker 2026-07-16): a book whose ONLY holdings are
+    conservatively-reserved yields a REAL snapshot with n_positions=0 and a
+    nonzero deterministic reserve. It must gate the reserve on the deterministic
+    axis — never blanket-fail-close every quote as 'unusable' (that declined
+    3k/8min quotes live when the one rehydrated gated-series position was the
+    whole book)."""
+
+    def _check(self, snap: object, det_frac: Fraction) -> list[ReasonCode]:
+        limits = {**LOOSE, "portfolio_det_max_frac": det_frac}
+        breaches = LimitChecker(RiskLimits(**limits)).check(  # type: ignore[arg-type]
+            empty_book(),
+            MARG,
+            DailyPnl(),
+            risk_bankroll_cc=BANKROLL_2K,
+            book_risk=snap,  # type: ignore[arg-type]
+        )
+        return r2_reasons(breaches)
+
+    def _snap(self, reserve_cc: float) -> object:
+        from combomaker.sim.book_risk import BookRiskSnapshot
+
+        # Exactly the shape compute_book_risk returns for an ALL-RESERVED book.
+        return BookRiskSnapshot(
+            unknown=False,
+            band="high",
+            n_samples=1,
+            seed=1,
+            n_positions=0,
+            deterministic_max_loss_cc=reserve_cc,
+        )
+
+    def test_reserve_under_det_ceiling_quotes(self) -> None:
+        snap = self._snap(210_000.0)  # $21 reserve on a $2k bankroll
+        assert snap.usable is True  # type: ignore[attr-defined]
+        reasons = self._check(snap, Fraction(15, 100))
+        assert ReasonCode.SKIP_PORTFOLIO_CVAR not in reasons
+        assert ReasonCode.SKIP_PORTFOLIO_DET_MAX not in reasons
+
+    def test_reserve_over_det_ceiling_still_gates(self) -> None:
+        thr = threshold_cc(Fraction(15, 100), BANKROLL_2K)
+        reasons = self._check(self._snap(float(thr + 1)), Fraction(15, 100))
+        assert ReasonCode.SKIP_PORTFOLIO_DET_MAX in reasons

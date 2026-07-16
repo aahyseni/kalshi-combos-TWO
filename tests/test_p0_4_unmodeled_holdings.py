@@ -228,9 +228,11 @@ def test_missing_marginal_never_becomes_ordinary_usable_half() -> None:
 def test_all_reserved_book_is_still_deterministic_reserve_not_nogo() -> None:
     """A book that is ALL reserved (no risk-modeled position) still has a real
     deterministic reserve to account for — the MC returns that reserve on the
-    deterministic max-loss axis rather than a no-go zero. (The CVaR cap still fails
-    closed via ``usable`` since there is no sampled position, but the reserve is
-    not lost.)"""
+    deterministic max-loss axis rather than a no-go zero, and the snapshot is
+    USABLE: the sampled tail is exactly 0 (nothing to sample) and the reserve
+    gates on the deterministic axis. Grading it unusable fail-closed EVERY quote
+    on a 100%-reserved book (live 2026-07-16: the one rehydrated gated-series
+    position blocked all quoting via SKIP_PORTFOLIO_CVAR)."""
     model = build_book_model([_mlb_reserved_position()], marginals=_mixed_marginals)
     assert model.unknown is False
     assert len(model.positions) == 0
@@ -240,3 +242,22 @@ def test_all_reserved_book_is_still_deterministic_reserve_not_nogo() -> None:
     assert snap.deterministic_max_loss_cc == 210_000.0
     # No sampled positions ⇒ the model-ES axis is zero (nothing sampled).
     assert snap.governing_model_es_99_cc == 0.0
+    # P0-4 documented intent: "still USABLE ... not a no-go".
+    assert snap.usable is True
+
+
+def test_truly_empty_and_unknown_snapshots_stay_unusable() -> None:
+    """The usable widening is EXACTLY the all-reserved case: a truly-empty book
+    (no positions, no reserve) and an UNKNOWN model (missing risk-modeled
+    marginal) both still fail closed."""
+    empty = compute_book_risk(
+        build_book_model([], marginals=_mixed_marginals), n_samples=100, seed=1
+    )
+    assert empty.usable is False
+
+    unknown_snap = compute_book_risk(
+        build_book_model([_wc_position()], marginals=lambda _t: None),
+        n_samples=100,
+        seed=1,
+    )
+    assert unknown_snap.usable is False

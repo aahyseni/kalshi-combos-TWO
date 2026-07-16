@@ -181,8 +181,20 @@ class BookRiskSnapshot:
 
     @property
     def usable(self) -> bool:
-        """True iff the stats may drive a gate/halt (not UNKNOWN, has positions)."""
-        return (not self.unknown) and self.n_positions > 0
+        """True iff the stats may drive a gate/halt (not UNKNOWN, describes a real
+        measured book).
+
+        P0-4: an ALL-RESERVED book (0 sampled positions, nonzero deterministic
+        reserve) IS fully measured — the sampled model tail is exactly 0 (nothing
+        to sample) and the deterministic axis carries the whole reserve — so it
+        must NOT grade as an unmeasured no-go. Before this clause a bot whose only
+        holding was a conservatively-reserved gated-series position fail-closed
+        EVERY quote on SKIP_PORTFOLIO_CVAR (live 2026-07-16, 3k declines/8min).
+        UNKNOWN stays unusable; a truly-empty snapshot (no positions AND no
+        reserve) stays unusable."""
+        if self.unknown:
+            return False
+        return self.n_positions > 0 or self.deterministic_max_loss_cc > 0.0
 
 
 def _deterministic_all_hit_loss_cc(model: BookModel) -> float:
