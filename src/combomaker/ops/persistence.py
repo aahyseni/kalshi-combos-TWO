@@ -215,6 +215,28 @@ class Store:
         await db.execute("PRAGMA wal_autocheckpoint=0")
         await db.executescript(_DDL)
         await db.commit()
+        # FILL-LEDGER IDEMPOTENCY BACKSTOP (2026-07-16 P1): a UNIQUE index on
+        # fills.fill_ref, so even a code path that bypasses record_fill's own
+        # INSERT-if-absent guard can never double-insert a fill. Created OUTSIDE
+        # the main DDL script deliberately: a legacy DB that already holds
+        # duplicate fill_refs (the pre-fix WS-replay double-insert) must NOT
+        # brick startup on the index build — the record_fill guard still
+        # protects every NEW write; the loud error tells the operator to de-dup
+        # offline. (Same IF NOT EXISTS idempotent-DDL pattern as
+        # idx_rfqs_market_ticker; the old non-unique idx_fills_ref stays.)
+        try:
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_ref_unique"
+                " ON fills (fill_ref)"
+            )
+            await db.commit()
+        except Exception:
+            log.exception(
+                "fills_unique_index_unavailable",
+                detail="fills.fill_ref holds pre-existing duplicates — the "
+                "UNIQUE index could not be created; record_fill's INSERT-if-"
+                "absent still guards new writes; de-dup the table offline",
+            )
         return cls(db, clock)
 
     def start_writer(self) -> None:
@@ -514,6 +536,16 @@ class Store:
             "reconciled_at": row[16],
         }
 
+    async def has_fill(self, fill_ref: str) -> bool:
+        """True iff a fills row with this ``fill_ref`` already exists — the
+        restart-safe idempotency read the lifecycle uses to skip a REPLAYED
+        execution (WS replay, or the 2026-07-16 recovery sweep's REST poll
+        racing the WS message) before it books fees/metrics twice."""
+        async with self._db.execute(
+            "SELECT 1 FROM fills WHERE fill_ref = ? LIMIT 1", (fill_ref,)
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
     async def record_fill(
         self,
         fill_ref: str,
@@ -526,11 +558,22 @@ class Store:
         fee_cc: int | None,
         expected_edge_cc: int | None,
         raw: JsonDict,
-    ) -> None:
-        await self._db.execute(
+    ) -> bool:
+        """Record a fill EXACTLY ONCE per ``fill_ref`` (2026-07-16 P1).
+
+        INSERT-if-absent in a single statement (atomic within this
+        transaction, restart-safe): a WS+poll race — the exchange's
+        quote_executed message and the recovery sweep's REST poll replaying the
+        same fill — can never double-insert, even if both callers passed a
+        ``has_fill`` pre-check before either wrote. The EV-ledger row rides the
+        same guard (inserted only when the fills row was). Returns True iff the
+        row was inserted (False ⇒ a fill with this ref already existed and
+        NOTHING was written)."""
+        cursor = await self._db.execute(
             "INSERT INTO fills (at, fill_ref, order_id, combo_ticker, our_side,"
             " contracts_centi, price_cc, fee_cc, expected_edge_cc, raw_json)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+            " WHERE NOT EXISTS (SELECT 1 FROM fills WHERE fill_ref = ?)",
             (
                 self._now(),
                 fill_ref,
@@ -542,15 +585,18 @@ class Store:
                 fee_cc,
                 expected_edge_cc,
                 json.dumps(raw),
+                fill_ref,
             ),
         )
-        if expected_edge_cc is not None:
+        inserted = (cursor.rowcount or 0) > 0
+        if inserted and expected_edge_cc is not None:
             await self._db.execute(
                 "INSERT INTO ev_ledger (at, fill_ref, expected_edge_cc, realized_pnl_cc)"
                 " VALUES (?, ?, ?, NULL)",
                 (self._now(), fill_ref, expected_edge_cc),
             )
         await self._db.commit()
+        return inserted
 
     async def record_markout(
         self,

@@ -134,6 +134,27 @@ class QuoteSender(Protocol):
     async def confirm_quote(self, quote_id: str) -> JsonDict: ...
 
 
+class QuoteGetter(Protocol):
+    """GET slice for the FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): the REST
+    ``GET /communications/quotes/{quote_id}`` read the sweep polls when a
+    confirmed fill's ``quote_executed`` WS message never arrived. Kept a
+    SEPARATE, optional protocol (not folded into ``QuoteSender``) so paper mode
+    and every existing fake sender stay untouched — no getter wired ⇒ no sweep
+    (fail-closed: the ledger is never patched from a guess)."""
+
+    async def get_quote(self, quote_id: str) -> JsonDict: ...
+
+
+# FILL-RECORD RECOVERY SWEEP bounds (2026-07-16 P1). Rate-bound the REST polls
+# per maintenance tick (the tick beats every 0.5s; recovery is not latency-
+# critical) and bound the per-quote attempts: after the budget is exhausted the
+# sweep gives up LOUDLY (fill_recovery.exhausted + an error log) and leaves the
+# state for the next-restart exchange reconcile (the P0-4/P0-5 backstop that
+# found the 2026-07-16 proven case) rather than polling forever.
+_FILL_RECOVERY_MAX_POLLS_PER_TICK = 3
+_FILL_RECOVERY_MAX_ATTEMPTS = 10
+
+
 @dataclass(frozen=True, slots=True)
 class LifecycleConfig:
     quote_ttl_s: float = 30.0
@@ -215,6 +236,17 @@ class LifecycleConfig:
     # confirm window ALONGSIDE the candidate gate's own budget; exceeding it
     # DECLINES (fail-closed — never let the waiver silently consume the window).
     lastlook_mc_waiver_deadline_s: float = 1.0
+    # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1, real-money bug). How long after
+    # a SUCCESSFUL confirm (reservation committed / position booked) the sweep
+    # waits for the exchange's quote_executed WS message before polling REST
+    # GET quote — the WS channel has NO replay, so a missed message left a REAL
+    # fill (quote 527b5a3a…, 117.07ct NO @ 80.60c) permanently out of the fills
+    # ledger / P&L / EV / markouts until the next-restart reconcile quarantined
+    # it. 10s is far beyond the combo execution timer (1s) + observed WS
+    # latency, so a poll only fires when the message is genuinely lost. Wired
+    # from RiskConfig.fill_record_recovery_after_s. A non-positive/NaN value
+    # disables the sweep (fail-closed: never poll on a nonsense config).
+    fill_record_recovery_after_s: float = 10.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +277,17 @@ class OpenQuoteState:
     risk_qty: CentiContracts = CentiContracts(0)
     # (side accepted, our bid on that side, accepted quantity) once confirmed
     pending_fill: tuple[Side, CentiCents, CentiContracts] | None = None
+    # FILL-RECORD RECOVERY (2026-07-16 P1). Set when the confirm round-trip
+    # SUCCEEDED (reservation committed / position booked) — the point after
+    # which a quote_executed message is EXPECTED; None means the confirm never
+    # succeeded client-side (the unknown-committed path belongs to the
+    # reservation-reconcile loop, never this sweep).
+    fill_confirmed_mono_ns: int | None = None
+    # True once this quote's fills-ledger row exists (recorded, or confirmed
+    # present on a replay) — the sweep's terminal success state.
+    fill_recorded: bool = False
+    # REST polls spent recovering this quote (bounded; exhausted ⇒ loud metric).
+    fill_recovery_attempts: int = 0
 
 
 class QuoteLifecycle:
@@ -279,8 +322,10 @@ class QuoteLifecycle:
         fee_model: FeeModel | None = None,
         fee_type: FeeType = FeeType.QUADRATIC,
         fee_multiplier: Fraction = Fraction(1),
+        maker_fee_active_prefixes: tuple[str, ...] = (),
         joint_pool: JointPool | None = None,
         book_risk_pool: BookRiskPool | None = None,
+        quote_getter: QuoteGetter | None = None,
     ) -> None:
         self._clock = clock
         self._sender = sender
@@ -380,6 +425,18 @@ class QuoteLifecycle:
         self._fee_model = fee_model
         self._fee_type = fee_type
         self._fee_multiplier = fee_multiplier
+        # MAKER-FEE LIST (2026-07-16, eat-the-fee doctrine — FeeConfig.
+        # maker_fee_active_prefixes): series/collection prefixes on which OUR
+        # maker fills pay the maker fee. Quoted prices are UNTOUCHED (the fee is
+        # never added to width); a matching fill's fee is ACCOUNTED via the real
+        # FeeModel (QUADRATIC → QUADRATIC_WITH_MAKER_FEES upgrade in
+        # _effective_fee_type) in the fills ledger, realized P&L, expected edge,
+        # and the waiver candidate. Empty (default) ⇒ bit-identical behaviour.
+        self._maker_fee_active_prefixes = maker_fee_active_prefixes
+        # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): the GET-capable REST slice
+        # the sweep polls. None (paper/backtests/minimal rigs) ⇒ no sweep — the
+        # ledger is never patched from a guess (fail-closed).
+        self._quote_getter = quote_getter
         self._markouts = MarkoutTracker(store.record_markout)
         # LAST-LOOK MC WAIVER observability: the per-confirm waiver audit record
         # ({granted, worst_case_cc, games}), set ONLY when a waiver ATTEMPT ran
@@ -1617,13 +1674,37 @@ class QuoteLifecycle:
         else:
             reservation_version = -1
             reservations = ()
+        # MAKER-FEE accounting for THE CANDIDATE (2026-07-16, eat-the-fee — the
+        # review-LOW fee_cc=0 hole): on a maker-fee-active series the candidate's
+        # predicted fill fee is a real per-state cash cost, so it rides on the
+        # candidate's WorstCaseEntity (hit_loss = premium + fee). Gated on the
+        # prefix list: empty (the default) ⇒ fee_cc=0, bit-identical waiver
+        # inputs. A None fee (no model / UNKNOWN) stays 0 — the pre-fix figure,
+        # never an invented cost.
+        # TODO(2026-07-16): COMMITTED positions (and outstanding reservations)
+        # still ride fee_cc=0 — threading their at-fill fee here needs
+        # OpenPosition to carry it (out of scope for this change; conservative
+        # direction is unaffected because a real fee only ever ADDS loss).
+        candidate_fee_cc = 0
+        pending = state.pending_fill
+        if pending is not None and self._maker_fee_active(
+            state.rfq.market_ticker, state.rfq.mve_collection_ticker
+        ):
+            predicted = self._fill_fee_cc(
+                pending[1],
+                pending[2],
+                combo_ticker=state.rfq.market_ticker,
+                collection=state.rfq.mve_collection_ticker,
+            )
+            if predicted is not None:
+                candidate_fee_cc = int(predicted)
         entities = (
             *(entity_from_position(position) for position in committed),
             *(
                 entity_from_position(position, earns_credit=False)
                 for position in reservations
             ),
-            entity_from_position(candidate),
+            entity_from_position(candidate, fee_cc=candidate_fee_cc),
         )
         open_quotes = tuple(
             quote_from_open_quote(quote, self._conventions)
@@ -2056,6 +2137,13 @@ class QuoteLifecycle:
                     self._reservation.commit(reservation_id)
                 else:
                     self._book_position(quote_id, state)
+                # FILL-RECORD RECOVERY (2026-07-16 P1): the confirm SUCCEEDED —
+                # a quote_executed message is now EXPECTED. Stamp the clock so
+                # the maintenance sweep can poll REST if it never arrives (the
+                # WS channel has no replay). Only this success path stamps: a
+                # failed/timed-out confirm is the unknown-committed path the
+                # reservation-reconcile loop owns.
+                state.fill_confirmed_mono_ns = self._clock.monotonic_ns()
             except Exception as exc:
                 self._metrics.inc("confirm.failed")
                 self._confirm_failures += 1
@@ -2149,6 +2237,17 @@ class QuoteLifecycle:
                 self._book_position(quote_id, state)
         else:
             self._book_position(quote_id, state)  # no-op if booked at confirm
+        fill_ref = f"fill:{quote_id}"
+        # LEDGER IDEMPOTENCY (2026-07-16 P1): the recovery sweep polls REST for a
+        # fill whose WS message never arrived and replays it through THIS path, so
+        # a WS+poll race (or an exchange replay) must never double-write the fills
+        # ledger — nor double-book the fee into realized P&L / double-count
+        # fill.count / markouts. The position booking above stays (idempotent by
+        # id); everything from here down runs at most once per fill_ref.
+        if state.fill_recorded or await self._store.has_fill(fill_ref):
+            state.fill_recorded = True
+            log.info("fill_replay_skipped", quote_id=quote_id, fill_ref=fill_ref)
+            return
         our_side = self._conventions.maker_position_side(accepted_side)
         expected_edge_cc: int | None
         if our_side is Side.YES:
@@ -2161,11 +2260,32 @@ class QuoteLifecycle:
             # UNKNOWN, never an assumed complement (defense #5).
             expected_edge_cc = None
         # Real fill fee from the fee model (defense #3): $0 for our combo maker
-        # quadratic fills, correct for any nonzero-fee series. None only when no
-        # fee model is wired (pre-Phase-6 behaviour) or the fee is UNKNOWN.
-        fill_fee_cc = self._fill_fee_cc(bid, qty)
-        await self._store.record_fill(
-            f"fill:{quote_id}",
+        # quadratic fills, the real maker fee once this combo's series is on
+        # Kalshi's maker-fee list (maker_fee_active_prefixes — eat-the-fee
+        # doctrine: the price was NOT widened, so the fee must be accounted
+        # here). None only when no fee model is wired (pre-Phase-6 behaviour)
+        # or the fee is UNKNOWN.
+        fill_fee_cc = self._fill_fee_cc(
+            bid,
+            qty,
+            combo_ticker=state.rfq.market_ticker,
+            collection=state.rfq.mve_collection_ticker,
+        )
+        # EAT-THE-FEE accounting in the EV ledger: on a maker-fee-active series
+        # the predicted fee is a known cash cost of this fill, so the recorded
+        # expected edge is net of it (grading expected vs realized stays
+        # apples-to-apples). Gated on the prefix list so an EMPTY list is
+        # bit-identical to prior behaviour on every ledger row.
+        if (
+            expected_edge_cc is not None
+            and fill_fee_cc is not None
+            and self._maker_fee_active(
+                state.rfq.market_ticker, state.rfq.mve_collection_ticker
+            )
+        ):
+            expected_edge_cc -= int(fill_fee_cc)
+        inserted = await self._store.record_fill(
+            fill_ref,
             order_id=str(msg.get("order_id")) if msg.get("order_id") else None,
             combo_ticker=state.rfq.market_ticker,
             our_side=str(our_side),
@@ -2175,6 +2295,13 @@ class QuoteLifecycle:
             expected_edge_cc=expected_edge_cc,
             raw=msg,
         )
+        state.fill_recorded = True
+        if not inserted:
+            # Store-level INSERT-if-absent caught a WS+poll race that slipped
+            # past the has_fill pre-check (both racers read before either
+            # wrote): exactly one row exists; this racer books nothing more.
+            log.info("fill_replay_skipped", quote_id=quote_id, fill_ref=fill_ref)
+            return
         # The trade fee is a real cash cost AT FILL — it must enter the realized
         # ledger the ENFORCED daily-loss cap reads, not only the settlement fee
         # (else, on a nonzero-fee series, realized P&L understates costs by the
@@ -2188,12 +2315,56 @@ class QuoteLifecycle:
         self._metrics.inc("fill.count")
         self._track_markout(f"fill:{quote_id}", state)
 
-    def _fill_fee_cc(self, bid: CentiCents, qty: CentiContracts) -> int | None:
+    def _maker_fee_active(
+        self, combo_ticker: str | None, collection: str | None
+    ) -> bool:
+        """Whether this combo sits on a series Kalshi charges MAKER fees on
+        (FeeConfig.maker_fee_active_prefixes — the operator mirrors Kalshi's
+        maker-fee list, monitored via GET /series/fee_changes). Prefix-matched
+        against BOTH the combo market ticker and its collection ticker (combo
+        tickers embed the collection blob, but matching both keeps either
+        spelling honest). Empty list (the default) ⇒ False everywhere —
+        bit-identical prior behaviour."""
+        if not self._maker_fee_active_prefixes:
+            return False
+        for prefix in self._maker_fee_active_prefixes:
+            if combo_ticker and combo_ticker.startswith(prefix):
+                return True
+            if collection and collection.startswith(prefix):
+                return True
+        return False
+
+    def _effective_fee_type(
+        self, combo_ticker: str | None, collection: str | None
+    ) -> FeeType:
+        """The fee type OUR fill on this combo is charged under. A QUADRATIC
+        series on the maker-fee list upgrades to QUADRATIC_WITH_MAKER_FEES so
+        the real FeeModel (pricing/fees.py — never reimplemented, rule 8) picks
+        the verified maker coefficient. Non-quadratic configured types pass
+        through untouched (FLAT/UNKNOWN still raise FeeUnknownError inside the
+        model — fail-closed, never a guessed coefficient)."""
+        if self._fee_type is FeeType.QUADRATIC and self._maker_fee_active(
+            combo_ticker, collection
+        ):
+            return FeeType.QUADRATIC_WITH_MAKER_FEES
+        return self._fee_type
+
+    def _fill_fee_cc(
+        self,
+        bid: CentiCents,
+        qty: CentiContracts,
+        *,
+        combo_ticker: str | None = None,
+        collection: str | None = None,
+    ) -> int | None:
         """The fee our fill is charged, in cc, from the real fee model
         (pricing/fees.py — never reimplemented). $0 for our combo maker quadratic
-        maker fill; correct for a nonzero-fee series. None when no fee model is
-        wired OR the fee is genuinely UNKNOWN (flat/unknown fee_type) — an honest
-        ledger records UNKNOWN, never a guessed 0 (defense #2)."""
+        maker fill; the real maker fee when the combo's series is on the
+        maker-fee list (``combo_ticker``/``collection`` prefix match — omitted ⇒
+        the configured fee type, the pre-2026-07-16 behaviour); correct for a
+        nonzero-fee series. None when no fee model is wired OR the fee is
+        genuinely UNKNOWN (flat/unknown fee_type) — an honest ledger records
+        UNKNOWN, never a guessed 0 (defense #2)."""
         if self._fee_model is None:
             return None
         try:
@@ -2201,12 +2372,179 @@ class QuoteLifecycle:
                 self._fee_model.trade_fee_cc(
                     price_cc=bid,
                     qty=qty,
-                    fee_type=self._fee_type,
+                    fee_type=self._effective_fee_type(combo_ticker, collection),
                     multiplier=self._fee_multiplier,
                 )
             )
         except FeeUnknownError:
             return None
+
+    # ---------------------------------------------- fill-record recovery sweep
+
+    async def _sweep_unrecorded_fills(self) -> None:
+        """FILL-RECORD RECOVERY SWEEP (2026-07-16 P1, real-money bug).
+
+        ``on_quote_executed`` is the ONLY writer of fills-ledger rows and fires
+        only on the exchange's ``quote_executed`` WS message — which has NO
+        replay. A missed message therefore left a REAL fill (reservation
+        committed at confirm, position live on the exchange) permanently out of
+        the fills ledger: invisible to P&L/EV/markouts/settlement-reconcile
+        until the next-restart reconcile quarantined it as a quantity mismatch
+        (PROVEN 2026-07-16: quote 527b5a3a…, 117.07ct NO @ 80.60c — confirm
+        committed at 15:28:02Z, no quote_executed_msg, fill present on GET
+        /portfolio/fills).
+
+        For every state whose confirm SUCCEEDED (``fill_confirmed_mono_ns``
+        stamped) but whose fills row was never recorded, once
+        ``fill_record_recovery_after_s`` has passed: poll REST GET quote (doc:
+        openapi-comms.md — status enum open|accepted|confirmed|executed|
+        cancelled) and
+
+          - ``executed``  ⇒ synthesize the executed message ({quote_id,
+            order_id from the quote payload's creator_order_id if present,
+            recovered_via_poll: true}) and run the SAME ``on_quote_executed``
+            path — never a parallel ledger implementation; the store-level
+            INSERT-if-absent guard makes a WS+poll race single-row safe;
+          - ``cancelled`` ⇒ the fill never happened: the existing lapse/cancel
+            cleanup (release any straggler reservation, drop the phantom
+            position booked at confirm, clear the parked state);
+          - still pending / any error / unreadable status ⇒ leave for the next
+            tick (bounded per-quote attempts, then a LOUD exhausted metric —
+            the restart reconcile stays the backstop). A fill is NEVER
+            synthesized from anything but an explicit ``executed`` status
+            (fail-closed).
+
+        Rate-bound to ``_FILL_RECOVERY_MAX_POLLS_PER_TICK`` REST polls per
+        maintenance tick. No ``quote_getter`` wired (paper/backtests/minimal
+        rigs) or a non-positive/NaN delay ⇒ no sweep at all."""
+        if self._quote_getter is None:
+            return
+        after_s = self._config.fill_record_recovery_after_s
+        if not (after_s > 0.0):  # non-positive OR NaN config ⇒ sweep disabled
+            return
+        after_ns = int(after_s * 1e9)
+        now = self._clock.monotonic_ns()
+        polls = 0
+        for quote_id, state in list(self._executed_states.items()):
+            if polls >= _FILL_RECOVERY_MAX_POLLS_PER_TICK:
+                break
+            if state.fill_recorded or state.pending_fill is None:
+                continue
+            if state.fill_confirmed_mono_ns is None:
+                # Confirm never succeeded client-side (unknown-committed): the
+                # reservation-reconcile loop owns that path, never this sweep.
+                continue
+            if now - state.fill_confirmed_mono_ns < after_ns:
+                continue  # the WS message may still arrive — too early to poll
+            if state.fill_recovery_attempts >= _FILL_RECOVERY_MAX_ATTEMPTS:
+                continue  # exhausted — already reported loudly below
+            polls += 1
+            state.fill_recovery_attempts += 1
+            self._metrics.inc("fill_recovery.swept")
+            try:
+                payload = await self._quote_getter.get_quote(quote_id)
+            except Exception as exc:  # noqa: BLE001 — any poll error retries next tick
+                self._metrics.inc("fill_recovery.errors")
+                log.warning(
+                    "fill_recovery_poll_failed",
+                    quote_id=quote_id,
+                    attempt=state.fill_recovery_attempts,
+                    error=repr(exc),
+                )
+                self._note_fill_recovery_exhausted(quote_id, state)
+                continue
+            quote = payload.get("quote", payload)
+            status = (
+                str(quote.get("status", "")).lower()
+                if isinstance(quote, dict)
+                else ""
+            )
+            if status == "executed":
+                msg: JsonDict = {"quote_id": quote_id, "recovered_via_poll": True}
+                order_id = (
+                    quote.get("creator_order_id") or quote.get("order_id")
+                    if isinstance(quote, dict)
+                    else None
+                )
+                if order_id:
+                    msg["order_id"] = str(order_id)
+                self._metrics.inc("fill_recovery.recovered")
+                log.warning(
+                    "fill_record_recovered_via_poll",
+                    quote_id=quote_id,
+                    order_id=msg.get("order_id"),
+                    attempts=state.fill_recovery_attempts,
+                    detail="quote_executed WS message never arrived; fill "
+                    "recorded from the REST quote status via the SAME "
+                    "on_quote_executed path",
+                )
+                await self.on_quote_executed(msg)
+            elif status == "cancelled":
+                self._metrics.inc("fill_recovery.cancelled")
+                self._recover_cancelled_fill(quote_id, state, quote)
+            elif status in ("open", "accepted", "confirmed"):
+                # Legitimately not executed yet (a stalled execution timer):
+                # keep waiting, bounded like an error so a quote stuck here
+                # forever cannot consume the poll budget indefinitely.
+                self._metrics.inc("fill_recovery.still_pending")
+                self._note_fill_recovery_exhausted(quote_id, state)
+            else:
+                # Missing/unknown status: NEVER assumed executed (fail-closed) —
+                # count as an error and retry next tick.
+                self._metrics.inc("fill_recovery.errors")
+                log.warning(
+                    "fill_recovery_unreadable_status",
+                    quote_id=quote_id,
+                    status=status,
+                    attempt=state.fill_recovery_attempts,
+                )
+                self._note_fill_recovery_exhausted(quote_id, state)
+
+    def _recover_cancelled_fill(
+        self, quote_id: str, state: OpenQuoteState, quote: Any
+    ) -> None:
+        """The exchange CANCELLED a quote we confirmed (a post-confirm void —
+        no WS event exists for it, doc: rfq-flow.md): the fill never executed,
+        so the position committed at confirm is PHANTOM. Existing lapse/cancel
+        cleanup, applied here: release any straggler reservation (idempotent —
+        a committed one is no longer outstanding), drop the phantom position
+        from the exposure book (the settlement seam's own removal — bumps the
+        position generation so stale snapshots invalidate), and un-park the
+        state exactly like the decline paths do."""
+        cancellation_reason = (
+            quote.get("cancellation_reason") if isinstance(quote, dict) else None
+        )
+        log.warning(
+            "fill_recovery_quote_cancelled",
+            quote_id=quote_id,
+            cancellation_reason=cancellation_reason,
+            detail="confirmed quote came back CANCELLED from REST — fill never "
+            "executed; phantom position removed, no fills row written",
+        )
+        if self._reservation is not None:
+            self._reservation.release(f"fill:{quote_id}")
+        self._exposure.remove_position(f"fill:{quote_id}")
+        self._executed_states.pop(quote_id, None)
+        state.pending_fill = None
+        self._drop_quote(quote_id)
+
+    def _note_fill_recovery_exhausted(
+        self, quote_id: str, state: OpenQuoteState
+    ) -> None:
+        """When a quote's poll budget is spent without a terminal status, say so
+        LOUDLY exactly once: the ledger hole persists until the next-restart
+        exchange reconcile (the P0-4/P0-5 backstop) — an operator must know."""
+        if state.fill_recovery_attempts != _FILL_RECOVERY_MAX_ATTEMPTS:
+            return
+        self._metrics.inc("fill_recovery.exhausted")
+        log.error(
+            "fill_recovery_exhausted",
+            quote_id=quote_id,
+            attempts=state.fill_recovery_attempts,
+            detail="recovery poll budget spent without executed/cancelled — the "
+            "fills ledger may still be missing this fill; the next-restart "
+            "exchange reconcile is the backstop",
+        )
 
     # ------------------------------------------------------------ maintenance
 
@@ -2379,6 +2717,11 @@ class QuoteLifecycle:
         # LAUNCHES the MC in a worker and returns immediately (never blocks the tick
         # / heartbeat); without one it runs inline (fast in paper/tests).
         self._maybe_recompute_book_risk()
+        # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): repair a confirmed fill
+        # whose quote_executed WS message was lost, BEFORE the limit check so a
+        # recovered position counts against the caps this same tick. Runs even
+        # when halted — recording exchange truth is reconciliation, not quoting.
+        await self._sweep_unrecorded_fills()
         if not self._killswitch.halted:
             breaches = self._partition_breaches(
                 self._limits.check(

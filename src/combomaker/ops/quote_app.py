@@ -31,7 +31,7 @@ from combomaker.exchange.ws import WsManager
 from combomaker.marketdata.feed import OrderbookFeed
 from combomaker.marketdata.grid import PriceGrid
 from combomaker.marketdata.metadata import MarketMeta, MetadataCache
-from combomaker.ops.config import AppConfig, Env, Mode
+from combomaker.ops.config import AppConfig, Env, Mode, RiskConfig
 from combomaker.ops.logging import configure_logging, get_logger
 from combomaker.ops.metrics import Metrics
 from combomaker.ops.persistence import Store
@@ -118,6 +118,14 @@ POOL_WORKERS = 8
 # event-loop pressure).
 POOL_DEADLINE_S = 2.0
 
+# STARTUP FIRST SNAPSHOT deadline (2026-07-16 warmup fix): the bounded wall
+# budget for the ONE synchronous book-risk snapshot computed after rehydration
+# and before quoting opens. Generous vs the MC's normal runtime (worker spawn +
+# numpy import on a cold pool is the tail); on timeout startup proceeds exactly
+# as today (warmup declines until the maintenance loop publishes the first
+# snapshot — never block startup on risk observability).
+STARTUP_BOOK_RISK_DEADLINE_S = 5.0
+
 # Quote resting TTL (2026-07-14, RFQ-lifecycle research). Kalshi RFQs have no fixed
 # exchange TTL — our quote rests, swipeable at its posted price, until the RFQ
 # closes or we pull it, with NO server-side book-move auto-void. Live tape: median
@@ -126,6 +134,41 @@ POOL_DEADLINE_S = 2.0
 # almost no late-swipe upside. 20s ≈ the RFQ p90: catches ~97% of realistic swipes,
 # cuts stale exposure, frees capacity to price more. Re-validate once we have fills.
 QUOTE_TTL_S = 20.0
+
+
+def build_lifecycle_config(risk_cfg: RiskConfig) -> LifecycleConfig:
+    """The ONE place YAML risk knobs become the live ``LifecycleConfig`` —
+    extracted pure (the ``supervisor_launch_cmd`` precedent) so tests can prove
+    every operator knob actually REACHES the lifecycle (a YAML field that stops
+    here is a dead knob; the 2026-07-15 heartbeat_timeout_s lesson).
+
+    - P0-1: candidate-aware portfolio-risk gate at confirm (ENFORCED by
+      default; YAML ``risk.candidate_gate_enabled: false`` is the kill switch).
+      The gate reads the SAME %-of-bankroll / ruin budgets from RiskLimits the
+      analytic caps use — it only ADDS the joint-tail credit/charge, never
+      loosens a cap.
+    - P0-2 (game-day wiring 2026-07-16): ``candidate_gate_deadline_s`` — the
+      gate's wall budget of the 3s confirm window, now YAML-settable so the
+      operator can rebalance it against the waiver (their joint fit is
+      validated by RiskConfig).
+    - P1 EV VISIBILITY: the OPTIONAL worst-challenger-EV tolerance. −inf by
+      default (the gate stays production-model-EV only, no behaviour change); a
+      finite operator value ALSO declines a +production-EV candidate whose
+      worst credible challenger EV falls below it (strictly additive).
+    - LAST-LOOK MC WAIVER (handoff Problem A — CONFIRM-PATH ONLY): committed
+      default OFF; the operator arms it in the local YAML.
+    """
+    return LifecycleConfig(
+        quote_ttl_s=QUOTE_TTL_S,
+        candidate_gate_enabled=risk_cfg.candidate_gate_enabled,
+        candidate_gate_deadline_s=risk_cfg.candidate_gate_deadline_s,
+        worst_challenger_ev_tolerance_cc=risk_cfg.worst_challenger_ev_tolerance_cc,
+        lastlook_mc_waiver_enabled=risk_cfg.lastlook_mc_waiver_enabled,
+        lastlook_mc_waiver_deadline_s=risk_cfg.lastlook_mc_waiver_deadline_s,
+        # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): poll REST for a confirmed
+        # fill whose quote_executed WS message never arrived.
+        fill_record_recovery_after_s=risk_cfg.fill_record_recovery_after_s,
+    )
 
 
 def supervisor_launch_cmd(config: AppConfig) -> list[str]:
@@ -255,6 +298,16 @@ class RateLimitRecordingSender:
     async def confirm_quote(self, quote_id: str) -> JsonDict:
         try:
             return await self._inner.confirm_quote(quote_id)  # type: ignore[attr-defined,no-any-return]
+        except RateLimitedError:
+            self._window.record()
+            raise
+
+    async def get_quote(self, quote_id: str) -> JsonDict:
+        """GET slice for the fill-record recovery sweep (2026-07-16 P1) — same
+        pass-through + 429 tap as the write endpoints, so a rate-limit storm on
+        the recovery polls feeds the burst breaker too."""
+        try:
+            return await self._inner.get_quote(quote_id)  # type: ignore[attr-defined,no-any-return]
         except RateLimitedError:
             self._window.record()
             raise
@@ -424,11 +477,19 @@ class QuoteApp:
             )
             # Quote mode: wrap the REST sender so create/delete/confirm 429s feed
             # the rate-limit-burst breaker (not just the polls). Paper never 429s.
-            sender = (
-                PaperSender()
-                if config.mode is Mode.PAPER
-                else RateLimitRecordingSender(rest, self._rate_limit_window)
-            )
+            sender: PaperSender | RateLimitRecordingSender
+            # FILL-RECORD RECOVERY (2026-07-16 P1): the GET-capable handle the
+            # lifecycle's recovery sweep polls — the SAME wrapped REST sender the
+            # write path uses (its get_quote taps 429s into the burst breaker
+            # too). Paper mode wires none: paper quotes never confirm, so there
+            # is nothing to recover (the sweep stays off, fail-closed).
+            quote_getter: RateLimitRecordingSender | None
+            if config.mode is Mode.PAPER:
+                sender = PaperSender()
+                quote_getter = None
+            else:
+                sender = RateLimitRecordingSender(rest, self._rate_limit_window)
+                quote_getter = sender
             # Real fee model for the fill fee the ledger books at execution
             # (defense #3): $0 for our combo maker quadratic fills, correct for a
             # nonzero-fee series. Built from the SAME config the engine uses.
@@ -506,31 +567,10 @@ class QuoteApp:
                     joint_move_tolerance_cc=risk_cfg.joint_move_tolerance_cc,
                     max_leg_age_s=risk_cfg.max_leg_age_s,
                 ),
-                config=LifecycleConfig(
-                    quote_ttl_s=QUOTE_TTL_S,
-                    # P0-1: candidate-aware portfolio-risk gate at confirm (ENFORCED
-                    # by default; YAML `risk.candidate_gate_enabled: false` is the
-                    # kill switch). The gate reads the SAME %-of-bankroll / ruin
-                    # budgets from RiskLimits the analytic caps use — it only ADDS the
-                    # joint-tail credit/charge, never loosens a cap.
-                    candidate_gate_enabled=risk_cfg.candidate_gate_enabled,
-                    # P1 EV VISIBILITY: the OPTIONAL worst-challenger-EV tolerance.
-                    # −inf by default (the gate stays production-model-EV only, no
-                    # behaviour change); a finite operator value ALSO declines a
-                    # +production-EV candidate whose worst credible challenger EV
-                    # falls below it (strictly additive).
-                    worst_challenger_ev_tolerance_cc=(
-                        risk_cfg.worst_challenger_ev_tolerance_cc
-                    ),
-                    # LAST-LOOK MC WAIVER (handoff Problem A — CONFIRM-PATH ONLY).
-                    # Committed default OFF; the operator arms it in the local
-                    # YAML. The deadline is validated to fit the 3s confirm
-                    # window alongside the candidate gate (RiskConfig validator).
-                    lastlook_mc_waiver_enabled=risk_cfg.lastlook_mc_waiver_enabled,
-                    lastlook_mc_waiver_deadline_s=(
-                        risk_cfg.lastlook_mc_waiver_deadline_s
-                    ),
-                ),
+                # YAML risk knobs → LifecycleConfig via the ONE pure builder
+                # (candidate gate + its deadline, EV tolerance, MC waiver —
+                # see build_lifecycle_config for the per-knob rationale).
+                config=build_lifecycle_config(risk_cfg),
                 balance_tracker=balance_tracker,
                 # Slate cap's per-leg game-start source — the exact pregame gate
                 # the filter already uses (peek-only, hot-path safe, no network).
@@ -552,8 +592,15 @@ class QuoteApp:
                 fee_model=fee_model,
                 fee_type=fee_type,
                 fee_multiplier=fee_multiplier,
+                # MAKER-FEE LIST (2026-07-16, eat-the-fee doctrine): prefixes on
+                # which OUR maker fills pay the maker fee — accounted in the
+                # ledger/edge/waiver, never added to the quoted price.
+                maker_fee_active_prefixes=tuple(fee_cfg.maker_fee_active_prefixes),
                 joint_pool=joint_pool,
                 book_risk_pool=book_risk_pool,
+                # FILL-RECORD RECOVERY (2026-07-16 P1): REST GET handle for the
+                # maintenance sweep (None in paper mode — nothing to recover).
+                quote_getter=quote_getter,
             )
             # R3 Phase 3: single-writer risk-reservation service. Wired AFTER the
             # lifecycle (it reuses the lifecycle's shadow splitter, so a %-cap
@@ -610,6 +657,14 @@ class QuoteApp:
                     config.filters.allowed_leg_series_prefixes,
                     subaccount=config.safety.subaccount,
                 )
+                # STARTUP FIRST SNAPSHOT (2026-07-16 warmup fix): compute ONE
+                # book-risk snapshot SYNCHRONOUSLY — after rehydration, before
+                # quote processing — so a restarted bot's first RFQs are gated
+                # against a FRESH tail instead of failing closed on the never-
+                # measured book for the first ~40s (69 skip_portfolio_cvar
+                # warmup declines, report 2026-07-16-heartbeat-config-fix…).
+                # Bounded; on timeout/error startup proceeds exactly as today.
+                await self._startup_book_risk_snapshot(lifecycle)
                 # LAUNCH THE EXTERNAL SUPERVISOR (separate OS process) BEFORE the
                 # preflight so its own-heartbeat is beating when external_kill_
                 # reachable is graded. The bot beats its heartbeat first so the
@@ -1039,6 +1094,44 @@ class QuoteApp:
         exch_by_ticker = open_combo_positions_from_positions(payload)
         if not exch_by_ticker:
             return
+        # DROP-SETTLED-ON-REHYDRATION (2026-07-16, clears the stale $4.46
+        # reserve): a position row on a market whose Market.status says the
+        # market is DEFINITIVELY SETTLED carries no live risk — folding it back
+        # in reserves capital against a corpse until the settlement poller
+        # happens to see it. Status vocabulary is the Market.status FIELD enum
+        # (initialized|inactive|active|closed|determined|disputed|amended|
+        # finalized — docs/api-notes/index-scan.md; the WS lifecycle notes map
+        # `settled` → `finalized`, and `settled` is also accepted in case the
+        # wire uses the filter-vocabulary spelling). ONLY those two drop:
+        # closed/determined-but-unsettled keeps today's behaviour (the payout
+        # has not landed — still real risk), and ANY error (unreachable market,
+        # unreadable payload) KEEPS the position (fail-safe: risk we cannot
+        # disprove stays in the caps).
+        for ticker in list(exch_by_ticker):
+            try:
+                market_payload = await rest.get_market(ticker)
+                market = market_payload.get("market", market_payload)
+                status = str(market.get("status", "")).lower()
+            except Exception as exc:  # noqa: BLE001 — any error keeps the position
+                log.warning(
+                    "rehydrate_market_status_unavailable",
+                    ticker=ticker,
+                    error=repr(exc),
+                    detail="could not verify settlement status — position kept "
+                    "(fail-safe)",
+                )
+                continue
+            if status in ("finalized", "settled"):
+                del exch_by_ticker[ticker]
+                log.info(
+                    "rehydrate_dropped_settled",
+                    ticker=ticker,
+                    status=status,
+                    detail="market definitively settled — position not "
+                    "rehydrated into the risk book",
+                )
+        if not exch_by_ticker:
+            return
         held = {h["combo_ticker"]: h for h in await store.held_positions(list(exch_by_ticker))}
 
         def _quoted(mt: str) -> bool:
@@ -1149,6 +1242,47 @@ class QuoteApp:
                 "before trusting the caps",
                 tickers=unmodeled,
             )
+
+    async def _startup_book_risk_snapshot(
+        self,
+        lifecycle: QuoteLifecycle,
+        *,
+        deadline_s: float = STARTUP_BOOK_RISK_DEADLINE_S,
+    ) -> None:
+        """STARTUP FIRST SNAPSHOT (2026-07-16 warmup fix). Compute ONE book-risk
+        snapshot synchronously — called AFTER ``_rehydrate_exposure_book`` and
+        BEFORE quote processing begins — so the first RFQs of a restarted bot
+        are evaluated against a fresh portfolio-tail snapshot instead of
+        failing closed on the never-measured book (69 skip_portfolio_cvar
+        warmup declines in the first ~40s, report 2026-07-16-heartbeat-config-
+        fix-and-cvar-usable-fix).
+
+        REUSES the exact maintenance-path machinery
+        (``recompute_book_risk_offloop`` → BookRiskPool worker when wired,
+        inline otherwise — never a duplicate MC path), bounded by
+        ``deadline_s``. On timeout or ANY error, startup proceeds exactly as
+        today: the warmup declines return until the maintenance loop publishes
+        the first snapshot — risk observability never blocks startup, and a
+        failed snapshot is never faked (the CVaR cap keeps failing closed on
+        the unmeasured book, the safe direction)."""
+        try:
+            await asyncio.wait_for(
+                lifecycle.recompute_book_risk_offloop(), timeout=deadline_s
+            )
+        except Exception as exc:
+            log.warning(
+                "startup_book_risk_snapshot_failed",
+                error=repr(exc),
+                detail="first snapshot did not land inside the startup budget — "
+                "proceeding as before (warmup declines until the maintenance "
+                "loop publishes one)",
+            )
+            return
+        log.info(
+            "startup_book_risk_snapshot",
+            detail="fresh book-risk snapshot computed before quote processing — "
+            "first RFQs gate against a measured tail (no warmup fail-closed)",
+        )
 
     async def _block_restart_until_reconciled(
         self, rest: KalshiRestClient, reservation: RiskReservationService

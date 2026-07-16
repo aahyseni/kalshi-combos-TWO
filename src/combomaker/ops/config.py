@@ -350,6 +350,18 @@ class FeeConfig(StrictModel):
     # default; overrides keyed by series/collection ticker prefix.
     default_fee_type: str = "quadratic"
     default_multiplier: str = "1.0"
+    # MAKER-FEE LIST (operator directive 2026-07-16 — Kalshi is adding maker
+    # fees for combos). Series/collection-ticker PREFIXES on which OUR maker
+    # fills pay the maker fee (0.0175, verified vs the official schedule). The
+    # operator flips this in the local YAML when Kalshi's maker-fee list changes
+    # (monitor GET /series/fee_changes; defense #3 still reconciles predicted vs
+    # actual to the cent on real fills). DOCTRINE = EAT THE FEE: quoted prices
+    # stay unchanged/competitive — the fee is never added to the quote width; it
+    # is ACCOUNTED everywhere downstream instead (the fills ledger fee_cc,
+    # realized P&L, expected_edge_cc at fill recording, and the Problem-A waiver
+    # candidate's per-state P&L). Empty (the default) ⇒ bit-identical behaviour:
+    # quadratic combo maker fills keep computing $0.
+    maker_fee_active_prefixes: tuple[str, ...] = ()
 
 
 class CorrelationConfig(StrictModel):
@@ -2051,6 +2063,15 @@ class RiskConfig(StrictModel):
     # DECLINES a fill the other gates admit). Set candidate_gate_enabled: false in
     # YAML to disable it (the kill switch for this gate; preserves prior behaviour).
     candidate_gate_enabled: bool = True
+    # P0-2 candidate-gate wall budget at CONFIRM (game-day wiring, 2026-07-16):
+    # the seconds of the exchange's 3s confirm window the ATOMIC candidate gate
+    # (MC + bounded rebuild retries) may consume — previously only the
+    # LifecycleConfig default (2.0), now operator-settable in YAML so the window
+    # can be rebalanced against the last-look MC waiver on game days. Exceeding
+    # the budget FAILS CLOSED (declines). Validated to (0, 3]; when the waiver
+    # is enabled the SUM of both budgets must fit the 3s window (model
+    # validator below).
+    candidate_gate_deadline_s: float = 2.0
     # P1 EV VISIBILITY (audit "+EV IS PRODUCTION-MODEL EV, NOT ROBUST EV"). The
     # candidate gate always LOGS the production candidate EV alongside the
     # challenger / bridge / split candidate EVs. This OPTIONAL tolerance (float cc)
@@ -2083,6 +2104,14 @@ class RiskConfig(StrictModel):
     # confirm window ALONGSIDE the candidate gate (candidate_gate_deadline_s,
     # default 2.0s), so it is validated to (0, 3].
     lastlook_mc_waiver_deadline_s: float = 1.0
+    # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1). Seconds after a SUCCESSFUL
+    # confirm before the maintenance sweep polls REST GET quote for a fill whose
+    # quote_executed WS message never arrived (the WS channel has no replay; a
+    # missed message left a REAL 2026-07-16 fill out of the ledger until the
+    # next-restart reconcile). Far beyond the combo 1s execution timer so a poll
+    # fires only on a genuinely lost message. Must be a positive, finite number
+    # (validator below); LifecycleConfig.fill_record_recovery_after_s downstream.
+    fill_record_recovery_after_s: float = 10.0
     game_loss_frac: str = "0.08"          # %-of-GAME correlated loss
     per_combo_loss_frac: str = "0.01"     # single position max_loss
     directional_frac: str = "0.10"        # net one-directional / theme
@@ -2145,19 +2174,57 @@ class RiskConfig(StrictModel):
             raise ValueError(f"must be >= 1, got {v}")
         return v
 
-    # The waiver's whole wall budget must FIT INSIDE the exchange's 3s confirm
-    # window (it runs alongside the candidate gate, which has its own 2.0s
-    # budget). NaN fails both comparisons ⇒ rejected too (never a silent
-    # unbounded deadline).
-    @field_validator("lastlook_mc_waiver_deadline_s")
+    # The recovery delay must be a positive finite number of seconds. NaN fails
+    # the comparison and infinity is an always-never sweep dressed up as a
+    # config — both rejected loudly rather than silently disabling a real-money
+    # ledger repair path (the lifecycle ALSO fail-closes on a non-positive
+    # value, belt-and-braces).
+    @field_validator("fill_record_recovery_after_s")
     @classmethod
-    def _valid_waiver_deadline(cls, v: float) -> float:
+    def _valid_recovery_delay(cls, v: float) -> float:
+        if not (0.0 < v < float("inf")):
+            raise ValueError(
+                f"fill_record_recovery_after_s must be a positive finite number "
+                f"of seconds, got {v}"
+            )
+        return v
+
+    # Each confirm-window wall budget must FIT INSIDE the exchange's 3s confirm
+    # window on its own (waiver + candidate gate run alongside each other; their
+    # SUM is checked by the model validator below when the waiver is armed).
+    # NaN fails both comparisons ⇒ rejected too (never a silent unbounded
+    # deadline).
+    @field_validator("lastlook_mc_waiver_deadline_s", "candidate_gate_deadline_s")
+    @classmethod
+    def _valid_confirm_window_budget(cls, v: float) -> float:
         if not (0.0 < v <= 3.0):
             raise ValueError(
-                f"lastlook_mc_waiver_deadline_s must be in (0, 3] seconds (the "
+                f"confirm-window budget must be in (0, 3] seconds (the "
                 f"exchange confirm window), got {v}"
             )
         return v
+
+    # When the last-look MC waiver is ARMED it runs IN ADDITION to the candidate
+    # gate inside the SAME exchange confirm window (3s for combos/HVM,
+    # docs/api-notes/openapi-comms.md): both wall budgets must fit together, or
+    # an operator could configure a confirm path that mathematically cannot
+    # finish inside the window (every waived confirm would then lapse). Checked
+    # only when the waiver is enabled — with it off, only the per-field (0, 3]
+    # bound applies (the gate runs alone).
+    @model_validator(mode="after")
+    def _confirm_window_budgets_fit_together(self) -> RiskConfig:
+        if self.lastlook_mc_waiver_enabled:
+            total = self.lastlook_mc_waiver_deadline_s + self.candidate_gate_deadline_s
+            if total > 3.0:
+                raise ValueError(
+                    f"lastlook_mc_waiver_deadline_s "
+                    f"({self.lastlook_mc_waiver_deadline_s}) + "
+                    f"candidate_gate_deadline_s ({self.candidate_gate_deadline_s}) "
+                    f"= {total}s exceeds the exchange's 3s confirm window — with "
+                    "the waiver enabled both budgets share the window; lower one "
+                    "(or disable lastlook_mc_waiver_enabled)"
+                )
+        return self
 
     def to_risk_limits(self) -> RiskLimits:
         """Build the ``RiskLimits`` the checker uses, parsing the decimal-string
