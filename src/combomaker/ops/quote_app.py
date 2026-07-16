@@ -546,7 +546,18 @@ class QuoteApp:
                 )
                 joint_pool.start()
                 await joint_pool.warmup()
-                book_risk_pool = BookRiskPool(workers=1, data_dir=config.data_dir)
+                # workers=2 (2026-07-16, research F10 + live evidence): ONE
+                # worker served three masters — the ~seconds-long maintenance
+                # snapshot MC, the candidate-gate MC, and the Problem-A waiver
+                # enumeration — inside the 3s confirm window. The waiver's FIRST
+                # live shot (quote b0d6696e, 19:50:30Z, a pure game-loss breach
+                # it was built to rescue) timed out at 1.0s while the
+                # enumeration itself measures 87ms warm: the wall was queue-wait
+                # behind an in-flight snapshot. A second worker gives confirm-
+                # window calls a free lane; correctness rests on the P0-2
+                # generation/version stamps (review-verified), not on worker
+                # exclusivity.
+                book_risk_pool = BookRiskPool(workers=2, data_dir=config.data_dir)
                 book_risk_pool.start()
             lifecycle = QuoteLifecycle(
                 clock=self._clock,
