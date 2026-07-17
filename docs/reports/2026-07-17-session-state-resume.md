@@ -284,3 +284,16 @@ MC needs ~0.3-0.6s). RESTARTED (`live_20260717_waiver18.log`). If 1.8s still tim
 out, next levers: BookRiskPool workers 2→3, or weight the waiver's own open-quote
 entity set (the haircut doctrine inside the enumeration — code change, not tonight
 unless needed). Chain status: deferral ✅ → attempt ✅ → GRANT = the remaining step.
+
+## ADDENDUM 12 (2026-07-17 22:55Z) — ✅ FIRST FILL THROUGH THE FIXED PIPELINE
+
+22:55:52Z, FRA-win × Mbappé 1+ (the night's canonical combo): quote_accepted
+(NO @ 55.60¢ × 6.50ct) → **risk_reservation_granted OUTRIGHT** ($3.61 max loss —
+the six cap fixes cleared it with NO waiver needed) → candidate gate ran and
+PASSED (+EV $0.12, post p_ruin 0.0, n_pre=12) → risk_reservation_committed →
+quote_executed 22:55:55Z → **fills row: NO @ 55.60¢ × 6.50ct, expected_edge
+$0.13**. The first fill in ~24 hours and the first ever through the complete
+chain (haircut → caps → reservation → candidate MC → commit → execute → ledger).
+The waiver (1.8s deadline) remains armed for the wins that DO breach — its first
+GRANT is still pending observation. Everything the operator asked for today is
+now live and proven end-to-end.
