@@ -241,3 +241,22 @@ branches → reservation GRANTED. Suite 2293/0. RESTARTED
 (`live_20260717_waiverfix.log`). Full lock ledger: det-max 25% ✅ | confirm
 resting fold 0.40 ✅ | delta caps ×3 ✅ | hard game cap waivable ✅ → every
 denial shape on tonight's wins is now passable or waiver-decidable.
+
+## ADDENDUM 9 (2026-07-17 ~22:45Z) — LOCK #6, THE TRUNCATED-DETAIL FINAL BOSS (`7dec02c`)
+
+lastlook.py truncates decline details to THREE breaches — hidden behind every denial
+all night sat a SLATE co-breach: the slate cap re-sums the comonotone per-game
+overstatement the waiver disproves, and slate 0.40 < 2×0.30 game budgets makes any
+waiver grant arithmetically unreachable on a 2-game slate. ALSO: the advisory
+last-look check (which declined BEFORE the reservation/waiver stage ever ran —
+explaining every waiver_attempted=False tonight) had no confirm haircut. Fixes in
+`7dec02c` (suite 2294/0): advisory check gets the confirm haircut; slate breaches
+DEFER + ride along as certificate-RESOLVABLE (slate-only denials still decline;
+delta shapes still fail closed); the slate roll-up substitutes certified state-exact
+worst cases (min'd, fail-closed). End-to-end test: tightened-slate co-breach →
+waiver → substituted sum passes → GRANTED. RESTARTED (`live_20260717_slatefix.log`).
+**OPEN operator knob: slate_loss_frac 0.40 → 0.65** for full 2-game capacity
+(until then the certified sums decide — likely sufficient at today's book size).
+FULL LOCK LEDGER (six): det-max 25% | confirm resting haircut 0.40 (reservation +
+advisory) | delta ×3 | hard game cap waivable | slate certificate-resolvable |
+waiver deferral chain intact end-to-end.
