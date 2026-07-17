@@ -404,7 +404,6 @@ async def test_waives_pure_directional_denial_under_game_loss_budget(
         ReasonCode.SKIP_PORTFOLIO_DET_MAX,
         ReasonCode.SKIP_PORTFOLIO_RUIN,
         ReasonCode.SKIP_UTILIZATION_BACKSTOP,     # notional backstop
-        ReasonCode.SKIP_SLATE_CAP,
         ReasonCode.SKIP_SIZE_ABOVE_MAX,
         ReasonCode.SKIP_BANKROLL_UNAVAILABLE,
         ReasonCode.SKIP_CLASSIFIER_UNKNOWN,
@@ -446,6 +445,55 @@ async def test_waivable_breach_without_game_key_fails_closed(
     assert ok is False and "game key" in detail
     assert reservation.outstanding_count == 0
     _assert_waiver_counters(metrics)
+
+
+async def test_slate_only_denial_never_waives(
+    kxwc: tuple[Harness, Store],
+) -> None:
+    # 2026-07-17: a slate breach is certificate-RESOLVABLE alongside per-game
+    # breaches, but a slate-ONLY denial carries no game to certify — decline.
+    h, store = kxwc
+    lifecycle, _sender, _exposure, reservation, metrics = _build_rig(
+        h, store, limits=LimitChecker(WAIVER_LIMITS), bankroll_cc=BANKROLL_CC
+    )
+    breaches = [Breach(ReasonCode.SKIP_SLATE_CAP, "slate over cap")]
+    ok, detail = await lifecycle._lastlook_mc_waiver(  # noqa: SLF001
+        "q1", _wc_state(), "fill:q1", breaches
+    )
+    assert ok is False and "non-waivable" in detail
+    assert reservation.outstanding_count == 0
+    _assert_waiver_counters(metrics)
+
+
+async def test_slate_co_breach_resolved_by_certificates_end_to_end(
+    kxwc: tuple[Harness, Store],
+) -> None:
+    # 2026-07-17 (the truncated-detail final boss): slate cap tightened to the
+    # game budget so the analytic roll-up breaches it alongside the game cap;
+    # the waiver arms anyway (slate rides along), and the retry's certificate-
+    # aware slate substitution passes on the certified exact sum — GRANT.
+    import dataclasses as _dc
+
+    h, store = kxwc
+    tight = _dc.replace(WAIVER_LIMITS, slate_loss_frac=WAIVER_LIMITS.game_loss_frac)
+    limits = LimitChecker(tight)
+    lifecycle, _sender, exposure, reservation, metrics = _build_rig(
+        h, store, limits=limits, bankroll_cc=BANKROLL_CC
+    )
+    exposure.upsert_quote(_resting_quote("q:eng", ENG_ADV, ADV_EV))
+    state = _wc_state()
+
+    denied = lifecycle._reserve_headroom("fill:q1", "q1", state)  # noqa: SLF001
+    assert denied is not None and not denied.granted
+    reasons = {b.reason for b in denied.breaches}
+    assert ReasonCode.SKIP_SLATE_CAP in reasons  # the analytic slate co-breach
+
+    ok, detail = await lifecycle._lastlook_mc_waiver(  # noqa: SLF001
+        "q1", state, "fill:q1", denied.breaches
+    )
+    assert ok is True and detail == ""
+    assert reservation.is_outstanding("fill:q1")
+    _assert_waiver_counters(metrics, attempted=1, granted=1)
 
 
 async def test_delta_style_mass_acceptance_breach_still_fails_closed(

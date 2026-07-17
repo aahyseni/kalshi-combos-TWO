@@ -1568,16 +1568,24 @@ class QuoteLifecycle:
             return False, ""
         if self._reservation is None:  # a denial implies a service; belt+braces
             return False, ""
-        if not breaches or any(
-            b.reason not in WAIVABLE_RESERVATION_BREACHES for b in breaches
+        # SLATE breaches are certificate-RESOLVABLE, not waivable (2026-07-17):
+        # the slate cap sums the per-game analytic losses, and the retry's
+        # certificate-aware roll-up substitutes each certified game's exact
+        # worst case — so a denial carrying slate breaches ALONGSIDE per-game
+        # waivable breaches still arms the waiver; the retry then re-checks
+        # the slate HONESTLY on the substituted sum (fail-closed if it still
+        # breaches). A slate-ONLY denial has no game to certify ⇒ decline.
+        core = [b for b in breaches if b.reason is not ReasonCode.SKIP_SLATE_CAP]
+        if not core or any(
+            b.reason not in WAIVABLE_RESERVATION_BREACHES for b in core
         ):
-            # A non-waivable cap (gross/per-combo/daily/CVaR/ruin/notional/slate/
+            # A non-waivable cap (gross/per-combo/daily/CVaR/ruin/notional/
             # halt…) is part of the denial: never waived, decline as today.
             return False, "non-waivable breach in denial"
-        if any(b.game is None for b in breaches):
+        if any(b.game is None for b in core):
             # A per-game breach without its game key cannot be certified.
             return False, "waivable breach missing its game key (fail-closed)"
-        games = sorted({b.game for b in breaches if b.game is not None})
+        games = sorted({b.game for b in core if b.game is not None})
         bankroll_cc = self._risk_bankroll_cc()
         if bankroll_cc is None or bankroll_cc <= 0:
             # The %-caps needed a bankroll to breach, but it may have gone stale
@@ -3562,6 +3570,12 @@ class QuoteLifecycle:
                 start_time_provider=self._start_time_provider,
                 halt_inputs=self._halt_inputs(),
                 book_risk=self._book_risk_for_check(),
+                # Confirm-path check ⇒ the confirm-time resting haircut applies
+                # here exactly as at the authoritative reservation (2026-07-17;
+                # un-weighted, this advisory fold breached slate/directional on
+                # the standing resting book and short-circuited BEFORE the
+                # deferral could ever hand the denial to the waiver).
+                apply_resting_haircut=self._config.resting_haircut_at_confirm,
             )
         )
         # LAST-LOOK MC WAIVER deferral (handoff Problem A). This advisory check
@@ -3582,7 +3596,11 @@ class QuoteLifecycle:
             breaches
             and self._config.lastlook_mc_waiver_enabled
             and self._reservation is not None
-            and all(b.reason in WAIVABLE_RESERVATION_BREACHES for b in breaches)
+            and all(
+                b.reason in WAIVABLE_RESERVATION_BREACHES
+                or b.reason is ReasonCode.SKIP_SLATE_CAP
+                for b in breaches
+            )
         ):
             self._metrics.inc("lastlook_waiver.deferred_to_reservation")
             log.info(

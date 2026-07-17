@@ -785,7 +785,26 @@ class LimitChecker:
         # start (start_time_provider); UNKNOWN start ⇒ pooled UNKNOWN bucket
         # (fail-closed, itself capped). Roll the game-keyed loss up per slate.
         slate_thr = threshold_cc(limits.slate_loss_frac, bankroll)
-        slate_loss = self._slate_rollup(book, snapshot, candidates, start_time_provider)
+        # CERTIFICATE-AWARE SLATE (2026-07-17, the waiver doctrine extended to
+        # the SUM): where a game carries a VALID waiver certificate (certified
+        # AND within the per-game budget — the same _waiver_covers validation
+        # the per-game caps apply), the certificate's state-exact worst case
+        # REPLACES that game's comonotone analytic term in the slate roll-up
+        # (min() — a certificate can only tighten, never raise). Uncertified
+        # games keep the analytic term (fail-closed). Without this, the slate
+        # cap re-summed the very overstatement the per-game waiver just
+        # disproved and re-blocked every waiver-granted fill on a multi-game
+        # slate (slate 0.40 < 2 x game 0.30 is arithmetically unreachable).
+        certified_game_loss: dict[str, int] = {}
+        if waived_games:
+            for g, loss_v in snapshot.worst_case_loss_by_game_cc.items():
+                if _waiver_covers(waived_games, g, game_thr):
+                    cert = waived_games[g]
+                    certified_game_loss[g] = min(int(loss_v), int(cert.worst_case_cc))
+        slate_loss = self._slate_rollup(
+            book, snapshot, candidates, start_time_provider,
+            certified_game_loss=certified_game_loss,
+        )
         for slate, loss_cc in slate_loss.items():
             if loss_cc > slate_thr:
                 out.append(
@@ -936,6 +955,7 @@ class LimitChecker:
         snapshot: object,
         candidates: list[OpenPosition],
         start_time_provider: StartTimeProvider | None,
+        certified_game_loss: dict[str, int] | None = None,
     ) -> dict[str, int]:
         """Sum ``worst_case_loss_by_game_cc`` into per-slate buckets.
 
@@ -985,6 +1005,11 @@ class LimitChecker:
 
         slate_loss: dict[str, int] = {}
         for game, loss_cc in snapshot.worst_case_loss_by_game_cc.items():
+            # Certificate substitution (2026-07-17): a covered game's term is
+            # its state-exact certified worst case (validated by the caller),
+            # min'd so a certificate can only ever TIGHTEN the sum.
+            if certified_game_loss and game in certified_game_loss:
+                loss_cc = min(int(loss_cc), certified_game_loss[game])
             start = earliest_start.get(game)  # None or absent ⇒ UNKNOWN bucket
             slate = slate_key_for_start(start)
             slate_loss[slate] = slate_loss.get(slate, 0) + loss_cc
