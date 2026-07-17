@@ -165,3 +165,26 @@ funnel re-check that the hedge/concentrating quote rates DIVERGE.
   `wf_be6f3102-51f` before its build phase; design + resume command live in ADDENDUM 3
   and [[feedback_balance_via_maker_quoting]]. Tree is CLEAN (verified) — nothing partial
   on disk.
+
+## ADDENDUM 5 (2026-07-17 ~21:20Z) — DET-MAX 15→25% (operator); THE 37-WIN AUTOPSY; WAIVER FINALLY UNBLOCKED
+
+- **All 37 auction wins since the D-move relaunch were auto-declined at last-look
+  (`decline_risk_limit`), waiver_attempted=False on every one, 0 fills.** Root cause: the
+  committed book's $280 all-hit premium PERMANENTLY exceeded the det-max ceiling ($266 =
+  15% × $1,772 CASH — det-max measures against cash, which falls as fills convert to
+  premium: a two-sided squeeze). The det-max co-breach disarmed the waiver (it arms only on
+  game-loss/mutex-directional-ONLY denials); directional itself stood at $877-970 vs ~$709
+  (200 resting quotes at 100% mass-acceptance AT CONFIRM — by design).
+- **Fix (operator): `portfolio_det_max_frac: "0.25"`** (ceiling ~$443; MC support: P(ruin)
+  0.0000%, ES99 $242 at the $280 book). Directional budget UNCHANGED — denials become
+  directional-only and the WAIVER decides each win by exact state netting. RESTARTED
+  21:19:02Z (`live_20260717_detmax25.log`, preflight green, 12 pos / 0 mismatch). Watch
+  armed for the FIRST live waiver attempt. Revisit det-max with the weekend game-cap
+  decision (it re-binds after ~$160 more premium).
+- **Leg autopsy of the 37 wins:** the correlation hot-spot is ONE pair — `FRA-win ×
+  Mbappé 1+` in 16/37 (43%), + FRA-win in 23/37 overall: ~2/3 of the declined flow would
+  have CONCENTRATED our existing FRA-short book (the cap's nervousness was right, its
+  bluntness wrong). The hedge-side subset (ENG-win 6, no:FRA2 4, ARG-champ+no:ESP2 2each)
+  is exactly what the waiver should now admit.
+- Recorder RESTARTED post-checkpoint (`observe_20260717_postmove.log`; WAL 415GB→0,
+  main 109GB, on D:).
