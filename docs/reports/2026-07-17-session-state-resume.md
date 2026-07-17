@@ -81,3 +81,21 @@ workflow was mid-flight when this report was written).
 - **Operator:** Sat-vs-Sun call for the skew fix canary; 200-slot + game-cap decisions after
   the games; maker-fee residuals (admission-EV policy + settlement fee_cost semantics) before
   ever arming `maker_fee_active_prefixes`.
+
+---
+
+## ADDENDUM (~04:05Z) — RESTART 2 EXECUTED, EVERYTHING LIVE
+
+The "one remaining step" is DONE. Haircut verify completed: 3-lens fleet found 1
+SERIOUS CONFIRMED (burst floor broke on the mutex-folded axes at the superadditive
+1→2 ME-event transition — the floor's base term now tracks the COMBINED census's
+netting regime, still monotone) + 1 MINOR (post-fill pull ran in the
+commit-to-drop double-count window — now schedules after the filled quote leaves
+the open set); both fixed + regression-tested. Suite independently re-run
+**2290/0**; ruff 13 / mypy 6 baseline. Committed **`9a27682`**, pushed. Yaml armed:
+`resting_quote_weight: "0.40"`, `resting_floor_count: 3` (+ the markup raise from
+earlier). **RESTART 2 at 03:51:19Z** → `live_20260717_haircut_markup.log`:
+preflight green, 12 positions / 0 mismatches, pool workers=2, supervisor up.
+Post-restart funnel measurement in flight. Remaining next steps unchanged from
+the list above from step 5 (Saturday canary watch) onward; skew mutex fix is now
+the next build.
