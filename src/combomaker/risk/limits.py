@@ -429,8 +429,10 @@ class LimitChecker:
         look passes the accepted side here). ``adding_quote``: pre-quote check
         counts one more open quote.
 
-        ``apply_resting_haircut`` (QUOTE-TIME ONLY — operator design
-        2026-07-17): True ⇒ the exposure snapshot weights every RESTING open
+        ``apply_resting_haircut`` (operator design 2026-07-17; the quote-time
+        sites, plus — since the same-day confirm extension — the reservation
+        check when ``risk.resting_haircut_at_confirm`` is armed): True ⇒ the
+        exposure snapshot weights every RESTING open
         quote's mass-acceptance contribution at ``limits.resting_quote_weight``
         (burst-floored at the full contribution of the
         ``limits.resting_floor_count`` largest; committed positions and

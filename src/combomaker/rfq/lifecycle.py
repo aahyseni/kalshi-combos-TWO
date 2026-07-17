@@ -285,6 +285,13 @@ class LifecycleConfig:
     # replay + port parity). Default False = today's behaviour, byte-identical;
     # the operator arms it in the local YAML (risk.pre_pricing_gate_enabled).
     pre_pricing_gate_enabled: bool = False
+    # CONFIRM-TIME resting haircut (operator 2026-07-17, the no-double-counting
+    # doctrine extended one layer down): the reservation check weights the
+    # RESTING open-quote fold at resting_quote_weight — committed positions,
+    # outstanding reservations, and the candidate all stay at 100% (the serial
+    # commit chain is untouched). Default False = today's 100% fold; the
+    # operator arms it in the local YAML (risk.resting_haircut_at_confirm).
+    resting_haircut_at_confirm: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1494,6 +1501,10 @@ class QuoteLifecycle:
             halt_inputs=self._halt_inputs(),
             book_risk=self._book_risk_for_check(),
             waived_games=waived_games,
+            # Confirm-time resting haircut (operator 2026-07-17): committed +
+            # reservations + candidate stay at 100%; only the resting fold
+            # weights. Default False = today; armed in the local YAML.
+            apply_resting_haircut=self._config.resting_haircut_at_confirm,
         )
 
     # ------------------------------------------- last-look MC waiver (Problem A)

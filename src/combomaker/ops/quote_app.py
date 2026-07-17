@@ -175,6 +175,9 @@ def build_lifecycle_config(risk_cfg: RiskConfig) -> LifecycleConfig:
         # on already-breached candidate-monotone caps BEFORE pricing. Default
         # OFF (today's behaviour); the operator arms it in the local YAML.
         pre_pricing_gate_enabled=risk_cfg.pre_pricing_gate_enabled,
+        # CONFIRM-TIME resting haircut (2026-07-17): the reservation check
+        # weights ONLY the resting fold; the serial commit chain stays 100%.
+        resting_haircut_at_confirm=risk_cfg.resting_haircut_at_confirm,
     )
 
 

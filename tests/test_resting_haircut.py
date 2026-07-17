@@ -32,6 +32,7 @@ Pinned here:
 
 from __future__ import annotations
 
+import dataclasses
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -598,6 +599,41 @@ class TestConfirmTimePinnedAtFullFold:
             breach_key(b) for b in r_plain.breaches
         ]
 
+    def test_confirm_haircut_flag_grants_where_full_fold_declines(self) -> None:
+        # Operator 2026-07-17 (the 37-auto-declined-wins fix): with
+        # apply_resting_haircut=True the reservation check weights the RESTING
+        # fold, so a win whose only obstacle is the standing resting-quote
+        # mass-acceptance now reserves; the identical service WITHOUT the flag
+        # still declines (bit-identical today path). Committed + reservations +
+        # candidate all still count at 100% in both.
+        book = self.blend_book()
+        # Widen the directional axis so the GAME-LOSS axis isolates the flag
+        # (blend_book's directional fold breaches at the class default either
+        # way — orthogonal to what this test pins).
+        wide_dir = dataclasses.replace(
+            limits_with_weight(W40), directional_frac=Fraction(99, 100)
+        )
+        service = RiskReservationService(
+            exposure=book,
+            limits=LimitChecker(wide_dir),
+            breach_splitter=lambda bs: [b for b in bs if not b.shadow],
+        )
+        # 1_000cc: armed fold 78k + 1k = 79k fits the 80k cap; plain fold
+        # 90k + 1k = 91k breaches — the flag alone flips the decision.
+        candidate = position("fill", "G1", contracts=100, price=1_000)
+        plain = service.try_reserve(
+            "r-plain", candidate, marginals=provider(), daily_pnl=DailyPnl(),
+            risk_bankroll_cc=self.BANKROLL,
+        )
+        assert plain.reservation is None  # full resting fold breaches the cap
+        assert ReasonCode.SKIP_GAME_LOSS_CAP in {b.reason for b in plain.breaches}
+        armed = service.try_reserve(
+            "r-armed", candidate, marginals=provider(), daily_pnl=DailyPnl(),
+            risk_bankroll_cc=self.BANKROLL,
+            apply_resting_haircut=True,
+        )
+        assert armed.reservation is not None  # weighted fold fits the SAME budget
+
 
 # ---------------------------------------------------- E2 rewrite (spec point 4)
 
@@ -657,12 +693,19 @@ class TestE2SerialConfirmBudget:
         resting_floor_count=1,
     )
 
+    @pytest.mark.parametrize("confirm_haircut", [False, True])
     @given(case=e2_cases())
     @settings(derandomize=True, max_examples=300, deadline=None)
     def test_confirm_path_never_exceeds_budgets(
         self,
+        confirm_haircut: bool,
         case: tuple[list[OpenQuoteRisk], list[tuple[int, int]], Fraction, int],
     ) -> None:
+        # confirm_haircut=True (operator 2026-07-17): the reservation check
+        # ALSO weights the resting fold — the invariant below must hold
+        # regardless, because committed + reservations + candidate stay at
+        # 100% (the serial commit chain is the enforcement, not the resting
+        # term).
         quotes, accepts, weight, floor = case
         limits = RiskLimits(
             game_loss_frac=self.LIMITS.game_loss_frac,
@@ -717,6 +760,7 @@ class TestE2SerialConfirmBudget:
                 f"fill:{q.quote_id}", candidate,
                 marginals=_marg, daily_pnl=pnl,
                 risk_bankroll_cc=self.BANKROLL,
+                apply_resting_haircut=confirm_haircut,
             )
             # Granted => commit books it; denied => nothing held (the decline).
             service.commit(f"fill:{q.quote_id}")

@@ -286,6 +286,7 @@ class RiskReservationService:
         halt_inputs: HaltInputs | None = None,
         book_risk: PortfolioRisk | None = None,
         waived_games: Mapping[str, WaiverCertificate] | None = None,
+        apply_resting_haircut: bool = False,
     ) -> ReserveResult:
         """Atomically reserve headroom for ``candidate`` if the limits allow it.
 
@@ -330,6 +331,15 @@ class RiskReservationService:
         # the book snapshot's extra_positions so the game/slate/gross aggregates
         # count held-but-uncommitted headroom too.
         outstanding = self.outstanding_positions()
+        # ``apply_resting_haircut`` (2026-07-17, operator extension of the
+        # no-double-counting doctrine to CONFIRM): weights ONLY the resting
+        # open-quote fold. The candidate and every outstanding reservation ride
+        # in candidate_positions at 100% and the committed book folds at 100% —
+        # the terms that become REAL money are enforced exactly as before. A
+        # resting quote only ever becomes risk by passing through THIS check
+        # itself at 100% as the candidate, so its weighted presence here is
+        # pure double-count removal (same subset-validity argument as the
+        # quote-time haircut; E2 property test covers the confirm-armed path).
         raw = self._limits.check(
             self._exposure,
             marginals,
@@ -341,6 +351,7 @@ class RiskReservationService:
             halt_inputs=halt_inputs,
             book_risk=book_risk,
             waived_games=waived_games,
+            apply_resting_haircut=apply_resting_haircut,
         )
         enforced = self._split(raw)
         if enforced:

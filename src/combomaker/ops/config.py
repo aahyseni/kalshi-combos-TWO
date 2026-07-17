@@ -2210,6 +2210,13 @@ class RiskConfig(StrictModel):
     # Default False = today's behaviour byte-identical; the operator arms it in
     # the local YAML after game-day review.
     pre_pricing_gate_enabled: bool = False
+    # CONFIRM-TIME resting haircut (2026-07-17): weight the RESTING open-quote
+    # fold at resting_quote_weight inside the reservation check too (committed +
+    # reservations + candidate stay 100%). Removes the standing directional/
+    # mass-acceptance breach that 200 resting slots exert AT CONFIRM (which
+    # co-breached every denial and disarmed the Problem-A waiver — 37/37
+    # auction wins auto-declined 2026-07-17). Default False = today.
+    resting_haircut_at_confirm: bool = False
     # QUOTE-TIME RESTING-QUOTE HAIRCUT (operator design 2026-07-17). Weight on
     # every resting (open) quote's contribution to the QUOTE-TIME
     # mass-acceptance folds (game-loss / slate / directional / delta / notional
