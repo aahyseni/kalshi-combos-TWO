@@ -260,3 +260,12 @@ waiver → substituted sum passes → GRANTED. RESTARTED (`live_20260717_slatefi
 FULL LOCK LEDGER (six): det-max 25% | confirm resting haircut 0.40 (reservation +
 advisory) | delta ×3 | hard game cap waivable | slate certificate-resolvable |
 waiver deferral chain intact end-to-end.
+
+## ADDENDUM 10 (2026-07-17 ~22:20Z) — SLATE 0.40 → 0.65 (operator) + RESTART
+
+`slate_loss_frac: "0.65"` armed (2 × 0.30 game budgets + headroom — the
+certificate-aware roll-up still fail-closes on the certified exact sum; det-max
+25% + candidate MC + per-game budgets gate commitments underneath). RESTARTED
+(`live_20260717_slate65.log`). The six-lock chain now has full 2-game capacity.
+Nothing else changed. Watch = deferrals → waiver_attempted → the first
+risk_reservation_granted.
