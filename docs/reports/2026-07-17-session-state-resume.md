@@ -142,3 +142,26 @@ flag `committed_state_netting_enabled` default False). Verify lenses ordered to
 attack E2/monotonicity; if item B is unsound in any corner, item A ships alone.
 On landing: orchestrator review → suite → commit → arm flags → restart 4 →
 funnel re-check that the hedge/concentrating quote rates DIVERGE.
+
+## ADDENDUM 4 (2026-07-17 ~16:05Z) — DATA DIR MOVED TO D: (JUNCTION); BOT RELAUNCHED; HEDGE-PAIR BUILD PARKED
+
+- **C: was critically full (6.6 GB free).** `data/` was 522 GB — the shadow tape's WAL had
+  grown to **415 GB** (checkpoint starved for a day+ of firehose recording; the earlier
+  52 GB reading was wrong). An attempted checkpoint ON C: was aborted (main grows during
+  fold; no room).
+- **Move executed:** `data` → `D:\kalshi-combos-TWO-data` with a DIRECTORY JUNCTION left at
+  `C:\Users\aahys\kalshi-combos-TWO\data` — zero config changes, all paths identical.
+  Small set (19.4 GB incl. live DB + logs) moved first at 443 MB/s; bot relaunched
+  immediately; shadow trio (503 GB) followed at 808 MB/s. **C: now 529 GB free.**
+- **BOT LIVE** on the junction since 15:49:51Z (`live_20260717_dmove.log`): preflight
+  green, 12 positions / 0 mismatches, 331 quotes in first minutes (daytime flow).
+  Ops note: D: I/O only carries DB/log/heartbeat writes (async/off hot path); if D: is
+  missing at boot the bot fails preflight CLOSED.
+- **Shadow DB checkpoint on D: in flight** (fold 415 GB WAL → main); recorder restarts
+  after it completes. RECORDER LESSON: long-lived readers starve WAL checkpoints — keep
+  heavy mode=ro analytics off game-time, and watch the WAL size (`data/…-wal`).
+- **HEDGE-PAIR BUILD (skew mutex + committed-book exact netting): PARKED by operator**
+  ("keep it in memory and we'll implement later") — the credits outage killed workflow
+  `wf_be6f3102-51f` before its build phase; design + resume command live in ADDENDUM 3
+  and [[feedback_balance_via_maker_quoting]]. Tree is CLEAN (verified) — nothing partial
+  on disk.
