@@ -188,3 +188,21 @@ funnel re-check that the hedge/concentrating quote rates DIVERGE.
   is exactly what the waiver should now admit.
 - Recorder RESTARTED post-checkpoint (`observe_20260717_postmove.log`; WAL 415GB→0,
   main 109GB, on D:).
+
+## ADDENDUM 6 (2026-07-17 ~21:55Z) — CONFIRM-TIME RESTING HAIRCUT (`c76d624`) ARMED; THE FULL FILL-BLOCKER CHAIN CLOSED
+
+Even at det-max 25%, wins kept auto-declining (39 total) with waiver_attempted=False:
+directional stood at $717-971 vs ~$709 AND a non-waivable delta-family co-breach rode
+along — all driven by 200 resting quotes at 100% AT CONFIRM. Fix (operator doctrine,
+one layer down): **`try_reserve(apply_resting_haircut=...)`** — the reservation check
+weights ONLY the resting fold at 0.40; committed + outstanding reservations + the
+candidate stay at 100% (the serial commit chain untouched — a resting quote only
+becomes risk by passing THIS check itself at 100%). E2 commit-budget property
+parametrized over the flag (300 examples × both) + direction test + bit-identity
+regression. Suite 2292/0. Committed `c76d624`, pushed. Armed
+`resting_haircut_at_confirm: true` + RESTARTED (`live_20260717_confirmhaircut.log`).
+Expected: denials become waivable-only → the waiver's first live run → FILLS.
+KNOWN ITEM (morning follow-up): the live store writer's manual WAL checkpoint failed
+"database table is locked" on EVERY attempt of the detmax25 run (WAL grew 78→194MB+
+in ~40min; data committed-safe BEFORE the pragma; one aiosqlite connection — suspect
+a long-lived read cursor; restart resets the WAL). Diagnose + resilient retry.
