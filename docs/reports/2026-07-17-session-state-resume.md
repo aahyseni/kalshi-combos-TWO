@@ -116,3 +116,29 @@ POST race = Batch-2 (WS sharding) territory. Post-fill pull + waiver metrics
 both at 0 so far (no fills in the quiet window). Final overnight platform:
 **haircut 0.40 + floor 3 + pull + 200 slots + markup 2/3.5/4.5/6¢ + F1 pre-gate
 + Batch-1 + champion aliases + schedule table, all on `9a27682`.**
+
+## ADDENDUM 3 (~04:40Z) — HEDGE-ACCEPTANCE FINDING + BUILD IN FLIGHT
+
+Measured since restart 3: hedge-side flow (ARG-champ-yes 16,745 RFQs / ENG-win-yes
+533) is quoted at the IDENTICAL ~13% rate as concentrating flow and declined by
+skip_game_loss_cap at the same ~75-80% — the quote-time fold is DIRECTION-BLIND
+because the ESPARG bucket carries ≥2 ME events (champion event via the alias +
+regulation moneyline; our book holds legs on both) → _mutex_game_worst_cc fails
+closed to comonotone → no hedge credit. The waiver still nets exactly at confirm
+for the 13% that gets quoted. Book therefore has no ENG-yes/ARG-yes shorts yet —
+takers haven't accepted, and we under-quote that side.
+
+**IN FLIGHT: workflow `wf_be6f3102-51f`** (resume:
+`Workflow({scriptPath: ".../workflows/scripts/hedge-acceptance-pair-wf_be6f3102-51f.js", resumeFromRunId: "wf_be6f3102-51f"})`
+— full path in the launch record; script persisted):
+(A) **skew mutex-aware direction** — feed the skew classifier the P0-9
+mutex-aware per-game direction instead of the raw delta sum (shadow-measured
+mis-widening ARG-champ 63/63); skew stays DARK, this fixes the signal for arming.
+(B) **quote-time committed-book exact netting base** — replace the comonotone
+COMMITTED base in the game-loss/directional folds with the waiver's state-exact
+enumeration (committed positions ONLY — subset-attack-safe since fills can't
+un-happen; cached per (game, position_generation); fail-closed to comonotone;
+flag `committed_state_netting_enabled` default False). Verify lenses ordered to
+attack E2/monotonicity; if item B is unsound in any corner, item A ships alone.
+On landing: orchestrator review → suite → commit → arm flags → restart 4 →
+funnel re-check that the hedge/concentrating quote rates DIVERGE.
