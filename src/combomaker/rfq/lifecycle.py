@@ -72,6 +72,7 @@ from combomaker.risk.limits import (
     PortfolioRisk,
     StartTimeProvider,
     StarvationWatchdog,
+    monotone_pre_quote_breaches,
     threshold_cc,
 )
 from combomaker.risk.markouts import MarkoutSubject, MarkoutTracker
@@ -159,6 +160,12 @@ _FILL_RECOVERY_MAX_ATTEMPTS = 10
 # circuit breaker, and the sweep's total wall budget per tick.
 _REPRICE_POOL_TRIP = 2
 _REPRICE_SWEEP_BUDGET_S = 2.5
+
+# F1 PRE-PRICING GATE cache age bound (seconds). The generation/bankroll keys
+# do the real invalidation; this bound only covers slow drift (metadata ME
+# answers) and matches the 0.5s maintenance-tick granularity the book is
+# re-checked at anyway.
+_PRE_GATE_CACHE_TTL_S = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +260,19 @@ class LifecycleConfig:
     # from RiskConfig.fill_record_recovery_after_s. A non-positive/NaN value
     # disables the sweep (fail-closed: never poll on a nonsense config).
     fill_record_recovery_after_s: float = 10.0
+    # F1 MONOTONE PRE-PRICING GATE (throughput synthesis 2026-07-16, lens-3 F1).
+    # When True, handle_rfq consults a CANDIDATE-FREE limits check (cached per
+    # exposure generation + bankroll, ≤0.5s) BEFORE the expensive joint pricing
+    # and pre-declines on the candidate-monotone breach subset
+    # (risk/limits.PRE_PRICING_MONOTONE_REASONS) — the SAME decline the full
+    # post-pricing check would produce, just before the pricing work is spent
+    # (measured: 81% of the game-day window's no-quotes were fully priced then
+    # risk-declined; 48.2% carried an allowlisted reason). Identical reason
+    # codes, earlier exit; the stage rides the decision context. Prototype-first
+    # validated (tools/proto_pre_pricing_gate.py: fuzz + counterexamples + tape
+    # replay + port parity). Default False = today's behaviour, byte-identical;
+    # the operator arms it in the local YAML (risk.pre_pricing_gate_enabled).
+    pre_pricing_gate_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -333,6 +353,7 @@ class QuoteLifecycle:
         book_risk_pool: BookRiskPool | None = None,
         quote_getter: QuoteGetter | None = None,
         beat: Callable[[], None] | None = None,
+        rfq_alive: Callable[[str], bool] | None = None,
     ) -> None:
         self._clock = clock
         self._sender = sender
@@ -451,6 +472,25 @@ class QuoteLifecycle:
         # event-loop wedge still cannot beat (the fail-closed signal survives).
         # None (tests/backtests) ⇒ no-op.
         self._beat_cb = beat
+        # F2 MID-PIPELINE LIVENESS (throughput synthesis 2026-07-16): "is this
+        # RFQ still open on the exchange stream?" — wired to the intake's
+        # liveness view (``intake.rfq_alive``: open registry + disconnect-
+        # cleared ids held as UNKNOWN⇒alive) by quote_app. The hot path
+        # re-checks it at three points (dequeue / after the pool joint
+        # / immediately before the create-quote POST) so an RFQ POSITIVELY
+        # deleted mid-flight stops consuming pricing, snapshots, and REST
+        # write budget (fixed run: 97.4% of POSTs went to already-dead RFQs).
+        # None (backtests / tests) ⇒ no liveness view ⇒ behaviour identical to
+        # today. Wired in BOTH paper and quote modes (additive skips only).
+        self._rfq_alive = rfq_alive
+        # F1 PRE-PRICING GATE cache: (exposure generation, bankroll_cc, built
+        # mono_ns, breaches). Every allowlisted cap input is either static per
+        # book mutation (loss/notional folds, quote count — invalidated by the
+        # GENERATION key) or the bankroll itself (its own key); the ≤0.5s age
+        # bound is belt-and-suspenders for metadata drift (ME answers), matching
+        # the maintenance-tick granularity. A falsely-CACHED verdict can only
+        # DECLINE (never admit), and retry_pending re-checks within 1s anyway.
+        self._pre_gate_cache: tuple[int, int | None, int, list[Breach]] | None = None
         self._markouts = MarkoutTracker(store.record_markout)
         # LAST-LOOK MC WAIVER observability: the per-confirm waiver audit record
         # ({granted, worst_case_cc, games}), set ONLY when a waiver ATTEMPT ran
@@ -1786,16 +1826,115 @@ class QuoteLifecycle:
         else:
             self._watchdog.record_quote_issued()
 
+    def _rfq_gone(self, rfq: Rfq) -> bool:
+        """F2 liveness probe: True iff the intake registry POSITIVELY says the
+        RFQ was already deleted. No registry wired (None — paper/backtests/
+        tests), or a probe error, ⇒ False: proceed exactly as today. That
+        proceed-on-unknown is deliberately NOT a fail-open money hole — a
+        deleted RFQ can never fill (the POST 409s ``rfq_closed`` and is
+        handled), so this gate is pure waste removal and must never be able to
+        turn a probe bug into a quote blackout."""
+        if self._rfq_alive is None:
+            return False
+        try:
+            return not self._rfq_alive(rfq.rfq_id)
+        except Exception:
+            log.exception("rfq_liveness_probe_failed", rfq_id=rfq.rfq_id)
+            return False
+
+    async def _skip_dead_rfq(self, rfq: Rfq, stage: str) -> None:
+        """Record one F2 mid-flight-delete skip: per-stage metric + the shared
+        reason code with the stage in context (same-decline-different-stage
+        discipline — the tape's reason vocabulary stays stable while the stage
+        attribution rides the context/metrics)."""
+        self._metrics.inc(f"rfq.liveness_skip.{stage}")
+        await self._record_skip(
+            rfq, [ReasonCode.SKIP_RFQ_DELETED_MIDFLIGHT], {"stage": stage}
+        )
+
+    def _pre_pricing_breaches(self) -> list[Breach]:
+        """F1 MONOTONE PRE-PRICING GATE (throughput synthesis 2026-07-16).
+
+        The candidate-FREE ``limits.check`` (the exact call the maintenance
+        tick already makes, plus ``adding_quote=True``) filtered to the
+        ENFORCED candidate-monotone subset (``monotone_pre_quote_breaches``):
+        every returned breach provably persists under ANY candidate, so a
+        pre-decline here is the SAME decline the full post-pricing check would
+        have produced — minus the joint pricing, snapshots, and POST. Cached
+        per (exposure generation, bankroll, ≤0.5s): all allowlisted cap inputs
+        are generation-static or the bankroll itself. Validated
+        prototype-first in tools/proto_pre_pricing_gate.py (fuzz 0 violations
+        + exclusion counterexamples + tape replay + part-D port parity)."""
+        gen = self._exposure.generation
+        bankroll = self._risk_bankroll_cc()
+        now = self._clock.monotonic_ns()
+        cached = self._pre_gate_cache
+        if (
+            cached is not None
+            and cached[0] == gen
+            and cached[1] == bankroll
+            and now - cached[2] <= int(_PRE_GATE_CACHE_TTL_S * 1e9)
+        ):
+            self._metrics.inc("pre_gate.cache_hit")
+            return cached[3]
+        raw = self._limits.check(
+            self._exposure,
+            self._marginals,
+            self.daily_pnl,
+            adding_quote=True,
+            risk_bankroll_cc=bankroll,
+            bankroll_source_configured=self._bankroll_source_configured(),
+            start_time_provider=self._start_time_provider,
+            halt_inputs=self._halt_inputs(),
+            book_risk=self._book_risk_for_check(),
+        )
+        # Shadow-split FIRST (the one shadow-enforcement seam), then the
+        # monotone filter (which also drops shadow, belt-and-suspenders).
+        breaches = monotone_pre_quote_breaches(self._partition_breaches(raw))
+        self._pre_gate_cache = (gen, bankroll, now, breaches)
+        self._metrics.inc("pre_gate.check")
+        return breaches
+
     # ------------------------------------------------------------------ intake
 
     async def handle_rfq(self, rfq: Rfq) -> None:
+        # F2 liveness check #1 — on dequeue, before ANY work (the RFQ may have
+        # been deleted while queued; nothing purges the rfq_work queue itself).
+        if self._rfq_gone(rfq):
+            await self._skip_dead_rfq(rfq, "pre_price")
+            return
         reasons = self._filter.evaluate(rfq)
         if reasons:
             await self._record_skip(rfq, reasons, self._pregame_flow_context(rfq, reasons))
             return
+        # F1 monotone pre-pricing gate (default OFF = today's behaviour). A
+        # candidate-monotone cap already breached WITHOUT this RFQ means the
+        # full check after pricing MUST decline it too — same reason codes,
+        # earlier exit (the stage rides the context), pricing work never spent.
+        # The watchdog still sees the would-be decline (constraint: a mis-set
+        # cap silently declining everything must surface identically).
+        if self._config.pre_pricing_gate_enabled:
+            pre = self._pre_pricing_breaches()
+            if pre:
+                self._metrics.inc("pre_gate.declined")
+                self._note_watchdog(risk_declined=True)
+                await self._record_skip(
+                    rfq,
+                    [b.reason for b in pre],
+                    {"stage": "pre_pricing", "details": [b.detail for b in pre]},
+                )
+                return
         result = await self._price_async(rfq)
         if isinstance(result, NoQuote):
             await self._record_skip(rfq, [result.reason], {"detail": result.detail})
+            return
+        # F2 liveness check #2 — after the joint returned (queue dwell + pool
+        # dwell is where most mid-flight deletes land): stop before spending
+        # the risk snapshots + POST on a dead RFQ. Deliberately AFTER the
+        # NoQuote branch, so pricing-failure reason tallies (the research
+        # denominator) are unchanged — only would-be downstream work converts.
+        if self._rfq_gone(rfq):
+            await self._skip_dead_rfq(rfq, "post_price")
             return
 
         # Risk-side size: a quote implicitly covers the RFQ's FULL size (no
@@ -1867,6 +2006,13 @@ class QuoteLifecycle:
             )
             return
 
+        # F2 liveness check #3 — immediately before the POST. The last cheap
+        # exit before a full REST round-trip holds one of the 8 workers and
+        # burns write budget on a certain ``rfq_closed``. Placed AFTER the risk
+        # check + watchdog so risk-decline tallies/audits are byte-identical.
+        if self._rfq_gone(rfq):
+            await self._skip_dead_rfq(rfq, "pre_post")
+            return
         try:
             response = await self._sender.create_quote(
                 rfq.rfq_id,

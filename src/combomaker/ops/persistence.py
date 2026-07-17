@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
@@ -314,14 +315,23 @@ class Store:
     def _now(self) -> str:
         return self._clock.now().isoformat()
 
-    async def record_rfq(self, rfq: Rfq, *, source: str) -> None:
+    async def record_rfq(
+        self, rfq: Rfq, *, source: str, seen_at: datetime | None = None
+    ) -> None:
+        """``seen_at``: optional PICKUP wall-time override (risk audit
+        2026-07-16). The quote-mode fast-lane records the tape row AFTER
+        pricing/dispatch, so it captures the wall-clock at worker pickup and
+        passes it here — ``rfqs.seen_at`` keeps its pre-fast-lane meaning
+        ("worker pickup, pre-pricing") for every latency instrument that reads
+        it (wire→pickup = created_ts→seen_at, pickup→post = seen_at→quote_sent
+        at). Default None stamps call time — all other callers unchanged."""
         await self._write(
             "INSERT INTO rfqs (rfq_id, seen_at, source, market_ticker, collection_ticker,"
             " contracts_centi, target_cost_cc, n_legs, legs_json, raw_json)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 rfq.rfq_id,
-                self._now(),
+                seen_at.isoformat() if seen_at is not None else self._now(),
                 source,
                 rfq.market_ticker,
                 rfq.mve_collection_ticker,

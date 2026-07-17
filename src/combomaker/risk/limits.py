@@ -183,6 +183,68 @@ class Breach:
     game: str | None = None
 
 
+# --- F1 monotone pre-pricing gate (throughput synthesis 2026-07-16) ---------
+# Breach reasons a CANDIDATE-FREE check may pre-decline an RFQ on, BEFORE the
+# expensive joint pricing runs: each is provably candidate-MONOTONE ("already
+# breached without the candidate ⇒ breached with ANY candidate"), so the gate
+# can only ever produce the SAME decline earlier — never skip an RFQ today's
+# full pipeline would have quoted. Validated prototype-first (hard rule 8) in
+# tools/proto_pre_pricing_gate.py: 5,000-case fuzz against THIS checker (0
+# violations) + constructed counterexamples for every exclusion + a live-tape
+# replay (48.2% of the window's no-quotes carried an allowlisted reason).
+#
+# INCLUDED (and why each is monotone):
+#   SKIP_MAX_OPEN_QUOTES      pure count with adding_quote=True — candidate-free
+#                             and with-candidate checks read the SAME count.
+#   SKIP_GAME_LOSS_CAP        the per-game loss fold (_mutex_game_worst_cc) is
+#                             monotone in the entry set (E2 dominance): a
+#                             candidate only ADDS entries to a game, and the
+#                             ME-count fold-switch only moves TOWARD the larger
+#                             comonotone sum.
+#   SKIP_UTILIZATION_BACKSTOP Σ gross settlement notional — every candidate
+#                             adds a non-negative notional.
+#   SKIP_BANKROLL_UNAVAILABLE candidate-independent (bankroll reading only).
+#
+# EXCLUDED (deliberately — each exclusion is load-bearing):
+#   SKIP_MASS_ACCEPTANCE_BREACH  spans the DELTA axes, where an opposite-side
+#                                candidate can hedge |delta| back UNDER the cap
+#                                (proto B1); the loss/notional instances are
+#                                monotone but the reason alone cannot tell the
+#                                axes apart and details are never parsed.
+#   SKIP_SLATE_CAP               a candidate leg with a KNOWN start re-buckets a
+#                                game out of the breached slate (proto B2 shows
+#                                a full false-skip).
+#   SKIP_DIRECTIONAL_CAP         plan-of-record conservatism: the P0-9 fold is
+#                                documented monotone, but the lens-3 allowlist
+#                                omitted it and its decline volume is marginal.
+#   per-combo / per-quote size   candidate-only (a candidate-free check cannot
+#                                emit them).
+#   CVaR / det-max / ruin        synthesis: never the candidate-EV/CVaR paths.
+#   halt-class breaches          escalation belongs to the maintenance tick.
+PRE_PRICING_MONOTONE_REASONS: frozenset[ReasonCode] = frozenset(
+    {
+        ReasonCode.SKIP_MAX_OPEN_QUOTES,
+        ReasonCode.SKIP_GAME_LOSS_CAP,
+        ReasonCode.SKIP_UTILIZATION_BACKSTOP,
+        ReasonCode.SKIP_BANKROLL_UNAVAILABLE,
+    }
+)
+
+
+def monotone_pre_quote_breaches(breaches: list[Breach]) -> list[Breach]:
+    """Filter a candidate-free ``check`` result down to the breaches the F1
+    pre-pricing gate may decline on: ENFORCED (never shadow — the shadow
+    guarantee survives even if the caller forgot to partition first) AND on a
+    candidate-monotone reason (PRE_PRICING_MONOTONE_REASONS above). Pure;
+    parity-pinned against the validated prototype
+    (tools/proto_pre_pricing_gate.py part D)."""
+    return [
+        b
+        for b in breaches
+        if not b.shadow and b.reason in PRE_PRICING_MONOTONE_REASONS
+    ]
+
+
 class WaiverCertificate(Protocol):
     """CONFIRM-PATH last-look waiver certificate for ONE game (structurally
     ``sim.state_worst_case.GameWorstCase`` — a Protocol so ``limits`` never
@@ -412,7 +474,15 @@ class LimitChecker:
                     )
                 )
 
-        open_quotes = book.snapshot(marginals, mass_acceptance=False).open_quote_count
+        # F5 (throughput synthesis 2026-07-16): a DIRECT count. The old
+        # ``book.snapshot(marginals, mass_acceptance=False).open_quote_count``
+        # built an entire O(positions × legs) exposure decomposition and threw
+        # everything away except this len() — one of three full decompositions
+        # per admitted RFQ on the single loop thread. ``ExposureSnapshot.
+        # open_quote_count`` is ``len(self.open_quotes)`` verbatim (exposure.py
+        # snapshot()), so this is value-identical on every book, by construction
+        # and by test (test_limits.py::TestOpenQuoteCountDirect).
+        open_quotes = len(book.open_quotes)
         if adding_quote and open_quotes + 1 > limits.max_open_quotes:
             breaches.append(
                 Breach(

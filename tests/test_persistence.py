@@ -44,6 +44,29 @@ async def test_roundtrip(tmp_path: Path) -> None:
         await store.close()
 
 
+async def test_record_rfq_seen_at_override_and_default(tmp_path: Path) -> None:
+    """rfqs.seen_at semantics (risk audit fix 2026-07-16): the fast-lane
+    passes the wall-clock captured at worker PICKUP so the column keeps its
+    pre-fast-lane meaning even though the row lands after pricing; the default
+    (no override) still stamps call time for every other caller."""
+    clock = FakeClock()
+    store = await Store.open(tmp_path / "t.sqlite3", clock)
+    try:
+        pickup = clock.now()
+        clock.advance(2.0)  # pricing-pool dwell between pickup and the write
+        await store.record_rfq(RFQ, source="ws", seen_at=pickup)
+        await store.record_rfq(RFQ, source="ws")  # default: call-time stamp
+        async with store._db.execute(  # noqa: SLF001
+            "SELECT seen_at FROM rfqs ORDER BY id"
+        ) as cursor:
+            rows = [row[0] async for row in cursor]
+        assert rows[0] == pickup.isoformat()          # override: pickup time
+        assert rows[1] == clock.now().isoformat()     # default: write time
+        assert rows[0] != rows[1]
+    finally:
+        await store.close()
+
+
 async def test_open_is_idempotent(tmp_path: Path) -> None:
     path = tmp_path / "t.sqlite3"
     store1 = await Store.open(path, FakeClock())

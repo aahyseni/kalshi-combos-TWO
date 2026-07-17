@@ -2196,6 +2196,20 @@ class RiskConfig(StrictModel):
     # fires only on a genuinely lost message. Must be a positive, finite number
     # (validator below); LifecycleConfig.fill_record_recovery_after_s downstream.
     fill_record_recovery_after_s: float = 10.0
+    # F1 MONOTONE PRE-PRICING GATE (throughput synthesis 2026-07-16). When True,
+    # handle_rfq consults a CANDIDATE-FREE limits check (cached ≤0.5s per
+    # exposure generation + bankroll) BEFORE the expensive joint pricing and
+    # pre-declines on the candidate-monotone breach subset
+    # (risk/limits.PRE_PRICING_MONOTONE_REASONS: max-open-quotes, game-loss,
+    # utilization backstop, bankroll-unavailable) — provably the SAME decline
+    # the full post-pricing check produces, just earlier, freeing the pool for
+    # live RFQs (48.2% of the game-day window's no-quotes carried an
+    # allowlisted reason). Identical reason codes; the "pre_pricing" stage rides
+    # the decision context. STRICTLY ADDITIVE (can only add earlier declines,
+    # never admit) and prototype-validated (tools/proto_pre_pricing_gate.py).
+    # Default False = today's behaviour byte-identical; the operator arms it in
+    # the local YAML after game-day review.
+    pre_pricing_gate_enabled: bool = False
     game_loss_frac: str = "0.08"          # %-of-GAME correlated loss
     per_combo_loss_frac: str = "0.01"     # single position max_loss
     directional_frac: str = "0.10"        # net one-directional / theme

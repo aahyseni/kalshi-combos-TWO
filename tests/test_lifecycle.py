@@ -90,6 +90,9 @@ class Rig:
         fee_model: FeeModel | None = None,
         fee_type: FeeType = FeeType.QUADRATIC,
         joint_pool: Any = None,
+        risk_limits: RiskLimits | None = None,
+        lifecycle_config: LifecycleConfig | None = None,
+        rfq_alive: Any = None,
     ) -> None:
         self.h = h
         self.sender = FakeSender()
@@ -107,7 +110,7 @@ class Rig:
                     update={"allowed_leg_series_prefixes": None}),
                 h.feed, h.metadata, h.killswitch, h.clock,
             ),
-            limits=LimitChecker(RiskLimits()),
+            limits=LimitChecker(risk_limits or RiskLimits()),
             exposure=self.exposure,
             feed=h.feed,
             metadata=h.metadata,
@@ -117,10 +120,12 @@ class Rig:
             store=store,
             metrics=self.metrics,
             lastlook_policy=LastLookPolicy(),
-            config=LifecycleConfig(quote_ttl_s=30.0, reprice_threshold_cc=100),
+            config=lifecycle_config
+            or LifecycleConfig(quote_ttl_s=30.0, reprice_threshold_cc=100),
             fee_model=fee_model,
             fee_type=fee_type,
             joint_pool=joint_pool,
+            rfq_alive=rfq_alive,
         )
 
 

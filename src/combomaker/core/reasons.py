@@ -98,6 +98,16 @@ class ReasonCode(StrEnum):
     # The RFQ's window closed before our quote POST landed — a normal taker-race
     # loss (we were not first to the taker), not an error.
     SKIP_RFQ_CLOSED = "skip_rfq_closed"
+    # F2 mid-pipeline liveness (throughput synthesis 2026-07-16): the intake's
+    # open-RFQ registry says this RFQ was ALREADY DELETED while it sat in our
+    # queue / pricing pool / risk checks — we stop the pipeline early instead of
+    # spending joint pricing, snapshots, and a doomed REST POST on it. Strictly
+    # additive waste removal: a deleted RFQ can never fill, and the POST-time
+    # ``rfq_closed`` handling (SKIP_RFQ_CLOSED above) remains the backstop for
+    # deletes that land during the POST itself. The pipeline stage that caught
+    # it ("pre_price" / "post_price" / "pre_post") is in the decision context +
+    # per-stage metrics, so the tape can attribute where mid-flight deletes die.
+    SKIP_RFQ_DELETED_MIDFLIGHT = "skip_rfq_deleted_midflight"
     SKIP_NEGATIVE_MARGINAL_EV = "skip_negative_marginal_ev"
     SKIP_SOURCES_DISAGREE = "skip_sources_disagree"
     SKIP_NO_FREE_MONEY_CHECK = "skip_no_free_money_check"

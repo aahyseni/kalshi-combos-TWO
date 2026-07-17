@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import sys
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from decimal import Decimal
 from fractions import Fraction
@@ -170,7 +171,38 @@ def build_lifecycle_config(risk_cfg: RiskConfig) -> LifecycleConfig:
         # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): poll REST for a confirmed
         # fill whose quote_executed WS message never arrived.
         fill_record_recovery_after_s=risk_cfg.fill_record_recovery_after_s,
+        # F1 MONOTONE PRE-PRICING GATE (2026-07-16 throughput batch-1): decline
+        # on already-breached candidate-monotone caps BEFORE pricing. Default
+        # OFF (today's behaviour); the operator arms it in the local YAML.
+        pre_pricing_gate_enabled=risk_cfg.pre_pricing_gate_enabled,
     )
+
+
+async def handle_rfq_record_after(
+    rfq: Rfq,
+    *,
+    handle: Callable[[Rfq], Awaitable[None]],
+    record: Callable[[Rfq], Awaitable[None]],
+) -> None:
+    """RECORD-AFTER-PRICE FAST-LANE (throughput synthesis 2026-07-16, B6).
+
+    Run the pricing path FIRST, then ALWAYS record the RFQ tape row — the
+    ``record_rfq`` write (a ``json.dumps(rfq.raw)`` serialize + writer-queue
+    put) used to sit BEFORE pricing on the wire→POST critical path, where the
+    exchange's ~0.67s quote window makes every pre-POST millisecond count. The
+    tape is observability, not a quoting input, so it moves AFTER
+    pricing/dispatch.
+
+    Exactly-once guarantee: the ``finally`` records every RFQ that entered the
+    pipeline — priced, skipped, non-combo, or RAISED (the exception still
+    propagates to the worker's error path afterwards). Extracted module-level
+    (the ``build_lifecycle_config`` testability precedent) so the invariant is
+    pinned by unit tests rather than living only inside ``run()``'s closure.
+    """
+    try:
+        await handle(rfq)
+    finally:
+        await record(rfq)
 
 
 def supervisor_launch_cmd(config: AppConfig) -> list[str]:
@@ -662,6 +694,20 @@ class QuoteApp:
                 # sub-loops (reprice sweep / recovery polls) — progress is not a
                 # wedge; a true event-loop wedge still cannot beat.
                 beat=self._heartbeat.beat,
+                # F2 MID-PIPELINE LIVENESS (throughput synthesis 2026-07-16):
+                # the intake's liveness view over its open-RFQ registry
+                # (populated on rfq_created, popped on rfq_deleted). The
+                # lifecycle re-checks it at dequeue / post-price / pre-POST so
+                # RFQs POSITIVELY deleted mid-flight stop consuming pool +
+                # POST budget. A comms-WS drop CLEARS the registry with no
+                # replay, and RFQs queued just before the drop can still be
+                # live and winnable (the REST POST needs no WS) — so absence
+                # after a disconnect is UNKNOWN, not deletion, and the view
+                # keeps answering alive for disconnect-cleared ids (risk
+                # audit fix 2026-07-16; intake._handle_disconnect). NOTE:
+                # active in BOTH paper and quote modes (additive skips only);
+                # only tests/backtests with no registry wired are inert.
+                rfq_alive=intake.rfq_alive,
             )
             # R3 Phase 3: single-writer risk-reservation service. Wired AFTER the
             # lifecycle (it reuses the lifecycle's shadow splitter, so a %-cap
@@ -782,13 +828,33 @@ class QuoteApp:
             rfq_work: asyncio.Queue[tuple[Rfq, int]] = asyncio.Queue(maxsize=RFQ_QUEUE_MAX)
 
             async def handle_rfq(rfq: Rfq, recv_mono: int) -> None:
-                await store.record_rfq(rfq, source="ws")
-                if not rfq.is_combo:
-                    return
-                await self._ensure_watched(rfq, feed, metadata)
-                await lifecycle.handle_rfq(rfq)
-                if not lifecycle.has_open_quote(rfq.rfq_id):
-                    pending[rfq.rfq_id] = (rfq, 0, recv_mono)
+                # RECORD-AFTER-PRICE FAST-LANE (2026-07-16 B6): pricing first,
+                # tape row after — via the exactly-once helper, so an error
+                # path (worker exception) still records the RFQ once.
+                # seen_at SEMANTICS (risk audit fix 2026-07-16): capture the
+                # pickup wall-clock NOW — before pricing — and pass it through,
+                # so the late-landing row still means "worker pickup,
+                # pre-pricing" (the pre-fast-lane meaning every latency
+                # instrument reads: stamping at write time inflated
+                # wire→pickup by the handling duration and drove
+                # pickup→quote_sent negative).
+                picked_up_at = self._clock.now()
+
+                async def price_path(r: Rfq) -> None:
+                    if not r.is_combo:
+                        return
+                    await self._ensure_watched(r, feed, metadata)
+                    await lifecycle.handle_rfq(r)
+                    if not lifecycle.has_open_quote(r.rfq_id):
+                        pending[r.rfq_id] = (r, 0, recv_mono)
+
+                await handle_rfq_record_after(
+                    rfq,
+                    handle=price_path,
+                    record=lambda r: store.record_rfq(
+                        r, source="ws", seen_at=picked_up_at
+                    ),
+                )
 
             async def rfq_worker() -> None:
                 while True:
