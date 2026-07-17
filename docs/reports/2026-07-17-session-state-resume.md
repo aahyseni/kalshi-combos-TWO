@@ -224,3 +224,20 @@ still gate. Home = the parked hedge-pair build. Interim: ×3 deltas + 25% det-ma
 0.40 confirm haircut let most hedges reach the existing waiver already.
 Fill-blocker chain final state: det-max ✅ 25% | confirm resting fold ✅ 0.40 |
 waiver ✅ unblocked | delta caps ✅ ×3. Everything else unchanged.
+
+## ADDENDUM 8 (2026-07-17 ~22:25Z) — THE ACTUAL LAST LOCK: HARD-DOLLAR GAME CAP WAS WAIVER-DISARMING (`aacaee7`)
+
+The delta×3 restart exposed lock #5: the hard-dollar per-game worst-case cap
+($1,000, `max_event_worst_case_loss_dollars`) emitted its breach under
+SKIP_MASS_ACCEPTANCE_BREACH with NO game key — the DELTA family's non-waivable
+code — so once the weighted 200-slot game fold crossed $1,000 (it did: FRAENG
+$1,149 / ESPARG $1,033), EVERY denial contained a "non-waivable" breach and the
+waiver stayed disarmed. Fix `aacaee7`: the breach is game-keyed + certificate-
+suppressed at the enforcement site (validated against the cap's OWN budget;
+frac budget separately, stricter); the code joined WAIVABLE — delta shapes
+(game=None) still fail closed at the game-key check (pinned). End-to-end test:
+real tightened-cap denial → waiver → retry certificate suppresses both game
+branches → reservation GRANTED. Suite 2293/0. RESTARTED
+(`live_20260717_waiverfix.log`). Full lock ledger: det-max 25% ✅ | confirm
+resting fold 0.40 ✅ | delta caps ×3 ✅ | hard game cap waivable ✅ → every
+denial shape on tonight's wins is now passable or waiver-decidable.
