@@ -206,3 +206,21 @@ KNOWN ITEM (morning follow-up): the live store writer's manual WAL checkpoint fa
 "database table is locked" on EVERY attempt of the detmax25 run (WAL grew 78→194MB+
 in ~40min; data committed-safe BEFORE the pragma; one aiosqlite connection — suspect
 a long-lived read cursor; restart resets the WAL). Diagnose + resilient retry.
+
+## ADDENDUM 7 (2026-07-17 ~22:10Z) — DELTA CAPS ×3 (THE LAST LOCK) + THE HEDGES-ALWAYS-FILL DOCTRINE
+
+Confirm-haircut verified working on its first win: game-loss AND directional vanished
+from the breach list — what remained was the FOURTH lock, the absolute delta caps
+(market 300 / event 500 contracts-equivalent, tuned in the 20-60-slot era; the
+weighted 200-slot resting book breached at market 336 / game 1051). Operator: scale
+×3 → **max_market_delta_contracts 900 / max_event_delta_contracts 1500** (20¢ adverse
+move ≤ $180 market / $300 game — inside the waiver-enforced budgets). RESTARTED
+(`live_20260717_delta3x.log`). Monitor keyed on risk_reservation_granted.
+**NEW DOCTRINE ([[feedback_hedges_always_fill]]):** hedge fills admit 100% regardless
+of concentration caps — implemented soundly = extend the waiver so a fill whose
+STATE-EXACT post-book worst case ≤ pre-book bypasses ANY concentration cap
+(delta/game-loss/directional); freshness + candidate-MC EV + per-combo + daily-halt
+still gate. Home = the parked hedge-pair build. Interim: ×3 deltas + 25% det-max +
+0.40 confirm haircut let most hedges reach the existing waiver already.
+Fill-blocker chain final state: det-max ✅ 25% | confirm resting fold ✅ 0.40 |
+waiver ✅ unblocked | delta caps ✅ ×3. Everything else unchanged.
