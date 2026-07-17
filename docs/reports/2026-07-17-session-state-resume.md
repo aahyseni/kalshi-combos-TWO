@@ -297,3 +297,24 @@ chain (haircut → caps → reservation → candidate MC → commit → execute 
 The waiver (1.8s deadline) remains armed for the wins that DO breach — its first
 GRANT is still pending observation. Everything the operator asked for today is
 now live and proven end-to-end.
+
+## ADDENDUM 13 (2026-07-17 ~23:00Z) — NIGHT CLOSE: PRIMARY FILL PATH PROVEN; WAIVER ENUMERATION COST = THE #1 MORNING ITEM
+
+State at close: bot LIVE (`live_20260717_waiver18.log`, 7dec02c, full stack + slate
+0.65 + deadlines 1.8/1.0). **Primary path PROVEN: the 22:55Z fill** (reservation
+granted outright → candidate MC +EV → committed → executed → ledger). The
+waiver-needing subset (wins that breach game-loss even after the haircut) still
+declines: the enumeration exceeds even 1.8s on the ~200-entity resting book (two
+timeouts observed; the 87ms benchmark was a 20-quote book). workers=2 is hardcoded
+AND irrelevant (single-call latency, not queue-wait).
+
+**MORNING ITEM #1 (before Sat FRAENG): waiver entity-set reduction** — enumerate
+committed + reservations + candidate + the K LARGEST resting quotes per game
+(burst-floor doctrine inside the enumeration; the dropped tail rides as a constant
+conservative adder or is excluded with the haircut rationale — design carefully,
+test, verify; sim/state_worst_case.py entities assembly). Alternative/additional:
+profile the enumeration on the live book offline (tools/, rule 8) to size K.
+**MORNING ITEM #2:** live-DB WAL checkpoint 'table is locked' (data-safe; diagnose
+the long-lived cursor; WAL resets each restart). **MORNING ITEM #3:** parked
+hedge-pair build (skew mutex + committed netting + hedges-always-fill extension).
+Sat watch list unchanged (waiver metrics, lapse rate, fills vs new markup, funnel).
