@@ -579,6 +579,7 @@ def _build_conditioning(
     (independent of the structural block) exactly as before, and covered by the
     worse-tail challenger. Empty maps ⇒ conditioning is an exact no-op."""
     from combomaker.pricing.grouping import game_key
+    from combomaker.pricing.legtypes import resolve_pricing_alias
 
     ticker_of_index = {i: t for t, i in model.leg_index.items()}
     # game_key(event) -> plan index, for every structural game.
@@ -592,9 +593,17 @@ def _build_conditioning(
             gk = game_key(event)
             plan_of_game.setdefault(gk, pi)
             # A game is knockout iff its structural legs were inverted under the
-            # knockout format — proxied by the leg-series prefix the config lists.
-            series = ticker_of_index.get(gidx, "").split("-", 1)[0].upper()
-            knockout_of_game[gk] = any(
+            # knockout format — proxied by the leg-series prefix the config
+            # lists, read off the ALIAS-RESOLVED ticker (review 2026-07-16: the
+            # raw champion series would flip the final's flag off whenever the
+            # aliased leg iterated last) and OR-folded so any knockout leg in
+            # the game marks it knockout, order-independent.
+            series = (
+                resolve_pricing_alias(ticker_of_index.get(gidx, ""))
+                .split("-", 1)[0]
+                .upper()
+            )
+            knockout_of_game[gk] = knockout_of_game.get(gk, False) or any(
                 series.startswith(p.upper()) for p in cfg.knockout_series
             )
     plan_map: dict[int, int] = {}

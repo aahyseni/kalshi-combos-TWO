@@ -68,9 +68,22 @@ def validate_pricing_aliases(aliases: Mapping[str, str]) -> None:
       (otherwise game grouping for that event is ill-defined).
     """
     events_seen: dict[str, str] = {}
+    values_seen: dict[str, str] = {}
+    synth_events_seen: dict[str, str] = {}
     for key, value in aliases.items():
         if not key or not value or key == value:
             raise ValueError(f"pricing alias {key!r} -> {value!r}: empty or self-alias")
+        # Canonical-form check (review 2026-07-16): runtime resolution is an
+        # EXACT string match against live uppercase tickers, while validation
+        # classifies via series.upper() — a lowercase/whitespace key would
+        # validate cleanly yet never match anything (a silently-inert alias,
+        # recreating the exact zero-markup incident this feature fixes).
+        for side, s in (("key", key), ("target", value)):
+            if s != s.strip() or s != s.upper():
+                raise ValueError(
+                    f"pricing alias {side} {s!r}: not canonical (uppercase, "
+                    "no surrounding whitespace) — would never match a live ticker"
+                )
         if "-" not in key or "-" not in value:
             raise ValueError(
                 f"pricing alias {key!r} -> {value!r}: both sides need an "
@@ -78,6 +91,18 @@ def validate_pricing_aliases(aliases: Mapping[str, str]) -> None:
             )
         if value in aliases:
             raise ValueError(f"pricing alias chain: {key!r} -> {value!r} is also a key")
+        # Injectivity (review 2026-07-16): two keys mapping to ONE synthetic
+        # ticker would make both real legs classify, parse, orient and SETTLE
+        # as the same synthetic leg — sign-flipped pricing and risk netting
+        # that measures a concentrated book as hedged (an E2 violation),
+        # through a config every other rule accepts (a one-character
+        # copy-paste slip produces exactly this shape).
+        if value in values_seen:
+            raise ValueError(
+                f"pricing aliases {values_seen[value]!r} and {key!r} both map "
+                f"to {value!r} — alias targets must be distinct"
+            )
+        values_seen[value] = key
         if _classify_leg_raw(key) is not LegType.UNKNOWN:
             raise ValueError(
                 f"pricing alias key {key!r} classifies {_classify_leg_raw(key)}, "
@@ -92,6 +117,21 @@ def validate_pricing_aliases(aliases: Mapping[str, str]) -> None:
             raise ValueError(
                 f"pricing aliases map event {real_event!r} to multiple synthetic "
                 f"events ({events_seen[real_event]!r}, {synth_event!r})"
+            )
+        # Reverse-event injectivity (adversarial verify 2026-07-16, SERIOUS):
+        # two DIFFERENT real events folding into ONE synthetic event would give
+        # unrelated legs the same game key — the ONE pricer/risk seam — so the
+        # game-loss cap, directional bound, skew, game plans, copula regroup
+        # and the waiver's scoreline enumeration would all cross-net legs of
+        # unrelated events (a cap grading a superset as safer than reality —
+        # the E2 failure family). A stale entry from a prior arming left in
+        # the yaml next to a new tournament's entries produces exactly this.
+        if synth_events_seen.setdefault(synth_event, real_event) != real_event:
+            raise ValueError(
+                f"pricing aliases fold real events "
+                f"{synth_events_seen[synth_event]!r} and {real_event!r} into one "
+                f"synthetic event {synth_event!r} — unrelated legs would share a "
+                "game key and cross-net in every risk cap"
             )
 
 

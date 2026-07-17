@@ -335,19 +335,24 @@ def structural_leg_deltas(
     if len(games) != 1 or any(leg.event_ticker is None for leg in position.legs):
         return None
 
-    first_ticker = position.legs[0].market_ticker
-    parts = first_ticker.split("-")
-    if len(parts) < 2:
-        return None
-    match = parse_match(parts[1])
+    # Alias-aware, order-independent reads (verify follow-up 2026-07-16,
+    # mirrors sim.structural_book._try_build_game): the match parses from the
+    # GAME KEY — an aliased champion leg's raw blob ('26') parses to no match
+    # and silently dropped the position to the independence proxy whenever it
+    # iterated first — and the format flag OR-folds over ALL legs so member
+    # order cannot flip it. Telemetry/hedge-credit path only (caps bind on
+    # the proxy), but it must see the final's book.
+    from combomaker.pricing.legtypes import resolve_pricing_alias
+
+    match = parse_match(next(iter(games)))
     if match is None:
         return None
-    series = first_ticker.split("-", 1)[0].upper()
-    fmt = (
-        MatchFormat.KNOCKOUT
-        if any(series.startswith(p.upper()) for p in c.knockout_series)
-        else MatchFormat.GROUP
-    )
+    fmt = MatchFormat.GROUP
+    for leg in position.legs:
+        series = resolve_pricing_alias(leg.market_ticker).split("-", 1)[0].upper()
+        if any(series.startswith(p.upper()) for p in c.knockout_series):
+            fmt = MatchFormat.KNOCKOUT
+            break
 
     specs: list[LegSpec] = []
     targets: list[tuple[LegSpec, float]] = []

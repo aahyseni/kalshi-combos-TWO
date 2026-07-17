@@ -493,7 +493,10 @@ class StructuralPricer:
     # --- margin/total sports (NFL, NBA, WNBA) ------------------------------
 
     def _parse_mt_leg(self, ticker: str, match: _Match) -> MTLegSpec | str:
-        parts = ticker.split("-")
+        # Alias-resolved for symmetry with _parse_leg (verify follow-up
+        # 2026-07-16): inert today (aliases target soccer), but a future alias
+        # onto an MT sport would otherwise read team/line off the raw suffix.
+        parts = resolve_pricing_alias(ticker).split("-")
         leg_type = classify_leg(ticker)
         if leg_type is LegType.MONEYLINE:
             team = _team_of(parts[-1], match)

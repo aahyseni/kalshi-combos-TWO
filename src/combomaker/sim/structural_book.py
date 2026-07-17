@@ -163,8 +163,8 @@ def _match_format(ticker: str, knockout_series: Sequence[str]) -> MatchFormat:
 
 
 def _try_build_game(
-    idxs: list[int], tickers: Sequence[str], marginals: Sequence[float | None],
-    cfg: StructuralConfigView,
+    game: str, idxs: list[int], tickers: Sequence[str],
+    marginals: Sequence[float | None], cfg: StructuralConfigView,
 ) -> GamePlan | None:
     """Invert one game's structural legs, or None ⇒ the whole game is copula.
 
@@ -173,19 +173,26 @@ def _try_build_game(
     joint is parity-gated vs ``joint_probability``). A leg that won't parse
     (corners/cards) or has an unknown marginal is left to the copula (dropped from
     the plan). ``invert`` needs >=2 team-level legs + an orienting leg for scorers,
-    else it raises and the game falls back to the copula entirely."""
-    # Pricing aliases resolve for the game-code/format read exactly as they do
-    # inside ``_parse_leg`` — an aliased champion leg carries the FINAL's game
-    # code only on its synthetic ticker (its raw game segment is a bare season
-    # code that parses to no match, which used to drop the whole game to copula).
-    first = resolve_pricing_alias(tickers[idxs[0]])
-    parts = first.split("-")
-    if len(parts) < 2:
-        return None
-    match = _parse_match(parts[1])
+    else it raises and the game falls back to the copula entirely.
+
+    The match is parsed from the GROUP KEY (``game``, the alias-resolved
+    ``grouping.game_key`` output that binned these indices), never from a
+    member leg's ticker (review 2026-07-16): a derived EVENT alias can pull an
+    UNALIASED sibling market of the aliased event (e.g. an eliminated team's
+    champion leg) into the game group, and an order-dependent read of the
+    FIRST member's raw game blob would then drop the ENTIRE game to the copula
+    while the sibling alone should. The format read scans all members for a
+    knockout series the same order-independent way."""
+    match = _parse_match(game)
     if match is None:
         return None
-    fmt = _match_format(first, cfg.knockout_series)
+    fmt = MatchFormat.GROUP
+    for j in idxs:
+        if _match_format(resolve_pricing_alias(tickers[j]), cfg.knockout_series) is (
+            MatchFormat.KNOCKOUT
+        ):
+            fmt = MatchFormat.KNOCKOUT
+            break
     specs: list[LegSpec] = []
     gidx: list[int] = []
     targets: list[tuple[LegSpec, float]] = []
@@ -238,8 +245,8 @@ def build_game_plans(
         else:
             by_game[game_key(ev)].append(j)
     plans: list[GamePlan] = []
-    for idxs in by_game.values():
-        plan = _try_build_game(idxs, tickers, marginals, cfg)
+    for game, idxs in by_game.items():
+        plan = _try_build_game(game, idxs, tickers, marginals, cfg)
         if plan is None:
             copula.extend(idxs)
             continue

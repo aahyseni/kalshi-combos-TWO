@@ -458,6 +458,13 @@ class QuoteLifecycle:
         # line and reset. None ⇒ no waiver attempted (the default fields).
         self._waiver_audit: dict[str, Any] | None = None
         self._open: dict[str, OpenQuoteState] = {}       # quote_id → state
+        # Reprice-sweep rotation marker (review 2026-07-16): when a sweep breaks
+        # early (wall budget / pool circuit trip) the next tick RESUMES after
+        # the last handled quote instead of restarting from the front of the
+        # insertion-ordered dict — without it, front quotes whose fair never
+        # moved re-consumed the budget every tick and back-of-book quotes could
+        # starve un-repriced for their whole TTL under sustained load.
+        self._reprice_resume_after: str | None = None
         self._by_rfq: dict[str, str] = {}                # rfq_id → quote_id
         self._executed_states: dict[str, OpenQuoteState] = {}
         self._realized_pnl_cc = 0
@@ -2469,7 +2476,14 @@ class QuoteLifecycle:
             self._beat()  # a REST poll is progress, not a wedge (2026-07-16)
             self._metrics.inc("fill_recovery.swept")
             try:
-                payload = await self._quote_getter.get_quote(quote_id)
+                # Per-poll bound (review 2026-07-16): the REST client's own
+                # 10s total timeout × 3 serial polls turned a black-holed
+                # connection into a ~30s maintenance tick — TTL expiry, reprice
+                # and limit-halt checks all waited behind it. A timed-out poll
+                # is just a failed attempt (bounded-retry, loud exhaustion).
+                payload = await asyncio.wait_for(
+                    self._quote_getter.get_quote(quote_id), timeout=2.5
+                )
             except Exception as exc:  # noqa: BLE001 — any poll error retries next tick
                 self._metrics.inc("fill_recovery.errors")
                 log.warning(
@@ -2811,13 +2825,35 @@ class QuoteLifecycle:
         sweep_start_ns = now
         budget_ns = int(_REPRICE_SWEEP_BUDGET_S * 1e9)
         consecutive_pool_deadline = 0
-        for quote_id, state in list(self._open.items()):
+        # ROTATION (review 2026-07-16): resume after the quote the previous
+        # tick's early break last handled, so a budget/trip deferral cycles the
+        # whole book across ticks instead of re-walking the same front quotes
+        # (whose unmoved fair neither replaces nor deletes them) forever. A
+        # vanished marker (filled/expired between ticks) restarts from the
+        # front; a completed pass clears it.
+        items = list(self._open.items())
+        if self._reprice_resume_after is not None and items:
+            ids = [qid for qid, _ in items]
+            try:
+                start = ids.index(self._reprice_resume_after) + 1
+            except ValueError:
+                start = 0
+            items = items[start:] + items[:start]
+        self._reprice_resume_after = None
+        prev_handled: str | None = None
+        for quote_id, state in items:
             self._beat()
             if state.accepted:
+                prev_handled = quote_id
                 continue
             age_s = (now - state.created_mono_ns) / 1e9
             if age_s > self._config.quote_ttl_s:
                 await self._delete_quote(quote_id, ReasonCode.DELETE_TTL_EXPIRED)
+                # Deleted — prev_handled must only ever name a SURVIVING quote:
+                # a marker pointing at a removed id fails next tick's index
+                # lookup and silently discards the rotation (verify follow-up
+                # 2026-07-16). Deleted quotes aren't in next tick's items, so
+                # resuming after the last survivor skips nothing.
                 continue
             if self._clock.monotonic_ns() - sweep_start_ns > budget_ns:
                 self._metrics.inc("reprice.sweep_budget_deferred")
@@ -2826,6 +2862,8 @@ class QuoteLifecycle:
                     detail="reprice sweep exceeded its wall budget — remaining "
                     "quotes defer to the next tick",
                 )
+                # Current quote was NOT handled — resume AT it next tick.
+                self._reprice_resume_after = prev_handled
                 break
             result = await self._price_async(state.rfq)
             if isinstance(result, NoQuote):
@@ -2840,9 +2878,15 @@ class QuoteLifecycle:
                             detail="consecutive pool deadlines — pool presumed "
                             "frozen; remaining reprices defer to the next tick",
                         )
+                        # Current quote WAS handled but fail-safe DELETED — the
+                        # marker must name a quote that still exists next tick
+                        # (verify follow-up 2026-07-16: a dead marker restarts
+                        # from the front and the rotation never survives a trip).
+                        self._reprice_resume_after = prev_handled
                         break
                 else:
                     consecutive_pool_deadline = 0
+                # Fail-safe deleted above — not a surviving marker candidate.
                 continue
             consecutive_pool_deadline = 0
             if abs(int(result.fair_cc) - int(state.constructed.fair_cc)) > (
@@ -2854,6 +2898,8 @@ class QuoteLifecycle:
                     # Replacement was refused (filter/risk) — a stale quote
                     # must never stay on the wire.
                     await self._delete_quote(quote_id, ReasonCode.DELETE_LEG_MOVED)
+            if quote_id in self._open:
+                prev_handled = quote_id
 
     async def cancel_all(self, reason: ReasonCode | str) -> None:
         """Best-effort delete of every open quote. Idempotent, race-safe."""

@@ -786,6 +786,94 @@ async def test_reprice_sweep_wall_budget_defers_remainder(rig: Rig) -> None:
     assert rig.metrics.counter("reprice.sweep_budget_deferred") == 1
 
 
+async def test_reprice_sweep_rotates_after_budget_break(rig: Rig) -> None:
+    """A budget/trip deferral RESUMES after the last handled quote next tick
+    (review 2026-07-16): without the rotation marker, the same front quotes —
+    whose unmoved fair neither replaces nor deletes them — re-consumed the
+    budget every tick and back-of-book quotes starved un-repriced for their
+    whole TTL under sustained load."""
+    await _open_n_quotes(rig, 4)
+    priced: list[str] = []
+
+    async def slow_but_fine(rfq_, **_: object):  # noqa: ANN202
+        priced.append(rfq_.rfq_id)
+        rig.h.clock.advance(1.5)
+        state = next(iter(rig.lifecycle._open.values()))
+        return state.constructed  # unchanged fair — no reprice action
+
+    rig.lifecycle._price_async = slow_but_fine  # type: ignore[method-assign]
+    await rig.lifecycle.maintenance_tick()
+    assert len(priced) == 2  # budget break mid-book
+    first_pass = list(priced)
+    await rig.lifecycle.maintenance_tick()
+    # The second tick starts where the first left off — the two quotes the
+    # break skipped are priced BEFORE the front pair comes around again.
+    assert len(priced) >= 4
+    assert set(priced[2:4]).isdisjoint(first_pass)
+    assert set(priced[:4]) == {s.rfq.rfq_id for s in rig.lifecycle._open.values()}
+
+
+async def test_reprice_sweep_trip_marker_names_a_surviving_quote(rig: Rig) -> None:
+    """The circuit-breaker break resumes after the last SURVIVING handled quote
+    (verify follow-up 2026-07-16): the tripped quote itself was fail-safe
+    DELETED, so a marker naming it fails next tick's index lookup and the
+    rotation silently restarts from the front on every trip."""
+    from combomaker.pricing.quote import NoQuote
+
+    await _open_n_quotes(rig, 4)
+    order = [s.rfq.rfq_id for s in rig.lifecycle._open.values()]
+    priced: list[str] = []
+
+    async def pool(rfq_, **_: object):  # noqa: ANN202
+        priced.append(rfq_.rfq_id)
+        if len(priced) in (2, 3):  # q2+q3 hit the frozen pool -> trip
+            return NoQuote(ReasonCode.SKIP_PRICE_DEADLINE, "pool frozen (test)")
+        state = next(iter(rig.lifecycle._open.values()))
+        return state.constructed  # unchanged fair — no reprice action
+
+    rig.lifecycle._price_async = pool  # type: ignore[method-assign]
+    await rig.lifecycle.maintenance_tick()
+    # q1 priced fine; q2+q3 fail-safe deleted; trip breaks with q4 unswept.
+    assert priced == order[:3]
+    assert rig.lifecycle.open_quote_count == 2
+    # The marker names q1 — the last handled quote that still EXISTS.
+    assert rig.lifecycle._reprice_resume_after == next(iter(rig.lifecycle._open))
+    await rig.lifecycle.maintenance_tick()  # pool thawed
+    # Resumes after q1: the starved q4 prices BEFORE q1 comes around again.
+    assert priced[3] == order[3]
+    assert priced[4] == order[0]
+
+
+async def test_reprice_sweep_budget_marker_skips_deleted_quotes(rig: Rig) -> None:
+    """A TTL-deleted quote never becomes the resume marker (verify follow-up
+    2026-07-16): the budget break after a deletion resumes from the last
+    SURVIVING handled quote, not the removed id (which would discard the
+    rotation and re-walk the front)."""
+    await _open_n_quotes(rig, 4)
+    states = list(rig.lifecycle._open.values())
+    order = [s.rfq.rfq_id for s in states]
+    # Age ONLY q2 past its TTL (the sweep ages against tick-start time).
+    states[1].created_mono_ns -= int((rig.lifecycle._config.quote_ttl_s + 1) * 1e9)
+    priced: list[str] = []
+
+    async def slow_but_fine(rfq_, **_: object):  # noqa: ANN202
+        priced.append(rfq_.rfq_id)
+        rig.h.clock.advance(3.0)  # one pricing blows the whole 2.5s budget
+        state = next(iter(rig.lifecycle._open.values()))
+        return state.constructed  # unchanged fair — no reprice action
+
+    rig.lifecycle._price_async = slow_but_fine  # type: ignore[method-assign]
+    await rig.lifecycle.maintenance_tick()
+    # q1 priced (3.0s), q2 TTL-deleted, q3 hits the budget break.
+    assert priced == [order[0]]
+    assert rig.lifecycle.open_quote_count == 3
+    # Marker = q1, the last SURVIVOR — not the deleted q2.
+    assert rig.lifecycle._reprice_resume_after == next(iter(rig.lifecycle._open))
+    await rig.lifecycle.maintenance_tick()
+    # Second tick resumes after q1: the deferred q3 prices first, not the front.
+    assert priced[1] == order[2]
+
+
 async def test_reprice_sweep_beats_heartbeat_per_iteration(rig: Rig) -> None:
     """The beat callback fires once per swept quote — a loop making progress
     never reads as a wedge, while a true event-loop wedge still cannot beat."""

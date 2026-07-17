@@ -511,12 +511,13 @@ def _ensure_workers_spawned(executor: object, want: int, *, timeout_s: float = 3
     visible for Job-Object assignment + registry recording. A ProcessPoolExecutor
     spawns lazily on first submit; callers warm it first, but we still poll so an
     un-warmed pool doesn't record zero PIDs. Returns whatever PIDs exist at the
-    deadline (best-effort)."""
+    deadline (best-effort). ``timeout_s=0`` is a single non-blocking read — the
+    read always happens at least once (review 2026-07-16: the old
+    deadline-guarded loop returned an EMPTY list at timeout 0, so a
+    non-blocking caller would never register anything)."""
     deadline = time.monotonic() + timeout_s
-    pids: list[int] = []
-    while time.monotonic() < deadline:
-        pids = worker_pids_of(executor)
-        if len(pids) >= want:
-            return pids
+    pids = worker_pids_of(executor)
+    while len(pids) < want and time.monotonic() < deadline:
         time.sleep(0.02)
+        pids = worker_pids_of(executor)
     return pids

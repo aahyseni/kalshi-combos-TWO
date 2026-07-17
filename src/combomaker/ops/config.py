@@ -278,6 +278,21 @@ class FiltersConfig(StrictModel):
         from datetime import datetime
 
         for event_ticker, raw in v.items():
+            # Canonical-key check (adversarial verify 2026-07-16): lookup is an
+            # EXACT match against the exchange's uppercase event ticker — a
+            # lowercase/whitespace key validates, installs, and silently never
+            # matches, so the tier is inert and the champion legs fall back to
+            # the broken expiry estimate (the exact flow-kill this table fixes).
+            if (
+                not event_ticker
+                or event_ticker != event_ticker.strip()
+                or event_ticker != event_ticker.upper()
+            ):
+                raise ValueError(
+                    f"pregame_scheduled_starts key {event_ticker!r}: not canonical "
+                    "(non-empty, uppercase, no surrounding whitespace) — would "
+                    "never match a live event ticker"
+                )
             try:
                 parsed = datetime.fromisoformat(raw)
             except ValueError as exc:
@@ -393,6 +408,24 @@ class FeeConfig(StrictModel):
     # candidate's per-state P&L). Empty (the default) ⇒ bit-identical behaviour:
     # quadratic combo maker fills keep computing $0.
     maker_fee_active_prefixes: tuple[str, ...] = ()
+
+    @field_validator("maker_fee_active_prefixes")
+    @classmethod
+    def _validate_maker_fee_prefixes(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        # Canonical-prefix check (adversarial verify 2026-07-16): matching is
+        # str.startswith against uppercase tickers. An EMPTY string (a stray
+        # "- " in yaml) matches EVERY combo — maker fee booked on all series;
+        # a lowercase/whitespace entry silently never matches — fee eaten but
+        # never accounted. Both are the quiet-failure direction this feature
+        # exists to close.
+        for prefix in v:
+            if not prefix or prefix != prefix.strip() or prefix != prefix.upper():
+                raise ValueError(
+                    f"maker_fee_active_prefixes entry {prefix!r}: not canonical "
+                    "(non-empty, uppercase, no surrounding whitespace) — an empty "
+                    "entry fees EVERY series, a non-canonical one fees none"
+                )
+        return v
 
 
 class CorrelationConfig(StrictModel):

@@ -431,6 +431,15 @@ class QuoteApp:
                     [(external[0], config.pricing.external_odds.weight)] if external else []
                 ),
             )
+            if config.pricing.leg_pricing_aliases:
+                # Loud install record (review 2026-07-16): a mistyped alias
+                # that never matches is otherwise invisible — this line plus
+                # the classification-mix metrics are the operator's check that
+                # the mapping actually fires on live flow.
+                log.info(
+                    "pricing_aliases_active",
+                    aliases=dict(config.pricing.leg_pricing_aliases),
+                )
             # Stage B: the per-game loss cap is mutual-exclusion-aware; it asks the
             # metadata cache whether an event's market family is mutually exclusive
             # (advance(ARG) ⊥ advance(ENG)) so opposite-side same-event positions
@@ -460,6 +469,15 @@ class QuoteApp:
                     for event_ticker, raw in config.filters.pregame_scheduled_starts.items()
                 }
             )
+            if config.filters.pregame_scheduled_starts:
+                # Loud install record (adversarial verify 2026-07-16): an entry
+                # that never matches a live event ticker is otherwise invisible
+                # — this line is the operator's check that the table is armed
+                # (the canonical-key config validator guards the match itself).
+                log.info(
+                    "pregame_scheduled_starts_active",
+                    entries=dict(config.filters.pregame_scheduled_starts),
+                )
             rfq_filter = RfqFilter(
                 config.filters, feed, metadata, killswitch, self._clock, schedule
             )
@@ -580,6 +598,12 @@ class QuoteApp:
                     pricing_aliases=config.pricing.leg_pricing_aliases,
                 )
                 book_risk_pool.start()
+                # Eager warmup (review 2026-07-16): without it worker #2 only
+                # spawns on the first CONTENDED submit — i.e. cold-imports 2.66s
+                # inside the first waiver/candidate confirm window after every
+                # restart — and the per-run register poll stalled the loop 1.0s
+                # per call until then.
+                await book_risk_pool.warmup()
             lifecycle = QuoteLifecycle(
                 clock=self._clock,
                 sender=sender,
@@ -1160,12 +1184,19 @@ class QuoteApp:
                 continue
             if status in ("finalized", "settled"):
                 del exch_by_ticker[ticker]
-                log.info(
+                # WARNING not info (adversarial verify 2026-07-16): dropping
+                # the position also skips the settlement poller's realized-P&L
+                # booking into the daily-loss ledger AND the to-the-cent
+                # settlement reconcile for this position this run — capital is
+                # released, but the ledger side effect must be loud until a
+                # startup-side reconcile pass exists.
+                log.warning(
                     "rehydrate_dropped_settled",
                     ticker=ticker,
                     status=status,
                     detail="market definitively settled — position not "
-                    "rehydrated into the risk book",
+                    "rehydrated; realized P&L NOT booked to the daily ledger "
+                    "and the settlement reconcile is SKIPPED for it this run",
                 )
         if not exch_by_ticker:
             return

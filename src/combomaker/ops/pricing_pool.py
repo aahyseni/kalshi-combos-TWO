@@ -589,14 +589,41 @@ class BookRiskPool:
             pricing_aliases=len(self._pricing_aliases),
         )
 
-    def register_workers(self) -> None:
-        """Bind spawned workers to the kill-job (layer 1) + record their PIDs
-        (layer 4). Unlike JointPool there is no warmup, so the caller invokes this
-        after ``start`` (workers spawn lazily on first submit; this polls briefly
-        for them). Best-effort."""
+    async def warmup(self) -> None:
+        """Force every worker to spawn (and pay the module cold-import, measured
+        2.66s — the initializer's module pulls the whole engine chain) BEFORE
+        live traffic. Review 2026-07-16 (F10 follow-up): ProcessPoolExecutor
+        spawns worker #2 only on a CONTENDED submit, i.e. at the exact instant a
+        waiver/candidate call lands behind an in-flight snapshot — the first
+        contended confirm-window call per process then ate the cold import and
+        timed out, recreating the b0d6696e loss F10 was shipped to fix. N
+        CONCURRENT probes force all N workers up front."""
         if self._executor is None:
             return
-        pids = _ensure_workers_spawned(self._executor, self._workers, timeout_s=1.0)
+        loop = asyncio.get_running_loop()
+        probes = [
+            loop.run_in_executor(self._executor, _warm_probe) for _ in range(self._workers)
+        ]
+        try:
+            await asyncio.wait_for(asyncio.gather(*probes), timeout=30.0)
+            log.info("book_risk_pool_warm", workers=self._workers)
+        except Exception as exc:  # noqa: BLE001 - warmup is best-effort
+            log.warning("book_risk_pool_warmup_failed", error=repr(exc))
+        self.register_workers(wait_s=1.0)
+
+    def register_workers(self, *, wait_s: float = 0.0) -> None:
+        """Bind spawned workers to the kill-job (layer 1) + record their PIDs
+        (layer 4). Best-effort. ``wait_s=0`` is a single non-blocking read —
+        review 2026-07-16: the per-run re-register used to poll the executor for
+        1.0s ON THE EVENT LOOP until the full worker count appeared, which a
+        lazily-spawning pool cannot satisfy before its first contended submit,
+        so every snapshot/candidate/waiver call ended in a hard 1.0s loop stall.
+        The blocking wait now happens exactly once, inside ``warmup``; per-run
+        calls register whatever exists right now (a respawned worker is picked
+        up on the next call — the registry dedupes)."""
+        if self._executor is None:
+            return
+        pids = _ensure_workers_spawned(self._executor, self._workers, timeout_s=wait_s)
         if self._kill_job is not None and self._kill_job.active:
             for pid in pids:
                 self._kill_job.assign(pid)

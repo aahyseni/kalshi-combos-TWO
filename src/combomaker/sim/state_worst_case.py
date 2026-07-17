@@ -132,6 +132,7 @@ from combomaker.pricing.structural_api import (
     Team,
     parse_leg,
     parse_match,
+    resolve_pricing_alias,
 )
 from combomaker.pricing.structural_api import (
     half_indicator as _half_indicator,
@@ -336,13 +337,20 @@ def _settle_specs(
         market = leg.market_ticker
         if market in settle:
             continue
-        parts = market.split("-")
+        # Alias-resolved reads (review 2026-07-16): an aliased champion leg's
+        # RAW blob ('26') never equals the resolved game key, so the
+        # marginal-free settlement — whose whole point is that settlement
+        # needs no marginal — skipped exactly the leg this feature exists for
+        # and left it adversarial in the waiver. The settle map stays keyed on
+        # the REAL ticker (the loss matrix looks legs up by exchange identity).
+        resolved = resolve_pricing_alias(market)
+        parts = resolved.split("-")
         if len(parts) < 2 or parts[1] != game:
             continue
         match = parse_match(parts[1])
         if match is None:
             continue
-        spec = parse_leg(market, match, fmt=_match_format(market, cfg.knockout_series))
+        spec = parse_leg(market, match, fmt=_match_format(resolved, cfg.knockout_series))
         if not isinstance(spec, str):
             settle[market] = spec
     return settle

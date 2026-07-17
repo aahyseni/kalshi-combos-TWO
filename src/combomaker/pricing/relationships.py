@@ -37,7 +37,13 @@ from combomaker.pricing.conditionals_mlb import (
     strongest_measured_direction,
 )
 from combomaker.pricing.grouping import game_key
-from combomaker.pricing.legtypes import LegType, Sport, classify_leg, classify_sport
+from combomaker.pricing.legtypes import (
+    LegType,
+    Sport,
+    classify_leg,
+    classify_sport,
+    resolve_pricing_alias,
+)
 
 # The ONE anchored MLB team parser (reviewer defect #3): the game-blob /
 # end-anchoring helpers live in sgp.py (prefix=away, suffix=home,
@@ -970,6 +976,69 @@ def classify_legs(
                     f"containment window {legs[ft_i].market_ticker} yes "
                     f"without {legs[fh_i].market_ticker}: "
                     "joint = P(superset) - P(subset)"
+                )
+
+    # Family 4 — same-game ADVANCE × ADVANCE, different teams: a COMPLEMENT
+    # (adversarial verify 2026-07-16). A knockout between two teams advances
+    # EXACTLY ONE of them (rule book: win incl. ET + pens; the championship
+    # legs alias to synthetic finals-advance legs, so "ARG champion" ⟺ "ESP
+    # not champion" on the final). Without this family a mixed-side advance
+    # pair falls to the structural path, where ``joint_probability``
+    # multiplies each leg's penalty-shootout factor INDEPENDENTLY — q²
+    # instead of q on the level-after-ET states, a systematic ~3-5c
+    # underprice on a tight final (verify finding, CONFIRMED). Complement is
+    # STRONGER than containment:
+    #   {A yes, B yes} → IMPOSSIBLE (both advance)  — usually caught earlier
+    #                    by the ME metadata pass; this is the rule-book
+    #                    backstop for metadata-absent events
+    #   {A no,  B no}  → IMPOSSIBLE (neither advances)
+    #   mixed          → equivalence: joint = P(the YES leg), exactly
+    # Reachability: Kalshi's one-selection-per-family check blocks most of
+    # these shapes today — wired DEFENSIVELY like Family 2's NO orientations
+    # (exact if ever reachable; the validator has known misses).
+    for a_i in range(len(legs)):
+        if types[a_i] is not LegType.ADVANCE:
+            continue
+        for b_i in range(a_i + 1, len(legs)):
+            if types[b_i] is not LegType.ADVANCE or game_keys[a_i] != game_keys[b_i]:
+                continue
+            team_a = (
+                resolve_pricing_alias(legs[a_i].market_ticker)
+                .rsplit("-", 1)[-1]
+                .upper()
+            )
+            team_b = (
+                resolve_pricing_alias(legs[b_i].market_ticker)
+                .rsplit("-", 1)[-1]
+                .upper()
+            )
+            if not team_a or not team_b or team_a == team_b:
+                # Same team twice is the duplicate-market check's job;
+                # unparseable suffixes record no verdict (fail-closed).
+                continue
+            pair_sides = (legs[a_i].side, legs[b_i].side)
+            if pair_sides in (("yes", "yes"), ("no", "no")):
+                notes.append(
+                    f"same-game advance complement: {legs[a_i].market_ticker} "
+                    f"{pair_sides[0]} x {legs[b_i].market_ticker} {pair_sides[1]} — "
+                    "exactly one team advances, impossible"
+                )
+                # Airtight rule-book tautology (a knockout produces exactly
+                # one advancer, incl. ET/pens) ⇒ farmable, like Families 1-3.
+                return Relationship(
+                    RelationshipKind.IMPOSSIBLE, (), tuple(notes), farmable=True
+                )
+            if pair_sides == ("yes", "no"):
+                containments.append((a_i, b_i))
+                notes.append(
+                    f"advance complement equivalence: joint = "
+                    f"P({legs[a_i].market_ticker} yes)"
+                )
+            elif pair_sides == ("no", "yes"):
+                containments.append((b_i, a_i))
+                notes.append(
+                    f"advance complement equivalence: joint = "
+                    f"P({legs[b_i].market_ticker} yes)"
                 )
 
     # TAXONOMY-IMPOSSIBLE TRIPWIRE (2026-07-11, V3 robustness §2.4-1 —

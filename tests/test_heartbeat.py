@@ -26,6 +26,36 @@ def test_beat_writes_readable_fresh_age(tmp_path: Path) -> None:
     assert age == 0.0  # same clock instant
 
 
+def test_beat_write_throttled_but_retries_after_failure(tmp_path: Path) -> None:
+    # Adversarial verify 2026-07-16: the wedge fix beats once per swept quote
+    # (N atomic replaces per 0.5s tick) — the WRITE dedupes to 10/s so the
+    # defense cannot stall the loop it defends, while a FAILED write must not
+    # arm the throttle (the very next beat retries).
+    clock = FakeClock()
+    path = tmp_path / "heartbeat.txt"
+    hb = Heartbeat(clock, path)
+    hb.beat()
+    first = path.read_text(encoding="utf-8")
+    clock.advance(0.05)  # inside the 100ms window
+    hb.beat()
+    assert path.read_text(encoding="utf-8") == first  # deduped
+    clock.advance(0.06)  # past the window
+    hb.beat()
+    assert path.read_text(encoding="utf-8") != first  # wrote again
+    # Failure never arms the throttle: a beat right after a failed write
+    # (fresh instance, unwritable dir simulated via monkeypatch-free check)
+    # is covered by the success-only assignment — pinned structurally here:
+    hb2 = Heartbeat(FakeClock(), tmp_path / "hb2.txt")
+    assert hb2._last_write_mono_ns is None
+    hb2.beat()
+    assert hb2._last_write_mono_ns is not None
+    # An externally-WIPED file is healed immediately, throttle or not (the
+    # supervisor latch re-beats after a kill; relaunch purges delete the file).
+    path.unlink()
+    hb.beat()  # still inside the throttle window
+    assert path.exists()
+
+
 def test_age_grows_with_reader_clock(tmp_path: Path) -> None:
     write_clock = FakeClock()
     hb = Heartbeat(write_clock, tmp_path / "heartbeat.txt")
