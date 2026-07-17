@@ -157,6 +157,14 @@ class ReasonCode(StrEnum):
     DELETE_KILL_SWITCH = "delete_kill_switch"
     DELETE_WS_GAP = "delete_ws_gap"
     DELETE_RFQ_GONE = "delete_rfq_gone"
+    # Event-driven post-fill risk pull (resting-quote haircut, 2026-07-17): a
+    # committed fill consumed budget, and this resting quote's game now shows
+    # an ENFORCED quote-time breach (haircut semantics) — pulled immediately
+    # (analytic-only pass, same-game quotes first) instead of waiting for an
+    # accept to be declined at confirm. Armed only while resting_quote_weight
+    # < 1; a failed pull fails SAFE (quotes stay; confirm-time exactness and
+    # TTL/reprice sweeps remain the backstop).
+    DELETE_RISK_EVICTED_ON_FILL = "delete_risk_evicted_on_fill"
 
     # --- Last look (confirm decision) ---
     CONFIRM_OK = "confirm_ok"

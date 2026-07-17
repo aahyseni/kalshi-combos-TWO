@@ -164,6 +164,21 @@ class RiskLimits:
     fill_velocity_soft_frac: Fraction = Fraction(5, 100)
     fill_velocity_hard_frac: Fraction = Fraction(10, 100)
     fill_velocity_max_fills: int = 8
+    # --- QUOTE-TIME resting-quote haircut (operator design 2026-07-17) ---
+    # Weight on every resting (open) quote's contribution to the QUOTE-TIME
+    # mass-acceptance folds (game-loss, slate, directional, delta/notional,
+    # utilization — every cap reading open quotes at quote time), with a BURST
+    # FLOOR: never less than the FULL (100%) contribution of the
+    # ``resting_floor_count`` largest resting quotes per axis/bucket. Applied
+    # ONLY when a call site passes ``apply_resting_haircut=True`` to ``check``
+    # — the quote-time sites (handle_rfq + the F1 pre-gate). CONFIRM-TIME call
+    # sites (reservation / last-look) never pass it, so they stay pinned at
+    # the 100% fold (the exact enforcement is theirs; regression-tested
+    # bit-identical armed vs not). DEFAULT 1.0 = today's behaviour byte-
+    # identical; the operator arms 0.40 in the local YAML. See
+    # risk/exposure.py's composition note + tools/proto_resting_haircut.py.
+    resting_quote_weight: Fraction = Fraction(1)
+    resting_floor_count: int = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,12 +421,27 @@ class LimitChecker:
         halt_inputs: HaltInputs | None = None,
         book_risk: PortfolioRisk | None = None,
         waived_games: Mapping[str, WaiverCertificate] | None = None,
+        apply_resting_haircut: bool = False,
     ) -> list[Breach]:
         """All current breaches, mass-acceptance included.
 
         ``candidate_positions``: hypothetical fills being contemplated (last
         look passes the accepted side here). ``adding_quote``: pre-quote check
         counts one more open quote.
+
+        ``apply_resting_haircut`` (QUOTE-TIME ONLY — operator design
+        2026-07-17): True ⇒ the exposure snapshot weights every RESTING open
+        quote's mass-acceptance contribution at ``limits.resting_quote_weight``
+        (burst-floored at the full contribution of the
+        ``limits.resting_floor_count`` largest; committed positions and
+        candidates are never haircut). Passed True by exactly two call sites —
+        ``handle_rfq``'s post-pricing check and the F1 pre-pricing gate (which
+        must share the semantics for the pre-gate lemma). CONFIRM-TIME callers
+        (reservation / last-look / maintenance) leave the default False and are
+        thereby PINNED at the 100% fold — they cannot pick the weight up even
+        by accident, and a regression test proves their decisions are
+        bit-identical with the haircut armed vs not. With the default weight
+        of 1 the flag is a no-op (today's behaviour byte-identical).
 
         ``waived_games`` (CONFIRM-PATH ONLY — the last-look MC waiver): per-game
         state-consistent worst-case certificates. For EXACTLY those games, and
@@ -492,7 +522,15 @@ class LimitChecker:
             )
 
         snapshot = book.snapshot(
-            marginals, mass_acceptance=True, extra_positions=candidates
+            marginals,
+            mass_acceptance=True,
+            extra_positions=candidates,
+            # QUOTE-TIME resting haircut: armed sites weight the resting fold;
+            # None ⇒ the pre-existing 100% fold, byte-identical (confirm path).
+            resting_quote_weight=(
+                limits.resting_quote_weight if apply_resting_haircut else None
+            ),
+            resting_floor_count=limits.resting_floor_count,
         )
         if snapshot.unknown_marginals:
             breaches.append(

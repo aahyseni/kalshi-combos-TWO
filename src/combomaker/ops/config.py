@@ -2210,6 +2210,24 @@ class RiskConfig(StrictModel):
     # Default False = today's behaviour byte-identical; the operator arms it in
     # the local YAML after game-day review.
     pre_pricing_gate_enabled: bool = False
+    # QUOTE-TIME RESTING-QUOTE HAIRCUT (operator design 2026-07-17). Weight on
+    # every resting (open) quote's contribution to the QUOTE-TIME
+    # mass-acceptance folds (game-loss / slate / directional / delta / notional
+    # / utilization), with a BURST FLOOR: never less than the FULL (100%)
+    # contribution of the ``resting_floor_count`` largest resting quotes per
+    # axis/bucket. Rationale: the quote-time 100% fold double-counted the
+    # confirm path's EXACT enforcement (serial reservations + analytic caps at
+    # confirm + candidate MC + waiver) and was the #1 measured flow killer
+    # (skip_game_loss_cap). CONFIRM-TIME checks are UNTOUCHED (pinned at 100%;
+    # regression-tested bit-identical armed vs not). Arming the weight below 1
+    # ALSO arms the event-driven post-fill risk pull: on a committed fill the
+    # lifecycle re-runs the quote-time analytic check and deletes resting
+    # quotes on enforced-breached games (delete_risk_evicted_on_fill).
+    # DEFAULT "1.0" = today's behaviour byte-identical; the operator arms
+    # "0.40" in the local YAML. Decimal string (exact Fraction; floats banned
+    # for risk weights), validated to (0, 1].
+    resting_quote_weight: str = "1.0"
+    resting_floor_count: int = 3
     game_loss_frac: str = "0.08"          # %-of-GAME correlated loss
     per_combo_loss_frac: str = "0.01"     # single position max_loss
     directional_frac: str = "0.10"        # net one-directional / theme
@@ -2264,12 +2282,33 @@ class RiskConfig(StrictModel):
         return v
 
     @field_validator(
-        "absolute_notional_multiple", "fill_velocity_max_fills", "starvation_threshold"
+        "absolute_notional_multiple",
+        "fill_velocity_max_fills",
+        "starvation_threshold",
+        "resting_floor_count",
     )
     @classmethod
     def _positive_int_knob(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"must be >= 1, got {v}")
+        return v
+
+    # The resting-quote weight is a fraction of the resting mass-acceptance
+    # contribution, NOT a percentage of bankroll — its own validator so the
+    # error message says what it is. (0, 1]: 0 would erase the resting fold
+    # entirely below the burst floor (never intended), > 1 would over-count.
+    @field_validator("resting_quote_weight")
+    @classmethod
+    def _valid_resting_weight(cls, v: str) -> str:
+        try:
+            d = Decimal(v)
+        except InvalidOperation as exc:
+            raise ValueError(f"resting_quote_weight {v!r} is not a decimal") from exc
+        if not d.is_finite() or not (Decimal(0) < d <= Decimal(1)):
+            raise ValueError(
+                f"resting_quote_weight {v!r} must be a finite fraction in (0, 1] "
+                f"(1.0 = today's full fold; the operator arms 0.40), not {d}"
+            )
         return v
 
     # The recovery delay must be a positive finite number of seconds. NaN fails
@@ -2353,6 +2392,8 @@ class RiskConfig(StrictModel):
             fill_velocity_soft_frac=Fraction(Decimal(self.fill_velocity_soft_frac)),
             fill_velocity_hard_frac=Fraction(Decimal(self.fill_velocity_hard_frac)),
             fill_velocity_max_fills=self.fill_velocity_max_fills,
+            resting_quote_weight=Fraction(Decimal(self.resting_quote_weight)),
+            resting_floor_count=self.resting_floor_count,
         )
 
 

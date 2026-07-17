@@ -51,6 +51,7 @@ from combomaker.ops.pricing_pool import (
 )
 from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.fees import FeeModel, FeeType, FeeUnknownError
+from combomaker.pricing.grouping import game_key
 from combomaker.pricing.quote import ConstructedQuote, NoQuote
 from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.models import Rfq
@@ -114,6 +115,17 @@ JsonDict = dict[str, Any]
 # decline exactly as today (the waiver never touches gross / per-combo / daily /
 # CVaR / ruin / notional / slate caps or any halt).
 WAIVABLE_RESERVATION_BREACHES: frozenset[ReasonCode] = frozenset(
+    {ReasonCode.SKIP_GAME_LOSS_CAP, ReasonCode.SKIP_DIRECTIONAL_CAP}
+)
+
+# EVENT-DRIVEN POST-FILL RISK PULL (resting-quote haircut, 2026-07-17): the
+# breach reasons the post-fill pull may evict resting quotes on — exactly the
+# two per-game caps that carry their game key on the ``Breach`` (the key is
+# never parsed out of detail strings) and whose quote-time bound the haircut
+# relaxed. Global caps (gross/utilization/slate/delta) are NOT evicted here:
+# they carry no game attribution, and the confirm-path exact enforcement +
+# TTL/reprice sweeps remain their backstop.
+EVICTABLE_ON_FILL_BREACHES: frozenset[ReasonCode] = frozenset(
     {ReasonCode.SKIP_GAME_LOSS_CAP, ReasonCode.SKIP_DIRECTIONAL_CAP}
 )
 
@@ -491,6 +503,13 @@ class QuoteLifecycle:
         # the maintenance-tick granularity. A falsely-CACHED verdict can only
         # DECLINE (never admit), and retry_pending re-checks within 1s anyway.
         self._pre_gate_cache: tuple[int, int | None, int, list[Breach]] | None = None
+        # EVENT-DRIVEN POST-FILL RISK PULL (resting-quote haircut, 2026-07-17):
+        # single-flight task + the games of recently committed fills (eviction
+        # priority: same-game resting quotes first). Armed only while
+        # resting_quote_weight < 1 (the haircut is what opens the gap the pull
+        # closes); an idle default build never runs it.
+        self._risk_evict_task: asyncio.Task[None] | None = None
+        self._risk_evict_pending_games: set[str] = set()
         self._markouts = MarkoutTracker(store.record_markout)
         # LAST-LOOK MC WAIVER observability: the per-confirm waiver audit record
         # ({granted, worst_case_cc, games}), set ONLY when a waiver ATTEMPT ran
@@ -1887,6 +1906,12 @@ class QuoteLifecycle:
             start_time_provider=self._start_time_provider,
             halt_inputs=self._halt_inputs(),
             book_risk=self._book_risk_for_check(),
+            # QUOTE-TIME resting haircut: the pre-gate MUST share handle_rfq's
+            # haircut semantics — the F1 lemma ("gate fires ⇒ the full
+            # quote-time check declines") holds only when both fold resting
+            # quotes identically (re-verified armed in
+            # tools/proto_resting_haircut.py part D2). No-op at weight 1.
+            apply_resting_haircut=True,
         )
         # Shadow-split FIRST (the one shadow-enforcement seam), then the
         # monotone filter (which also drops shadow, belt-and-suspenders).
@@ -1988,6 +2013,14 @@ class QuoteLifecycle:
             start_time_provider=self._start_time_provider,
             halt_inputs=self._halt_inputs(),
             book_risk=self._book_risk_for_check(),
+            # QUOTE-TIME resting haircut (operator design 2026-07-17): resting
+            # quotes fold at resting_quote_weight with the top-K burst floor —
+            # the confirm path keeps counting them at 100% and enforces the
+            # budgets EXACTLY (reservations + candidate MC + waiver), so the
+            # 100% fold here was a double count of that defense. The CANDIDATE
+            # (this RFQ's hypothetical fill) is never haircut. No-op at the
+            # default weight 1.
+            apply_resting_haircut=True,
         )
         # Watchdog sees the ISSUE decision: any breach (enforced OR shadow) is a
         # would-be decline; only a fully clean check is a real issue (reset). This
@@ -2311,6 +2344,14 @@ class QuoteLifecycle:
                 # failed/timed-out confirm is the unknown-committed path the
                 # reservation-reconcile loop owns.
                 state.fill_confirmed_mono_ns = self._clock.monotonic_ns()
+                # POST-FILL RISK PULL: scheduled BELOW, after _drop_quote —
+                # see the stamp-gated call at the end of this method. It must
+                # NOT be scheduled here: between commit (position booked) and
+                # the drop, the fill is DOUBLE-counted (position + its own
+                # still-resting quote), and the awaited record below yields to
+                # the event loop, so a pull scheduled here runs its first
+                # check inside that window and can evict an innocent same-game
+                # resting quote on a transient breach (2026-07-17 finding).
             except Exception as exc:
                 self._metrics.inc("confirm.failed")
                 self._confirm_failures += 1
@@ -2338,6 +2379,19 @@ class QuoteLifecycle:
         )
         # Accepted quotes are no longer open either way.
         self._drop_quote(quote_id)
+        # POST-FILL RISK PULL (resting-quote haircut): the fill is COMMITTED —
+        # re-evaluate resting quotes against the new book (analytic-only
+        # background task; no-op unless the haircut is armed). Scheduled ONLY
+        # AFTER the filled quote left the exposure book, so the pull's first
+        # check never sees the fill double-counted (position + its own
+        # still-resting quote) — a transient breach in that window spuriously
+        # evicted an innocent same-game resting quote (2026-07-17 finding).
+        # ``fill_confirmed_mono_ns`` is stamped ONLY on confirm-send success,
+        # so decline/exception paths never schedule (the confirm-timeout path
+        # is owned by reservation-reconcile + the on_quote_executed replay,
+        # whose own schedule at that hook is already post-drop-safe).
+        if state.fill_confirmed_mono_ns is not None:
+            self._schedule_risk_evict_on_fill(state)
 
     def _fill_position(self, quote_id: str, state: OpenQuoteState) -> OpenPosition:
         """The exact ``OpenPosition`` a confirmed fill of this quote produces.
@@ -2372,6 +2426,119 @@ class QuoteLifecycle:
             return
         self._exposure.add_position(position)
 
+    # ------------------------- post-fill risk pull (resting-quote haircut) --
+
+    def _resting_haircut_armed(self) -> bool:
+        return self._limits.limits.resting_quote_weight < 1
+
+    def _schedule_risk_evict_on_fill(self, state: OpenQuoteState) -> None:
+        """EVENT-DRIVEN POST-FILL RISK PULL (haircut design point 3): a fill
+        just COMMITTED, consuming real budget — schedule an immediate
+        analytic-only re-evaluation of the resting quotes against the new book
+        (same tick: the task runs at the next await point; the confirm path's
+        latency-sensitive tail is never blocked on REST deletes). Armed only
+        while the haircut is armed (weight < 1): at weight 1 the quote-time
+        fold still counts every resting quote at 100%, so today's behaviour is
+        untouched. Single-flight: a running pass picks pending fill games up
+        on its next loop iteration."""
+        if not self._resting_haircut_armed():
+            return
+        self._risk_evict_pending_games |= {
+            game_key(leg.event_ticker)
+            for leg in self._leg_refs(state.rfq)
+            if leg.event_ticker
+        }
+        if self._risk_evict_task is not None and not self._risk_evict_task.done():
+            return
+        self._risk_evict_task = asyncio.ensure_future(self._risk_evict_after_fill())
+
+    async def _risk_evict_after_fill(self) -> None:
+        """Delete resting quotes whose game now shows an ENFORCED quote-time
+        breach (haircut semantics) after a committed fill.
+
+        ANALYTIC-ONLY (``limits.check`` — no pricing pool, no MC snapshot is
+        recomputed), bounded (each iteration deletes exactly one quote or
+        stops; at most the number of open quotes at entry), beat-friendly (the
+        heartbeat is beaten per iteration, and every REST delete awaits).
+        Victim choice per iteration: a resting, un-accepted quote touching a
+        breached game — quotes on the just-filled game(s) first, then the
+        largest worst-case loss (the biggest budget release per delete);
+        re-check after each delete so no more quotes are pulled than needed.
+        Scope: the two per-game caps that carry their game key
+        (``EVICTABLE_ON_FILL_BREACHES``); a breach that persists with no
+        matching resting quote is the committed book's own (the confirm-path
+        exact caps + maintenance sweeps own it — nothing to evict). ERRORS
+        FAIL SAFE: an exception leaves the resting quotes standing — every
+        accept still faces the exact confirm-time enforcement, and TTL/reprice
+        sweeps remain the backstop."""
+        try:
+            for _ in range(len(self._open) + 1):
+                self._beat()
+                fill_games = set(self._risk_evict_pending_games)
+                raw = self._limits.check(
+                    self._exposure,
+                    self._marginals,
+                    self.daily_pnl,
+                    risk_bankroll_cc=self._risk_bankroll_cc(),
+                    bankroll_source_configured=self._bankroll_source_configured(),
+                    start_time_provider=self._start_time_provider,
+                    halt_inputs=self._halt_inputs(),
+                    book_risk=self._book_risk_for_check(),
+                    apply_resting_haircut=True,
+                )
+                breached_games = {
+                    b.game
+                    for b in self._partition_breaches(raw)
+                    if b.game is not None and b.reason in EVICTABLE_ON_FILL_BREACHES
+                }
+                if not breached_games:
+                    break
+                victim = self._pick_eviction_victim(breached_games, fill_games)
+                if victim is None:
+                    break  # committed book's own breach — nothing to evict
+                self._metrics.inc("risk_evict.on_fill")
+                log.info(
+                    "risk_evicted_on_fill",
+                    quote_id=victim,
+                    breached_games=sorted(breached_games),
+                )
+                await self._delete_quote(
+                    victim, ReasonCode.DELETE_RISK_EVICTED_ON_FILL
+                )
+        except Exception:
+            self._metrics.inc("risk_evict.pass_error")
+            log.exception("risk_evict_on_fill_failed")
+        finally:
+            self._risk_evict_pending_games.clear()
+
+    def _pick_eviction_victim(
+        self, breached_games: set[str], fill_games: set[str]
+    ) -> str | None:
+        """The next resting quote to pull: touches a breached game, is not
+        mid-confirm (accepted), same-game-as-the-fill first, then largest
+        worst-case loss (per-quote worst-side max_loss — the loss-axis figure
+        the caps fold). None ⇒ no resting quote touches any breached game."""
+        best_key: tuple[int, int, str] | None = None
+        best_id: str | None = None
+        for quote_id, quote in self._exposure.open_quotes.items():
+            state = self._open.get(quote_id)
+            if state is None or state.accepted:
+                continue  # unknown to us or mid-confirm — never yank
+            qgames = {
+                game_key(leg.event_ticker)
+                for leg in quote.legs
+                if leg.event_ticker
+            }
+            if not (qgames & breached_games):
+                continue
+            hypos = quote.hypothetical_positions(self._conventions)
+            worst_loss = max((h.max_loss_cc for h in hypos), default=0)
+            key = (0 if qgames & fill_games else 1, -worst_loss, quote_id)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_id = quote_id
+        return best_id
+
     async def on_quote_executed(self, msg: JsonDict) -> None:
         quote_id = str(msg.get("quote_id", ""))
         # Full-message capture (2026-07-14): the LIVE combo quote_accepted carries
@@ -2404,6 +2571,12 @@ class QuoteLifecycle:
                 self._book_position(quote_id, state)
         else:
             self._book_position(quote_id, state)  # no-op if booked at confirm
+        # POST-FILL RISK PULL (resting-quote haircut): covers the paths where
+        # the position lands HERE rather than at confirm (confirm timeout →
+        # execution, recovery-sweep replay). A duplicate schedule after a
+        # confirm-path pull is a cheap no-op re-check (single-flight, and a
+        # clean book breaks the pass on its first iteration).
+        self._schedule_risk_evict_on_fill(state)
         fill_ref = f"fill:{quote_id}"
         # LEDGER IDEMPOTENCY (2026-07-16 P1): the recovery sweep polls REST for a
         # fill whose WS message never arrived and replays it through THIS path, so

@@ -45,6 +45,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
+from fractions import Fraction
 from typing import TYPE_CHECKING
 
 from combomaker.core.conventions import Conventions, Side
@@ -577,6 +578,30 @@ def _mutex_required(
     return None
 
 
+def _me_event_census(
+    entries: Iterable[tuple[tuple[LegRef, ...], float, bool]],
+    is_me_event: Callable[[str], bool | None],
+) -> list[str]:
+    """Distinct explicit-True ME events among the REQUIRES-ALL entries' legs,
+    first-seen order — the EXACT census the mutex folds net on (len == 1 nets;
+    0 or >=2 fails closed to the comonotone/summed fold). Shared by both folds
+    and by the armed haircut's floor-regime check (2026-07-17 fix: the burst
+    floor's base term must track the COMBINED book's regime, not the base's).
+    Accepts both loss (int) and directional (float) entry tuples."""
+    me_events: list[str] = []
+    seen: set[str] = set()
+    for legs, _value, requires in entries:
+        if not requires:
+            continue
+        for leg in legs:
+            e = leg.event_ticker
+            if e and e not in seen:
+                seen.add(e)
+                if is_me_event(e) is True:
+                    me_events.append(e)
+    return me_events
+
+
 def _mutex_event_bound_cc(entries: list[_MutexEntry], event: str) -> int:
     """Max over the ME event's branches of the Σ loss of entries that can lose in
     that branch. Branches = every required YES-outcome + an ``__OTHER__`` catch-all
@@ -614,17 +639,7 @@ def _mutex_game_worst_cc(
     comonotone = sum(loss for _legs, loss, _r in entries)
     if not entries or is_me_event is None:
         return comonotone
-    me_events: list[str] = []
-    seen: set[str] = set()
-    for legs, _loss, requires in entries:
-        if not requires:
-            continue
-        for leg in legs:
-            e = leg.event_ticker
-            if e and e not in seen:
-                seen.add(e)
-                if is_me_event(e) is True:
-                    me_events.append(e)
+    me_events = _me_event_census(entries, is_me_event)
     if len(me_events) != 1:                     # 0 ⇒ no ME; ≥2 ⇒ fail-closed
         return comonotone
     return _mutex_event_bound_cc(entries, me_events[0])
@@ -699,17 +714,7 @@ def _mutex_directional_game_cc(
     summed = sum(mag for _legs, mag, _r in entries)
     if not entries or is_me_event is None:
         return summed
-    me_events: list[str] = []
-    seen: set[str] = set()
-    for legs, _mag, requires in entries:
-        if not requires:
-            continue
-        for leg in legs:
-            e = leg.event_ticker
-            if e and e not in seen:
-                seen.add(e)
-                if is_me_event(e) is True:
-                    me_events.append(e)
+    me_events = _me_event_census(entries, is_me_event)
     if len(me_events) != 1:                     # 0 ⇒ no ME; ≥2 ⇒ fail-closed
         return summed
     return _mutex_directional_event_bound(entries, me_events[0])
@@ -745,6 +750,96 @@ def mutex_exclusivity_violations(
         for event, markets in settled_yes_by_event.items()
         if len(markets) >= 2
     }
+
+
+# --- Quote-time resting-quote haircut (operator design 2026-07-17) ----------
+# Quote-time caps used to fold ALL resting (open) quotes at 100% mass-
+# acceptance worst case, double-counting the defense the CONFIRM path already
+# enforces EXACTLY (serial provisional reservations + analytic caps at confirm
+# + candidate MC + freshness + waiver). At QUOTE TIME ONLY, the resting
+# contribution to every mass-acceptance fold is composed as
+#
+#     value = min( full,  max( ceil(w*full + (1-w)*base),  base + topK ) )
+#
+# where ``base`` = the fold of committed positions (+ candidates) only,
+# ``full`` = the fold with ALL resting quotes at 100% (exactly today's value),
+# ``topK`` = the comonotone sum of the ``resting_floor_count`` largest
+# per-quote worst-case contributions on that axis/bucket (the BURST FLOOR: the
+# resting contribution is never below the FULL contribution of the K largest
+# resting quotes — a burst of few large quotes is never haircut away).
+#
+# MONOTONE by construction — required for the E2/F1 lemmas:
+#  - in the RESTING set: ``full`` is monotone (E2), ``topK`` (top-K sum of
+#    non-negatives) is monotone, ``base`` unaffected; min/max of monotone
+#    terms is monotone.
+#  - in the CANDIDATE/committed set: monotone in BOTH ``base`` and ``full``
+#    for w in [0, 1] (each term is), so "breached candidate-free => breached
+#    with any candidate" (the F1 pre-gate lemma) survives the haircut.
+# FLOOR: the composed value must never under-count the 100% fold of base +
+# the K largest resting quotes. On the ADDITIVE axes (gross premium, notional,
+# delta magnitudes) that fold is exactly base + topK. On the MUTEX-FOLDED axes
+# (game loss, directional) the fold's netting REGIME is decided by the
+# COMBINED entry set's ME-event census, and the fail-closed 1->2 transition is
+# SUPERADDITIVE: fold(base + topK entries) can exceed netted(base) + topK,
+# because a second ME event arriving with the resting quotes UN-NETS the base
+# inside the combined fold (the canonical advance-hedge book: opposing long-NO
+# hedges netting on event 1, resting quotes on event 2 of the same game).
+# FIX 2026-07-17: those axes pass ``floor_base`` = the COMONOTONE base fold
+# whenever the combined (base + ALL resting) census fails closed (0 or >=2 ME
+# events), and the netted base when it nets on exactly one — then
+# fold(base + anyK) <= floor_base + topK by branch-max subadditivity in every
+# regime. Monotone in BOTH sets: the census only gains events when a resting
+# quote or candidate is added, moving the floor term toward the (larger)
+# comonotone value. Pinned in tests/test_resting_haircut.py::
+# TestMutexRegimeFloorPinned; fuzzed in proto parts A/C with a 2-ME generator.
+# DEFAULT PARITY: at w == 1 the ceil-blend equals ``full`` exactly and the min
+# clamps the (possibly overshooting) comonotone floor back to ``full`` — but
+# weight None/>=1 routes through the pre-existing fold verbatim anyway
+# (bit-identical live behaviour; the composed reduction is prototype-verified
+# in tools/proto_resting_haircut.py parts B/D1).
+def _haircut_compose_cc(
+    base: int, full: int, topk: int, num: int, den: int, *,
+    floor_base: int | None = None,
+) -> int:
+    """min(full, max(ceil-blend, floor_base+topK)) on an int-cc money axis.
+
+    ``floor_base`` defaults to ``base`` (the additive axes); the mutex-folded
+    axes pass the regime-tracked base term (see the FLOOR note above)."""
+    blend = -(-(num * full + (den - num) * base) // den)  # ceil — conservative
+    fb = base if floor_base is None else floor_base
+    return min(full, max(blend, fb + topk))
+
+
+def _haircut_compose_float(
+    base: float, full: float, topk: float, w: float, *,
+    floor_base: float | None = None,
+) -> float:
+    """The same composition on a float (delta / directional) axis."""
+    fb = base if floor_base is None else floor_base
+    return min(full, max(w * full + (1.0 - w) * base, fb + topk))
+
+
+def _topk_sum_int(values: Iterable[int], k: int) -> int:
+    return sum(sorted(values, reverse=True)[:k])
+
+
+def _topk_sum_float(values: Iterable[float], k: int) -> float:
+    return sum(sorted(values, reverse=True)[:k])
+
+
+@dataclass(frozen=True, slots=True)
+class _QuoteContrib:
+    """One resting quote's mass-acceptance contribution, collected ONCE so the
+    100% fold (weight None/1 — today's path, replayed operation-for-operation
+    in the same order for bit-identical floats) and the haircut composition
+    fold the SAME figures."""
+
+    quote_legs: tuple[LegRef, ...]
+    legs_by_game: dict[str, tuple[LegRef, ...]]
+    worst_loss: int
+    worst_notional: int
+    requires_all: bool
+    per_market: dict[str, float]
 
 
 class ExposureBook:
@@ -889,6 +984,8 @@ class ExposureBook:
         *,
         mass_acceptance: bool,
         extra_positions: Iterable[OpenPosition] = (),
+        resting_quote_weight: Fraction | None = None,
+        resting_floor_count: int = 3,
     ) -> ExposureSnapshot:
         """Current exposures; with ``mass_acceptance`` every open quote fills
         on its per-aggregate WORSE side (sign-aligned magnitude bound).
@@ -899,6 +996,19 @@ class ExposureBook:
         families cluster into ONE bucket. The E2 mass-acceptance dominance bound
         (sign-aligned magnitude, per-aggregate worse side) is preserved verbatim
         on every axis, including the gross-settlement-notional one.
+
+        ``resting_quote_weight`` (QUOTE-TIME resting haircut, 2026-07-17):
+        None or >= 1 ⇒ today's 100% fold, byte-identical (the CONFIRM-path
+        callers and every pre-existing caller). A Fraction < 1 ⇒ every resting
+        quote's contribution to every mass-acceptance aggregate is composed via
+        ``_haircut_compose_*`` (see the design note above the helpers): weighted
+        at the fraction, floored at the FULL contribution of the
+        ``resting_floor_count`` largest resting quotes per axis/bucket, clamped
+        at the full fold. Committed positions and ``extra_positions``
+        (candidates/reservations) are NEVER haircut — the weight applies to
+        open quotes only. The composed fold stays MONOTONE in the resting set
+        AND in the candidate set (E2/F1 lemmas); parity vs the validated
+        prototype is pinned by tools/proto_resting_haircut.py part D1.
         """
         delta_market: dict[str, float] = defaultdict(float)
         delta_game: dict[str, float] = defaultdict(float)
@@ -978,6 +1088,15 @@ class ExposureBook:
                         (tuple(glegs), magnitude, requires_all)
                     )
 
+        # Quote-time resting haircut: armed iff a weight < 1 was passed (the
+        # confirm-path/pre-existing callers pass None ⇒ the 100% fold below is
+        # today's code, operation-for-operation).
+        haircut = (
+            mass_acceptance
+            and resting_quote_weight is not None
+            and resting_quote_weight < 1
+        )
+        quote_contribs: list[_QuoteContrib] = []
         if mass_acceptance:
             for quote in self.open_quotes.values():
                 hypos = quote.hypothetical_positions(self._conventions)
@@ -986,7 +1105,6 @@ class ExposureBook:
                 # Worst side on each money axis (independently — the loss and
                 # notional worst sides are the same side here, but computed per
                 # axis so the invariant never depends on that coincidence).
-                gross_cc += max(h.max_loss_cc for h in hypos)
                 worst_hypo = max(hypos, key=lambda h: h.max_loss_cc)
                 worst_loss = worst_hypo.max_loss_cc
                 worst_notional = max(h.gross_settlement_notional_cc for h in hypos)
@@ -997,10 +1115,7 @@ class ExposureBook:
                 for leg in quote.legs:
                     if leg.event_ticker:
                         q_legs_by_game[game_key(leg.event_ticker)].append(leg)
-                for game, glegs in q_legs_by_game.items():
-                    game_notional[game] += worst_notional
-                    game_entries[game].append((tuple(glegs), worst_loss, requires_all))
-                # Sign-aligned delta bound per market/game.
+                # Sign-aligned delta bound per market (worst side per hypo).
                 per_market: dict[str, float] = defaultdict(float)
                 for hypo in hypos:
                     deltas = analytic_leg_deltas(hypo, marginals)
@@ -1009,47 +1124,183 @@ class ExposureBook:
                         continue
                     for ticker, delta in deltas.items():
                         per_market[ticker] = max(per_market[ticker], abs(delta))
-                for ticker, magnitude in per_market.items():
+                quote_contribs.append(
+                    _QuoteContrib(
+                        quote_legs=quote.legs,
+                        legs_by_game={
+                            g: tuple(gl) for g, gl in q_legs_by_game.items()
+                        },
+                        worst_loss=worst_loss,
+                        worst_notional=worst_notional,
+                        requires_all=requires_all,
+                        per_market=dict(per_market),
+                    )
+                )
+
+        if mass_acceptance and not haircut:
+            # 100% fold — TODAY'S code path, replayed per quote in the same
+            # order and with the same operations (bit-identical floats).
+            for c in quote_contribs:
+                gross_cc += c.worst_loss
+                for game, qlegs in c.legs_by_game.items():
+                    game_notional[game] += c.worst_notional
+                    game_entries[game].append((qlegs, c.worst_loss, c.requires_all))
+                for ticker, magnitude in c.per_market.items():
                     current = delta_market[ticker]
                     delta_market[ticker] = current + (
                         magnitude if current >= 0 else -magnitude
                     )
-                for leg in quote.legs:
-                    if leg.event_ticker and leg.market_ticker in per_market:
+                for leg in c.quote_legs:
+                    if leg.event_ticker and leg.market_ticker in c.per_market:
                         game = game_key(leg.event_ticker)
                         current = delta_game[game]
                         delta_game[game] = current + (
-                            per_market[leg.market_ticker]
+                            c.per_market[leg.market_ticker]
                             if current >= 0
-                            else -per_market[leg.market_ticker]
+                            else -c.per_market[leg.market_ticker]
                         )
-                # P0-9 directional entry for the open quote (mass acceptance): the
-                # per-game magnitude is the WORST-SIDE |delta| bound (per_market, the
-                # sign-aligned upper bound) summed over this game's legs — a
-                # conservative per-quote directional magnitude, mirroring the loss
-                # axis's ``worst_loss`` choice. Folded with the SAME monotone mutex
-                # bound so an opposing-advance quote nets against a held hedge while
-                # the mass snapshot still dominates every realizable accepted subset.
-                for game, glegs in q_legs_by_game.items():
-                    magnitude = (
-                        sum(per_market.get(g.market_ticker, 0.0) for g in glegs)
+                # P0-9 directional entry for the open quote (mass acceptance):
+                # the per-game magnitude is the WORST-SIDE |delta| bound
+                # (per_market, the sign-aligned upper bound) summed over this
+                # game's legs — a conservative per-quote directional magnitude,
+                # mirroring the loss axis's ``worst_loss`` choice. Folded with
+                # the SAME monotone mutex bound so an opposing-advance quote
+                # nets against a held hedge while the mass snapshot still
+                # dominates every realizable accepted subset.
+                for game, qlegs in c.legs_by_game.items():
+                    q_magnitude = (
+                        sum(c.per_market.get(g.market_ticker, 0.0) for g in qlegs)
                         * CC_PER_DOLLAR
                     )
-                    game_dir_entries[game].append(
-                        (tuple(glegs), magnitude, requires_all)
+                    game_dir_entries[game].append((qlegs, q_magnitude, c.requires_all))
+
+        # Per-game resting entries for the HAIRCUT composition (empty unless
+        # armed): the same figures as the 100% fold, kept separate so base
+        # (committed + candidates) and full (base + resting) fold independently.
+        q_loss_entries: dict[str, list[_MutexEntry]] = defaultdict(list)
+        q_dir_entries: dict[str, list[_DirEntry]] = defaultdict(list)
+        if haircut:
+            assert resting_quote_weight is not None
+            num = resting_quote_weight.numerator
+            den = resting_quote_weight.denominator
+            wf = num / den
+            k = max(0, resting_floor_count)
+            q_notional: dict[str, list[int]] = defaultdict(list)
+            q_market_mags: dict[str, list[float]] = defaultdict(list)
+            q_game_mags: dict[str, list[float]] = defaultdict(list)
+            for c in quote_contribs:
+                for game, qlegs in c.legs_by_game.items():
+                    q_notional[game].append(c.worst_notional)
+                    q_loss_entries[game].append((qlegs, c.worst_loss, c.requires_all))
+                    gmag = sum(c.per_market.get(g.market_ticker, 0.0) for g in qlegs)
+                    q_game_mags[game].append(gmag)
+                    q_dir_entries[game].append(
+                        (qlegs, gmag * CC_PER_DOLLAR, c.requires_all)
                     )
+                for ticker, mag in c.per_market.items():
+                    q_market_mags[ticker].append(mag)
+            # GROSS premium axis (whole book).
+            q_losses = [c.worst_loss for c in quote_contribs]
+            gross_cc = _haircut_compose_cc(
+                gross_cc,
+                gross_cc + sum(q_losses),
+                _topk_sum_int(q_losses, k),
+                num,
+                den,
+            )
+            # Per-game NOTIONAL axis.
+            for game, values in q_notional.items():
+                base_n = game_notional.get(game, 0)
+                game_notional[game] = _haircut_compose_cc(
+                    base_n, base_n + sum(values), _topk_sum_int(values, k), num, den
+                )
+            # DELTA axes: sign-aligned magnitudes add away from zero, so the
+            # 100% fold is |base| + Σ mags with the base's sign — compose the
+            # magnitude and re-apply the sign.
+            for ticker, mags in q_market_mags.items():
+                base_d = delta_market.get(ticker, 0.0)
+                composed = _haircut_compose_float(
+                    abs(base_d), abs(base_d) + sum(mags), _topk_sum_float(mags, k), wf
+                )
+                delta_market[ticker] = composed if base_d >= 0 else -composed
+            for game, mags in q_game_mags.items():
+                base_d = delta_game.get(game, 0.0)
+                composed = _haircut_compose_float(
+                    abs(base_d), abs(base_d) + sum(mags), _topk_sum_float(mags, k), wf
+                )
+                delta_game[game] = composed if base_d >= 0 else -composed
 
         # Fold each game's entries with the mutual-exclusion-aware bound (Stage B).
-        game_worst = {
-            game: _mutex_game_worst_cc(entries, self._is_me_event)
-            for game, entries in game_entries.items()
-        }
         # P0-9: fold the directional entries with the SAME monotone mutex bound so
         # opposing-advance hedges net; round to int cc (loss-equivalent, ints only).
-        game_directional = {
-            game: int(_mutex_directional_game_cc(entries, self._is_me_event))
-            for game, entries in game_dir_entries.items()
-        }
+        if not haircut:
+            game_worst = {
+                game: _mutex_game_worst_cc(entries, self._is_me_event)
+                for game, entries in game_entries.items()
+            }
+            game_directional = {
+                game: int(_mutex_directional_game_cc(entries, self._is_me_event))
+                for game, entries in game_dir_entries.items()
+            }
+        else:
+            assert resting_quote_weight is not None
+            num = resting_quote_weight.numerator
+            den = resting_quote_weight.denominator
+            wf = num / den
+            k = max(0, resting_floor_count)
+            # Deterministic bucket order: committed-first, then quote-only games
+            # in insertion order (dict iteration must not depend on set order).
+            ordered_games = list(game_entries)
+            ordered_games.extend(g for g in q_loss_entries if g not in game_entries)
+            game_worst = {}
+            game_directional = {}
+            for game in ordered_games:
+                base_entries = game_entries.get(game, [])
+                rest_entries = q_loss_entries.get(game, [])
+                combined = base_entries + rest_entries
+                base_v = _mutex_game_worst_cc(base_entries, self._is_me_event)
+                full_v = _mutex_game_worst_cc(combined, self._is_me_event)
+                tk = _topk_sum_int(
+                    (loss for _legs, loss, _r in rest_entries), k
+                )
+                # BURST-FLOOR base term (2026-07-17 fix): the floor must cover
+                # the true 100% fold of base + the K largest resting quotes,
+                # whose netting REGIME is the COMBINED census's. When the
+                # combined fold fails closed (0 or >=2 ME events) the base
+                # folds COMONOTONE inside it — its netting credit is gone —
+                # so the floor's base term must be the comonotone base, not
+                # the netted base_v (superadditive 1->2 ME transition).
+                # Monotone: adding a quote/candidate only ADDS census events,
+                # moving this term toward the (larger) comonotone value.
+                floor_v = base_v
+                if self._is_me_event is not None and len(
+                    _me_event_census(combined, self._is_me_event)
+                ) != 1:
+                    floor_v = sum(loss for _legs, loss, _r in base_entries)
+                game_worst[game] = _haircut_compose_cc(
+                    base_v, full_v, tk, num, den, floor_base=floor_v
+                )
+                base_dir = game_dir_entries.get(game, [])
+                rest_dir = q_dir_entries.get(game, [])
+                combined_dir = base_dir + rest_dir
+                base_f = _mutex_directional_game_cc(base_dir, self._is_me_event)
+                full_f = _mutex_directional_game_cc(
+                    combined_dir, self._is_me_event
+                )
+                tkf = _topk_sum_float((mag for _legs, mag, _r in rest_dir), k)
+                # Same regime-tracked floor base term on the directional axis
+                # (its own census: directional entries exclude un-pricable
+                # positions, so the regimes can differ from the loss axis).
+                floor_f = base_f
+                if self._is_me_event is not None and len(
+                    _me_event_census(combined_dir, self._is_me_event)
+                ) != 1:
+                    floor_f = sum(mag for _legs, mag, _r in base_dir)
+                game_directional[game] = int(
+                    _haircut_compose_float(
+                        base_f, full_f, tkf, wf, floor_base=floor_f
+                    )
+                )
         return ExposureSnapshot(
             delta_by_market=dict(delta_market),
             delta_by_game=dict(delta_game),
