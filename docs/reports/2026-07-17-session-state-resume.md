@@ -269,3 +269,18 @@ certificate-aware roll-up still fail-closes on the certified exact sum; det-max
 (`live_20260717_slate65.log`). The six-lock chain now has full 2-game capacity.
 Nothing else changed. Watch = deferrals → waiver_attempted → the first
 risk_reservation_granted.
+
+## ADDENDUM 11 (2026-07-17 ~22:35Z) — FIRST LIVE WAIVER RUN (timed out at 1.0s) → DEADLINES REBALANCED 1.8/1.0
+
+MILESTONE: 22:29:16Z quote 08c7873b — `lastlook_waiver_deferred` fired (first ever:
+all-waivable game-loss breaches handed to the waiver) and 22:29:17Z
+**`waiver_attempted: true`** — the Problem-A waiver's FIRST live enumeration, on
+[26JUL18FRAENG, 26JUL19ESPARG] with candidate EV computed ($0.88). Refusal:
+"waiver enumeration timed out" at the 1.0s deadline — the 87ms measurement was on a
+~20-quote book; the 200-slot resting book is a ~200-entity loss-matrix set across
+two games. REBALANCED (yaml): `lastlook_mc_waiver_deadline_s 1.0→1.8`,
+`candidate_gate_deadline_s 1.5→1.0` (sum 2.8 ≤ the 3.0s joint validator; the gate
+MC needs ~0.3-0.6s). RESTARTED (`live_20260717_waiver18.log`). If 1.8s still times
+out, next levers: BookRiskPool workers 2→3, or weight the waiver's own open-quote
+entity set (the haircut doctrine inside the enumeration — code change, not tonight
+unless needed). Chain status: deferral ✅ → attempt ✅ → GRANT = the remaining step.
