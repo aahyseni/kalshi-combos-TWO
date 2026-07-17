@@ -306,10 +306,15 @@ def _assert_waiver_counters(metrics: Metrics, **expected: int) -> None:
 # ---------------------------------------------------------------- reason set
 
 
-def test_waivable_reason_code_set_is_exactly_the_two_per_game_caps() -> None:
+def test_waivable_reason_code_set_is_exactly_the_per_game_caps() -> None:
+    # 2026-07-17: SKIP_MASS_ACCEPTANCE_BREACH joined because the hard-dollar
+    # per-game worst-case cap emits it WITH a game key (same game-loss
+    # aggregate the waiver certifies); the DELTA family emits it with
+    # game=None and stays fail-closed at the game-key check.
     assert WAIVABLE_RESERVATION_BREACHES == {
         ReasonCode.SKIP_GAME_LOSS_CAP,
         ReasonCode.SKIP_DIRECTIONAL_CAP,
+        ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH,
     }
 
 
@@ -393,7 +398,6 @@ async def test_waives_pure_directional_denial_under_game_loss_budget(
 @pytest.mark.parametrize(
     "other",
     [
-        ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH,   # gross / delta hard caps
         ReasonCode.SKIP_PER_COMBO_LOSS_CAP,
         ReasonCode.HALT_DAILY_LOSS,               # daily loss
         ReasonCode.SKIP_PORTFOLIO_CVAR,
@@ -442,6 +446,65 @@ async def test_waivable_breach_without_game_key_fails_closed(
     assert ok is False and "game key" in detail
     assert reservation.outstanding_count == 0
     _assert_waiver_counters(metrics)
+
+
+async def test_delta_style_mass_acceptance_breach_still_fails_closed(
+    kxwc: tuple[Harness, Store],
+) -> None:
+    # 2026-07-17: the DELTA family shares the hard-dollar cap's reason code
+    # but carries NO game key — the waiver must keep refusing it (fail-closed
+    # at the game-key check), never enumerate.
+    h, store = kxwc
+    lifecycle, _sender, _exposure, reservation, metrics = _build_rig(
+        h, store, limits=LimitChecker(WAIVER_LIMITS), bankroll_cc=BANKROLL_CC
+    )
+    breaches = [
+        Breach(ReasonCode.SKIP_GAME_LOSS_CAP, "game over cap", game=GAME),
+        Breach(ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH, "market delta -900 > 300"),
+    ]
+    ok, detail = await lifecycle._lastlook_mc_waiver(  # noqa: SLF001
+        "q1", _wc_state(), "fill:q1", breaches
+    )
+    assert ok is False and "game key" in detail
+    assert reservation.outstanding_count == 0
+    _assert_waiver_counters(metrics)
+
+
+async def test_hard_dollar_game_breach_arms_and_grants_the_waiver(
+    kxwc: tuple[Harness, Store],
+) -> None:
+    # 2026-07-17 (the 40-declined-wins root cause): the hard-dollar per-game
+    # cap's breach — game-KEYED under SKIP_MASS_ACCEPTANCE_BREACH — arms the
+    # waiver exactly like the frac cap, and the retry's certificate
+    # re-validation covers the hard branch too (_waiver_covers at hard_cc).
+    import dataclasses as _dc
+
+    h, store = kxwc
+    # Tighten the HARD cap so the resting-quote fold genuinely breaches it —
+    # the REAL denial then carries the game-keyed hard breach alongside the
+    # frac breach, and the retry exercises the _waiver_covers suppression on
+    # the hard branch end-to-end (certificate 8000cc <= the 8500cc hard
+    # budget AND <= the frac budget).
+    tight = _dc.replace(WAIVER_LIMITS, max_event_worst_case_loss_dollars=0.85)
+    limits = LimitChecker(tight)
+    lifecycle, _sender, exposure, reservation, metrics = _build_rig(
+        h, store, limits=limits, bankroll_cc=BANKROLL_CC
+    )
+    exposure.upsert_quote(_resting_quote("q:eng", ENG_ADV, ADV_EV))
+    state = _wc_state()
+
+    denied = lifecycle._reserve_headroom("fill:q1", "q1", state)  # noqa: SLF001
+    assert denied is not None and not denied.granted
+    reasons = {b.reason for b in denied.breaches}
+    assert ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH in reasons  # the hard cap
+    assert all(b.game == GAME for b in denied.breaches)
+
+    ok, detail = await lifecycle._lastlook_mc_waiver(  # noqa: SLF001
+        "q1", state, "fill:q1", denied.breaches
+    )
+    assert ok is True and detail == ""
+    assert reservation.is_outstanding("fill:q1")
+    _assert_waiver_counters(metrics, attempted=1, granted=1)
 
 
 # ------------------------------------------------------------ over budget

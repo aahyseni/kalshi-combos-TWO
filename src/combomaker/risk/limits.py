@@ -574,11 +574,23 @@ class LimitChecker:
         # R1/R2 correctness invariant #2.
         for game, loss_cc in snapshot.worst_case_loss_by_game_cc.items():
             if loss_cc / 10_000 > limits.max_event_worst_case_loss_dollars:
+                # WAIVER COVERAGE (2026-07-17): this hard-dollar cap binds on
+                # the SAME game-keyed loss aggregate as the %-of-bankroll
+                # game-loss cap below — a state-exact certificate within THIS
+                # cap's own budget covers it identically (in practice the
+                # waiver validates at the STRICTER frac budget too). The
+                # breach carries its game key so the waiver can certify it;
+                # pre-fix it was emitted game-less under a non-waivable code
+                # and disarmed the waiver on every 200-slot confirm.
+                hard_cc = int(limits.max_event_worst_case_loss_dollars * 10_000)
+                if _waiver_covers(waived_games, game, hard_cc):
+                    continue
                 breaches.append(
                     Breach(
                         ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH,
                         f"game {game} worst-case loss ${loss_cc / 10_000:.2f} > "
                         f"${limits.max_event_worst_case_loss_dollars}",
+                        game=game,
                     )
                 )
 

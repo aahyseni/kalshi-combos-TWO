@@ -115,7 +115,18 @@ JsonDict = dict[str, Any]
 # decline exactly as today (the waiver never touches gross / per-combo / daily /
 # CVaR / ruin / notional / slate caps or any halt).
 WAIVABLE_RESERVATION_BREACHES: frozenset[ReasonCode] = frozenset(
-    {ReasonCode.SKIP_GAME_LOSS_CAP, ReasonCode.SKIP_DIRECTIONAL_CAP}
+    {
+        ReasonCode.SKIP_GAME_LOSS_CAP,
+        ReasonCode.SKIP_DIRECTIONAL_CAP,
+        # 2026-07-17: the hard-dollar per-game worst-case cap emits this code
+        # WITH its game key (limits.py) — it binds on the SAME game-loss
+        # aggregate the waiver certifies, and the certificate is re-validated
+        # against the cap's own budget at the enforcement site. The DELTA
+        # family emits the same code with game=None, so those denials still
+        # fail closed at the "waivable breach missing its game key" check —
+        # a delta breach can never be waived.
+        ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH,
+    }
 )
 
 # EVENT-DRIVEN POST-FILL RISK PULL (resting-quote haircut, 2026-07-17): the
