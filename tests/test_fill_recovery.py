@@ -88,6 +88,7 @@ class RecoveryRig:
         *,
         getter: FakeQuoteGetter | None,
         config: LifecycleConfig | None = None,
+        fills_getter: Any | None = None,
     ) -> None:
         self.h = h
         self.store = store
@@ -124,6 +125,7 @@ class RecoveryRig:
                 fill_record_recovery_after_s=RECOVERY_AFTER_S,
             ),
             quote_getter=getter,
+            fills_getter=fills_getter,
         )
 
 
@@ -133,6 +135,7 @@ async def _make_rig(
     getter: FakeQuoteGetter | None,
     db: str = "recovery.sqlite3",
     config: LifecycleConfig | None = None,
+    fills_getter: Any | None = None,
 ) -> RecoveryRig:
     h = Harness()
     await h.with_books(["M1", "M2"])
@@ -142,7 +145,7 @@ async def _make_rig(
     seed_event(h, "E1", exclusive=True)
     seed_event(h, "E2", exclusive=True)
     store = await Store.open(tmp_path / db, h.clock)
-    return RecoveryRig(h, store, getter=getter, config=config)
+    return RecoveryRig(h, store, getter=getter, config=config, fills_getter=fills_getter)
 
 
 def rfq(rfq_id: str = "rfq_1") -> Rfq:

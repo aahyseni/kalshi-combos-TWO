@@ -2233,6 +2233,25 @@ class RiskConfig(StrictModel):
     # fires only on a genuinely lost message. Must be a positive, finite number
     # (validator below); LifecycleConfig.fill_record_recovery_after_s downstream.
     fill_record_recovery_after_s: float = 10.0
+    # CANCEL-REPORT VERIFY-BEFORE-DISCARD (2026-07-18, two live incidents the
+    # same day — quotes 903935fc/7d79f32b). A CONFIRMED quote whose REST status
+    # comes back CANCELLED ("execution failed") is NOT discarded on the report
+    # alone: /portfolio/fills is polled ``fill_cancel_verify_attempts`` times,
+    # ``fill_cancel_verify_delay_s`` apart (defaults: 3 polls over ~3 min —
+    # covers the observed late taker-style execution), before the phantom is
+    # removed. A matching exchange fill KEEPS the position and writes the
+    # fills row via the normal writer (fill_recovery_late_execution).
+    # attempts = 0 disables verification (the pre-incident immediate discard —
+    # not recommended live); the delay must be a positive finite number.
+    fill_cancel_verify_attempts: int = 3
+    fill_cancel_verify_delay_s: float = 90.0
+    # PERIODIC POSITION-RECONCILE NET (2026-07-18 requirement 3). Every this
+    # many seconds the app compares the exchange's open positions
+    # (GET /portfolio/positions, read-only, subaccount-pinned) against the
+    # in-memory exposure book and alarms position_reconcile_unmodeled on any
+    # exchange position the book does not know — alarm-only, NEVER an
+    # auto-insert (fail-safe direction). Default 300 s (5 min).
+    position_reconcile_interval_s: float = 300.0
     # F1 MONOTONE PRE-PRICING GATE (throughput synthesis 2026-07-16). When True,
     # handle_rfq consults a CANDIDATE-FREE limits check (cached ≤0.5s per
     # exposure generation + bankroll) BEFORE the expensive joint pricing and
@@ -2394,6 +2413,29 @@ class RiskConfig(StrictModel):
             raise ValueError(
                 f"fill_record_recovery_after_s must be a positive finite number "
                 f"of seconds, got {v}"
+            )
+        return v
+
+    # Cancel-report verification (2026-07-18): the delay must be positive and
+    # finite (NaN fails the comparison ⇒ rejected — never a silent stall), and
+    # the poll budget non-negative (0 = verification explicitly disabled).
+    @field_validator("fill_cancel_verify_delay_s", "position_reconcile_interval_s")
+    @classmethod
+    def _valid_verify_intervals(cls, v: float, info: ValidationInfo) -> float:
+        if not (0.0 < v < float("inf")):
+            raise ValueError(
+                f"{info.field_name} must be a positive finite number of "
+                f"seconds, got {v}"
+            )
+        return v
+
+    @field_validator("fill_cancel_verify_attempts")
+    @classmethod
+    def _valid_verify_attempts(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(
+                f"fill_cancel_verify_attempts must be >= 0 (0 disables "
+                f"verification), got {v}"
             )
         return v
 

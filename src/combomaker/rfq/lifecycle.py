@@ -31,7 +31,13 @@ from typing import Any, Protocol
 
 from combomaker.core.clock import Clock
 from combomaker.core.conventions import Conventions, Side
-from combomaker.core.money import CC_PER_CENT, CC_PER_DOLLAR, CentiCents
+from combomaker.core.money import (
+    CC_PER_CENT,
+    CC_PER_DOLLAR,
+    CentiCents,
+    MoneyParseError,
+    fee_cc_from_dollars_str,
+)
 from combomaker.core.quantity import CentiContracts, qty_from_fp_str
 from combomaker.core.reasons import ReasonCode
 from combomaker.exchange.rest import KalshiApiError
@@ -180,6 +186,22 @@ class QuoteGetter(Protocol):
     async def get_quote(self, quote_id: str) -> JsonDict: ...
 
 
+class FillsGetter(Protocol):
+    """GET slice for CANCEL-REPORT VERIFICATION (2026-07-18 incidents A+B): the
+    REST ``GET /portfolio/fills`` read the sweep polls before it will believe a
+    CANCELLED quote status. PROVEN twice live 2026-07-18 (quotes 903935fc and
+    7d79f32b): the exchange reported a CONFIRMED quote as ``cancelled``
+    (``cancellation_reason: "execution failed"``) while the fill EXECUTED
+    anyway as a taker-style REGULAR order (nonzero ``fee_cost``,
+    ``is_taker: true``) visible only on /portfolio/fills — no
+    ``quote_executed`` WS message ever fires for that variant. Optional and
+    separate from ``QuoteSender``/``QuoteGetter`` so paper mode and existing
+    fakes stay untouched; no getter wired ⇒ the prior immediate-discard
+    behaviour (backtests/minimal rigs only — live always wires it)."""
+
+    async def get_fills(self, **params: str | int) -> JsonDict: ...
+
+
 # FILL-RECORD RECOVERY SWEEP bounds (2026-07-16 P1). Rate-bound the REST polls
 # per maintenance tick (the tick beats every 0.5s; recovery is not latency-
 # critical) and bound the per-quote attempts: after the budget is exhausted the
@@ -188,6 +210,19 @@ class QuoteGetter(Protocol):
 # found the 2026-07-16 proven case) rather than polling forever.
 _FILL_RECOVERY_MAX_POLLS_PER_TICK = 3
 _FILL_RECOVERY_MAX_ATTEMPTS = 10
+
+# CANCEL-REPORT VERIFICATION bounds (2026-07-18 review). A verification ROUND
+# whose EVERY /portfolio/fills read failed proves nothing about absence — the
+# whole round is retried on the same cadence up to this many rounds (so a
+# transient 429 storm cannot pin a possibly-phantom position's budget until
+# restart), THEN the loud unresolved give-up. And the /portfolio/fills query is
+# time-scoped to the verification window: min_ts = the quote's confirm
+# WALL-time minus this slack (absorbs local-vs-exchange clock skew without
+# re-admitting the ticker's historical tape — the live ledger holds
+# same-ticker/side/exact-count fills hours apart, so an unscoped match can hit
+# a HISTORICAL fill and double-count it).
+_CANCEL_VERIFY_MAX_ROUNDS = 3
+_CANCEL_VERIFY_MIN_TS_SLACK_S = 60
 
 # REPRICE-SWEEP WEDGE DEFENSES (2026-07-16 — the 18:13Z heartbeat kill; see
 # maintenance_tick). Consecutive pool-deadline results that trip the frozen-pool
@@ -294,6 +329,22 @@ class LifecycleConfig:
     # from RiskConfig.fill_record_recovery_after_s. A non-positive/NaN value
     # disables the sweep (fail-closed: never poll on a nonsense config).
     fill_record_recovery_after_s: float = 10.0
+    # CANCEL-REPORT VERIFY-BEFORE-DISCARD (2026-07-18, two live incidents).
+    # When the recovery sweep's REST GET quote reports a CONFIRMED quote as
+    # CANCELLED, the position is NOT discarded until ``/portfolio/fills`` has
+    # been checked for a matching execution: the exchange executed BOTH
+    # 2026-07-18 "cancelled" quotes as taker-style regular orders (fills
+    # visible only on /portfolio/fills, one landing minutes after the cancel
+    # report). ``fill_cancel_verify_attempts`` bounded polls, spaced
+    # ``fill_cancel_verify_delay_s`` apart on the injectable clock (defaults: 3
+    # polls over ~3 minutes — covers the observed late execution). A match ⇒
+    # the position is KEPT and the fills row is written through the NORMAL
+    # on_quote_executed writer (fill_recovery_late_execution). Genuinely absent
+    # after the polls ⇒ the phantom is removed exactly as before, with the
+    # verification evidence logged. attempts <= 0 ⇒ verification disabled (the
+    # pre-2026-07-18 immediate discard; not recommended live).
+    fill_cancel_verify_attempts: int = 3
+    fill_cancel_verify_delay_s: float = 90.0
     # F1 MONOTONE PRE-PRICING GATE (throughput synthesis 2026-07-16, lens-3 F1).
     # When True, handle_rfq consults a CANDIDATE-FREE limits check (cached per
     # exposure generation + bankroll, ≤0.5s) BEFORE the expensive joint pricing
@@ -374,11 +425,38 @@ class OpenQuoteState:
     # succeeded client-side (the unknown-committed path belongs to the
     # reservation-reconcile loop, never this sweep).
     fill_confirmed_mono_ns: int | None = None
+    # WALL-clock epoch seconds of the same confirm-success moment (2026-07-18
+    # review): the ``min_ts`` anchor that scopes the cancel-verification
+    # /portfolio/fills query to THIS quote's execution window instead of the
+    # ticker's whole recent tape (which holds identical-count historical fills).
+    fill_confirmed_wall_ts: int | None = None
     # True once this quote's fills-ledger row exists (recorded, or confirmed
     # present on a replay) — the sweep's terminal success state.
     fill_recorded: bool = False
     # REST polls spent recovering this quote (bounded; exhausted ⇒ loud metric).
     fill_recovery_attempts: int = 0
+    # CANCEL-REPORT VERIFICATION (2026-07-18 incidents A+B). Set (monotonic ns)
+    # when REST reported this CONFIRMED quote as CANCELLED — the point
+    # verify-before-discard starts. While set, the position stays booked
+    # (fail-safe: risk keeps counting) and the sweep polls /portfolio/fills on
+    # the configured cadence instead of trusting the cancel report.
+    cancel_verify_started_mono_ns: int | None = None
+    # /portfolio/fills polls spent (bounded by fill_cancel_verify_attempts).
+    cancel_verify_attempts: int = 0
+    # Polls that READ successfully (a no-match only counts as evidence of
+    # absence when we actually read the fills tape; all-errors ⇒ unresolved).
+    cancel_verify_ok_reads: int = 0
+    # Fully-errored verification ROUNDS completed (2026-07-18 review): each
+    # all-errors round is retried on the same cadence up to
+    # _CANCEL_VERIFY_MAX_ROUNDS before the loud unresolved give-up, so a
+    # transient 429 storm cannot pin a phantom's budget until restart.
+    cancel_verify_rounds: int = 0
+    # The matched exchange fill once verification FINDS the execution — the
+    # terminal "this fill is REAL" state; the ledger row is then written via
+    # the normal on_quote_executed path (retried boundedly if the write fails).
+    cancel_verified_fill: JsonDict | None = None
+    # The cancel report's cancellation_reason, kept for the resolution log.
+    cancel_reported_reason: str | None = None
 
 
 class QuoteLifecycle:
@@ -417,6 +495,8 @@ class QuoteLifecycle:
         joint_pool: JointPool | None = None,
         book_risk_pool: BookRiskPool | None = None,
         quote_getter: QuoteGetter | None = None,
+        fills_getter: FillsGetter | None = None,
+        fills_subaccount: int | None = None,
         beat: Callable[[], None] | None = None,
         rfq_alive: Callable[[str], bool] | None = None,
     ) -> None:
@@ -530,6 +610,22 @@ class QuoteLifecycle:
         # the sweep polls. None (paper/backtests/minimal rigs) ⇒ no sweep — the
         # ledger is never patched from a guess (fail-closed).
         self._quote_getter = quote_getter
+        # CANCEL-REPORT VERIFICATION (2026-07-18): the /portfolio/fills GET
+        # slice verify-before-discard polls before believing a CANCELLED status
+        # on a confirmed quote (both 2026-07-18 incidents executed as
+        # taker-style regular orders while the quote status said cancelled).
+        # None (paper/backtests/minimal rigs) ⇒ the prior immediate discard.
+        # ``fills_subaccount`` pins the read to our ONE subaccount at the query
+        # layer (P0-5 doctrine), matching every other portfolio read.
+        self._fills_getter = fills_getter
+        self._fills_subaccount = fills_subaccount
+        # CLAIM SET (2026-07-18 review): exchange order_ids adopted by an
+        # IN-FLIGHT verification whose ledger row has not landed yet. Two
+        # concurrently-verifying quotes structurally matching the SAME exchange
+        # fill must not both adopt it — the first claims the order_id here; the
+        # claim is released once the fills row exists (the ledger's own
+        # order_id guard takes over from there).
+        self._claimed_exchange_order_ids: set[str] = set()
         # HEARTBEAT BEAT (2026-07-16 wedge fix): quote_app's Heartbeat.beat,
         # invoked per iteration inside the long maintenance sub-loops (reprice
         # sweep, recovery polls) so a loop that is genuinely MAKING PROGRESS
@@ -2614,6 +2710,10 @@ class QuoteLifecycle:
                 # failed/timed-out confirm is the unknown-committed path the
                 # reservation-reconcile loop owns.
                 state.fill_confirmed_mono_ns = self._clock.monotonic_ns()
+                # WALL-time twin of the stamp above (2026-07-18 review): the
+                # min_ts anchor for the cancel-verification /portfolio/fills
+                # query — scopes matching to THIS execution window.
+                state.fill_confirmed_wall_ts = int(self._clock.now().timestamp())
                 # POST-FILL RISK PULL: scheduled BELOW, after _drop_quote —
                 # see the stamp-gated call at the end of this method. It must
                 # NOT be scheduled here: between commit (position booked) and
@@ -2826,7 +2926,6 @@ class QuoteLifecycle:
         if state.pending_fill is None:
             log.warning("execution_without_pending_fill", quote_id=quote_id)
             return
-        accepted_side, bid, qty = state.pending_fill
         # Book the fill. With a reservation service, execution CONFIRMS the fill
         # landed — commit the reservation (converts a still-outstanding
         # reservation, e.g. one whose confirm timed out and was marked
@@ -2848,6 +2947,40 @@ class QuoteLifecycle:
         # clean book breaks the pass on its first iteration).
         self._schedule_risk_evict_on_fill(state)
         fill_ref = f"fill:{quote_id}"
+        # LEDGER-WRITE HARDENING (2026-07-18 requirement 2): the in-memory
+        # commit above SUCCEEDED (position booked / evictions scheduled), so a
+        # failed or crashed ledger write below must never pass silently — that
+        # is exactly the "book counted it, persistence did not" divergence. Any
+        # exception here is a LOUD ERROR + a retry: ``fill_recorded`` stays
+        # False and ``fill_confirmed_mono_ns`` is stamped, so the maintenance
+        # recovery sweep re-polls and replays this same path (bounded attempts,
+        # loud exhaustion); the /portfolio/fills verification net applies if
+        # the quote status comes back cancelled.
+        try:
+            await self._record_executed_fill(quote_id, state, msg, fill_ref)
+        except Exception:
+            self._metrics.inc("fill_ledger.write_failed")
+            if state.fill_confirmed_mono_ns is None:
+                state.fill_confirmed_mono_ns = self._clock.monotonic_ns()
+            if state.fill_confirmed_wall_ts is None:
+                state.fill_confirmed_wall_ts = int(self._clock.now().timestamp())
+            self._executed_states.setdefault(quote_id, state)
+            log.exception(
+                "fill_ledger_write_failed",
+                quote_id=quote_id,
+                fill_ref=fill_ref,
+                detail="in-memory book holds this committed fill but the "
+                "fills-ledger write failed — row NOT written yet; the recovery "
+                "sweep will retry (bounded, loud on exhaustion)",
+            )
+
+    async def _record_executed_fill(
+        self, quote_id: str, state: OpenQuoteState, msg: JsonDict, fill_ref: str
+    ) -> None:
+        """The fills-ledger tail of ``on_quote_executed`` — the ONE writer of
+        fills rows (2026-07-16 P1). Split out so the caller can make any
+        failure here a loud ERROR with a retry (2026-07-18 requirement 2)
+        without touching the booking logic above it."""
         # LEDGER IDEMPOTENCY (2026-07-16 P1): the recovery sweep polls REST for a
         # fill whose WS message never arrived and replays it through THIS path, so
         # a WS+poll race (or an exchange replay) must never double-write the fills
@@ -2858,6 +2991,8 @@ class QuoteLifecycle:
             state.fill_recorded = True
             log.info("fill_replay_skipped", quote_id=quote_id, fill_ref=fill_ref)
             return
+        assert state.pending_fill is not None  # caller verified
+        accepted_side, bid, qty = state.pending_fill
         our_side = self._conventions.maker_position_side(accepted_side)
         expected_edge_cc: int | None
         if our_side is Side.YES:
@@ -2881,16 +3016,34 @@ class QuoteLifecycle:
             combo_ticker=state.rfq.market_ticker,
             collection=state.rfq.mve_collection_ticker,
         )
+        # EXCHANGE-REPORTED FEE OVERRIDE (2026-07-18 verify-before-discard): a
+        # late/taker-style execution recovered off /portfolio/fills carries the
+        # REAL charged fee (both incidents: is_taker=true, nonzero fee_cost) —
+        # the model's maker-quadratic $0 would understate a cash cost we
+        # actually paid. The recovery replay passes it as ``exchange_fee_cc``
+        # (int cc, parsed fail-closed by _exchange_fill_fee_cc); it beats the
+        # model figure. Absent on every normal WS/poll message ⇒ bit-identical
+        # prior behaviour.
+        exchange_fee = msg.get("exchange_fee_cc")
+        exchange_fee_reported = False
+        if isinstance(exchange_fee, int) and not isinstance(exchange_fee, bool):
+            exchange_fee_reported = True
+            fill_fee_cc = int(exchange_fee)
         # EAT-THE-FEE accounting in the EV ledger: on a maker-fee-active series
         # the predicted fee is a known cash cost of this fill, so the recorded
         # expected edge is net of it (grading expected vs realized stays
         # apples-to-apples). Gated on the prefix list so an EMPTY list is
-        # bit-identical to prior behaviour on every ledger row.
+        # bit-identical to prior behaviour on every ledger row. An
+        # EXCHANGE-REPORTED fee (late-execution recovery) is a real cash cost
+        # regardless of the maker-fee list, so it nets the edge the same way.
         if (
             expected_edge_cc is not None
             and fill_fee_cc is not None
-            and self._maker_fee_active(
-                state.rfq.market_ticker, state.rfq.mve_collection_ticker
+            and (
+                exchange_fee_reported
+                or self._maker_fee_active(
+                    state.rfq.market_ticker, state.rfq.mve_collection_ticker
+                )
             )
         ):
             expected_edge_cc -= int(fill_fee_cc)
@@ -3052,6 +3205,14 @@ class QuoteLifecycle:
                 break
             if state.fill_recorded or state.pending_fill is None:
                 continue
+            if state.cancel_verify_started_mono_ns is not None:
+                # CANCEL-REPORT VERIFICATION in progress (2026-07-18): the
+                # quote status said CANCELLED but the position stays booked
+                # until /portfolio/fills proves the fill absent (or finds it —
+                # both 2026-07-18 "cancelled" quotes were REAL taker-style
+                # executions). Own cadence + bounds; never re-polls GET quote.
+                polls += await self._cancel_verification_step(quote_id, state, now)
+                continue
             if state.fill_confirmed_mono_ns is None:
                 # Confirm never succeeded client-side (unknown-committed): the
                 # reservation-reconcile loop owns that path, never this sweep.
@@ -3110,7 +3271,6 @@ class QuoteLifecycle:
                 )
                 await self.on_quote_executed(msg)
             elif status == "cancelled":
-                self._metrics.inc("fill_recovery.cancelled")
                 self._recover_cancelled_fill(quote_id, state, quote)
             elif status in ("open", "accepted", "confirmed"):
                 # Legitimately not executed yet (a stalled execution timer):
@@ -3134,22 +3294,83 @@ class QuoteLifecycle:
         self, quote_id: str, state: OpenQuoteState, quote: Any
     ) -> None:
         """The exchange CANCELLED a quote we confirmed (a post-confirm void —
-        no WS event exists for it, doc: rfq-flow.md): the fill never executed,
-        so the position committed at confirm is PHANTOM. Existing lapse/cancel
-        cleanup, applied here: release any straggler reservation (idempotent —
-        a committed one is no longer outstanding), drop the phantom position
-        from the exposure book (the settlement seam's own removal — bumps the
-        position generation so stale snapshots invalidate), and un-park the
-        state exactly like the decline paths do."""
+        no WS event exists for it, doc: rfq-flow.md).
+
+        VERIFY-BEFORE-DISCARD (2026-07-18, two live incidents the same day):
+        the cancel report is NOT trusted on its own. Quotes 903935fc (16:24Z)
+        and 7d79f32b (18:30Z) both came back ``cancelled``
+        (``cancellation_reason: "execution failed"``) from REST GET quote while
+        the exchange EXECUTED the fill anyway as a taker-style REGULAR order —
+        visible only on ``/portfolio/fills`` (nonzero fee, ``is_taker: true``),
+        with no ``quote_executed`` WS message ever emitted. Discarding on the
+        report alone removed a REAL position from the risk book (undercount —
+        the dangerous direction). So: with a fills getter wired, the position
+        STAYS BOOKED and verification polls /portfolio/fills on the sweep's
+        next ticks (bounded attempts, injectable clock). Only a verified
+        absence discards the phantom. No fills getter (paper/backtests/minimal
+        rigs) or verification disabled ⇒ the prior immediate discard."""
         cancellation_reason = (
             quote.get("cancellation_reason") if isinstance(quote, dict) else None
         )
+        if (
+            self._fills_getter is None
+            or self._config.fill_cancel_verify_attempts <= 0
+        ):
+            self._discard_phantom_position(
+                quote_id,
+                state,
+                cancellation_reason=cancellation_reason,
+                detail="confirmed quote came back CANCELLED from REST — fill "
+                "never executed; phantom position removed, no fills row written"
+                " (no fills getter wired — /portfolio/fills verification "
+                "unavailable)",
+                verify_attempts=0,
+                verify_ok_reads=0,
+            )
+            return
+        state.cancel_verify_started_mono_ns = self._clock.monotonic_ns()
+        state.cancel_reported_reason = (
+            None if cancellation_reason is None else str(cancellation_reason)
+        )
+        self._metrics.inc("fill_recovery.cancel_verify_started")
+        log.warning(
+            "fill_recovery_cancel_report_verifying",
+            quote_id=quote_id,
+            cancellation_reason=cancellation_reason,
+            attempts=self._config.fill_cancel_verify_attempts,
+            delay_s=self._config.fill_cancel_verify_delay_s,
+            detail="confirmed quote came back CANCELLED from REST — NOT "
+            "discarding yet; the position stays in the risk book while "
+            "/portfolio/fills is checked for a late/taker-style execution "
+            "(both 2026-07-18 cancel reports were REAL executed fills)",
+        )
+        self._drop_quote(quote_id)
+
+    def _discard_phantom_position(
+        self,
+        quote_id: str,
+        state: OpenQuoteState,
+        *,
+        cancellation_reason: Any,
+        detail: str,
+        verify_attempts: int,
+        verify_ok_reads: int,
+    ) -> None:
+        """Remove a verified-phantom position: release any straggler
+        reservation (idempotent — a committed one is no longer outstanding),
+        drop the phantom position from the exposure book (the settlement seam's
+        own removal — bumps the position generation so stale snapshots
+        invalidate), and un-park the state exactly like the decline paths do.
+        The ONLY writer of ``fill_recovery_quote_cancelled`` — every discard
+        carries its verification evidence."""
+        self._metrics.inc("fill_recovery.cancelled")
         log.warning(
             "fill_recovery_quote_cancelled",
             quote_id=quote_id,
             cancellation_reason=cancellation_reason,
-            detail="confirmed quote came back CANCELLED from REST — fill never "
-            "executed; phantom position removed, no fills row written",
+            verify_attempts=verify_attempts,
+            verify_ok_reads=verify_ok_reads,
+            detail=detail,
         )
         if self._reservation is not None:
             self._reservation.release(f"fill:{quote_id}")
@@ -3157,6 +3378,316 @@ class QuoteLifecycle:
         self._executed_states.pop(quote_id, None)
         state.pending_fill = None
         self._drop_quote(quote_id)
+
+    # ------------------------------------ cancel-report /portfolio/fills verify
+
+    async def _cancel_verification_step(
+        self, quote_id: str, state: OpenQuoteState, now: int
+    ) -> int:
+        """One maintenance-tick step of verify-before-discard for a quote whose
+        REST status said CANCELLED. Returns the number of REST polls spent (0
+        or 1) so the sweep's per-tick budget covers these too.
+
+        States: (a) execution already VERIFIED but the ledger write failed ⇒
+        retry the normal-writer replay (no REST poll; bounded by the sweep's
+        attempt budget, loud on exhaustion); (b) next /portfolio/fills poll due
+        (attempt n is due at start + n·delay on the injectable clock) ⇒ poll
+        and match; (c) not due yet ⇒ nothing. Resolution is in
+        ``_resolve_cancel_verification``: verified-absent discards the phantom,
+        all-reads-errored KEEPS the position (fail-safe — never uncount risk we
+        could not disprove) and reports loudly."""
+        assert state.cancel_verify_started_mono_ns is not None
+        if state.cancel_verified_fill is not None:
+            # (a) fill PROVEN real; only the ledger row is missing. Replay the
+            # normal writer path until it lands (bounded + loud). The order_id
+            # claim is held until the row exists (then the ledger guard owns it).
+            if state.fill_recovery_attempts >= _FILL_RECOVERY_MAX_ATTEMPTS:
+                return 0  # exhausted — already reported loudly
+            state.fill_recovery_attempts += 1
+            await self._replay_verified_fill(quote_id, state)
+            if state.fill_recorded:
+                self._release_fill_claim(state)
+            else:
+                self._note_fill_recovery_exhausted(quote_id, state)
+            return 0
+        delay_ns = self._cancel_verify_delay_ns()
+        max_attempts = self._config.fill_cancel_verify_attempts
+        due_ns = (
+            state.cancel_verify_started_mono_ns
+            + state.cancel_verify_attempts * delay_ns
+        )
+        if now < due_ns:
+            return 0
+        if state.cancel_verify_attempts >= max_attempts:
+            # Budget spent without a match (only reachable if resolution was
+            # interrupted): resolve now.
+            self._resolve_cancel_verification(quote_id, state, now)
+            return 0
+        state.cancel_verify_attempts += 1
+        final = state.cancel_verify_attempts >= max_attempts
+        self._beat()  # a REST poll is progress, not a wedge
+        self._metrics.inc("fill_recovery.verify_polls")
+        # TIME-SCOPE the query (2026-07-18 review): min_ts = confirm wall-time
+        # minus a small skew slack, so the match window is THIS quote's
+        # verification window — never the ticker's historical tape (which holds
+        # identical-count fills hours apart; adopting one double-counts).
+        min_ts: int | None = None
+        if state.fill_confirmed_wall_ts is not None:
+            min_ts = max(0, state.fill_confirmed_wall_ts - _CANCEL_VERIFY_MIN_TS_SLACK_S)
+        try:
+            payload = await asyncio.wait_for(
+                self._get_portfolio_fills(state.rfq.market_ticker, min_ts=min_ts),
+                timeout=2.5,
+            )
+        except Exception as exc:  # noqa: BLE001 — any poll error retries on cadence
+            self._metrics.inc("fill_recovery.verify_errors")
+            log.warning(
+                "fill_recovery_verify_poll_failed",
+                quote_id=quote_id,
+                attempt=state.cancel_verify_attempts,
+                error=repr(exc),
+            )
+            if final:
+                self._resolve_cancel_verification(quote_id, state, now)
+            return 1
+        state.cancel_verify_ok_reads += 1
+        match = await self._adopt_exchange_fill(quote_id, state, payload)
+        if match is not None:
+            state.cancel_verified_fill = dict(match)
+            self._metrics.inc("fill_recovery.late_execution")
+            log.warning(
+                "fill_recovery_late_execution",
+                quote_id=quote_id,
+                combo_ticker=state.rfq.market_ticker,
+                order_id=match.get("order_id"),
+                count_fp=match.get("count_fp"),
+                fee_cost=match.get("fee_cost"),
+                is_taker=match.get("is_taker"),
+                created_time=match.get("created_time"),
+                attempts=state.cancel_verify_attempts,
+                detail="quote status said CANCELLED but /portfolio/fills shows "
+                "the execution (late/taker-style) — position KEPT in the risk "
+                "book; fills row now written via the normal on_quote_executed "
+                "writer",
+            )
+            await self._replay_verified_fill(quote_id, state)
+            if state.fill_recorded:
+                self._release_fill_claim(state)
+            return 1
+        if final:
+            self._resolve_cancel_verification(quote_id, state, now)
+        return 1
+
+    def _cancel_verify_delay_ns(self) -> int:
+        """The verification poll spacing in monotonic ns. NaN/negative delay ⇒
+        0 (attempts run back-to-back per tick — still bounded by the attempt
+        budget; never a silent verification stall)."""
+        delay_s = self._config.fill_cancel_verify_delay_s
+        return int(delay_s * 1e9) if delay_s > 0.0 else 0
+
+    def _resolve_cancel_verification(
+        self, quote_id: str, state: OpenQuoteState, now: int
+    ) -> None:
+        """Verdict once a verification ROUND's poll budget is spent without a
+        match. At least one successful read (any round) ⇒ the fill is GENUINELY
+        absent: discard the phantom exactly as before (with the evidence).
+        Every read errored ⇒ absence was never proven: KEEP the position and
+        RETRY a whole round on the same cadence (2026-07-18 review — a
+        transient 429 storm must not pin a phantom's budget until restart),
+        bounded by ``_CANCEL_VERIFY_MAX_ROUNDS``; only then the loud ERROR
+        give-up (position still kept — fail-safe; the next-restart exchange
+        reconcile owns it from there)."""
+        if state.cancel_verify_ok_reads > 0:
+            self._release_fill_claim(state)  # defensive — no adoption happened
+            self._discard_phantom_position(
+                quote_id,
+                state,
+                cancellation_reason=state.cancel_reported_reason,
+                detail="confirmed quote came back CANCELLED from REST and "
+                "/portfolio/fills shows NO matching execution after bounded "
+                "verification — phantom position removed, no fills row written",
+                verify_attempts=state.cancel_verify_attempts,
+                verify_ok_reads=state.cancel_verify_ok_reads,
+            )
+            return
+        state.cancel_verify_rounds += 1
+        if state.cancel_verify_rounds < _CANCEL_VERIFY_MAX_ROUNDS:
+            # Reschedule a fresh round one delay from now (same cadence).
+            state.cancel_verify_attempts = 0
+            state.cancel_verify_started_mono_ns = now + self._cancel_verify_delay_ns()
+            self._metrics.inc("fill_recovery.verify_round_failed")
+            log.warning(
+                "fill_recovery_verify_round_failed",
+                quote_id=quote_id,
+                combo_ticker=state.rfq.market_ticker,
+                round=state.cancel_verify_rounds,
+                max_rounds=_CANCEL_VERIFY_MAX_ROUNDS,
+                detail="every /portfolio/fills read in this verification round "
+                "failed — position stays booked; retrying a full round",
+            )
+            return
+        self._release_fill_claim(state)  # defensive — no adoption happened
+        self._metrics.inc("fill_recovery.verify_unresolved")
+        log.error(
+            "fill_recovery_verify_unresolved",
+            quote_id=quote_id,
+            combo_ticker=state.rfq.market_ticker,
+            verify_rounds=state.cancel_verify_rounds,
+            detail="cancel report could NOT be verified against "
+            "/portfolio/fills (every read failed across all retry rounds) — "
+            "position KEPT in the risk book (fail-safe), no fills row written; "
+            "the next-restart exchange reconcile is the backstop",
+        )
+        self._executed_states.pop(quote_id, None)
+
+    async def _get_portfolio_fills(
+        self, ticker: str, *, min_ts: int | None = None
+    ) -> JsonDict:
+        """GET /portfolio/fills for one combo ticker (read-only), pinned to our
+        subaccount when configured (P0-5 query-layer pin) and time-scoped by
+        ``min_ts`` (epoch seconds — index-scan §portfolio fills) when given."""
+        assert self._fills_getter is not None
+        params: dict[str, str | int] = {"ticker": ticker, "limit": 100}
+        if min_ts is not None:
+            params["min_ts"] = min_ts
+        if self._fills_subaccount is not None:
+            params["subaccount"] = self._fills_subaccount
+        return await self._fills_getter.get_fills(**params)
+
+    async def _adopt_exchange_fill(
+        self, quote_id: str, state: OpenQuoteState, payload: JsonDict
+    ) -> JsonDict | None:
+        """The first structurally-matching exchange fill that passes the
+        ADOPTION GUARDS (2026-07-18 review), with its order_id CLAIMED — or
+        None. Guards, each independently load-bearing against double-count:
+
+        - ``order_id`` present (the dedupe key; the documented Fill schema
+          always carries it — a row without one can never be deduped, so it is
+          never adopted: fail-closed);
+        - not already CLAIMED by another in-flight verification (two
+          concurrently-verifying quotes must not both adopt ONE exchange fill);
+        - not already IN THE LOCAL LEDGER (a historical fill of the same
+          ticker/side/exact count — proven on today's live tape — belongs to
+          an earlier quote; adopting it would keep a phantom AND double-book
+          the fee).
+
+        Rejected candidates are logged + counted per reason so a guard firing
+        live is visible evidence, not silence."""
+        for row in self._match_exchange_fill(state, payload):
+            order_id_raw = row.get("order_id")
+            if not order_id_raw:
+                reason = "order_id_missing"
+            else:
+                order_id = str(order_id_raw)
+                if order_id in self._claimed_exchange_order_ids:
+                    reason = "already_claimed"
+                elif await self._store.has_fill_for_order_id(order_id):
+                    reason = "already_in_ledger"
+                else:
+                    self._claimed_exchange_order_ids.add(order_id)
+                    return row
+            self._metrics.inc("fill_recovery.verify_match_rejected")
+            self._metrics.inc(f"fill_recovery.verify_match_rejected.{reason}")
+            log.warning(
+                "fill_recovery_verify_match_rejected",
+                quote_id=quote_id,
+                combo_ticker=state.rfq.market_ticker,
+                order_id=row.get("order_id"),
+                reason=reason,
+                detail="structurally-matching exchange fill NOT adopted — "
+                "adoption guard refused it (double-count protection)",
+            )
+        return None
+
+    def _release_fill_claim(self, state: OpenQuoteState) -> None:
+        """Release this state's claimed exchange order_id (once the ledger row
+        exists the ledger's own order_id guard takes over; on discard/terminal
+        paths the release is defensive — no adoption reaches them)."""
+        fill = state.cancel_verified_fill
+        if not fill:
+            return
+        order_id = fill.get("order_id")
+        if order_id:
+            self._claimed_exchange_order_ids.discard(str(order_id))
+
+    def _match_exchange_fill(
+        self, state: OpenQuoteState, payload: JsonDict
+    ) -> list[JsonDict]:
+        """Every exchange fill STRUCTURALLY matching this quote's pending fill
+        (adoption guards — order_id/claim/ledger — are applied by
+        ``_adopt_exchange_fill``).
+
+        Structural match = same combo ticker (queried, but re-checked) + same
+        OUR side (``outcome_side``, legacy ``side`` fallback — index-scan
+        §portfolio fills) + EXACT centi-contract count (``count_fp``). Price is
+        deliberately NOT matched: incident A executed at 0.7660 against our
+        0.7670 bid — the taker-style variant can fill off our exact bid; the
+        raw fill rides the ledger row for the evidence. Any unreadable field
+        skips that row (fail-closed: a fill is never matched from a guess)."""
+        if state.pending_fill is None:
+            return []
+        accepted_side, _bid, qty = state.pending_fill
+        our_side = self._conventions.maker_position_side(accepted_side)
+        rows = payload.get("fills") or []
+        if not isinstance(rows, list):
+            return []
+        matches: list[JsonDict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            ticker = str(row.get("ticker") or row.get("market_ticker") or "")
+            if ticker != state.rfq.market_ticker:
+                continue
+            side_raw = str(row.get("outcome_side") or row.get("side") or "").lower()
+            if side_raw != our_side.value:
+                continue
+            count_raw = row.get("count_fp") or row.get("count")
+            if count_raw is None:
+                continue
+            try:
+                count = int(qty_from_fp_str(str(count_raw)))
+            except ValueError:
+                continue
+            if count != int(qty):
+                continue
+            matches.append(row)
+        return matches
+
+    async def _replay_verified_fill(self, quote_id: str, state: OpenQuoteState) -> None:
+        """Book the VERIFIED late execution through the NORMAL writer path —
+        the same ``on_quote_executed`` every ordinary fill takes (never a
+        hand-built ledger row). The position was never removed (verification
+        keeps it booked), so the booking side is an idempotent no-op; the
+        ledger tail writes the row, books the exchange-reported fee into
+        realized P&L, and tracks markouts exactly once (fill_ref guard)."""
+        fill = state.cancel_verified_fill
+        assert fill is not None
+        msg: JsonDict = {
+            "quote_id": quote_id,
+            "recovered_via_fills_poll": True,
+            "exchange_fill": dict(fill),
+        }
+        order_id = fill.get("order_id")
+        if order_id:
+            msg["order_id"] = str(order_id)
+        fee_cc = self._exchange_fill_fee_cc(fill)
+        if fee_cc is not None:
+            msg["exchange_fee_cc"] = fee_cc
+        await self.on_quote_executed(msg)
+
+    @staticmethod
+    def _exchange_fill_fee_cc(fill: JsonDict) -> int | None:
+        """The exchange fill's ``fee_cost`` (fixed-point dollars) in cc,
+        rounded UP to a whole cc (fee_cc_from_dollars_str — never understate a
+        cost we paid). None when absent/unreadable — the ledger then records
+        the fee model's figure rather than a guessed number (defense #2)."""
+        raw = fill.get("fee_cost")
+        if raw is None:
+            return None
+        try:
+            return int(fee_cc_from_dollars_str(str(raw)))
+        except MoneyParseError:
+            return None
 
     def _note_fill_recovery_exhausted(
         self, quote_id: str, state: OpenQuoteState

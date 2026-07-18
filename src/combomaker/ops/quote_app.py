@@ -19,7 +19,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from decimal import Decimal
 from fractions import Fraction
-from typing import Any
+from typing import Any, Protocol
 
 from combomaker.core.clock import SystemClock
 from combomaker.core.conventions import Side, load_conventions
@@ -179,6 +179,12 @@ def build_lifecycle_config(risk_cfg: RiskConfig) -> LifecycleConfig:
         # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): poll REST for a confirmed
         # fill whose quote_executed WS message never arrived.
         fill_record_recovery_after_s=risk_cfg.fill_record_recovery_after_s,
+        # CANCEL-REPORT VERIFY-BEFORE-DISCARD (2026-07-18 incidents): bounded
+        # /portfolio/fills polls before a CANCELLED-status confirmed quote's
+        # position may be discarded (both incidents were REAL taker-style
+        # executions behind a "cancelled" quote status).
+        fill_cancel_verify_attempts=risk_cfg.fill_cancel_verify_attempts,
+        fill_cancel_verify_delay_s=risk_cfg.fill_cancel_verify_delay_s,
         # F1 MONOTONE PRE-PRICING GATE (2026-07-16 throughput batch-1): decline
         # on already-breached candidate-monotone caps BEFORE pricing. Default
         # OFF (today's behaviour); the operator arms it in the local YAML.
@@ -356,6 +362,66 @@ class RateLimitRecordingSender:
         except RateLimitedError:
             self._window.record()
             raise
+
+    async def get_fills(self, **params: str | int) -> JsonDict:
+        """GET /portfolio/fills slice for the cancel-report verification
+        (2026-07-18 verify-before-discard) — same pass-through + 429 tap, so
+        verification polls feed the burst breaker too."""
+        try:
+            return await self._inner.get_fills(**params)  # type: ignore[attr-defined,no-any-return]
+        except RateLimitedError:
+            self._window.record()
+            raise
+
+
+class PositionsGetter(Protocol):
+    """GET /portfolio/positions slice the periodic position-reconcile net
+    reads (2026-07-18 requirement 3). A protocol so tests fake it without a
+    real REST client; the live loop passes the KalshiRestClient."""
+
+    async def get_positions(self, **params: str | int) -> JsonDict: ...
+
+
+async def position_reconcile_unmodeled_once(
+    rest: PositionsGetter,
+    exposure: ExposureBook,
+    store: Store,
+    metrics: Metrics,
+    *,
+    subaccount: int,
+) -> list[str]:
+    """RUNTIME POSITION-RECONCILE NET (2026-07-18, after the two same-day
+    fill-recovery incidents left REAL exchange positions out of the risk book
+    for hours). Compare the exchange's open positions (read-only GET, pinned to
+    our subaccount — P0-5) against the in-memory exposure book and alarm
+    ``position_reconcile_unmodeled`` on any exchange position the book does
+    not model. FAIL-SAFE DIRECTION ONLY: this NEVER inserts a position (an
+    exchange position with no local model cannot be modeled from a guess —
+    rule 6); it alarms so the operator/monitor sees the divergence within one
+    interval instead of at the next restart's rehydrate. Local fills are
+    consulted only to annotate the alarm (our-own-fill-fell-out vs
+    manual/external trade). Returns the unmodeled tickers (for tests/callers)."""
+    payload = await rest.get_positions(subaccount=subaccount)
+    exch_by_ticker = open_combo_positions_from_positions(payload)
+    known = {pos.combo_ticker for pos in exposure.positions.values()}
+    unmodeled = sorted(t for t in exch_by_ticker if t not in known)
+    if not unmodeled:
+        return []
+    local_fill_tickers = [
+        t for t in unmodeled if await store.has_fill_for_ticker(t)
+    ]
+    metrics.inc("position_reconcile.unmodeled")
+    log.warning(
+        "position_reconcile_unmodeled",
+        tickers=unmodeled,
+        local_fill_tickers=local_fill_tickers,
+        detail="exchange reports open positions the in-memory risk book does "
+        "NOT model — the caps are undercounting until reconciled; NOT "
+        "auto-inserted (fail-safe, never modeled from a guess) — reconcile "
+        "manually (tickers with a local fills row are our own fills that fell "
+        "out of the book, the 2026-07-18 incident class)",
+    )
+    return unmodeled
 
 
 class QuoteApp:
@@ -700,6 +766,13 @@ class QuoteApp:
                 # FILL-RECORD RECOVERY (2026-07-16 P1): REST GET handle for the
                 # maintenance sweep (None in paper mode — nothing to recover).
                 quote_getter=quote_getter,
+                # CANCEL-REPORT VERIFY-BEFORE-DISCARD (2026-07-18): the
+                # /portfolio/fills handle the sweep polls before believing a
+                # CANCELLED status on a confirmed quote (same wrapped sender —
+                # its 429s feed the burst breaker), pinned to our subaccount at
+                # the query layer (P0-5). None in paper mode.
+                fills_getter=quote_getter,
+                fills_subaccount=config.safety.subaccount,
                 # WEDGE FIX (2026-07-16, the 18:13Z kill): the lifecycle beats
                 # this heartbeat per iteration inside its long maintenance
                 # sub-loops (reprice sweep / recovery polls) — progress is not a
@@ -1014,6 +1087,12 @@ class QuoteApp:
                 asyncio.create_task(
                     self._reservation_reconcile_loop(rest, reservation),
                     name="reservation-reconcile",
+                ),
+                # RUNTIME POSITION-RECONCILE NET (2026-07-18): alarm-only
+                # exchange-vs-book comparison every N minutes (read-only GET).
+                asyncio.create_task(
+                    self._position_reconcile_loop(rest, exposure, store),
+                    name="position-reconcile",
                 ),
             ]
             if external is not None:
@@ -1769,6 +1848,31 @@ class QuoteApp:
             except Exception as exc:
                 log.warning("settlement_poll_failed", error=repr(exc))
             await asyncio.sleep(SETTLEMENT_POLL_INTERVAL_S)
+
+    async def _position_reconcile_loop(
+        self, rest: KalshiRestClient, exposure: ExposureBook, store: Store
+    ) -> None:
+        """Periodic position-reconcile net (2026-07-18 requirement 3): every
+        ``risk.position_reconcile_interval_s`` (default 5 min) alarm on any
+        exchange open position the in-memory book does not model. Alarm-only —
+        never an insert. Sleeps FIRST so the startup rehydrate/reconcile pass
+        finishes before the first comparison; errors retry next interval."""
+        interval_s = self._config.risk.position_reconcile_interval_s
+        while True:
+            await asyncio.sleep(interval_s)
+            try:
+                await position_reconcile_unmodeled_once(
+                    rest,
+                    exposure,
+                    store,
+                    self._metrics,
+                    subaccount=self._config.safety.subaccount,
+                )
+            except RateLimitedError as exc:
+                self._rate_limit_window.record()
+                log.warning("position_reconcile_rate_limited", error=str(exc))
+            except Exception as exc:
+                log.warning("position_reconcile_failed", error=repr(exc))
 
     async def _reservation_reconcile_loop(
         self, rest: KalshiRestClient, reservation: RiskReservationService

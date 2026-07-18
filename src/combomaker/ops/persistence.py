@@ -471,7 +471,7 @@ class Store:
         model: str,
         n_legs: int,
         tickers: tuple[str, ...],
-        challenge: "FitChallenge",
+        challenge: FitChallenge,
     ) -> None:
         """Durably record a structural inversion's misfit + its challenge verdict
         (P1-4). Synchronous & committed like other risk-relevant records — this
@@ -625,6 +625,31 @@ class Store:
         racing the WS message) before it books fees/metrics twice."""
         async with self._db.execute(
             "SELECT 1 FROM fills WHERE fill_ref = ? LIMIT 1", (fill_ref,)
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def has_fill_for_order_id(self, order_id: str) -> bool:
+        """True iff a fills row already records this exchange ``order_id`` —
+        the verify-before-discard ADOPTION GUARD (2026-07-18 review). An
+        exchange fill whose order is already in the local ledger belongs to an
+        EARLIER quote and must never be adopted for a second one: the live
+        tape holds same-ticker/same-side/same-exact-count fills hours apart
+        (rows 59/61, both 4071 centi-ct NO on one combo), so a structural
+        match alone can hit a HISTORICAL fill and double-count it."""
+        async with self._db.execute(
+            "SELECT 1 FROM fills WHERE order_id = ? LIMIT 1", (order_id,)
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def has_fill_for_ticker(self, combo_ticker: str) -> bool:
+        """True iff ANY fills row exists for this combo ticker. Used by the
+        periodic position-reconcile net (2026-07-18): an exchange position the
+        in-memory book does not model is alarmed either way, but whether a
+        local fill record exists distinguishes "our own fill fell out of the
+        book" (the 2026-07-18 fill-recovery incidents) from "a manual/external
+        trade we never saw"."""
+        async with self._db.execute(
+            "SELECT 1 FROM fills WHERE combo_ticker = ? LIMIT 1", (combo_ticker,)
         ) as cursor:
             return await cursor.fetchone() is not None
 
