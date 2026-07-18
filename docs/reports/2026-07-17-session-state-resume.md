@@ -336,3 +336,23 @@ optional 0.5¢ tightening noted); `allow_negative_ev_hedge` knob exists but does
 verify hedging — do NOT arm as-is; the certified version joins the hedge-pair
 build. Morning list: certified-hedge EV budget + skew mutex, WAL lock, optional
 reprice 0.5¢, mid-enumeration churn test for a6ecb80.
+
+## ADDENDUM 15 (2026-07-18 ~04:20Z) — MORNING BUILDS LANDED + ARMED; THE COMPLETE STACK
+
+Operator: "complete the morning builds right now... raise cvar to 35%... restart when
+verified." DONE: CVaR 0.35 armed (~$660 tail allowance; ES budget explained = avg loss
+in the worst 1% MC scenarios) with an interim restart so fills flowed during the build.
+Workflow wf_28806e42 (build → 3-lens verify → fix; 2 CONFIRMED fixed: SERIOUS
+vacuous-ES-certification on item C, MINOR skew second-ME over-rebate). Committed +
+pushed; suite 2327/0 my re-run. ARMED at the final restart
+(`live_20260718_morningstack.log`): **lastlook_waiver_topk_resting: 12** (profiled:
+full 200-quote enumeration 816ms+ = the timeouts; K=12 = 29.5ms; fail-closed constant
+tail adder, certified+adder ~13% looser vs the $954 budget) + **pricing.skew.enabled:
+true** (the operator's "if it's a hedge lower the markup": mutex-aware direction via
+P0-9 reuse; ARG-champ-vs-short-ESP flips to OFFSETTING/rebate, clamp 1.5¢; watch
+inventory_skew_shadow applied_cc + hedge fill mix). Certified-hedge EV budget (item C)
+remains DEFAULT-OFF pending review of the vacuous-certification fix. WAL checkpoint
+resilience shipped (separate event/metric, 500-write retry, PASSIVE fallback).
+Overnight probe fact: 0 competing makers at 03:27Z — the FRA×Mbappé fill concentration
+is overnight demand, not looseness. Session tally: 8 fills ~$30, +$1.1 edge.
+SATURDAY: watch waiver grants (trimmed), skew flips, declined_uncertified, fills mix.
