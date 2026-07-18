@@ -378,3 +378,28 @@ SATURDAY: watch waiver grants (trimmed), skew flips, declined_uncertified, fills
 Every decision, fix, measurement, and revert switch of 2026-07-17→18 lives in the 15
 addenda above. A fresh session needs: this file + the memory index + `git log` since
 `a397efb`. The bot needs nothing — it is running the finished machine.
+
+## ADDENDUM 16 (1:10 AM ET Sat 7/18) — OVERNIGHT CLOSE; OPERATOR ASLEEP; MORNING PLAN
+
+Tally at close: **11 fills, $51.35 premium, +$1.93 expected edge, 0 hedges lost.**
+All fills = FRA×Mbappé variants — PROVEN a demand artifact: since the 11:48 PM ET
+restart alone we quoted 14,309 ARG-champ / 6,973 other-scorer (Messi, Yamal, Kane,
+Dembélé) / 543 ENG-win combos with ZERO last-look declines on any of them — takers
+simply only accepted the FRA narrative; the 11:27 PM ET probe found ZERO competing
+makers. The $78.63 TIE×BTTS decline analyzed exactly: sold-parlay hedges are bounded
+by PREMIUM COLLECTED ($18.93 relief in the FRA branch) not size — the waiver's exact
+enumeration (which RAN, trimmed, in-deadline) scored it net-ADDING at that size;
+~$35 version clears. NEW RULE: all operator-facing times in EASTERN
+([[feedback_est_time_only]]).
+
+**MORNING CHECKLIST (operator asleep; update them on wake):**
+1. Overnight fills+declines summary in ET (monitor feed + DB).
+2. ~mid-morning when makers wake: PROBE ritual on an ARG-champ combo, a scorer
+   parlay, an ENG combo — if the field's best undercuts the +4.5/+6 longshot tiers,
+   trim tiers before kickoff.
+3. FRAENG ~3 PM ET: full-stack game-day watch (waiver grants w/ trim,
+   declined_uncertified, skew flips + applied_cc, fill mix diversifying, lapse
+   rate, funnel windows, decline reports per the standing format).
+4. Certified-hedge EV budget still default-OFF (review its vacuous-cert fix).
+5. Sunday: budget-family review (game .50 / slate .65 / det .25 / cvar .35) with
+   both games' data → merge (llm-b ancestry check) → MLB+WNBA.
