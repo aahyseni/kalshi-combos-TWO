@@ -207,6 +207,12 @@ class FiltersConfig(StrictModel):
     # YAML) once its classification + priors exist; null disables the gate;
     # empty list blocks ALL combos (fail-closed).
     allowed_leg_series_prefixes: list[str] | None = ["KXWC", "KXMLB"]
+    # OPERATOR LEG BLOCKLIST (2026-07-18, FRAENG game day): no-quote any combo
+    # containing a NON-"no"-side leg whose market ticker contains one of these
+    # substrings. Side-aware on purpose: "no" side of a blocked ticker is a
+    # HEDGE against that exposure and stays quotable; "yes" or unknown/garbage
+    # side is blocked (fail-closed on unknown). Empty = gate off.
+    blocked_leg_yes_substrings: list[str] = []
     combos_only: bool = True          # skip single-market RFQs
     # Quote-time feed-freshness gate: refuse to POST a quote when the WS feed's
     # rx-age exceeds this. Keep it >= breakers.max_rx_age_s (5s) so that a feed

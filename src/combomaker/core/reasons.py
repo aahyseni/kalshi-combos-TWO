@@ -15,6 +15,7 @@ class ReasonCode(StrEnum):
     # --- RFQ filter (no-quote) ---
     SKIP_NOT_WHITELISTED = "skip_not_whitelisted"
     SKIP_SERIES_NOT_ALLOWED = "skip_series_not_allowed"
+    SKIP_OPERATOR_LEG_BLOCK = "skip_operator_leg_block"
     SKIP_TOO_MANY_LEGS = "skip_too_many_legs"
     SKIP_SIZE_BELOW_MIN = "skip_size_below_min"
     SKIP_SIZE_ABOVE_MAX = "skip_size_above_max"

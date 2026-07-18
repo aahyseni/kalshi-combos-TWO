@@ -301,3 +301,51 @@ def test_series_gate_unblock_via_config_prefix() -> None:
     h = Harness(FiltersConfig(allowed_leg_series_prefixes=["KXWC", "KXMLB", "KXUCL"]))
     rfq = _regime_combo("KXUCLGAME-26AUG12REALARS-REAL")
     assert ReasonCode.SKIP_SERIES_NOT_ALLOWED not in h.filter.evaluate(rfq)
+
+
+# --------------------------------------------------------------------------- #
+# Operator leg blocklist (2026-07-18): side-aware no-new-blocked-exposure gate #
+# --------------------------------------------------------------------------- #
+
+_FRA_BLOCK = FiltersConfig(
+    blocked_leg_yes_substrings=["FRAENG-FRA", "FRAKMBAPP"],
+)
+
+
+def test_operator_leg_block_blocks_yes_side() -> None:
+    h = Harness(_FRA_BLOCK)
+    rfq = combo_rfq(mve_selected_legs=_legs(
+        "KXWCGAME-26JUL18FRAENG-FRA", "KXWCBTTS-26JUL18FRAENG-BTTS"))
+    assert ReasonCode.SKIP_OPERATOR_LEG_BLOCK in h.filter.evaluate(rfq)
+
+
+def test_operator_leg_block_blocks_scorer_and_spread_yes() -> None:
+    h = Harness(_FRA_BLOCK)
+    for tk in ("KXWCPLAYERGOALS-26JUL18FRAENG-FRAKMBAPP10-1",
+               "KXWCSPREAD-26JUL18FRAENG-FRA2"):
+        rfq = combo_rfq(mve_selected_legs=_legs(tk, "KXWCBTTS-26JUL18FRAENG-BTTS"))
+        assert ReasonCode.SKIP_OPERATOR_LEG_BLOCK in h.filter.evaluate(rfq), tk
+
+
+def test_operator_leg_block_passes_no_side_hedge() -> None:
+    # NO side of a blocked ticker is a hedge AGAINST the exposure — quotable.
+    h = Harness(_FRA_BLOCK)
+    legs = [{"market_ticker": "KXWCSPREAD-26JUL18FRAENG-FRA2", "side": "no"},
+            {"market_ticker": "KXWCGAME-26JUL18FRAENG-ENG", "side": "yes"}]
+    assert ReasonCode.SKIP_OPERATOR_LEG_BLOCK not in h.filter.evaluate(
+        combo_rfq(mve_selected_legs=legs))
+
+
+def test_operator_leg_block_fails_closed_on_unknown_side() -> None:
+    h = Harness(_FRA_BLOCK)
+    legs = [{"market_ticker": "KXWCGAME-26JUL18FRAENG-FRA", "side": "banana"},
+            {"market_ticker": "KXWCBTTS-26JUL18FRAENG-BTTS", "side": "yes"}]
+    assert ReasonCode.SKIP_OPERATOR_LEG_BLOCK in h.filter.evaluate(
+        combo_rfq(mve_selected_legs=legs))
+
+
+def test_operator_leg_block_empty_gate_off() -> None:
+    h = Harness()
+    rfq = combo_rfq(mve_selected_legs=_legs(
+        "KXWCGAME-26JUL18FRAENG-FRA", "KXWCBTTS-26JUL18FRAENG-BTTS"))
+    assert ReasonCode.SKIP_OPERATOR_LEG_BLOCK not in h.filter.evaluate(rfq)
