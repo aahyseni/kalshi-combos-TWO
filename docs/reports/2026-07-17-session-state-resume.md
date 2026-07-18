@@ -318,3 +318,21 @@ profile the enumeration on the live book offline (tools/, rule 8) to size K.
 the long-lived cursor; WAL resets each restart). **MORNING ITEM #3:** parked
 hedge-pair build (skew mutex + committed netting + hedges-always-fill extension).
 Sat watch list unchanged (waiver metrics, lapse rate, fills vs new markup, funnel).
+
+## ADDENDUM 14 (2026-07-18 ~00:40Z) — GAME CAP 0.50 (operator) + WAIVER STABILITY FIX (`a6ecb80`) — THE FILL-MORE CONFIG
+
+Overnight tally to this point: 5 fills (~$21.5, +$0.8 edge incl. the first ARG-champ
+hedge), declines all concentrators/right-sizing/EV-negative-snipes, 0 hedges lost.
+Operator: "$21 in 4 hours is too low... up it to .5" → `game_loss_frac 0.30→0.50`
+(budget $572→$954/game; slate 0.65 = the binding aggregate now, intended) AND the
+waiver instability root-caused+fixed (`a6ecb80`): stability key was the FULL book
+generation (any quote change anywhere invalidated → un-runnable at 400 q/min;
+declined a +$1.76 EV $31 win live) → now position generation + reservation version
++ the BREACHED games' resting-quote id set (unrelated churn ignored; every
+2026-07-16 stale-cert case still covered). Suite 2294/0. RESTARTED
+(`live_20260718_game50_stablewaiver.log`). ALSO diagnosed tonight: EV-gate declined
+a below-fair snipe (reprice threshold 1¢ staleness window — working as designed;
+optional 0.5¢ tightening noted); `allow_negative_ev_hedge` knob exists but does NOT
+verify hedging — do NOT arm as-is; the certified version joins the hedge-pair
+build. Morning list: certified-hedge EV budget + skew mutex, WAL lock, optional
+reprice 0.5¢, mid-enumeration churn test for a6ecb80.
