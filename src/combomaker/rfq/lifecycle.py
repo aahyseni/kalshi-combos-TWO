@@ -103,6 +103,7 @@ from combomaker.sim.book_risk import (
     compute_book_risk,
     modeled_cost_basis_cc,
 )
+from combomaker.sim.peak_profile import PeakProfile, build_peak_profile
 from combomaker.sim.state_worst_case import (
     GameWorstCase,
     entity_from_position,
@@ -388,6 +389,16 @@ class LifecycleConfig:
     # sniper-tax subsidy on stale quotes.
     allow_negative_ev_hedge: bool = False
     hedge_cost_budget_cc: int = 0
+    # PEAK-CONCENTRATION pricing steer (operator directive 2026-07-18 evening).
+    # K cached worst scorelines per game for the committed-book peak profile
+    # (sim/peak_profile.build_peak_profile) — rebuilt OFF the hot path on the
+    # maintenance tick, ONLY when the position generation changed (fills/
+    # settlements are rare; the build is a committed-only enumeration, ms-scale
+    # vs the waiver's trimmed 29.5ms which includes resting quotes). The profile
+    # is a PRICING input to the skew seam: stale/absent => the peak component is
+    # a hard ZERO adder (neutral), never a decline. Wired from
+    # ``pricing.skew.peak_topk_states``.
+    peak_topk_states: int = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -591,6 +602,16 @@ class QuoteLifecycle:
         # Widen-vs-DECLINE policy (R3 Part R2), SHADOW by default. Needs the same
         # snapshot + candidate the skew builds, so it is computed alongside it.
         self._widen_params = widen_params
+        # PEAK-CONCENTRATION steer (2026-07-18): the cached committed-book
+        # peak-state profile (sim/peak_profile.py), rebuilt off the hot path on
+        # position-generation change (_maybe_recompute_peak_profile) and read
+        # at quote time by _quoting_policy as a PRICING input to the skew. A
+        # stale/absent profile is a hard ZERO adder (neutral) — never a
+        # decline. ``_peak_profile_failed_generation`` rate-limits rebuild
+        # retries after a build error to once per generation (no exception loop
+        # on the 0.5s maintenance cadence).
+        self._peak_profile: PeakProfile | None = None
+        self._peak_profile_failed_generation: int | None = None
         # Fee model for the REAL fill fee booked at execution (defense #3): our
         # combo maker quadratic fills compute $0 (pricing/fees.py + ground truth),
         # correct for any nonzero-fee series. None ⇒ book fee UNKNOWN (None) — the
@@ -3869,6 +3890,77 @@ class QuoteLifecycle:
         # the worker finishes; the maintenance tick returns now and keeps beating.
         self._book_risk_task = asyncio.ensure_future(self.recompute_book_risk_offloop())
 
+    def _maybe_recompute_peak_profile(self) -> None:
+        """Refresh the PEAK-CONCENTRATION profile (sim/peak_profile.py) off the
+        maintenance tick — ONLY when the committed position set changed
+        (position generation), mirroring the book-risk snapshot's
+        read-generation-stamp-publish discipline in miniature.
+
+        The build enumerates the COMMITTED book only (no resting quotes, no
+        reservations) so it is ms-scale and runs inline on the tick; position
+        generation moves only on fills/settlements, so this is a rare event,
+        not a per-tick cost — and NEVER a per-quote cost (the hot path only
+        READS the cached profile). A build error logs once, marks the
+        generation failed (retry only after the NEXT position change), and
+        leaves the profile ABSENT — the skew's neutral zero-adder branch
+        (pricing fail-safe, never a decline)."""
+        if self._skew_params is None or not self._skew_params.peak_enabled:
+            return
+        if self._structural_cfg is None:
+            return  # no structural machinery wired -> no profile -> neutral
+        gen = self._exposure.position_generation
+        if self._peak_profile is not None and self._peak_profile.input_generation == gen:
+            return  # current — nothing changed
+        if self._peak_profile_failed_generation == gen:
+            return  # already failed on this exact book — wait for the next change
+        try:
+            positions = list(self._exposure.positions.values())
+            tickers: set[str] = set()
+            for position in positions:
+                tickers.update(leg.market_ticker for leg in position.legs)
+            marginals: dict[str, float] = {}
+            for ticker in sorted(tickers):
+                p = self._marginals(ticker)
+                if p is not None:
+                    marginals[ticker] = float(p)
+            profile = build_peak_profile(
+                positions,
+                marginals,
+                None,
+                self._structural_cfg,
+                k=self._config.peak_topk_states,
+                input_generation=gen,
+            )
+        except Exception:
+            log.exception("peak_profile_recompute_failed", generation=gen)
+            self._peak_profile_failed_generation = gen
+            self._peak_profile = None  # fail-safe: neutral, never stale-wrong
+            return
+        self._peak_profile = profile
+        self._peak_profile_failed_generation = None
+        log.info(
+            "peak_profile_snapshot",
+            generation=gen,
+            n_positions=len(positions),
+            games={
+                game: gp.top_loss_cc for game, gp in sorted(profile.by_game.items())
+            },
+            k=self._config.peak_topk_states,
+        )
+
+    def _peak_profile_for_quote(self) -> PeakProfile | None:
+        """The cached peak profile IF it still describes the current committed
+        book (generation match — the same read-time re-check
+        ``_book_risk_for_check`` performs); else None => the skew's peak
+        component is neutral (zero adder) until the next off-hot-path rebuild.
+        Cheap: one generation read."""
+        profile = self._peak_profile
+        if profile is None:
+            return None
+        if profile.input_generation != self._exposure.position_generation:
+            return None
+        return profile
+
     async def maintenance_tick(self) -> None:
         """TTL expiry + reprice + P&L mark + daily-loss halt. Every few 100ms."""
         self._refresh_daily_pnl()
@@ -3878,6 +3970,10 @@ class QuoteLifecycle:
         # LAUNCHES the MC in a worker and returns immediately (never blocks the tick
         # / heartbeat); without one it runs inline (fast in paper/tests).
         self._maybe_recompute_book_risk()
+        # PEAK-CONCENTRATION profile (2026-07-18): rebuild the cached committed-
+        # book peak scorelines when a fill/settlement changed the position set —
+        # a pure PRICING input to the skew seam (stale/absent = neutral adder).
+        self._maybe_recompute_peak_profile()
         # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): repair a confirmed fill
         # whose quote_executed WS message was lost, BEFORE the limit check so a
         # recovered position counts against the caps this same tick. Runs even
@@ -4163,6 +4259,13 @@ class QuoteLifecycle:
             dir_entries_by_game=snap.dir_entries_by_game,
             committed_dir_entries_by_game=snap.committed_dir_entries_by_game,
             is_me_event=self._exposure.is_me_event,
+            # PEAK-CONCENTRATION steer (2026-07-18): the cached committed-book
+            # peak profile + the live position generation. Absent/stale =>
+            # the component is a hard ZERO adder inside the classifier
+            # (neutral pricing — never a decline, never a throughput cost:
+            # the hot path only reads <= K cached state rows per game).
+            peak_profile=self._peak_profile_for_quote(),
+            peak_book_generation=self._exposure.position_generation,
         )
         log.info(
             "inventory_skew_shadow",
@@ -4175,7 +4278,28 @@ class QuoteLifecycle:
             enabled=skew.enabled,
             per_game=list(skew.per_game),
             mutex_direction_games=list(skew.mutex_direction_games),
+            peak_cc=skew.peak_cc,                        # composed peak component
         )
+        if skew.peak_per_game:
+            # DEBUG-level explainability (operator directive: every peak adder
+            # decision explainable — peak_overlap + adder_cc per game — without
+            # flooding info-level; the info event above carries only peak_cc).
+            log.debug(
+                "peak_concentration_detail",
+                rfq_id=rfq.rfq_id,
+                peak_cc=skew.peak_cc,
+                peak_widen_cc=skew.peak_widen_cc,
+                peak_tighten_cc=skew.peak_tighten_cc,
+                per_game=[
+                    {
+                        "game": game,
+                        "adder_cc": adder_cc,
+                        "peak_overlap": overlap,
+                        "reason": reason,
+                    }
+                    for game, adder_cc, overlap, reason in skew.peak_per_game
+                ],
+            )
         widen_declines = False
         if self._widen_params is not None:
             widen = decide_widen_or_decline(

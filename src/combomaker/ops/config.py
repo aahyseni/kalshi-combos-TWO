@@ -1812,6 +1812,25 @@ class SkewConfig(StrictModel):
     gamma: float = 2.0                 # convex headroom ramp f(u)=u**gamma
     skew_max_widen_cc: int = 600       # cap on the positive (concentrating) side
     skew_max_tighten_cc: int = 150     # cap on the negative (offsetting) rebate
+    # PEAK-CONCENTRATION pricing steer (operator directive 2026-07-18 evening;
+    # risk/skew._peak_component + sim/peak_profile.py). An ADDITIVE second
+    # classifier component riding the SAME armed skew seam: a candidate that
+    # HITS the committed book's cached top-K worst scorelines widens by up to
+    # ``peak_widen_max_cc`` extra (scaled by the candidate's own premium vs the
+    # game-loss budget AND convexly by how close that game's peak already is to
+    # the budget); one that provably MISSES the ENTIRE top-loss plateau
+    # (certified against the full argmax level, not the K sample — 2026-07-18
+    # verify fix) rebates by up to ``peak_tighten_max_cc``. Composed total stays inside
+    # [-(skew_max_tighten_cc+peak_tighten_max_cc),
+    #  +(skew_max_widen_cc+peak_widen_max_cc)]. PRICING ONLY — no new caps, no
+    # new skip reasons; any doubt (no profile / stale generation / unparseable
+    # legs) is a hard ZERO adder. It takes effect only while ``enabled`` is
+    # True (the seam's dark-ship master switch). ``peak_topk_states`` is the K
+    # of the off-hot-path profile build (per game, per position-generation).
+    peak_enabled: bool = True
+    peak_widen_max_cc: int = 600       # extra widen cap for peak-stackers (+6c)
+    peak_tighten_max_cc: int = 150     # extra rebate cap for anti-peak flow
+    peak_topk_states: int = 5          # cached worst scorelines per game
 
     @field_validator("w_conc", "w_off")
     @classmethod
@@ -1827,11 +1846,23 @@ class SkewConfig(StrictModel):
             raise ValueError(f"skew gamma must be > 0, got {v}")
         return v
 
-    @field_validator("skew_max_widen_cc", "skew_max_tighten_cc")
+    @field_validator(
+        "skew_max_widen_cc",
+        "skew_max_tighten_cc",
+        "peak_widen_max_cc",
+        "peak_tighten_max_cc",
+    )
     @classmethod
     def _nonneg_cap(cls, v: int) -> int:
         if v < 0:
             raise ValueError(f"skew cap must be >= 0, got {v}")
+        return v
+
+    @field_validator("peak_topk_states")
+    @classmethod
+    def _valid_topk(cls, v: int) -> int:
+        if not 1 <= v <= 64:
+            raise ValueError(f"peak_topk_states must be in [1, 64], got {v}")
         return v
 
 

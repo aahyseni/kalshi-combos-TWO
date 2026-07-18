@@ -139,7 +139,9 @@ STARTUP_BOOK_RISK_DEADLINE_S = 5.0
 QUOTE_TTL_S = 20.0
 
 
-def build_lifecycle_config(risk_cfg: RiskConfig) -> LifecycleConfig:
+def build_lifecycle_config(
+    risk_cfg: RiskConfig, *, peak_topk_states: int = 5
+) -> LifecycleConfig:
     """The ONE place YAML risk knobs become the live ``LifecycleConfig`` —
     extracted pure (the ``supervisor_launch_cmd`` precedent) so tests can prove
     every operator knob actually REACHES the lifecycle (a YAML field that stops
@@ -192,6 +194,12 @@ def build_lifecycle_config(risk_cfg: RiskConfig) -> LifecycleConfig:
         # CONFIRM-TIME resting haircut (2026-07-17): the reservation check
         # weights ONLY the resting fold; the serial commit chain stays 100%.
         resting_haircut_at_confirm=risk_cfg.resting_haircut_at_confirm,
+        # PEAK-CONCENTRATION steer (2026-07-18): K cached worst scorelines per
+        # game for the off-hot-path committed-book peak profile (a PRICING
+        # input to the skew seam — sim/peak_profile.py). Sourced from
+        # ``pricing.skew.peak_topk_states`` (a keyword here because this
+        # builder's positional contract is RiskConfig-only).
+        peak_topk_states=peak_topk_states,
     )
 
 
@@ -605,6 +613,12 @@ class QuoteApp:
                 skew_max_widen_cc=skew_cfg.skew_max_widen_cc,
                 skew_max_tighten_cc=skew_cfg.skew_max_tighten_cc,
                 enabled=skew_cfg.enabled,
+                # PEAK-CONCENTRATION steer (2026-07-18): additive component on
+                # the same armed seam; its clamps compose with the directional
+                # caps above (overall bound documented on SkewParams).
+                peak_enabled=skew_cfg.peak_enabled,
+                peak_widen_max_cc=skew_cfg.peak_widen_max_cc,
+                peak_tighten_max_cc=skew_cfg.peak_tighten_max_cc,
             )
             skew_limits = SkewLimits(
                 max_event_delta_contracts=risk_cfg.max_event_delta_contracts,
@@ -735,7 +749,9 @@ class QuoteApp:
                 # YAML risk knobs → LifecycleConfig via the ONE pure builder
                 # (candidate gate + its deadline, EV tolerance, MC waiver —
                 # see build_lifecycle_config for the per-knob rationale).
-                config=build_lifecycle_config(risk_cfg),
+                config=build_lifecycle_config(
+                    risk_cfg, peak_topk_states=skew_cfg.peak_topk_states
+                ),
                 balance_tracker=balance_tracker,
                 # Slate cap's per-leg game-start source — the exact pregame gate
                 # the filter already uses (peek-only, hot-path safe, no network).
