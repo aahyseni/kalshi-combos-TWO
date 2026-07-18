@@ -1609,6 +1609,7 @@ class QuoteLifecycle:
         # One build + AT MOST ONE rebuild (version moved during the enumeration),
         # then fail-closed decline — the mandated retry budget.
         for attempt in range(2):
+            fp_before = self._waiver_games_fingerprint(games)
             try:
                 inputs = self._build_state_worst_case_inputs(
                     quote_id, state, structural_cfg
@@ -1658,21 +1659,18 @@ class QuoteLifecycle:
             # (or repricing/expiring) during the await would otherwise be
             # invisible and the stale certificate would skip the per-game caps
             # on a book it never priced (findings 1+3, 2026-07-16).
-            live_gen = self._exposure.generation
-            live_ver = self._reservation.version
-            if (
-                live_gen != inputs.book_generation
-                or live_ver != inputs.reservation_version
-            ):
+            # Stability key (2026-07-18): position generation + reservation
+            # version + the BREACHED games' resting-quote id set — NOT the
+            # full book generation (see _waiver_games_fingerprint).
+            fp_after = self._waiver_games_fingerprint(games)
+            if fp_after != fp_before:
                 self._metrics.inc("lastlook_waiver.version_conflict")
                 log.info(
                     "lastlook_waiver_version_conflict",
                     quote_id=quote_id,
                     attempt=attempt,
-                    snapshot_book_generation=inputs.book_generation,
-                    live_book_generation=live_gen,
-                    snapshot_reservation_version=inputs.reservation_version,
-                    live_reservation_version=live_ver,
+                    detail="breached-game resting set / positions / "
+                    "reservations moved during the enumeration",
                 )
                 continue
             result = candidate_result
@@ -1839,6 +1837,33 @@ class QuoteLifecycle:
             structural_cfg=structural_cfg,
             book_generation=book_generation,
             reservation_version=reservation_version,
+        )
+
+    def _waiver_games_fingerprint(
+        self, games: list[str]
+    ) -> tuple[int, int, tuple[str, ...]]:
+        """Stability key for a waiver enumeration (2026-07-18): the POSITION
+        generation + reservation version + the ids of the resting quotes
+        touching the BREACHED games. A quote landing/expiring on an UNRELATED
+        game cannot change the breached games' certified worst case, so it no
+        longer invalidates the run — at 400+ quotes/min the old FULL-generation
+        stamp made the waiver un-runnable ("book moved during every
+        enumeration", observed live on a +$1.76 EV $31 win). Same-game
+        quote arrivals and any position/reservation change still invalidate
+        (the 2026-07-16 stale-certificate findings stay covered — quotes are
+        immutable per id; a reprice replaces the id)."""
+        gset = set(games)
+        qids = tuple(sorted(
+            qid for qid, q in self._exposure.open_quotes.items()
+            if any(
+                leg.event_ticker and game_key(leg.event_ticker) in gset
+                for leg in q.legs
+            )
+        ))
+        return (
+            self._exposure.position_generation,
+            self._reservation.version if self._reservation is not None else -1,
+            qids,
         )
 
     async def _run_state_worst_case(
