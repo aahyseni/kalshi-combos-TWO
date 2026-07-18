@@ -117,6 +117,7 @@ class GateRig:
         *,
         pool: StubBookRiskPool | None = None,
         gate_enabled: bool = True,
+        limits: RiskLimits | None = None,
     ) -> None:
         self.h = h
         self.sender = FakeSender()
@@ -135,7 +136,7 @@ class GateRig:
                 ),
                 h.feed, h.metadata, h.killswitch, h.clock,
             ),
-            limits=LimitChecker(RiskLimits()),
+            limits=LimitChecker(limits if limits is not None else RiskLimits()),
             exposure=self.exposure,
             feed=h.feed,
             metadata=h.metadata,
@@ -160,6 +161,7 @@ async def _make_rig(
     pool: StubBookRiskPool | None = None,
     gate_enabled: bool = True,
     db: str = "gate.sqlite3",
+    limits: RiskLimits | None = None,
 ) -> GateRig:
     h = Harness()
     await h.with_books(["M1", "M2"])
@@ -169,7 +171,7 @@ async def _make_rig(
     seed_event(h, "E1", exclusive=True)
     seed_event(h, "E2", exclusive=True)
     store = await Store.open(tmp_path / db, h.clock)
-    return GateRig(h, store, pool=pool, gate_enabled=gate_enabled)
+    return GateRig(h, store, pool=pool, gate_enabled=gate_enabled, limits=limits)
 
 
 async def _accept(rig: GateRig, side: str = "yes") -> None:
@@ -361,3 +363,65 @@ async def test_positive_ev_real_inline_eval_confirms(tmp_path: Path) -> None:
         rig.metrics.counter(f"confirm.declined.{ReasonCode.DECLINE_CANDIDATE_RISK}")
         == 0
     )
+
+
+# --------------------------------------------------------------------------- #
+# MUTEX-AWARE DET-MAX rollback knob: config -> inputs -> worker plumbing.      #
+# The quote-time cap reads RiskLimits directly; the confirm gate runs in a     #
+# worker and can only honor the knob if the lifecycle THREADS it through       #
+# CandidateBookRiskInputs and the worker FORWARDS it (verify finding           #
+# 2026-07-18: before the thread-through, knob=False was silently ignored on    #
+# the one path that admits fills).                                             #
+# --------------------------------------------------------------------------- #
+
+
+async def test_lifecycle_threads_det_max_mutex_knob_into_gate_inputs(
+    tmp_path: Path,
+) -> None:
+    for knob in (True, False):
+        pool = StubBookRiskPool(_verdict(confirm=True))
+        rig = await _make_rig(
+            tmp_path,
+            pool=pool,
+            db=f"knob_{knob}.sqlite3",
+            limits=RiskLimits(portfolio_det_max_mutex_aware=knob),
+        )
+        await _accept(rig)
+        assert len(pool.calls) == 1
+        assert pool.calls[0].det_max_mutex_aware is knob
+
+
+async def test_worker_forwards_det_max_mutex_knob_to_eval(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    # Pin the LAST hop: _worker_candidate_book_risk must forward
+    # inputs.det_max_mutex_aware into evaluate_candidate_book_risk. Recorded via
+    # a stub eval so the pin survives any future eval-signature growth.
+    import pytest
+
+    import combomaker.ops.pricing_pool as pool_mod
+
+    pool = StubBookRiskPool(_verdict(confirm=True))
+    rig = await _make_rig(
+        tmp_path,
+        pool=pool,
+        db="knob_fwd.sqlite3",
+        limits=RiskLimits(portfolio_det_max_mutex_aware=False),
+    )
+    await _accept(rig)
+    inputs = pool.calls[0]
+    assert inputs.det_max_mutex_aware is False
+
+    seen: dict[str, object] = {}
+
+    def _recording_eval(*args: object, **kwargs: object) -> CandidateBookRisk:
+        seen.update(kwargs)
+        return _verdict(confirm=True)
+
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(pool_mod, "evaluate_candidate_book_risk", _recording_eval)
+        pool_mod._worker_candidate_book_risk(inputs)
+    finally:
+        mp.undo()
+    assert seen["det_max_mutex_aware"] is False

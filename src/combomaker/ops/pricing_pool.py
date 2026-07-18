@@ -408,6 +408,12 @@ class CandidateBookRiskInputs:
     # only (no behaviour change); the operator sets a finite (negative) tolerance to
     # ALSO decline a candidate whose worst credible challenger EV falls below it.
     worst_challenger_ev_tolerance: float = float("-inf")
+    # MUTEX-AWARE DET-MAX (2026-07-18): the operator's rollback switch
+    # (RiskLimits.portfolio_det_max_mutex_aware) threaded to the worker so the
+    # confirm-path POST det-max gate honors knob=False exactly like the
+    # quote-time cap does. Defaults True = the config default (and the sound
+    # smaller bound), so an unstamped legacy caller is unchanged.
+    det_max_mutex_aware: bool = True
     # P0-2 (candidate MC atomic with reservations). The ExposureBook POSITION
     # generation and the RiskReservationService VERSION captured on the loop at the
     # instant these inputs were read. They are NOT consumed by the worker (the MC
@@ -519,6 +525,7 @@ def _worker_candidate_book_risk(
         hedge_cost_budget_cc=inputs.hedge_cost_budget_cc,
         allow_negative_ev_hedge=inputs.allow_negative_ev_hedge,
         worst_challenger_ev_tolerance=inputs.worst_challenger_ev_tolerance,
+        det_max_mutex_aware=inputs.det_max_mutex_aware,
     )
 
 

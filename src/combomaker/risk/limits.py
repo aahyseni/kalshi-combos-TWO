@@ -150,6 +150,19 @@ class RiskLimits:
     # deterministic enforcement the old operative-ES max provided (the all-hit
     # maximum normally dominated), while the model-ES axis now fires on its own.
     portfolio_det_max_frac: Fraction = Fraction(15, 100)
+    # MUTEX/SCENARIO-AWARE det-max gating (operator directive 2026-07-18). The
+    # comonotone all-hit number charges MUTUALLY EXCLUSIVE parlays (FRA-wins
+    # and ENG-wins of one game; two champion outcomes) as if they could all hit
+    # simultaneously — impossible — so the det-max cap taxed diversifying flow.
+    # True (default): the portfolio det-max cap gates on the snapshot's
+    # ``mutex_aware_det_max_cc`` (within-game exclusive branches max, across
+    # games sum, comonotone for every unproven slice; always <= the comonotone
+    # number — see sim/book_risk.mutex_aware_det_max_from_units). False: the
+    # old comonotone gating, byte-identical. A snapshot that predates the field
+    # (None) gates comonotone regardless (fail closed). The threshold and the
+    # SKIP_PORTFOLIO_DET_MAX reason are unchanged; both bounds are logged in
+    # the breach detail so monitoring can compare.
+    portfolio_det_max_mutex_aware: bool = True
     # A2: max acceptable P(this settlement wave drops equity below the ruin floor).
     # Read off the structural-MC snapshot's ``p_ruin`` (floor set on the MC side,
     # -30% ⇒ equity < 0.70·bankroll). A probability budget, not a $ cap.
@@ -393,6 +406,13 @@ class PortfolioRisk(Protocol):
     # degrades to the point estimate (never looser) instead of raising.
     @property
     def p_ruin_upper(self) -> float: ...
+
+    # 2026-07-18: the MUTEX/SCENARIO-AWARE deterministic maximum (always <= the
+    # comonotone ``deterministic_max_loss_cc``; None when uncomputed). Read via
+    # ``getattr`` with a None fallback in ``check`` so a snapshot/fake predating
+    # this field degrades to the comonotone number (fail closed, never looser).
+    @property
+    def mutex_aware_det_max_cc(self) -> float | None: ...
 
 
 class LimitChecker:
@@ -905,14 +925,34 @@ class LimitChecker:
                             shadow=shadow,
                         )
                     )
-                # (8b) DETERMINISTIC maximum-loss axis — the exact all-hit
-                # premium-at-risk, gated INDEPENDENTLY (P0-3).
-                if book_risk.deterministic_max_loss_cc > det_max_thr:
+                # (8b) DETERMINISTIC maximum-loss axis — the all-hit
+                # premium-at-risk, gated INDEPENDENTLY (P0-3). MUTEX-AWARE
+                # (2026-07-18): when armed (the default) the gate reads the
+                # snapshot's scenario-aware bound — mutually exclusive parlays
+                # are charged max-over-branches within their game, never as if
+                # they all hit at once — falling back to the comonotone number
+                # when the field is absent/None (fail closed: the LARGER
+                # bound). Threshold + reason string unchanged; BOTH bounds are
+                # logged in the breach detail for live monitoring comparison.
+                det_comono_cc = book_risk.deterministic_max_loss_cc
+                det_mutex_cc = getattr(book_risk, "mutex_aware_det_max_cc", None)
+                det_gate_cc = det_comono_cc
+                if limits.portfolio_det_max_mutex_aware and det_mutex_cc is not None:
+                    det_gate_cc = min(det_comono_cc, float(det_mutex_cc))
+                if det_gate_cc > det_max_thr:
+                    mutex_note = (
+                        f"{int(det_mutex_cc)}cc"
+                        if det_mutex_cc is not None
+                        else "n/a"
+                    )
                     out.append(
                         Breach(
                             ReasonCode.SKIP_PORTFOLIO_DET_MAX,
                             f"portfolio deterministic max loss "
-                            f"{int(book_risk.deterministic_max_loss_cc)}cc > "
+                            f"{int(det_gate_cc)}cc (comonotone "
+                            f"{int(det_comono_cc)}cc, mutex-aware {mutex_note}, "
+                            f"mutex gating "
+                            f"{'on' if limits.portfolio_det_max_mutex_aware else 'off'}) > "
                             f"{limits.portfolio_det_max_frac} bankroll = "
                             f"{det_max_thr}cc",
                             shadow=shadow,

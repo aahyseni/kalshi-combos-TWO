@@ -330,16 +330,7 @@ def trim_open_quotes_for_games(
     — still a valid conservative bound, but callers normally gate on ``k > 0``.
     """
     gset = set(games)
-    touching: list[tuple[WorstCaseQuote, frozenset[str]]] = []
-    for q in open_quotes:
-        qgames: set[str] = set()
-        for h in q.hypotheticals:
-            for hleg in h.legs:
-                g = _leg_game(hleg, events)
-                if g is not None and g in gset:
-                    qgames.add(g)
-        if qgames:
-            touching.append((q, frozenset(qgames)))
+    touching = _quotes_touching_games(open_quotes, gset, events)
     kept_ids: set[str] = set()
     if k > 0:
         for game in sorted(gset):
@@ -356,6 +347,75 @@ def trim_open_quotes_for_games(
         for game in qgs:
             adders[game] = adders.get(game, 0) + q.worst_hit_loss_cc
     return kept, adders
+
+
+def _quotes_touching_games(
+    open_quotes: Sequence[WorstCaseQuote],
+    gset: set[str],
+    events: Mapping[str, str | None] | None,
+) -> list[tuple[WorstCaseQuote, frozenset[str]]]:
+    """Each open quote paired with the breached games it touches (quotes
+    touching none omitted). The ONE 'touching' relation shared by the trim
+    selection and its grant-time revalidation (``tail_outside_selection``) —
+    identical by construction, so the tail the revalidation sums is measured
+    on exactly the universe the trim dropped from."""
+    touching: list[tuple[WorstCaseQuote, frozenset[str]]] = []
+    for q in open_quotes:
+        qgames: set[str] = set()
+        for h in q.hypotheticals:
+            for hleg in h.legs:
+                g = _leg_game(hleg, events)
+                if g is not None and g in gset:
+                    qgames.add(g)
+        if qgames:
+            touching.append((q, frozenset(qgames)))
+    return touching
+
+
+def tail_outside_selection(
+    open_quotes: Sequence[WorstCaseQuote],
+    games: Sequence[str],
+    events: Mapping[str, str | None] | None,
+    selected_sizes: Mapping[str, int],
+) -> tuple[dict[str, int], tuple[str, ...]]:
+    """GRANT-TIME REVALIDATION of a TRIMMED waiver enumeration (2026-07-18 —
+    the 'waiver unstable: book moved during every enumeration' churn fix).
+
+    ``selected_sizes`` is the ENUMERATED trim selection: quote_id → the
+    ``worst_hit_loss_cc`` the enumeration priced for each KEPT quote. Given the
+    CURRENT book's ``open_quotes``, partition the breached-game touchers
+    against that selection and return ``(tails_cc, mutated)``:
+
+      - ``tails_cc[game]``: sum of ``worst_hit_loss_cc`` over every CURRENT
+        quote touching ``game`` that is NOT in the enumerated selection. Per
+        state a quote's clamped contribution is <= its ``worst_hit_loss_cc``
+        (state-independent — the same bound the trim's adder uses), so while
+        ``tails_cc[game] <= adder[game]`` the enumeration's
+        ``trimmed_worst + adder`` still upper-bounds the CURRENT full book's
+        worst case for that game. The caller grants only under that condition.
+      - ``mutated``: selected quote ids whose CURRENT ``worst_hit_loss_cc``
+        differs from the enumerated size. Quotes are immutable per id (a
+        reprice replaces the id), so this should be impossible — but
+        ``ExposureBook.upsert_quote`` is physically able to swap content under
+        an id, and a selection priced on stale content is unsound: callers
+        MUST fail closed on a non-empty ``mutated``.
+
+    A selected quote MISSING from the current book is conservative, not a
+    conflict: its enumerated per-state contribution is >= 0 (clamped), so the
+    certified bound only overstates the book without it — it simply does not
+    appear in either output.
+    """
+    tails: dict[str, int] = {}
+    mutated: list[str] = []
+    for q, qgames in _quotes_touching_games(open_quotes, set(games), events):
+        size = selected_sizes.get(q.quote_id)
+        if size is not None:
+            if q.worst_hit_loss_cc != size:
+                mutated.append(q.quote_id)
+            continue
+        for game in qgames:
+            tails[game] = tails.get(game, 0) + q.worst_hit_loss_cc
+    return tails, tuple(sorted(mutated))
 
 
 def _selected_possible(

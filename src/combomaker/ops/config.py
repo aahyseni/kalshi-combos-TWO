@@ -2275,6 +2275,23 @@ class RiskConfig(StrictModel):
     hard_trip_frac: str = "0.12"          # hard-trip KILL
     portfolio_cvar_frac: str = "0.15"     # portfolio joint-tail (governing model ES_0.99)
     portfolio_det_max_frac: str = "0.15"  # P0-3: deterministic all-hit max-loss cap
+    # MUTEX/SCENARIO-AWARE det-max gating (operator directive 2026-07-18). The
+    # comonotone all-hit det-max charges mutually exclusive parlays (opposing
+    # moneylines of one game; two champion outcomes) as if they could all hit
+    # SIMULTANEOUSLY — impossible — and refused diversifying +EV flow at the
+    # portfolio det-max caps (live 2026-07-17 night: ENG-win / ARG-champ / tie
+    # combos declined at $453 of the $500 budget while ES/CVaR sat far from
+    # binding). True (default): the SKIP_PORTFOLIO_DET_MAX cap and the P0-1
+    # candidate gate's post_deterministic_max_over_budget budget gate on the
+    # sound scenario-aware bound (within a game: max over provably-exclusive
+    # outcome branches; across games: sum; comonotone fallback for every
+    # unproven slice — always <= the comonotone number, which keeps emitting
+    # unchanged for telemetry). False: byte-identical old comonotone gating at
+    # BOTH sites — the quote-time cap reads it from RiskLimits and the
+    # candidate gate receives it via CandidateBookRiskInputs.det_max_mutex_aware
+    # (threaded in QuoteLifecycle._build_candidate_gate_inputs).
+    # Reason codes and budgets are unchanged.
+    portfolio_det_max_mutex_aware: bool = True
     portfolio_ruin_prob_budget: str = "0.05"  # A2: max P(equity < ruin floor this wave)
     absolute_notional_multiple: int = 3   # utilization backstop (× bankroll)
     fill_velocity_window_s: float = 2.0
@@ -2434,6 +2451,7 @@ class RiskConfig(StrictModel):
             hard_trip_frac=Fraction(Decimal(self.hard_trip_frac)),
             portfolio_cvar_frac=Fraction(Decimal(self.portfolio_cvar_frac)),
             portfolio_det_max_frac=Fraction(Decimal(self.portfolio_det_max_frac)),
+            portfolio_det_max_mutex_aware=self.portfolio_det_max_mutex_aware,
             portfolio_ruin_prob_budget=Fraction(Decimal(self.portfolio_ruin_prob_budget)),
             absolute_notional_multiple=self.absolute_notional_multiple,
             fill_velocity_window_s=self.fill_velocity_window_s,

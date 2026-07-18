@@ -40,7 +40,13 @@ from dataclasses import dataclass, field
 import numpy as np
 from numpy.typing import NDArray
 
-from combomaker.risk.exposure import MarginalProvider, OpenPosition
+from combomaker.core.conventions import Side
+from combomaker.risk.exposure import (
+    LegRef,
+    MarginalProvider,
+    OpenPosition,
+    mutex_scenario_bound,
+)
 from combomaker.sim.book_model import (
     BookModel,
     WithinGameRhoProvider,
@@ -174,6 +180,23 @@ class BookRiskSnapshot:
     # holdings). A hard upper bound the sampled ES can never exceed — gated as its
     # OWN axis (premium-at-risk cap), never maxed into the ES number.
     deterministic_max_loss_cc: float = 0.0
+    # MUTEX/SCENARIO-AWARE deterministic maximum loss (operator directive
+    # 2026-07-18): the comonotone all-hit number above pretends MUTUALLY
+    # EXCLUSIVE parlays (FRA-wins and ENG-wins of ONE game; two champion
+    # outcomes) can all hit SIMULTANEOUSLY, which is impossible — so it taxed
+    # diversifying flow at the det-max caps. This field is the sound
+    # scenario-aware bound (``mutex_aware_det_max_from_units``): within a game,
+    # max over that game's provably-exclusive outcome branches; across games,
+    # sum (independent games' worst cases CAN co-occur); comonotone fallback
+    # for every slice whose exclusivity is not PROVEN by structure. Invariants:
+    # <= ``deterministic_max_loss_cc`` ALWAYS; == it when no mutex structure
+    # exists among held combos; never below any single realizable joint
+    # scenario's loss. The det-max CAP CHECKS gate on this field when
+    # ``portfolio_det_max_mutex_aware`` is armed (the default); the comonotone
+    # field above keeps emitting unchanged for telemetry/log continuity. None
+    # (an UNKNOWN/empty snapshot, or a pre-fix snapshot) ⇒ consumers fall back
+    # to the comonotone number (fail-closed: the LARGER bound).
+    mutex_aware_det_max_cc: float | None = None
 
     # Tail attribution (§4.4).
     per_game_tail_cc: tuple[TailContribution, ...] = ()
@@ -981,6 +1004,9 @@ def compute_book_risk(
             n_positions=0,
             input_generation=input_generation,
             deterministic_max_loss_cc=reserve,
+            # A reserve has no leg structure to net — the mutex-aware bound IS
+            # the comonotone reserve (equality when no structure, by contract).
+            mutex_aware_det_max_cc=reserve,
         )
 
     corr = model.corr_for_band(band)
@@ -1131,6 +1157,27 @@ def compute_book_risk(
     # whole-account risk is never hidden from the operative tail number.
     deterministic_max = _deterministic_all_hit_loss_cc(model) + reserve
 
+    # Mutex/scenario-aware deterministic bound (2026-07-18): same counted
+    # losses, co-aggregated soundly — within-game exclusive branches max, across
+    # games sum, comonotone for every unproven slice. The comonotone number
+    # above keeps emitting unchanged; the det-max caps read THIS field when
+    # armed. Computed here (off the hot path) so the snapshot is the quote-time
+    # cache — recomputed only on a book change via the generation stamp. Any
+    # failure falls back to the comonotone number (fail closed, never open).
+    try:
+        marg_map = {t: model.legs[i].p for t, i in model.leg_index.items()}
+        mutex_det = min(
+            deterministic_max,
+            mutex_aware_det_max_from_units(
+                _det_units_from_model(model),
+                reserved_loss_cc=reserve,
+                marginals=marg_map.get,
+                structural_cfg=structural_cfg,
+            ),
+        )
+    except Exception:
+        mutex_det = deterministic_max
+
     # P0-3: the governing MODEL tail is the worst SAMPLED CVaR across scenarios —
     # NOT maxed with the deterministic maximum. The deterministic maximum is a
     # separate axis (deterministic_max_loss_cc), gated independently, so it can no
@@ -1180,6 +1227,7 @@ def compute_book_risk(
         bridge_active=bridge_active,
         governing_model_es_99_cc=governing_model_es,
         deterministic_max_loss_cc=deterministic_max,
+        mutex_aware_det_max_cc=mutex_det,
         per_game_tail_cc=per_game_tail,
         per_leg_tail_cc=per_leg_tail,
     )
@@ -1249,6 +1297,15 @@ class _TailAxes:
     # is a genuine loss. NEVER used for the %-of-bankroll budgets — those keep
     # gating the clamped ES.
     governing_model_tail_loss_cc: float = 0.0
+    # MUTEX/SCENARIO-AWARE deterministic maximum (2026-07-18): the sound
+    # co-aggregation of the SAME counted losses (within-game exclusive branches
+    # max, across games sum, comonotone for unproven slices) — see
+    # ``mutex_aware_det_max_from_units``. None ⇒ not computed for this book
+    # (the mutex-aware gate is off, or the det budget is not evaluated) ⇒ the
+    # candidate gate falls back to the comonotone number (fail closed). Always
+    # <= ``deterministic_max_loss_cc`` when present. Both ride the verdict so
+    # live monitoring can compare the two bounds per decision.
+    mutex_aware_det_max_cc: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1324,6 +1381,7 @@ def _tail_axes_from_pnl(
     bridge_pnl: NDArray[np.float64] | None = None,
     split_pnl: NDArray[np.float64] | None = None,
     ruin_prob_ci_z: float = 0.0,
+    mutex_aware_det_max_cc: float | None = None,
 ) -> _TailAxes:
     """Roll a per-scenario book P&L vector (and its correlation-inflated
     challenger re-sample, plus the optional P0-7 full-copula bridge re-sample and
@@ -1430,6 +1488,7 @@ def _tail_axes_from_pnl(
         bridge_ev_cc=bridge_ev,
         split_ev_cc=split_ev,
         governing_model_tail_loss_cc=governing_tail_loss,
+        mutex_aware_det_max_cc=mutex_aware_det_max_cc,
     )
 
 
@@ -1453,6 +1512,285 @@ def _det_and_gross(
     det += _reserved_loss_of(positions)
     gross = float(sum(p.gross_settlement_notional_cc for p in positions))
     return det, gross
+
+
+# ---------------------------------------------------------------------------
+# Mutex/scenario-aware deterministic maximum loss (operator directive
+# 2026-07-18): variety must stop being taxed by a bound that pretends mutually
+# exclusive losses co-occur.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class DetMaxUnit:
+    """One counted unit of the deterministic premium-at-risk fold.
+
+    ``loss_cc`` is this unit's FULL contribution to the comonotone all-hit
+    number, computed by the CALL SITE with its own arithmetic (float premium +
+    fee for a sampled combo) so the aggregation changes only HOW counted losses
+    co-aggregate, never WHAT counts. ``contracts_centi`` / ``entry_price_cc``
+    feed the state-exact enumeration (``WorstCaseEntity``); ``legs`` carry the
+    structure (market tickers, event tickers, selected sides) the mutex proof
+    reads — NEVER leg-sign heuristics."""
+
+    unit_id: str
+    our_side: Side
+    contracts_centi: int
+    entry_price_cc: int
+    legs: tuple[LegRef, ...]
+    loss_cc: float
+    risk_modeled: bool = True
+
+
+def _det_units_from_positions(
+    positions: Sequence[OpenPosition],
+) -> tuple[list[DetMaxUnit], float]:
+    """(risk-modeled units, reserved premium) for a position set, with per-unit
+    ``loss_cc`` computed by the EXACT arithmetic ``_det_and_gross`` uses for the
+    comonotone number (``float(price) * (centi/100)``, fee 0 — build_book_model
+    sets every sampled combo's fee to 0), so no-netting parity is exact."""
+    units: list[DetMaxUnit] = []
+    reserved = 0.0
+    for p in positions:
+        if p.risk_modeled:
+            units.append(
+                DetMaxUnit(
+                    unit_id=p.position_id,
+                    our_side=p.our_side,
+                    contracts_centi=int(p.contracts),
+                    entry_price_cc=int(p.entry_price_cc),
+                    legs=p.legs,
+                    loss_cc=float(int(p.entry_price_cc)) * (int(p.contracts) / 100),
+                )
+            )
+        else:
+            reserved += float(p.max_loss_cc)
+    return units, reserved
+
+
+def _det_units_from_model(model: BookModel) -> list[DetMaxUnit]:
+    """Units for the async snapshot path, reconstructed from the frozen
+    ``BookModel`` (the workers never see the live ``ExposureBook``): per combo,
+    legs are rebuilt from the shared leg universe (ticker + event + selected
+    side) and ``loss_cc`` uses the EXACT ``_deterministic_all_hit_loss_cc``
+    arithmetic (``float(price)·contracts + fee``). A combo whose legs cannot be
+    reconstructed gets an EMPTY leg tuple ⇒ the fold routes it comonotone
+    (fail-closed)."""
+    ticker_of = {i: t for t, i in model.leg_index.items()}
+    units: list[DetMaxUnit] = []
+    for k, pos in enumerate(model.positions):
+        sides = pos.leg_sides or tuple("yes" for _ in pos.leg_indices)
+        legs: list[LegRef] = []
+        for i, s in zip(pos.leg_indices, sides, strict=True):
+            ticker = ticker_of.get(i)
+            if ticker is None:
+                legs = []
+                break
+            legs.append(
+                LegRef(
+                    market_ticker=ticker,
+                    event_ticker=model.event_by_index.get(i),
+                    side=s,
+                )
+            )
+        units.append(
+            DetMaxUnit(
+                unit_id=f"model:{k}",
+                our_side=Side.YES if pos.side == "yes" else Side.NO,
+                contracts_centi=max(1, int(round(pos.contracts * 100))),
+                entry_price_cc=int(pos.price_cc),
+                legs=tuple(legs),
+                loss_cc=float(pos.price_cc) * pos.contracts + float(pos.fee_cc),
+            )
+        )
+    return units
+
+
+def _single_game_of(unit: DetMaxUnit) -> str | None:
+    """The ONE game every leg of this unit lives in (``pricing.grouping.
+    game_key`` — alias-resolved, so a champion leg joins the final's game), or
+    None when the unit is ungamed / spans games (⇒ comonotone residual: a
+    multi-game parlay's exclusivity vs the rest of the book is not certified
+    here — fail-closed, never a netting guess)."""
+    from combomaker.pricing.grouping import game_key
+
+    game: str | None = None
+    for leg in unit.legs:
+        if not leg.event_ticker:
+            return None
+        g = game_key(leg.event_ticker)
+        if game is None:
+            game = g
+        elif g != game:
+            return None
+    return game
+
+
+def mutex_aware_det_max_from_units(
+    units: Sequence[DetMaxUnit],
+    *,
+    reserved_loss_cc: float = 0.0,
+    marginals: MarginalProvider | None = None,
+    structural_cfg: StructuralConfigView | None = None,
+    is_me_event: Callable[[str], bool | None] | None = None,
+) -> float:
+    """The sound MUTEX/SCENARIO-AWARE deterministic maximum loss, float cc.
+
+    AGGREGATION (per-scenario soundness is the invariant):
+      * Each unit is assigned to exactly ONE bucket: its single game (every leg
+        in one ``game_key`` game, long-NO, risk-modeled, known leg sides) or
+        the COMONOTONE RESIDUAL (multi-game / ungamed / non-NO / reserved /
+        unknown-side units, plus ``reserved_loss_cc``) — counted at full loss.
+      * Within a game bucket the bound is the MIN over the sound per-bucket
+        bounds that apply, each >= the largest single unit (a floor that keeps
+        the fold monotone) and <= the bucket's comonotone sum:
+          - STATE-EXACT: ``state_worst_case_by_game`` over the bucket's units
+            mapped ``earns_credit=False`` — per enumerated DC-scoreline state
+            (× shootout branch) a long-NO parlay contributes its FULL premium
+            iff every structural leg can still hit (non-structural legs
+            adversarial), else 0, NEVER a negative credit; the bound is the max
+            state total. Clamped-at-0 keeps it MONOTONE in the unit set (unlike
+            the waiver's signed netting, which is confirm-path-only), so this
+            use does NOT violate that module's quote-time prohibition.
+          - ME-BRANCH: the P0-9 single-explicit-ME-event max-over-branches fold
+            (``exposure.mutex_scenario_bound``) on full float losses, when the
+            caller supplies ``is_me_event`` metadata. Fails closed to the sum
+            on 0 or >= 2 ME events.
+          - COMONOTONE: always a candidate (the fail-closed slice bound).
+      * TOTAL = Σ bucket bounds + residual. Across DIFFERENT games worst cases
+        CAN co-occur (independent events) — summing is required, and each unit
+        is counted in exactly one bucket, so the total never double-counts.
+
+    SOUNDNESS: fix any realizable joint outcome. Within a game its outcome
+    selects one enumerated state / one ME branch; every unit that LOSES in that
+    outcome is counted in that state/branch's total (a long-NO parlay loses ⇒
+    ALL its legs hit ⇒ its in-game legs hit in the realized state ⇒ counted;
+    the ME fold's per-branch requirement is implied the same way, GIVEN the
+    event's exclusivity — the same explicit-True metadata trust the Stage-B/
+    P0-9 caps net on, audited by the P1-7 settlement tripwire). Residual units
+    are counted at full loss unconditionally. Hence realized book loss <=
+    Σ bucket bounds + residual. Every candidate bound <= its bucket's sum and
+    the residual is exact, so the total is <= the comonotone number, with
+    equality when no netting structure is proven (also clamped so ordering
+    noise can never exceed it).
+
+    Int/float seam: the state enumeration charges each unit its INT premium
+    (``centi·price//100``); the per-unit non-negative float remainder
+    (``loss_cc − int premium``, incl. any fee) is added back comonotone-style,
+    so the bound never undercounts the float arithmetic the caps compare.
+
+    FAIL-CLOSED: any exception anywhere returns the comonotone number (the
+    LARGER bound — never fail open); a game with no buildable structural plan
+    or an enumeration error is already comonotone per ``state_worst_case_by_
+    game``'s own fail-closed contract. Certification is structural (game plans
+    from real tickers/marginals) or explicit ME metadata — never leg-sign
+    heuristics. Pure and deterministic; the caller caches it (the async
+    snapshot is the quote-time cache, generation-stamped)."""
+    comonotone = float(sum(u.loss_cc for u in units)) + max(0.0, reserved_loss_cc)
+    try:
+        bound = _mutex_aware_det_fold(
+            units,
+            reserved_loss_cc=max(0.0, reserved_loss_cc),
+            marginals=marginals,
+            structural_cfg=structural_cfg,
+            is_me_event=is_me_event,
+        )
+    except Exception:
+        return comonotone  # fail closed: the larger, comonotone bound
+    return min(bound, comonotone)
+
+
+def _mutex_aware_det_fold(
+    units: Sequence[DetMaxUnit],
+    *,
+    reserved_loss_cc: float,
+    marginals: MarginalProvider | None,
+    structural_cfg: StructuralConfigView | None,
+    is_me_event: Callable[[str], bool | None] | None,
+) -> float:
+    """The aggregation body (see ``mutex_aware_det_max_from_units``)."""
+    residual = reserved_loss_cc
+    buckets: dict[str, list[DetMaxUnit]] = {}
+    for u in units:
+        game: str | None = None
+        if (
+            u.risk_modeled
+            and u.our_side is Side.NO
+            and u.legs
+            and all(leg.side in ("yes", "no") for leg in u.legs)
+        ):
+            game = _single_game_of(u)
+        if game is None:
+            residual += u.loss_cc
+        else:
+            buckets.setdefault(game, []).append(u)
+
+    # Netting can only bite where >= 2 units share a game; singleton buckets are
+    # exactly their unit's loss under every candidate bound, so the enumeration
+    # is skipped for them (hot-path thrift, value-identical).
+    multi = {g: us for g, us in buckets.items() if len(us) >= 2}
+    state_bounds: dict[str, object] = {}
+    if multi and structural_cfg is not None and marginals is not None:
+        from combomaker.sim.state_worst_case import (
+            WorstCaseEntity,
+            state_worst_case_by_game,
+        )
+
+        entities = [
+            WorstCaseEntity(
+                entity_id=f"{g}:{u.unit_id}",
+                our_side=u.our_side,
+                contracts_centi=u.contracts_centi,
+                entry_price_cc=u.entry_price_cc,
+                legs=u.legs,
+                fee_cc=0,
+                risk_modeled=True,
+                # The CLAMPED treatment: per state a unit contributes its full
+                # hit loss or 0 — never a miss-side credit — which is what makes
+                # this bound monotone and therefore safe OUTSIDE the confirm
+                # path (the module's signed-netting prohibition targets credit).
+                earns_credit=False,
+            )
+            for g, us in multi.items()
+            for u in us
+        ]
+        marg_map: dict[str, float] = {}
+        for us in multi.values():
+            for u in us:
+                for leg in u.legs:
+                    if leg.market_ticker not in marg_map:
+                        p = marginals(leg.market_ticker)
+                        if p is not None:
+                            marg_map[leg.market_ticker] = float(p)
+        state_bounds = dict(
+            state_worst_case_by_game(entities, (), marg_map, None, structural_cfg)
+        )
+
+    total = residual
+    for game, bucket in buckets.items():
+        como_g = float(sum(u.loss_cc for u in bucket))
+        bound_g = como_g
+        if game in multi:
+            largest = max(u.loss_cc for u in bucket)
+            sw = state_bounds.get(game)
+            if sw is not None and getattr(sw, "certified", False):
+                # Int state bound + the non-negative float remainders (never
+                # undercount the float arithmetic), floored at the largest
+                # single unit (monotone across the singleton fast path).
+                frac = sum(
+                    max(0.0, u.loss_cc - u.contracts_centi * u.entry_price_cc // 100)
+                    for u in bucket
+                )
+                state_cand = max(
+                    float(getattr(sw, "worst_case_cc", 0)) + frac, largest
+                )
+                bound_g = min(bound_g, state_cand)
+            if is_me_event is not None:
+                entries = [(u.legs, u.loss_cc, True) for u in bucket]
+                # >= largest single entry by the fold's own contract.
+                bound_g = min(bound_g, mutex_scenario_bound(entries, is_me_event))
+        total += bound_g
+    return total
 
 
 def evaluate_candidate_book_risk(
@@ -1479,6 +1817,7 @@ def evaluate_candidate_book_risk(
     hedge_cost_budget_cc: int = 0,
     allow_negative_ev_hedge: bool = False,
     worst_challenger_ev_tolerance: float = float("-inf"),
+    det_max_mutex_aware: bool = True,
 ) -> CandidateBookRisk:
     """Candidate- and reservation-aware portfolio risk on COMMON sampled states.
 
@@ -1643,6 +1982,51 @@ def evaluate_candidate_book_risk(
     pre_det, pre_gross = _det_and_gross(pre_positions, pre_combos)
     post_det, post_gross = _det_and_gross(all_positions, post_combos)
 
+    # MUTEX/SCENARIO-AWARE deterministic bound (2026-07-18): the SAME counted
+    # premium-at-risk (committed + reservations + simultaneous accepts [+ the
+    # candidate], reserved holdings comonotone) co-aggregated soundly — see
+    # ``mutex_aware_det_max_from_units``. Computed only when the det budget will
+    # actually gate (flag armed + fraction + bankroll supplied); otherwise both
+    # axes carry None and the gate reads the comonotone number, byte-identical
+    # to the pre-fix behaviour (``det_max_mutex_aware=False`` restores it
+    # exactly). Reservations participate in branch netting deliberately: the
+    # branch max never SUBTRACTS a loss (no hedge credit), and the fold is
+    # monotone, so a released reservation only ever LOWERS the bound — the
+    # waiver's credit-outlives-release hazard cannot arise. Any failure leaves
+    # None (fail closed to comonotone, never open).
+    pre_mutex: float | None = None
+    post_mutex: float | None = None
+    if (
+        det_max_mutex_aware
+        and portfolio_det_max_frac is not None
+        and bankroll_cc is not None
+        and bankroll_cc > 0
+    ):
+        try:
+            pre_units, pre_reserved = _det_units_from_positions(pre_positions)
+            post_units, post_reserved = _det_units_from_positions(all_positions)
+            pre_mutex = min(
+                pre_det,
+                mutex_aware_det_max_from_units(
+                    pre_units,
+                    reserved_loss_cc=pre_reserved,
+                    marginals=marginals,
+                    structural_cfg=structural_cfg,
+                ),
+            )
+            post_mutex = min(
+                post_det,
+                mutex_aware_det_max_from_units(
+                    post_units,
+                    reserved_loss_cc=post_reserved,
+                    marginals=marginals,
+                    structural_cfg=structural_cfg,
+                ),
+            )
+        except Exception:
+            pre_mutex = None
+            post_mutex = None
+
     pre_axes = _tail_axes_from_pnl(
         pre_pnl,
         pre_det,
@@ -1653,6 +2037,7 @@ def evaluate_candidate_book_risk(
         bridge_pnl=pre_bridge_pnl,
         split_pnl=pre_split_pnl,
         ruin_prob_ci_z=ruin_prob_ci_z,
+        mutex_aware_det_max_cc=pre_mutex,
     )
     post_axes = _tail_axes_from_pnl(
         post_pnl,
@@ -1664,6 +2049,7 @@ def evaluate_candidate_book_risk(
         bridge_pnl=post_bridge_pnl,
         split_pnl=post_split_pnl,
         ruin_prob_ci_z=ruin_prob_ci_z,
+        mutex_aware_det_max_cc=post_mutex,
     )
     # PRODUCTION-model candidate EV — the number the admission policy gates on.
     candidate_ev = post_axes.ev_cc - pre_axes.ev_cc
@@ -1811,15 +2197,26 @@ def _candidate_gate(
         if post.governing_model_es_99_cc > cvar_thr:
             return False, "post_governing_model_es_over_budget"
 
-    # (3) POST deterministic all-hit maximum vs its INDEPENDENT %-of-bankroll
-    # ceiling (P0-3: gated separately from the sampled ES).
+    # (3) POST deterministic maximum vs its INDEPENDENT %-of-bankroll ceiling
+    # (P0-3: gated separately from the sampled ES). MUTEX-AWARE (2026-07-18):
+    # when the evaluator computed the scenario-aware bound the gate reads IT —
+    # mutually exclusive parlays (opposing moneylines of one game, two champion
+    # outcomes) can no longer be charged as if they all hit simultaneously, so
+    # diversifying flow stops being taxed. None (flag off / budget not armed /
+    # any failure) ⇒ the comonotone number gates, byte-identical to pre-fix
+    # (fail closed: comonotone is the LARGER bound). Both numbers ride the
+    # verdict's ``post`` axes for decline logging/monitoring; the decline
+    # reason string is unchanged.
     if (
         portfolio_det_max_frac is not None
         and bankroll_cc is not None
         and bankroll_cc > 0
     ):
         det_thr = portfolio_det_max_frac * bankroll_cc
-        if post.deterministic_max_loss_cc > det_thr:
+        post_det_gate = post.deterministic_max_loss_cc
+        if post.mutex_aware_det_max_cc is not None:
+            post_det_gate = min(post_det_gate, post.mutex_aware_det_max_cc)
+        if post_det_gate > det_thr:
             return False, "post_deterministic_max_over_budget"
 
     # (4) POST P(ruin) vs the probability budget (reflects the same-game hedge —

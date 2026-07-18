@@ -101,11 +101,21 @@ from combomaker.sim.state_worst_case import (
     GameWorstCase,
     entity_from_position,
     quote_from_open_quote,
+    tail_outside_selection,
     trim_open_quotes_for_games,
 )
 from combomaker.sim.structural_book import StructuralConfigView
 
 log = get_logger(__name__)
+
+
+def _fmt_opt_cc(value_cc: float | None) -> str:
+    """Format an optional centi-cent figure for decline-detail strings.
+
+    ``None`` (mutex-aware bound unavailable — pre-fix snapshot or fail-closed
+    slice) renders as ``"n/a"`` so the operator's decline reports can tell
+    "not computed" apart from a real 0."""
+    return "n/a" if value_cc is None else f"{value_cc:.0f}"
 
 JsonDict = dict[str, Any]
 
@@ -341,6 +351,7 @@ class _StaleBookRisk:
     usable: bool = False
     governing_model_es_99_cc: float = 0.0
     deterministic_max_loss_cc: float = 0.0
+    mutex_aware_det_max_cc: float | None = None
     p_ruin: float = 0.0
     p_ruin_upper: float = 0.0  # P1-2 (never read on the unusable path)
 
@@ -727,6 +738,11 @@ class QuoteLifecycle:
                 es_99_cc=int(snap.es_99_cc),
                 challenger_es_99_cc=int(snap.challenger_es_99_cc),
                 deterministic_max_loss_cc=int(snap.deterministic_max_loss_cc),
+                mutex_aware_det_max_cc=(
+                    None
+                    if snap.mutex_aware_det_max_cc is None
+                    else int(snap.mutex_aware_det_max_cc)
+                ),
                 p_ruin=round(snap.p_ruin, 4),
             )
 
@@ -1278,6 +1294,8 @@ class QuoteLifecycle:
                     f"{result.worst_credible_candidate_ev_cc:.1f}, "
                     f"post_es_cc={result.post.governing_model_es_99_cc:.0f}, "
                     f"post_det_cc={result.post.deterministic_max_loss_cc:.0f}, "
+                    f"post_mutex_det_cc="
+                    f"{_fmt_opt_cc(result.post.mutex_aware_det_max_cc)}, "
                     f"post_p_ruin={result.post.p_ruin:.4f})"
                 )
             log.info(
@@ -1287,6 +1305,11 @@ class QuoteLifecycle:
                 candidate_ev_cc=round(result.candidate_ev_cc, 1),
                 post_governing_es_cc=int(result.post.governing_model_es_99_cc),
                 post_deterministic_max_cc=int(result.post.deterministic_max_loss_cc),
+                post_mutex_det_max_cc=(
+                    None
+                    if result.post.mutex_aware_det_max_cc is None
+                    else int(result.post.mutex_aware_det_max_cc)
+                ),
                 post_p_ruin=round(result.post.p_ruin, 4),
                 n_pre=result.n_pre_positions,
             )
@@ -1481,6 +1504,10 @@ class QuoteLifecycle:
             # a finite operator value ALSO declines a +production-EV candidate whose
             # worst credible challenger EV falls below it (strictly additive).
             worst_challenger_ev_tolerance=self._config.worst_challenger_ev_tolerance_cc,
+            # MUTEX-AWARE DET-MAX rollback switch: the SAME RiskLimits knob the
+            # quote-time cap honors, threaded to the worker gate so knob=False
+            # restores comonotone gating at BOTH sites (verify finding 2026-07-18).
+            det_max_mutex_aware=bool(limits.portfolio_det_max_mutex_aware),
             # P0-2 staleness stamps (see _build_candidate_gate_inputs docstring).
             input_generation=input_generation,
             reservation_version=reservation_version,
@@ -1579,6 +1606,12 @@ class QuoteLifecycle:
             run_state_worst_case`` bounded by ``lastlook_mc_waiver_deadline_s``.
           - If either stamp moved during the enumeration the verdict priced a
             book that no longer exists: REBUILD ONCE, then fail-closed decline.
+            TRIM ARMED (topk > 0, 2026-07-18): quote-churn stability is judged
+            against the trim-SELECTED set + tail adder instead of the full
+            same-game id set — same-game churn wholly outside the enumerated
+            selection and within the adder budget no longer invalidates
+            (``_waiver_trim_revalidate``); position/reservation stamps stay
+            exact.
           - Every breached game must come back CERTIFIED with worst_case_cc
             within the SAME game-loss budget (threshold_cc(game_loss_frac,
             bankroll) — never a raised one; re-validated AGAIN by the checker at
@@ -1635,6 +1668,7 @@ class QuoteLifecycle:
         deadline_ns = int(self._config.lastlook_mc_waiver_deadline_s * 1e9)
         result: dict[str, GameWorstCase] | None = None
         trim_adders: dict[str, int] = {}
+        selected_sizes: dict[str, int] = {}
         topk = self._config.lastlook_waiver_topk_resting
         # One build + AT MOST ONE rebuild (version moved during the enumeration),
         # then fail-closed decline — the mandated retry budget.
@@ -1655,6 +1689,12 @@ class QuoteLifecycle:
                     kept, trim_adders = trim_open_quotes_for_games(
                         inputs.open_quotes, games, inputs.events, topk
                     )
+                    # The SELECTED set's identity+size — the trimmed stability
+                    # key (2026-07-18): what the enumeration actually prices,
+                    # revalidated (with the adder) after the off-loop await.
+                    selected_sizes = {
+                        q.quote_id: q.worst_hit_loss_cc for q in kept
+                    }
                     if len(kept) != len(inputs.open_quotes):
                         self._metrics.inc("lastlook_waiver.trimmed")
                         log.info(
@@ -1715,7 +1755,59 @@ class QuoteLifecycle:
             # version + the BREACHED games' resting-quote id set — NOT the
             # full book generation (see _waiver_games_fingerprint).
             fp_after = self._waiver_games_fingerprint(games)
-            if fp_after != fp_before:
+            if topk > 0:
+                # TRIMMED STABILITY (2026-07-18 — the "waiver unstable: book
+                # moved during every enumeration" churn fix, 51 live declines
+                # 2026-07-17 night): the enumeration priced only the trim-
+                # SELECTED top-K quotes per breached game plus a CONSTANT tail
+                # adder, so the stability key is that certificate's own
+                # support — not the full same-game id set (churn among small
+                # quotes the trim never priced was invalidating certificates
+                # whose bound still held). The stamps (position generation +
+                # reservation version) stay EXACT: committed fills and
+                # reservation churn are real risk changes, never waived
+                # through. Quote churn is then judged by grant-time
+                # revalidation (``_waiver_trim_revalidate``): the certificate
+                # stays valid iff every still-present SELECTED quote is
+                # byte-identical (id + priced size) and the CURRENT outside-
+                # selection tail still fits the enumerated adder — then
+                # (trimmed worst + adder) still upper-bounds the CURRENT
+                # book's worst case. Anything else fails closed exactly as
+                # today (retry once, then the unstable decline).
+                conflict_why: str | None = None
+                if fp_after[:2] != fp_before[:2]:
+                    conflict_why = (
+                        "positions / reservations moved during the enumeration"
+                    )
+                else:
+                    trim_ok, trim_why = self._waiver_trim_revalidate(
+                        games, selected_sizes, trim_adders
+                    )
+                    if not trim_ok:
+                        conflict_why = trim_why
+                if conflict_why is not None:
+                    self._metrics.inc("lastlook_waiver.version_conflict")
+                    log.info(
+                        "lastlook_waiver_version_conflict",
+                        quote_id=quote_id,
+                        attempt=attempt,
+                        detail="breached-game resting set / positions / "
+                        "reservations moved during the enumeration",
+                        why=conflict_why,
+                    )
+                    continue
+                if fp_after != fp_before:
+                    # Same-game churn DID happen — but entirely outside the
+                    # certificate's support and within its adder budget: the
+                    # newly-tolerated case (a spurious unstable-decline before
+                    # this fix).
+                    log.debug(
+                        "lastlook_waiver_tail_churn_tolerated",
+                        quote_id=quote_id,
+                        attempt=attempt,
+                        detail="waiver stable: tail churn within adder",
+                    )
+            elif fp_after != fp_before:
                 self._metrics.inc("lastlook_waiver.version_conflict")
                 log.info(
                     "lastlook_waiver_version_conflict",
@@ -1915,7 +2007,16 @@ class QuoteLifecycle:
         enumeration", observed live on a +$1.76 EV $31 win). Same-game
         quote arrivals and any position/reservation change still invalidate
         (the 2026-07-16 stale-certificate findings stay covered — quotes are
-        immutable per id; a reprice replaces the id)."""
+        immutable per id; a reprice replaces the id).
+
+        TRIM ARMED (``lastlook_waiver_topk_resting > 0``, 2026-07-18): only
+        the first two components (position generation + reservation version)
+        are compared exactly; the quote-id set is judged instead by grant-time
+        revalidation against the trim's SELECTED set + tail adder
+        (``_waiver_trim_revalidate``) — churn among same-game quotes the
+        enumeration never priced no longer invalidates a certificate whose
+        bound provably still holds. The id set still feeds the tolerated-churn
+        debug log."""
         gset = set(games)
         qids = tuple(sorted(
             qid for qid, q in self._exposure.open_quotes.items()
@@ -1929,6 +2030,56 @@ class QuoteLifecycle:
             self._reservation.version if self._reservation is not None else -1,
             qids,
         )
+
+    def _waiver_trim_revalidate(
+        self,
+        games: list[str],
+        selected_sizes: Mapping[str, int],
+        adders: Mapping[str, int],
+    ) -> tuple[bool, str]:
+        """Grant-time revalidation of a TRIMMED waiver enumeration (2026-07-18
+        — runs ON-LOOP after the off-loop await, atomically with the
+        reservation retry). Returns ``(still_valid, why)``.
+
+        GRANT CONDITION (the simplest sound sufficient condition; anything
+        else fails closed): for every breached game, the CURRENT tail — the
+        summed ``worst_hit_loss_cc`` of all current same-game quotes NOT in
+        the enumerated selection — must be <= the tail adder the enumeration
+        folded into the certificate, AND every still-present SELECTED quote
+        must be unchanged (same id, same priced size).
+
+        SOUNDNESS: per state a quote contributes ``max(0, loss) <=
+        worst_hit_loss_cc`` (state-independent), so for every state s of a
+        breached game:  current_total(s) <= enumerated_trimmed_total(s) +
+        current_tail <= enumerated_trimmed_total(s) + adder — i.e. the
+        certificate (trimmed worst + adder) still upper-bounds the CURRENT
+        book's worst case. A SELECTED quote that VANISHED is conservative
+        (its enumerated clamped contribution was >= 0), so it never blocks; a
+        selected quote whose content changed under its id makes the
+        enumerated per-state terms stale ⇒ fail closed. Entities (positions/
+        reservations) are outside this check — the caller compares those
+        stamps exactly and never waives through them."""
+        current = tuple(
+            quote_from_open_quote(quote, self._conventions)
+            for quote in self._exposure.open_quotes.values()
+        )
+        tails, mutated = tail_outside_selection(
+            current, games, None, selected_sizes
+        )
+        if mutated:
+            return False, (
+                f"selected resting quotes mutated under their ids: "
+                f"{list(mutated)}"
+            )
+        for game in games:
+            tail_cc = tails.get(game, 0)
+            adder_cc = adders.get(game, 0)
+            if tail_cc > adder_cc:
+                return False, (
+                    f"game {game} current tail {tail_cc}cc exceeds the "
+                    f"enumerated adder {adder_cc}cc"
+                )
+        return True, ""
 
     async def _run_state_worst_case(
         self, inputs: StateWorstCaseInputs, *, deadline_s: float

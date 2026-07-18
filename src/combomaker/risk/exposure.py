@@ -828,6 +828,28 @@ def mutex_directional_alignment_cc(
     return (min(max(full - base, 0.0), mag), base)
 
 
+def mutex_scenario_bound(
+    entries: Sequence[DirEntry],
+    is_me_event: Callable[[str], bool | None] | None,
+) -> float:
+    """Public branch-max fold for GENERIC non-negative per-entry magnitudes —
+    the P0-9 single-ME-event max-over-branches machinery, verbatim (never a
+    reimplementation), exposed for the MUTEX-AWARE DETERMINISTIC MAX-LOSS bound
+    (operator directive 2026-07-18, ``sim.book_risk.mutex_aware_det_max_from_
+    units``).
+
+    ``entries`` are ``(this-game legs, magnitude, requires_all)`` tuples where
+    ``magnitude`` is a non-negative float (here: a unit's full premium-at-risk
+    in float cc). Semantics are exactly ``_mutex_directional_game_cc``: nets the
+    single explicit-True ME event among the requires-all entries' legs via
+    max-over-branches; fails closed to the comonotone SUM on 0 or >= 2 ME
+    events. Always <= the summed magnitude, >= the largest single entry, and
+    MONOTONE in the entry set (adding an entry never lowers it) — the exact
+    properties the det-max aggregation's soundness/monotonicity proof leans on.
+    """
+    return _mutex_directional_game_cc(list(entries), is_me_event)
+
+
 # --- P1-7: mutex-metadata settlement tripwire -------------------------------
 # The netting above (loss axis Stage B + directional axis P0-9) trusts ONE fact
 # about an event the metadata flagged ``is_me_event(e) is True``: its outcome
