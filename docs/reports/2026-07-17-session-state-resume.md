@@ -403,3 +403,11 @@ enumeration (which RAN, trimmed, in-deadline) scored it net-ADDING at that size;
 4. Certified-hedge EV budget still default-OFF (review its vacuous-cert fix).
 5. Sunday: budget-family review (game .50 / slate .65 / det .25 / cvar .35) with
    both games' data → merge (llm-b ancestry check) → MLB+WNBA.
+
+**MONITOR RE-ARM (post-compact / fresh session — run immediately):** verify the watch
+is alive; if not, re-arm with (Monitor tool, persistent=true):
+`tail -f data/live_logs/live_20260718_morningstack.log | grep -v --line-buffered '"periodic_report"' | grep -E --line-buffered '"phase": "decline"|"waiver_granted": true|"risk_reservation_granted"|"quote_executed"|risk_evicted_on_fill|"prod_preflight_green"|preflight_failed|emergency|heartbeat_wedged|"halt"'`
+(swap the log filename if the bot restarted since — newest `live_*.log` in
+data/live_logs). On each decline event: enrich from the DB (decisions kind='decline'
+join rfqs legs_json + the accept's no_bid/contracts from the log) and report combo /
+$ / bid / legs / reason / hedge-verdict in ET per [[feedback_decline_reports]].
