@@ -356,3 +356,25 @@ resilience shipped (separate event/metric, 500-write retry, PASSIVE fallback).
 Overnight probe fact: 0 competing makers at 03:27Z — the FRA×Mbappé fill concentration
 is overnight demand, not looseness. Session tally: 8 fills ~$30, +$1.1 edge.
 SATURDAY: watch waiver grants (trimmed), skew flips, declined_uncertified, fills mix.
+
+## FINAL CLOSE (2026-07-18 ~04:50Z) — SESSION COMPLETE; THIS DOCUMENT IS THE HANDOFF
+
+**Bot LIVE on the complete stack** (`live_20260718_morningstack.log`, preflight green
+03:48:37Z, commit head = morning-builds commit on risk-audit-overnight, all pushed).
+
+**THE NIGHT IN ONE TABLE:**
+| Domain | End state |
+|---|---|
+| Throughput | Batch-1 live: 420+ quotes/min, speed-miss ~3-6% (was 133/min, 32%) |
+| Fill pipeline | SIX locks opened (det-max 25%, confirm haircut 0.40, delta ×3, hard-cap waivable, slate cert-aware 0.65, stable+trimmed waiver K=12) — 8 fills ~$30/+$1.1 edge incl. the first ARG-champ hedge |
+| Budgets (ALL operator-set) | game 0.50, slate 0.65, det-max 0.25, CVaR 0.35, slots 200, waiver 1.8s/gate 1.0s |
+| Pricing | markup 2/3.5/4.5/6¢ + corners 4.5¢; SKEW ON (mutex-aware hedge rebate ≤1.5¢) |
+| Aliases | champion legs structural + filling; schedule table for final day |
+| Infra | data on D: (junction, C: 529GB free); recorder live; WAL resilience shipped |
+| Doctrines (memory) | no-double-risk-layers, balance-via-maker-quoting, hedges-always-fill, decline-reports |
+| Default-OFF pending review | certified-hedge EV budget (vacuous-certification fix unreviewed); pre-gate F1 armed; hedge-pair items B partially superseded by skew fix |
+| Sat/Sun | FRAENG 7/18 + final 7/19: watch waiver grants, skew flips, declined_uncertified, fill mix; budget-family review with Sunday data; then merge (llm-b ancestry check) → MLB+WNBA |
+
+Every decision, fix, measurement, and revert switch of 2026-07-17→18 lives in the 15
+addenda above. A fresh session needs: this file + the memory index + `git log` since
+`a397efb`. The bot needs nothing — it is running the finished machine.
