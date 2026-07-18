@@ -168,6 +168,14 @@ def build_lifecycle_config(risk_cfg: RiskConfig) -> LifecycleConfig:
         worst_challenger_ev_tolerance_cc=risk_cfg.worst_challenger_ev_tolerance_cc,
         lastlook_mc_waiver_enabled=risk_cfg.lastlook_mc_waiver_enabled,
         lastlook_mc_waiver_deadline_s=risk_cfg.lastlook_mc_waiver_deadline_s,
+        # WAIVER ENTITY-SET TRIM (2026-07-18): K largest resting quotes per
+        # breached game inside the waiver enumeration; dropped tail rides as a
+        # constant conservative adder. 0 (default) = full-set enumeration.
+        lastlook_waiver_topk_resting=risk_cfg.lastlook_waiver_topk_resting,
+        # CERTIFIED-HEDGE EV BUDGET (2026-07-18): the candidate gate's verified
+        # negative-EV hedge exception. Default disabled / 0 = today.
+        allow_negative_ev_hedge=risk_cfg.allow_negative_ev_hedge,
+        hedge_cost_budget_cc=risk_cfg.hedge_cost_budget_cc,
         # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): poll REST for a confirmed
         # fill whose quote_executed WS message never arrived.
         fill_record_recovery_after_s=risk_cfg.fill_record_recovery_after_s,

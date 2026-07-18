@@ -60,14 +60,19 @@ markout-validated enable flips it live (never refit on a P&L window).
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
-from combomaker.core.conventions import Conventions
+from combomaker.core.conventions import Conventions, Side
+from combomaker.core.money import CC_PER_DOLLAR
 from combomaker.risk.exposure import (
+    DirEntry,
     ExposureSnapshot,
+    LegRef,
     MarginalProvider,
     OpenPosition,
     analytic_leg_deltas,
+    mutex_directional_alignment_cc,
 )
 
 
@@ -171,6 +176,11 @@ class InventorySkew:
     offset_cc: int
     per_game: tuple[tuple[str, int], ...]  # (game, signed contribution cc)
     enabled: bool
+    # SKEW MUTEX FIX (2026-07-18): the games whose classification came from the
+    # P0-9 mutex-aware branch-max fold (``mutex_directional_alignment_cc``)
+    # instead of the raw delta-sum sign — the shadow-verification key (grep the
+    # ``inventory_skew_shadow`` log for it to measure the ARG-champ flip live).
+    mutex_direction_games: tuple[str, ...] = ()
 
     @property
     def applied_cc(self) -> int:
@@ -208,6 +218,9 @@ def compute_inventory_skew(
     params: SkewParams,
     *,
     cache: GameSkewCache | None = None,
+    dir_entries_by_game: Mapping[str, Sequence[DirEntry]] | None = None,
+    committed_dir_entries_by_game: Mapping[str, Sequence[DirEntry]] | None = None,
+    is_me_event: Callable[[str], bool | None] | None = None,
 ) -> InventorySkew:
     """Compute the inventory skew for ``candidate`` against the current book.
 
@@ -218,6 +231,35 @@ def compute_inventory_skew(
     ``analytic_leg_deltas``. ``limits`` gives the headroom denominators;
     ``cache`` optionally overrides the per-game direction from the Phase-4 sim.
 
+    SKEW MUTEX FIX (2026-07-18). ``dir_entries_by_game`` (the snapshot's
+    exported P0-9 directional entries) + ``is_me_event`` (the exposure book's
+    OWN metadata answer) arm the mutex-aware classifier: where the candidate's
+    this-game legs carry exactly ONE explicit-ME event, the concentrating /
+    offsetting split comes from how much the candidate RAISES the book's P0-9
+    branch-max directional bound (``mutex_directional_alignment_cc`` — reused,
+    never reimplemented). A long-NO candidate on outcome B of the event the
+    book is short outcome A of NETS there (marginal 0 ⇒ full rebate) even
+    though its raw delta sign MATCHES the book's — the mutex-blind raw read
+    mis-widened exactly that hedge 63/63 on the live shadow tape. Anything the
+    single-ME math cannot certify (no entries, 0 or >= 2 ME events among the
+    candidate's legs, non-requires-all) FALLS BACK to the raw delta-sum read —
+    never a larger rebate than the mutex math justifies. Omitting any new
+    argument (every pre-existing caller) is byte-identical to the raw
+    classifier.
+
+    COMMITTED SECOND-ME-EVENT FALLBACK (2026-07-18 verify fix).
+    ``committed_dir_entries_by_game`` (the snapshot's COMMITTED-positions-only
+    entry subset) is REQUIRED for the mutex path to engage: a committed leg on
+    a second explicit-ME event of the same game (champion event + regulation
+    moneyline) is correlated mass the single-event fold rides as COMMON —
+    inflating base and full equally, cancelling out of the marginal and
+    OVER-REBATING a candidate that truly concentrates against it (see
+    ``mutex_directional_alignment_cc``). Such games — and any caller that
+    omits the committed census — fall back to the raw read (fail-closed).
+    Resting-quote entries deliberately do NOT drive that fallback: the live
+    200-slot book spans both ME events, and a quote-driven fallback would
+    suppress the fix on exactly the shape it was built for.
+
     Returns an :class:`InventorySkew` whose ``applied_cc`` is 0 while
     ``params.enabled`` is False (dark ship) and the honest ``skew_cc`` otherwise.
     ``skew_cc`` itself is ALWAYS the honest number (for shadow logging).
@@ -226,8 +268,10 @@ def compute_inventory_skew(
     cand_deltas = analytic_leg_deltas(candidate, marginals)
 
     # Per-game candidate delta (contracts-equivalent), aggregated the same way
-    # the book does — Σ over the legs the candidate touches per game.
+    # the book does — Σ over the legs the candidate touches per game — plus the
+    # per-game legs themselves (the mutex classifier's candidate entry).
     cand_by_game: dict[str, float] = {}
+    cand_legs_by_game: dict[str, list[LegRef]] = {}
     if cand_deltas is not None:
         for leg in candidate.legs:
             if leg.event_ticker is None:
@@ -236,6 +280,7 @@ def compute_inventory_skew(
             cand_by_game[game] = cand_by_game.get(game, 0.0) + cand_deltas.get(
                 leg.market_ticker, 0.0
             )
+            cand_legs_by_game.setdefault(game, []).append(leg)
 
     max_delta = limits.max_event_delta_contracts
     max_loss_cc = limits.max_event_worst_case_loss_dollars * 10_000.0
@@ -244,6 +289,7 @@ def compute_inventory_skew(
     concentration = 0.0
     offset = 0.0
     per_game: list[tuple[str, int]] = []
+    mutex_games: list[str] = []
 
     for game, cand_delta in cand_by_game.items():
         net = snapshot.delta_by_game.get(game, 0.0)
@@ -266,6 +312,31 @@ def compute_inventory_skew(
         cand_dir = _sign(cand_delta)
         aligns = cand_dir == book_dir
 
+        # P0-9 mutex-aware direction (2026-07-18): applicable only where the
+        # candidate's this-game legs carry exactly ONE explicit-ME event AND
+        # the game's COMMITTED census certifies the single-event fold (no
+        # committed leg on a second explicit-ME event — 2026-07-18 verify fix);
+        # else None ⇒ the raw sign-alignment read below (fail-safe).
+        mutex: tuple[float, float] | None = None
+        if dir_entries_by_game is not None and is_me_event is not None:
+            entries = dir_entries_by_game.get(game)
+            if entries:
+                committed_entries = (
+                    committed_dir_entries_by_game.get(game, ())
+                    if committed_dir_entries_by_game is not None
+                    else None                   # census unavailable ⇒ raw read
+                )
+                mutex = mutex_directional_alignment_cc(
+                    entries,
+                    (
+                        tuple(cand_legs_by_game.get(game, ())),
+                        d_e * CC_PER_DOLLAR,
+                        candidate.our_side is Side.NO,
+                    ),
+                    is_me_event,
+                    committed_entries=committed_entries,
+                )
+
         # Utilisation: how little headroom is left before a real cap binds. Take
         # the MAX over the delta / loss / notional axes so the tightest binds.
         util = 0.0
@@ -278,7 +349,22 @@ def compute_inventory_skew(
         if max_notional_cc > 0.0:
             util = max(util, min(1.0, notional_cc / max_notional_cc))
 
-        if aligns:
+        if mutex is not None:
+            # Split the candidate's magnitude by the mutex math: only the part
+            # that RAISES the book's branch-max bound concentrates (pays the
+            # convex widen); the netted remainder rebates, bounded by the
+            # book's own mutex-aware magnitude on the event (never rebate more
+            # direction than the book actually holds there).
+            marginal_cc, base_cc = mutex
+            conc_mag = marginal_cc / CC_PER_DOLLAR
+            off_mag = max(0.0, d_e - conc_mag)
+            term = params.w_conc * conc_mag * (util**params.gamma)
+            rebate = params.w_off * min(off_mag, base_cc / CC_PER_DOLLAR) * util
+            concentration += term
+            offset += rebate
+            per_game.append((game, int(round(term)) - int(round(rebate))))
+            mutex_games.append(game)
+        elif aligns:
             # concentration_term = d_e · f(util), f(u) = u**gamma (convex): a
             # near-empty book is nearly free, a near-limit book pays the full
             # widen. WIDEN (positive) when the candidate ADDS to the net.
@@ -307,6 +393,7 @@ def compute_inventory_skew(
         offset_cc=off_cc,
         per_game=tuple(per_game),
         enabled=params.enabled,
+        mutex_direction_games=tuple(mutex_games),
     )
 
 

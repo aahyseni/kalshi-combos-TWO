@@ -340,6 +340,30 @@ def _es_from_pnl(pnl: NDArray[np.float64], level: float) -> tuple[float, float]:
     return var, es
 
 
+def _tail_loss_from_pnl(pnl: NDArray[np.float64], level: float) -> float:
+    """UNCLAMPED expected tail loss at ``level`` — the same tail set as
+    ``_es_from_pnl`` (P&L at/below the (1−level) quantile) WITHOUT the
+    ``max(0, ·)`` clamp, so a still-profitable sampled tail reports a NEGATIVE
+    loss (the size of the tail profit cushion) instead of 0.
+
+    2026-07-18 verify fix: the certified-hedge gate compares THIS number pre vs
+    post. The clamped ES is exactly 0.0 on any book whose worst-1% sampled
+    outcome is still net-profitable (a fresh book after a settlement-day reset,
+    or any small early book of +EV fills), which made the risk-reduction
+    certification VACUOUS there — 0 <= 0 passed for EVERY candidate, including
+    fills that hedge nothing, re-admitting the sniper tax the certification
+    exists to exclude. On the unclamped number, eroding the tail cushion counts
+    against the candidate; whenever the tail is a genuine loss it equals the
+    clamped ES exactly, so the certification is unchanged in the loss regime
+    and strictly TIGHTER (decline-only) in the profit-clamped regime. Empty
+    ``pnl`` ⇒ 0.0."""
+    if pnl.size == 0:
+        return 0.0
+    cut = float(np.quantile(pnl, 1.0 - level))
+    tail = pnl[pnl <= cut]
+    return -float(tail.mean()) if tail.size > 0 else -cut
+
+
 def _same_game_mask(model: BookModel) -> NDArray[np.bool_]:
     """Boolean ``(n, n)`` mask: True where legs i and j are in the SAME game.
 
@@ -1215,6 +1239,16 @@ class _TailAxes:
     challenger_ev_cc: float = 0.0
     bridge_ev_cc: float | None = None
     split_ev_cc: float | None = None
+    # 2026-07-18 verify fix: the UNCLAMPED governing expected tail loss — the
+    # max over every model that RAN of ``-tail.mean()`` BEFORE the ``max(0,·)``
+    # clamp. NEGATIVE ⇒ even the worst credible model's 1% tail is still
+    # net-profitable (the value is minus the cushion). The certified-hedge gate
+    # compares THIS pre vs post so its risk-reduction certification is never
+    # vacuous on a profit-clamped book (clamped ES 0 <= 0 admitted everything
+    # there); equal to ``governing_model_es_99_cc`` whenever the governing tail
+    # is a genuine loss. NEVER used for the %-of-bankroll budgets — those keep
+    # gating the clamped ES.
+    governing_model_tail_loss_cc: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1311,6 +1345,11 @@ def _tail_axes_from_pnl(
     only fatten, never thin). None ⇒ not conditioned ⇒ never enters the max."""
     ev = float(pnl.mean()) if pnl.size else 0.0
     _, es = _es_from_pnl(pnl, HEADLINE_LEVEL)
+    # 2026-07-18 verify fix: the UNCLAMPED expected tail loss per model, folded
+    # into a governing max over the models that actually RAN (a path that did
+    # not run must not contribute its 0.0 — on a profit-clamped tail 0.0 would
+    # spuriously dominate the negative cushion). Production always runs.
+    governing_tail_loss = _tail_loss_from_pnl(pnl, HEADLINE_LEVEL)
     # P1 EV VISIBILITY: the SAME-book mean P&L under each challenger re-sample, so
     # the caller can difference post−pre per book and surface a candidate that is
     # +EV under production yet −EV under a challenger. A path that did not run leaves
@@ -1318,18 +1357,27 @@ def _tail_axes_from_pnl(
     if challenger_pnl is not None and challenger_pnl.size:
         _, challenger_es = _es_from_pnl(challenger_pnl, HEADLINE_LEVEL)
         challenger_ev = float(challenger_pnl.mean())
+        governing_tail_loss = max(
+            governing_tail_loss, _tail_loss_from_pnl(challenger_pnl, HEADLINE_LEVEL)
+        )
     else:
         challenger_es = 0.0
         challenger_ev = 0.0
     if bridge_pnl is not None and bridge_pnl.size:
         _, bridge_es = _es_from_pnl(bridge_pnl, HEADLINE_LEVEL)
         bridge_ev: float | None = float(bridge_pnl.mean())
+        governing_tail_loss = max(
+            governing_tail_loss, _tail_loss_from_pnl(bridge_pnl, HEADLINE_LEVEL)
+        )
     else:
         bridge_es = 0.0
         bridge_ev = None
     if split_pnl is not None and split_pnl.size:
         _, split_es = _es_from_pnl(split_pnl, HEADLINE_LEVEL)
         split_ev: float | None = float(split_pnl.mean())
+        governing_tail_loss = max(
+            governing_tail_loss, _tail_loss_from_pnl(split_pnl, HEADLINE_LEVEL)
+        )
     else:
         split_es = 0.0
         split_ev = None
@@ -1381,6 +1429,7 @@ def _tail_axes_from_pnl(
         challenger_ev_cc=challenger_ev,
         bridge_ev_cc=bridge_ev,
         split_ev_cc=split_ev,
+        governing_model_tail_loss_cc=governing_tail_loss,
     )
 
 
@@ -1449,8 +1498,17 @@ def evaluate_candidate_book_risk(
     Gate (``confirm``): True ONLY when
       * the candidate's marginal EV (``post.ev − pre.ev``) is POSITIVE — UNLESS a
         negative-EV HEDGE is explicitly authorized (``allow_negative_ev_hedge``)
-        AND its EV cost stays within ``hedge_cost_budget_cc`` (default disabled:
-        a negative-EV hedge is DECLINED absent an explicit enabled budget); and
+        AND the candidate is CERTIFIED risk-reducing (2026-07-18: POST governing
+        model UNCLAMPED expected tail loss <= PRE, measured on the SAME
+        common-random-numbers sample — UNCLAMPED so the certification is never
+        vacuous on a book whose sampled 1% tail is still net-profitable, where
+        the clamped ES comparison degenerated to 0 <= 0 and admitted every
+        pickoff) AND its EV cost stays within
+        ``hedge_cost_budget_cc`` (default disabled: a negative-EV fill is
+        DECLINED absent an explicit enabled budget, and even with one it is
+        NEVER admitted unless it measurably shrinks the book's tail — arming is
+        "pay up to $X of EV only for certified hedges", not a sniper-tax subsidy
+        on stale quotes); and
       * every POST-book budget passes — the governing model ES_0.99, deterministic
         all-hit maximum, and P(ruin) under their %-of-bankroll / probability
         budgets, plus the gross utilization backstop.
@@ -1638,6 +1696,7 @@ def evaluate_candidate_book_risk(
         candidate_ev=candidate_ev,
         worst_credible_candidate_ev=worst_credible_candidate_ev,
         worst_challenger_ev_tolerance=worst_challenger_ev_tolerance,
+        pre=pre_axes,
         post=post_axes,
         bankroll_cc=bankroll_cc,
         portfolio_cvar_frac=portfolio_cvar_frac,
@@ -1672,6 +1731,7 @@ def _candidate_gate(
     candidate_ev: float,
     worst_credible_candidate_ev: float,
     worst_challenger_ev_tolerance: float,
+    pre: _TailAxes,
     post: _TailAxes,
     bankroll_cc: int | None,
     portfolio_cvar_frac: float | None,
@@ -1681,21 +1741,52 @@ def _candidate_gate(
     hedge_cost_budget_cc: int,
     allow_negative_ev_hedge: bool,
 ) -> tuple[bool, str]:
-    """The confirm/decline decision from the candidate EV + POST tail axes.
+    """The confirm/decline decision from the candidate EV + PRE/POST tail axes.
 
-    Order (first failing reason wins): EV sign (with the explicit hedge-budget
+    Order (first failing reason wins): EV sign (with the CERTIFIED-HEDGE
     exception), the OPTIONAL worst-challenger-EV tolerance, then each supplied POST
     budget. Returns ``(confirm, reason)``; ``reason`` is "" iff confirmed. Any budget
     whose fraction is None is skipped — the lifecycle's LimitChecker still enforces
     the full control set; this is the ADDED joint-tail gate, never a demotion of
     those caps."""
-    # (1) EV sign — the PRODUCTION-model admission policy, UNCHANGED. A negative-EV
-    # fill is DECLINED unless it is an explicitly authorized hedge whose EV cost stays
-    # within the enabled budget (default disabled ⇒ no negative-EV hedges). A
-    # positive-EV candidate passes this gate.
+    # (1) EV sign — the PRODUCTION-model admission policy. A negative-EV fill is
+    # DECLINED unless it is an explicitly authorized CERTIFIED HEDGE (2026-07-18):
+    # the budget must be enabled, the candidate must MEASURABLY SHRINK the book's
+    # tail — POST governing model UNCLAMPED expected tail loss <= PRE, both
+    # scored on the SAME common-random-numbers sample so the comparison is the
+    # candidate's true marginal effect, not MC noise — and its EV cost must fit
+    # the enabled budget. Without the certification, arming the budget would pay
+    # the sniper tax on EVERY stale quote (any negative-EV pickoff within budget
+    # was admitted). A positive-EV candidate passes this gate untouched.
+    #
+    # WHY THE UNCLAMPED TAIL (2026-07-18 verify fix): the clamped governing
+    # ES_0.99 is exactly 0.0 on any book whose worst-1% sampled outcome is
+    # still net-profitable — a fresh book after a settlement-day reset, or any
+    # small early book of +EV fills — so a clamped-ES comparison passed 0 <= 0
+    # for EVERY candidate there, including fills that hedge nothing: the armed
+    # budget would have paid the sniper tax on every stale-quote pickoff in
+    # exactly that regime. The unclamped tail loss (negative = the tail profit
+    # cushion) makes eroding the cushion count against the candidate; it equals
+    # the clamped ES whenever the governing tail is a genuine loss, so the
+    # certification is unchanged in the loss regime and strictly TIGHTER
+    # (decline-only) in the profit-clamped one — and a genuine hedge that
+    # GROWS the tail cushion still certifies there.
+    #
+    # NOTE (deliberate deviation from the 2026-07-18 spec, flagged for review):
+    # the spec also asked for "post det-max <= pre det-max", but on a sell-only
+    # book that comparison is PROVABLY DEGENERATE — the deterministic all-hit
+    # maximum is comonotone-ADDITIVE by design (P0-3: it never nets mutually
+    # exclusive parlays), so post det-max == pre det-max + candidate premium +
+    # fee on EVERY real fill, strictly larger; requiring it would make the
+    # exception dead code. Det-max protection instead stays where it already is:
+    # budget (3) below still gates POST det-max against its ABSOLUTE
+    # %-of-bankroll ceiling, so a certified hedge that would push the all-hit
+    # maximum over the det budget still declines there.
     if candidate_ev <= 0.0:
         if not allow_negative_ev_hedge:
             return False, "negative_ev_no_hedge_budget"
+        if post.governing_model_tail_loss_cc > pre.governing_model_tail_loss_cc:
+            return False, "negative_ev_not_risk_reducing"
         # The hedge's cost is the EV we give up = −candidate_ev (a positive $).
         if -candidate_ev > float(hedge_cost_budget_cc):
             return False, "negative_ev_exceeds_hedge_budget"

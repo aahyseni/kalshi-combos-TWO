@@ -2188,6 +2188,37 @@ class RiskConfig(StrictModel):
     # confirm window ALONGSIDE the candidate gate (candidate_gate_deadline_s,
     # default 2.0s), so it is validated to (0, 3].
     lastlook_mc_waiver_deadline_s: float = 1.0
+    # WAIVER ENTITY-SET TRIM (2026-07-18 — burst-floor doctrine inside the
+    # enumeration). The full ~200-entity resting-quote set made the live waiver
+    # enumeration exceed even a 1.8s deadline (two timeouts observed 2026-07-17
+    # night; the 87ms benchmark was a 20-quote book), declining +EV wins. When
+    # > 0, the waiver enumerates committed entities + reservations + the
+    # candidate (never trimmed) + only the K LARGEST resting quotes per
+    # BREACHED game (ranked by comonotone worst-side loss); every dropped
+    # resting quote touching a breached game folds into a CONSTANT conservative
+    # adder on that game's certificate — state-independent, so it can only
+    # RAISE the certified worst case (fail-closed; sim/state_worst_case.
+    # trim_open_quotes_for_games). 0 (default) = today's full-set enumeration
+    # byte-identical; the operator arms the profiled K (12 sizes the worst-case
+    # runtime under ~0.8s on the live book shape — tools/
+    # profile_waiver_entity_trim.py) in the local YAML.
+    lastlook_waiver_topk_resting: int = 0
+    # CERTIFIED-HEDGE EV BUDGET (2026-07-18). The P0-1 candidate gate's
+    # negative-EV exception, now VERIFIED: arming ``allow_negative_ev_hedge``
+    # admits a negative-EV fill ONLY when the gate CERTIFIES it risk-reducing —
+    # POST governing model UNCLAMPED expected tail loss <= PRE on the same
+    # common-random-numbers sample (sim/book_risk._candidate_gate; UNCLAMPED so
+    # the certification is never vacuous on a book whose sampled 1% tail is
+    # still net-profitable, where a clamped-ES comparison degenerates to 0 <= 0
+    # and would admit every pickoff) — AND its EV
+    # cost fits ``hedge_cost_budget_cc`` (int centi-cents of EV given up per
+    # fill). Semantics of arming: "pay up to $X of EV only for fills that
+    # measurably shrink the book's tail" — a stale-quote sniper pickoff is
+    # negative-EV WITHOUT shrinking the tail and still declines. All POST
+    # budgets (CVaR / det-max / ruin / notional) still gate afterwards. BOTH
+    # default to the P0-1 safety default (disabled / 0 = today's behaviour).
+    allow_negative_ev_hedge: bool = False
+    hedge_cost_budget_cc: int = 0
     # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1). Seconds after a SUCCESSFUL
     # confirm before the maintenance sweep polls REST GET quote for a fill whose
     # quote_executed WS message never arrived (the WS channel has no replay; a
@@ -2298,6 +2329,16 @@ class RiskConfig(StrictModel):
     def _positive_int_knob(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"must be >= 1, got {v}")
+        return v
+
+    # 0 is a MEANINGFUL value for these two (trim disabled / zero hedge budget
+    # = today's behaviour), so they get their own >= 0 validator rather than
+    # joining the >= 1 knob set above.
+    @field_validator("lastlook_waiver_topk_resting", "hedge_cost_budget_cc")
+    @classmethod
+    def _nonnegative_int_knob(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"must be >= 0, got {v}")
         return v
 
     # The resting-quote weight is a fraction of the resting mass-acceptance

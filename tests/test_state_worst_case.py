@@ -32,6 +32,7 @@ from combomaker.sim.state_worst_case import (
     entity_from_position,
     quote_from_open_quote,
     state_worst_case_by_game,
+    trim_open_quotes_for_games,
 )
 from combomaker.sim.structural_book import StructuralConfigView
 from tools.proto_state_worst_case import (
@@ -641,3 +642,101 @@ class TestPrototypeParity:
         assert not module[GAME2].certified
         assert module[GAME].certified
         assert module[GAME3].certified
+
+
+# --------------------------------------------------------------------------- #
+# WAIVER ENTITY-SET TRIM (2026-07-18): trim_open_quotes_for_games             #
+# --------------------------------------------------------------------------- #
+
+
+class TestTrimOpenQuotesForGames:
+    """The pure trim seam the last-look waiver applies when
+    ``lastlook_waiver_topk_resting`` > 0 (rfq/lifecycle). Ranking, adders, the
+    exact-drop of unrelated-game quotes, the union-keep across breached games,
+    and the DOMINANCE property (trimmed + adder >= full — fail-closed)."""
+
+    def test_keeps_topk_by_worst_loss_and_folds_tail_into_adder(self) -> None:
+        qs = [
+            quote("qa", ent("qa:no", (leg(ARG_ADV, ADV_EV),), 8000)),
+            quote("qb", ent("qb:no", (leg(ENG_ADV, ADV_EV),), 5000)),
+            quote("qc", ent("qc:no", (leg(ARG_ADV, ADV_EV),), 500)),
+        ]
+        kept, adders = trim_open_quotes_for_games(qs, [GAME], None, 2)
+        assert [q.quote_id for q in kept] == ["qa", "qb"]  # input order kept
+        assert adders == {GAME: 500}
+
+    def test_worst_hit_loss_is_the_comonotone_per_quote_term(self) -> None:
+        two_sided = quote(
+            "q2",
+            ent("q2:yes", (leg(ARG_ADV, ADV_EV),), 3000, side=Side.YES),
+            ent("q2:no", (leg(ARG_ADV, ADV_EV),), 7000),
+        )
+        assert two_sided.worst_hit_loss_cc == 7000
+        assert WorstCaseQuote("qe", ()).worst_hit_loss_cc == 0
+
+    def test_unrelated_game_quote_dropped_without_adder(self) -> None:
+        qs = [
+            quote("qa", ent("qa:no", (leg(ARG_ADV, ADV_EV),), 8000)),
+            quote("qx", ent("qx:no", (leg(FRA_ML, ML2_EV),), 9000)),
+        ]
+        kept, adders = trim_open_quotes_for_games(qs, [GAME], None, 5)
+        assert [q.quote_id for q in kept] == ["qa"]
+        assert adders == {}
+
+    def test_union_keep_across_breached_games_never_double_charges(self) -> None:
+        # qx touches BOTH breached games; it makes GAME's top-K (only toucher)
+        # but not GAME2's (two larger quotes there) — kept via the union, so it
+        # is enumerated everywhere and adds NOTHING anywhere.
+        big2 = [
+            quote(f"qg2-{i}", ent(f"qg2-{i}:no", (leg(FRA_ML, ML2_EV),), 9000))
+            for i in range(2)
+        ]
+        cross = quote(
+            "qx", ent("qx:no", (leg(ARG_ADV, ADV_EV), leg(FRA_ML, ML2_EV)), 8000)
+        )
+        kept, adders = trim_open_quotes_for_games(
+            [*big2, cross], [GAME, GAME2], None, 2
+        )
+        assert {q.quote_id for q in kept} == {"qg2-0", "qg2-1", "qx"}
+        assert adders == {}
+
+    def test_dropped_cross_game_quote_adds_to_every_breached_game_it_touches(
+        self,
+    ) -> None:
+        # k=0 keeps nothing: the cross quote's worst-side bound rides on BOTH
+        # breached games (each game's fold is bounded independently).
+        cross = quote(
+            "qx", ent("qx:no", (leg(ARG_ADV, ADV_EV), leg(FRA_ML, ML2_EV)), 8000)
+        )
+        kept, adders = trim_open_quotes_for_games([cross], [GAME, GAME2], None, 0)
+        assert kept == ()
+        assert adders == {GAME: 8000, GAME2: 8000}
+
+    @given(
+        prices=st.lists(st.integers(500, 9000), min_size=1, max_size=6),
+        k=st.integers(0, 6),
+    )
+    @settings(max_examples=25, deadline=None)
+    def test_trimmed_plus_adder_dominates_full_enumeration(
+        self, prices: list[int], k: int
+    ) -> None:
+        """THE fail-closed property: for every book and every K, the trimmed
+        certified worst case plus the dropped-tail adder is >= the FULL
+        enumeration's certified worst case — the trim can only tighten the
+        admit direction, never loosen it."""
+        qs = [
+            quote(
+                f"q{i}",
+                ent(
+                    f"q{i}:no",
+                    (leg(ARG_ADV if i % 2 else ENG_ADV, ADV_EV),),
+                    p,
+                ),
+            )
+            for i, p in enumerate(prices)
+        ]
+        entities = [ent("cand", (leg(ARG_ADV, ADV_EV), leg(TOT3, TOT_EV)), 8000)]
+        full = run(entities, qs, CFG_SMALL)[GAME].worst_case_cc
+        kept, adders = trim_open_quotes_for_games(qs, [GAME], None, k)
+        trimmed = run(entities, list(kept), CFG_SMALL)[GAME].worst_case_cc
+        assert trimmed + adders.get(GAME, 0) >= full

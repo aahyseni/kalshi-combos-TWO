@@ -206,6 +206,15 @@ class WorstCaseQuote:
     quote_id: str
     hypotheticals: tuple[WorstCaseEntity, ...]
 
+    @property
+    def worst_hit_loss_cc(self) -> int:
+        """The quote's comonotone worst-side bound — exactly the per-quote term
+        of ``_comonotone_cc``, and a STATE-INDEPENDENT upper bound on the
+        quote's clamped contribution to ANY game's fold (per state the fold
+        adds ``max(0, worst-side loss) <= worst-side hit loss``). The trim's
+        ranking key and its dropped-tail adder (``trim_open_quotes_for_games``)."""
+        return max((h.hit_loss_cc for h in self.hypotheticals), default=0)
+
 
 @dataclass(frozen=True, slots=True)
 class GameWorstCase:
@@ -279,8 +288,74 @@ def _comonotone_cc(
     certified bound is provably <= (property-tested)."""
     total = sum(e.hit_loss_cc for e in entities)
     for q in quotes:
-        total += max((h.hit_loss_cc for h in q.hypotheticals), default=0)
+        total += q.worst_hit_loss_cc
     return total
+
+
+def trim_open_quotes_for_games(
+    open_quotes: Sequence[WorstCaseQuote],
+    games: Sequence[str],
+    events: Mapping[str, str | None] | None,
+    k: int,
+) -> tuple[tuple[WorstCaseQuote, ...], dict[str, int]]:
+    """WAIVER ENTITY-SET TRIM (2026-07-18 — the burst-floor doctrine inside the
+    enumeration). The full ~200-entity resting-quote set made the confirm-path
+    waiver enumeration exceed even a 1.8s deadline live (the 87ms benchmark was
+    a 20-quote book), so the waiver enumerates committed entities +
+    reservations + the candidate (NEVER trimmed — the netting substance) + only
+    the ``k`` LARGEST resting quotes per BREACHED game, ranked by
+    ``worst_hit_loss_cc`` (comonotone worst-side loss; ties broken by quote_id
+    for determinism).
+
+    Returns ``(kept_quotes, adders_cc)`` where ``adders_cc[game]`` is the
+    CONSTANT conservative adder for the dropped tail: the sum of the dropped
+    quotes' ``worst_hit_loss_cc`` over every dropped quote touching ``game``.
+    FAIL-CLOSED by construction: per state a quote contributes
+    ``max(0, loss) <= worst_hit_loss_cc``, so for every state s
+
+        trimmed_total(s) + adder  >=  full_total(s)
+
+    and therefore ``trimmed_worst + adder >= full_worst`` — the adder is
+    state-independent and can only RAISE the certified worst case, never lower
+    it (property-tested in tests/test_state_worst_case.py). The caller adds
+    ``adders_cc[game]`` to the returned certificate BEFORE the budget check and
+    the reservation retry, so the checker re-validates the RAISED bound.
+
+    Exactness notes: a quote touching NO breached game is dropped with NO adder
+    — its legs carry no breached-game markets, so it contributes nothing to a
+    breached game's fold and (game plans group legs per game) cannot change a
+    breached game's structural plan or certification. A quote KEPT for any
+    breached game is enumerated everywhere it touches (no adder). ``k <= 0``
+    keeps no resting quotes (every breached-game toucher folds into the adder)
+    — still a valid conservative bound, but callers normally gate on ``k > 0``.
+    """
+    gset = set(games)
+    touching: list[tuple[WorstCaseQuote, frozenset[str]]] = []
+    for q in open_quotes:
+        qgames: set[str] = set()
+        for h in q.hypotheticals:
+            for hleg in h.legs:
+                g = _leg_game(hleg, events)
+                if g is not None and g in gset:
+                    qgames.add(g)
+        if qgames:
+            touching.append((q, frozenset(qgames)))
+    kept_ids: set[str] = set()
+    if k > 0:
+        for game in sorted(gset):
+            ranked = sorted(
+                (q for q, qg in touching if game in qg),
+                key=lambda q: (-q.worst_hit_loss_cc, q.quote_id),
+            )
+            kept_ids.update(q.quote_id for q in ranked[:k])
+    kept = tuple(q for q, _qg in touching if q.quote_id in kept_ids)
+    adders: dict[str, int] = {}
+    for q, qgs in touching:
+        if q.quote_id in kept_ids:
+            continue
+        for game in qgs:
+            adders[game] = adders.get(game, 0) + q.worst_hit_loss_cc
+    return kept, adders
 
 
 def _selected_possible(

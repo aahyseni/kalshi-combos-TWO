@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from typing import Any, Protocol
 
@@ -101,6 +101,7 @@ from combomaker.sim.state_worst_case import (
     GameWorstCase,
     entity_from_position,
     quote_from_open_quote,
+    trim_open_quotes_for_games,
 )
 from combomaker.sim.structural_book import StructuralConfigView
 
@@ -303,6 +304,29 @@ class LifecycleConfig:
     # commit chain is untouched). Default False = today's 100% fold; the
     # operator arms it in the local YAML (risk.resting_haircut_at_confirm).
     resting_haircut_at_confirm: bool = False
+    # WAIVER ENTITY-SET TRIM (2026-07-18 — burst-floor doctrine inside the
+    # enumeration). When > 0, the last-look MC waiver enumerates committed
+    # entities + reservations + the candidate (never trimmed) + only the K
+    # LARGEST resting quotes per BREACHED game (by comonotone worst-side loss);
+    # every dropped resting quote touching a breached game folds into a CONSTANT
+    # conservative adder on that game's certificate (state-independent — it can
+    # only RAISE the certified worst case, never lower it: fail-closed; see
+    # sim/state_worst_case.trim_open_quotes_for_games). 0 (default) = today's
+    # full-set enumeration, byte-identical; the operator arms the profiled K in
+    # the local YAML (risk.lastlook_waiver_topk_resting).
+    lastlook_waiver_topk_resting: int = 0
+    # CERTIFIED-HEDGE EV BUDGET (2026-07-18). Wired verbatim into the P0-1
+    # candidate gate: a NEGATIVE-EV fill can be admitted ONLY when this is True
+    # AND the candidate is CERTIFIED risk-reducing (POST governing model
+    # UNCLAMPED expected tail loss <= PRE, on common random numbers —
+    # sim/book_risk._candidate_gate; unclamped so the certification is never
+    # vacuous on a profit-clamped tail) AND its
+    # EV cost fits hedge_cost_budget_cc. Both default to the P0-1 SAFETY
+    # DEFAULT (disabled / 0 = today, byte-identical): arming means "pay up to
+    # $X of EV only for fills that measurably shrink the book's tail" — never a
+    # sniper-tax subsidy on stale quotes.
+    allow_negative_ev_hedge: bool = False
+    hedge_cost_budget_cc: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1443,11 +1467,15 @@ class QuoteLifecycle:
             portfolio_det_max_frac=float(limits.portfolio_det_max_frac),
             portfolio_ruin_prob_budget=float(limits.portfolio_ruin_prob_budget),
             absolute_notional_multiple=limits.absolute_notional_multiple,
-            # Negative-EV hedges are DISABLED here (no explicit enabled hedge-cost
-            # budget) — the spec's SAFETY DEFAULT (P0-1: do not accept negative-EV
-            # hedges without an explicit enabled budget).
-            hedge_cost_budget_cc=0,
-            allow_negative_ev_hedge=False,
+            # CERTIFIED-HEDGE EV BUDGET (2026-07-18): wired from config, BOTH
+            # defaulting to the P0-1 SAFETY DEFAULT (disabled / 0 — byte-
+            # identical to the old hardcoded values). Arming admits a
+            # negative-EV fill ONLY when the gate CERTIFIES it risk-reducing
+            # (POST governing UNCLAMPED expected tail loss <= PRE, common
+            # random numbers — never vacuous on a profit-clamped tail) AND its
+            # EV cost fits the budget — sim/book_risk._candidate_gate.
+            hedge_cost_budget_cc=self._config.hedge_cost_budget_cc,
+            allow_negative_ev_hedge=self._config.allow_negative_ev_hedge,
             # P1 EV VISIBILITY: the OPTIONAL worst-challenger-EV tolerance. −inf by
             # default (no behaviour change — the gate stays production-model-EV only);
             # a finite operator value ALSO declines a +production-EV candidate whose
@@ -1606,6 +1634,8 @@ class QuoteLifecycle:
         start_ns = self._clock.monotonic_ns()
         deadline_ns = int(self._config.lastlook_mc_waiver_deadline_s * 1e9)
         result: dict[str, GameWorstCase] | None = None
+        trim_adders: dict[str, int] = {}
+        topk = self._config.lastlook_waiver_topk_resting
         # One build + AT MOST ONE rebuild (version moved during the enumeration),
         # then fail-closed decline — the mandated retry budget.
         for attempt in range(2):
@@ -1614,6 +1644,28 @@ class QuoteLifecycle:
                 inputs = self._build_state_worst_case_inputs(
                     quote_id, state, structural_cfg
                 )
+                # WAIVER ENTITY-SET TRIM (2026-07-18): keep the K largest
+                # resting quotes per breached game; the dropped tail rides as a
+                # constant conservative adder on each breached game's
+                # certificate (applied below, BEFORE the budget check and the
+                # reservation retry — the checker re-validates the RAISED
+                # bound). Entities (committed + reservations + candidate) are
+                # never trimmed. topk == 0 (default) is today's full set.
+                if topk > 0:
+                    kept, trim_adders = trim_open_quotes_for_games(
+                        inputs.open_quotes, games, inputs.events, topk
+                    )
+                    if len(kept) != len(inputs.open_quotes):
+                        self._metrics.inc("lastlook_waiver.trimmed")
+                        log.info(
+                            "lastlook_waiver_trimmed",
+                            quote_id=quote_id,
+                            kept_quotes=len(kept),
+                            dropped_quotes=len(inputs.open_quotes) - len(kept),
+                            adders_cc=dict(trim_adders),
+                            topk=topk,
+                        )
+                    inputs = replace(inputs, open_quotes=kept)
             except Exception as exc:  # noqa: BLE001 — any build error declines
                 self._metrics.inc("lastlook_waiver.errored")
                 log.error(
@@ -1690,9 +1742,21 @@ class QuoteLifecycle:
                     reason=None if cert is None else cert.uncertified_reason,
                 )
                 return False, f"game {game} not certifiable"
+            # Dropped-tail adder (trim armed): fold the constant conservative
+            # adder INTO the certificate itself, so both the budget check below
+            # AND the checker's re-validation at the reservation retry see the
+            # RAISED bound (a certificate understating the dropped tail must
+            # never reach the enforcement site).
+            adder_cc = trim_adders.get(game, 0)
+            if adder_cc:
+                cert = replace(cert, worst_case_cc=cert.worst_case_cc + adder_cc)
             certs[game] = cert
         worst_cc = max(cert.worst_case_cc for cert in certs.values())
         audit["worst_case_cc"] = worst_cc
+        if topk > 0:
+            # Trim observability (armed only — the default audit shape is
+            # unchanged): the per-game dropped-tail adders inside the bound.
+            audit["trim_adders_cc"] = dict(trim_adders)
         if worst_cc > game_thr_cc:
             self._metrics.inc("lastlook_waiver.declined_over_budget")
             log.info(
@@ -3406,6 +3470,17 @@ class QuoteLifecycle:
             self._skew_limits,
             self._skew_params,
             cache=self._skew_cache,
+            # SKEW MUTEX FIX (2026-07-18): the snapshot's P0-9 directional
+            # entries + the exposure book's OWN ME-metadata answer, so a
+            # single-ME hedge (ARG-champ vs a short-ESP book — mis-widened
+            # 63/63 on the raw delta sum) classifies OFFSETTING. The
+            # COMMITTED-only census (verify fix) fails the mutex path closed
+            # to the raw read when the committed book carries a leg on a
+            # SECOND explicit-ME event of the game (over-rebate corner);
+            # resting quotes never drive that fallback.
+            dir_entries_by_game=snap.dir_entries_by_game,
+            committed_dir_entries_by_game=snap.committed_dir_entries_by_game,
+            is_me_event=self._exposure.is_me_event,
         )
         log.info(
             "inventory_skew_shadow",
@@ -3417,6 +3492,7 @@ class QuoteLifecycle:
             offset_cc=skew.offset_cc,
             enabled=skew.enabled,
             per_game=list(skew.per_game),
+            mutex_direction_games=list(skew.mutex_direction_games),
         )
         widen_declines = False
         if self._widen_params is not None:

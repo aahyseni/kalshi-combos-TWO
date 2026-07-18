@@ -177,6 +177,15 @@ CREATE INDEX IF NOT EXISTS idx_position_ledger_leghash ON position_ledger (leg_s
 
 
 class Store:
+    # Manual WAL checkpoint cadence (writes between attempts) and the
+    # ACCELERATED retry cadence after a failed/busy checkpoint (2026-07-18:
+    # 'database table is locked' was observed on EVERY attempt of a live run —
+    # a long-lived read cursor starves the TRUNCATE — and the old shared
+    # try/except waited another full 5000 writes while the WAL grew 78→194MB
+    # in ~40min). Class attributes so tests can tighten them per instance.
+    _CHECKPOINT_EVERY_WRITES = 5000
+    _CHECKPOINT_RETRY_WRITES = 500
+
     def __init__(self, db: aiosqlite.Connection, clock: Clock) -> None:
         self._db = db
         self._clock = clock
@@ -191,6 +200,11 @@ class Store:
         self._write_q: asyncio.Queue[tuple[str, tuple[Any, ...]]] | None = None
         self._writer_task: asyncio.Task[None] | None = None
         self._dropped_writes = 0
+        # WAL-checkpoint health counters (2026-07-18): failed/busy TRUNCATE
+        # attempts and PASSIVE fallbacks that ran. Public so an ops surface can
+        # report them alongside dropped writes.
+        self.checkpoint_failures = 0
+        self.checkpoint_passive_fallbacks = 0
 
     @classmethod
     async def open(cls, path: Path, clock: Clock) -> Self:
@@ -281,10 +295,24 @@ class Store:
 
     async def _writer_loop(self) -> None:
         """Drain the tape queue and commit in BATCHES off the hot path — a WAL
-        checkpoint here stalls only THIS task, never the intake/worker loop."""
+        checkpoint here stalls only THIS task, never the intake/worker loop.
+
+        CHECKPOINT RESILIENCE (2026-07-18): the manual checkpoint has its OWN
+        failure path, no longer sharing the batch try/except — the live run's
+        repeated 'database table is locked' checkpoint failures were logged
+        indistinguishably from batch failures and each waited the full 5000
+        writes to retry. A failed/busy TRUNCATE now (a) logs its own
+        ``store_writer_checkpoint_failed`` event + counts
+        ``checkpoint_failures``, (b) falls back to a PASSIVE checkpoint (folds
+        whatever pages it can WITHOUT blocking readers — bounds WAL growth even
+        while a long-lived cursor pins the lock), and (c) retries after
+        ``_CHECKPOINT_RETRY_WRITES`` (~500) writes instead of the full cadence.
+        Batch failures keep the existing loud ``store_writer_batch_failed``
+        path, which now ALWAYS means the tape writes themselves failed."""
         assert self._write_q is not None
         q = self._write_q
         writes_since_checkpoint = 0
+        checkpoint_after = self._CHECKPOINT_EVERY_WRITES
         while True:
             first = await q.get()
             batch = [first]
@@ -297,20 +325,64 @@ class Store:
                 for sql, params in batch:
                     await self._db.execute(sql, params)
                 await self._db.commit()
-                # Bounded manual checkpoint OFF the hot path (autocheckpoint=0):
-                # a TRUNCATE every ~5000 writes keeps the WAL small without an
-                # inline checkpoint stalling every commit (which starved the writer
-                # and dropped 96% of the tape during bursts). PASSIVE-then-TRUNCATE
-                # via TRUNCATE is fine here — it runs on the writer task, never the
-                # intake/worker loop, so a brief stall only delays tape, not quotes.
-                writes_since_checkpoint += len(batch)
-                if writes_since_checkpoint >= 5000:
-                    writes_since_checkpoint = 0
-                    await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except Exception:
                 log.exception("store_writer_batch_failed", n=len(batch))
+            else:
+                # Bounded manual checkpoint OFF the hot path (autocheckpoint=0):
+                # a TRUNCATE every ~5000 writes keeps the WAL small without an
+                # inline checkpoint stalling every commit (which starved the
+                # writer and dropped 96% of the tape during bursts). It runs on
+                # the writer task, never the intake/worker loop, so a brief
+                # stall only delays tape, not quotes. Committed data is durable
+                # BEFORE the pragma — a checkpoint failure never loses tape.
+                writes_since_checkpoint += len(batch)
+                if writes_since_checkpoint >= checkpoint_after:
+                    writes_since_checkpoint = 0
+                    checkpoint_after = (
+                        self._CHECKPOINT_EVERY_WRITES
+                        if await self._wal_checkpoint()
+                        else self._CHECKPOINT_RETRY_WRITES
+                    )
             for _ in batch:
                 q.task_done()
+
+    async def _wal_checkpoint(self) -> bool:
+        """ONE bounded manual checkpoint attempt (writer task only). Returns
+        True iff the TRUNCATE fully completed (the WAL was reset).
+
+        A raised error ('database table is locked') AND a busy verdict (the
+        pragma's first result column — TRUNCATE that could not finish reports
+        busy=1 WITHOUT raising, which the old code silently counted as success)
+        both take the failure path: count + log ``store_writer_checkpoint_failed``
+        (its own event — never confused with a batch failure), then attempt a
+        PASSIVE checkpoint before giving up the cycle. PASSIVE copies what it
+        can without blocking readers, so the WAL keeps getting folded even
+        while the TRUNCATE lock is starved by a long-lived cursor."""
+        failure: str
+        try:
+            cursor = await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            row = await cursor.fetchone()
+            if row is None or not row[0]:
+                return True
+            failure = f"busy (wal_frames={row[1]}, checkpointed={row[2]})"
+        except Exception as exc:  # noqa: BLE001 - the pragma's failure IS the signal
+            failure = repr(exc)
+        self.checkpoint_failures += 1
+        passive_ok = False
+        try:
+            await self._db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            passive_ok = True
+            self.checkpoint_passive_fallbacks += 1
+        except Exception:  # noqa: BLE001 - fallback is best-effort
+            passive_ok = False
+        log.warning(
+            "store_writer_checkpoint_failed",
+            error=failure,
+            passive_fallback_ok=passive_ok,
+            checkpoint_failures=self.checkpoint_failures,
+            retry_after_writes=self._CHECKPOINT_RETRY_WRITES,
+        )
+        return False
 
     def _now(self) -> str:
         return self._clock.now().isoformat()

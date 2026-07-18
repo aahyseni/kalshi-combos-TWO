@@ -79,7 +79,9 @@ from tests.test_state_worst_case import (
     ADV_EV,
     ARG_ADV,
     ENG_ADV,
+    FRA_ML,
     GAME,
+    ML2_EV,
     TOT3,
     TOT_EV,
 )
@@ -1237,14 +1239,237 @@ def test_risk_config_waiver_defaults_and_validation() -> None:
     cfg = RiskConfig()
     assert cfg.lastlook_mc_waiver_enabled is False  # committed default OFF
     assert cfg.lastlook_mc_waiver_deadline_s == 1.0
+    assert cfg.lastlook_waiver_topk_resting == 0   # trim OFF = today's full set
     # Must fit inside the 3s confirm window: (0, 3] accepted, else rejected.
     assert RiskConfig(lastlook_mc_waiver_deadline_s=3.0).lastlook_mc_waiver_deadline_s == 3.0
     for bad in (0.0, -1.0, 3.5, float("nan")):
         with pytest.raises(ValidationError):
             RiskConfig(lastlook_mc_waiver_deadline_s=bad)
+    # The trim K is a count: 0 (disabled) and positives accepted, negatives not.
+    assert RiskConfig(lastlook_waiver_topk_resting=12).lastlook_waiver_topk_resting == 12
+    with pytest.raises(ValidationError):
+        RiskConfig(lastlook_waiver_topk_resting=-1)
 
 
 def test_lifecycle_config_waiver_defaults() -> None:
     cfg = LifecycleConfig()
     assert cfg.lastlook_mc_waiver_enabled is False
     assert cfg.lastlook_mc_waiver_deadline_s == 1.0
+    assert cfg.lastlook_waiver_topk_resting == 0
+
+
+# ------------------------------------------------ a6ecb80 fingerprint churn
+
+
+async def _add_fra_book(h: Harness) -> None:
+    """Arm the second game's moneyline (FRA_ML / GAME2) with a book + meta so a
+    churned-in unrelated-game quote stays fully pricable at the retry check."""
+    h.feed.watch([FRA_ML])
+    # seq continues the kxwc fixture's stream (…4, 5) — a gap would invalidate
+    # every book on the sid and change the denial shape under test.
+    await h.ws.deliver(snapshot_env(5, 6, FRA_ML))
+    h.with_meta(FRA_ML)
+
+
+async def test_unrelated_game_quote_churn_mid_enumeration_still_grants(
+    kxwc: tuple[Harness, Store],
+) -> None:
+    """a6ecb80 REGRESSION (the owed mid-enumeration churn test): a quote landing
+    on an UNRELATED game while the off-loop enumeration runs must NOT invalidate
+    the waiver — the old FULL-book-generation stamp did exactly that, making the
+    waiver un-runnable at 400 quotes/min (declined a +$1.76 EV $31 win live).
+    The stability key is now position generation + reservation version + the
+    BREACHED games' resting-quote id set, so unrelated churn is invisible:
+    granted on the FIRST attempt, zero version conflicts."""
+    h, store = kxwc
+    await _add_fra_book(h)
+    limits = LimitChecker(WAIVER_LIMITS)
+    lifecycle, _sender, exposure, reservation, metrics = _build_rig(
+        h, store, limits=limits, bankroll_cc=BANKROLL_CC
+    )
+    exposure.upsert_quote(_resting_quote("q:eng", ENG_ADV, ADV_EV))
+    pool = _QuoteChurnPool(
+        [lambda: exposure.upsert_quote(_resting_quote("q:other", FRA_ML, ML2_EV))]
+    )
+    lifecycle._book_risk_pool = pool  # type: ignore[assignment]  # noqa: SLF001
+    state = _wc_state()
+    denied = lifecycle._reserve_headroom("fill:q1", "q1", state)  # noqa: SLF001
+    assert denied is not None and not denied.granted
+    assert {b.reason for b in denied.breaches} == {ReasonCode.SKIP_GAME_LOSS_CAP}
+
+    ok, detail = await lifecycle._lastlook_mc_waiver(  # noqa: SLF001
+        "q1", state, "fill:q1", denied.breaches
+    )
+    assert ok is True and detail == ""
+    assert pool.calls == 1  # first attempt stood — no rebuild burned
+    assert reservation.is_outstanding("fill:q1")
+    _assert_waiver_counters(metrics, attempted=1, granted=1)
+
+
+async def test_waiver_fingerprint_keys_same_game_vs_unrelated(
+    kxwc: tuple[Harness, Store],
+) -> None:
+    """The a6ecb80 stability key, pinned axis by axis: unrelated-game quote
+    churn leaves the fingerprint unchanged; a same-game quote arrival OR
+    removal, and any position mutation, each change it."""
+    h, store = kxwc
+    lifecycle, _sender, exposure, _reservation, _metrics = _build_rig(
+        h, store, limits=LimitChecker(WAIVER_LIMITS), bankroll_cc=BANKROLL_CC
+    )
+    fp0 = lifecycle._waiver_games_fingerprint([GAME])  # noqa: SLF001
+    # Unrelated-game churn: invisible to the breached game's key.
+    exposure.upsert_quote(_resting_quote("q:other", FRA_ML, ML2_EV))
+    assert lifecycle._waiver_games_fingerprint([GAME]) == fp0  # noqa: SLF001
+    # Same-game arrival: invalidates.
+    exposure.upsert_quote(_resting_quote("q:same", ENG_ADV, ADV_EV))
+    fp1 = lifecycle._waiver_games_fingerprint([GAME])  # noqa: SLF001
+    assert fp1 != fp0
+    # Same-game removal: invalidates again (never back to fp1).
+    exposure.remove_quote("q:same")
+    fp2 = lifecycle._waiver_games_fingerprint([GAME])  # noqa: SLF001
+    assert fp2 != fp1 and fp2 == fp0  # id-set based: back to the original set
+    # Position mutation: invalidates via the position generation.
+    exposure.add_position(
+        OpenPosition(
+            position_id="held:fp",
+            combo_ticker="COMBO-FP",
+            collection=None,
+            our_side=Side.NO,
+            contracts=CentiContracts(100),
+            entry_price_cc=CentiCents(1000),
+            legs=(LegRef(ARG_ADV, ADV_EV, "yes"),),
+        )
+    )
+    assert lifecycle._waiver_games_fingerprint([GAME]) != fp2  # noqa: SLF001
+
+
+# ------------------------------------------------- waiver entity-set trim (K)
+
+
+def _trim_config(k: int) -> LifecycleConfig:
+    return LifecycleConfig(
+        candidate_gate_enabled=False,
+        lastlook_mc_waiver_enabled=True,
+        lastlook_waiver_topk_resting=k,
+    )
+
+
+async def test_trim_dropped_tail_adder_rides_certificate(
+    kxwc: tuple[Harness, Store],
+) -> None:
+    """K=1 on a book of {opposing hedge quote 8000cc, small co-directional
+    quote 500cc}: the hedge is kept (largest), the tail quote folds into a
+    CONSTANT adder — the certified bound becomes 8000 (netted) + 500 (adder)
+    = 8500, still under the 10000cc budget ⇒ GRANT, with the adder INSIDE the
+    certificate the retry re-validates."""
+    h, store = kxwc
+    limits = LimitChecker(WAIVER_LIMITS)
+    lifecycle, _sender, exposure, reservation, metrics = _build_rig(
+        h, store, limits=limits, bankroll_cc=BANKROLL_CC, config=_trim_config(1)
+    )
+    exposure.upsert_quote(_resting_quote("q:eng", ENG_ADV, ADV_EV))
+    exposure.upsert_quote(
+        _resting_quote("q:small", ARG_ADV, ADV_EV, no_bid_cc=500)
+    )
+    state = _wc_state()
+    denied = lifecycle._reserve_headroom("fill:q1", "q1", state)  # noqa: SLF001
+    assert denied is not None and not denied.granted
+
+    ok, detail = await lifecycle._lastlook_mc_waiver(  # noqa: SLF001
+        "q1", state, "fill:q1", denied.breaches
+    )
+    assert ok is True and detail == ""
+    assert reservation.is_outstanding("fill:q1")
+    assert metrics.counter("lastlook_waiver.trimmed") == 1
+    _assert_waiver_counters(metrics, attempted=1, granted=1)
+    assert lifecycle._waiver_audit == {  # noqa: SLF001
+        "granted": True,
+        "worst_case_cc": 8500,               # 8000 certified + 500 dropped-tail
+        "games": [GAME],
+        "trim_adders_cc": {GAME: 500},
+    }
+
+
+async def test_trim_adder_only_raises_never_loosens(
+    kxwc: tuple[Harness, Store],
+) -> None:
+    """FAIL-CLOSED direction (the adversarial edge): a book the UNTRIMMED
+    enumeration certifies at 16000cc under a 20000cc budget (grant) DECLINES
+    once K=1 drops the opposing hedge quote — the kept co-directional quote
+    enumerates at 16000 and the dropped hedge's 8000 rides as a constant adder
+    (24000 > 20000). The trim can only RAISE the certified bound; it can never
+    admit a fill the full enumeration would refuse."""
+    h, store = kxwc
+
+    async def build(k: int) -> tuple[bool, Metrics, QuoteLifecycle]:
+        limits = LimitChecker(GATE_LIMITS)  # 20_000cc game budget
+        lifecycle, _sender, exposure, _res, metrics = _build_rig(
+            h, store, limits=limits, bankroll_cc=BANKROLL_CC,
+            config=_trim_config(k),
+        )
+        exposure.upsert_quote(_resting_quote("q:arg2", ARG_ADV, ADV_EV))
+        exposure.upsert_quote(_resting_quote("q:eng", ENG_ADV, ADV_EV))
+        # Two structural legs so the game identifies a plan from the CANDIDATE
+        # alone — the K=1 trim drops q:eng from the universe, and a candidate
+        # with only the ARG leg would (correctly, fail-closed) come back
+        # UNCERTIFIED instead of exercising the adder path under test.
+        state = _wc_state(
+            rfq_obj=_wc_rfq(
+                [
+                    {"market_ticker": ARG_ADV, "side": "yes", "event_ticker": ADV_EV},
+                    {"market_ticker": TOT3, "side": "yes", "event_ticker": TOT_EV},
+                ]
+            )
+        )
+        denied = lifecycle._reserve_headroom("fill:q1", "q1", state)  # noqa: SLF001
+        assert denied is not None and not denied.granted
+        ok, _detail = await lifecycle._lastlook_mc_waiver(  # noqa: SLF001
+            "q1", state, "fill:q1", denied.breaches
+        )
+        return ok, metrics, lifecycle
+
+    ok_full, metrics_full, _lc = await build(k=0)   # untrimmed: 16000 <= 20000
+    assert ok_full is True
+    _assert_waiver_counters(metrics_full, attempted=1, granted=1)
+
+    ok_trim, metrics_trim, lc = await build(k=1)    # trimmed: 16000 + 8000 adder
+    assert ok_trim is False
+    _assert_waiver_counters(
+        metrics_trim, attempted=1, declined_over_budget=1
+    )
+    audit = lc._waiver_audit  # noqa: SLF001
+    assert audit is not None
+    assert audit["worst_case_cc"] == 24000
+    assert audit["trim_adders_cc"] == {GAME: 8000}
+
+
+async def test_trim_drops_unrelated_game_quotes_without_adder(
+    kxwc: tuple[Harness, Store],
+) -> None:
+    """A resting quote touching NO breached game is dropped EXACTLY (no adder —
+    it contributes nothing to the breached game's fold or plan): same grant and
+    the same 8000cc certificate as the base case."""
+    h, store = kxwc
+    await _add_fra_book(h)
+    limits = LimitChecker(WAIVER_LIMITS)
+    lifecycle, _sender, exposure, reservation, metrics = _build_rig(
+        h, store, limits=limits, bankroll_cc=BANKROLL_CC, config=_trim_config(1)
+    )
+    exposure.upsert_quote(_resting_quote("q:eng", ENG_ADV, ADV_EV))
+    exposure.upsert_quote(_resting_quote("q:other", FRA_ML, ML2_EV))
+    state = _wc_state()
+    denied = lifecycle._reserve_headroom("fill:q1", "q1", state)  # noqa: SLF001
+    assert denied is not None and not denied.granted
+
+    ok, detail = await lifecycle._lastlook_mc_waiver(  # noqa: SLF001
+        "q1", state, "fill:q1", denied.breaches
+    )
+    assert ok is True and detail == ""
+    assert reservation.is_outstanding("fill:q1")
+    assert lifecycle._waiver_audit == {  # noqa: SLF001
+        "granted": True,
+        "worst_case_cc": 8000,     # identical to the untrimmed base case
+        "games": [GAME],
+        "trim_adders_cc": {},      # unrelated-game drop is exact — no adder
+    }
+    _assert_waiver_counters(metrics, attempted=1, granted=1)

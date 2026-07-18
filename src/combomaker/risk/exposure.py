@@ -42,8 +42,8 @@ from __future__ import annotations
 
 import hashlib
 from collections import defaultdict
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field
 from enum import Enum
 from fractions import Fraction
 from typing import TYPE_CHECKING
@@ -524,6 +524,28 @@ class ExposureSnapshot:
     directional_by_game_cc: dict[str, int]
     open_quote_count: int
     unknown_marginals: bool                 # any delta was uncomputable
+    # SKEW MUTEX FIX (2026-07-18): the RAW per-game directional ENTRIES behind
+    # ``directional_by_game_cc`` — (this-game legs, |Σ this-game leg deltas| ×
+    # $1 cc, requires_all) per position AND (under mass acceptance) per resting
+    # quote's worst-side bound. Exported so the inventory skew can classify a
+    # candidate with the SAME P0-9 mutex-aware branch-max fold the directional
+    # cap binds on (``mutex_directional_alignment_cc``) instead of the
+    # mutex-blind raw delta sum. Defaulted for back-compat constructions;
+    # ``snapshot()`` always populates it.
+    dir_entries_by_game: dict[str, list[DirEntry]] = field(default_factory=dict)
+    # 2026-07-18 verify fix (over-rebate corner): the COMMITTED-POSITIONS-ONLY
+    # subset of ``dir_entries_by_game`` (no resting-quote mass-acceptance
+    # entries, no extra candidates/reservations). The mutex-aware skew
+    # classifier consults THIS census to fail closed to the raw read when the
+    # committed book carries a leg on a SECOND explicit-ME event of the same
+    # game — such a leg is CORRELATED mass the candidate-event fold would
+    # misfold as COMMON (inflating base and full equally, suppressing the true
+    # marginal and over-rebating an actually-concentrating candidate). Resting
+    # quotes deliberately do NOT drive that fallback (the live 200-slot book
+    # spans both ME events, which would kill the mutex fix entirely).
+    committed_dir_entries_by_game: dict[str, list[DirEntry]] = field(
+        default_factory=dict
+    )
 
     # --- back-compat aliases (old event-keyed names; now game-keyed data) ------
     # The pre-B2 field names ``delta_by_event`` / ``worst_case_loss_by_event_cc``
@@ -720,6 +742,92 @@ def _mutex_directional_game_cc(
     return _mutex_directional_event_bound(entries, me_events[0])
 
 
+# Public alias for consumers OUTSIDE this module (the inventory skew): one
+# game's directional entry — (this-game legs, |Σ this-game leg deltas| × $1 in
+# cc, requires_all). Same tuple shape as the folds above; a single definition.
+DirEntry = _DirEntry
+
+
+def mutex_directional_alignment_cc(
+    game_entries: Sequence[DirEntry],
+    candidate: DirEntry,
+    is_me_event: Callable[[str], bool | None] | None,
+    committed_entries: Sequence[DirEntry] | None = None,
+) -> tuple[float, float] | None:
+    """SKEW MUTEX FIX (2026-07-18): one candidate's mutex-aware directional
+    ALIGNMENT against one game's book, reusing the P0-9 branch-max machinery
+    verbatim (``_me_event_census`` + ``_mutex_directional_event_bound`` — never
+    a reimplementation).
+
+    The raw per-game delta sum is MUTEX-BLIND: a long-NO candidate on outcome B
+    of a mutually-exclusive event where the book is short outcome A carries the
+    SAME delta sign as the book, so the sign-alignment classifier calls the
+    HEDGE concentrating (measured live on 63k shadow events: ARG-champ combos
+    hedging a short-ESP-champion book widened 63/63). This function instead
+    measures how much the candidate RAISES the book's P0-9 mutex-aware
+    directional bound on the single explicit-ME event the candidate's own
+    this-game legs require.
+
+    Returns ``(marginal_cc, base_cc)``:
+      * ``base_cc``     — the book's branch-max directional bound on that event
+                          (entries on other events ride as COMMON, exactly the
+                          P0-9 fold semantics);
+      * ``marginal_cc`` — how much adding the candidate raises it, clamped to
+                          ``[0, candidate magnitude]``. ``== magnitude`` ⇒ fully
+                          CONCENTRATING; ``0`` ⇒ fully OFFSETTING (the fold nets
+                          it — opposing outcomes land in different branches);
+                          in between ⇒ only the excess concentrates.
+
+    Returns None ⇒ NOT APPLICABLE — no ME metadata, a non-requires-all
+    candidate (not a long-NO parlay: the mutex partition cannot certify
+    netting), zero magnitude, the candidate's this-game legs carry 0 or >= 2
+    explicit-ME events, OR the COMMITTED census fails (below). The caller then
+    falls back to the RAW delta-sum read (the operator's fail-safe: the mutex
+    path is used only where the single-ME branch math actually applies; richer
+    >= 2-ME netting stays in the parked committed-book exact-netting build).
+
+    COMMITTED SECOND-ME-EVENT FALLBACK (2026-07-18 verify fix — over-rebate
+    corner). ``committed_entries`` is the game's COMMITTED-POSITIONS-ONLY
+    entry subset (``ExposureSnapshot.committed_dir_entries_by_game``). A
+    committed leg on a DIFFERENT explicit-ME event of the same game (e.g. the
+    regulation moneyline while the candidate is on the champion event) is
+    CORRELATED with the candidate event's outcomes, but this single-event fold
+    can only ride it as COMMON — inflating base and full EQUALLY, so it
+    cancels out of the marginal and SUPPRESSES the candidate's true
+    concentration (numerically: book short ESP-champ 100 + short ARG-ML 50,
+    candidate short ARG-champ 80 ⇒ marginal 0 ⇒ FULL rebate, where the true
+    2-ME-aware split is concentration 30 / nettable 50). The cap folds get
+    away with common-riding because for a CAP overstatement is conservative;
+    for a MARGINAL it inverts. So: any committed leg on an explicit-ME event
+    != the candidate's ⇒ None (raw read — today's behaviour, never an
+    uncertified rebate). ``committed_entries is None`` (census unavailable)
+    also ⇒ None, fail-closed. RESTING-QUOTE entries deliberately do NOT drive
+    this fallback — the live 200-slot book spans both ME events of its games,
+    and a quote-driven fallback would suppress the mutex fix on exactly the
+    book shape it was built for (their residual common-mass inflation is
+    bounded pricing-width EV, capped by the free-money clamp and
+    ``skew_max_tighten_cc``)."""
+    if is_me_event is None:
+        return None
+    _legs, mag, requires = candidate
+    if not requires or mag <= 0.0:
+        return None
+    cand_events = _me_event_census([candidate], is_me_event)
+    if len(cand_events) != 1:
+        return None
+    event = cand_events[0]
+    if committed_entries is None:
+        return None                 # committed census unavailable — fail closed
+    for c_legs, _c_mag, _c_requires in committed_entries:
+        for c_leg in c_legs:
+            e = c_leg.event_ticker
+            if e and e != event and is_me_event(e) is True:
+                return None         # committed second ME event — raw read
+    base = _mutex_directional_event_bound(list(game_entries), event)
+    full = _mutex_directional_event_bound([*game_entries, candidate], event)
+    return (min(max(full - base, 0.0), mag), base)
+
+
 # --- P1-7: mutex-metadata settlement tripwire -------------------------------
 # The netting above (loss axis Stage B + directional axis P0-9) trusts ONE fact
 # about an event the metadata flagged ``is_me_event(e) is True``: its outcome
@@ -904,6 +1012,13 @@ class ExposureBook:
         current portfolio iff its ``input_generation`` equals this value."""
         return self._position_generation
 
+    @property
+    def is_me_event(self) -> Callable[[str], bool | None] | None:
+        """The book's mutual-exclusion metadata answer (read-only) — the EXACT
+        callable the Stage-B/P0-9 folds net on, exported so the inventory skew
+        classifies with the same ME facts (never a second source of truth)."""
+        return self._is_me_event
+
     def _bump_generation(self) -> None:
         self._generation += 1
 
@@ -1019,6 +1134,9 @@ class ExposureBook:
         # entry's |Σ this-game leg deltas| magnitude, folded with the SAME monotone
         # mutex bound so opposing-advance hedges net (mass-acceptance dominance kept).
         game_dir_entries: dict[str, list[_DirEntry]] = defaultdict(list)
+        # 2026-07-18 verify fix: the COMMITTED-positions-only directional
+        # entries (skew mutex fallback census — see ExposureSnapshot field).
+        committed_dir_entries: dict[str, list[_DirEntry]] = defaultdict(list)
         game_notional: dict[str, int] = defaultdict(int)   # NOTIONAL axis ($1/ct)
         gross_cc = 0
         unknown = False
@@ -1084,9 +1202,10 @@ class ExposureBook:
                 for game, glegs in pos_legs_by_game.items():
                     game_delta = sum(deltas.get(g.market_ticker, 0.0) for g in glegs)
                     magnitude = abs(game_delta) * CC_PER_DOLLAR
-                    game_dir_entries[game].append(
-                        (tuple(glegs), magnitude, requires_all)
-                    )
+                    entry = (tuple(glegs), magnitude, requires_all)
+                    game_dir_entries[game].append(entry)
+                    if is_committed:
+                        committed_dir_entries[game].append(entry)
 
         # Quote-time resting haircut: armed iff a weight < 1 was passed (the
         # confirm-path/pre-existing callers pass None ⇒ the 100% fold below is
@@ -1301,6 +1420,17 @@ class ExposureBook:
                         base_f, full_f, tkf, wf, floor_base=floor_f
                     )
                 )
+        # SKEW MUTEX FIX (2026-07-18): export the directional entries the fold
+        # above consumed — positions (+ mass-acceptance quote entries; under
+        # the armed haircut the resting entries live in q_dir_entries) — so the
+        # skew classifies with the SAME P0-9 mutex machinery. Observability/
+        # classifier surface only: no fold reads this back.
+        dir_entries: dict[str, list[DirEntry]] = {
+            game: list(entries) for game, entries in game_dir_entries.items()
+        }
+        if haircut:
+            for game, extra in q_dir_entries.items():
+                dir_entries.setdefault(game, []).extend(extra)
         return ExposureSnapshot(
             delta_by_market=dict(delta_market),
             delta_by_game=dict(delta_game),
@@ -1310,6 +1440,11 @@ class ExposureBook:
             directional_by_game_cc=game_directional,
             open_quote_count=len(self.open_quotes),
             unknown_marginals=unknown,
+            dir_entries_by_game=dir_entries,
+            committed_dir_entries_by_game={
+                game: list(entries)
+                for game, entries in committed_dir_entries.items()
+            },
         )
 
 
