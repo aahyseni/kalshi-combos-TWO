@@ -292,14 +292,25 @@ class FakeFeed:
 
 
 class FakeLifecycle:
-    """Minimal QuoteLifecycle double: only the marginal_of accessor the breaker
-    sampler uses. ``marginals`` maps market_ticker → P(YES) (None = unreadable)."""
+    """Minimal QuoteLifecycle double: the marginal_of accessor the breaker
+    sampler uses plus the settled-watch exemption (2026-07-18). ``marginals``
+    maps market_ticker → P(YES) (None = unreadable); ``settled`` is the set of
+    tickers the exchange confirmed no longer live (default empty — the strict
+    pre-fix watch)."""
 
-    def __init__(self, marginals: dict[str, float | None] | None = None) -> None:
+    def __init__(
+        self,
+        marginals: dict[str, float | None] | None = None,
+        settled: set[str] | None = None,
+    ) -> None:
         self._m = marginals or {}
+        self._s = settled or set()
 
     def marginal_of(self, market_ticker: str) -> float | None:
         return self._m.get(market_ticker)
+
+    def settled_watch_exempt(self, market_ticker: str) -> bool:
+        return market_ticker in self._s
 
 
 def _empty_book() -> ExposureBook:

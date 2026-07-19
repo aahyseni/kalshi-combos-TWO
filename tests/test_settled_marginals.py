@@ -41,6 +41,7 @@ from combomaker.core.clock import FakeClock
 from combomaker.core.conventions import Side
 from combomaker.core.money import CentiCents
 from combomaker.core.quantity import CentiContracts
+from combomaker.core.reasons import ReasonCode
 from combomaker.marketdata.settled import SettledMarginalResolver
 from combomaker.ops.config import FiltersConfig, PricingConfig, RiskConfig
 from combomaker.ops.metrics import Metrics
@@ -49,8 +50,14 @@ from combomaker.ops.quote_app import build_settled_resolver
 from combomaker.pricing.engine import PricingEngine
 from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.lifecycle import LifecycleConfig, QuoteLifecycle
+from combomaker.risk.breakers import (
+    BreakerInputs,
+    BreakerThresholds,
+    CircuitBreakers,
+)
 from combomaker.risk.exposure import ExposureBook, LegRef, OpenPosition
 from combomaker.risk.inplay import InPlayDetector
+from combomaker.risk.killswitch import KillSwitch
 from combomaker.risk.lastlook import LastLookPolicy
 from combomaker.risk.limits import LimitChecker, RiskLimits
 from combomaker.sim.book_model import build_book_model
@@ -624,3 +631,215 @@ class TestLifecycleWiring:
         assert risk is snap
         await lifecycle.handle_rfq(rfq())
         assert len(sender.created) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Marginal-jump circuit breaker: settled-leg exemption (live halt 2026-07-18   #
+# 02:17Z — "marginal became unreadable (had 1.000)" on a settled FRAENG leg    #
+# hard-killed the bot 90s after preflight).                                    #
+# --------------------------------------------------------------------------- #
+
+
+def _breaker_rig(clock: FakeClock) -> tuple[CircuitBreakers, KillSwitch]:
+    killswitch = KillSwitch(clock)
+    return CircuitBreakers(killswitch, BreakerThresholds(), clock), killswitch
+
+
+def _tick(
+    marginals: dict[str, float | None],
+    settled: frozenset[str] = frozenset(),
+) -> BreakerInputs:
+    """A healthy-everything-else breaker input carrying only the marginal watch
+    under test (the breaker's PUBLIC check path consumes exactly this)."""
+    return BreakerInputs(
+        rx_age_s=0.1, marginals=marginals, settled_tickers=settled
+    )
+
+
+class TestBreakerSettledExemption:
+    async def test_settled_fact_no_feed_book_never_trips(self) -> None:
+        # (a) The fact is cached and the book is gone: marginal_of serves the
+        # fact (1.0) forever. Held across ticks + past the 30s grace — never a
+        # trip, never a halt, and the baseline is PURGED so nothing lingers.
+        clock = FakeClock()
+        breakers, killswitch = _breaker_rig(clock)
+        exempt = frozenset({FRA_WIN})
+        for _ in range(4):
+            verdict = await breakers.evaluate_and_halt(
+                _tick({FRA_WIN: 1.0}, exempt)
+            )
+            assert verdict.tripped is False
+            clock.advance(31.0)
+        assert killswitch.halted is False
+        assert FRA_WIN not in breakers._last_marginal  # noqa: SLF001 — purged
+
+    async def test_live_outage_sequence_unreadable_settled_leg_no_halt(
+        self,
+    ) -> None:
+        # (a, the exact 02:17Z shape) tick 1: a last feed echo reads 1.000 —
+        # baseline seeds. Book then leaves the feed; the resolver's fetch finds
+        # the market CLOSED (not yet graded, marginal still None) so the
+        # sampler marks the leg exchange-confirmed non-live. The old breaker
+        # tripped "became unreadable (had 1.000)" and hard-halted after the
+        # 30s grace; now the exempt leg is skipped — sustained forever, no halt.
+        clock = FakeClock()
+        breakers, killswitch = _breaker_rig(clock)
+        v1 = await breakers.evaluate_and_halt(_tick({FRA_WIN: 1.000}))
+        assert v1.tripped is False  # baseline seeded from the live echo
+        clock.advance(15.0)
+        exempt = frozenset({FRA_WIN})
+        for _ in range(4):  # far past the 30s sustained-grace window
+            verdict = await breakers.evaluate_and_halt(
+                _tick({FRA_WIN: None}, exempt)
+            )
+            assert verdict.tripped is False
+            clock.advance(31.0)
+        assert killswitch.halted is False
+
+    async def test_live_to_settled_grading_is_not_a_jump(self) -> None:
+        # (b) live 0.60 -> graded fact 1.0 (delta 0.40 > max_jump 0.25): a
+        # settlement, not a feed move — must NOT trip.
+        clock = FakeClock()
+        breakers, killswitch = _breaker_rig(clock)
+        assert not (await breakers.evaluate_and_halt(_tick({FRA_WIN: 0.60}))).tripped
+        verdict = await breakers.evaluate_and_halt(
+            _tick({FRA_WIN: 1.0}, frozenset({FRA_WIN}))
+        )
+        assert verdict.tripped is False
+        assert killswitch.halted is False
+
+    async def test_same_transition_without_exemption_would_trip(self) -> None:
+        # The exemption is LOAD-BEARING: the identical 0.60 -> 1.0 sequence
+        # WITHOUT the settled set still trips the jump detector (pins that the
+        # fix is the exemption, not a loosened threshold).
+        clock = FakeClock()
+        breakers, _killswitch = _breaker_rig(clock)
+        assert not (await breakers.evaluate_and_halt(_tick({FRA_WIN: 0.60}))).tripped
+        verdict = await breakers.evaluate_and_halt(_tick({FRA_WIN: 1.0}))
+        assert verdict.tripped is True
+        assert verdict.reason is ReasonCode.HALT_MARGINAL_JUMP
+
+    async def test_genuinely_unreadable_live_market_still_halts(self) -> None:
+        # (c) regression: a LIVE market's leg that becomes unreadable (dead
+        # feed, NOT exchange-confirmed non-live) trips, holds the 30s grace,
+        # and hard-halts when sustained — exactly the pre-fix contract.
+        clock = FakeClock()
+        breakers, killswitch = _breaker_rig(clock)
+        assert not (await breakers.evaluate_and_halt(_tick({"LIVE-M": 0.60}))).tripped
+        v_hold = await breakers.evaluate_and_halt(_tick({"LIVE-M": None}))
+        assert v_hold.tripped is True  # transient hold starts
+        assert killswitch.halted is False  # grace window — not yet
+        clock.advance(31.0)
+        v_sustained = await breakers.evaluate_and_halt(_tick({"LIVE-M": None}))
+        assert v_sustained.tripped is True
+        assert killswitch.halted is True  # sustained past grace: hard halt
+        assert v_sustained.reason is ReasonCode.HALT_MARGINAL_JUMP
+
+
+# --------------------------------------------------------------------------- #
+# Call-site wiring: resolver liveness knowledge -> lifecycle exemption ->      #
+# breaker-input sampler.                                                       #
+# --------------------------------------------------------------------------- #
+
+
+class TestSettledWatchExemptWiring:
+    async def test_resolver_market_no_longer_live_knowledge(self) -> None:
+        source = FakeMarketSource()
+        clock = FakeClock()
+        source.payloads[FRA_WIN] = market_payload(
+            FRA_WIN, status="closed", result=""
+        )
+        source.payloads[FRAENG_O5] = market_payload(
+            FRAENG_O5, status="finalized", result="no"
+        )
+        source.payloads["DISP"] = market_payload(
+            "DISP", status="disputed", result="yes"
+        )
+        source.payloads["SCLR"] = market_payload(
+            "SCLR", status="determined", result="scalar"
+        )
+        source.payloads["LIVE-M"] = market_payload(
+            "LIVE-M", status="active", result=""
+        )
+        source.payloads["ERR"] = RuntimeError("rest boom")
+        r = _resolver(source, clock, fetch_budget_per_pass=10)
+        for t in (FRA_WIN, FRAENG_O5, "DISP", "SCLR", "LIVE-M", "ERR"):
+            r.note_missing(t)
+        await r.resolve_pending()
+        # Closed-but-UNGRADED: no fact (marginal None) but exchange-confirmed
+        # non-live — the exact 02:17Z gap the exemption must cover.
+        assert r.resolved(FRA_WIN) is None
+        assert r.market_no_longer_live(FRA_WIN) is True
+        # A cached graded fact is non-live too.
+        assert r.market_no_longer_live(FRAENG_O5) is True
+        # Disputed / scalar: no 0/1 fact, but the market is over.
+        assert r.market_no_longer_live("DISP") is True
+        assert r.market_no_longer_live("SCLR") is True
+        # LIVE market and a FAILED fetch: fail-closed — keep the full watch.
+        assert r.market_no_longer_live("LIVE-M") is False
+        assert r.market_no_longer_live("ERR") is False
+        assert r.market_no_longer_live("NEVER-FETCHED") is False
+
+    async def test_lifecycle_settled_watch_exempt(
+        self, harness: tuple[Harness, Store]
+    ) -> None:
+        h, store = harness
+        source = FakeMarketSource()
+        source.payloads[FRA_WIN] = market_payload(
+            FRA_WIN, status="closed", result=""
+        )
+        settled = _resolver(source, h.clock)
+        settled.note_missing(FRA_WIN)
+        await settled.resolve_pending()
+        lifecycle, _sender, _exposure = _build(
+            h, store, bankroll_cc=10**11, settled=settled
+        )
+        assert lifecycle.settled_watch_exempt(FRA_WIN) is True
+        assert lifecycle.settled_watch_exempt("M1") is False  # live, feed-owned
+        # No resolver wired: never exempt (the breaker keeps its full watch).
+        bare, _s, _e = _build(h, store, bankroll_cc=10**11, settled=None)
+        assert bare.settled_watch_exempt(FRA_WIN) is False
+
+    def test_sampler_surfaces_settled_exemption(self, tmp_path: Path) -> None:
+        # (d) The REAL sampler (`_sample_breaker_inputs`) carries the exempt
+        # set for exactly the book legs the lifecycle reports non-live, and
+        # still reads every leg's marginal from the provider.
+        from tests.test_quote_app_phase6 import (
+            FakeFeed as Phase6Feed,
+        )
+        from tests.test_quote_app_phase6 import (
+            FakeMetadata as Phase6Metadata,
+        )
+        from tests.test_quote_app_phase6 import (
+            _demo_app,
+        )
+
+        class _ExemptLifecycle:
+            def __init__(
+                self, marginals: dict[str, float | None], settled: set[str]
+            ) -> None:
+                self._m = marginals
+                self._s = settled
+
+            def marginal_of(self, market_ticker: str) -> float | None:
+                return self._m.get(market_ticker)
+
+            def settled_watch_exempt(self, market_ticker: str) -> bool:
+                return market_ticker in self._s
+
+        app = _demo_app(tmp_path)
+        exposure = ExposureBook(TEST_CONVENTIONS)
+        exposure.add_position(_cross_game_position("held"))
+        lifecycle = _ExemptLifecycle(
+            {FRA_WIN: 1.0, FRAENG_O5: 0.0, "M1": 0.35},
+            {FRA_WIN, FRAENG_O5},
+        )
+        feed = Phase6Feed(rx_age_s=0.1, warm=True, seq_gap=False)
+        inputs = app._sample_breaker_inputs(  # noqa: SLF001 — sampler seam
+            feed,  # type: ignore[arg-type]
+            lifecycle,  # type: ignore[arg-type]
+            exposure,
+            Phase6Metadata(),  # type: ignore[arg-type]
+        )
+        assert inputs.settled_tickers == frozenset({FRA_WIN, FRAENG_O5})
+        assert inputs.marginals == {FRA_WIN: 1.0, FRAENG_O5: 0.0, "M1": 0.35}

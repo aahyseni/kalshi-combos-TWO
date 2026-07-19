@@ -70,6 +70,16 @@ GRADED_STATUSES: frozenset[str] = frozenset({"determined", "finalized"})
 # the lifecycle re-notes it and resolution starts over.
 LIVE_STATUSES: frozenset[str] = frozenset({"initialized", "inactive", "active"})
 
+# The recognized NON-LIVE statuses (trading over; the order book ceases to
+# exist). Includes closed-but-UNGRADED and the dispute-window states: those
+# stay UNKNOWN for the MARGINAL (no fact until graded), but their book leaving
+# the feed is the normal close transition — knowledge ``market_no_longer_live``
+# carries to the breaker exemption. An unknown status string is in NEITHER set
+# (fail-closed: no exemption, keep retrying).
+NON_LIVE_STATUSES: frozenset[str] = frozenset(
+    {"closed", "determined", "disputed", "amended", "finalized"}
+)
+
 
 class MarketSource(Protocol):
     """The one REST method resolution needs (public, no auth).
@@ -126,6 +136,16 @@ class SettledMarginalResolver:
         # the next pass. With it, a re-note of a known-live ticker is deferred
         # to the floor — at most one fetch per backoff window per ticker.
         self._live_floor: dict[str, int] = {}
+        # Tickers whose LAST successful fetch reported a NON-LIVE exchange
+        # status (closed/determined/disputed/amended/finalized) but no cached
+        # 0/1 fact yet (closed-but-ungraded, disputed, scalar, …). Feeds
+        # ``market_no_longer_live``: for such a ticker the order book leaving
+        # the feed is NORMAL AND PERMANENT (books cease to exist at close), so
+        # the marginal-jump breaker's dead-feed readability watch must not
+        # read it as a feed failure (live halt 2026-07-18 02:17Z:
+        # halt_marginal_jump "became unreadable (had 1.000)" on a settled
+        # FRAENG leg hard-killed the bot 90s after preflight).
+        self._known_non_live: set[str] = set()
 
     # ------------------------------------------------------------- hot path
 
@@ -134,6 +154,24 @@ class SettledMarginalResolver:
         in-memory read — hot-path safe, never touches the network."""
         cached = self._results.get(market_ticker)
         return None if cached is None else cached.marginal
+
+    def market_no_longer_live(self, market_ticker: str) -> bool:
+        """True iff the EXCHANGE told us this market is no longer live: a
+        graded 0/1 fact is cached, or the last successful fetch reported a
+        non-live status (closed/determined/disputed/amended/finalized —
+        including closed-but-UNGRADED and scalar markets). Pure in-memory read.
+
+        Consumed by the marginal-jump circuit breaker's watch-exemption
+        (``QuoteLifecycle.settled_watch_exempt``): for such a ticker
+        "readable → unreadable" is the NORMAL, PERMANENT close transition, not
+        the dead-feed signature the breaker exists to catch. Fail-closed: a
+        ticker never successfully fetched (or last seen LIVE) returns False —
+        the breaker keeps its full readability watch on it, so a genuinely
+        dead feed on a live market still halts."""
+        return (
+            market_ticker in self._results
+            or market_ticker in self._known_non_live
+        )
 
     def note_missing(self, market_ticker: str) -> None:
         """Register a ticker whose feed book is gone as a resolution candidate.
@@ -195,6 +233,16 @@ class SettledMarginalResolver:
             return False
         status = str(market.get("status") or "")
         result = str(market.get("result") or "")
+
+        # Track exchange-confirmed liveness for the breaker exemption. Only a
+        # KNOWN status moves the flag: a recognized non-live status sets it
+        # (the close transition is one-way on the exchange); a recognized LIVE
+        # status clears it (defensive); an empty/unknown status string leaves
+        # it untouched (fail-closed — never infer liveness).
+        if status in LIVE_STATUSES:
+            self._known_non_live.discard(ticker)
+        elif status in NON_LIVE_STATUSES:
+            self._known_non_live.add(ticker)
 
         if status in LIVE_STATUSES:
             # A live market — the feed owns it; not a settlement candidate.

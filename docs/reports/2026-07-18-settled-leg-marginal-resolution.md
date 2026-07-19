@@ -102,15 +102,79 @@ Assumption-audit rows appended to `NOTES.md` (SR1–SR4).
 - Live-market fetches (a committed leg whose book merely flickered) cost one
   public GET then drop from pending — bounded (5/pass, 512 pending cap).
 
+---
+
+## ADDENDUM (2026-07-18 relight, ~02:17Z / 10:17 PM ET 07-17): marginal-jump breaker missed — HARD HALT 90s after preflight — FIXED
+
+The relight on `a57afc3` worked (`settled_marginal_resolved` fired, snapshot
+healed) but the **marginal-jump circuit breaker** was a missed consumer
+(`data/live_logs/live_20260718_settled_relight.log`):
+`halt_marginal_jump` — `"KXWCTOTAL-26JUL18FRAENG-4: marginal became unreadable
+(had 1.000)"` → 30s transient grace → `circuit_breaker_tripped_sustained` →
+kill switch → clean shutdown (supervisor rc=1).
+
+Mechanism: the breaker sampler DOES read the patched provider
+(`lifecycle.marginal_of`), so the residual gap was the window where the book
+is gone but the exchange has NOT graded yet (`status=closed`, `result=""` ⇒
+marginal legitimately None) — the baseline 1.000 came from the market's last
+live echo, and "readable → unreadable" sustained 30s is the breaker's
+dead-feed trip. For a settled/closing market that transition is NORMAL AND
+PERMANENT.
+
+Fix (smallest sound change — exempt exchange-confirmed non-live tickers from
+the jump/readability watch):
+
+| item | desc | status |
+|------|------|--------|
+| `marketdata/settled.py` | resolver now tracks `NON_LIVE_STATUSES` knowledge (`closed/determined/disputed/amended/finalized` seen on a successful fetch, incl. closed-but-UNGRADED and scalar) + public `market_no_longer_live()`; a graded fact counts too | SHIPPED |
+| `rfq/lifecycle.py` | public `settled_watch_exempt(ticker)` — True iff the resolver holds the fact OR the exchange confirmed non-live; False with no resolver / nothing confirmed (full fail-closed watch retained) | SHIPPED |
+| `risk/breakers.py` | `BreakerInputs.settled_tickers` (default empty = pre-fix contract); `_evaluate_marginal_jumps` SKIPS exempt tickers and PURGES their baseline — held fact ≠ jump, live 0.97 → graded 1.000 ≠ jump, unreadable-while-closed ≠ dead feed | SHIPPED |
+| `ops/quote_app.py` | `_book_leg_signals`/`_sample_breaker_inputs` build + thread the exempt set from `settled_watch_exempt` | SHIPPED |
+
+Quote path unaffected: an ungraded closed leg still prices UNKNOWN (no-quote);
+only the BREAKER stops reading the close transition as a feed failure. A
+genuinely dead feed on a LIVE market still trips + sustains + halts
+(regression-pinned).
+
+Consumer audit (every reader of the marginal provider / raw feed books vs
+settled tickers — so no third layer surfaces):
+
+| call site | verdict |
+|---|---|
+| breaker sampler `_book_leg_signals` → jump watch | **PATCHED** (exempt set + skip/purge) |
+| `_build_book_risk_inputs` → `build_book_model` | patched (the original fix — conditional model) |
+| `_build_candidate_gate_inputs` marginals dict (candidate MC) | already-safe (inherits provider; facts flow) |
+| `_build_state_worst_case_inputs` (waiver enumeration) | already-safe (facts flow; degenerate excluded from inversion; per-state settlement marginal-free) |
+| `_maybe_recompute_peak_profile` marginals dict | already-safe (facts flow; absent ⇒ neutral zero-adder, never a decline) |
+| `limits.check` / `reservation.try_reserve` / `exposure.snapshot` (skew) | already-safe (provider inherited; settled 0/1 = exact conditional folds) |
+| `_refresh_daily_pnl` mark | already-safe + benefits (settled legs mark at fact) |
+| `_current_leg_mids` (RFQ legs) | N-A (exchange mints no RFQs on settled legs) |
+| `_last_look_inputs` max-move (open-quote legs) | already-safe (a settled move ⇒ last-look declines — fail-safe) |
+| `ops/report.py build_report` | already-safe (observability only, no halt path) |
+| breaker `game_keys` → unmapped-game | N-A (settled legs keep event tickers; key resolves) |
+| `_book_tripwire` taxonomy | N-A (shape-only, settlement-independent) |
+| `_metadata_changes` fingerprint (HALT_METADATA_CHANGE, structural/no-grace) | already-safe TODAY: peek-only, and metadata is fetched only for legs NEW to the watch set — nothing refreshes a held leg's meta, so the active→closed flip never lands in the fingerprint. **Watch item**: if a future sweep refreshes held-leg metadata, exempt the normal close progression first |
+| `pricing/engine`, `pricing/legs`, `rfq/filters`, `_book_valid` raw `feed.book` reads | N-A / fail-safe (RFQ + open-quote legs only; missing book ⇒ NoQuote/decline/cancel, never a halt) |
+
+Verification: 8 new tests (breaker public-path: fact-held, the exact 02:17Z
+unreadable-while-closed sequence past grace, live→graded 0.40 delta no-trip,
+same delta WITHOUT exemption still trips, dead-feed LIVE regression halt;
+wiring: resolver liveness knowledge, lifecycle exemption incl. no-resolver
+False, real sampler surfaces the set). Suites: settled file **25/25**,
+breakers/quote_app/lifecycle/book-risk **173/173**, FULL suite
+**2454 passed** (2446 + 8), 3 deselected. ruff + mypy --strict clean.
+
 ## NEXT STEPS
 
-- **Operator**: restart the bot to pick up the fix (edits are inert until
-  restart); watch for `settled_marginal_resolved` lines for the FRAENG legs,
-  then `book_risk_snapshot` usable=true and quotes flowing while ESPARG legs
-  stay open (Sunday's exact scenario).
-- **Operator decision owed**: none — knob defaults ON
-  (`risk.settled_marginal_resolution`); set `false` in the local YAML to
-  restore pre-fix behaviour.
+- **Operator**: relight again — this was the last consumer of the settled
+  transition (audit table above is exhaustive over the marginal readers).
+  Watch order in the log: `settled_marginal_resolved` → `book_risk_snapshot`
+  usable → NO `circuit_breaker_transient_holding` with
+  `reason=halt_marginal_jump` on FRAENG legs.
+- **Operator decision owed**: none — no new knobs; the exemption rides the
+  existing `risk.settled_marginal_resolution` (False ⇒ no resolver ⇒ breaker
+  keeps the full pre-fix watch everywhere).
 - **Next session**: after the Sunday final settles, confirm the settlement
   poller's combo reconcile agreed to the cent with the resolver's cached leg
-  facts (both grading orders exercised live).
+  facts (both grading orders exercised live); close the `_metadata_changes`
+  watch item if a held-leg metadata sweep is ever added.

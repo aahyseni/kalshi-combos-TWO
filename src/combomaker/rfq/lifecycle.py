@@ -4186,12 +4186,32 @@ class QuoteLifecycle:
 
     def marginal_of(self, market_ticker: str) -> float | None:
         """Public read accessor for a leg's current P(YES) — the SAME provider
-        (feed microprice) the pricer and exposure book use. ``None`` when the
-        book is missing/invalid (fail-closed: an unreadable leg is UNKNOWN, never
-        a guessed value). Exposed so the risk-breaker sampler (quote_app's
+        (feed microprice, then the settled-fact cache) the pricer and exposure
+        book use. ``None`` when the book is missing/invalid and no graded fact
+        is cached (fail-closed: an unreadable leg is UNKNOWN, never a guessed
+        value). Exposed so the risk-breaker sampler (quote_app's
         _sample_breaker_inputs) can feed the marginal-jump breaker the exact
         marginals we priced on, without reaching into a private name."""
         return self._marginals(market_ticker)
+
+    def settled_watch_exempt(self, market_ticker: str) -> bool:
+        """True iff the marginal-jump breaker must NOT watch this leg's
+        readability/jump: the settled-marginal resolver holds its
+        exchange-graded fact, or the exchange told it the market is no longer
+        live (closed/determined/disputed/amended/finalized — including
+        closed-but-UNGRADED). For such a ticker "readable → unreadable" is the
+        NORMAL, PERMANENT close transition (books cease to exist at close) and
+        "0.97 → 1.000" is a grading, not a feed move — neither is the
+        dead-feed/mis-mark signature the breaker exists to catch (live halt
+        2026-07-18 02:17Z: halt_marginal_jump on a settled FRAENG leg killed
+        the bot 90s after preflight). False when no resolver is wired or
+        nothing is exchange-confirmed about the ticker — the breaker keeps its
+        full fail-closed watch (a genuinely dead feed on a LIVE market still
+        halts). The QUOTE path is unaffected either way: an ungraded closed
+        leg still prices as UNKNOWN (no-quote)."""
+        if self._settled is None:
+            return False
+        return self._settled.market_no_longer_live(market_ticker)
 
     # ---------------------------------------------------------------- helpers
 

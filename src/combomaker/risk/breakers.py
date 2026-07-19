@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 
 from combomaker.core.clock import Clock
@@ -268,6 +269,19 @@ class BreakerInputs:
     # ticker -> current P(YES); the coordinator compares against its own
     # last-seen map to detect jumps and unreadable-now legs.
     marginals: Mapping[str, float | None] = field(default_factory=dict)
+    # SETTLED-LEG EXEMPTION (2026-07-18 02:17Z live halt: halt_marginal_jump
+    # "became unreadable (had 1.000)" on a settled FRAENG leg hard-killed the
+    # bot 90s after preflight). Tickers whose market the EXCHANGE confirmed no
+    # longer live (a graded settlement fact is cached, or the last status read
+    # was closed/determined/disputed/amended/finalized — sampled from
+    # ``QuoteLifecycle.settled_watch_exempt``). For these the jump/readability
+    # watch is SKIPPED and their baseline purged: a book leaving the feed at
+    # close is normal and permanent (not the dead-feed signature), and a
+    # live→graded move (0.97 → 1.000) is a settlement, not a mis-mark. Legs
+    # NOT in this set keep the full fail-closed watch, so a genuinely dead
+    # feed on a live market still trips exactly as before. Default empty ⇒
+    # every existing caller keeps the strict pre-fix contract.
+    settled_tickers: frozenset[str] = frozenset()
     # ticker -> resolved game key (None = unresolvable). Only legs actually on
     # the risk path are here.
     game_keys: Mapping[str, str | None] = field(default_factory=dict)
@@ -365,7 +379,9 @@ class CircuitBreakers:
 
             # Marginal jump last: it also UPDATES the baseline, so run it after
             # the others (a trip elsewhere shouldn't leave the baseline half-way).
-            jump = self._evaluate_marginal_jumps(inputs.marginals)
+            jump = self._evaluate_marginal_jumps(
+                inputs.marginals, inputs.settled_tickers
+            )
             if jump.tripped:
                 return jump
 
@@ -377,10 +393,22 @@ class CircuitBreakers:
             )
 
     def _evaluate_marginal_jumps(
-        self, marginals: Mapping[str, float | None]
+        self,
+        marginals: Mapping[str, float | None],
+        settled_tickers: AbstractSet[str] = frozenset(),
     ) -> BreakerVerdict:
         tripped: BreakerVerdict | None = None
         for ticker, cur in marginals.items():
+            if ticker in settled_tickers:
+                # SETTLED-LEG EXEMPTION (2026-07-18 02:17Z live halt): the
+                # exchange confirmed this market is no longer live, so there
+                # is nothing live to watch — its book leaving the feed is the
+                # normal permanent close transition (not a dead feed), a held
+                # graded fact is not a move, and the transition INTO the fact
+                # (e.g. 0.97 → 1.000 at grading) is a settlement, not a jump.
+                # PURGE the baseline so no stale reading can ever fire later.
+                self._last_marginal.pop(ticker, None)
+                continue
             prev = self._last_marginal.get(ticker)
             verdict = detect_marginal_jump(
                 prev, cur, ticker=ticker, max_jump=self._thr.max_marginal_jump

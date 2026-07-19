@@ -2006,9 +2006,14 @@ class QuoteApp:
         - ``rate_limit_count``: the rolling 429-burst window (polls AND writes).
         - ``marginals``: the CURRENT per-leg P(YES) for every leg the risk path
           touches (legs of every open quote + open position), from the SAME
-          marginal provider the pricer/exposure use. The coordinator diffs each
-          against its own last-seen baseline ⇒ ``detect_marginal_jump`` fires on
-          a real move (and on a leg that became unreadable after we priced it).
+          marginal provider the pricer/exposure use (feed first, settled-fact
+          cache second). The coordinator diffs each against its own last-seen
+          baseline ⇒ ``detect_marginal_jump`` fires on a real move (and on a
+          leg that became unreadable after we priced it) — EXCEPT the
+          ``settled_tickers`` set: legs whose market the exchange confirmed no
+          longer live are exempt from the jump/readability watch (a settled
+          book leaving the feed is normal and permanent — the 2026-07-18
+          02:17Z live halt).
         - ``game_keys``: the resolved ``pricing.grouping.game_key`` for each of
           those legs ⇒ ``detect_unmapped_game`` fires on a None/unresolved key
           (a leg that would escape the game/slate cluster caps).
@@ -2024,7 +2029,9 @@ class QuoteApp:
         — UNKNOWN is never a convenient pass. Runs off the hot path (status loop,
         15s cadence), never in the 0.5s maintenance/status hot path.
         """
-        marginals, game_keys, book_legs = self._book_leg_signals(exposure, lifecycle)
+        marginals, game_keys, book_legs, settled = self._book_leg_signals(
+            exposure, lifecycle
+        )
         return BreakerInputs(
             rx_age_s=feed.rx_age_s,
             feed_warm=feed.warm,
@@ -2035,33 +2042,50 @@ class QuoteApp:
             rate_limit_count=self._rate_limit_window.count(),
             marginals=marginals,
             game_keys=game_keys,
+            settled_tickers=settled,
             tripwire_hit=self._book_tripwire(self._book_leg_refs(exposure)),
             changed_markets=self._metadata_changes(book_legs, metadata),
         )
 
     def _book_leg_signals(
         self, exposure: ExposureBook, lifecycle: QuoteLifecycle
-    ) -> tuple[dict[str, float | None], dict[str, str | None], tuple[RfqLeg, ...]]:
+    ) -> tuple[
+        dict[str, float | None],
+        dict[str, str | None],
+        tuple[RfqLeg, ...],
+        frozenset[str],
+    ]:
         """Extract, from the legs the risk path actually touches (every open
         quote + every open position), the per-leg marginal map, the per-leg
-        game-key map, and the deduped legs (as ``RfqLeg`` for the tripwire).
+        game-key map, the deduped legs (as ``RfqLeg`` for the tripwire), and
+        the SETTLED watch-exemption set for the marginal-jump breaker.
 
         The marginal map keys on ``market_ticker`` and reads the SAME provider
-        the pricer/exposure use (``lifecycle._marginals`` → feed microprice); a
-        leg whose book is missing/invalid surfaces as ``None`` (fail-closed: the
-        jump breaker trips a leg we priced against that we can no longer read).
-        The game-key map resolves ``pricing.grouping.game_key`` on each leg's
-        ``event_ticker`` — a leg with no event_ticker resolves to ``None`` so the
-        unmapped-game breaker trips (a leg that would escape the cluster caps)."""
+        the pricer/exposure use (``lifecycle.marginal_of`` → feed microprice,
+        then the settled-fact cache); a leg whose book is missing/invalid and
+        holds no graded fact surfaces as ``None`` (fail-closed: the jump
+        breaker trips a leg we priced against that we can no longer read).
+        The SETTLED set (``lifecycle.settled_watch_exempt``) carries every leg
+        whose market the EXCHANGE confirmed no longer live (graded fact
+        cached, or last status read closed/determined/…): the jump breaker
+        SKIPS those — their book leaving the feed is the normal permanent
+        close transition, and a grading (0.97 → 1.000) is not a feed move
+        (live halt 2026-07-18 02:17Z). The game-key map resolves
+        ``pricing.grouping.game_key`` on each leg's ``event_ticker`` — a leg
+        with no event_ticker resolves to ``None`` so the unmapped-game breaker
+        trips (a leg that would escape the cluster caps)."""
         marginals: dict[str, float | None] = {}
         game_keys: dict[str, str | None] = {}
         legs: dict[str, RfqLeg] = {}  # market_ticker → RfqLeg (deduped)
+        settled: set[str] = set()
         marginal_of = lifecycle.marginal_of
         for leg_refs in self._book_leg_refs(exposure):
             for leg in leg_refs:
                 ticker = leg.market_ticker
                 if ticker not in marginals:
                     marginals[ticker] = marginal_of(ticker)
+                    if lifecycle.settled_watch_exempt(ticker):
+                        settled.add(ticker)
                     game_keys[ticker] = (
                         game_key(leg.event_ticker) if leg.event_ticker else None
                     )
@@ -2074,7 +2098,7 @@ class QuoteApp:
                         # None is the pre-determination value.
                         yes_settlement_value_cc=None,
                     )
-        return marginals, game_keys, tuple(legs.values())
+        return marginals, game_keys, tuple(legs.values()), frozenset(settled)
 
     @staticmethod
     def _book_leg_refs(exposure: ExposureBook) -> list[tuple[Any, ...]]:
