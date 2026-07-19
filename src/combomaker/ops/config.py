@@ -602,7 +602,17 @@ class CorrelationConfig(StrictModel):
             # (symmetric→0) — see memory, wire by ticker series when it lists.
             "advance|total": 0.12,
             "advance|btts": -0.07,
-            "advance|player_goal:same": 0.45,
+            # 2026-07-19 PROMOTE 0.45 -> 0.52 (operator-approved, rule 8b):
+            # the 0.45 was inherited from the regulation ml|player_goal
+            # measurement, but ADVANCE settles incl ET/pens and scorer props
+            # ALSO settle incl ET - the regulation attenuation does not apply
+            # (measured retention ~104% of the ml level). DC model identified
+            # from the ESPARG final's live books three ways: conditional
+            # P(scorer 1+ | team advances) ~53.6-54.9% => rho 0.51-0.53.
+            # Field raw fills ~25.7c vs our 23.6c corroborated the direction
+            # (fee-print theory REFUTED by 12/12 ledger reconciliation - tape
+            # prints are RAW). docs/reports/2026-07-19-argmessi-fair-vs-field.md
+            "advance|player_goal:same": 0.52,
             "advance|player_goal:opp": -0.45,
             "advance|spread": 0.95,
             # SPREAD (win-by-margin) × full-time markets — also UNLISTED → +0.6
@@ -1826,9 +1836,12 @@ class SkewConfig(StrictModel):
     # reflects WHERE the risk lands, never the clip size, which the caps/
     # velocity brake already govern); one that provably MISSES the ENTIRE
     # top-loss plateau (certified against the full argmax level, not the K
-    # sample — 2026-07-18 verify fix) AND every cached lower cluster
-    # (2026-07-19) rebates ``peak_tighten_max_cc x peak_ratio`` — quoted
-    # TIGHTER to win the flattening auctions. Composed total stays inside
+    # sample — 2026-07-18 verify fix) rebates
+    # ``peak_tighten_max_cc x peak_ratio x (1 - hit_severity)`` (2026-07-19
+    # cluster-asymmetry hotfix: a lower-cluster hit discounts the rebate and
+    # pays its own widen instead of voiding it) — balancing flow, whose
+    # premium provably pays into every argmax state, is quoted TIGHTER to win
+    # its auctions. Composed total stays inside
     # [-(skew_max_tighten_cc+peak_tighten_max_cc),
     #  +(skew_max_widen_cc+peak_widen_max_cc)]. PRICING ONLY — no new caps, no
     # new skip reasons; any doubt (no profile / stale generation / unparseable
@@ -1844,11 +1857,14 @@ class SkewConfig(StrictModel):
     # ARG-champ+Messi cluster at ~60-80% of the top loss rode nearly free).
     # Up to ``peak_n_clusters`` DISTINCT loss levels are cached per game
     # (descending; a level qualifies at >= peak_cluster_min_frac x top loss),
-    # each as its FULL level set under the shared 4096-state cache cap
-    # (overflow drops the LOWEST clusters first; an uncached cluster is
-    # neutral — today's behaviour). Hitting ANY cached cluster widens, scaled
-    # by that cluster's loss relative to the top; the anti-peak rebate now
-    # certifies a provable miss of ALL cached clusters (strictly tighter).
+    # each as its FULL level set under the shared state-cache cap (131,072
+    # since the 2026-07-19 zero-rebate hotfix — the old 4096 overflowed on
+    # with-halves grids and the cascade silently disabled every rebate;
+    # overflow still drops the LOWEST clusters first and an uncached cluster
+    # is neutral). Hitting ANY cached cluster widens, scaled
+    # by that cluster's loss relative to the top; the anti-peak rebate
+    # certifies a provable miss of the FULL TOP cluster, discounted by
+    # (1 - hit_severity) for any lower cluster still reachable (2026-07-19).
     # ``peak_n_clusters: 1`` restores the single-plateau CLUSTER semantics
     # exactly (the cluster-view rollback knob; the 2026-07-19 magnitude
     # recalibration applies at every n). ``peak_cluster_min_frac`` is a

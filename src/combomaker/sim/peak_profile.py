@@ -46,9 +46,14 @@ top loss), each as its FULL level set, all under the SHARED
 ``_PLATEAU_CACHE_MAX_STATES`` cap (overflow drops the LOWEST clusters first —
 an uncached cluster is neutral, exactly today's behaviour). Hitting ANY cached
 cluster widens, scaled by that cluster's loss relative to the top; the rebate
-now certifies a provable miss of ALL cached clusters (strictly tighter).
-``n_clusters == 1`` restores the single-plateau CLUSTER semantics exactly
-(profile content + severity/rebate walks; the skew's 2026-07-19 magnitude
+certifies a provable miss of the FULL TOP cluster (the argmax level — the
+2026-07-18 certification, unchanged in strictness) and is DISCOUNTED by the
+severity the candidate can still reach (2026-07-19 cluster-asymmetry hotfix:
+hitting a lower cluster no longer voids the rebate, it scales it by
+(1 - hit_severity) while the hit pays its own widen — genuinely balancing
+flow, whose premium provably pays into every argmax state, now quotes
+tighter). ``n_clusters == 1`` restores the single-plateau CLUSTER semantics
+exactly (profile content + severity walk; the skew's 2026-07-19 magnitude
 recalibration applies at every n).
 
 SEMANTICS (inherited from ``state_worst_case``, committed-book subset):
@@ -126,14 +131,24 @@ _HALF_SPECS = (HalfResult, HalfDraw, HalfTotalOver, HalfBtts, HalfGoalSpread)
 # rebate certifies a miss of the FULL top-loss plateau (``PlateauSlice``); a
 # plateau larger than this is NOT cached and the rebate simply never fires for
 # that game (fail-safe NEUTRAL — never a rebate the quote path cannot afford
-# to verify). 4096 covers the branch-doubled knockout FT enumeration (1586)
-# with headroom; only half-aware grids or a degenerate constant-loss surface
-# (a fail-closed entity making every state tie) exceed it.
-# MULTI-CLUSTER (2026-07-19): this is now the SHARED budget across ALL cached
+# to verify).
+# MULTI-CLUSTER (2026-07-19): this is the SHARED budget across ALL cached
 # clusters of a game together — the top plateau plus every cached lower level
 # set. Overflow drops the LOWEST clusters first; an uncached cluster is
 # neutral (no widen from it, no rebate certification against it).
-_PLATEAU_CACHE_MAX_STATES = 4096
+# 2026-07-19 LIVE HOTFIX (zero-rebate tape diagnosis): 4096 covered the FT
+# enumerations (1586 branch-doubled) but NOT the with-halves grids the live
+# book actually runs on (ESPARG 47,593 states; FRAENG 95,186 — the book holds
+# KXWC1H* legs): a coarse top region ties across thousands of
+# (scoreline x half-split) cells, the plateau overflowed, and the overflow
+# CASCADE disabled BOTH the rebate certification and every lower cluster
+# (live tape: ``clusters: {}`` in all 5 snapshots, 0 rebates in 300 shadow
+# quotes while the K-sample widen kept working at exactly
+# 600 x severity x (top/budget)**2). 131_072 covers the branch-doubled halves
+# grid with headroom; the >cap fail-safe (neutral) remains for degenerate
+# surfaces. The certification walk only runs for candidates that already
+# missed the argmax K rows and is vectorised — measured cost in the tests.
+_PLATEAU_CACHE_MAX_STATES = 131_072
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,16 +296,24 @@ class PeakContainment:
     hit(cluster)`` folded with the K-row severity — so stacking a SECOND loss
     cluster (mutually exclusive from the argmax plateau, hence invisible to
     the K sample) is priced at that cluster's relative loss.
-    ``provably_misses_all`` (2026-07-18 verify fix) is True iff a structural
-    leg of the candidate provably MISSES in EVERY cached peak row AND in every
-    state of the FULL top-loss plateau (``GamePeakProfile.plateau_slices`` —
-    the entire argmax level, not the K sample) AND (2026-07-19, strictly
-    tighter) in every state of every CACHED lower cluster: the parlay is dead
-    everywhere the book bleeds — the flattening flow that earns the rebate. An
-    uncached plateau (too large) makes it False (neutral, never a rebate)."""
+    ``provably_misses_top`` (2026-07-19 cluster-asymmetry rebate, replacing
+    the all-clusters ``provably_misses_all``): True iff a structural leg of
+    the candidate provably MISSES in EVERY state of the FULL top-loss plateau
+    (``GamePeakProfile.plateau_slices`` — the entire argmax level, never the K
+    sample: the 2026-07-18 verify-fix certification is UNCHANGED in
+    strictness). THE INVARIANT: ``provably_misses_top`` implies the
+    candidate's parlay adds ZERO loss in every argmax state — its premium
+    arrives in exactly the states where the book bleeds worst. The skew turns
+    this into the balancing rebate, DISCOUNTED by ``hit_severity`` (the worst
+    cached loss the candidate can still reach): hitting a lower cluster no
+    longer voids the rebate (the old all-clusters rule graded the live
+    ESP-side balancing flow neutral), it scales it by (1 - hit_severity)
+    while the cluster hit pays its own widen. An uncached plateau (beyond the
+    shared state cap) makes it False (neutral, never a rebate the quote path
+    cannot verify)."""
 
     hit_severity: float
-    provably_misses_all: bool
+    provably_misses_top: bool
     n_states: int
 
 
@@ -665,13 +688,22 @@ def evaluate_peak_containment(
         # K row (the common stacker) pays zero extra cost here.
         # ``n_clusters == 1`` skips this block entirely — the single-plateau
         # legacy path, byte-identical.
+        # ONE shared full-plateau walk (2026-07-19 hotfix restructure) feeds
+        # BOTH the multi-cluster severity (a plateau hit is severity 1.0 at
+        # n_clusters >= 2) and the TOP-MISS certification below. Skipped
+        # entirely when an argmax K row already hit (severity == 1.0 — the
+        # common stacker pays zero extra cost); ``None`` = uncertifiable
+        # (plateau beyond the shared cap — fail-safe: no rebate, and at
+        # n_clusters == 1 severity stays the K-sample-only legacy read).
+        plateau_hit: bool | None = None
+        if gp.plateau_slices is not None:
+            if severity >= 1.0:
+                plateau_hit = True
+            else:
+                plateau_hit = _hits_any(gp.plateau_slices, struct, gp.params)
+        if plateau_hit is True and gp.n_clusters >= 2 and worst > 0:
+            severity = 1.0
         if gp.n_clusters >= 2 and worst > 0:
-            if (
-                severity < 1.0
-                and gp.plateau_slices is not None
-                and _hits_any(gp.plateau_slices, struct, gp.params)
-            ):
-                severity = 1.0
             for cluster in gp.lower_clusters:
                 if cluster.loss_cc <= 0:
                     break  # descending: nothing below carries a loss
@@ -681,39 +713,23 @@ def evaluate_peak_containment(
                 if _hits_any(cluster.slices, struct, gp.params):
                     severity = weight
 
-        # REBATE CERTIFICATION (2026-07-18 verify fix): ``provably_misses_all``
-        # must prove a miss of the ENTIRE top-loss plateau, not of the K
-        # sampled rows — on a loss plateau wider than K (one-way Advance book:
-        # ~793 identical-loss states, K rows all on its lowest-scoreline
-        # corner) a plateau-STACKING refinement (NO {ARG-adv & over 5.5})
-        # missed all K rows yet raised the certified worst case by its full
-        # premium. Certified against ``plateau_slices`` — the FULL argmax
-        # level; uncached (None ⇒ too large) ⇒ False (neutral, never a rebate
-        # the quote path can't verify). MULTI-CLUSTER (2026-07-19, strictly
-        # TIGHTER): the walk extends to every CACHED lower cluster's full
-        # level set — a candidate missing the top plateau but stacking a
-        # cached cluster B is cluster flow, not flattening flow, and earns no
-        # rebate. An UNCACHED (dropped) cluster is not certified against —
-        # same as the single-plateau ship (its fail-safe lands on the widen
-        # side: dropped ⇒ no widen from it). Evaluated ONLY when the candidate
-        # already missed every cached row (the rebate's only reachable path —
-        # ``_peak_component`` widens on any hit first), so the widen/stacker
-        # path pays zero extra cost.
-        misses_all = not any(hits)
-        if misses_all:
-            if gp.plateau_slices is None:
-                misses_all = False
-            else:
-                misses_all = not _hits_any(gp.plateau_slices, struct, gp.params)
-                if misses_all:
-                    for cluster in gp.lower_clusters:
-                        if _hits_any(cluster.slices, struct, gp.params):
-                            misses_all = False
-                            break
-
+        # TOP-MISS CERTIFICATION (2026-07-19 cluster-asymmetry rebate;
+        # operator directive — the zero-rebate live tape). The certification
+        # itself is UNCHANGED in strictness since the 2026-07-18 verify fix:
+        # a provable miss of the ENTIRE argmax level (``plateau_slices``,
+        # never the K sample; uncached ⇒ False ⇒ neutral). What changed is
+        # the TRIGGER: the old rule additionally demanded a provable miss of
+        # every cached row AND every lower cluster, which graded genuinely
+        # balancing flow (pays exactly when the top cluster pays) as neutral
+        # whenever it could reach ANY lower loss state. Now the top-miss
+        # certificate alone earns the rebate and ``hit_severity`` DISCOUNTS
+        # it in the skew (x (1 - severity)) while any lower-cluster hit keeps
+        # paying its own widen. INVARIANT (property-tested): a rebated
+        # candidate provably adds ZERO loss in every top-cluster (argmax)
+        # state.
         return PeakContainment(
             hit_severity=severity,
-            provably_misses_all=misses_all,
+            provably_misses_top=plateau_hit is False,
             n_states=len(losses),
         )
     except Exception:

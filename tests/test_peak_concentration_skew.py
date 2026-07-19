@@ -562,14 +562,20 @@ class TestPlateauRebateCertification:
             peak_profile=_PLATEAU_PROFILE_K5,
             peak_book_generation=7,
         )
-        rebated = any(row[3] == "peak_miss_rebate" for row in skew.peak_per_game)
+        # 2026-07-19 asymmetry hotfix: a rebate contribution now also rides
+        # peak_partial_offset rows (certified top-miss + reachable lower
+        # cluster) — the invariant covers BOTH.
+        rebated = any(
+            row[3] in ("peak_miss_rebate", "peak_partial_offset")
+            for row in skew.peak_per_game
+        ) or skew.peak_tighten_cc > 0
         if rebated:
             # The full profile caches EVERY enumerated state with its loss;
             # its severity is 1.0 iff the candidate can hit a state at the
             # top loss level. Rebate => severity < 1.0 there, i.e. the
             # candidate adds ZERO loss in every top-plateau state. (A
             # legitimate opposite-outcome hedge still HITS the book's
-            # negative-loss states, so full-cache misses_all is NOT the
+            # negative-loss states, so a full-cache all-miss is NOT the
             # oracle — the top-level severity is.)
             full = evaluate_peak_containment(
                 _PLATEAU_PROFILE_FULL, GAME_B, list(candidate.legs)
@@ -1097,7 +1103,7 @@ class TestProfileBuilder:
         hit = evaluate_peak_containment(profile, GAME, list(STACK_LEGS))
         assert hit is not None and hit.hit_severity == 1.0
         miss = evaluate_peak_containment(profile, GAME, list(ANTI_LEGS))
-        assert miss is not None and miss.provably_misses_all
+        assert miss is not None and miss.provably_misses_top
         assert evaluate_peak_containment(profile, "NOPE", list(STACK_LEGS)) is None
 
 
@@ -1175,16 +1181,20 @@ class TestMultiClusterLiveShape:
         assert gp.n_clusters == 3
         assert [c.loss_cc for c in gp.lower_clusters] == [460_000]
         # Shared cap accounting: plateau + cluster states all cached.
-        assert gp.n_plateau_states + gp.n_lower_cluster_states <= 4096
+        cap = peak_profile_mod._PLATEAU_CACHE_MAX_STATES
+        assert gp.n_plateau_states + gp.n_lower_cluster_states <= cap
         assert gp.n_lower_cluster_states > 0
 
     def test_b_stacker_widened_at_cluster_loss_ratio(self) -> None:
-        # EXACT ARITHMETIC (2026-07-19 recalibration — no candidate-size
-        # factor): budget $95 -> peak_ratio 760k/950k = 0.8; gamma 2.
-        #   A-stacker: severity 1.0     -> 600 x 1.0   x 0.64 = 384cc
-        #   B-stacker: severity 23/38   -> 600 x 23/38 x 0.64 = 232.42 -> 232cc
-        # i.e. the B-widen is ~0.6053 x the A-widen (the cluster loss ratio),
-        # and BOTH are real cents now (~3.8c / ~2.3c at ratio 0.8).
+        # EXACT ARITHMETIC (2026-07-19 recalibration + asymmetry hotfix):
+        # budget $95 -> peak_ratio 760k/950k = 0.8; gamma 2.
+        #   A-stacker: severity 1.0   -> widen 600 x 1.0   x 0.64 = 384cc
+        #   B-stacker: severity 23/38 -> widen 600 x 23/38 x 0.64 = 232cc,
+        #     MINUS the certified-top-miss rebate (B provably misses every A
+        #     state) 150 x 0.8 x (1 - 23/38) = 47cc -> NET +185cc
+        #     ("peak_partial_offset": B-flow stacks B but pays into A).
+        # The cluster loss ratio still governs the WIDEN half (232 = 0.605 x
+        # 384), and both halves are real cents.
         book = two_cluster_book()
         profile = profile_for(book)
         a_st = no_position("ca", STACK_LEGS, contracts=1_000, entry_price=7_600)
@@ -1193,14 +1203,16 @@ class TestMultiClusterLiveShape:
         s_b = skew_for(b_st, book, profile=profile, limits=LIMITS_95)
         assert s_a.peak_cc == 384
         assert s_a.peak_per_game == ((GAME, 384, 1.0, "peak_hit"),)
-        assert s_b.peak_cc == 232
-        assert s_b.peak_per_game == ((GAME, 232, 0.605263, "peak_hit"),)
+        assert s_b.peak_widen_cc == 232 and s_b.peak_tighten_cc == 47
+        assert s_b.peak_cc == 185
+        assert s_b.peak_per_game == ((GAME, 185, 0.605263, "peak_partial_offset"),)
         # Additive composition with the directional classifier is untouched.
         base_b = skew_for(b_st, book, profile=None, limits=LIMITS_95)
         assert s_b.skew_cc == base_b.skew_cc + s_b.peak_cc
         # Containment severity is EXACTLY the cluster loss ratio.
         c = evaluate_peak_containment(profile, GAME, list(B_LEGS))
         assert c is not None and c.hit_severity == 460_000 / 760_000
+        assert c.provably_misses_top  # dead in every argmax state
 
     def test_b_stacker_with_nonstructural_prop_rider_same_widen(self) -> None:
         # The live ladder carries a player-prop rider (Messi analog): a
@@ -1219,7 +1231,7 @@ class TestMultiClusterLiveShape:
                 entry_price=7_600,
             )
             s = skew_for(b_prop, book, profile=profile, limits=LIMITS_95)
-            assert s.peak_cc == 232
+            assert s.peak_cc == 185  # same NET as the pure B-stacker
 
     def test_prefix_n1_b_stacker_rode_free_and_collected_rebate(self) -> None:
         # THE REGRESSION PIN (peak_n_clusters=1 == the single-plateau cluster
@@ -1227,7 +1239,7 @@ class TestMultiClusterLiveShape:
         # whole A plateau (mutually exclusive branch), so it not only paid no
         # widen — it collected the anti-peak rebate (recalibrated magnitude:
         # 150 x peak_ratio 0.8 = 120cc BACK). Multi-cluster (n=3) flips the
-        # same candidate to a +232cc widen — the live fix.
+        # same candidate to a +185cc net widen — the live fix.
         book = two_cluster_book()
         legacy = profile_for(book, n_clusters=1)
         assert legacy.by_game[GAME].lower_clusters == ()
@@ -1238,49 +1250,62 @@ class TestMultiClusterLiveShape:
 
     def test_three_cluster_severity_ladder(self) -> None:
         # Three clusters price at their exact loss ratios (budget $80 ->
-        # ratio 640k/800k = 0.8, ratio**2 = 0.64; gamma 2):
-        #   A: 600 x 1.0     x 0.64 = 384;  B: 600 x 0.53125 x 0.64 = 204
-        #   C: 600 x 0.375   x 0.64 = 144
+        # ratio 640k/800k = 0.8, ratio**2 = 0.64; gamma 2). Widen halves:
+        #   A: 600 x 1.0 x 0.64 = 384; B: 600 x 0.53125 x 0.64 = 204;
+        #   C: 600 x 0.375 x 0.64 = 144.
+        # B and C provably miss the top cluster, so the asymmetry rebate nets
+        # against them: B 204 - 120 x (1-0.53125) = 204 - 56 = 148;
+        # C 144 - 120 x (1-0.375) = 144 - 75 = 69. A hits the top: no rebate.
         book = three_cluster_book()
         profile = profile_for(book)
         gp = profile.by_game[GAME]
         assert gp.top_loss_cc == 640_000
         assert [c.loss_cc for c in gp.lower_clusters] == [340_000, 240_000]
-        expected = {"A": (STACK_LEGS, 384), "B": (B_LEGS, 204), "C": (UNDER_LEGS, 144)}
-        for _name, (legs, cc) in expected.items():
+        expected = {
+            "A": (STACK_LEGS, 384, "peak_hit"),
+            "B": (B_LEGS, 148, "peak_partial_offset"),
+            "C": (UNDER_LEGS, 69, "peak_partial_offset"),
+        }
+        for _name, (legs, cc, reason) in expected.items():
             cand = no_position("c", legs, contracts=2_000, entry_price=6_400)
             s = skew_for(cand, book, profile=profile, limits=LIMITS_80)
             assert s.peak_cc == cc
-            assert [row[3] for row in s.peak_per_game] == ["peak_hit"]
+            assert [row[3] for row in s.peak_per_game] == [reason]
 
 
 # ---------------------------------------------------------------------------
-# (M2) REBATE: missing A but hitting B => NO rebate (pre-fix it rebated);
-# provably missing A AND B => rebate survives (strictly tighter cert).
+# (M2) REBATE (2026-07-19 asymmetry hotfix): missing A but hitting B => the
+# certified top-miss rebate DISCOUNTED by (1 - severity), netted against B's
+# widen (never a free ride, never a full rebate); provably missing A AND B =>
+# the full rebate.
 # ---------------------------------------------------------------------------
 
 
 class TestMultiClusterRebate:
-    def test_miss_a_hit_b_gets_no_rebate(self) -> None:
+    def test_miss_a_hit_b_partial_offset(self) -> None:
         book = two_cluster_book()
         profile = profile_for(book)
         b_st = no_position("cb", B_LEGS, contracts=1_000, entry_price=7_600)
         s = skew_for(b_st, book, profile=profile, limits=LIMITS_95)
-        assert s.peak_tighten_cc == 0                      # the new no-rebate
-        assert s.peak_cc > 0                               # it is cluster flow
+        # Asymmetry hotfix: the certified top-miss earns the discounted
+        # rebate half (47cc) but the B hit's widen half (232cc) dominates —
+        # NET widen, never a net rebate for cluster-stacking flow.
+        assert s.peak_tighten_cc == 47
+        assert s.peak_widen_cc == 232
+        assert s.peak_cc == 185 > 0
         c = evaluate_peak_containment(profile, GAME, list(B_LEGS))
-        assert c is not None and not c.provably_misses_all
-        # Pre-fix pin: n_clusters=1 granted the rebate to the same candidate
-        # (recalibrated magnitude: 150 x 0.8 = 120cc).
+        assert c is not None and c.provably_misses_top
+        # Pre-fix pin: n_clusters=1 granted the FULL rebate to the same
+        # candidate (recalibrated magnitude: 150 x 0.8 = 120cc).
         legacy = profile_for(book, n_clusters=1)
         s1 = skew_for(b_st, book, profile=legacy, limits=LIMITS_95)
         assert s1.peak_tighten_cc > 0 and s1.peak_cc == -120
 
-    def test_miss_a_and_b_still_rebates(self) -> None:
-        # {FRA & under 2.5} provably misses EVERY A state (all over) and EVERY
-        # B state (all ESP-win): genuine flattening flow keeps the rebate
-        # under the all-clusters certification — recalibrated to real cents:
-        # 150 x peak_ratio 0.8 = 120cc (~1.2c tighter, wins its auction).
+    def test_miss_a_and_b_full_rebate(self) -> None:
+        # {FRA & under 2.5} provably misses EVERY A state (all over) and hits
+        # no cached loss state (severity 0): genuine flattening flow earns the
+        # UNDISCOUNTED rebate: 150 x peak_ratio 0.8 x (1 - 0) = 120cc
+        # (~1.2c tighter, wins its auction).
         book = two_cluster_book()
         profile = profile_for(book)
         flat = no_position("cf", UNDER_LEGS, contracts=1_000, entry_price=7_600)
@@ -1288,7 +1313,7 @@ class TestMultiClusterRebate:
         assert s.peak_cc == -120
         assert s.peak_per_game == ((GAME, -120, 0.8, "peak_miss_rebate"),)
         c = evaluate_peak_containment(profile, GAME, list(UNDER_LEGS))
-        assert c is not None and c.provably_misses_all and c.hit_severity == 0.0
+        assert c is not None and c.provably_misses_top and c.hit_severity == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -1412,9 +1437,10 @@ class TestClusterStateCapOverflow:
         s = skew_for(c_st, book, profile=profile, limits=LIMITS_80)
         assert s.peak_cc == -120  # same as n_clusters=1 (uncached = neutral C)
         assert [row[3] for row in s.peak_per_game] == ["peak_miss_rebate"]
-        # B (the higher cluster) kept its widen (600 x 0.53125 x 0.64 = 204).
+        # B (the higher cluster) kept its widen (600 x 0.53125 x 0.64 = 204)
+        # net of the certified top-miss discount (120 x (1-0.53125) = 56).
         b_st = no_position("cb", B_LEGS, contracts=2_000, entry_price=6_400)
-        assert skew_for(b_st, book, profile=profile, limits=LIMITS_80).peak_cc == 204
+        assert skew_for(b_st, book, profile=profile, limits=LIMITS_80).peak_cc == 148
 
     def test_overflow_cascades_lowest_first_never_skips(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1559,3 +1585,141 @@ class TestPerQuoteCost:
         )
         assert eval_ms < 1.0  # per-quote budget: well under 1ms
         assert skew_ms < 2.0  # generous CI bound; report the printed number
+
+
+# ---------------------------------------------------------------------------
+# (M7) 2026-07-19 ZERO-REBATE LIVE HOTFIX. Diagnosis (live tape
+# live_20260719_steer_recal.log): the committed book holds KXWC1H* legs, so
+# the profile enumerates the WITH-HALVES grid (~47k states/branch); a coarse
+# top region ties across thousands of (scoreline x half-split) cells, the
+# argmax plateau exceeded the old 4096-state cap, and the overflow CASCADE
+# silently disabled BOTH the rebate certification and every lower cluster
+# (`clusters: {}` in all snapshots; 0 rebates in 300 shadow quotes while the
+# K-sample widen kept working). Fix 1: cap -> 131,072 (covers halves grids).
+# Fix 2 (operator directive): the CLUSTER-ASYMMETRY rebate — a certified miss
+# of the FULL top cluster earns tighten_max x ratio x (1 - hit_severity),
+# netted against any lower-cluster widen. INVARIANT: rebate > 0 implies the
+# candidate provably adds ZERO loss in every argmax state.
+# ---------------------------------------------------------------------------
+
+
+def halves_live_shape_book() -> list[OpenPosition]:
+    """The live failure shape in the module's FRA/ESP frame: a one-way pile
+    on {ESP wins} plus a 1H leg — the 1H leg upgrades the enumeration to the
+    with-halves grid, and the top level (ESP-win AND 1H total >= 1) ties
+    across thousands of (scoreline x half-split) cells (> the old 4096 cap on
+    the ``_CFG_HOT`` grid). ESP here plays the live ARG-champ role;
+    {FRA & under} plays the live ESP-quiet balancing role."""
+    return [
+        no_position(
+            "esp", (LegRef(ESP_ML, ML_EV, "yes"),), contracts=10_000, entry_price=7_000
+        ),
+        no_position(
+            "h1", (LegRef(H1TOT1, H1_EV, "yes"),), contracts=5_000, entry_price=6_000
+        ),
+    ]
+
+
+# Grid sized so the fixture's argmax level set exceeds the OLD 4096 cap
+# (measured: plateau 6,475 of 92,520 enumerated states at max_goals=14) while
+# staying comfortably under the new 131,072 shared cap — the live-shape
+# reproduction knob, not a live config value.
+_CFG_HOT = StructuralConfigView(max_goals=14)
+
+
+def _hot_profile(book: list[OpenPosition], *, k: int = 5) -> PeakProfile:
+    return build_peak_profile(book, MARGINALS, None, _CFG_HOT, k=k, input_generation=7)
+
+
+class TestZeroRebateLiveHotfix:
+    def test_halves_plateau_exceeds_old_cap_and_now_caches(self) -> None:
+        book = halves_live_shape_book()
+        profile = _hot_profile(book)
+        gp = profile.by_game[GAME]
+        assert gp.params.with_halves            # the live grid
+        assert gp.n_states_enumerated > 10_000  # halves enumeration
+        assert gp.plateau_slices is not None    # cached under the NEW cap...
+        assert gp.n_plateau_states > 4_096      # ...but IMPOSSIBLE under the old
+
+    def test_old_cap_reproduces_the_live_zero_rebate_bug(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Under the pre-hotfix 4096 cap the plateau overflows: clusters {}
+        # (the live snapshot signature) and the balancing candidate grades
+        # NEUTRAL — the exact live tape (0 rebates in 300).
+        monkeypatch.setattr(peak_profile_mod, "_PLATEAU_CACHE_MAX_STATES", 4_096)
+        book = halves_live_shape_book()
+        profile = _hot_profile(book)
+        gp = profile.by_game[GAME]
+        assert gp.plateau_slices is None and gp.lower_clusters == ()
+        balancer = no_position("cf", UNDER_LEGS, contracts=1_000)
+        s = skew_for(balancer, book, profile=profile, limits=limits_with_budget(100.0))
+        assert s.peak_cc == 0 and s.peak_tighten_cc == 0    # the live bug
+
+    def test_balancing_candidate_rebate_fires_on_live_shape(self) -> None:
+        # Mandated (1): the pure-structural balancing shape ({FRA & under} —
+        # the live ESP-quiet/TIE+under/ARG-blank analog) now certifies the
+        # top-cluster miss on the halves grid and earns the FULL rebate
+        # 150 x peak_ratio (severity 0). Exact value pinned from the book's
+        # own top loss vs a $100 budget.
+        book = halves_live_shape_book()
+        profile = _hot_profile(book)
+        gp = profile.by_game[GAME]
+        limits = limits_with_budget(100.0)
+        ratio = min(1.0, gp.top_loss_cc / 1_000_000.0)
+        assert 0.0 < ratio <= 1.0
+        balancer = no_position("cf", UNDER_LEGS, contracts=1_000)
+        s = skew_for(balancer, book, profile=profile, limits=limits)
+        assert s.peak_cc == -round(150 * ratio)
+        assert [row[3] for row in s.peak_per_game] == ["peak_miss_rebate"]
+        c = evaluate_peak_containment(profile, GAME, list(UNDER_LEGS))
+        assert c is not None and c.provably_misses_top and c.hit_severity == 0.0
+        # INVARIANT (mandated (4), direct form): the rebated candidate can
+        # hit NO top-level state — asserted against the full enumeration.
+        full = _hot_profile(book, k=10**9)
+        oracle = evaluate_peak_containment(full, GAME, list(UNDER_LEGS))
+        assert oracle is not None and oracle.hit_severity < 1.0
+
+    def test_nonstructural_candidate_still_neutral(self) -> None:
+        # Mandated (2): corners/scorer-style non-structural legs stay
+        # ADVERSARIAL — no certificate, no rebate, neutral (correct).
+        book = halves_live_shape_book()
+        profile = _hot_profile(book)
+        corners = no_position("cc", (LegRef(CORN, CORN_EV, "yes"),), contracts=1_000)
+        s = skew_for(corners, book, profile=profile, limits=limits_with_budget(100.0))
+        assert s.peak_cc == 0 and s.peak_tighten_cc == 0
+        assert [row[3] for row in s.peak_per_game] == ["unknown"]
+
+    def test_top_cluster_stacker_still_widened(self) -> None:
+        # Mandated (3): the top-cluster stacker ({ESP} + the 1H leg) keeps
+        # its severity-1.0 widen and never a rebate.
+        book = halves_live_shape_book()
+        profile = _hot_profile(book)
+        stacker = no_position(
+            "cs",
+            (LegRef(ESP_ML, ML_EV, "yes"), LegRef(H1TOT1, H1_EV, "yes")),
+            contracts=1_000,
+        )
+        s = skew_for(stacker, book, profile=profile, limits=limits_with_budget(100.0))
+        assert s.peak_cc > 0 and s.peak_tighten_cc == 0
+        assert [row[3] for row in s.peak_per_game] == ["peak_hit"]
+
+    def test_certification_walk_cost_on_halves_grid(self) -> None:
+        # The expensive new path: full-plateau certification over the halves
+        # grid (thousands of cached states). Measure and report.
+        book = halves_live_shape_book()
+        profile = _hot_profile(book)
+        gp = profile.by_game[GAME]
+        balancer = list(UNDER_LEGS)
+        assert evaluate_peak_containment(profile, GAME, balancer) is not None
+        n = 100
+        t0 = time.perf_counter()
+        for _ in range(n):
+            evaluate_peak_containment(profile, GAME, balancer)
+        ms = (time.perf_counter() - t0) * 1_000.0 / n
+        print(
+            f"\n[hotfix cost] certification walk over {gp.n_plateau_states} "
+            f"plateau + {gp.n_lower_cluster_states} cluster states "
+            f"(halves grid {gp.n_states_enumerated}): {ms:.4f} ms/call"
+        )
+        assert ms < 5.0  # rare path (only for candidates missing all K rows)

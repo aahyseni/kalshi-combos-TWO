@@ -224,10 +224,12 @@ class InventorySkew:
     # ``peak_tighten_cc`` are the pre-clamp non-negative halves;
     # ``peak_per_game`` is the debug-level explanation: one
     # ``(game, adder_cc, factor, reason)`` row per candidate game — ``factor``
-    # is the hit_severity on peak_hit rows and the peak_ratio on
-    # peak_miss_rebate rows (2026-07-19 magnitude recalibration: the
-    # candidate-size factor is gone). Reasons:
-    # peak_hit / peak_miss_rebate / no_peak_profile / peak_not_a_loss /
+    # is the hit_severity on peak_hit/peak_partial_offset rows and the
+    # peak_ratio on peak_miss_rebate rows (2026-07-19 magnitude recalibration:
+    # the candidate-size factor is gone). Reasons:
+    # peak_hit / peak_miss_rebate / peak_partial_offset (certified top-miss
+    # with a reachable lower cluster — NET adder, 2026-07-19 asymmetry
+    # hotfix) / no_peak_profile / peak_not_a_loss /
     # unknown / neutral, plus the global stale_profile / disabled sentinels.
     peak_cc: int = 0
     peak_widen_cc: int = 0
@@ -349,11 +351,14 @@ def compute_inventory_skew(
     FULL argmax level cached in the profile, never just the K sampled rows
     (2026-07-18 verify fix: on a plateau wider than K a plateau-stacking
     refinement missed all K rows and pocketed the rebate while raising the
-    certified worst case) — AND every CACHED lower cluster's level set
-    (2026-07-19, strictly tighter) contributes
-    ``- peak_tighten_max_cc x peak_ratio`` (the
-    linear rebate for distribution-flattening flow — its premium pays into our
-    loss states, so we quote TIGHTER to win those auctions; an
+    certified worst case) — contributes
+    ``- peak_tighten_max_cc x peak_ratio x (1 - hit_severity)`` (2026-07-19
+    cluster-asymmetry hotfix: the certified top-miss ALONE triggers the
+    rebate — the old all-clusters trigger graded genuinely balancing flow
+    neutral whenever it could reach any lower loss state; a lower-cluster hit
+    now discounts the rebate via (1 - severity) AND pays its own widen, so
+    both halves can fire on one candidate. Its premium provably pays into
+    every argmax state, so we quote TIGHTER to win those auctions; an
     uncached/oversized plateau ⇒ no rebate, neutral).
     Summed over the candidate's games, then clamped to
     [-peak_tighten_max_cc, +peak_widen_max_cc] and ADDED to the independently
@@ -593,20 +598,44 @@ def _peak_component(
         if containment is None:
             rows.append((game, 0, 0.0, "unknown"))
             continue
-        if containment.hit_severity > 0.0:
-            severity = containment.hit_severity
+        # CLUSTER-ASYMMETRY composition (2026-07-19 hotfix, operator
+        # directive — the zero-rebate live tape): the widen prices WHAT the
+        # candidate can still hit (severity x ratio**gamma); the rebate
+        # prices the CERTIFIED top-cluster miss (its premium provably pays
+        # into every argmax state — the invariant on PeakContainment),
+        # discounted by the severity it can still reach:
+        #     tighten_max x peak_ratio x (1 - hit_severity).
+        # BOTH can fire on one candidate (miss-top-hit-lower-cluster flow):
+        # the halves accumulate separately (peak_widen_cc / peak_tighten_cc
+        # stay the honest non-negative decomposition) and the per-game row
+        # carries the NET adder with reason "peak_partial_offset".
+        severity = containment.hit_severity
+        term = 0.0
+        if severity > 0.0:
             term = params.peak_widen_max_cc * severity * (peak_ratio**params.gamma)
             widen += term
-            rows.append((game, int(round(term)), round(severity, 6), "peak_hit"))
-        elif containment.provably_misses_all:
-            rebate = params.peak_tighten_max_cc * peak_ratio
+        rebate = 0.0
+        if containment.provably_misses_top:
+            rebate = params.peak_tighten_max_cc * peak_ratio * (1.0 - severity)
             tighten += rebate
+        if severity > 0.0 and containment.provably_misses_top:
+            rows.append(
+                (
+                    game,
+                    int(round(term)) - int(round(rebate)),
+                    round(severity, 6),
+                    "peak_partial_offset",
+                )
+            )
+        elif severity > 0.0:
+            rows.append((game, int(round(term)), round(severity, 6), "peak_hit"))
+        elif containment.provably_misses_top:
             rows.append(
                 (game, -int(round(rebate)), round(peak_ratio, 6), "peak_miss_rebate")
             )
         else:
-            # Hits only non-loss peak rows (possible when K exceeds the number
-            # of loss-carrying states): neither stacking nor flattening.
+            # Hits only non-loss peak rows / no certificate: neither stacking
+            # nor certified flattening.
             rows.append((game, 0, 0.0, "neutral"))
     widen_cc = int(round(widen))
     tighten_cc = int(round(tighten))

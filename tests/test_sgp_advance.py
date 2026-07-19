@@ -70,9 +70,13 @@ def test_advance_btts_is_negative_not_positive_fallback() -> None:
 
 
 def test_advance_scorer_same_team_positive() -> None:
-    # scorer plays for the advancing team → his goals push them through
+    # scorer plays for the advancing team → his goals push them through.
+    # 0.45 → 0.52 promoted 2026-07-19 (operator-approved rule-8b measurement:
+    # advance AND scorer props both settle incl ET, so the regulation
+    # ml|player_goal attenuation does not apply; DC-identified conditional
+    # ~54% — docs/reports/2026-07-19-argmessi-fair-vs-field.md).
     r = _rho(f"KXWCADVANCE-{_G}-FRA", f"KXWCGOAL-{_G}-FRAKMBAPP10-1")
-    assert abs(r - 0.45) < 1e-9
+    assert abs(r - 0.52) < 1e-9
 
 
 def test_advance_scorer_opponent_flips_sign() -> None:
