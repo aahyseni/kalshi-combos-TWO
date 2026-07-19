@@ -164,16 +164,60 @@ False, real sampler surfaces the set). Suites: settled file **25/25**,
 breakers/quote_app/lifecycle/book-risk **173/173**, FULL suite
 **2454 passed** (2446 + 8), 3 deselected. ruff + mypy --strict clean.
 
+---
+
+## ADDENDUM 2 (relight2, 02:40–02:57Z): registration stall — batch registrar + never-fetched priority + pending observability
+
+Relight2 evidence (`live_20260719_relight2.log`): only THREE
+`settled_marginal_resolved` (BTTS, TOTAL-3, TOTAL-4, all 02:40:19–20) in 25
+minutes; **42,377 `book_risk_unusable` audits to log end**; zero
+`settled_fetch_failed`. Direct exchange probe (this session): **every FRAENG
+leg market was `finalized` HOURS earlier** (1H legs 21:55Z, TOTAL-1..6
+21:24–22:34Z, ADVANCE/SPREAD 23:04–23:05Z, Mbappé GOAL 23:16Z) — the facts sat
+graded on the exchange while the bot stayed dark. Champion legs
+(`KXMENWORLDCUP-26-AR/-ES`) are genuinely `active` until Sunday.
+
+**Root cause (proven by offline repro + tape):** the resolver's fetch loop is
+CORRECT — replaying the exact live book shape with FULL registration resolves
+every graded leg in ≤3 passes (budget 5). The stall was REGISTRATION: it rode
+the serial marginal-provider walks, and in the live process only the first
+~5 walk-order tickers ever entered the fetch queue (the exact trio+2 pattern
+in the tape: 3 graded resolved, 2 active legs silently dropped by the
+live-status branch). Every later leg — including 9+ already-graded FRAENG
+facts — waited on a serial walk that sat stuck behind UNGRADED/active
+blockers (`_refresh_daily_pnl` returns at the FIRST unmarkable leg; the
+live-pop cycle was silent, so the operator was blind to it).
+
+| item | desc | status |
+|------|------|--------|
+| `rfq/lifecycle.py _register_settled_candidates` | BATCH registrar on EVERY maintenance tick: every committed leg with a dark feed book and no fact registers at once — startup, every position-generation change, continuous self-heal; never gated on any serial walk (provider-walk noting stays as belt-and-braces) | SHIPPED |
+| `marketdata/settled.py resolve_pending` | per-pass PRIORITY: never-fetched tickers beat backoff retries for the budget (stable sort — insertion order within tiers), so a freshly-registered graded fact lands within ~2 passes no matter how many ungraded tickers cycle; attempts counter dropped with the pending entry | SHIPPED |
+| `marketdata/settled.py` observability | INFO `settled_resolution_pending {n_pending, n_never_fetched, sample}` once per pass over a non-empty pending set — the line that would have answered relight2 instantly | SHIPPED |
+
+Verification: offline repro (live book shape, 16 tickers, graded+active mix)
+resolves ALL graded in 3 passes; 4 new tests — batch registrar registers all
+10 dark legs in one call; never-fetched priority (5 new beat 6 due retries,
+fetch order pinned); the full relight2 shape e2e through `maintenance_tick`
+(9 positions, ungraded-first leg order → all 9 graded facts within TWO
+passes, blocker stays pending, snapshot unusable while it blocks
+[fail-closed pinned], flips usable + `es_99==0`/`p_profit==1` the pass after
+the exchange grades it); the pending log line emitted with counts + sample.
+Suites: settled file **29/29**, related **183/183**, FULL **2458 passed**
+(2454 + 4), 3 deselected. ruff + mypy --strict clean.
+
 ## NEXT STEPS
 
-- **Operator**: relight again — this was the last consumer of the settled
-  transition (audit table above is exhaustive over the marginal readers).
-  Watch order in the log: `settled_marginal_resolved` → `book_risk_snapshot`
-  usable → NO `circuit_breaker_transient_holding` with
-  `reason=halt_marginal_jump` on FRAENG legs.
-- **Operator decision owed**: none — no new knobs; the exemption rides the
-  existing `risk.settled_marginal_resolution` (False ⇒ no resolver ⇒ breaker
-  keeps the full pre-fix watch everywhere).
+- **Operator**: relight. Watch order: `settled_resolution_pending` (the full
+  pending set is now visible immediately — expect the remaining FRAENG legs +
+  the active ESPARG/champion legs in the sample) → a burst of
+  `settled_marginal_resolved` within ~2 passes (seconds) →
+  `book_risk_snapshot` usable → quotes; and still NO `halt_marginal_jump`
+  holds on settled legs (Addendum 1). Live/champion legs keep cycling
+  silently on the 30s backoff until their books subscribe — expected, and now
+  visible in the pending line's counts.
+- **Operator decision owed**: none — no new knobs; everything rides
+  `risk.settled_marginal_resolution` (False ⇒ no resolver ⇒ pre-fix
+  behaviour everywhere).
 - **Next session**: after the Sunday final settles, confirm the settlement
   poller's combo reconcile agreed to the cent with the resolver's cached leg
   facts (both grading orders exercised live); close the `_metadata_changes`

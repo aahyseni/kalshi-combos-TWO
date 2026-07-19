@@ -843,3 +843,175 @@ class TestSettledWatchExemptWiring:
         )
         assert inputs.settled_tickers == frozenset({FRA_WIN, FRAENG_O5})
         assert inputs.marginals == {FRA_WIN: 1.0, FRAENG_O5: 0.0, "M1": 0.35}
+
+
+# --------------------------------------------------------------------------- #
+# RELIGHT2 STALL (2026-07-19 02:40Z, live_20260719_relight2.log): only 3 of    #
+# ~12 graded, exchange-finalized FRAENG facts ever resolved in 25 minutes —    #
+# registration rode the serial provider walks (one blocker-gated leg at a      #
+# time) instead of a batch, so graded facts sat unfetched behind UNGRADED/     #
+# active blockers. Fixes pinned here: (1) BATCH registration of every dark     #
+# committed leg on every maintenance tick; (2) never-fetched priority over     #
+# backoff retries in the per-pass budget; (4) the settled_resolution_pending   #
+# observability line.                                                          #
+# --------------------------------------------------------------------------- #
+
+
+UNGRADED_BLOCKER = "KXWCTOTAL-26JUL18FRAENG-6"  # closed, not yet graded
+
+
+def _graded_ticker(i: int) -> str:
+    return f"KXWCGRD-26JUL18FRAENG-{i}"
+
+
+class TestBatchRegistrationAndPriority:
+    def test_batch_registrar_registers_all_dark_legs_at_once(
+        self, harness: tuple[Harness, Store]
+    ) -> None:
+        # Requirement 1: EVERY committed leg with no feed book registers
+        # IMMEDIATELY — one call, no serial-walk gating, blockers irrelevant.
+        h, store = harness
+        settled = _resolver(FakeMarketSource(), h.clock)
+        lifecycle, _sender, exposure = _build(
+            h, store, bankroll_cc=10**11, settled=settled
+        )
+        for i in range(9):
+            exposure.add_position(
+                OpenPosition(
+                    position_id=f"p{i}",
+                    combo_ticker=f"COMBO-p{i}",
+                    collection=None,
+                    our_side=Side.NO,
+                    contracts=CentiContracts(100),
+                    entry_price_cc=CentiCents(5_000),
+                    legs=(
+                        # The UNGRADED blocker deliberately FIRST in leg order
+                        # (the serial-walk stall shape).
+                        LegRef(UNGRADED_BLOCKER, FRAENG_EVENT, "yes"),
+                        LegRef(_graded_ticker(i), FRAENG_EVENT, "yes"),
+                        LegRef("M1", "E1", "no"),
+                    ),
+                )
+            )
+        lifecycle._register_settled_candidates()  # noqa: SLF001 — the registrar
+        pending = set(settled._pending)  # noqa: SLF001 — queue seam
+        expected = {UNGRADED_BLOCKER} | {_graded_ticker(i) for i in range(9)}
+        assert pending == expected  # all 10 dark legs, one call; M1 (live) not
+
+    async def test_never_fetched_priority_over_backoff_retries(self) -> None:
+        # Requirement 2: freshly-registered tickers beat backoff retries for
+        # the per-pass budget — a graded fact lands within ~2 passes of
+        # registration no matter how many ungraded tickers are cycling.
+        source = FakeMarketSource()
+        clock = FakeClock()
+        cycling = [f"CYC-{i}" for i in range(6)]
+        for t in cycling:
+            source.payloads[t] = market_payload(t, status="closed", result="")
+        r = _resolver(source, clock, retry_after_s=30.0, fetch_budget_per_pass=5)
+        for t in cycling:
+            r.note_missing(t)
+        await r.resolve_pending()  # 5 fetched, on backoff
+        await r.resolve_pending()  # 6th fetched
+        clock.advance(31.0)  # every cycling ticker is now a DUE RETRY
+        source.calls.clear()
+        graded = [f"NEW-{i}" for i in range(5)]
+        for t in graded:
+            source.payloads[t] = market_payload(t, status="finalized", result="yes")
+            r.note_missing(t)
+        # One pass: the budget must go to the 5 NEVER-FETCHED tickers, not the
+        # 6 due retries that were registered (and inserted) earlier.
+        assert await r.resolve_pending() == 5
+        assert source.calls == graded
+        for t in graded:
+            assert r.resolved(t) == 1.0
+
+    async def test_relight2_shape_graded_resolve_within_two_passes(
+        self, harness: tuple[Harness, Store]
+    ) -> None:
+        # Requirement 3, end to end through the REAL maintenance path: a
+        # 9-position book, every position ordering an UNGRADED leg before a
+        # GRADED one. All 9 graded facts must land within TWO resolve passes;
+        # the ungraded blocker stays pending; the snapshot stays UNUSABLE
+        # while it blocks (fail-closed unchanged) and flips USABLE as soon as
+        # the exchange grades it.
+        h, store = harness
+        source = FakeMarketSource()
+        source.payloads[UNGRADED_BLOCKER] = market_payload(
+            UNGRADED_BLOCKER, status="closed", result=""
+        )
+        for i in range(9):
+            source.payloads[_graded_ticker(i)] = market_payload(
+                _graded_ticker(i), status="finalized", result="yes"
+            )
+        settled = _resolver(source, h.clock)
+        lifecycle, _sender, exposure = _build(
+            h, store, bankroll_cc=10**11, settled=settled
+        )
+        for i in range(9):
+            exposure.add_position(
+                OpenPosition(
+                    position_id=f"p{i}",
+                    combo_ticker=f"COMBO-p{i}",
+                    collection=None,
+                    our_side=Side.NO,
+                    contracts=CentiContracts(100),
+                    entry_price_cc=CentiCents(5_000),
+                    legs=(
+                        LegRef(UNGRADED_BLOCKER, FRAENG_EVENT, "yes"),
+                        LegRef(_graded_ticker(i), FRAENG_EVENT, "yes"),
+                        LegRef("M1", "E1", "no"),
+                    ),
+                )
+            )
+        # TWO maintenance ticks = two bounded fetch passes (budget 5 each).
+        for _ in range(2):
+            await lifecycle.maintenance_tick()
+            task = lifecycle._settled_task  # noqa: SLF001
+            assert task is not None
+            await task
+        for i in range(9):
+            assert settled.resolved(_graded_ticker(i)) == 1.0  # within 2 passes
+        assert settled.resolved(UNGRADED_BLOCKER) is None
+        assert UNGRADED_BLOCKER in settled._pending  # noqa: SLF001 — retried
+        # Fail-closed: the truly-ungraded leg still blocks every position.
+        lifecycle.recompute_book_risk()
+        snap = lifecycle._book_risk  # noqa: SLF001
+        assert snap is not None and snap.unknown and not snap.usable
+        # The exchange grades the blocker ⇒ the next backoff retry resolves it
+        # ⇒ the snapshot becomes usable (facts now suffice).
+        source.payloads[UNGRADED_BLOCKER] = market_payload(
+            UNGRADED_BLOCKER, status="finalized", result="no"
+        )
+        h.clock.advance(31.0)  # past the retry backoff
+        await lifecycle.maintenance_tick()
+        task = lifecycle._settled_task  # noqa: SLF001
+        assert task is not None
+        await task
+        assert settled.resolved(UNGRADED_BLOCKER) == 0.0
+        lifecycle.recompute_book_risk()
+        snap = lifecycle._book_risk  # noqa: SLF001
+        assert snap is not None
+        assert snap.usable
+        # Blocker settled NO on yes-side legs ⇒ every parlay dead ⇒ the whole
+        # book is locked profit for its seller (conditional risk exact).
+        assert snap.es_99_cc == 0.0
+        assert snap.p_profit == 1.0
+
+    async def test_pending_observability_line_emitted(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Requirement 4: every pass over a non-empty pending set reports what
+        # the resolver knows (n_pending / n_never_fetched / sample) — the
+        # line that would have answered relight2's "what is it waiting on?"
+        # instantly.
+        source = FakeMarketSource()
+        clock = FakeClock()
+        source.payloads["T-A"] = market_payload("T-A", status="closed", result="")
+        r = _resolver(source, clock)
+        r.note_missing("T-A")
+        r.note_missing("T-B")  # no payload ⇒ fetch fails ⇒ stays pending
+        await r.resolve_pending()
+        out = capsys.readouterr().out
+        assert "settled_resolution_pending" in out
+        assert "n_pending" in out and "n_never_fetched" in out
+        assert "T-A" in out  # the sample names the tickers

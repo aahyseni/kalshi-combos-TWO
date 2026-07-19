@@ -3983,15 +3983,45 @@ class QuoteLifecycle:
             return None
         return profile
 
+    def _register_settled_candidates(self) -> None:
+        """BATCH-register EVERY committed leg whose feed book is dark and whose
+        graded fact is unresolved — never gated on being reached by a serial
+        marginal walk (relight2 stall, 2026-07-19: registration rode the
+        provider walks, only the first walk-order legs ever entered the fetch
+        queue, and graded FRAENG facts sat unfetched on the exchange for 25
+        minutes while the walk sat stuck behind blockers). Runs on EVERY
+        maintenance tick — this covers startup (first tick), every
+        position-generation change, and continuously self-heals any discovery
+        gap. Cost: O(distinct committed legs) dict/set work, no network
+        (``note_missing`` is a no-op for pending/resolved/unresolvable
+        tickers)."""
+        if self._settled is None:
+            return
+        for ticker in self._committed_leg_tickers():
+            if self._settled.resolved(ticker) is not None:
+                continue
+            try:
+                book = self._feed.book(ticker)
+            except KeyError:
+                book = None
+            if book is not None and book.valid:
+                continue  # the feed owns it — nothing to resolve
+            self._settled.note_missing(ticker)
+
     def _maybe_resolve_settled_marginals(self) -> None:
         """Launch one bounded settled-marginal fetch pass (single-flight,
         fire-and-forget — the book-risk-task pattern) when a committed leg's
         book has left the feed and its graded result is still unfetched/due.
         The maintenance tick never awaits the REST reads; results land in the
         resolver's permanent cache and the NEXT book-risk recompute consumes
-        them via ``_marginals``. No resolver wired ⇒ no-op (prior behaviour)."""
+        them via ``_marginals``. No resolver wired ⇒ no-op (prior behaviour).
+
+        Registration is the BATCH walk below (every tick, all committed legs
+        at once — the relight2 fix); the ``_marginals`` fallback's per-query
+        noting remains as belt-and-braces only."""
         if self._settled is None:
             return
+        self._register_settled_candidates()
         if not self._settled.has_due_pending:
             return
         if self._settled_task is not None and not self._settled_task.done():

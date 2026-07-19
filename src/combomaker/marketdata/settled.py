@@ -146,6 +146,13 @@ class SettledMarginalResolver:
         # halt_marginal_jump "became unreadable (had 1.000)" on a settled
         # FRAENG leg hard-killed the bot 90s after preflight).
         self._known_non_live: set[str] = set()
+        # ticker → fetch attempts while pending (popped with the pending
+        # entry). Drives the per-pass PRIORITY: NEVER-FETCHED tickers are
+        # fetched before backoff RETRIES, so a freshly-registered graded fact
+        # lands within ~2 passes of registration no matter how many
+        # ungraded/active tickers are cycling on the backoff (relight2
+        # 2026-07-19: graded FRAENG facts sat unfetched for 25 minutes).
+        self._attempts: dict[str, int] = {}
 
     # ------------------------------------------------------------- hot path
 
@@ -207,11 +214,34 @@ class SettledMarginalResolver:
     async def resolve_pending(self) -> int:
         """One bounded fetch pass over the due pending tickers. Returns the
         number of tickers RESOLVED this pass. Never raises: a per-ticker fetch
-        error logs a warning and retries after the backoff."""
+        error logs a warning and retries after the backoff.
+
+        PRIORITY (relight2 stall, 2026-07-19): NEVER-FETCHED tickers are
+        fetched BEFORE backoff retries — a freshly-registered graded fact must
+        land within ~2 passes of registration regardless of how many ungraded/
+        active tickers are cycling on the backoff. The sort is stable, so
+        insertion order is preserved within each tier.
+
+        OBSERVABILITY (requirement from the same outage — the operator was
+        blind to what the resolver knew): once per pass with a non-empty
+        pending set, an INFO ``settled_resolution_pending`` line reports the
+        pending/never-fetched counts and a ticker sample."""
         now = self._clock.monotonic_ns()
+        if self._pending:
+            never_fetched = sum(
+                1 for t in self._pending if self._attempts.get(t, 0) == 0
+            )
+            log.info(
+                "settled_resolution_pending",
+                n_pending=len(self._pending),
+                n_never_fetched=never_fetched,
+                sample=sorted(self._pending)[:8],
+            )
         due = [t for t, due_ns in self._pending.items() if due_ns <= now]
+        due.sort(key=lambda t: self._attempts.get(t, 0) > 0)  # new first; stable
         resolved = 0
         for ticker in due[: self._fetch_budget_per_pass]:
+            self._attempts[ticker] = self._attempts.get(ticker, 0) + 1
             try:
                 payload = await self._source.get_market(ticker)
             except Exception as exc:
@@ -248,7 +278,7 @@ class SettledMarginalResolver:
             # A live market — the feed owns it; not a settlement candidate.
             # Arm the recheck floor so a book-flicker re-note within the
             # backoff window cannot trigger another fetch.
-            self._pending.pop(ticker, None)
+            self._drop_pending(ticker)
             self._live_floor[ticker] = (
                 self._clock.monotonic_ns() + self._retry_after_ns
             )
@@ -258,7 +288,7 @@ class SettledMarginalResolver:
             # A scalar outcome is never a 0/1 leg fact — permanently
             # unresolvable here; the leg stays UNKNOWN (fail-closed).
             log.warning("settled_scalar_unresolvable", ticker=ticker, status=status)
-            self._pending.pop(ticker, None)
+            self._drop_pending(ticker)
             self._unresolvable.add(ticker)
             return False
 
@@ -266,13 +296,13 @@ class SettledMarginalResolver:
             marginal = 1.0 if result == "yes" else 0.0
             if not self._settlement_value_consistent(ticker, market, result):
                 # Internally inconsistent row: refuse to cache (fail-closed).
-                self._pending.pop(ticker, None)
+                self._drop_pending(ticker)
                 self._unresolvable.add(ticker)
                 return False
             self._results[ticker] = SettledResult(
                 ticker=ticker, result=result, marginal=marginal, status=status
             )
-            self._pending.pop(ticker, None)
+            self._drop_pending(ticker)
             log.info(
                 "settled_marginal_resolved",
                 ticker=ticker,
@@ -287,6 +317,14 @@ class SettledMarginalResolver:
         # status string — is NOT a fact yet: stay UNKNOWN, retry on backoff.
         self._pending[ticker] = self._clock.monotonic_ns() + self._retry_after_ns
         return False
+
+    def _drop_pending(self, ticker: str) -> None:
+        """Remove a ticker from the pending queue AND its attempt counter (a
+        later re-registration starts as never-fetched again — correct: it is a
+        fresh discovery, and the priority tier must not remember stale
+        history)."""
+        self._pending.pop(ticker, None)
+        self._attempts.pop(ticker, None)
 
     @staticmethod
     def _settlement_value_consistent(
