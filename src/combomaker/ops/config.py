@@ -23,10 +23,13 @@ from pydantic import (
     model_validator,
 )
 
+from combomaker.ops.logging import get_logger
 from combomaker.risk.limits import RiskLimits
 
 if TYPE_CHECKING:
     from combomaker.risk.breakers import BreakerThresholds
+
+log = get_logger(__name__)
 
 
 class Env(StrEnum):
@@ -2148,6 +2151,29 @@ class RiskConfig(StrictModel):
     max_notional_per_quote_dollars: float = 500.0
     max_market_delta_contracts: float = 300.0
     max_event_delta_contracts: float = 500.0
+    # --- AUTO-SCALING DELTA CAPS (operator directive 2026-07-19: "I don't
+    # like manually moving stuff like this, it should be automatic"). The
+    # delta caps were the LAST absolute numbers in the risk stack — hand-bumped
+    # three times the week of 7/13 (300/500 → 900/1500 → 1500/2500) as bankroll
+    # and book size moved. When set (non-None), each cap's CONTRACT threshold
+    # derives at check time from the SAME live risk bankroll every loss budget
+    # scales from (BalanceTracker.risk_bankroll_cc = min(start-of-day equity,
+    # cash + haircut·portfolio_value); recomputed per check, no caching):
+    #     cap_contracts = frac × bankroll_cc / 10_000
+    # (1 contract ≈ $1 max payout, so this is frac × bankroll-in-dollars).
+    # PRECEDENCE: a set frac WINS — the absolute knob above is IGNORED while a
+    # usable bankroll reading exists (it stands in only when the bankroll is
+    # unavailable, where SKIP_BANKROLL_UNAVAILABLE already blocks quoting).
+    # Which mode is active per cap is logged once at startup
+    # (``delta_cap_mode`` in to_risk_limits). Decimal strings → exact
+    # Fractions (house convention; floats banned for thresholds). UNLIKE the
+    # loss fracs these may exceed 1 — the delta axis is a directional
+    # contract bound, not premium at risk. OPERATOR RATIOS at design time
+    # (2026-07-19, $1,910 cash): the hand-set 1500/2500 ≈ 0.785/1.31 of cash
+    # → suggested arming values "0.80" (market) / "1.30" (event). Defaults
+    # None = absolute caps behave exactly as today (no change until armed).
+    max_market_delta_frac: str | None = None
+    max_event_delta_frac: str | None = None
     max_gross_notional_dollars: float = 5_000.0
     max_open_quotes: int = 20
     max_daily_loss_dollars: float = 500.0
@@ -2414,6 +2440,32 @@ class RiskConfig(StrictModel):
             )
         return v
 
+    # The auto-scaling delta-cap fracs get their OWN validator: None is a
+    # meaningful value (frac mode disarmed → absolute knob governs), and the
+    # legal range differs from the loss fracs — a delta cap is a directional
+    # CONTRACT bound (frac × bankroll dollars), not premium at risk, so > 1 is
+    # legitimate (the suggested event arming value is "1.30"). Bounded at 10:
+    # a cap above 10× bankroll is not a cap (catches the "80"-for-"0.80" typo
+    # the loss-frac validator catches at 1).
+    @field_validator("max_market_delta_frac", "max_event_delta_frac")
+    @classmethod
+    def _valid_delta_frac(cls, v: str | None, info: ValidationInfo) -> str | None:
+        if v is None:
+            return v
+        try:
+            d = Decimal(v)
+        except InvalidOperation as exc:
+            raise ValueError(f"{info.field_name} {v!r} is not a decimal") from exc
+        # is_finite() first: NaN/sNaN/±Infinity rejected before the range
+        # compare (a signaling-NaN comparison would raise InvalidOperation).
+        if not d.is_finite() or not (Decimal(0) < d <= Decimal(10)):
+            raise ValueError(
+                f"{info.field_name} {v!r} must be a finite fraction of bankroll "
+                f"in (0, 10] (delta cap in contracts = frac × bankroll dollars; "
+                f"e.g. '0.80'), not {d}"
+            )
+        return v
+
     @field_validator(
         "absolute_notional_multiple",
         "fill_velocity_max_fills",
@@ -2536,12 +2588,46 @@ class RiskConfig(StrictModel):
     def to_risk_limits(self) -> RiskLimits:
         """Build the ``RiskLimits`` the checker uses, parsing the decimal-string
         percentages into exact Fractions (via Decimal so "0.08" is EXACTLY 8/100,
-        never a binary-float approximation). The one place config → limits."""
+        never a binary-float approximation). The one place config → limits.
+
+        Also emits the ``delta_cap_mode`` startup record (which mode — frac or
+        absolute — is active per directional delta cap): this seam runs exactly
+        once at quote-app startup, so logging here IS the log-once-at-startup
+        required by the auto-scaling delta-cap directive (2026-07-19)."""
+        log.info(
+            "delta_cap_mode",
+            market_mode=(
+                "frac" if self.max_market_delta_frac is not None else "absolute"
+            ),
+            market_value=(
+                self.max_market_delta_frac
+                if self.max_market_delta_frac is not None
+                else self.max_market_delta_contracts
+            ),
+            event_mode=(
+                "frac" if self.max_event_delta_frac is not None else "absolute"
+            ),
+            event_value=(
+                self.max_event_delta_frac
+                if self.max_event_delta_frac is not None
+                else self.max_event_delta_contracts
+            ),
+        )
         return RiskLimits(
             max_contracts_per_quote=self.max_contracts_per_quote,
             max_notional_per_quote_dollars=self.max_notional_per_quote_dollars,
             max_market_delta_contracts=self.max_market_delta_contracts,
             max_event_delta_contracts=self.max_event_delta_contracts,
+            max_market_delta_frac=(
+                None
+                if self.max_market_delta_frac is None
+                else Fraction(Decimal(self.max_market_delta_frac))
+            ),
+            max_event_delta_frac=(
+                None
+                if self.max_event_delta_frac is None
+                else Fraction(Decimal(self.max_event_delta_frac))
+            ),
             max_gross_notional_dollars=self.max_gross_notional_dollars,
             max_open_quotes=self.max_open_quotes,
             max_daily_loss_dollars=self.max_daily_loss_dollars,

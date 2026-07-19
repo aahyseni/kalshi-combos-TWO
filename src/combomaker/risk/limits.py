@@ -81,6 +81,35 @@ def threshold_cc(frac: Fraction, bankroll_cc: int) -> int:
     return frac.numerator * bankroll_cc // frac.denominator
 
 
+def scaled_delta_cap_contracts(
+    frac: Fraction | None, absolute_contracts: float, bankroll_cc: int | None
+) -> tuple[float, str]:
+    """The effective directional delta cap in WHOLE contracts + a detail suffix.
+
+    Auto-scaling delta caps (operator directive 2026-07-19). When ``frac`` is
+    armed AND a usable bankroll reading exists, the cap derives from the live
+    bankroll, integer-exact in cc then converted to contracts at the $1-payout
+    convention (1 contract ≈ $1 = 10_000 cc — the same convention the check
+    site's ``loss_cc / 10_000`` dollar comparisons use):
+
+        cap_contracts = threshold_cc(frac, bankroll_cc) / 10_000
+
+    The suffix documents the derivation in the breach detail. When ``frac`` is
+    None (default) or the bankroll is unavailable/non-positive, the ABSOLUTE
+    knob governs with an empty suffix — the pre-existing breach detail string
+    byte-identical. (A configured-but-stale bankroll source already blocks new
+    quoting via the R2 layer's SKIP_BANKROLL_UNAVAILABLE, so the fallback can
+    never let the book run away in the dark.) Recomputed per check from the
+    live bankroll — exactly the loss budgets' no-caching pattern.
+    """
+    if frac is None or bankroll_cc is None or bankroll_cc <= 0:
+        return absolute_contracts, ""
+    return (
+        threshold_cc(frac, bankroll_cc) / 10_000,
+        f" ({frac} x bankroll {bankroll_cc}cc)",
+    )
+
+
 def slate_key_for_start(start: datetime | None) -> str:
     """Slate bucket for a game start: its US/Eastern calendar date, or the pooled
     UNKNOWN bucket when the start is unknown (fail-closed)."""
@@ -96,6 +125,26 @@ class RiskLimits:
     max_notional_per_quote_dollars: float = 500.0
     max_market_delta_contracts: float = 300.0
     max_event_delta_contracts: float = 500.0
+    # --- AUTO-SCALING DELTA CAPS (operator directive 2026-07-19: "I don't like
+    # manually moving stuff like this, it should be automatic"). When set
+    # (non-None), the two enforced directional delta caps above DERIVE their
+    # CONTRACT threshold at CHECK TIME from the SAME live risk bankroll the
+    # %-of-bankroll loss budgets use (``risk_bankroll_cc`` =
+    # BalanceTracker.risk_bankroll_cc, passed per check — no caching):
+    #     cap_contracts = threshold_cc(frac, bankroll_cc) / 10_000
+    # (1 contract ≈ $1 max payout = 10_000 cc, so this is frac ×
+    # bankroll-in-dollars in contract units; delta_by_market/delta_by_game are
+    # float WHOLE contracts at this site). PRECEDENCE: a set frac WINS and the
+    # absolute knob is IGNORED whenever a usable bankroll reading exists; with
+    # no usable bankroll (None / <= 0) the absolute knob stands in as the
+    # backstop — and when a bankroll SOURCE is configured, the R2 layer's
+    # SKIP_BANKROLL_UNAVAILABLE is already blocking new quoting (fail-closed),
+    # so the fallback never loosens anything. None (default) = the absolute
+    # caps behave exactly as today, byte-identical. The derived-cap breaches
+    # keep the delta family's existing shape: SKIP_MASS_ACCEPTANCE_BREACH,
+    # shadow=False (always-enforced axis), game=None (never waivable).
+    max_market_delta_frac: Fraction | None = None
+    max_event_delta_frac: Fraction | None = None
     max_gross_notional_dollars: float = 5_000.0
     max_open_quotes: int = 20
     max_daily_loss_dollars: float = 500.0
@@ -561,22 +610,41 @@ class LimitChecker:
                     "exposure decomposition has unknown marginals",
                 )
             )
+        # AUTO-SCALING DELTA CAPS (2026-07-19): each cap's contract threshold
+        # is derived PER CHECK from the live bankroll when its frac is armed
+        # (frac wins, absolute ignored); frac unset ⇒ the absolute knob,
+        # byte-identical detail included. Deltas here are float WHOLE
+        # contracts; the derived cap is frac × bankroll-in-dollars at the
+        # $1-payout convention (scaled_delta_cap_contracts). Breach shape is
+        # unchanged: SKIP_MASS_ACCEPTANCE_BREACH, shadow=False, game=None —
+        # the delta family stays non-waivable at the lifecycle's game-key
+        # check regardless of which mode derived the threshold.
+        market_delta_cap, market_delta_note = scaled_delta_cap_contracts(
+            limits.max_market_delta_frac,
+            limits.max_market_delta_contracts,
+            risk_bankroll_cc,
+        )
+        event_delta_cap, event_delta_note = scaled_delta_cap_contracts(
+            limits.max_event_delta_frac,
+            limits.max_event_delta_contracts,
+            risk_bankroll_cc,
+        )
         for ticker, delta in snapshot.delta_by_market.items():
-            if abs(delta) > limits.max_market_delta_contracts:
+            if abs(delta) > market_delta_cap:
                 breaches.append(
                     Breach(
                         ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH,
                         f"market {ticker} delta {delta:.1f} > "
-                        f"{limits.max_market_delta_contracts}",
+                        f"{market_delta_cap}{market_delta_note}",
                     )
                 )
         for game, delta in snapshot.delta_by_game.items():
-            if abs(delta) > limits.max_event_delta_contracts:
+            if abs(delta) > event_delta_cap:
                 breaches.append(
                     Breach(
                         ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH,
                         f"game {game} delta {delta:.1f} > "
-                        f"{limits.max_event_delta_contracts}",
+                        f"{event_delta_cap}{event_delta_note}",
                     )
                 )
         if snapshot.gross_notional_cc / 10_000 > limits.max_gross_notional_dollars:
