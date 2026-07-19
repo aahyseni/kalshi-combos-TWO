@@ -200,6 +200,17 @@ def _try_build_game(
         mgl = marginals[j]
         if mgl is None:
             continue
+        if not 0.0 < float(mgl) < 1.0:
+            # SETTLED-LEG MARGINAL RESOLUTION (2026-07-18): a DETERMINISTIC
+            # marginal (exactly 0.0/1.0 — an exchange-graded settled leg) is a
+            # FACT, not a distribution. It cannot identify a Dixon-Coles model
+            # (a degenerate inversion target is un-fittable and would drop or
+            # pollute the whole game's plan) and needs no structural coupling —
+            # the copula path samples it as a CONSTANT column, which is the
+            # exact conditional treatment. Left to the copula; a fully-settled
+            # game then builds no plan at all and every one of its legs rides
+            # the copula as a constant.
+            continue
         spec = _parse_leg(tickers[j], match, fmt=fmt)
         if isinstance(spec, str):        # unrepresentable ⇒ copula
             continue

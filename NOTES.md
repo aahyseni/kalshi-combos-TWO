@@ -523,3 +523,20 @@ Refuted (16, cleared): frame-sign fix correct+complete; fee code matches the PDF
 | MF2 | EAT-THE-FEE doctrine: quoted prices stay unchanged/competitive — the maker fee is never added to quote width; it is ACCOUNTED in fills.fee_cc, realized P&L, expected_edge_cc (net of predicted fee), and the Problem-A waiver candidate per-state P&L | `rfq/lifecycle.py on_quote_executed`, `_build_state_worst_case_inputs` | operator directive 2026-07-16 (business decision, not a market fact) |
 | MF3 | Prefix `startswith` on the combo market ticker OR its collection ticker identifies a maker-fee-active series; the empty list (committed default) is EXACTLY today's $0 maker regime — regression-proven bit-identical (edge, fills row, waiver inputs) | `rfq/lifecycle.py _maker_fee_active` + `tests/test_maker_fee_prefixes.py` | fixture:regression (empty-prefix parity tests); prefix-shape UNVERIFIED against Kalshi's eventual fee-list keying (they may key on series ticker exactly — revisit when the list ships) |
 | MF4 | Committed positions (and outstanding reservations) in the waiver enumeration still ride fee_cc=0 — their at-fill fee is not threaded (OpenPosition carries no fee field); conservative direction unaffected because a real fee only ADDS loss on the hit side | `rfq/lifecycle.py _build_state_worst_case_inputs` (dated TODO 2026-07-16) | code-comment TODO; close when OpenPosition gains a fee field |
+
+## Settled-leg marginal resolution — assumption audit (2026-07-18, defense #6)
+
+Doc verification (hard rule 4): fetched the LIVE `https://docs.kalshi.com/openapi.yaml`
+2026-07-18 and compared against `docs/api-notes/index-scan.md` §5/§10 — **no
+discrepancy**. `GET /markets/{ticker}` Market: `result` enum `yes|no|scalar|''`
+(empty until determined); `status` enum `initialized|inactive|active|closed|
+determined|disputed|amended|finalized`; `settlement_timer_seconds` = "amount of
+time after determination that the market settles"; `settlement_value_dollars`
+nullable, "Only filled after determination".
+
+| row | assumption | where | provenance |
+|---|---|---|---|
+| SR1 | A leg market's `result` ∈ {yes,no} under `status` ∈ {determined,finalized} is the exchange-graded settlement FACT (yes ⇒ P=1.0, no ⇒ P=0.0) and is immutable — cached permanently, fetched once | `marketdata/settled.py` | doc:openapi.yaml (live fetch 2026-07-18) + index-scan §10 lifecycle (determined → settled/finalized). Residual: the determined→finalized dispute window could in principle amend a result (rare); backstop = SettlementHandler's to-the-cent reconcile HALT (defense #3) — the cached marginal feeds RISK only, never a booking |
+| SR2 | `status` closed/disputed/amended, or a graded status with empty `result`, is NOT a fact — the leg stays UNKNOWN (snapshot unusable) and is retried on a backoff; outcomes are NEVER inferred from scores/feeds | `marketdata/settled.py _ingest` | doc:openapi.yaml enums; fail-closed by construction (defense #2), test-pinned (`test_settled_marginals.py`) |
+| SR3 | A present `settlement_value_dollars` must equal $1 (yes) / $0 (no) for a binary result, else the row is internally inconsistent and refused (never cached) | `marketdata/settled.py _settlement_value_consistent` | doc:openapi.yaml ("Only filled after determination"); mirrors `risk/settlement.py parse_settlement`'s cross-check |
+| SR4 | A DETERMINISTIC marginal (exactly 0.0/1.0) is a constant, not a distribution: excluded from Dixon-Coles inversion targets (copula samples it as a constant column — the exact conditional treatment) and never shocked by the P1.9 structural challenger | `sim/structural_book.py _try_build_game`, `sim/book_risk.py _shock_marginals` | ARITHMETIC (a constant's conditional law is itself; a degenerate target is un-fittable); test-pinned won/lost conditional ES values |

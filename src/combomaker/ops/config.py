@@ -2276,6 +2276,28 @@ class RiskConfig(StrictModel):
     # not recommended live); the delay must be a positive finite number.
     fill_cancel_verify_attempts: int = 3
     fill_cancel_verify_delay_s: float = 90.0
+    # SETTLED-LEG MARGINAL RESOLUTION (2026-07-18 live outage: FRAENG settled
+    # while cross-game combos holding FRAENG legs stayed open — the settled
+    # legs' books left the feed, the book-risk model went UNKNOWN and the
+    # portfolio-CVaR cap failed closed on EVERY quote until the last leg would
+    # have settled). True (default): the app wires a SettledMarginalResolver —
+    # a COMMITTED leg whose order book is gone from the feed resolves its
+    # marginal to the exchange-GRADED settlement fact (GET /markets/{ticker}
+    # `result`: yes ⇒ 1.0 / no ⇒ 0.0; accepted only under status determined/
+    # finalized — verified against the live openapi.yaml 2026-07-18), fetched
+    # OFF the hot path on the maintenance tick and cached permanently (a
+    # settlement never changes). Precedence: feed first, settled-cache second,
+    # else UNKNOWN — an UNRESOLVED closed market (game over, not yet graded)
+    # stays UNKNOWN/fail-closed; outcomes are NEVER inferred from scores or
+    # feeds. Risk numbers become CONDITIONAL on the settled facts (a lost-leg
+    # combo contributes zero further loss; a won-leg combo carries full
+    # conditional exposure on its remaining legs). False: no resolver is wired
+    # — the pre-fix behaviour (settled legs leave the snapshot unusable).
+    settled_marginal_resolution: bool = True
+    # Backoff (seconds) between REST re-fetch attempts for a pending ticker
+    # whose result is not graded yet (or whose fetch errored). Positive finite
+    # (validator below); the fetch pass is bounded and single-flight.
+    settled_resolution_retry_s: float = 30.0
     # PERIODIC POSITION-RECONCILE NET (2026-07-18 requirement 3). Every this
     # many seconds the app compares the exchange's open positions
     # (GET /portfolio/positions, read-only, subaccount-pinned) against the
@@ -2450,7 +2472,11 @@ class RiskConfig(StrictModel):
     # Cancel-report verification (2026-07-18): the delay must be positive and
     # finite (NaN fails the comparison ⇒ rejected — never a silent stall), and
     # the poll budget non-negative (0 = verification explicitly disabled).
-    @field_validator("fill_cancel_verify_delay_s", "position_reconcile_interval_s")
+    @field_validator(
+        "fill_cancel_verify_delay_s",
+        "position_reconcile_interval_s",
+        "settled_resolution_retry_s",
+    )
     @classmethod
     def _valid_verify_intervals(cls, v: float, info: ValidationInfo) -> float:
         if not (0.0 < v < float("inf")):

@@ -21,7 +21,7 @@ from decimal import Decimal
 from fractions import Fraction
 from typing import Any, Protocol
 
-from combomaker.core.clock import SystemClock
+from combomaker.core.clock import Clock, SystemClock
 from combomaker.core.conventions import Side, load_conventions
 from combomaker.core.money import CentiCents
 from combomaker.core.quantity import CentiContracts
@@ -33,6 +33,7 @@ from combomaker.exchange.ws import WsManager
 from combomaker.marketdata.feed import OrderbookFeed
 from combomaker.marketdata.grid import PriceGrid
 from combomaker.marketdata.metadata import MarketMeta, MetadataCache
+from combomaker.marketdata.settled import MarketSource, SettledMarginalResolver
 from combomaker.ops.config import AppConfig, Env, Mode, RiskConfig
 from combomaker.ops.logging import configure_logging, get_logger
 from combomaker.ops.metrics import Metrics
@@ -200,6 +201,22 @@ def build_lifecycle_config(
         # ``pricing.skew.peak_topk_states`` (a keyword here because this
         # builder's positional contract is RiskConfig-only).
         peak_topk_states=peak_topk_states,
+    )
+
+
+def build_settled_resolver(
+    risk_cfg: RiskConfig, source: MarketSource, clock: Clock
+) -> SettledMarginalResolver | None:
+    """SETTLED-LEG MARGINAL RESOLUTION wiring (2026-07-18 live outage) — the
+    ONE place the YAML knob decides whether a resolver exists, extracted pure
+    (the ``build_lifecycle_config`` precedent) so a test can prove the knob
+    actually reaches the lifecycle. ``risk.settled_marginal_resolution: false``
+    ⇒ None ⇒ the lifecycle behaves exactly as before the fix (a settled leg's
+    missing marginal leaves the book-risk snapshot unusable, fail-closed)."""
+    if not risk_cfg.settled_marginal_resolution:
+        return None
+    return SettledMarginalResolver(
+        source, clock, retry_after_s=risk_cfg.settled_resolution_retry_s
     )
 
 
@@ -727,6 +744,16 @@ class QuoteApp:
                 # restart — and the per-run register poll stalled the loop 1.0s
                 # per call until then.
                 await book_risk_pool.warmup()
+            # SETTLED-LEG MARGINAL RESOLUTION (2026-07-18 live outage): a
+            # committed leg whose market settled (book gone from the feed)
+            # resolves to the exchange-GRADED 0/1 fact — fetched off the
+            # maintenance tick via public GET /markets/{ticker}, permanently
+            # cached — so a cross-game book stays risk-modelable after one of
+            # its games settles. Knob: risk.settled_marginal_resolution
+            # (False ⇒ None ⇒ the pre-fix fail-closed behaviour).
+            settled_marginals = build_settled_resolver(
+                risk_cfg, rest, self._clock
+            )
             lifecycle = QuoteLifecycle(
                 clock=self._clock,
                 sender=sender,
@@ -808,6 +835,8 @@ class QuoteApp:
                 # active in BOTH paper and quote modes (additive skips only);
                 # only tests/backtests with no registry wired are inert.
                 rfq_alive=intake.rfq_alive,
+                # SETTLED-LEG MARGINAL RESOLUTION (2026-07-18): see above.
+                settled_marginals=settled_marginals,
             )
             # R3 Phase 3: single-writer risk-reservation service. Wired AFTER the
             # lifecycle (it reuses the lifecycle's shadow splitter, so a %-cap

@@ -43,6 +43,7 @@ from combomaker.core.reasons import ReasonCode
 from combomaker.exchange.rest import KalshiApiError
 from combomaker.marketdata.feed import OrderbookFeed
 from combomaker.marketdata.metadata import MetadataCache
+from combomaker.marketdata.settled import SettledMarginalResolver
 from combomaker.ops.logging import get_logger
 from combomaker.ops.metrics import Metrics
 from combomaker.ops.persistence import Store
@@ -510,6 +511,7 @@ class QuoteLifecycle:
         fills_subaccount: int | None = None,
         beat: Callable[[], None] | None = None,
         rfq_alive: Callable[[str], bool] | None = None,
+        settled_marginals: SettledMarginalResolver | None = None,
     ) -> None:
         self._clock = clock
         self._sender = sender
@@ -665,6 +667,26 @@ class QuoteLifecycle:
         # None (backtests / tests) ⇒ no liveness view ⇒ behaviour identical to
         # today. Wired in BOTH paper and quote modes (additive skips only).
         self._rfq_alive = rfq_alive
+        # SETTLED-LEG MARGINAL RESOLUTION (2026-07-18 live outage: FRAENG
+        # settled while cross-game combos with FRAENG legs stayed open — the
+        # settled legs' feed books were gone, so build_book_model went UNKNOWN
+        # and the CVaR cap failed closed on EVERY quote for hours). When wired
+        # (quote_app, risk.settled_marginal_resolution), ``_marginals`` falls
+        # back — feed first, settled-cache second, else UNKNOWN — to the
+        # exchange-GRADED settlement fact (GET /markets/{ticker} result:
+        # yes ⇒ 1.0 / no ⇒ 0.0, accepted only under status determined/
+        # finalized), permanently cached and fetched OFF the hot path by
+        # ``_maybe_resolve_settled_marginals`` on the maintenance tick. None
+        # (tests/backtests/knob off) ⇒ the prior fail-closed behaviour.
+        self._settled = settled_marginals
+        # Single-flight fetch task (the book-risk-task pattern in miniature).
+        self._settled_task: asyncio.Task[int] | None = None
+        # Committed-position leg tickers, cached per position generation, so
+        # the hot-path fallback only ever REGISTERS resolution candidates for
+        # legs we actually HOLD (an RFQ leg with no book stays a plain
+        # no-quote — settled resolution exists to repair the BOOK model, never
+        # to admit quoting on dead markets).
+        self._committed_leg_cache: tuple[int, frozenset[str]] | None = None
         # F1 PRE-PRICING GATE cache: (exposure generation, bankroll_cc, built
         # mono_ns, breaches). Every allowlisted cap input is either static per
         # book mutation (loss/notional folds, quote count — invalidated by the
@@ -3961,6 +3983,21 @@ class QuoteLifecycle:
             return None
         return profile
 
+    def _maybe_resolve_settled_marginals(self) -> None:
+        """Launch one bounded settled-marginal fetch pass (single-flight,
+        fire-and-forget — the book-risk-task pattern) when a committed leg's
+        book has left the feed and its graded result is still unfetched/due.
+        The maintenance tick never awaits the REST reads; results land in the
+        resolver's permanent cache and the NEXT book-risk recompute consumes
+        them via ``_marginals``. No resolver wired ⇒ no-op (prior behaviour)."""
+        if self._settled is None:
+            return
+        if not self._settled.has_due_pending:
+            return
+        if self._settled_task is not None and not self._settled_task.done():
+            return
+        self._settled_task = asyncio.ensure_future(self._settled.resolve_pending())
+
     async def maintenance_tick(self) -> None:
         """TTL expiry + reprice + P&L mark + daily-loss halt. Every few 100ms."""
         self._refresh_daily_pnl()
@@ -3974,6 +4011,14 @@ class QuoteLifecycle:
         # book peak scorelines when a fill/settlement changed the position set —
         # a pure PRICING input to the skew seam (stale/absent = neutral adder).
         self._maybe_recompute_peak_profile()
+        # SETTLED-LEG MARGINAL RESOLUTION (2026-07-18): fetch graded results
+        # for committed legs whose books left the feed — bounded, off-loop,
+        # single-flight — so the book-risk model regains a marginal for every
+        # risk-modeled leg and the CVaR cap stops failing closed on a book
+        # that merely holds settled-leg cross-game combos. Runs AFTER the
+        # recompute paths above, which are what REGISTER the missing committed
+        # legs (via ``_marginals``), so the first pass already sees them all.
+        self._maybe_resolve_settled_marginals()
         # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): repair a confirmed fill
         # whose quote_executed WS message was lost, BEFORE the limit check so a
         # recovered position counts against the caps this same tick. Runs even
@@ -4329,13 +4374,49 @@ class QuoteLifecycle:
         return min(times) if times else None
 
     def _marginals(self, market_ticker: str) -> float | None:
+        """The lifecycle's ONE marginal provider: live feed microprice first;
+        for a leg whose book has left the feed, the permanently-cached
+        exchange-GRADED settlement fact (0.0/1.0) second; else None (UNKNOWN,
+        fail-closed — unchanged). The settled fallback is a pure in-memory
+        cache read (hot-path safe); fetching happens on the maintenance tick.
+
+        Feeding the graded 0/1 into the book/risk model makes every number
+        CONDITIONAL on the settled facts — the correct book risk: a combo
+        whose settled leg LOST samples a deterministically-dead parlay (zero
+        further loss), one whose settled leg WON carries the full conditional
+        exposure of its remaining legs."""
         try:
             book = self._feed.book(market_ticker)
         except KeyError:
+            book = None
+        if book is not None and book.valid:
+            return book.top().microprice()
+        if self._settled is None:
             return None
-        if not book.valid:
-            return None
-        return book.top().microprice()
+        p = self._settled.resolved(market_ticker)
+        if p is not None:
+            return p
+        # Not resolved yet: register COMMITTED legs as fetch candidates (an
+        # RFQ-only leg with no book stays a plain no-quote — never fetched).
+        if market_ticker in self._committed_leg_tickers():
+            self._settled.note_missing(market_ticker)
+        return None
+
+    def _committed_leg_tickers(self) -> frozenset[str]:
+        """Distinct leg tickers of the COMMITTED positions, cached per position
+        generation (fills/settlements are rare; the hot path only pays a tuple
+        compare + set lookup)."""
+        gen = self._exposure.position_generation
+        cached = self._committed_leg_cache
+        if cached is not None and cached[0] == gen:
+            return cached[1]
+        tickers = frozenset(
+            leg.market_ticker
+            for position in self._exposure.positions.values()
+            for leg in position.legs
+        )
+        self._committed_leg_cache = (gen, tickers)
+        return tickers
 
     def _current_leg_mids(self, rfq: Rfq) -> dict[str, int]:
         mids: dict[str, int] = {}

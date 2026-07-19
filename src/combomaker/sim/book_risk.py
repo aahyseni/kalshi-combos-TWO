@@ -877,12 +877,21 @@ def _shock_marginals(
     leg toward maximum uncertainty (the tail-fattening direction: a less-confident
     leg contributes more joint-tail mass). Returns None when ``shock <= 0`` (no
     shock ⇒ the challenger inverts the ORIGINAL marginals, an exact no-op on this
-    axis). Clamped to (0,1) exclusive so inversion never sees a degenerate 0/1."""
+    axis). Clamped to (0,1) exclusive so inversion never sees a degenerate 0/1.
+
+    SETTLED-LEG exception (2026-07-18): a DETERMINISTIC marginal (exactly
+    0.0/1.0 — an exchange-GRADED settled leg) is a fact, not a feed mark: no
+    feed error can apply to it, so it passes through UNSHOCKED (shocking would
+    also un-degenerate it back into the structural inversion, re-treating a
+    settled leg as probabilistic)."""
     if shock <= 0.0:
         return None
     out: dict[int, float] = {}
     for i, leg in enumerate(model.legs):
         p = float(leg.p)
+        if not 0.0 < p < 1.0:
+            out[i] = p
+            continue
         shocked = p + shock * (0.5 - p)
         out[i] = min(0.999, max(0.001, shocked))
     return out
