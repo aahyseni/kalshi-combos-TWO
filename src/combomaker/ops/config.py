@@ -1834,6 +1834,22 @@ class SkewConfig(StrictModel):
     peak_widen_max_cc: int = 600       # extra widen cap for peak-stackers (+6c)
     peak_tighten_max_cc: int = 150     # extra rebate cap for anti-peak flow
     peak_topk_states: int = 5          # cached worst scorelines per game
+    # MULTI-CLUSTER peak steer (operator directive 2026-07-19 — the live
+    # ESPARG two-cluster book: only the argmax plateau was cached, so the
+    # ARG-champ+Messi cluster at ~60-80% of the top loss rode nearly free).
+    # Up to ``peak_n_clusters`` DISTINCT loss levels are cached per game
+    # (descending; a level qualifies at >= peak_cluster_min_frac x top loss),
+    # each as its FULL level set under the shared 4096-state cache cap
+    # (overflow drops the LOWEST clusters first; an uncached cluster is
+    # neutral — today's behaviour). Hitting ANY cached cluster widens, scaled
+    # by that cluster's loss relative to the top; the anti-peak rebate now
+    # certifies a provable miss of ALL cached clusters (strictly tighter).
+    # ``peak_n_clusters: 1`` is byte-identical to the 2026-07-18
+    # single-plateau ship (the rollback knob). ``peak_cluster_min_frac`` is a
+    # decimal STRING parsed to an exact Fraction in (0, 1] (house convention;
+    # floats banned for thresholds).
+    peak_n_clusters: int = 3
+    peak_cluster_min_frac: str = "0.30"
 
     @field_validator("w_conc", "w_off")
     @classmethod
@@ -1866,6 +1882,29 @@ class SkewConfig(StrictModel):
     def _valid_topk(cls, v: int) -> int:
         if not 1 <= v <= 64:
             raise ValueError(f"peak_topk_states must be in [1, 64], got {v}")
+        return v
+
+    @field_validator("peak_n_clusters")
+    @classmethod
+    def _valid_n_clusters(cls, v: int) -> int:
+        if not 1 <= v <= 8:
+            raise ValueError(f"peak_n_clusters must be in [1, 8], got {v}")
+        return v
+
+    @field_validator("peak_cluster_min_frac")
+    @classmethod
+    def _valid_cluster_min_frac(cls, v: str) -> str:
+        try:
+            d = Decimal(v)
+        except InvalidOperation as exc:
+            raise ValueError(f"peak_cluster_min_frac {v!r} is not a decimal") from exc
+        # `not d.is_finite()` catches NaN/sNaN/±Infinity BEFORE the range
+        # compare (a signaling-NaN comparison itself raises InvalidOperation).
+        if not d.is_finite() or not (Decimal(0) < d <= Decimal(1)):
+            raise ValueError(
+                f"peak_cluster_min_frac {v!r} must be a finite fraction in "
+                f"(0, 1] — a fraction of the game's top loss (e.g. '0.30')"
+            )
         return v
 
 

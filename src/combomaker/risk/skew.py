@@ -118,9 +118,12 @@ class SkewParams:
     # --- PEAK-CONCENTRATION pricing steer (operator directive 2026-07-18) ----
     # A SECOND, ADDITIVE classifier component fed by the cached committed-book
     # peak-state profile (sim/peak_profile.py). A candidate that HITS the
-    # book's cached worst scoreline(s) widens by up to ``peak_widen_max_cc``
+    # book's cached worst scoreline(s) — or, MULTI-CLUSTER (2026-07-19), ANY
+    # cached loss cluster, scaled by that cluster's loss relative to the top —
+    # widens by up to ``peak_widen_max_cc``
     # extra; one that provably MISSES the ENTIRE top-loss plateau (certified
-    # against the full argmax level, 2026-07-18 verify fix) rebates by up to
+    # against the full argmax level, 2026-07-18 verify fix) AND every cached
+    # lower cluster (2026-07-19) rebates by up to
     # ``peak_tighten_max_cc`` extra. Each side is HARD-clamped independently of
     # the directional caps above, so the COMPOSED classifier is bounded by
     #   [-(skew_max_tighten_cc + peak_tighten_max_cc),
@@ -323,12 +326,21 @@ def compute_inventory_skew(
 
     a HIT contributes  ``+ peak_widen_max_cc x peak_overlap x peak_ratio**gamma``
     (convex in how close the book's peak already is to its budget: a small book
-    is nearly free, a peak near budget pays the full widen) and a candidate
+    is nearly free, a peak near budget pays the full widen). MULTI-CLUSTER
+    (operator directive 2026-07-19): ``hit_severity`` is the max over ALL
+    cached loss clusters of (cluster_loss / top_loss) x hit-indicator — the
+    top plateau at weight 1.0 plus the cached lower clusters at their level
+    weights (folded with the K-row severity; ``peak_n_clusters=1`` restores
+    the K-sample-only read byte-identically) — so stacking a SECOND loss
+    cluster on a mutually exclusive branch (the live ESPARG ARG-champ+Messi
+    ladder) now pays a widen scaled by that cluster's relative loss instead of
+    riding free. A candidate
     that provably MISSES the ENTIRE top-loss plateau — certified against the
     FULL argmax level cached in the profile, never just the K sampled rows
     (2026-07-18 verify fix: on a plateau wider than K a plateau-stacking
     refinement missed all K rows and pocketed the rebate while raising the
-    certified worst case) — contributes
+    certified worst case) — AND every CACHED lower cluster's level set
+    (2026-07-19, strictly tighter) contributes
     ``- peak_tighten_max_cc x min(1, premium/budget) x peak_ratio`` (the
     linear rebate for distribution-flattening flow — its premium pays into our
     loss states; an uncached/oversized plateau ⇒ no rebate, neutral).
@@ -507,9 +519,14 @@ def _peak_component(
     where the component is clamped to [−peak_tighten_max_cc, +peak_widen_max_cc]
     and the debug rows are ``(game, adder_cc, peak_overlap, reason)``.
 
-    Pure O(K x legs) arithmetic on the CACHED profile rows — the containment
-    indicator (``sim.peak_profile.evaluate_peak_containment``) is <= one
-    vectorised numpy op per structural leg per branch slice. FAIL-SAFE: every
+    Pure O((K + cached cluster states) x legs) arithmetic on the CACHED
+    profile rows — the containment indicator
+    (``sim.peak_profile.evaluate_peak_containment``) is <= one vectorised
+    numpy op per structural leg per slice, over the K sample plus the cached
+    cluster level sets (all clusters together bounded by the shared 4096-state
+    cap; ``hit_severity`` is the max over ALL cached clusters of
+    (cluster_loss/top_loss) x hit — see the multi-cluster notes there).
+    FAIL-SAFE: every
     doubt branch returns a hard 0 (neutral), never raises, never refuses."""
     if not params.peak_enabled or profile is None:
         return 0, 0, 0, ()

@@ -33,6 +33,20 @@ sample (2026-07-18 verify fix) — TIGHTENS (its premium pays into our loss
 states — distribution-flattening flow). PRICING ONLY: this module never
 declines, never caps, never raises to a caller.
 
+MULTI-CLUSTER (operator directive 2026-07-19 — the live ESPARG shape). A book
+can carry TWO (or more) loss clusters: the argmax plateau (cluster A) plus a
+second correlated pile on a mutually exclusive branch (cluster B — live: the
+ARG-champ+Messi ladder at ~60-80% of the top loss). Single-plateau pricing let
+B-stackers ride free (near-zero peak charge, even a small rebate for provably
+missing A). The profile therefore caches up to ``n_clusters`` DISTINCT loss
+LEVELS per game (descending; a level qualifies at >= ``cluster_min_frac`` x
+top loss), each as its FULL level set, all under the SHARED
+``_PLATEAU_CACHE_MAX_STATES`` cap (overflow drops the LOWEST clusters first —
+an uncached cluster is neutral, exactly today's behaviour). Hitting ANY cached
+cluster widens, scaled by that cluster's loss relative to the top; the rebate
+now certifies a provable miss of ALL cached clusters (strictly tighter).
+``n_clusters == 1`` is byte-identical to the 2026-07-18 single-plateau ship.
+
 SEMANTICS (inherited from ``state_worst_case``, committed-book subset):
 
   * Entities are the COMMITTED positions only — full signed netting (a real
@@ -58,6 +72,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from fractions import Fraction
 
 import numpy as np
 from numpy.typing import NDArray
@@ -110,6 +125,10 @@ _HALF_SPECS = (HalfResult, HalfDraw, HalfTotalOver, HalfBtts, HalfGoalSpread)
 # to verify). 4096 covers the branch-doubled knockout FT enumeration (1586)
 # with headroom; only half-aware grids or a degenerate constant-loss surface
 # (a fail-closed entity making every state tie) exceed it.
+# MULTI-CLUSTER (2026-07-19): this is now the SHARED budget across ALL cached
+# clusters of a game together — the top plateau plus every cached lower level
+# set. Overflow drops the LOWEST clusters first; an uncached cluster is
+# neutral (no widen from it, no rebate certification against it).
 _PLATEAU_CACHE_MAX_STATES = 4096
 
 
@@ -140,6 +159,22 @@ class PlateauSlice:
 
 
 @dataclass(frozen=True, slots=True)
+class LossCluster:
+    """One cached loss cluster BELOW the top plateau (2026-07-19 multi-cluster
+    steer): the FULL level set of one distinct loss level — every enumerated
+    state whose committed-book loss equals ``loss_cc`` exactly (int centi-cent
+    arithmetic makes level sets exact ties), grouped by shootout branch with
+    the same representation as the top plateau. A cluster qualifies at
+    ``loss_cc >= cluster_min_frac x top_loss`` (so always > 0) and is cached
+    under the SHARED ``_PLATEAU_CACHE_MAX_STATES`` budget; overflow drops the
+    lowest clusters first (an uncached cluster is neutral — no widen from it,
+    exactly the pre-multi-cluster behaviour)."""
+
+    loss_cc: int
+    slices: tuple[PlateauSlice, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class PeakStateSlice:
     """Up to K cached peak (largest-loss) states of ONE game, for ONE shootout
     branch. ``states`` is a row-slice of the game's full enumeration (each row
@@ -165,8 +200,16 @@ class GamePeakProfile:
     ``plateau_slices`` (2026-07-18 verify fix) is the FULL argmax plateau —
     every state at exactly ``top_loss_cc`` — grouped by branch; None when the
     plateau exceeds ``_PLATEAU_CACHE_MAX_STATES`` (rebate then never fires:
-    fail-safe neutral). Consumed ONLY by the rebate certification in
-    ``evaluate_peak_containment``; the widen path reads ``slices`` alone."""
+    fail-safe neutral). At ``n_clusters == 1`` it is consumed ONLY by the
+    rebate certification in ``evaluate_peak_containment`` (the widen path
+    reads ``slices`` alone — the pre-multi-cluster behaviour, byte-identical);
+    at ``n_clusters >= 2`` it is ALSO cluster 1 of the severity walk.
+
+    ``lower_clusters`` (2026-07-19 multi-cluster steer) are the cached loss
+    clusters BELOW the top plateau, descending by loss level — full level sets
+    under the shared state cap, empty at ``n_clusters == 1`` or when nothing
+    qualifies/fits. ``n_clusters`` records the build knob and gates the
+    multi-cluster severity semantics in ``evaluate_peak_containment``."""
 
     game: str
     params: ModelParams
@@ -174,6 +217,8 @@ class GamePeakProfile:
     top_loss_cc: int
     n_states_enumerated: int
     plateau_slices: tuple[PlateauSlice, ...] | None = None
+    lower_clusters: tuple[LossCluster, ...] = ()
+    n_clusters: int = 1
 
     @property
     def n_peak_states(self) -> int:
@@ -185,6 +230,13 @@ class GamePeakProfile:
         if self.plateau_slices is None:
             return 0
         return sum(int(s.states.w.size) for s in self.plateau_slices)
+
+    @property
+    def n_lower_cluster_states(self) -> int:
+        """Total cached states across the lower clusters (0 at n_clusters=1)."""
+        return sum(
+            int(s.states.w.size) for c in self.lower_clusters for s in c.slices
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,12 +270,19 @@ class PeakContainment:
     ``hit_severity`` in [0, 1]: the severity weight (state loss / the game's
     worst-state loss, losses clamped at >= 0) of the WORST cached state the
     candidate's parlay can still HIT — 1.0 means it stacks squarely on the
-    book's worst scoreline, 0.0 means it hits no loss-carrying peak state.
+    book's worst scoreline, 0.0 means it hits no loss-carrying peak state. At
+    ``n_clusters >= 2`` (2026-07-19 multi-cluster steer) the hit test ALSO
+    runs over every cached cluster's FULL level set:
+    ``hit_severity = max over cached clusters of (cluster_loss / top_loss) x
+    hit(cluster)`` folded with the K-row severity — so stacking a SECOND loss
+    cluster (mutually exclusive from the argmax plateau, hence invisible to
+    the K sample) is priced at that cluster's relative loss.
     ``provably_misses_all`` (2026-07-18 verify fix) is True iff a structural
     leg of the candidate provably MISSES in EVERY cached peak row AND in every
     state of the FULL top-loss plateau (``GamePeakProfile.plateau_slices`` —
-    the entire argmax level, not the K sample): the parlay is dead everywhere
-    the book bleeds worst — the flattening flow that earns the rebate. An
+    the entire argmax level, not the K sample) AND (2026-07-19, strictly
+    tighter) in every state of every CACHED lower cluster: the parlay is dead
+    everywhere the book bleeds — the flattening flow that earns the rebate. An
     uncached plateau (too large) makes it False (neutral, never a rebate)."""
 
     hit_severity: float
@@ -248,6 +307,21 @@ def _slice_states(st: States, rows: NDArray[np.intp]) -> States:
     )
 
 
+def _branch_slices(
+    st: States, idx: NDArray[np.intp], branches: tuple[Team | None, ...], n: int
+) -> tuple[PlateauSlice, ...]:
+    """Group flat branch-major state indices into per-branch ``PlateauSlice``
+    rows (the exact representation both the plateau and the lower clusters
+    cache — ``_selected_possible``-ready)."""
+    out: list[PlateauSlice] = []
+    for bi, branch in enumerate(branches):
+        rows = idx[idx // n == bi] % n
+        if rows.size == 0:
+            continue
+        out.append(PlateauSlice(branch=branch, states=_slice_states(st, rows)))
+    return tuple(out)
+
+
 def _game_peak(
     game: str,
     plan_specs: dict[str, LegSpec],
@@ -256,6 +330,8 @@ def _game_peak(
     events: Mapping[str, str | None] | None,
     cfg: StructuralConfigView,
     k: int,
+    n_clusters: int,
+    cluster_min_frac: Fraction,
 ) -> GamePeakProfile | None:
     """Top-K loss states of one certified game's COMMITTED book (full signed
     netting — mirrors ``state_worst_case._certified_worst_case`` minus quotes
@@ -309,13 +385,40 @@ def _game_peak(
     if int(plateau_idx.size) > _PLATEAU_CACHE_MAX_STATES:
         plateau_slices = None
     else:
-        plats: list[PlateauSlice] = []
-        for bi, branch in enumerate(branches):
-            rows = plateau_idx[plateau_idx // n == bi] % n
-            if rows.size == 0:
-                continue
-            plats.append(PlateauSlice(branch=branch, states=_slice_states(st, rows)))
-        plateau_slices = tuple(plats)
+        plateau_slices = _branch_slices(st, plateau_idx, branches, n)
+    # MULTI-CLUSTER identification (2026-07-19): up to ``n_clusters - 1``
+    # DISTINCT loss LEVELS below the top plateau, descending, each qualifying
+    # at level >= cluster_min_frac x top_loss (exact int x Fraction compare —
+    # levels are exact centi-cent sums, so a "cluster" is an exact level set).
+    # All clusters share the ONE ``_PLATEAU_CACHE_MAX_STATES`` budget with the
+    # plateau; a cluster that does not fit is dropped WITH everything below it
+    # (drop-lowest-first — an uncached cluster is neutral: no widen from it,
+    # no rebate certification against it, exactly the single-plateau ship).
+    # Guards: an uncached plateau caches no lower clusters either (severity
+    # weights are anchored on the top level), and a top loss <= 0 has nothing
+    # to cluster (the skew's peak_ratio zeroes the whole component anyway).
+    lower_clusters: tuple[LossCluster, ...] = ()
+    if plateau_slices is not None and n_clusters >= 2 and top_loss > 0:
+        remaining = _PLATEAU_CACHE_MAX_STATES - int(plateau_idx.size)
+        num = cluster_min_frac.numerator
+        den = cluster_min_frac.denominator
+        picked: list[LossCluster] = []
+        for level_v in np.unique(flat)[::-1]:
+            level = int(level_v)
+            if level >= top_loss:
+                continue  # the top plateau itself — cluster 1, cached above
+            if level * den < num * top_loss:
+                break  # descending levels: nothing below meets the threshold
+            if len(picked) >= n_clusters - 1:
+                break  # cluster budget spent (the top plateau is cluster 1)
+            idx = np.nonzero(flat == level)[0]
+            if int(idx.size) > remaining:
+                break  # shared state cap: drop this and every LOWER cluster
+            remaining -= int(idx.size)
+            picked.append(
+                LossCluster(loss_cc=level, slices=_branch_slices(st, idx, branches, n))
+            )
+        lower_clusters = tuple(picked)
     return GamePeakProfile(
         game=game,
         params=params,
@@ -323,6 +426,8 @@ def _game_peak(
         top_loss_cc=top_loss,
         n_states_enumerated=n * len(branches),
         plateau_slices=plateau_slices,
+        lower_clusters=lower_clusters,
+        n_clusters=n_clusters,
     )
 
 
@@ -333,6 +438,8 @@ def build_peak_profile(
     structural_cfg: StructuralConfigView,
     *,
     k: int = 5,
+    n_clusters: int = 3,
+    cluster_min_frac: Fraction = Fraction(30, 100),
     input_generation: int = -1,
 ) -> PeakProfile:
     """Build the per-game peak-state cache of the COMMITTED book.
@@ -343,6 +450,13 @@ def build_peak_profile(
     ``marginals`` maps market_ticker -> P(YES) for the plan INVERSION only
     (settlement is marginal-free — a missing entry just drops that leg from
     the inversion, exactly as in ``state_worst_case_by_game``).
+
+    ``n_clusters`` / ``cluster_min_frac`` (2026-07-19 multi-cluster steer):
+    cache up to ``n_clusters`` distinct loss clusters per game — the top
+    plateau plus the descending lower loss levels at >= ``cluster_min_frac`` x
+    top loss, full level sets under the shared state cap (module docstring).
+    ``n_clusters=1`` reproduces the 2026-07-18 single-plateau profile
+    byte-identically.
 
     FAIL-SAFE: a game with no buildable structural plan, or whose enumeration
     raises, is simply ABSENT from the profile (the skew's neutral zero-adder
@@ -418,6 +532,8 @@ def build_peak_profile(
                 events,
                 structural_cfg,
                 k,
+                n_clusters,
+                cluster_min_frac,
             )
         except Exception:
             continue  # enumeration error -> absent -> neutral (never a guess)
@@ -452,6 +568,26 @@ def _parse_candidate_leg(
     return None if isinstance(spec, str) else spec
 
 
+def _hits_any(
+    slices: Sequence[PlateauSlice],
+    struct: Sequence[tuple[str, LegSpec]],
+    params: ModelParams,
+) -> bool:
+    """Can the candidate's structural parlay still HIT in ANY state of the
+    given cached slices? One vectorised ``_selected_possible`` per structural
+    leg per branch slice (the exact waiver settlement logic); non-structural
+    legs are adversarial (assumed hit) and already absent from ``struct``."""
+    for sl in slices:
+        hit = np.ones(int(sl.states.w.size), dtype=np.bool_)
+        for side, spec in struct:
+            hit &= _selected_possible(spec, side, sl.states, params, sl.branch)
+            if not bool(hit.any()):
+                break
+        if bool(hit.any()):
+            return True
+    return False
+
+
 def evaluate_peak_containment(
     profile: PeakProfile,
     game: str,
@@ -460,9 +596,12 @@ def evaluate_peak_containment(
 ) -> PeakContainment | None:
     """Does this candidate's parlay HIT in the cached peak states of ``game``?
 
-    O(K x legs) on cached rows: per structural leg ONE vectorised indicator
-    over the <= K cached states (``_selected_possible`` — the exact waiver
-    settlement logic). Non-structural legs of the game (and every other-game
+    O((K + cached cluster states) x legs) simple arithmetic on cached rows:
+    per structural leg ONE vectorised indicator per slice
+    (``_selected_possible`` — the exact waiver settlement logic) over the <= K
+    sampled rows and, at ``n_clusters >= 2``, the cached cluster level sets
+    (all clusters together bounded by the shared 4096-state cap, walked with
+    early exits). Non-structural legs of the game (and every other-game
     leg, which the caller never passes) are ADVERSARIAL: assumed hit, so they
     never block a hit and never certify a miss.
 
@@ -506,6 +645,38 @@ def evaluate_peak_containment(
                 if h and loss > 0:
                     severity = max(severity, loss / worst)
 
+        # MULTI-CLUSTER severity (operator directive 2026-07-19): at
+        # ``n_clusters >= 2`` the hit indicator ALSO runs over every cached
+        # cluster's FULL level set —
+        #     hit_severity = max over cached clusters of
+        #                    (cluster_loss / top_loss) x hit(cluster)
+        # folded into the K-row severity above, so a candidate stacking a
+        # SECOND loss cluster (mutually exclusive from the argmax plateau,
+        # hence invisible to the K sample — the live ESPARG ARG-champ+Messi
+        # ladder) widens, scaled by that cluster's loss relative to the top.
+        # Cluster 1 is the full top plateau (weight exactly 1.0 — worst ==
+        # top_loss whenever positive, K row 0 is the argmax); lower clusters
+        # walk in DESCENDING loss order with an early exit once no remaining
+        # weight can raise the max, so a candidate that already hit an argmax
+        # K row (the common stacker) pays zero extra cost here.
+        # ``n_clusters == 1`` skips this block entirely — the single-plateau
+        # legacy path, byte-identical.
+        if gp.n_clusters >= 2 and worst > 0:
+            if (
+                severity < 1.0
+                and gp.plateau_slices is not None
+                and _hits_any(gp.plateau_slices, struct, gp.params)
+            ):
+                severity = 1.0
+            for cluster in gp.lower_clusters:
+                if cluster.loss_cc <= 0:
+                    break  # descending: nothing below carries a loss
+                weight = cluster.loss_cc / worst
+                if weight <= severity:
+                    break  # descending: no lower cluster can raise the max
+                if _hits_any(cluster.slices, struct, gp.params):
+                    severity = weight
+
         # REBATE CERTIFICATION (2026-07-18 verify fix): ``provably_misses_all``
         # must prove a miss of the ENTIRE top-loss plateau, not of the K
         # sampled rows — on a loss plateau wider than K (one-way Advance book:
@@ -514,7 +685,13 @@ def evaluate_peak_containment(
         # missed all K rows yet raised the certified worst case by its full
         # premium. Certified against ``plateau_slices`` — the FULL argmax
         # level; uncached (None ⇒ too large) ⇒ False (neutral, never a rebate
-        # the quote path can't verify). Evaluated ONLY when the candidate
+        # the quote path can't verify). MULTI-CLUSTER (2026-07-19, strictly
+        # TIGHTER): the walk extends to every CACHED lower cluster's full
+        # level set — a candidate missing the top plateau but stacking a
+        # cached cluster B is cluster flow, not flattening flow, and earns no
+        # rebate. An UNCACHED (dropped) cluster is not certified against —
+        # same as the single-plateau ship (its fail-safe lands on the widen
+        # side: dropped ⇒ no widen from it). Evaluated ONLY when the candidate
         # already missed every cached row (the rebate's only reachable path —
         # ``_peak_component`` widens on any hit first), so the widen/stacker
         # path pays zero extra cost.
@@ -523,15 +700,12 @@ def evaluate_peak_containment(
             if gp.plateau_slices is None:
                 misses_all = False
             else:
-                for pl in gp.plateau_slices:
-                    hit = np.ones(int(pl.states.w.size), dtype=np.bool_)
-                    for side, spec in struct:
-                        hit &= _selected_possible(
-                            spec, side, pl.states, gp.params, pl.branch
-                        )
-                    if bool(hit.any()):
-                        misses_all = False
-                        break
+                misses_all = not _hits_any(gp.plateau_slices, struct, gp.params)
+                if misses_all:
+                    for cluster in gp.lower_clusters:
+                        if _hits_any(cluster.slices, struct, gp.params):
+                            misses_all = False
+                            break
 
         return PeakContainment(
             hit_severity=severity,

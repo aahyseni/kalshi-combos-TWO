@@ -141,7 +141,11 @@ QUOTE_TTL_S = 20.0
 
 
 def build_lifecycle_config(
-    risk_cfg: RiskConfig, *, peak_topk_states: int = 5
+    risk_cfg: RiskConfig,
+    *,
+    peak_topk_states: int = 5,
+    peak_n_clusters: int = 3,
+    peak_cluster_min_frac: str = "0.30",
 ) -> LifecycleConfig:
     """The ONE place YAML risk knobs become the live ``LifecycleConfig`` —
     extracted pure (the ``supervisor_launch_cmd`` precedent) so tests can prove
@@ -201,6 +205,12 @@ def build_lifecycle_config(
         # ``pricing.skew.peak_topk_states`` (a keyword here because this
         # builder's positional contract is RiskConfig-only).
         peak_topk_states=peak_topk_states,
+        # MULTI-CLUSTER steer (2026-07-19): distinct loss clusters cached per
+        # game + the qualifying threshold as a fraction of the top loss.
+        # Sourced from ``pricing.skew.peak_n_clusters`` /
+        # ``peak_cluster_min_frac``; 1 = the single-plateau behaviour.
+        peak_n_clusters=peak_n_clusters,
+        peak_cluster_min_frac=peak_cluster_min_frac,
     )
 
 
@@ -777,7 +787,10 @@ class QuoteApp:
                 # (candidate gate + its deadline, EV tolerance, MC waiver —
                 # see build_lifecycle_config for the per-knob rationale).
                 config=build_lifecycle_config(
-                    risk_cfg, peak_topk_states=skew_cfg.peak_topk_states
+                    risk_cfg,
+                    peak_topk_states=skew_cfg.peak_topk_states,
+                    peak_n_clusters=skew_cfg.peak_n_clusters,
+                    peak_cluster_min_frac=skew_cfg.peak_cluster_min_frac,
                 ),
                 balance_tracker=balance_tracker,
                 # Slate cap's per-leg game-start source — the exact pregame gate

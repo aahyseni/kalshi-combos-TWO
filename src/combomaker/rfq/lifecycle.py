@@ -400,6 +400,15 @@ class LifecycleConfig:
     # a hard ZERO adder (neutral), never a decline. Wired from
     # ``pricing.skew.peak_topk_states``.
     peak_topk_states: int = 5
+    # MULTI-CLUSTER peak steer (operator directive 2026-07-19): up to
+    # ``peak_n_clusters`` DISTINCT loss levels cached per game — the top
+    # plateau plus lower level sets at >= ``peak_cluster_min_frac`` (decimal
+    # string, exact Fraction, (0, 1]) of the top loss, all under the shared
+    # 4096-state cache cap (drop-lowest-first on overflow). 1 = the
+    # 2026-07-18 single-plateau behaviour, byte-identical (rollback knob).
+    # Wired from ``pricing.skew.peak_n_clusters`` / ``peak_cluster_min_frac``.
+    peak_n_clusters: int = 3
+    peak_cluster_min_frac: str = "0.30"
 
 
 @dataclass(frozen=True, slots=True)
@@ -3951,6 +3960,12 @@ class QuoteLifecycle:
                 None,
                 self._structural_cfg,
                 k=self._config.peak_topk_states,
+                # MULTI-CLUSTER steer (2026-07-19): Fraction("0.30") is exact
+                # (3/10) — the YAML decimal-string convention, validated in
+                # SkewConfig; a bad string raises here and rides the fail-safe
+                # neutral branch below.
+                n_clusters=self._config.peak_n_clusters,
+                cluster_min_frac=Fraction(self._config.peak_cluster_min_frac),
                 input_generation=gen,
             )
         except Exception:
@@ -3968,6 +3983,14 @@ class QuoteLifecycle:
                 game: gp.top_loss_cc for game, gp in sorted(profile.by_game.items())
             },
             k=self._config.peak_topk_states,
+            n_clusters=self._config.peak_n_clusters,
+            # Per-game cached lower-cluster loss levels — the live observable
+            # for the 2026-07-19 multi-cluster steer (empty at n_clusters=1).
+            clusters={
+                game: [c.loss_cc for c in gp.lower_clusters]
+                for game, gp in sorted(profile.by_game.items())
+                if gp.lower_clusters
+            },
         )
 
     def _peak_profile_for_quote(self) -> PeakProfile | None:
