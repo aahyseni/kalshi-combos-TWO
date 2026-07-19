@@ -4000,12 +4000,14 @@ class QuoteLifecycle:
         for ticker in self._committed_leg_tickers():
             if self._settled.resolved(ticker) is not None:
                 continue
-            try:
-                book = self._feed.book(ticker)
-            except KeyError:
-                book = None
-            if book is not None and book.valid:
-                continue  # the feed owns it — nothing to resolve
+            # THE SAME feed-readability predicate the provider uses
+            # (relight3 fix): register iff the feed cannot PRICE the leg —
+            # which includes a settled market's lingering VALID-but-EMPTY
+            # husk book, not just an absent/invalid one. Single source of
+            # truth (``_feed_marginal``) so registrar and provider can never
+            # diverge again.
+            if self._feed_marginal(ticker) is not None:
+                continue  # the feed serves a readable price — nothing to resolve
             self._settled.note_missing(ticker)
 
     def _maybe_resolve_settled_marginals(self) -> None:
@@ -4423,29 +4425,52 @@ class QuoteLifecycle:
             times.append((close - now).total_seconds())
         return min(times) if times else None
 
+    def _feed_marginal(self, market_ticker: str) -> float | None:
+        """The FEED-path marginal: the book's microprice, or None when the
+        feed cannot price the leg — no book object, an invalid book, OR a
+        valid book with no priceable two-sided top (``microprice()`` is None
+        on an empty/one-sided book).
+
+        THE single feed-readability predicate (relight3 root cause,
+        2026-07-19): settled/closed markets can retain VALID-but-EMPTY mirrors
+        in the feed, so "has a valid book object" and "the provider can read a
+        price" are DIFFERENT tests. The registrar used the former while the
+        provider effectively applied the latter — 9 exchange-finalized FRAENG
+        legs were never registered (their husk books looked feed-owned) and
+        the snapshot stayed unusable. Both ``_marginals`` and
+        ``_register_settled_candidates`` now consume THIS helper, so the two
+        can never diverge again: the feed serves a leg iff this returns a
+        price; the settled machinery owns it iff this returns None."""
+        try:
+            book = self._feed.book(market_ticker)
+        except KeyError:
+            return None
+        if not book.valid:
+            return None
+        return book.top().microprice()
+
     def _marginals(self, market_ticker: str) -> float | None:
-        """The lifecycle's ONE marginal provider: live feed microprice first;
-        for a leg whose book has left the feed, the permanently-cached
-        exchange-GRADED settlement fact (0.0/1.0) second; else None (UNKNOWN,
-        fail-closed — unchanged). The settled fallback is a pure in-memory
-        cache read (hot-path safe); fetching happens on the maintenance tick.
+        """The lifecycle's ONE marginal provider: the feed-READABLE microprice
+        first (``_feed_marginal`` — the shared predicate); for a leg the feed
+        cannot price (book gone, invalid, or a valid-but-EMPTY husk on a
+        settled market), the permanently-cached exchange-GRADED settlement
+        fact (0.0/1.0) second; else None (UNKNOWN, fail-closed — unchanged).
+        The settled fallback is a pure in-memory cache read (hot-path safe);
+        fetching happens on the maintenance tick.
 
         Feeding the graded 0/1 into the book/risk model makes every number
         CONDITIONAL on the settled facts — the correct book risk: a combo
         whose settled leg LOST samples a deterministically-dead parlay (zero
         further loss), one whose settled leg WON carries the full conditional
         exposure of its remaining legs."""
-        try:
-            book = self._feed.book(market_ticker)
-        except KeyError:
-            book = None
-        if book is not None and book.valid:
-            return book.top().microprice()
-        if self._settled is None:
-            return None
-        p = self._settled.resolved(market_ticker)
+        p = self._feed_marginal(market_ticker)
         if p is not None:
             return p
+        if self._settled is None:
+            return None
+        fact = self._settled.resolved(market_ticker)
+        if fact is not None:
+            return fact
         # Not resolved yet: register COMMITTED legs as fetch candidates (an
         # RFQ-only leg with no book stays a plain no-quote — never fetched).
         if market_ticker in self._committed_leg_tickers():

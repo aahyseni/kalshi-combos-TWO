@@ -205,6 +205,40 @@ the exchange grades it); the pending log line emitted with counts + sample.
 Suites: settled file **29/29**, related **183/183**, FULL **2458 passed**
 (2454 + 4), 3 deselected. ruff + mypy --strict clean.
 
+---
+
+## ADDENDUM 3 (relight3, `live_20260719_batchfacts.log`): valid-but-EMPTY husk books — shared feed-readability predicate
+
+Relight3 confirmed the batch registrar + priority + pending line work (pending
+burned to 1, ESPARG live-drops silent) but 9 exchange-finalized FRAENG legs
+(`1HSPREAD-FRA2`, `1HTOTAL-2/3`, `ADVANCE-FRA`, `GOAL-MBAPP`, `SPREAD-FRA2/3`,
+`TOTAL-1/5`) STILL never registered → snapshot still unusable.
+
+**Root cause confirmed in code** (`marketdata/orderbook.py:61-77`):
+`TopOfBook.microprice()` returns **None whenever either book side is empty**.
+A settled market can retain a VALID-but-EMPTY (or one-sided) husk mirror in
+the feed. The registrar tested "has a valid book object" (`book.valid`) and
+skipped those legs as feed-owned, while the provider's read
+(`book.top().microprice()`) returned None — an early return that ALSO
+bypassed the settled-cache fallback. Predicate mismatch ⇒ unreadable-but-
+book-present legs never registered ⇒ permanent UNKNOWN.
+
+| item | desc | status |
+|------|------|--------|
+| `rfq/lifecycle.py _feed_marginal` (new) | THE single feed-readability predicate: book missing OR invalid OR unpriceable top (empty/one-sided ⇒ microprice None) ⇒ None. `_marginals` serves the feed iff it returns a price; the registrar registers iff it returns None — single source of truth, can never diverge again | SHIPPED |
+| `rfq/lifecycle.py _marginals` | now falls through to the settled-fact cache even when a husk book lingers (the old early return served the husk's None and shadowed a cached fact) | SHIPPED |
+| `rfq/lifecycle.py _register_settled_candidates` | consumes `_feed_marginal` instead of `book.valid` | SHIPPED |
+
+Verification: 3 new tests — (1) the exact relight3 shape: 9 committed legs
+with PRESENT-but-unpriceable books (valid-empty husks + invalid mirrors),
+exchange-finalized ⇒ registered on the next tick, resolved within TWO passes,
+snapshot usable; (2) the shared-predicate property over every feed state
+(no-book / invalid / valid-empty / valid-one-sided / full two-sided):
+registrar-registers ⟺ provider-feed-read-is-None, with only the priceable
+book feed-owned; (3) a cached fact serves THROUGH a lingering husk book.
+Suites: settled file **32/32**, related **198/198**, FULL **2461 passed**
+(2458 + 3), 3 deselected. ruff + mypy --strict clean.
+
 ## NEXT STEPS
 
 - **Operator**: relight. Watch order: `settled_resolution_pending` (the full

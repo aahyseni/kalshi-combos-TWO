@@ -1015,3 +1015,152 @@ class TestBatchRegistrationAndPriority:
         assert "settled_resolution_pending" in out
         assert "n_pending" in out and "n_never_fetched" in out
         assert "T-A" in out  # the sample names the tickers
+
+
+# --------------------------------------------------------------------------- #
+# RELIGHT3 (2026-07-19, live_20260719_batchfacts.log): 9 exchange-finalized    #
+# FRAENG legs never registered — settled markets can retain VALID-but-EMPTY    #
+# husk books in the feed, so the registrar's "has a valid book object" test    #
+# and the provider's "can read a microprice" test DIVERGED (microprice() is    #
+# None on an empty/one-sided book, so the provider returned None while the    #
+# registrar skipped the leg as feed-owned). Fix: ONE shared predicate          #
+# (`_feed_marginal`) consumed by both.                                         #
+# --------------------------------------------------------------------------- #
+
+
+async def _husk_books(h: Harness, empty: list[str], invalid: list[str]) -> None:
+    """Create feed mirrors in the two unpriceable-but-present states: VALID
+    with an EMPTY book (a settled market's lingering husk — the relight3
+    shape) and INVALID (watched, no snapshot yet)."""
+    from tests.test_feed import snapshot_env
+
+    tickers = [*empty, *invalid]
+    h.feed.watch(tickers)
+    await h.ws.ack_subscription(len(h.ws.subscriptions) - 1, 90)
+    for seq, ticker in enumerate(empty, start=1):
+        env = snapshot_env(90, seq, ticker)
+        env["msg"]["yes_dollars_fp"] = []
+        env["msg"]["no_dollars_fp"] = []
+        await h.ws.deliver(env)
+    # ``invalid`` tickers: watched (mirror object EXISTS) but no snapshot ⇒
+    # mirror stays invalid.
+
+
+class TestSharedFeedReadabilityPredicate:
+    async def test_husk_book_legs_register_resolve_and_snapshot_usable(
+        self, harness: tuple[Harness, Store]
+    ) -> None:
+        # The exact relight3 shape: 9 committed legs, exchange-finalized, but
+        # their feed books still EXIST (valid-but-empty husks / invalid
+        # mirrors). They must register on the next tick, resolve within TWO
+        # passes, and the snapshot must become usable.
+        h, store = harness
+        husks = [f"HUSK-{i}" for i in range(9)]
+        await _husk_books(
+            h,
+            empty=[t for i, t in enumerate(husks) if i % 2 == 0],
+            invalid=[t for i, t in enumerate(husks) if i % 2 == 1],
+        )
+        source = FakeMarketSource()
+        for t in husks:
+            source.payloads[t] = market_payload(t, status="finalized", result="yes")
+        settled = _resolver(source, h.clock)
+        lifecycle, _sender, exposure = _build(
+            h, store, bankroll_cc=10**11, settled=settled
+        )
+        for i, t in enumerate(husks):
+            exposure.add_position(
+                OpenPosition(
+                    position_id=f"p{i}",
+                    combo_ticker=f"COMBO-p{i}",
+                    collection=None,
+                    our_side=Side.NO,
+                    contracts=CentiContracts(100),
+                    entry_price_cc=CentiCents(5_000),
+                    legs=(LegRef(t, FRAENG_EVENT, "yes"), LegRef("M1", "E1", "no")),
+                )
+            )
+        # Pre-fix pin: every husk book EXISTS in the feed (the old registrar
+        # predicate would have skipped all of them) yet the provider cannot
+        # price a single one.
+        for t in husks:
+            assert h.feed.book(t) is not None  # book OBJECT present
+            assert lifecycle._feed_marginal(t) is None  # noqa: SLF001
+        # Two maintenance ticks = registration + two bounded passes (5+4).
+        for _ in range(2):
+            await lifecycle.maintenance_tick()
+            task = lifecycle._settled_task  # noqa: SLF001
+            assert task is not None
+            await task
+        for t in husks:
+            assert settled.resolved(t) == 1.0  # resolved within 2 passes
+        lifecycle.recompute_book_risk()
+        snap = lifecycle._book_risk  # noqa: SLF001
+        assert snap is not None
+        assert snap.unknown is False
+        assert snap.usable
+
+    async def test_registrar_iff_provider_feed_none_for_every_feed_state(
+        self, harness: tuple[Harness, Store]
+    ) -> None:
+        # The shared-predicate property: with no fact cached, the registrar
+        # registers a committed leg ⟺ the provider's FEED-path read returns
+        # None — across every feed state: no book at all, invalid mirror,
+        # valid-but-EMPTY book, valid one-sided book, and a full two-sided
+        # book (the only feed-owned state).
+        h, store = harness
+        await _husk_books(h, empty=["ST-EMPTY"], invalid=["ST-INVALID"])
+        from tests.test_feed import snapshot_env
+
+        h.feed.watch(["ST-ONESIDED"])
+        await h.ws.ack_subscription(len(h.ws.subscriptions) - 1, 91)
+        env = snapshot_env(91, 1, "ST-ONESIDED")
+        env["msg"]["no_dollars_fp"] = []  # yes side only ⇒ microprice None
+        await h.ws.deliver(env)
+        states = ["ST-NOBOOK", "ST-INVALID", "ST-EMPTY", "ST-ONESIDED", "M1"]
+        settled = _resolver(FakeMarketSource(), h.clock)
+        lifecycle, _sender, exposure = _build(
+            h, store, bankroll_cc=10**11, settled=settled
+        )
+        exposure.add_position(
+            OpenPosition(
+                position_id="all-states",
+                combo_ticker="COMBO-states",
+                collection=None,
+                our_side=Side.NO,
+                contracts=CentiContracts(100),
+                entry_price_cc=CentiCents(5_000),
+                legs=tuple(LegRef(t, "E1", "yes") for t in states),
+            )
+        )
+        lifecycle._register_settled_candidates()  # noqa: SLF001
+        for t in states:
+            provider_feed_none = lifecycle._feed_marginal(t) is None  # noqa: SLF001
+            registered = t in settled._pending  # noqa: SLF001 — queue seam
+            assert registered == provider_feed_none, t
+        # And concretely: only the priceable two-sided book is feed-owned.
+        assert "M1" not in settled._pending  # noqa: SLF001
+        for t in ("ST-NOBOOK", "ST-INVALID", "ST-EMPTY", "ST-ONESIDED"):
+            assert t in settled._pending  # noqa: SLF001
+
+    async def test_cached_fact_serves_through_a_husk_book(
+        self, harness: tuple[Harness, Store]
+    ) -> None:
+        # Corollary of the shared predicate: once the fact is cached, the
+        # provider serves it even though a valid-but-EMPTY husk book still
+        # exists (the old code returned the husk's None microprice EARLY and
+        # never consulted the cache).
+        h, store = harness
+        await _husk_books(h, empty=["HUSK-FACT"], invalid=[])
+        source = FakeMarketSource()
+        source.payloads["HUSK-FACT"] = market_payload(
+            "HUSK-FACT", status="finalized", result="no"
+        )
+        settled = _resolver(source, h.clock)
+        settled.note_missing("HUSK-FACT")
+        assert await settled.resolve_pending() == 1
+        lifecycle, _sender, _exposure = _build(
+            h, store, bankroll_cc=10**11, settled=settled
+        )
+        assert h.feed.book("HUSK-FACT").valid  # husk still present + "valid"
+        assert lifecycle._marginals("HUSK-FACT") == 0.0  # noqa: SLF001 — the fact
