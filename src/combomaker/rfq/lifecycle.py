@@ -405,7 +405,8 @@ class LifecycleConfig:
     # plateau plus lower level sets at >= ``peak_cluster_min_frac`` (decimal
     # string, exact Fraction, (0, 1]) of the top loss, all under the shared
     # 4096-state cache cap (drop-lowest-first on overflow). 1 = the
-    # 2026-07-18 single-plateau behaviour, byte-identical (rollback knob).
+    # single-plateau CLUSTER semantics exactly (cluster-view rollback knob;
+    # the 2026-07-19 magnitude recalibration applies at every n).
     # Wired from ``pricing.skew.peak_n_clusters`` / ``peak_cluster_min_frac``.
     peak_n_clusters: int = 3
     peak_cluster_min_frac: str = "0.30"

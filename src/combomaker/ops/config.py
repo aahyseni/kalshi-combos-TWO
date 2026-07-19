@@ -1818,12 +1818,17 @@ class SkewConfig(StrictModel):
     # PEAK-CONCENTRATION pricing steer (operator directive 2026-07-18 evening;
     # risk/skew._peak_component + sim/peak_profile.py). An ADDITIVE second
     # classifier component riding the SAME armed skew seam: a candidate that
-    # HITS the committed book's cached top-K worst scorelines widens by up to
-    # ``peak_widen_max_cc`` extra (scaled by the candidate's own premium vs the
-    # game-loss budget AND convexly by how close that game's peak already is to
-    # the budget); one that provably MISSES the ENTIRE top-loss plateau
-    # (certified against the full argmax level, not the K sample — 2026-07-18
-    # verify fix) rebates by up to ``peak_tighten_max_cc``. Composed total stays inside
+    # HITS the committed book's cached worst scorelines/clusters widens by
+    # ``peak_widen_max_cc x hit_severity x peak_ratio**gamma`` (severity = the
+    # hit cluster's loss relative to the top; ratio = how close that game's
+    # peak already is to the game-loss budget — MAGNITUDE RECALIBRATION
+    # 2026-07-19 evening: the old candidate-size factor is GONE, the price
+    # reflects WHERE the risk lands, never the clip size, which the caps/
+    # velocity brake already govern); one that provably MISSES the ENTIRE
+    # top-loss plateau (certified against the full argmax level, not the K
+    # sample — 2026-07-18 verify fix) AND every cached lower cluster
+    # (2026-07-19) rebates ``peak_tighten_max_cc x peak_ratio`` — quoted
+    # TIGHTER to win the flattening auctions. Composed total stays inside
     # [-(skew_max_tighten_cc+peak_tighten_max_cc),
     #  +(skew_max_widen_cc+peak_widen_max_cc)]. PRICING ONLY — no new caps, no
     # new skip reasons; any doubt (no profile / stale generation / unparseable
@@ -1844,8 +1849,9 @@ class SkewConfig(StrictModel):
     # neutral — today's behaviour). Hitting ANY cached cluster widens, scaled
     # by that cluster's loss relative to the top; the anti-peak rebate now
     # certifies a provable miss of ALL cached clusters (strictly tighter).
-    # ``peak_n_clusters: 1`` is byte-identical to the 2026-07-18
-    # single-plateau ship (the rollback knob). ``peak_cluster_min_frac`` is a
+    # ``peak_n_clusters: 1`` restores the single-plateau CLUSTER semantics
+    # exactly (the cluster-view rollback knob; the 2026-07-19 magnitude
+    # recalibration applies at every n). ``peak_cluster_min_frac`` is a
     # decimal STRING parsed to an exact Fraction in (0, 1] (house convention;
     # floats banned for thresholds).
     peak_n_clusters: int = 3

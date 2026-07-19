@@ -25,9 +25,11 @@ scoreline". This module supplies the missing input as a PURE PRICING signal:
      enumeration, NO I/O at quote time.
 
 The consumer is the EXISTING skew seam (``risk/skew.py``): a candidate that
-hits the peak WIDENS (scaled by its own loss contribution relative to the
-game-loss budget AND by how large the game's peak already is relative to that
-budget), a candidate that provably MISSES the ENTIRE top-loss plateau — the
+hits the peak WIDENS (scaled by the severity of the cached state/cluster it
+lands on AND by how large the game's peak already is relative to the game-loss
+budget — 2026-07-19 magnitude recalibration: never by the clip size, which the
+caps/velocity brake already govern), a candidate that provably MISSES the
+ENTIRE top-loss plateau — the
 full argmax level, certified against ``plateau_slices``, never just the K
 sample (2026-07-18 verify fix) — TIGHTENS (its premium pays into our loss
 states — distribution-flattening flow). PRICING ONLY: this module never
@@ -45,7 +47,9 @@ top loss), each as its FULL level set, all under the SHARED
 an uncached cluster is neutral, exactly today's behaviour). Hitting ANY cached
 cluster widens, scaled by that cluster's loss relative to the top; the rebate
 now certifies a provable miss of ALL cached clusters (strictly tighter).
-``n_clusters == 1`` is byte-identical to the 2026-07-18 single-plateau ship.
+``n_clusters == 1`` restores the single-plateau CLUSTER semantics exactly
+(profile content + severity/rebate walks; the skew's 2026-07-19 magnitude
+recalibration applies at every n).
 
 SEMANTICS (inherited from ``state_worst_case``, committed-book subset):
 

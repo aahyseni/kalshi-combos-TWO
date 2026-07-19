@@ -223,9 +223,12 @@ class InventorySkew:
     # the SkewParams-documented overall clamp. ``peak_widen_cc`` /
     # ``peak_tighten_cc`` are the pre-clamp non-negative halves;
     # ``peak_per_game`` is the debug-level explanation: one
-    # ``(game, adder_cc, peak_overlap, reason)`` row per candidate game (reasons:
+    # ``(game, adder_cc, factor, reason)`` row per candidate game — ``factor``
+    # is the hit_severity on peak_hit rows and the peak_ratio on
+    # peak_miss_rebate rows (2026-07-19 magnitude recalibration: the
+    # candidate-size factor is gone). Reasons:
     # peak_hit / peak_miss_rebate / no_peak_profile / peak_not_a_loss /
-    # unknown / neutral, plus the global stale_profile / disabled sentinels).
+    # unknown / neutral, plus the global stale_profile / disabled sentinels.
     peak_cc: int = 0
     peak_widen_cc: int = 0
     peak_tighten_cc: int = 0
@@ -319,19 +322,26 @@ def compute_inventory_skew(
     component: per candidate game, a structural containment check against the
     <= K cached peak scorelines (O(K x legs), no MC, no enumeration). Defining
 
-        peak_overlap = min(1, candidate premium / game-loss budget)
-                       x hit_severity            (severity of the worst cached
-                                                  state the candidate HITS)
+        hit_severity = relative loss of the worst cached state/cluster the
+                       candidate's parlay can still HIT (state loss / the
+                       game's top loss, in [0, 1])
         peak_ratio   = min(1, game peak loss / game-loss budget)
 
-    a HIT contributes  ``+ peak_widen_max_cc x peak_overlap x peak_ratio**gamma``
+    a HIT contributes  ``+ peak_widen_max_cc x hit_severity x peak_ratio**gamma``
     (convex in how close the book's peak already is to its budget: a small book
-    is nearly free, a peak near budget pays the full widen). MULTI-CLUSTER
+    is nearly free, a peak near budget pays the full widen). MAGNITUDE
+    RECALIBRATION (operator directive 2026-07-19 evening): the old
+    candidate-size factor ``min(1, candidate premium / budget)`` is GONE from
+    both sides — a quote's per-contract price reflects WHERE its risk lands,
+    never the clip size (size is the caps'/velocity brake's job; on the live
+    tape the ~0.015 size factor of realistic clips multiplied against
+    peak_ratio**2 and zeroed the whole steer — a $15 rung on a ~$300 cluster
+    priced at ~0.01c). MULTI-CLUSTER
     (operator directive 2026-07-19): ``hit_severity`` is the max over ALL
     cached loss clusters of (cluster_loss / top_loss) x hit-indicator — the
     top plateau at weight 1.0 plus the cached lower clusters at their level
     weights (folded with the K-row severity; ``peak_n_clusters=1`` restores
-    the K-sample-only read byte-identically) — so stacking a SECOND loss
+    the K-sample-only read) — so stacking a SECOND loss
     cluster on a mutually exclusive branch (the live ESPARG ARG-champ+Messi
     ladder) now pays a widen scaled by that cluster's relative loss instead of
     riding free. A candidate
@@ -341,9 +351,10 @@ def compute_inventory_skew(
     refinement missed all K rows and pocketed the rebate while raising the
     certified worst case) — AND every CACHED lower cluster's level set
     (2026-07-19, strictly tighter) contributes
-    ``- peak_tighten_max_cc x min(1, premium/budget) x peak_ratio`` (the
+    ``- peak_tighten_max_cc x peak_ratio`` (the
     linear rebate for distribution-flattening flow — its premium pays into our
-    loss states; an uncached/oversized plateau ⇒ no rebate, neutral).
+    loss states, so we quote TIGHTER to win those auctions; an
+    uncached/oversized plateau ⇒ no rebate, neutral).
     Summed over the candidate's games, then clamped to
     [-peak_tighten_max_cc, +peak_widen_max_cc] and ADDED to the independently
     clamped directional classifier, so the composed ``skew_cc`` obeys the
@@ -517,7 +528,10 @@ def _peak_component(
 
     Returns ``(widen_cc, tighten_cc, clamped_component_cc, per_game_debug)``
     where the component is clamped to [−peak_tighten_max_cc, +peak_widen_max_cc]
-    and the debug rows are ``(game, adder_cc, peak_overlap, reason)``.
+    and the debug rows are ``(game, adder_cc, factor, reason)`` — ``factor`` is
+    the ``hit_severity`` on ``peak_hit`` rows and the ``peak_ratio`` on
+    ``peak_miss_rebate`` rows (the one variable input of each side's price
+    after the 2026-07-19 magnitude recalibration).
 
     Pure O((K + cached cluster states) x legs) arithmetic on the CACHED
     profile rows — the containment indicator
@@ -541,10 +555,13 @@ def _peak_component(
     budget_cc = limits.max_event_worst_case_loss_dollars * 10_000.0
     if budget_cc <= 0.0:
         return 0, 0, 0, (("*", 0, 0.0, "no_budget"),)
-    # Candidate loss added in any state its parlay HITS = its full premium
-    # (long-NO seller loses exactly what it paid — OpenPosition.max_loss_cc,
-    # ground-truth verified), relative to the game-loss budget.
-    overlap_base = min(1.0, float(candidate.max_loss_cc) / budget_cc)
+    # MAGNITUDE RECALIBRATION (operator directive 2026-07-19 evening): the old
+    # candidate-size factor min(1, candidate.max_loss_cc / budget) is GONE — a
+    # quote's per-contract price reflects WHERE its risk lands (severity x
+    # book-peak ratio), never the clip size. Size is already governed exactly
+    # by the caps / last-look / velocity brake; multiplying the ~0.015 size
+    # factor of a realistic clip against peak_ratio**gamma zeroed the steer on
+    # the live tape (a $15 rung on a ~$300 cluster priced at ~0.01c).
 
     legs_by_game: dict[str, list[LegRef]] = {}
     for leg in candidate.legs:
@@ -577,15 +594,15 @@ def _peak_component(
             rows.append((game, 0, 0.0, "unknown"))
             continue
         if containment.hit_severity > 0.0:
-            peak_overlap = overlap_base * containment.hit_severity
-            term = params.peak_widen_max_cc * peak_overlap * (peak_ratio**params.gamma)
+            severity = containment.hit_severity
+            term = params.peak_widen_max_cc * severity * (peak_ratio**params.gamma)
             widen += term
-            rows.append((game, int(round(term)), round(peak_overlap, 6), "peak_hit"))
+            rows.append((game, int(round(term)), round(severity, 6), "peak_hit"))
         elif containment.provably_misses_all:
-            rebate = params.peak_tighten_max_cc * overlap_base * peak_ratio
+            rebate = params.peak_tighten_max_cc * peak_ratio
             tighten += rebate
             rows.append(
-                (game, -int(round(rebate)), round(overlap_base, 6), "peak_miss_rebate")
+                (game, -int(round(rebate)), round(peak_ratio, 6), "peak_miss_rebate")
             )
         else:
             # Hits only non-loss peak rows (possible when K exceeds the number
