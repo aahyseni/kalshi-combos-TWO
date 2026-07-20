@@ -423,10 +423,23 @@ class HaltInputs:
 
     ``peak_equity_cc`` = highest exchange equity seen intraday;
     ``current_equity_cc`` = current exchange equity. Give-back = peak − current.
+
+    ``pending_settlement_credit_cc`` = the sum of settlement RECEIVABLES: gross
+    credits for held positions whose outcome is KNOWN from exchange-graded facts
+    but whose cash the balance poll has not yet observed (the exchange removes a
+    settled position from ``portfolio_value`` before crediting ``balance``, so a
+    settlement cascade transiently dips equity by exactly this in-flight value —
+    the 2026-07-19 false-positive $430 give-back kill whose real losers were
+    $29.51). The give-back halts measure ``max(0, peak − current − pending)``:
+    receivables only ever REDUCE the measured give-back — they never inflate
+    equity or the peak — and a LOSING position produces no receivable, so a real
+    loss cascade is never shielded. Default 0 ⇒ every existing caller keeps the
+    exact raw measurement.
     """
 
     peak_equity_cc: int | None = None
     current_equity_cc: int | None = None
+    pending_settlement_credit_cc: int = 0
 
 
 class PortfolioRisk(Protocol):
@@ -925,7 +938,21 @@ class LimitChecker:
             halt_inputs.peak_equity_cc is not None
             and halt_inputs.current_equity_cc is not None
         ):
-            give_back_cc = halt_inputs.peak_equity_cc - halt_inputs.current_equity_cc
+            # Settlement-cascade shield: pending receivables (KNOWN-outcome
+            # credits the balance poll has not yet observed) reduce the measured
+            # give-back, floored at 0 — see HaltInputs. Raw peak/current stay
+            # untouched, so the shield can never inflate a peak; losers carry no
+            # receivable, so a genuine loss cascade still measures in full.
+            raw_give_back_cc = (
+                halt_inputs.peak_equity_cc - halt_inputs.current_equity_cc
+            )
+            pending_cc = halt_inputs.pending_settlement_credit_cc
+            give_back_cc = max(0, raw_give_back_cc - pending_cc)
+            pending_note = (
+                f" (raw {raw_give_back_cc}cc − receivables {pending_cc}cc)"
+                if pending_cc > 0
+                else ""
+            )
             hard_thr = threshold_cc(limits.hard_trip_frac, bankroll)
             draw_thr = threshold_cc(limits.drawdown_frac, bankroll)
             # Hard-trip is the deeper give-back; report it distinctly (KILL, not a
@@ -934,8 +961,9 @@ class LimitChecker:
                 out.append(
                     Breach(
                         ReasonCode.HALT_HARD_TRIP,
-                        f"give-back {give_back_cc}cc >= {limits.hard_trip_frac} "
-                        f"bankroll = {hard_thr}cc (KILL, human-only clear)",
+                        f"give-back {give_back_cc}cc{pending_note} >= "
+                        f"{limits.hard_trip_frac} bankroll = {hard_thr}cc "
+                        f"(KILL, human-only clear)",
                         shadow=shadow,
                     )
                 )
@@ -943,8 +971,8 @@ class LimitChecker:
                 out.append(
                     Breach(
                         ReasonCode.HALT_DRAWDOWN,
-                        f"give-back {give_back_cc}cc >= {limits.drawdown_frac} "
-                        f"bankroll = {draw_thr}cc",
+                        f"give-back {give_back_cc}cc{pending_note} >= "
+                        f"{limits.drawdown_frac} bankroll = {draw_thr}cc",
                         shadow=shadow,
                     )
                 )

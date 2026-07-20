@@ -150,6 +150,26 @@ class RfqFilter:
         pregame gate agree on each game's start."""
         return self._pregame.leg_start_time(market_ticker)
 
+    def leg_inplay_watch_exempt(self, market_ticker: str) -> bool:
+        """True iff this leg's game has STARTED per the SAME start-time ladder
+        the pregame gate stops quoting on — the in-play exemption for the
+        marginal-jump breaker (2026-07-19: in-play book drops tripped 45
+        halt_marginal_jump halts through the WC final; an in-play book going
+        dark is normal, not the dead-feed signature).
+
+        Polarity contract: the exemption may begin only once quoting on the leg
+        has ended, so — fail-closed — an UNKNOWN start keeps the full watch,
+        and ``allow_inplay_legs`` (operator re-enabled in-play quoting) disables
+        the exemption entirely: a leg we can still quote is never blind. Uses
+        the RAW start (no M_q margin), which begins the exemption at-or-after
+        the quote cutoff, never before."""
+        if self._config.allow_inplay_legs:
+            return False
+        start = self._pregame.leg_start_time(market_ticker)
+        if start is None:
+            return False
+        return self._clock.now().astimezone(UTC) >= start.astimezone(UTC)
+
     def _pregame_reasons(self, rfq: Rfq) -> list[ReasonCode]:
         """Pregame-only gate: any started leg ⇒ skip; any UNKNOWN start ⇒
         skip (fail-closed). Stands down only via config.allow_inplay_legs."""

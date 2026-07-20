@@ -781,6 +781,10 @@ class QuoteLifecycle:
         return HaltInputs(
             peak_equity_cc=self._balance.peak_equity_cc_or_none(),
             current_equity_cc=self._balance.exchange_equity_cc_or_none(),
+            # Settlement-cascade shield (2026-07-19 false-positive kill): the
+            # give-back halts subtract KNOWN-outcome in-flight settlement
+            # credits from the measured give-back (floored at 0 in the checker).
+            pending_settlement_credit_cc=self._balance.pending_receivables_cc(),
         )
 
     # ------------------------------------------------ portfolio-CVaR book risk
@@ -4034,6 +4038,37 @@ class QuoteLifecycle:
                 continue  # the feed serves a readable price — nothing to resolve
             self._settled.note_missing(ticker)
 
+    def _refresh_settlement_receivables(self) -> None:
+        """Note a settlement RECEIVABLE for every held position whose outcome is
+        KNOWN from exchange-graded leg facts (the settled-marginal resolver's
+        permanent cache) — the give-back cascade shield (2026-07-19 false-
+        positive kill: settled value leaves ``portfolio_value`` before the cash
+        lands in ``balance``, so the equity trough reads as a give-back).
+
+        Facts ONLY — never a live/feed marginal: a receivable shields a halt,
+        so doubt must produce NO receivable (fail-closed toward halting). A leg
+        without a graded fact ⇒ no receivable for that position this tick (the
+        sweep self-heals next tick once the fact lands). A position whose
+        predicted credit is zero (a loser) never notes one, so a genuine loss
+        cascade is never shielded. Runs every maintenance tick —
+        O(positions × legs) dict lookups, no I/O."""
+        if self._balance is None or self._settled is None:
+            return
+        for position in self._exposure.positions.values():
+            v_combo = 1.0
+            unresolved = False
+            for leg in position.legs:
+                fact = self._settled.resolved(leg.market_ticker)
+                if fact is None:
+                    unresolved = True
+                    break
+                v_combo *= fact if leg.side == "yes" else 1.0 - fact
+            if unresolved:
+                continue
+            credit_cc = self._predicted_settlement_credit_cc(position, v_combo)
+            if credit_cc > 0:
+                self._balance.note_receivable(position.position_id, credit_cc)
+
     def _maybe_resolve_settled_marginals(self) -> None:
         """Launch one bounded settled-marginal fetch pass (single-flight,
         fire-and-forget — the book-risk-task pattern) when a committed leg's
@@ -4075,6 +4110,11 @@ class QuoteLifecycle:
         # recompute paths above, which are what REGISTER the missing committed
         # legs (via ``_marginals``), so the first pass already sees them all.
         self._maybe_resolve_settled_marginals()
+        # SETTLEMENT RECEIVABLES (2026-07-19): once a position's outcome is
+        # KNOWN from graded facts, its predicted credit shields the give-back
+        # halts from the settlement-cascade equity trough. After the resolver
+        # pass above so a fact fetched this tick notes its receivable this tick.
+        self._refresh_settlement_receivables()
         # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): repair a confirmed fill
         # whose quote_executed WS message was lost, BEFORE the limit check so a
         # recovered position counts against the caps this same tick. Runs even
@@ -4268,6 +4308,21 @@ class QuoteLifecycle:
         if self._settled is None:
             return False
         return self._settled.market_no_longer_live(market_ticker)
+
+    def inplay_watch_exempt(self, market_ticker: str) -> bool:
+        """True iff the marginal-jump breaker must NOT watch this leg because
+        its game is IN-PLAY: the game has STARTED per the SAME start-time ladder
+        the pregame gate stops quoting on (2026-07-19: 45 halt_marginal_jump
+        trips through the final, every one an in-play ESPARG book going dark
+        mid-game — normal in-play behaviour, not the dead-feed signature). The
+        exemption begins exactly when quoting on the game ends, so a leg we can
+        still QUOTE keeps the full fail-closed watch; committed in-play legs
+        have nothing actionable behind a halt (resting quotes die via
+        cancel-on-invalidate, confirms via last-look freshness, and the
+        whole-feed staleness breaker stays fully armed). UNKNOWN start ⇒ False
+        (keep watching); ``allow_inplay_legs`` ⇒ False (never blind a leg the
+        operator re-enabled quoting on)."""
+        return self._filter.leg_inplay_watch_exempt(market_ticker)
 
     # ---------------------------------------------------------------- helpers
 

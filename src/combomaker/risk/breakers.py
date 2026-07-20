@@ -282,6 +282,19 @@ class BreakerInputs:
     # feed on a live market still trips exactly as before. Default empty ⇒
     # every existing caller keeps the strict pre-fix contract.
     settled_tickers: frozenset[str] = frozenset()
+    # IN-PLAY EXEMPTION (2026-07-19: 45 halt_marginal_jump trips through the WC
+    # final — every one an in-play ESPARG book going dark mid-game, 8 hard
+    # halts). Tickers whose GAME HAS STARTED per the SAME start-time ladder the
+    # pregame gate stops quoting on (sampled from
+    # ``QuoteLifecycle.inplay_watch_exempt``). An in-play book emptying or a
+    # goal moving a marginal > max_jump is NORMAL in-play behaviour, not the
+    # dead-feed/mis-mark signature — and by the polarity contract the exemption
+    # begins only once quoting on the leg has ended (UNKNOWN start or operator
+    # ``allow_inplay_legs`` ⇒ NOT in this set ⇒ full fail-closed watch). Legs
+    # not in either exempt set keep the full watch; the whole-feed staleness
+    # breaker is untouched. Default empty ⇒ every existing caller keeps the
+    # strict pre-fix contract.
+    inplay_tickers: frozenset[str] = frozenset()
     # ticker -> resolved game key (None = unresolvable). Only legs actually on
     # the risk path are here.
     game_keys: Mapping[str, str | None] = field(default_factory=dict)
@@ -380,7 +393,7 @@ class CircuitBreakers:
             # Marginal jump last: it also UPDATES the baseline, so run it after
             # the others (a trip elsewhere shouldn't leave the baseline half-way).
             jump = self._evaluate_marginal_jumps(
-                inputs.marginals, inputs.settled_tickers
+                inputs.marginals, inputs.settled_tickers, inputs.inplay_tickers
             )
             if jump.tripped:
                 return jump
@@ -396,17 +409,23 @@ class CircuitBreakers:
         self,
         marginals: Mapping[str, float | None],
         settled_tickers: AbstractSet[str] = frozenset(),
+        inplay_tickers: AbstractSet[str] = frozenset(),
     ) -> BreakerVerdict:
         tripped: BreakerVerdict | None = None
         for ticker, cur in marginals.items():
-            if ticker in settled_tickers:
+            if ticker in settled_tickers or ticker in inplay_tickers:
                 # SETTLED-LEG EXEMPTION (2026-07-18 02:17Z live halt): the
                 # exchange confirmed this market is no longer live, so there
                 # is nothing live to watch — its book leaving the feed is the
                 # normal permanent close transition (not a dead feed), a held
                 # graded fact is not a move, and the transition INTO the fact
                 # (e.g. 0.97 → 1.000 at grading) is a settlement, not a jump.
-                # PURGE the baseline so no stale reading can ever fire later.
+                # IN-PLAY EXEMPTION (2026-07-19, 45 trips through the final):
+                # the leg's game has started and quoting on it has ended — an
+                # in-play book going dark or gapping on a goal is normal, not
+                # the dead-feed signature. Either way PURGE the baseline so no
+                # stale reading can ever fire later; a book that RETURNS
+                # readable simply re-baselines (prev None ⇒ clear).
                 self._last_marginal.pop(ticker, None)
                 continue
             prev = self._last_marginal.get(ticker)

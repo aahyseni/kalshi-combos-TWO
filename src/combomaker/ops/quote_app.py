@@ -2042,7 +2042,7 @@ class QuoteApp:
         — UNKNOWN is never a convenient pass. Runs off the hot path (status loop,
         15s cadence), never in the 0.5s maintenance/status hot path.
         """
-        marginals, game_keys, book_legs, settled = self._book_leg_signals(
+        marginals, game_keys, book_legs, settled, inplay = self._book_leg_signals(
             exposure, lifecycle
         )
         return BreakerInputs(
@@ -2056,6 +2056,7 @@ class QuoteApp:
             marginals=marginals,
             game_keys=game_keys,
             settled_tickers=settled,
+            inplay_tickers=inplay,
             tripwire_hit=self._book_tripwire(self._book_leg_refs(exposure)),
             changed_markets=self._metadata_changes(book_legs, metadata),
         )
@@ -2066,6 +2067,7 @@ class QuoteApp:
         dict[str, float | None],
         dict[str, str | None],
         tuple[RfqLeg, ...],
+        frozenset[str],
         frozenset[str],
     ]:
         """Extract, from the legs the risk path actually touches (every open
@@ -2086,11 +2088,19 @@ class QuoteApp:
         (live halt 2026-07-18 02:17Z). The game-key map resolves
         ``pricing.grouping.game_key`` on each leg's ``event_ticker`` — a leg
         with no event_ticker resolves to ``None`` so the unmapped-game breaker
-        trips (a leg that would escape the cluster caps)."""
+        trips (a leg that would escape the cluster caps).
+
+        The IN-PLAY set (``lifecycle.inplay_watch_exempt``) carries every leg
+        whose game has STARTED per the same start-time ladder the pregame gate
+        stops quoting on: an in-play book going dark / gapping on a goal is
+        normal in-play behaviour, not the dead-feed signature (2026-07-19: 45
+        halt_marginal_jump trips through the WC final). UNKNOWN start or
+        operator-re-enabled in-play quoting ⇒ NOT in the set ⇒ full watch."""
         marginals: dict[str, float | None] = {}
         game_keys: dict[str, str | None] = {}
         legs: dict[str, RfqLeg] = {}  # market_ticker → RfqLeg (deduped)
         settled: set[str] = set()
+        inplay: set[str] = set()
         marginal_of = lifecycle.marginal_of
         for leg_refs in self._book_leg_refs(exposure):
             for leg in leg_refs:
@@ -2099,6 +2109,8 @@ class QuoteApp:
                     marginals[ticker] = marginal_of(ticker)
                     if lifecycle.settled_watch_exempt(ticker):
                         settled.add(ticker)
+                    elif lifecycle.inplay_watch_exempt(ticker):
+                        inplay.add(ticker)
                     game_keys[ticker] = (
                         game_key(leg.event_ticker) if leg.event_ticker else None
                     )
@@ -2111,7 +2123,13 @@ class QuoteApp:
                         # None is the pre-determination value.
                         yes_settlement_value_cc=None,
                     )
-        return marginals, game_keys, tuple(legs.values()), frozenset(settled)
+        return (
+            marginals,
+            game_keys,
+            tuple(legs.values()),
+            frozenset(settled),
+            frozenset(inplay),
+        )
 
     @staticmethod
     def _book_leg_refs(exposure: ExposureBook) -> list[tuple[Any, ...]]:

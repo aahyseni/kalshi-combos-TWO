@@ -82,6 +82,15 @@ CC_PER_CENT = 100
 # conservative), 1 = full equity.
 DEFAULT_PORTFOLIO_HAIRCUT = Fraction(1, 2)
 
+# Backstop TTL on a settlement RECEIVABLE (2026-07-19 false-positive give-back
+# kill): a pending receivable that is never exchange-confirmed expires after this
+# long and the give-back measurement returns to the raw peak−equity figure. Sized
+# from the observed settlement-cascade payment lag (minutes) with a wide margin;
+# NOT an operator knob — it is a structural bound on how long a predicted credit
+# may shield the give-back halts, and a wrong prediction is already caught to the
+# cent by HALT_RECONCILIATION_MISMATCH when the settlement row lands.
+DEFAULT_RECEIVABLE_TTL_S = 1800.0
+
 
 class BalanceSource(Protocol):
     """The one REST method the tracker needs. ``KalshiRestClient`` satisfies it;
@@ -229,6 +238,7 @@ class BalanceTracker:
         *,
         stale_after_s: float,
         portfolio_haircut: Fraction = DEFAULT_PORTFOLIO_HAIRCUT,
+        receivable_ttl_s: float = DEFAULT_RECEIVABLE_TTL_S,
     ) -> None:
         if not 0 <= portfolio_haircut <= 1:
             raise ValueError(f"portfolio_haircut must be in [0,1], got {portfolio_haircut}")
@@ -256,6 +266,25 @@ class BalanceTracker:
         self._cumulative_loss_cc: int = 0
         self._accrued_fees_cc: int = 0
         self._settled_ids: set[str] = set()
+        # SETTLEMENT RECEIVABLES (2026-07-19 false-positive give-back kill: the
+        # exchange removes a settled position from ``portfolio_value`` BEFORE
+        # crediting ``balance``, so during a settlement cascade exchange equity
+        # transiently dips by exactly the in-flight settlement value — the
+        # give-back halts read that trough as a $430 drawdown whose real losers
+        # were $29.51). A receivable = a held position's PREDICTED gross
+        # settlement credit once its outcome is KNOWN from exchange-graded leg
+        # facts. The give-back halts subtract the pending sum from the measured
+        # give-back (floored at 0) — receivables never touch equity or the peak
+        # itself, so they cannot inflate a peak or fabricate equity. Lifecycle:
+        # noted by the fact sweep → confirmed when the settlement reconciler
+        # books the exchange row → DROPPED at the first successful balance poll
+        # whose request STARTED after that confirmation (that poll provably
+        # includes the credited cash, so the shield lifts exactly when the cash
+        # is in the reading) → TTL backstop expires a never-confirmed one loudly.
+        self._receivable_ttl_s = receivable_ttl_s
+        self._receivables_cc: dict[str, int] = {}          # position_id → credit cc
+        self._receivable_noted_ns: dict[str, int] = {}     # for the TTL backstop
+        self._receivable_confirmed_ns: dict[str, int] = {}  # reconciler confirm stamp
 
     # --- live bankroll -------------------------------------------------------
 
@@ -277,6 +306,13 @@ class BalanceTracker:
         (e.g. re-anchor after a deposit), call ``set_start_of_day_equity`` to
         override.
         """
+        # Receivable drop rule needs the REQUEST-START instant: a poll that
+        # STARTED after the reconciler confirmed a settlement provably includes
+        # its credited cash (the exchange books the settlement row and the
+        # balance credit as one ledger event), so dropping the receivable on
+        # this poll's success can never leave a double-count window in either
+        # direction. Captured BEFORE the await.
+        request_start_ns = self._clock.monotonic_ns()
         payload = await source.get_balance()
         cash_cc = _parse_balance_cc(payload)
         portfolio_cc = _parse_portfolio_value_cc(payload)
@@ -284,6 +320,7 @@ class BalanceTracker:
         self._available_cash_cc = cash_cc
         self._portfolio_value_cc = portfolio_cc
         self._last_poll_ns = self._clock.monotonic_ns()
+        self._drop_confirmed_receivables(request_start_ns)
         today = self._clock.now().date()
         equity_cc = int(cash_cc) + int(portfolio_cc)
         if self._anchor_utc_date != today:
@@ -449,6 +486,89 @@ class BalanceTracker:
         if self.is_stale or self._peak_equity_cc is None:
             return None
         return self._peak_equity_cc
+
+    # --- settlement receivables (give-back cascade shield) -------------------
+
+    def note_receivable(self, position_id: str, amount_cc: int) -> None:
+        """Record/refresh a held position's PREDICTED gross settlement credit —
+        called by the lifecycle's fact sweep once EVERY leg of the position
+        carries an exchange-graded fact (outcome KNOWN, cash not yet observed).
+
+        Zero/negative amounts are ignored (a losing position produces no
+        receivable, so a genuine loss cascade is never shielded). Re-noting an
+        already-confirmed receivable is a no-op — once the reconciler has
+        confirmed the exchange row, only the drop rule may touch it (a sweep
+        racing the reconciler must not resurrect the TTL clock)."""
+        if amount_cc <= 0:
+            return
+        if position_id in self._receivable_confirmed_ns:
+            return
+        if position_id not in self._receivables_cc:
+            self._receivable_noted_ns[position_id] = self._clock.monotonic_ns()
+            log.info(
+                "settlement_receivable_noted",
+                position_id=position_id,
+                amount_cc=amount_cc,
+            )
+        self._receivables_cc[position_id] = amount_cc
+
+    def confirm_receivable(self, position_id: str) -> None:
+        """Stamp a receivable exchange-CONFIRMED — called by the settlement
+        reconciler right after it books the exchange's settlement row for this
+        position. The receivable then drops at the first successful balance
+        poll whose request started after this instant (see ``refresh``). A
+        position with no pending receivable is a no-op (the reconciler confirms
+        everything it books; not everything was fact-resolved first)."""
+        if position_id not in self._receivables_cc:
+            return
+        self._receivable_confirmed_ns[position_id] = self._clock.monotonic_ns()
+
+    def pending_receivables_cc(self) -> int:
+        """Sum of pending settlement receivables in cc — what the give-back
+        halts subtract from the measured give-back (floored at 0 by the
+        checker). TTL-expired entries are dropped LOUDLY first: a receivable
+        the reconciler never confirmed within the TTL stops shielding the
+        halts (fail-closed backstop — if the cash truly is not coming, the
+        give-back must become visible again)."""
+        if self._receivables_cc:
+            now_ns = self._clock.monotonic_ns()
+            ttl_ns = int(self._receivable_ttl_s * 1e9)
+            expired = [
+                pid
+                for pid, noted_ns in self._receivable_noted_ns.items()
+                if pid not in self._receivable_confirmed_ns
+                and now_ns - noted_ns > ttl_ns
+            ]
+            for pid in expired:
+                amount = self._receivables_cc.pop(pid, 0)
+                self._receivable_noted_ns.pop(pid, None)
+                log.warning(
+                    "settlement_receivable_ttl_expired",
+                    position_id=pid,
+                    amount_cc=amount,
+                    ttl_s=self._receivable_ttl_s,
+                )
+        return sum(self._receivables_cc.values())
+
+    def _drop_confirmed_receivables(self, poll_request_start_ns: int) -> None:
+        """Drop every receivable confirmed BEFORE this successful poll's request
+        started — that poll's reading provably contains the credited cash, so
+        the shield lifts in the same instant the cash enters the equity figure
+        (no window where both the receivable and the cash count)."""
+        dropped = [
+            pid
+            for pid, confirmed_ns in self._receivable_confirmed_ns.items()
+            if confirmed_ns < poll_request_start_ns
+        ]
+        for pid in dropped:
+            amount = self._receivables_cc.pop(pid, 0)
+            self._receivable_noted_ns.pop(pid, None)
+            self._receivable_confirmed_ns.pop(pid)
+            log.info(
+                "settlement_receivable_dropped",
+                position_id=pid,
+                amount_cc=amount,
+            )
 
     # --- realized-P&L ledger -------------------------------------------------
 

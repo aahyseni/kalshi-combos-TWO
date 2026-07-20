@@ -67,6 +67,16 @@ class _FixedBankroll:
         # directly with an explicit equity, not through this stub.
         return self._current
 
+    def pending_receivables_cc(self) -> int:
+        # Settlement-receivable seam (2026-07-19 give-back shield): 0 keeps the
+        # give-back halts on the exact raw peak−current measurement, so every
+        # existing rig reads unchanged. The REAL ledger is exercised in
+        # test_settlement_receivables.py.
+        return 0
+
+    def note_receivable(self, position_id: str, amount_cc: int) -> None:
+        return None  # sweep sink — the real ledger lives in BalanceTracker
+
 
 def _build_lifecycle(
     h: Harness,

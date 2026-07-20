@@ -356,6 +356,12 @@ class SettlementHandler:
                 )
                 return None
             self._reconciled.add(pos.position_id)
+            # Settlement-receivable confirm (give-back cascade shield): the
+            # exchange row for this position is now booked, so its receivable —
+            # if the fact sweep noted one — drops at the first balance poll
+            # whose request starts after this instant (that poll provably
+            # contains the credited cash). No receivable noted ⇒ no-op.
+            self._balance.confirm_receivable(pos.position_id)
             # A settled position no longer carries live risk: drop it from the
             # exposure book so it stops counting toward the enforced
             # game/slate/gross/CVaR caps + the daily-P&L mark (else settled

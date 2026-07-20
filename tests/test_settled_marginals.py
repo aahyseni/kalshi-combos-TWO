@@ -827,6 +827,9 @@ class TestSettledWatchExemptWiring:
             def settled_watch_exempt(self, market_ticker: str) -> bool:
                 return market_ticker in self._s
 
+            def inplay_watch_exempt(self, market_ticker: str) -> bool:
+                return False  # this rig exercises the settled path only
+
         app = _demo_app(tmp_path)
         exposure = ExposureBook(TEST_CONVENTIONS)
         exposure.add_position(_cross_game_position("held"))
