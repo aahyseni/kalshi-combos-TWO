@@ -37,6 +37,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from combomaker.core.conventions import Side
 from combomaker.core.money import (
     ZERO,
     CentiCents,
@@ -360,8 +361,14 @@ class SettlementHandler:
             # exchange row for this position is now booked, so its receivable —
             # if the fact sweep noted one — drops at the first balance poll
             # whose request starts after this instant (that poll provably
-            # contains the credited cash). No receivable noted ⇒ no-op.
-            self._balance.confirm_receivable(pos.position_id)
+            # contains the credited cash). No receivable noted ⇒ no-op. The
+            # EXCHANGE-derived credit rides along (review F4): a fact-derived
+            # receivable that disagrees ≥1¢ was a phony shield and drops
+            # immediately instead of confirming.
+            self._balance.confirm_receivable(
+                pos.position_id,
+                expected_credit_cc=self._exchange_credit_cc(pos, parsed),
+            )
             # A settled position no longer carries live risk: drop it from the
             # exposure book so it stops counting toward the enforced
             # game/slate/gross/CVaR caps + the daily-P&L mark (else settled
@@ -390,6 +397,18 @@ class SettlementHandler:
             realized_cc=total_realized_cc,
             booked=any_new,
         )
+
+    @staticmethod
+    def _exchange_credit_cc(pos: OpenPosition, parsed: ParsedSettlement) -> int:
+        """This position's gross settlement credit from the EXCHANGE's V —
+        the same convention frame as the lifecycle's predicted-credit helper
+        (LONG NO pays $1−V, LONG YES pays V; keep in sync with
+        ``QuoteLifecycle._predicted_settlement_credit_cc``). Used to
+        cross-check a fact-derived receivable at confirm time (review F4)."""
+        contracts = int(pos.contracts)
+        v_cc = round(parsed.settled_value * 10_000)
+        per_ct = (10_000 - v_cc) if pos.our_side is Side.NO else v_cc
+        return contracts * per_ct // 100
 
     def _build_settlement(
         self, pos: OpenPosition, parsed: ParsedSettlement

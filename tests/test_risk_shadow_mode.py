@@ -77,6 +77,17 @@ class _FixedBankroll:
     def note_receivable(self, position_id: str, amount_cc: int) -> None:
         return None  # sweep sink — the real ledger lives in BalanceTracker
 
+    def cancel_receivable(self, position_id: str) -> None:
+        return None  # removal-path sink (review F6)
+
+    def pnl_equity_cc_or_none(self) -> int | None:
+        # P&L-space seam (2026-07-21): this stub has no transfer ledger, so
+        # pnl-space == the fixed raw figures — give-back tests read unchanged.
+        return self._current
+
+    def peak_pnl_cc_or_none(self) -> int | None:
+        return self._peak
+
 
 def _build_lifecycle(
     h: Harness,

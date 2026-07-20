@@ -337,6 +337,36 @@ class FiltersConfig(StrictModel):
     pregame_quote_margin_s_by_prefix: dict[str, float] = {}
     pregame_confirm_margin_s_by_prefix: dict[str, float] = {}
 
+    @field_validator("pregame_quote_margin_s", "pregame_confirm_margin_s")
+    @classmethod
+    def _margin_nonnegative(cls, v: float) -> float:
+        # NEGATIVE margins would put the quote cutoff AFTER the game start —
+        # quoting an in-play leg while the in-play watch exemption has already
+        # blinded its breaker (2026-07-21 review, MED: the polarity contract
+        # "exemption begins only once quoting ends" must hold for every
+        # config). In-play quoting has a dedicated, exemption-aware switch:
+        # filters.allow_inplay_legs.
+        if v < 0:
+            raise ValueError(
+                f"pregame margins must be >= 0 (got {v}) — to quote in-play, "
+                "use filters.allow_inplay_legs, never a negative margin"
+            )
+        return v
+
+    @field_validator(
+        "pregame_quote_margin_s_by_prefix", "pregame_confirm_margin_s_by_prefix"
+    )
+    @classmethod
+    def _prefix_margins_nonnegative(cls, v: dict[str, float]) -> dict[str, float]:
+        for prefix, margin in v.items():
+            if margin < 0:
+                raise ValueError(
+                    f"pregame margin for prefix {prefix!r} must be >= 0 "
+                    f"(got {margin}) — to quote in-play, use "
+                    "filters.allow_inplay_legs, never a negative margin"
+                )
+        return v
+
     @field_validator("pregame_confirm_margin_s")
     @classmethod
     def _confirm_ge_quote(cls, v: float, info: ValidationInfo) -> float:

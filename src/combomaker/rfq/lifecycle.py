@@ -779,8 +779,12 @@ class QuoteLifecycle:
         if self._balance is None:
             return HaltInputs()
         return HaltInputs(
-            peak_equity_cc=self._balance.peak_equity_cc_or_none(),
-            current_equity_cc=self._balance.exchange_equity_cc_or_none(),
+            # P&L-SPACE pair (2026-07-21 review): peak/current of equity minus
+            # detected external transfers, so a deposit is never give-back
+            # headroom and a withdrawal is never a drawdown. The raw
+            # high-water accessors remain for reports only.
+            peak_equity_cc=self._balance.peak_pnl_cc_or_none(),
+            current_equity_cc=self._balance.pnl_equity_cc_or_none(),
             # Settlement-cascade shield (2026-07-19 false-positive kill): the
             # give-back halts subtract KNOWN-outcome in-flight settlement
             # credits from the measured give-back (floored at 0 in the checker).
@@ -3432,6 +3436,13 @@ class QuoteLifecycle:
         if self._reservation is not None:
             self._reservation.release(f"fill:{quote_id}")
         self._exposure.remove_position(f"fill:{quote_id}")
+        # A phantom position may have accrued a settlement RECEIVABLE while it
+        # sat in the book through game end (the fact sweep notes any held
+        # position with graded legs) — cash that will never arrive, because
+        # there was no fill. Cancel it with the position (2026-07-21 review
+        # F6), else it shields the give-back halts for the full TTL.
+        if self._balance is not None:
+            self._balance.cancel_receivable(f"fill:{quote_id}")
         self._executed_states.pop(quote_id, None)
         state.pending_fill = None
         self._drop_quote(quote_id)
@@ -3872,6 +3883,16 @@ class QuoteLifecycle:
         (limits also see UNKNOWN marginals as a breach on their own)."""
         unrealized = 0
         for position in self._exposure.positions.values():
+            if not position.risk_modeled:
+                # CONSERVATIVELY-RESERVED holding (P0-4 / adoption 2026-07-21):
+                # its legs have no readable marginals BY CONSTRUCTION, so it
+                # can never be marked — SKIP it (its premium is already fully
+                # at risk in the deterministic caps). Treating it as a
+                # temporarily-unmarkable position would freeze the whole
+                # book's unrealized mark for the reserve's lifetime and
+                # silently disarm the daily-loss cap's unrealized half
+                # (2026-07-21 review, CRITICAL finding 1).
+                continue
             fair = 1.0
             failed = False
             for leg in position.legs:

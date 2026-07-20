@@ -26,6 +26,7 @@ import sqlite3
 import sys
 from collections import defaultdict
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -84,9 +85,23 @@ async def _fetch_exchange(max_pages: int) -> tuple[list[dict[str, object]], dict
 
 
 def _et_day(iso: str) -> str:
+    if not iso:
+        return "unknown-date"
     return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(ET).strftime(
         "%a %m/%d"
     )
+
+
+def _fee_cc(raw: object, ticker: str) -> int:
+    """Exact fee dollars-string → cc via Decimal (hard rule 5: no binary-float
+    money). Unparseable ⇒ 0 + a printed flag, never a guess."""
+    if raw is None:
+        return 0
+    try:
+        return int((Decimal(str(raw)) * 10_000).to_integral_value())
+    except (InvalidOperation, ValueError):
+        print(f"  !! unparseable fee_cost on {ticker}: {raw!r}")
+        return 0
 
 
 def main() -> None:
@@ -122,14 +137,7 @@ def main() -> None:
     for s in ours:
         t = str(s.get("ticker"))
         revenue_cc = int(s.get("revenue") or 0) * CC_PER_CENT
-        # settlement fee_cost is a dollars string; sub-cent fees exist — track
-        # to the cc without inventing precision (bad parse -> 0 + flagged row).
-        fee_raw = s.get("fee_cost")
-        try:
-            fee_cc = round(float(str(fee_raw)) * 10_000) if fee_raw is not None else 0
-        except ValueError:
-            fee_cc = 0
-            print(f"  !! unparseable fee_cost on {t}: {fee_raw!r}")
+        fee_cc = _fee_cc(s.get("fee_cost"), t)
         premium_cc = premium_by_ticker[t] + fill_fee_by_ticker[t]
         realized_cc = revenue_cc - premium_cc - fee_cc
         day = _et_day(str(s.get("settled_time") or s.get("settled_ts") or ""))
@@ -155,6 +163,9 @@ def main() -> None:
     print("=" * 74)
     print("CAMPAIGN REALIZED P&L — exchange settlement ledger vs local fill store")
     print("=" * 74)
+    if not fills:
+        print("fill store is EMPTY — nothing to reconcile.")
+        return
     print(f"fills in store: {len(fills)} across {len(fill_tickers)} combo markets "
           f"({fills[0]['at'][:10]} → {fills[-1]['at'][:10]})")  # type: ignore[index]
     print(f"exchange settlement rows matched: {len(ours)} markets "

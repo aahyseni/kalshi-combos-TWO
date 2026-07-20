@@ -236,6 +236,13 @@ class PregameGate:
         )
         return resolved.start - timedelta(seconds=margin_s)
 
+    def quote_cutoff_time(self, ticker: str) -> datetime | None:
+        """Public quote-side cutoff (``start − M_q`` for a precise start, the
+        bare estimate otherwise; None = UNKNOWN). Consumed by the in-play
+        watch exemption's polarity guard — the exemption instant is
+        ``max(start, this)`` so a leg is never exempt while still quotable."""
+        return self._cutoff_time(ticker, confirm=False)
+
     def leg_start_time(self, ticker: str) -> datetime | None:
         """Best available RAW start time for a leg's game; None = UNKNOWN.
 

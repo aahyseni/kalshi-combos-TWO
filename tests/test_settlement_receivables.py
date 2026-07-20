@@ -302,6 +302,15 @@ class _RecordingBankroll:
     def note_receivable(self, position_id: str, amount_cc: int) -> None:
         self.noted.append((position_id, amount_cc))
 
+    def cancel_receivable(self, position_id: str) -> None:
+        self.noted = [(p, a) for p, a in self.noted if p != position_id]
+
+    def pnl_equity_cc_or_none(self) -> int | None:
+        return None
+
+    def peak_pnl_cc_or_none(self) -> int | None:
+        return None
+
 
 def _two_leg_position(
     pid: str, *, fra_side: str = "yes", o5_side: str = "no"
@@ -412,6 +421,130 @@ class TestLifecycleFactSweep:
         lifecycle, _s, _e = _build(h, store, bankroll_cc=10**11, settled=None)
         lifecycle._balance = _RecordingBankroll(pending_cc=1_234)  # noqa: SLF001
         assert lifecycle._halt_inputs().pending_settlement_credit_cc == 1_234  # noqa: SLF001
+
+
+# --------------------------------------------------------------------------- #
+# 3b. Review-fix regressions (2026-07-21): TTL tombstone, cancel hook,         #
+#     confirm cross-check, reserve self-leg sign, daily-mark liveness.         #
+# --------------------------------------------------------------------------- #
+
+
+class TestReviewFixes:
+    def test_ttl_expiry_tombstones_against_renote(self) -> None:
+        # Review F3: the every-tick sweep re-notes a held position — a plain
+        # TTL pop would re-arm the shield one tick later, forever. The
+        # tombstone refuses re-notes after expiry.
+        tracker, clock = _tracker(ttl_s=60.0)
+        tracker.note_receivable("p1", 10_000)
+        clock.advance(61.0)
+        assert tracker.pending_receivables_cc() == 0  # expired
+        tracker.note_receivable("p1", 10_000)  # the sweep's next tick
+        assert tracker.pending_receivables_cc() == 0  # REFUSED — still raw
+
+    def test_renote_keeps_original_ttl_clock(self) -> None:
+        tracker, clock = _tracker(ttl_s=60.0)
+        tracker.note_receivable("p1", 10_000)
+        clock.advance(59.0)
+        tracker.note_receivable("p1", 10_000)  # re-note must NOT reset the TTL
+        clock.advance(2.0)
+        assert tracker.pending_receivables_cc() == 0
+
+    def test_cancel_clears_and_unblocks(self) -> None:
+        # Review F6: a position removed by a non-settlement path voids its
+        # cash claim immediately (no TTL lingering)…
+        tracker, clock = _tracker()
+        tracker.note_receivable("p1", 10_000)
+        tracker.cancel_receivable("p1")
+        assert tracker.pending_receivables_cc() == 0
+        # …and cancel also clears a tombstone (the position is gone; a NEW
+        # position with a recycled id may legitimately note again).
+        tracker2, clock2 = _tracker(ttl_s=60.0)
+        tracker2.note_receivable("p2", 5_000)
+        clock2.advance(61.0)
+        tracker2.pending_receivables_cc()  # expire → tombstone
+        tracker2.cancel_receivable("p2")
+        tracker2.note_receivable("p2", 5_000)
+        assert tracker2.pending_receivables_cc() == 5_000
+
+    def test_confirm_amount_mismatch_drops_the_shield(self) -> None:
+        # Review F4: a fact-derived receivable disagreeing ≥1¢ with the
+        # exchange-derived credit was a phony shield — drop, don't confirm.
+        tracker, _clock = _tracker()
+        tracker.note_receivable("p1", 10_000)
+        tracker.confirm_receivable("p1", expected_credit_cc=5_000)
+        assert tracker.pending_receivables_cc() == 0
+
+    def test_confirm_matching_amount_confirms(self) -> None:
+        tracker, _clock = _tracker()
+        tracker.note_receivable("p1", 10_000)
+        tracker.confirm_receivable("p1", expected_credit_cc=10_050)  # sub-1¢
+        assert tracker.pending_receivables_cc() == 10_000  # confirmed, held
+
+    async def test_reserve_self_leg_receivable_sign(
+        self, harness: tuple[Harness, Store]  # noqa: F811
+    ) -> None:
+        # Review CRITICAL: with the self-leg encoded side="yes", a NO reserve
+        # whose market settles NO (we WIN) notes the full credit, and one that
+        # settles YES (we LOSE) notes nothing — never the inversion.
+        h, store = harness
+        source = FakeMarketSource()
+        source.payloads["COMBO-WIN"] = market_payload(
+            "COMBO-WIN", status="determined", result="no"
+        )
+        source.payloads["COMBO-LOSE"] = market_payload(
+            "COMBO-LOSE", status="determined", result="yes"
+        )
+        settled = _resolver(source, h.clock)
+        settled.note_missing("COMBO-WIN")
+        settled.note_missing("COMBO-LOSE")
+        await settled.resolve_pending()
+        lifecycle, _s, exposure = _build(h, store, bankroll_cc=10**11, settled=settled)
+        bank = _RecordingBankroll()
+        lifecycle._balance = bank  # noqa: SLF001
+        for ticker in ("COMBO-WIN", "COMBO-LOSE"):
+            exposure.add_position(
+                OpenPosition(
+                    position_id=f"reserve:{ticker}",
+                    combo_ticker=ticker,
+                    collection=None,
+                    our_side=Side.NO,
+                    contracts=Q(500),
+                    entry_price_cc=CC(4_000),
+                    legs=(LegRef(ticker, ticker, "yes"),),
+                    risk_modeled=False,
+                )
+            )
+        lifecycle._refresh_settlement_receivables()  # noqa: SLF001
+        # WIN (V=0): NO pays $1 × 5.00 ct = 50_000cc. LOSE (V=1): nothing.
+        assert bank.noted == [("reserve:COMBO-WIN", 50_000)]
+
+    async def test_daily_mark_survives_a_reserve(
+        self, harness: tuple[Harness, Store]  # noqa: F811
+    ) -> None:
+        # Review CRITICAL: a reserve's permanently-unreadable self-leg must
+        # not freeze the whole book's unrealized mark (that silently disarms
+        # the daily-loss cap's unrealized half).
+        from combomaker.risk.limits import DailyPnl
+
+        h, store = harness
+        lifecycle, _s, exposure = _build(h, store, bankroll_cc=10**11, settled=None)
+        exposure.add_position(
+            OpenPosition(
+                position_id="reserve:COMBO-R",
+                combo_ticker="COMBO-R",
+                collection=None,
+                our_side=Side.NO,
+                contracts=Q(500),
+                entry_price_cc=CC(4_000),
+                legs=(LegRef("COMBO-R", "COMBO-R", "yes"),),
+                risk_modeled=False,
+            )
+        )
+        lifecycle.daily_pnl = DailyPnl(realized_cc=-777, unrealized_cc=-777)
+        lifecycle._refresh_daily_pnl()  # noqa: SLF001
+        # The mark REFRESHED (reserve skipped) instead of returning early and
+        # freezing the sentinel forever.
+        assert lifecycle.daily_pnl.unrealized_cc == 0
 
 
 # --------------------------------------------------------------------------- #

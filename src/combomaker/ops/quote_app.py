@@ -24,7 +24,7 @@ from typing import Any, Protocol
 from combomaker.core.clock import Clock, SystemClock
 from combomaker.core.conventions import Side, load_conventions
 from combomaker.core.money import CentiCents, MoneyParseError, cc_from_dollars_str
-from combomaker.core.quantity import CentiContracts
+from combomaker.core.quantity import CentiContracts, qty_from_fp_str
 from combomaker.core.reasons import ReasonCode
 from combomaker.exchange.auth import Credentials, RequestSigner
 from combomaker.exchange.quote_query import list_open_quotes, open_quote_ids
@@ -97,61 +97,92 @@ BALANCE_POLL_INTERVAL_S = 10.0
 # so realized P&L lands promptly for the enforced daily-loss cap.
 SETTLEMENT_POLL_INTERVAL_S = 30.0
 # External-transfer watch (2026-07-21): deposits/withdrawals are rare human
-# events — a slow poll is fine; what matters is that a mid-session transfer
-# adjusts the SOD/peak anchors within minutes, not that it lands instantly.
-# The startup delay lets the first balance poll land so the account_standing
-# line reports real figures instead of None.
-TRANSFER_WATCH_INTERVAL_S = 300.0
+# events, but a LAGGING withdrawal transiently reads as a give-back in P&L
+# space until detected (the K-ledger corrects it at detection) — 60s bounds
+# that window well under the operator's reaction time while costing two GETs
+# a minute. The startup delay lets the first balance poll land so the
+# account_standing line reports real figures instead of None.
+TRANSFER_WATCH_INTERVAL_S = 60.0
 TRANSFER_WATCH_STARTUP_DELAY_S = 15.0
 
-# Withdrawal statuses that mean the money has actually left the balance. The
-# deposits side is documented (applied|pending|failed|returned); withdrawals
-# mirror it, with "complete"/"completed" observed variants kept so an
-# unrecognized terminal spelling errs toward ADJUSTING anchors DOWN (which only
-# tightens the halts) rather than missing a real withdrawal.
-_TERMINAL_WITHDRAWAL_STATUSES = frozenset({"applied", "complete", "completed"})
+# Doc-verified 2026-07-21 (get-deposits.md / get-withdrawals.md): BOTH enums
+# are pending|applied|failed|returned; "applied" is the money-moved status
+# (deposit: "funds are reflected in balance"; withdrawal: "funds have been
+# deducted from balance"); finalized_ts (unix ms, nullable) stamps the
+# terminal transition. Never guess a Kalshi enum.
+_TRANSFER_APPLIED = "applied"
+_TRANSFER_RETURNED = "returned"
 
 
 def new_external_transfer_deltas(
-    seen: set[str],
+    statuses: dict[str, str],
     deposits: list[dict[str, Any]],
     withdrawals: list[dict[str, Any]],
-) -> list[tuple[str, str, int]]:
-    """``(kind, id, delta_cc)`` for every transfer that reached a terminal
-    money-moved status since the last pass; ``seen`` is mutated so each
-    transfer applies exactly once per process. Deltas are what the BALANCE
-    actually moved by: a deposit credits ``amount − fee`` (net), a withdrawal
-    debits ``amount + fee`` (the fee leaves the balance too). A pending/failed
-    row is never seeded, so a pending→applied transition IS picked up. Amounts
-    are int cents on the wire (doc-verified 2026-07-21) → ×100 to cc; a
-    non-int amount is skipped (never guess money)."""
-    out: list[tuple[str, str, int]] = []
-    for row in deposits:
-        if str(row.get("status")) != "applied":
-            continue
-        key = f"dep:{row.get('id')}"
-        if key in seen:
-            continue
-        amount = row.get("amount_cents")
-        if not isinstance(amount, int) or isinstance(amount, bool):
-            continue
-        fee = row.get("fee_cents")
-        fee_c = fee if isinstance(fee, int) and not isinstance(fee, bool) else 0
-        seen.add(key)
-        out.append(("deposit", key, (amount - fee_c) * 100))
-    for row in withdrawals:
-        if str(row.get("status")) not in _TERMINAL_WITHDRAWAL_STATUSES:
-            continue
-        key = f"wd:{row.get('id')}"
-        if key in seen:
-            continue
-        amount = row.get("amount_cents")
-        if not isinstance(amount, int) or isinstance(amount, bool):
-            continue
-        fee = row.get("fee_cents")
-        fee_c = fee if isinstance(fee, int) and not isinstance(fee, bool) else 0
-        seen.add(key)
-        out.append(("withdrawal", key, -(amount + fee_c) * 100))
+    *,
+    baseline_before_ms: int | None = None,
+) -> list[tuple[str, str, int, int]]:
+    """``(kind, ref, delta_cc, finalized_wall_ms)`` for every transfer whose
+    STATUS TRANSITION moved money since the last pass. ``statuses`` (mutated)
+    tracks each transfer's last-seen status so:
+
+    - a transition INTO ``applied`` applies its delta exactly once (deposit:
+      +net(amount − fee); withdrawal: −(amount + fee) — the balance moves by
+      those, int cents on the wire ×100 → cc);
+    - a later ``applied`` → ``returned`` regression (ACH clawback / bounced
+      withdrawal) applies the REVERSING delta (review F5 — a one-way seen-set
+      would leave the anchors permanently shifted by a clawed-back deposit);
+    - pending/failed rows only record status, so pending→applied IS picked up.
+
+    ``baseline_before_ms`` (first pass only): a transition whose
+    ``finalized_ts`` is at/before this instant is already inside the balance
+    the anchors formed on — status is recorded, NO delta (review F6: "terminal
+    at first pass" is the wrong criterion; ordering vs the anchor instant is
+    the right one). A row missing both id or a readable amount is skipped
+    loudly (never guess money); a missing ``finalized_ts`` falls back to
+    ``created_ts`` and then to 0 (treated as ancient ⇒ baselined / peak-safe
+    direction)."""
+    out: list[tuple[str, str, int, int]] = []
+    for kind, rows in (("deposit", deposits), ("withdrawal", withdrawals)):
+        prefix = "dep" if kind == "deposit" else "wd"
+        for row in rows:
+            row_id = row.get("id")
+            if not row_id:
+                log.warning("transfer_row_missing_id", kind=kind)
+                continue
+            key = f"{prefix}:{row_id}"
+            status = str(row.get("status"))
+            prev = statuses.get(key)
+            statuses[key] = status
+            amount = row.get("amount_cents")
+            if not isinstance(amount, int) or isinstance(amount, bool):
+                if status == _TRANSFER_APPLIED and prev != _TRANSFER_APPLIED:
+                    log.warning(
+                        "transfer_row_unreadable_amount", kind=kind, ref=key
+                    )
+                    statuses.pop(key, None)  # a later readable row still applies
+                continue
+            fee = row.get("fee_cents")
+            fee_c = fee if isinstance(fee, int) and not isinstance(fee, bool) else 0
+            # Balance delta of the money-moved event, signed.
+            moved_cc = (
+                (amount - fee_c) * 100 if kind == "deposit" else -(amount + fee_c) * 100
+            )
+            finalized = row.get("finalized_ts") or row.get("created_ts")
+            finalized_ms = (
+                finalized
+                if isinstance(finalized, int) and not isinstance(finalized, bool)
+                else 0
+            )
+            if status == _TRANSFER_APPLIED and prev != _TRANSFER_APPLIED:
+                if (
+                    baseline_before_ms is not None
+                    and finalized_ms <= baseline_before_ms
+                ):
+                    continue  # already inside the anchored readings — baseline
+                out.append((kind, key, moved_cc, finalized_ms))
+            elif status == _TRANSFER_RETURNED and prev == _TRANSFER_APPLIED:
+                # Clawback: reverse the applied delta (money moved back).
+                out.append((f"{kind}-returned", key, -moved_cc, finalized_ms))
     return out
 
 
@@ -523,6 +554,29 @@ def _exchange_exposure_cc_by_ticker(positions_payload: dict[str, Any]) -> dict[s
     return out
 
 
+async def _exchange_position_confirmed_flat(
+    rest: PositionsGetter, ticker: str, *, subaccount: int
+) -> bool:
+    """True iff a TARGETED read returns a row for ``ticker`` whose signed
+    position parses to exactly zero — the only provable "flat". A missing or
+    unparseable row is NOT flat (fail-safe: never release reserved risk on a
+    lagging or unreadable payload); a read error propagates to the caller's
+    retry."""
+    payload = await rest.get_positions(subaccount=subaccount, ticker=ticker)
+    rows = payload.get("market_positions") or payload.get("positions") or []
+    for row in rows:
+        if str(row.get("ticker") or row.get("market_ticker") or "") != ticker:
+            continue
+        raw = row.get("position_fp")
+        if raw is None:
+            return False
+        try:
+            return int(qty_from_fp_str(str(raw))) == 0
+        except ValueError:
+            return False
+    return False
+
+
 async def position_reconcile_unmodeled_once(
     rest: PositionsGetter,
     exposure: ExposureBook,
@@ -530,6 +584,7 @@ async def position_reconcile_unmodeled_once(
     metrics: Metrics,
     *,
     subaccount: int,
+    balance: BalanceTracker | None = None,
 ) -> list[str]:
     """RUNTIME POSITION-RECONCILE NET (2026-07-18; ADOPTION 2026-07-21).
 
@@ -560,11 +615,33 @@ async def position_reconcile_unmodeled_once(
        gone, holding it would overcount forever.
 
     Returns the unmodeled tickers seen this pass (for tests/callers)."""
-    payload = await rest.get_positions(subaccount=subaccount)
-    exch_by_ticker = open_combo_positions_from_positions(payload)
-    exposure_cc_by_ticker = _exchange_exposure_cc_by_ticker(payload)
+    # Page the OPEN-positions listing to exhaustion (2026-07-21 review F3: a
+    # single unpaginated GET truncates past ~100 rows — MLB volume crosses
+    # that within days — and truncation must never read as "flat").
+    # count_filter=position keeps the listing to genuinely open rows.
+    rows: list[dict[str, Any]] = []
+    cursor = ""
+    for _ in range(25):
+        params: dict[str, str | int] = {
+            "subaccount": subaccount,
+            "limit": 200,
+            "count_filter": "position",
+        }
+        if cursor:
+            params["cursor"] = cursor
+        payload = await rest.get_positions(**params)
+        rows.extend(payload.get("market_positions") or payload.get("positions") or [])
+        cursor = str(payload.get("cursor") or "")
+        if not cursor:
+            break
+    merged: dict[str, Any] = {"market_positions": rows}
+    exch_by_ticker = open_combo_positions_from_positions(merged)
+    exposure_cc_by_ticker = _exchange_exposure_cc_by_ticker(merged)
 
-    # (3) drop reserves the exchange no longer reports open.
+    # (3) release reserves the exchange no longer lists open — but ONLY on a
+    # TARGETED read whose row parses to an explicit zero (review F3: absence
+    # from a listing — a lagging/partial payload, an unparseable row — must
+    # never release real reserved risk; only a provable flat does).
     stale_reserves = [
         pos
         for pos in exposure.positions.values()
@@ -572,14 +649,58 @@ async def position_reconcile_unmodeled_once(
         and pos.combo_ticker not in exch_by_ticker
     ]
     for pos in stale_reserves:
+        flat = await _exchange_position_confirmed_flat(
+            rest, pos.combo_ticker, subaccount=subaccount
+        )
+        if not flat:
+            log.warning(
+                "position_reconcile_reserve_missing",
+                ticker=pos.combo_ticker,
+                detail="reserved position absent from the open listing but NOT "
+                "confirmed flat by a targeted read — reserve HELD (fail-safe)",
+            )
+            continue
         exposure.remove_position(pos.position_id)
+        if balance is not None:
+            # A receivable noted for this reserve is void with it (review F6).
+            balance.cancel_receivable(pos.position_id)
         log.info(
             "position_reconcile_reserve_released",
             ticker=pos.combo_ticker,
             reserved_max_loss_cc=pos.max_loss_cc,
-            detail="exchange reports the reserved position flat (settled or "
-            "externally exited) — reserve released",
+            detail="targeted read confirms the reserved position flat (settled "
+            "or externally exited) — reserve released",
         )
+
+    # QUANTITY divergence net (review F5): presence alone is not
+    # reconciliation — a known ticker whose exchange count/side disagrees with
+    # the book total is undercounting (the $31-ARG class) and must alarm.
+    book_by_ticker: dict[str, int] = {}
+    book_side_by_ticker: dict[str, Side] = {}
+    for pos in exposure.positions.values():
+        book_by_ticker[pos.combo_ticker] = (
+            book_by_ticker.get(pos.combo_ticker, 0) + int(pos.contracts)
+        )
+        book_side_by_ticker[pos.combo_ticker] = pos.our_side
+    for ticker, exch in exch_by_ticker.items():
+        if ticker not in book_by_ticker:
+            continue
+        if (
+            exch.contracts_centi != book_by_ticker[ticker]
+            or exch.side is not book_side_by_ticker[ticker]
+        ):
+            metrics.inc("position_reconcile.quantity_divergence")
+            log.warning(
+                "position_reconcile_quantity_divergence",
+                ticker=ticker,
+                exchange_contracts_centi=exch.contracts_centi,
+                exchange_side=str(exch.side),
+                book_contracts_centi=book_by_ticker[ticker],
+                book_side=str(book_side_by_ticker[ticker]),
+                detail="exchange count/side disagrees with the modeled book — "
+                "caps may be undercounting until reconciled (alarm-only; the "
+                "startup rehydrate reconciles quantities fail-safe LARGER)",
+            )
 
     known = {pos.combo_ticker for pos in exposure.positions.values()}
     unmodeled = sorted(t for t in exch_by_ticker if t not in known)
@@ -603,7 +724,6 @@ async def position_reconcile_unmodeled_once(
         # Entry price per contract, rounded UP: booked max_loss_cc
         # (= contracts × entry // 100) is then ≥ the exchange's exposure.
         entry_cc = -(-exposure_cc * 100 // exch.contracts_centi)  # ceil div
-        side_str = "yes" if exch.side is Side.YES else "no"
         reserved = OpenPosition(
             position_id=f"reserve:{ticker}",
             combo_ticker=ticker,
@@ -611,7 +731,15 @@ async def position_reconcile_unmodeled_once(
             our_side=exch.side,
             contracts=CentiContracts(exch.contracts_centi),
             entry_price_cc=CentiCents(entry_cc),
-            legs=(LegRef(ticker, ticker, side_str),),
+            # Self-leg side is ALWAYS "yes": a combo settles YES iff its own
+            # market settles YES — the leg encodes the combo's YES definition,
+            # and direction lives SOLELY in our_side. Writing our position
+            # side here double-complements every NO reserve downstream
+            # (receivable sweep, daily mark): losers would shield the
+            # give-back halts with full notional and winners with nothing —
+            # the exact inversion of the shield's contract (2026-07-21
+            # review, CRITICAL finding 2).
+            legs=(LegRef(ticker, ticker, "yes"),),
             risk_modeled=False,
         )
         exposure.add_position(reserved)
@@ -619,7 +747,7 @@ async def position_reconcile_unmodeled_once(
         log.warning(
             "position_reconcile_reserved_adopted",
             ticker=ticker,
-            side=side_str,
+            side="yes" if exch.side is Side.YES else "no",
             contracts_centi=exch.contracts_centi,
             exchange_exposure_cc=exposure_cc,
             reserved_max_loss_cc=reserved.max_loss_cc,
@@ -1091,6 +1219,14 @@ class QuoteApp:
                     config.filters.allowed_leg_series_prefixes,
                     subaccount=config.safety.subaccount,
                 )
+                # ARM THE REHYDRATED LEGS (2026-07-21 review, HIGH): watch
+                # their books and fetch their metadata NOW — a restarted bot
+                # otherwise holds committed legs with no cached metadata, so
+                # the pregame start ladder resolves UNKNOWN and the in-play
+                # watch exemption silently stands down (the mid-slate-relight
+                # halt storm, the exact 2026-07-19 signature). Best-effort:
+                # a failed fetch retries via _ensure_watched's peek-None rule.
+                await self._arm_rehydrated_legs(exposure, feed, metadata)
                 # STARTUP FIRST SNAPSHOT (2026-07-16 warmup fix): compute ONE
                 # book-risk snapshot SYNCHRONOUSLY — after rehydration, before
                 # quote processing — so a restarted bot's first RFQs are gated
@@ -1335,7 +1471,9 @@ class QuoteApp:
                 # 2026-07-21): exchange-vs-book comparison every N minutes
                 # (read-only GET) — no-context positions adopt as reserves.
                 asyncio.create_task(
-                    self._position_reconcile_loop(rest, exposure, store),
+                    self._position_reconcile_loop(
+                        rest, exposure, store, balance_tracker
+                    ),
                     name="position-reconcile",
                 ),
                 # EXTERNAL-TRANSFER WATCH + startup account-standing line
@@ -2022,8 +2160,16 @@ class QuoteApp:
             self._watched.update(new)
             feed.watch(new)
         # LEG metadata: legs are SHARED real markets, so a fetch caches and is
-        # reused across combos — no per-RFQ storm.
-        for ticker in new:
+        # reused across combos — no per-RFQ storm. Keyed on the CACHE being
+        # empty, NOT on first sighting (2026-07-21 review, HIGH): gating on
+        # ``new`` made a 429'd fetch permanent — the ticker was already in
+        # ``_watched`` so the fetch never retried, and post-restart a
+        # committed leg without metadata loses its pregame start resolution
+        # (⇒ the in-play watch exemption silently stands down and the halt
+        # storm returns). peek-None retries on every RFQ naming the leg.
+        for ticker in rfq.leg_tickers:
+            if metadata.peek(ticker) is not None:
+                continue
             try:
                 meta = await metadata.market(ticker)
                 if meta.event_ticker:
@@ -2100,6 +2246,49 @@ class QuoteApp:
                 log.warning("settlement_poll_failed", error=repr(exc))
             await asyncio.sleep(SETTLEMENT_POLL_INTERVAL_S)
 
+    async def _arm_rehydrated_legs(
+        self, exposure: ExposureBook, feed: OrderbookFeed, metadata: MetadataCache
+    ) -> None:
+        """Watch + fetch metadata for every rehydrated position leg at startup
+        (2026-07-21 review): committed legs must have their start times
+        resolvable BEFORE any RFQ flow arrives, or the in-play watch
+        exemption (estimate tier needs metadata anchors) cannot protect them.
+        Self-legs of reserved holdings (leg ticker == combo ticker) are
+        skipped — they have no start ladder and no book to watch. Failures
+        log and retry via ``_ensure_watched``'s peek-None rule."""
+        tickers = sorted(
+            {
+                leg.market_ticker
+                for pos in exposure.positions.values()
+                for leg in pos.legs
+                if leg.market_ticker != pos.combo_ticker
+            }
+        )
+        if not tickers:
+            return
+        new = [t for t in tickers if t not in self._watched]
+        if new:
+            self._watched.update(new)
+            feed.watch(new)
+        for ticker in tickers:
+            if metadata.peek(ticker) is not None:
+                continue
+            try:
+                meta = await metadata.market(ticker)
+                if meta.event_ticker:
+                    await metadata.event(meta.event_ticker)
+            except KalshiApiError as exc:
+                log.warning(
+                    "rehydrated_leg_metadata_fetch_failed",
+                    ticker=ticker,
+                    error=str(exc),
+                )
+        log.info(
+            "rehydrated_legs_armed",
+            legs=len(tickers),
+            newly_watched=len(new),
+        )
+
     async def _transfer_watch_loop(
         self,
         rest: KalshiRestClient,
@@ -2121,18 +2310,45 @@ class QuoteApp:
         profit, a withdrawal is not a give-back. Fetch errors retry next
         interval (anchors untouched — fail-safe: an unobserved transfer means
         halts read conservative, never loose)."""
-        seen: set[str] = set()
+        statuses: dict[str, str] = {}
         await asyncio.sleep(TRANSFER_WATCH_STARTUP_DELAY_S)
         first = True
         while True:
             try:
+                # The baseline needs the anchors to EXIST (the ordering rule
+                # compares finalized_ts against the anchor instant) — until the
+                # first successful balance poll, defer (review F6: a failed
+                # first pass must not widen the mis-baseline window).
+                anchor_ms = tracker.anchor_wall_ms_or_none()
+                if first and anchor_ms is None:
+                    await asyncio.sleep(TRANSFER_WATCH_INTERVAL_S)
+                    continue
                 deposits = await _page_portfolio(rest.get_deposits, "deposits")
                 withdrawals = await _page_portfolio(rest.get_withdrawals, "withdrawals")
-                deltas = new_external_transfer_deltas(seen, deposits, withdrawals)
+                deltas = new_external_transfer_deltas(
+                    statuses,
+                    deposits,
+                    withdrawals,
+                    baseline_before_ms=anchor_ms if first else None,
+                )
+                for kind, ref, delta_cc, finalized_ms in deltas:
+                    tracker.apply_external_transfer(
+                        delta_cc, kind=kind, ref=ref, finalized_wall_ms=finalized_ms
+                    )
                 if first:
                     first = False
-                    dep_cc = sum(d for _, _, d in deltas if d > 0)
-                    wd_cc = -sum(d for _, _, d in deltas if d < 0)
+                    dep_cc = sum(
+                        (int(d.get("amount_cents") or 0) - int(d.get("fee_cents") or 0))
+                        * 100
+                        for d in deposits
+                        if str(d.get("status")) == _TRANSFER_APPLIED
+                    )
+                    wd_cc = sum(
+                        (int(w.get("amount_cents") or 0) + int(w.get("fee_cents") or 0))
+                        * 100
+                        for w in withdrawals
+                        if str(w.get("status")) == _TRANSFER_APPLIED
+                    )
                     log.info(
                         "account_standing",
                         applied_deposits_cc=dep_cc,
@@ -2145,12 +2361,9 @@ class QuoteApp:
                         ),
                         modeled_positions=len(exposure.positions),
                         pending_receivables_cc=tracker.pending_receivables_cc(),
-                        detail="startup exchange-truth standing; transfers "
-                        "baselined (already inside the balance)",
+                        detail="startup exchange-truth standing; historical "
+                        "transfers baselined (already inside the balance)",
                     )
-                else:
-                    for kind, ref, delta_cc in deltas:
-                        tracker.apply_external_transfer(delta_cc, kind=kind, ref=ref)
             except RateLimitedError as exc:
                 self._rate_limit_window.record()
                 log.warning("transfer_watch_rate_limited", error=str(exc))
@@ -2159,7 +2372,11 @@ class QuoteApp:
             await asyncio.sleep(TRANSFER_WATCH_INTERVAL_S)
 
     async def _position_reconcile_loop(
-        self, rest: KalshiRestClient, exposure: ExposureBook, store: Store
+        self,
+        rest: KalshiRestClient,
+        exposure: ExposureBook,
+        store: Store,
+        balance: BalanceTracker | None = None,
     ) -> None:
         """Periodic position-reconcile net (2026-07-18 requirement 3; adoption
         2026-07-21): every ``risk.position_reconcile_interval_s`` (default
@@ -2179,6 +2396,7 @@ class QuoteApp:
                     store,
                     self._metrics,
                     subaccount=self._config.safety.subaccount,
+                    balance=balance,
                 )
             except RateLimitedError as exc:
                 self._rate_limit_window.record()

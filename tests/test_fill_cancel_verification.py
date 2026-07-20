@@ -648,7 +648,8 @@ async def test_position_reconcile_flags_unknown_exchange_position(
             rest, exposure, store, metrics, subaccount=0
         )
         assert unmodeled == ["KXMVE-EXTERNAL", "KXMVE-FELLOUT"]
-        assert rest.params == {"subaccount": 0}  # query-layer pin (P0-5)
+        assert rest.params is not None
+        assert rest.params["subaccount"] == 0  # query-layer pin (P0-5)
         assert metrics.counter("position_reconcile.unmodeled") == 1
         # Neither row ADOPTS here: FELLOUT has a local fills row (the recovery
         # sweep owns full re-modeling) and EXTERNAL carries NO readable
@@ -712,9 +713,13 @@ class TestReserveAdoption:
             # max_loss 20_003cc ≥ the exchange's 20_000cc, never below.
             assert reserve.max_loss_cc >= 20_000
             assert reserve.max_loss_cc == 333 * 6_007 // 100
-            # Identity self-leg: its own singleton cluster, never a guessed leg.
+            # Identity self-leg: its own singleton cluster, never a guessed
+            # leg — and side ALWAYS "yes" (the combo settles YES iff its own
+            # market does; direction lives solely in our_side — writing the
+            # position side here double-complemented NO reserves and inverted
+            # the receivable shield; 2026-07-21 review CRITICAL finding 2).
             assert reserve.legs == (
-                LegRef(market_ticker="KXMVE-PAST", event_ticker="KXMVE-PAST", side="no"),
+                LegRef(market_ticker="KXMVE-PAST", event_ticker="KXMVE-PAST", side="yes"),
             )
 
             # Idempotent: the next pass sees the ticker modeled — no re-adopt,
@@ -785,6 +790,107 @@ class TestReserveAdoption:
                 rest, exposure, store, Metrics(), subaccount=0
             )
             assert "reserve:KXMVE-PAST" not in exposure.positions
+        finally:
+            await store.close()
+
+    async def test_pagination_reaches_page_two(self, tmp_path: Path) -> None:
+        # Review F3: a single unpaginated GET truncates past one page and the
+        # truncated tail must still adopt (never read as absent/flat).
+        store = await Store.open(tmp_path / "pages.sqlite3", FakeClock())
+        try:
+            exposure = ExposureBook(TEST_CONVENTIONS)
+
+            class _PagedRest:
+                def __init__(self) -> None:
+                    self.calls: list[dict[str, str | int]] = []
+
+                async def get_positions(self, **params: str | int) -> JsonDict:
+                    self.calls.append(dict(params))
+                    if not params.get("cursor"):
+                        return {
+                            "market_positions": [
+                                {
+                                    "ticker": "KXMVE-P1",
+                                    "position_fp": "-1.00",
+                                    "market_exposure_dollars": "1.00",
+                                }
+                            ],
+                            "cursor": "page2",
+                        }
+                    return {
+                        "market_positions": [
+                            {
+                                "ticker": "KXMVE-P2",
+                                "position_fp": "-2.00",
+                                "market_exposure_dollars": "2.00",
+                            }
+                        ],
+                        "cursor": "",
+                    }
+
+            rest = _PagedRest()
+            await position_reconcile_unmodeled_once(
+                rest, exposure, store, Metrics(), subaccount=0
+            )
+            assert "reserve:KXMVE-P1" in exposure.positions
+            assert "reserve:KXMVE-P2" in exposure.positions  # page-2 adopted
+        finally:
+            await store.close()
+
+    async def test_absence_without_flat_confirmation_holds_reserve(
+        self, tmp_path: Path
+    ) -> None:
+        # Review F3: absence from the open listing (lagging/thin payload) must
+        # NEVER release reserved risk — only a targeted read parsing to an
+        # explicit zero row does.
+        store = await Store.open(tmp_path / "hold.sqlite3", FakeClock())
+        try:
+            exposure = ExposureBook(TEST_CONVENTIONS)
+            rest = FakePositionsRest(
+                {
+                    "market_positions": [
+                        {
+                            "ticker": "KXMVE-PAST",
+                            "position_fp": "-5.00",
+                            "market_exposure_dollars": "4.11",
+                        }
+                    ]
+                }
+            )
+            await position_reconcile_unmodeled_once(
+                rest, exposure, store, Metrics(), subaccount=0
+            )
+            assert "reserve:KXMVE-PAST" in exposure.positions
+            # The listing (and the targeted read) now returns NOTHING for the
+            # ticker — no zero row, no proof of flat: the reserve HOLDS.
+            rest.payload = {"market_positions": []}
+            await position_reconcile_unmodeled_once(
+                rest, exposure, store, Metrics(), subaccount=0
+            )
+            assert "reserve:KXMVE-PAST" in exposure.positions
+        finally:
+            await store.close()
+
+    async def test_quantity_divergence_alarms(self, tmp_path: Path) -> None:
+        # Review F5: presence alone is not reconciliation — a known ticker
+        # whose exchange count disagrees with the book must alarm (the
+        # $31-ARG undercounting class).
+        store = await Store.open(tmp_path / "qty.sqlite3", FakeClock())
+        try:
+            exposure = ExposureBook(TEST_CONVENTIONS)
+            exposure.add_position(_position("KXMVE-KNOWN"))  # book: 10.00 YES
+            rest = FakePositionsRest(
+                {
+                    "market_positions": [
+                        {"ticker": "KXMVE-KNOWN", "position_fp": "12.00"}
+                    ]
+                }
+            )
+            metrics = Metrics()
+            await position_reconcile_unmodeled_once(
+                rest, exposure, store, metrics, subaccount=0
+            )
+            assert metrics.counter("position_reconcile.quantity_divergence") == 1
         finally:
             await store.close()
 

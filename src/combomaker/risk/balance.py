@@ -266,6 +266,22 @@ class BalanceTracker:
         self._cumulative_loss_cc: int = 0
         self._accrued_fees_cc: int = 0
         self._settled_ids: set[str] = set()
+        # EXTERNAL-TRANSFER LEDGER (adversarial review 2026-07-21, CRITICAL
+        # family): the give-back halts must measure TRADING drawdown, in P&L
+        # SPACE — adjusted equity A = raw exchange equity − Σ detected
+        # transfers — because the raw peak is a HIGH-WATER MARK updated by the
+        # 10s balance poll: a mid-session deposit's cash raises the raw peak
+        # within one poll, and a later naive ``peak += Δ`` would double-count
+        # it (phantom give-back = Δ for the rest of the day → false KILL on
+        # the build's own primary use case). So: ``_transfers_known_cc`` (K)
+        # accumulates detected transfer deltas; the peak is kept over A with
+        # the WALL time it was last raised; ``apply_external_transfer`` orders
+        # each transfer's ``finalized_ts`` against the peak/SOD formation
+        # times to correct exactly the double-counted portion and no more.
+        self._transfers_known_cc: int = 0
+        self._peak_pnl_cc: int | None = None      # peak over A = equity − K
+        self._peak_set_wall_ms: int | None = None  # wall ms when peak last rose
+        self._sod_anchor_wall_ms: int | None = None  # wall ms of SOD formation
         # SETTLEMENT RECEIVABLES (2026-07-19 false-positive give-back kill: the
         # exchange removes a settled position from ``portfolio_value`` BEFORE
         # crediting ``balance``, so during a settlement cascade exchange equity
@@ -285,6 +301,12 @@ class BalanceTracker:
         self._receivables_cc: dict[str, int] = {}          # position_id → credit cc
         self._receivable_noted_ns: dict[str, int] = {}     # for the TTL backstop
         self._receivable_confirmed_ns: dict[str, int] = {}  # reconciler confirm stamp
+        # TTL TOMBSTONES (2026-07-21 review F3): the sweep re-notes every tick
+        # while the position is held, so a plain TTL pop would re-arm the
+        # shield one tick later — the "structural bound" would be a lie. An
+        # expired id refuses re-notes until the position leaves the book
+        # (``cancel_receivable``) or the reconciler confirms it for real.
+        self._receivable_expired: set[str] = set()
 
     # --- live bankroll -------------------------------------------------------
 
@@ -321,17 +343,31 @@ class BalanceTracker:
         self._portfolio_value_cc = portfolio_cc
         self._last_poll_ns = self._clock.monotonic_ns()
         self._drop_confirmed_receivables(request_start_ns)
-        today = self._clock.now().date()
+        now = self._clock.now()
+        wall_ms = int(now.timestamp() * 1000)
+        today = now.date()
         equity_cc = int(cash_cc) + int(portfolio_cc)
+        # P&L-space adjusted equity: raw equity minus every DETECTED external
+        # transfer. The give-back halts measure drawdown on THIS series, so a
+        # deposit is never headroom and a withdrawal is never a give-back
+        # (2026-07-21 review, CRITICAL family).
+        pnl_cc = equity_cc - self._transfers_known_cc
         if self._anchor_utc_date != today:
             self._start_of_day_equity_cc = CentiCents(equity_cc)
             self._anchor_utc_date = today
-            # New trading day: the intraday peak restarts at today's SOD equity,
-            # never carried over from yesterday (give-back is measured within the
-            # day, in lockstep with the SOD re-anchor above).
+            self._sod_anchor_wall_ms = wall_ms
+            # New trading day: both peaks restart at today's readings, never
+            # carried over (give-back is measured within the day, in lockstep
+            # with the SOD re-anchor above).
             self._peak_equity_cc = CentiCents(equity_cc)
-        elif self._peak_equity_cc is None or equity_cc > int(self._peak_equity_cc):
-            self._peak_equity_cc = CentiCents(equity_cc)
+            self._peak_pnl_cc = pnl_cc
+            self._peak_set_wall_ms = wall_ms
+        else:
+            if self._peak_equity_cc is None or equity_cc > int(self._peak_equity_cc):
+                self._peak_equity_cc = CentiCents(equity_cc)
+            if self._peak_pnl_cc is None or pnl_cc > self._peak_pnl_cc:
+                self._peak_pnl_cc = pnl_cc
+                self._peak_set_wall_ms = wall_ms
         return cash_cc
 
     def set_start_of_day_equity(self, equity_cc: CentiCents) -> None:
@@ -341,44 +377,87 @@ class BalanceTracker:
         day."""
         self._start_of_day_equity_cc = equity_cc
         self._anchor_utc_date = self._clock.now().date()
-        # A manual re-anchor also restarts the intraday peak: the drawdown the
-        # halts measure is give-back from THIS anchor, not a stale prior peak
-        # (e.g. after a deposit the old high-water mark is meaningless).
+        self._sod_anchor_wall_ms = int(self._clock.now().timestamp() * 1000)
+        # A manual re-anchor also restarts BOTH intraday peaks: the drawdown
+        # the halts measure is give-back from THIS anchor, not a stale prior
+        # peak (e.g. after a deposit the old high-water mark is meaningless).
         self._peak_equity_cc = equity_cc
+        if (
+            self._available_cash_cc is not None
+            and self._portfolio_value_cc is not None
+        ):
+            self._peak_pnl_cc = (
+                int(self._available_cash_cc)
+                + int(self._portfolio_value_cc)
+                - self._transfers_known_cc
+            )
+            self._peak_set_wall_ms = self._sod_anchor_wall_ms
 
-    def apply_external_transfer(self, delta_cc: int, *, kind: str, ref: str) -> None:
-        """AUTOMATIC anchor adjustment for an external cash transfer (a NEW
-        applied deposit ⇒ positive ``delta_cc`` net of its fee; a withdrawal ⇒
-        negative, gross of its fee). Called by the app's transfer watcher —
-        the no-manual-intervention replacement for "call
-        ``set_start_of_day_equity`` after a deposit" (2026-07-21).
+    def anchor_wall_ms_or_none(self) -> int | None:
+        """Wall-clock ms of the instant the current SOD anchor formed. The
+        transfer watcher's baseline rule: a transfer ``finalized_ts`` BEFORE
+        this instant is already inside the anchored readings (seed, never
+        apply); one finalized after it must APPLY even on the first pass."""
+        return self._sod_anchor_wall_ms
 
-        BOTH anchors shift by exactly the transfer: SOD' = SOD + Δ keeps the
-        daily-loss measurement pure P&L (a deposit is not profit, a withdrawal
-        is not loss), and peak' = peak + Δ keeps the give-back halts pure
-        drawdown (a withdrawal must never read as a $-for-$ give-back, and a
-        deposit must not inflate headroom under the peak). No anchor yet (no
-        poll this day) ⇒ nothing to adjust — the first poll anchors on a
-        balance that already contains the transfer."""
-        if self._start_of_day_equity_cc is not None:
+    def apply_external_transfer(
+        self, delta_cc: int, *, kind: str, ref: str, finalized_wall_ms: int
+    ) -> None:
+        """ORDERING-AWARE anchor adjustment for an external cash transfer (a
+        NEW applied deposit ⇒ positive ``delta_cc`` net of its fee; a
+        withdrawal ⇒ negative, amount+fee; an applied→returned clawback ⇒ the
+        reversing delta). Called by the app's transfer watcher — the
+        no-manual-intervention replacement for manual re-anchoring.
+
+        The 2026-07-21 review's CRITICAL finding: the raw peak is a
+        high-water mark fed by the 10s balance poll, so by the time the 60s
+        watcher detects a deposit the cash has usually ALREADY raised both
+        equity and the raw peak — a naive ``peak += Δ`` double-counts and
+        manufactures a phantom give-back (false KILL). Correct treatment,
+        keyed on the transfer's exchange ``finalized_ts``:
+
+        - ``K += Δ`` always: the P&L series ``A = equity − K`` excludes the
+          transfer from this instant on (a lagging withdrawal's transient
+          false give-back self-corrects here).
+        - SOD (raw space, feeds the risk-bankroll denominator): shift by Δ
+          ONLY if the anchor formed BEFORE the transfer finalized — an anchor
+          formed after already contains the cash (day-boundary race).
+        - P&L peak: if the peak last rose AT/AFTER the transfer finalized and
+          Δ > 0, that peak reading was computed with the deposit's cash in
+          equity but not yet in K — overstated by exactly Δ — so subtract it.
+          A peak set before the transfer never contained it (no correction),
+          and a late-detected WITHDRAWAL only ever UNDERSTATED A (a max is
+          not corrupted downward — no correction).
+        """
+        self._transfers_known_cc += delta_cc
+        if (
+            self._start_of_day_equity_cc is not None
+            and self._sod_anchor_wall_ms is not None
+            and self._sod_anchor_wall_ms < finalized_wall_ms
+        ):
             self._start_of_day_equity_cc = CentiCents(
                 int(self._start_of_day_equity_cc) + delta_cc
             )
-        if self._peak_equity_cc is not None:
-            self._peak_equity_cc = CentiCents(int(self._peak_equity_cc) + delta_cc)
+        if (
+            delta_cc > 0
+            and self._peak_pnl_cc is not None
+            and self._peak_set_wall_ms is not None
+            and self._peak_set_wall_ms >= finalized_wall_ms
+        ):
+            self._peak_pnl_cc -= delta_cc
         log.info(
             "external_transfer_anchors_adjusted",
             kind=kind,
             ref=ref,
             delta_cc=delta_cc,
+            finalized_wall_ms=finalized_wall_ms,
+            transfers_known_cc=self._transfers_known_cc,
             start_of_day_equity_cc=(
                 None
                 if self._start_of_day_equity_cc is None
                 else int(self._start_of_day_equity_cc)
             ),
-            peak_equity_cc=(
-                None if self._peak_equity_cc is None else int(self._peak_equity_cc)
-            ),
+            peak_pnl_cc=self._peak_pnl_cc,
         )
 
     @property
@@ -515,12 +594,38 @@ class BalanceTracker:
         return CentiCents(int(self._available_cash_cc) + int(self._portfolio_value_cc))
 
     def peak_equity_cc_or_none(self) -> CentiCents | None:
-        """Non-raising intraday peak equity, or None when stale / not yet
-        anchored. Feeds ``HaltInputs.peak_equity_cc``; None ⇒ the give-back
-        halts skip (no invented peak)."""
+        """Non-raising intraday peak of RAW exchange equity (reports /
+        display), or None when stale / not yet anchored. The give-back halts
+        do NOT read this — they read the P&L-space pair below (2026-07-21
+        review: the raw high-water mark absorbs deposits within one poll)."""
         if self.is_stale or self._peak_equity_cc is None:
             return None
         return self._peak_equity_cc
+
+    def pnl_equity_cc_or_none(self) -> int | None:
+        """Non-raising P&L-SPACE equity: raw equity minus every detected
+        external transfer. The give-back halts' CURRENT reading — a deposit
+        is not profit here and a withdrawal is not a drawdown. None when
+        stale."""
+        if (
+            self.is_stale
+            or self._available_cash_cc is None
+            or self._portfolio_value_cc is None
+        ):
+            return None
+        return (
+            int(self._available_cash_cc)
+            + int(self._portfolio_value_cc)
+            - self._transfers_known_cc
+        )
+
+    def peak_pnl_cc_or_none(self) -> int | None:
+        """Non-raising intraday peak of P&L-space equity — the give-back
+        halts' PEAK reading (transfer-corrected via
+        ``apply_external_transfer``). None when stale / not yet anchored."""
+        if self.is_stale or self._peak_pnl_cc is None:
+            return None
+        return self._peak_pnl_cc
 
     # --- settlement receivables (give-back cascade shield) -------------------
 
@@ -533,13 +638,20 @@ class BalanceTracker:
         receivable, so a genuine loss cascade is never shielded). Re-noting an
         already-confirmed receivable is a no-op — once the reconciler has
         confirmed the exchange row, only the drop rule may touch it (a sweep
-        racing the reconciler must not resurrect the TTL clock)."""
+        racing the reconciler must not resurrect the TTL clock). A
+        TTL-EXPIRED id also refuses re-notes (tombstone, review F3 — the
+        every-tick sweep must not re-arm an expired shield), and a re-note of
+        a still-pending id keeps the ORIGINAL TTL clock."""
         if amount_cc <= 0:
             return
         if position_id in self._receivable_confirmed_ns:
             return
+        if position_id in self._receivable_expired:
+            return
         if position_id not in self._receivables_cc:
-            self._receivable_noted_ns[position_id] = self._clock.monotonic_ns()
+            self._receivable_noted_ns.setdefault(
+                position_id, self._clock.monotonic_ns()
+            )
             log.info(
                 "settlement_receivable_noted",
                 position_id=position_id,
@@ -547,16 +659,56 @@ class BalanceTracker:
             )
         self._receivables_cc[position_id] = amount_cc
 
-    def confirm_receivable(self, position_id: str) -> None:
+    def confirm_receivable(
+        self, position_id: str, *, expected_credit_cc: int | None = None
+    ) -> None:
         """Stamp a receivable exchange-CONFIRMED — called by the settlement
         reconciler right after it books the exchange's settlement row for this
         position. The receivable then drops at the first successful balance
         poll whose request started after this instant (see ``refresh``). A
         position with no pending receivable is a no-op (the reconciler confirms
-        everything it books; not everything was fact-resolved first)."""
+        everything it books; not everything was fact-resolved first).
+
+        ``expected_credit_cc`` (review F4): the reconciler's own
+        exchange-derived credit for this position. A noted amount differing by
+        ≥ 1¢ means the FACT-product prediction was wrong (e.g. a
+        determined→amended flip) — the shield was phony, so it DROPS
+        immediately (raw measurement restored) with a loud error; the
+        to-the-cent settlement reconcile still owns the model-error HALT."""
         if position_id not in self._receivables_cc:
             return
+        if (
+            expected_credit_cc is not None
+            and abs(self._receivables_cc[position_id] - expected_credit_cc) >= 100
+        ):
+            log.error(
+                "settlement_receivable_amount_mismatch",
+                position_id=position_id,
+                noted_cc=self._receivables_cc[position_id],
+                exchange_credit_cc=expected_credit_cc,
+                detail="fact-derived receivable != exchange-derived credit — "
+                "dropping the shield (raw give-back measurement restored)",
+            )
+            self.cancel_receivable(position_id)
+            return
         self._receivable_confirmed_ns[position_id] = self._clock.monotonic_ns()
+
+    def cancel_receivable(self, position_id: str) -> None:
+        """Remove a receivable WITHOUT a cash confirmation — called by every
+        position-removal path that is not the settlement reconciler (phantom
+        discard, reserve release; review F6): a removed position's cash claim
+        is void, so its shield must not linger for the TTL. Also clears the
+        tombstone (the position is gone — nothing can re-note it)."""
+        amount = self._receivables_cc.pop(position_id, None)
+        self._receivable_noted_ns.pop(position_id, None)
+        self._receivable_confirmed_ns.pop(position_id, None)
+        self._receivable_expired.discard(position_id)
+        if amount is not None:
+            log.info(
+                "settlement_receivable_cancelled",
+                position_id=position_id,
+                amount_cc=amount,
+            )
 
     def pending_receivables_cc(self) -> int:
         """Sum of pending settlement receivables in cc — what the give-back
@@ -577,6 +729,9 @@ class BalanceTracker:
             for pid in expired:
                 amount = self._receivables_cc.pop(pid, 0)
                 self._receivable_noted_ns.pop(pid, None)
+                # Tombstone: the every-tick sweep would otherwise re-note this
+                # id next tick and re-arm the shield for another TTL (F3).
+                self._receivable_expired.add(pid)
                 log.warning(
                     "settlement_receivable_ttl_expired",
                     position_id=pid,

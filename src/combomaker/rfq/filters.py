@@ -160,15 +160,22 @@ class RfqFilter:
         Polarity contract: the exemption may begin only once quoting on the leg
         has ended, so — fail-closed — an UNKNOWN start keeps the full watch,
         and ``allow_inplay_legs`` (operator re-enabled in-play quoting) disables
-        the exemption entirely: a leg we can still quote is never blind. Uses
-        the RAW start (no M_q margin), which begins the exemption at-or-after
-        the quote cutoff, never before."""
+        the exemption entirely: a leg we can still quote is never blind. The
+        exemption instant is ``max(raw start, quote cutoff)`` BY CONSTRUCTION
+        (2026-07-21 review): with the validated non-negative margins the
+        cutoff is at-or-before start so this equals the raw start, and if a
+        later-than-start cutoff ever exists the exemption WAITS for quoting
+        to end rather than blinding a still-quotable leg."""
         if self._config.allow_inplay_legs:
             return False
         start = self._pregame.leg_start_time(market_ticker)
         if start is None:
             return False
-        return self._clock.now().astimezone(UTC) >= start.astimezone(UTC)
+        cutoff = self._pregame.quote_cutoff_time(market_ticker)
+        exempt_from = start.astimezone(UTC)
+        if cutoff is not None:
+            exempt_from = max(exempt_from, cutoff.astimezone(UTC))
+        return self._clock.now().astimezone(UTC) >= exempt_from
 
     def _pregame_reasons(self, rfq: Rfq) -> list[ReasonCode]:
         """Pregame-only gate: any started leg ⇒ skip; any UNKNOWN start ⇒

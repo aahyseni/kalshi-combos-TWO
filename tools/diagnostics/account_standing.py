@@ -106,8 +106,11 @@ def main() -> None:
     bad_rows: list[str] = []
     for s in settlements:
         t = _sett_time(s)
-        day = t.astimezone(ET).strftime("%Y-%m-%d") if t else "?"
-        era = "pre-store" if day < split_day else "store-era"
+        if t is None:
+            era = "unknown-date"  # never silently bucketed (review F9)
+        else:
+            day = t.astimezone(ET).strftime("%Y-%m-%d")
+            era = "pre-store" if day < split_day else "store-era"
         try:
             revenue_c = int(s.get("revenue") or 0)
             cost_c = _dollars_cents(s.get("yes_total_cost_dollars")) + _dollars_cents(
@@ -161,7 +164,10 @@ def main() -> None:
     print(f"| era (split {split_day} ET) | settlements | revenue | cost basis | fees | realized |")
     print("|---|---|---|---|---|---|")
     tot = [0, 0, 0, 0]
-    for era in ("pre-store", "store-era"):
+    eras = ["pre-store", "store-era"]
+    if "unknown-date" in by_era:
+        eras.append("unknown-date")  # never silently bucketed (review F9)
+    for era in eras:
         n, rev, cost, fee = by_era[era]
         realized = rev - cost - fee
         print(f"| {era} | {n} | {usd(rev)} | {usd(cost)} | {usd(fee)} | {usd(realized)} |")

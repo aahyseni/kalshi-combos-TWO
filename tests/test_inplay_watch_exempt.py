@@ -189,6 +189,50 @@ class TestFilterPredicate:
         h.clock.advance(ESTIMATE_START_S + 3600.0)
         assert h.filter.leg_inplay_watch_exempt("M1") is False
 
+    def test_committed_leg_with_absent_metadata_keeps_watch(self) -> None:
+        # The restart state (2026-07-21 review, HIGH): a committed leg whose
+        # metadata is not cached resolves UNKNOWN → NOT exempt (full watch) —
+        # pinned deliberately, because the surrounding system must instead
+        # HEAL the metadata (rehydrate arm + _ensure_watched peek-None retry)
+        # rather than ever loosening this fail-closed default.
+        h = Harness()
+        h.clock.advance(30 * 24 * 3600.0)  # any game long started
+        assert h.filter.leg_inplay_watch_exempt("M1") is False  # no metadata
+        # The heal: metadata lands (refetched) → exemption resolves again.
+        h.with_meta("M1", close_in_s=-3600.0)  # close an hour ago ⇒ started
+        assert h.filter.leg_inplay_watch_exempt("M1") is True
+
+    def test_negative_margins_rejected_by_config(self) -> None:
+        # Review MED: a negative M_q would quote PAST the start while the
+        # exemption blinds the leg — the config now refuses it outright.
+        import pytest
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            FiltersConfig(pregame_quote_margin_s=-300.0, pregame_confirm_margin_s=-300.0)
+        with pytest.raises(ValidationError):
+            FiltersConfig(pregame_quote_margin_s_by_prefix={"KXMLB": -900.0})
+
+    def test_exemption_never_precedes_quote_cutoff(self) -> None:
+        # Polarity invariant, by construction: with a positive M_q the quote
+        # cutoff is BEFORE start, and the exemption still waits for the raw
+        # start (max(start, cutoff)) — there is a window where quoting has
+        # stopped and the watch is still armed, but NEVER the reverse.
+        h = Harness(
+            FiltersConfig(
+                pregame_quote_margin_s=600.0, pregame_confirm_margin_s=600.0
+            )
+        )
+        # Harness NOW = 2026-07-05 12:00 UTC; MLB start 2026-07-10 19:15 ET =
+        # 23:15 UTC ⇒ 5d 11h 15m = 472_500s to start. Precise path: quote
+        # cutoff = start − 600s.
+        seconds_to_start = 5 * 24 * 3600.0 + 11 * 3600.0 + 15 * 60.0
+        h.clock.advance(seconds_to_start - 300.0)  # 5 min BEFORE the start
+        # Quoting already cut off (inside M_q), exemption NOT yet active.
+        assert h.filter.leg_inplay_watch_exempt(MLB_TICKER) is False
+        h.clock.advance(301.0)  # now past the raw start
+        assert h.filter.leg_inplay_watch_exempt(MLB_TICKER) is True
+
 
 # --------------------------------------------------------------------------- #
 # 3. Lifecycle delegate + sampler wiring.                                      #
