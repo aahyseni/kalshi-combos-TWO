@@ -23,7 +23,7 @@ from typing import Any, Protocol
 
 from combomaker.core.clock import Clock, SystemClock
 from combomaker.core.conventions import Side, load_conventions
-from combomaker.core.money import CentiCents
+from combomaker.core.money import CentiCents, MoneyParseError, cc_from_dollars_str
 from combomaker.core.quantity import CentiContracts
 from combomaker.core.reasons import ReasonCode
 from combomaker.exchange.auth import Credentials, RequestSigner
@@ -96,6 +96,85 @@ BALANCE_POLL_INTERVAL_S = 10.0
 # handler is idempotent per position, so a re-poll never double-books. Kept modest
 # so realized P&L lands promptly for the enforced daily-loss cap.
 SETTLEMENT_POLL_INTERVAL_S = 30.0
+# External-transfer watch (2026-07-21): deposits/withdrawals are rare human
+# events — a slow poll is fine; what matters is that a mid-session transfer
+# adjusts the SOD/peak anchors within minutes, not that it lands instantly.
+# The startup delay lets the first balance poll land so the account_standing
+# line reports real figures instead of None.
+TRANSFER_WATCH_INTERVAL_S = 300.0
+TRANSFER_WATCH_STARTUP_DELAY_S = 15.0
+
+# Withdrawal statuses that mean the money has actually left the balance. The
+# deposits side is documented (applied|pending|failed|returned); withdrawals
+# mirror it, with "complete"/"completed" observed variants kept so an
+# unrecognized terminal spelling errs toward ADJUSTING anchors DOWN (which only
+# tightens the halts) rather than missing a real withdrawal.
+_TERMINAL_WITHDRAWAL_STATUSES = frozenset({"applied", "complete", "completed"})
+
+
+def new_external_transfer_deltas(
+    seen: set[str],
+    deposits: list[dict[str, Any]],
+    withdrawals: list[dict[str, Any]],
+) -> list[tuple[str, str, int]]:
+    """``(kind, id, delta_cc)`` for every transfer that reached a terminal
+    money-moved status since the last pass; ``seen`` is mutated so each
+    transfer applies exactly once per process. Deltas are what the BALANCE
+    actually moved by: a deposit credits ``amount − fee`` (net), a withdrawal
+    debits ``amount + fee`` (the fee leaves the balance too). A pending/failed
+    row is never seeded, so a pending→applied transition IS picked up. Amounts
+    are int cents on the wire (doc-verified 2026-07-21) → ×100 to cc; a
+    non-int amount is skipped (never guess money)."""
+    out: list[tuple[str, str, int]] = []
+    for row in deposits:
+        if str(row.get("status")) != "applied":
+            continue
+        key = f"dep:{row.get('id')}"
+        if key in seen:
+            continue
+        amount = row.get("amount_cents")
+        if not isinstance(amount, int) or isinstance(amount, bool):
+            continue
+        fee = row.get("fee_cents")
+        fee_c = fee if isinstance(fee, int) and not isinstance(fee, bool) else 0
+        seen.add(key)
+        out.append(("deposit", key, (amount - fee_c) * 100))
+    for row in withdrawals:
+        if str(row.get("status")) not in _TERMINAL_WITHDRAWAL_STATUSES:
+            continue
+        key = f"wd:{row.get('id')}"
+        if key in seen:
+            continue
+        amount = row.get("amount_cents")
+        if not isinstance(amount, int) or isinstance(amount, bool):
+            continue
+        fee = row.get("fee_cents")
+        fee_c = fee if isinstance(fee, int) and not isinstance(fee, bool) else 0
+        seen.add(key)
+        out.append(("withdrawal", key, -(amount + fee_c) * 100))
+    return out
+
+
+async def _page_portfolio(
+    method: Callable[..., Awaitable[dict[str, Any]]], key: str, max_pages: int = 25
+) -> list[dict[str, Any]]:
+    """Page a cursor-paginated portfolio GET to exhaustion (bounded)."""
+    rows: list[dict[str, Any]] = []
+    cursor = ""
+    for _ in range(max_pages):
+        params: dict[str, str | int] = {"limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        payload = await method(**params)
+        rows.extend(payload.get(key) or [])
+        cursor = str(payload.get("cursor") or "")
+        if not cursor:
+            break
+    return rows
+
+
+def _int_or_none(value: CentiCents | int | None) -> int | None:
+    return None if value is None else int(value)  # CentiCents → plain int for logs
 # Reservation-vs-exchange reconcile cadence: resolves a confirm-timeout
 # mark_unconfirmed reservation against the exchange's real open positions before it
 # leaks headroom until restart. Only touches the network when a reservation is
@@ -417,6 +496,33 @@ class PositionsGetter(Protocol):
     async def get_positions(self, **params: str | int) -> JsonDict: ...
 
 
+def _exchange_exposure_cc_by_ticker(positions_payload: dict[str, Any]) -> dict[str, int]:
+    """Per-ticker cost basis of the remaining open position, in cc, from the
+    positions payload's own ``market_exposure_dollars`` (doc-verified
+    2026-07-21: "Cost of the aggregate market position in dollars" — the money
+    at risk on the open position). Prefers the exact fixed-point dollars
+    string; falls back to int-cents ``market_exposure``; a ticker with neither
+    (or an unparseable value) is simply absent — the caller must then leave
+    that position alarm-only rather than invent an at-risk figure (rule 6)."""
+    rows = positions_payload.get("market_positions") or positions_payload.get("positions") or []
+    out: dict[str, int] = {}
+    for row in rows:
+        ticker = str(row.get("ticker") or row.get("market_ticker") or "")
+        if not ticker:
+            continue
+        dollars = row.get("market_exposure_dollars")
+        if dollars is not None:
+            try:
+                out[ticker] = int(cc_from_dollars_str(str(dollars)))
+                continue
+            except MoneyParseError:
+                pass
+        cents = row.get("market_exposure")
+        if isinstance(cents, int) and not isinstance(cents, bool):
+            out[ticker] = cents * 100
+    return out
+
+
 async def position_reconcile_unmodeled_once(
     rest: PositionsGetter,
     exposure: ExposureBook,
@@ -425,19 +531,56 @@ async def position_reconcile_unmodeled_once(
     *,
     subaccount: int,
 ) -> list[str]:
-    """RUNTIME POSITION-RECONCILE NET (2026-07-18, after the two same-day
-    fill-recovery incidents left REAL exchange positions out of the risk book
-    for hours). Compare the exchange's open positions (read-only GET, pinned to
-    our subaccount — P0-5) against the in-memory exposure book and alarm
-    ``position_reconcile_unmodeled`` on any exchange position the book does
-    not model. FAIL-SAFE DIRECTION ONLY: this NEVER inserts a position (an
-    exchange position with no local model cannot be modeled from a guess —
-    rule 6); it alarms so the operator/monitor sees the divergence within one
-    interval instead of at the next restart's rehydrate. Local fills are
-    consulted only to annotate the alarm (our-own-fill-fell-out vs
-    manual/external trade). Returns the unmodeled tickers (for tests/callers)."""
+    """RUNTIME POSITION-RECONCILE NET (2026-07-18; ADOPTION 2026-07-21).
+
+    Compare the exchange's open positions (read-only GET, pinned to our
+    subaccount — P0-5) against the in-memory exposure book. Divergences split
+    into three classes:
+
+    1. **Our own fill fell out of the book** (a local fills row exists): the
+       fill-recovery sweep owns full re-modeling from the stored RFQ context —
+       here it stays ALARM-ONLY so two writers never race one position.
+    2. **No local context** (an older store's era, a manual app trade, any
+       past-run history — operator directive 2026-07-21: the bot must know its
+       standing even for what happened before it went live): ADOPTED as a
+       CONSERVATIVELY-RESERVED holding (P0-4, ``risk_modeled=False``) built
+       ONLY from exchange truth — side/count from the signed position, premium
+       at risk from the exchange's own ``market_exposure``; the entry price is
+       rounded UP so the booked ``max_loss_cc`` is never below the exchange's
+       figure (fail-safe LARGER). The reserve counts in every deterministic /
+       gross / concentration cap and enters the portfolio MC as a
+       deterministic reserve — never a leg sampled at a fabricated marginal.
+       Identity is a single self-leg (the combo market itself, its own
+       cluster): permanently unreadable ⇒ the marginal watch never baselines
+       it (no false trip), and its game key is its own singleton (it can't be
+       netted with anything anyway). Nothing is ever modeled from a GUESS —
+       a row whose exposure figure is unreadable stays alarm-only.
+    3. **A reserve whose exchange position went flat** (settled or manually
+       exited on the app): REMOVED — the exchange ledger says the risk is
+       gone, holding it would overcount forever.
+
+    Returns the unmodeled tickers seen this pass (for tests/callers)."""
     payload = await rest.get_positions(subaccount=subaccount)
     exch_by_ticker = open_combo_positions_from_positions(payload)
+    exposure_cc_by_ticker = _exchange_exposure_cc_by_ticker(payload)
+
+    # (3) drop reserves the exchange no longer reports open.
+    stale_reserves = [
+        pos
+        for pos in exposure.positions.values()
+        if pos.position_id.startswith("reserve:")
+        and pos.combo_ticker not in exch_by_ticker
+    ]
+    for pos in stale_reserves:
+        exposure.remove_position(pos.position_id)
+        log.info(
+            "position_reconcile_reserve_released",
+            ticker=pos.combo_ticker,
+            reserved_max_loss_cc=pos.max_loss_cc,
+            detail="exchange reports the reserved position flat (settled or "
+            "externally exited) — reserve released",
+        )
+
     known = {pos.combo_ticker for pos in exposure.positions.values()}
     unmodeled = sorted(t for t in exch_by_ticker if t not in known)
     if not unmodeled:
@@ -445,16 +588,58 @@ async def position_reconcile_unmodeled_once(
     local_fill_tickers = [
         t for t in unmodeled if await store.has_fill_for_ticker(t)
     ]
+    recovery_owned = set(local_fill_tickers)
+
+    adopted: list[str] = []
+    alarm_only: list[str] = []
+    for ticker in unmodeled:
+        if ticker in recovery_owned:
+            continue  # class 1: the fill-recovery sweep re-models it exactly
+        exch = exch_by_ticker[ticker]
+        exposure_cc = exposure_cc_by_ticker.get(ticker)
+        if exposure_cc is None or exposure_cc <= 0 or exch.contracts_centi <= 0:
+            alarm_only.append(ticker)  # no provable at-risk figure — never guess
+            continue
+        # Entry price per contract, rounded UP: booked max_loss_cc
+        # (= contracts × entry // 100) is then ≥ the exchange's exposure.
+        entry_cc = -(-exposure_cc * 100 // exch.contracts_centi)  # ceil div
+        side_str = "yes" if exch.side is Side.YES else "no"
+        reserved = OpenPosition(
+            position_id=f"reserve:{ticker}",
+            combo_ticker=ticker,
+            collection=None,
+            our_side=exch.side,
+            contracts=CentiContracts(exch.contracts_centi),
+            entry_price_cc=CentiCents(entry_cc),
+            legs=(LegRef(ticker, ticker, side_str),),
+            risk_modeled=False,
+        )
+        exposure.add_position(reserved)
+        adopted.append(ticker)
+        log.warning(
+            "position_reconcile_reserved_adopted",
+            ticker=ticker,
+            side=side_str,
+            contracts_centi=exch.contracts_centi,
+            exchange_exposure_cc=exposure_cc,
+            reserved_max_loss_cc=reserved.max_loss_cc,
+            detail="exchange position with NO local context adopted as a "
+            "conservatively-reserved holding (risk_modeled=False) — counted "
+            "in every deterministic/gross cap from exchange figures only",
+        )
+
     metrics.inc("position_reconcile.unmodeled")
     log.warning(
         "position_reconcile_unmodeled",
         tickers=unmodeled,
         local_fill_tickers=local_fill_tickers,
-        detail="exchange reports open positions the in-memory risk book does "
-        "NOT model — the caps are undercounting until reconciled; NOT "
-        "auto-inserted (fail-safe, never modeled from a guess) — reconcile "
-        "manually (tickers with a local fills row are our own fills that fell "
-        "out of the book, the 2026-07-18 incident class)",
+        adopted_as_reserve=adopted,
+        alarm_only=alarm_only,
+        detail="exchange reports open positions the in-memory risk book did "
+        "not model — no-context positions are adopted as reserved holdings "
+        "(exchange figures only); tickers with a local fills row are left to "
+        "the fill-recovery sweep (full re-model, 2026-07-18 incident class); "
+        "alarm-only rows had no readable exposure figure",
     )
     return unmodeled
 
@@ -1146,11 +1331,19 @@ class QuoteApp:
                     self._reservation_reconcile_loop(rest, reservation),
                     name="reservation-reconcile",
                 ),
-                # RUNTIME POSITION-RECONCILE NET (2026-07-18): alarm-only
-                # exchange-vs-book comparison every N minutes (read-only GET).
+                # RUNTIME POSITION-RECONCILE NET (2026-07-18; adoption
+                # 2026-07-21): exchange-vs-book comparison every N minutes
+                # (read-only GET) — no-context positions adopt as reserves.
                 asyncio.create_task(
                     self._position_reconcile_loop(rest, exposure, store),
                     name="position-reconcile",
+                ),
+                # EXTERNAL-TRANSFER WATCH + startup account-standing line
+                # (2026-07-21): deposits/withdrawals auto-adjust the SOD/peak
+                # anchors — never a manual re-anchor.
+                asyncio.create_task(
+                    self._transfer_watch_loop(rest, balance_tracker, exposure),
+                    name="transfer-watch",
                 ),
             ]
             if external is not None:
@@ -1907,14 +2100,75 @@ class QuoteApp:
                 log.warning("settlement_poll_failed", error=repr(exc))
             await asyncio.sleep(SETTLEMENT_POLL_INTERVAL_S)
 
+    async def _transfer_watch_loop(
+        self,
+        rest: KalshiRestClient,
+        tracker: BalanceTracker,
+        exposure: ExposureBook,
+    ) -> None:
+        """External-transfer watcher + startup account-standing line
+        (2026-07-21, operator: the bot must 100% know its standing/balance at
+        all times, with NO manual anchor updates).
+
+        First pass (shortly after start, once the first balance poll has
+        landed): BASELINE — every already-terminal deposit/withdrawal is
+        seeded WITHOUT applying (its cash is already in the balance the
+        anchors formed on) and one ``account_standing`` line reports the
+        exchange-truth standing: applied deposits/withdrawals, cash, equity,
+        modeled positions, pending receivables. Every later pass: a NEWLY
+        terminal transfer adjusts the SOD/peak anchors by exactly its delta
+        via ``apply_external_transfer`` — a mid-session deposit is not
+        profit, a withdrawal is not a give-back. Fetch errors retry next
+        interval (anchors untouched — fail-safe: an unobserved transfer means
+        halts read conservative, never loose)."""
+        seen: set[str] = set()
+        await asyncio.sleep(TRANSFER_WATCH_STARTUP_DELAY_S)
+        first = True
+        while True:
+            try:
+                deposits = await _page_portfolio(rest.get_deposits, "deposits")
+                withdrawals = await _page_portfolio(rest.get_withdrawals, "withdrawals")
+                deltas = new_external_transfer_deltas(seen, deposits, withdrawals)
+                if first:
+                    first = False
+                    dep_cc = sum(d for _, _, d in deltas if d > 0)
+                    wd_cc = -sum(d for _, _, d in deltas if d < 0)
+                    log.info(
+                        "account_standing",
+                        applied_deposits_cc=dep_cc,
+                        applied_withdrawals_cc=wd_cc,
+                        available_cash_cc=_int_or_none(
+                            tracker.available_cash_cc_or_none()
+                        ),
+                        exchange_equity_cc=_int_or_none(
+                            tracker.exchange_equity_cc_or_none()
+                        ),
+                        modeled_positions=len(exposure.positions),
+                        pending_receivables_cc=tracker.pending_receivables_cc(),
+                        detail="startup exchange-truth standing; transfers "
+                        "baselined (already inside the balance)",
+                    )
+                else:
+                    for kind, ref, delta_cc in deltas:
+                        tracker.apply_external_transfer(delta_cc, kind=kind, ref=ref)
+            except RateLimitedError as exc:
+                self._rate_limit_window.record()
+                log.warning("transfer_watch_rate_limited", error=str(exc))
+            except Exception as exc:
+                log.warning("transfer_watch_failed", error=repr(exc))
+            await asyncio.sleep(TRANSFER_WATCH_INTERVAL_S)
+
     async def _position_reconcile_loop(
         self, rest: KalshiRestClient, exposure: ExposureBook, store: Store
     ) -> None:
-        """Periodic position-reconcile net (2026-07-18 requirement 3): every
-        ``risk.position_reconcile_interval_s`` (default 5 min) alarm on any
-        exchange open position the in-memory book does not model. Alarm-only —
-        never an insert. Sleeps FIRST so the startup rehydrate/reconcile pass
-        finishes before the first comparison; errors retry next interval."""
+        """Periodic position-reconcile net (2026-07-18 requirement 3; adoption
+        2026-07-21): every ``risk.position_reconcile_interval_s`` (default
+        5 min) compare the exchange's open positions against the book —
+        no-local-context positions ADOPT as conservatively-reserved holdings
+        from exchange figures, recovery-owned ones alarm, flat reserves
+        release (see ``position_reconcile_unmodeled_once``). Sleeps FIRST so
+        the startup rehydrate/reconcile pass finishes before the first
+        comparison; errors retry next interval."""
         interval_s = self._config.risk.position_reconcile_interval_s
         while True:
             await asyncio.sleep(interval_s)

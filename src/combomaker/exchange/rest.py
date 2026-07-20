@@ -298,3 +298,21 @@ class KalshiRestClient:
         all subaccounts (docs/api-notes/index-scan.md §portfolio).
         """
         return await self._request("GET", "/portfolio/settlements", params=dict(params))
+
+    async def get_deposits(self, **params: str | int) -> JsonDict:
+        """Deposit history (GET /portfolio/deposits, docs 2026-07-21).
+
+        Response ``{cursor, deposits: Deposit[]}``; each carries ``id``,
+        ``status`` (pending|applied|failed|returned — only ``applied`` funds
+        are in the balance), ``type``, ``amount_cents``/``fee_cents`` (int
+        CENTS), ``created_ts``/``finalized_ts`` (unix ms). Page with
+        ``limit`` (≤500) / ``cursor``. Account-standing reconciliation input:
+        deposits − withdrawals + realized settlements ≡ balance.
+        """
+        return await self._request("GET", "/portfolio/deposits", params=dict(params))
+
+    async def get_withdrawals(self, **params: str | int) -> JsonDict:
+        """Withdrawal history (GET /portfolio/withdrawals) — mirror of
+        ``get_deposits`` (same paging + cents fields), the subtractive side of
+        the account-standing identity."""
+        return await self._request("GET", "/portfolio/withdrawals", params=dict(params))

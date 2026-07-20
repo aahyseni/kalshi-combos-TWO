@@ -346,6 +346,41 @@ class BalanceTracker:
         # (e.g. after a deposit the old high-water mark is meaningless).
         self._peak_equity_cc = equity_cc
 
+    def apply_external_transfer(self, delta_cc: int, *, kind: str, ref: str) -> None:
+        """AUTOMATIC anchor adjustment for an external cash transfer (a NEW
+        applied deposit ⇒ positive ``delta_cc`` net of its fee; a withdrawal ⇒
+        negative, gross of its fee). Called by the app's transfer watcher —
+        the no-manual-intervention replacement for "call
+        ``set_start_of_day_equity`` after a deposit" (2026-07-21).
+
+        BOTH anchors shift by exactly the transfer: SOD' = SOD + Δ keeps the
+        daily-loss measurement pure P&L (a deposit is not profit, a withdrawal
+        is not loss), and peak' = peak + Δ keeps the give-back halts pure
+        drawdown (a withdrawal must never read as a $-for-$ give-back, and a
+        deposit must not inflate headroom under the peak). No anchor yet (no
+        poll this day) ⇒ nothing to adjust — the first poll anchors on a
+        balance that already contains the transfer."""
+        if self._start_of_day_equity_cc is not None:
+            self._start_of_day_equity_cc = CentiCents(
+                int(self._start_of_day_equity_cc) + delta_cc
+            )
+        if self._peak_equity_cc is not None:
+            self._peak_equity_cc = CentiCents(int(self._peak_equity_cc) + delta_cc)
+        log.info(
+            "external_transfer_anchors_adjusted",
+            kind=kind,
+            ref=ref,
+            delta_cc=delta_cc,
+            start_of_day_equity_cc=(
+                None
+                if self._start_of_day_equity_cc is None
+                else int(self._start_of_day_equity_cc)
+            ),
+            peak_equity_cc=(
+                None if self._peak_equity_cc is None else int(self._peak_equity_cc)
+            ),
+        )
+
     @property
     def is_stale(self) -> bool:
         """True when there is no reading yet, or the last good poll is older

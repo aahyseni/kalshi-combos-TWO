@@ -650,7 +650,10 @@ async def test_position_reconcile_flags_unknown_exchange_position(
         assert unmodeled == ["KXMVE-EXTERNAL", "KXMVE-FELLOUT"]
         assert rest.params == {"subaccount": 0}  # query-layer pin (P0-5)
         assert metrics.counter("position_reconcile.unmodeled") == 1
-        # FAIL-SAFE ONLY: the net NEVER inserts into the book.
+        # Neither row ADOPTS here: FELLOUT has a local fills row (the recovery
+        # sweep owns full re-modeling) and EXTERNAL carries NO readable
+        # market_exposure figure — an at-risk amount is never guessed, so it
+        # stays alarm-only (adoption with a real figure: TestReserveAdoption).
         assert {p.combo_ticker for p in exposure.positions.values()} == {
             "KXMVE-KNOWN"
         }
@@ -668,6 +671,153 @@ async def test_position_reconcile_flags_unknown_exchange_position(
         assert metrics2.counter("position_reconcile.unmodeled") == 0
     finally:
         await store.close()
+
+
+# --------------------------------------------------------------------------- #
+# Reserve adoption (2026-07-21): a no-local-context exchange position adopts   #
+# as a conservatively-reserved holding from exchange figures only.             #
+# --------------------------------------------------------------------------- #
+
+
+class TestReserveAdoption:
+    async def test_no_context_position_adopts_as_reserve(
+        self, tmp_path: Path
+    ) -> None:
+        # Past-run history: -3.33 NO contracts, exchange says $2.00 at risk.
+        # Adopted exactly: side/count from the signed position, entry rounded
+        # UP so the booked max loss is never below the exchange's figure.
+        store = await Store.open(tmp_path / "adopt.sqlite3", FakeClock())
+        try:
+            exposure = ExposureBook(TEST_CONVENTIONS)
+            rest = FakePositionsRest(
+                {
+                    "market_positions": [
+                        {
+                            "ticker": "KXMVE-PAST",
+                            "position_fp": "-3.33",
+                            "market_exposure_dollars": "2.00",
+                        }
+                    ]
+                }
+            )
+            unmodeled = await position_reconcile_unmodeled_once(
+                rest, exposure, store, Metrics(), subaccount=0
+            )
+            assert unmodeled == ["KXMVE-PAST"]
+            reserve = exposure.positions["reserve:KXMVE-PAST"]
+            assert reserve.our_side is Side.NO
+            assert int(reserve.contracts) == 333
+            assert reserve.risk_modeled is False
+            # Fail-safe LARGER: ceil(20_000cc × 100 / 333) = 6_007cc/ct ⇒
+            # max_loss 20_003cc ≥ the exchange's 20_000cc, never below.
+            assert reserve.max_loss_cc >= 20_000
+            assert reserve.max_loss_cc == 333 * 6_007 // 100
+            # Identity self-leg: its own singleton cluster, never a guessed leg.
+            assert reserve.legs == (
+                LegRef(market_ticker="KXMVE-PAST", event_ticker="KXMVE-PAST", side="no"),
+            )
+
+            # Idempotent: the next pass sees the ticker modeled — no re-adopt,
+            # no duplicate, no alarm.
+            metrics2 = Metrics()
+            assert (
+                await position_reconcile_unmodeled_once(
+                    rest, exposure, store, metrics2, subaccount=0
+                )
+                == []
+            )
+            assert metrics2.counter("position_reconcile.unmodeled") == 0
+        finally:
+            await store.close()
+
+    async def test_int_cents_exposure_fallback(self, tmp_path: Path) -> None:
+        # Older payload shape: market_exposure int CENTS (no dollars string).
+        store = await Store.open(tmp_path / "adopt2.sqlite3", FakeClock())
+        try:
+            exposure = ExposureBook(TEST_CONVENTIONS)
+            rest = FakePositionsRest(
+                {
+                    "market_positions": [
+                        {
+                            "ticker": "KXMVE-CENTS",
+                            "position_fp": "-5.00",
+                            "market_exposure": 411,
+                        }
+                    ]
+                }
+            )
+            await position_reconcile_unmodeled_once(
+                rest, exposure, store, Metrics(), subaccount=0
+            )
+            reserve = exposure.positions["reserve:KXMVE-CENTS"]
+            assert reserve.max_loss_cc >= 41_100
+        finally:
+            await store.close()
+
+    async def test_flat_reserve_releases(self, tmp_path: Path) -> None:
+        # The exchange reporting the reserved market flat (settled / manually
+        # exited on the app) releases the reserve — held risk never overcounts
+        # forever. A still-open reserve is untouched.
+        store = await Store.open(tmp_path / "adopt3.sqlite3", FakeClock())
+        try:
+            exposure = ExposureBook(TEST_CONVENTIONS)
+            rest = FakePositionsRest(
+                {
+                    "market_positions": [
+                        {
+                            "ticker": "KXMVE-PAST",
+                            "position_fp": "-5.00",
+                            "market_exposure_dollars": "4.11",
+                        }
+                    ]
+                }
+            )
+            await position_reconcile_unmodeled_once(
+                rest, exposure, store, Metrics(), subaccount=0
+            )
+            assert "reserve:KXMVE-PAST" in exposure.positions
+            rest.payload = {
+                "market_positions": [
+                    {"ticker": "KXMVE-PAST", "position_fp": "0.00"}
+                ]
+            }
+            await position_reconcile_unmodeled_once(
+                rest, exposure, store, Metrics(), subaccount=0
+            )
+            assert "reserve:KXMVE-PAST" not in exposure.positions
+        finally:
+            await store.close()
+
+    async def test_reserve_counts_in_deterministic_caps(
+        self, tmp_path: Path
+    ) -> None:
+        # The point of adoption: the reserve's premium is REAL in the exposure
+        # snapshot (P0-4 doctrine) — whole-account risk never vanishes.
+        store = await Store.open(tmp_path / "adopt4.sqlite3", FakeClock())
+        try:
+            exposure = ExposureBook(TEST_CONVENTIONS)
+            rest = FakePositionsRest(
+                {
+                    "market_positions": [
+                        {
+                            "ticker": "KXMVE-PAST",
+                            "position_fp": "-5.00",
+                            "market_exposure_dollars": "4.11",
+                        }
+                    ]
+                }
+            )
+            await position_reconcile_unmodeled_once(
+                rest, exposure, store, Metrics(), subaccount=0
+            )
+            snapshot = exposure.snapshot(lambda _t: None, mass_acceptance=False)
+            assert snapshot.gross_notional_cc >= 41_100  # Σ max_loss (premium)
+            # Its own singleton game cluster carries the loss too.
+            assert max(
+                snapshot.worst_case_loss_by_game_cc.values(), default=0
+            ) >= 41_100
+        finally:
+            await store.close()
 
 
 # --------------------------------------------------------------------------- #

@@ -2385,12 +2385,15 @@ class RiskConfig(StrictModel):
     # whose result is not graded yet (or whose fetch errored). Positive finite
     # (validator below); the fetch pass is bounded and single-flight.
     settled_resolution_retry_s: float = 30.0
-    # PERIODIC POSITION-RECONCILE NET (2026-07-18 requirement 3). Every this
-    # many seconds the app compares the exchange's open positions
-    # (GET /portfolio/positions, read-only, subaccount-pinned) against the
-    # in-memory exposure book and alarms position_reconcile_unmodeled on any
-    # exchange position the book does not know — alarm-only, NEVER an
-    # auto-insert (fail-safe direction). Default 300 s (5 min).
+    # PERIODIC POSITION-RECONCILE NET (2026-07-18 requirement 3; adoption
+    # 2026-07-21). Every this many seconds the app compares the exchange's
+    # open positions (GET /portfolio/positions, read-only, subaccount-pinned)
+    # against the in-memory exposure book: a position with NO local context
+    # (past-run/manual history) ADOPTS as a conservatively-reserved holding
+    # built from exchange figures only (risk_modeled=False — counted in every
+    # deterministic/gross cap, never modeled from a guess); one with a local
+    # fills row stays alarm-only (the fill-recovery sweep re-models it); a
+    # reserve the exchange reports flat releases. Default 300 s (5 min).
     position_reconcile_interval_s: float = 300.0
     # F1 MONOTONE PRE-PRICING GATE (throughput synthesis 2026-07-16). When True,
     # handle_rfq consults a CANDIDATE-FREE limits check (cached ≤0.5s per
