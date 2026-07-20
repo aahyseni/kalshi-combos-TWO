@@ -37,7 +37,13 @@ from combomaker.pricing.conditionals_mlb import (
     strongest_measured_direction,
 )
 from combomaker.pricing.grouping import game_key
-from combomaker.pricing.legtypes import LegType, Sport, classify_leg, classify_sport
+from combomaker.pricing.legtypes import (
+    LegType,
+    Sport,
+    classify_leg,
+    classify_sport,
+    resolve_pricing_alias,
+)
 
 # The ONE anchored MLB team parser (reviewer defect #3): the game-blob /
 # end-anchoring helpers live in sgp.py (prefix=away, suffix=home,
@@ -116,6 +122,16 @@ class Relationship:
     # bare 2-leg pair itself never records here (it keeps the OK/sgp path,
     # bit-identical). Empty for every other kind.
     conditionals: tuple[tuple[int, int], ...] = ()
+    # NESTED_BAND with a same-game NEIGHBOUR (2026-07-14). A containment WINDOW
+    # (ml×spread / ladder rung) whose game ALSO carries a 3rd same-game leg used to
+    # decline UNKNOWN: the super-leg collapse can't correlate a non-monotone window
+    # with a same-game neighbour (its ρ is the rung's, attenuated by an unmeasured
+    # factor). But the STRUCTURAL scoreline model prices P(window ∧ neighbour)
+    # DIRECTLY (a scoreline region — validated: FRA win ∧ ¬cover ∧ total priced
+    # exact + arb-safe). So the engine routes these to structural and declines only
+    # if structural can't represent the legs (corners / MLB / multi-game), never a
+    # copula guess. Set only on that NESTED_BAND return.
+    band_with_neighbour: bool = False
 
 
 # Team-corners ticker suffix = team code + the over-line digits (…-COL5 -> COL, 5).
@@ -962,6 +978,69 @@ def classify_legs(
                     "joint = P(superset) - P(subset)"
                 )
 
+    # Family 4 — same-game ADVANCE × ADVANCE, different teams: a COMPLEMENT
+    # (adversarial verify 2026-07-16). A knockout between two teams advances
+    # EXACTLY ONE of them (rule book: win incl. ET + pens; the championship
+    # legs alias to synthetic finals-advance legs, so "ARG champion" ⟺ "ESP
+    # not champion" on the final). Without this family a mixed-side advance
+    # pair falls to the structural path, where ``joint_probability``
+    # multiplies each leg's penalty-shootout factor INDEPENDENTLY — q²
+    # instead of q on the level-after-ET states, a systematic ~3-5c
+    # underprice on a tight final (verify finding, CONFIRMED). Complement is
+    # STRONGER than containment:
+    #   {A yes, B yes} → IMPOSSIBLE (both advance)  — usually caught earlier
+    #                    by the ME metadata pass; this is the rule-book
+    #                    backstop for metadata-absent events
+    #   {A no,  B no}  → IMPOSSIBLE (neither advances)
+    #   mixed          → equivalence: joint = P(the YES leg), exactly
+    # Reachability: Kalshi's one-selection-per-family check blocks most of
+    # these shapes today — wired DEFENSIVELY like Family 2's NO orientations
+    # (exact if ever reachable; the validator has known misses).
+    for a_i in range(len(legs)):
+        if types[a_i] is not LegType.ADVANCE:
+            continue
+        for b_i in range(a_i + 1, len(legs)):
+            if types[b_i] is not LegType.ADVANCE or game_keys[a_i] != game_keys[b_i]:
+                continue
+            team_a = (
+                resolve_pricing_alias(legs[a_i].market_ticker)
+                .rsplit("-", 1)[-1]
+                .upper()
+            )
+            team_b = (
+                resolve_pricing_alias(legs[b_i].market_ticker)
+                .rsplit("-", 1)[-1]
+                .upper()
+            )
+            if not team_a or not team_b or team_a == team_b:
+                # Same team twice is the duplicate-market check's job;
+                # unparseable suffixes record no verdict (fail-closed).
+                continue
+            pair_sides = (legs[a_i].side, legs[b_i].side)
+            if pair_sides in (("yes", "yes"), ("no", "no")):
+                notes.append(
+                    f"same-game advance complement: {legs[a_i].market_ticker} "
+                    f"{pair_sides[0]} x {legs[b_i].market_ticker} {pair_sides[1]} — "
+                    "exactly one team advances, impossible"
+                )
+                # Airtight rule-book tautology (a knockout produces exactly
+                # one advancer, incl. ET/pens) ⇒ farmable, like Families 1-3.
+                return Relationship(
+                    RelationshipKind.IMPOSSIBLE, (), tuple(notes), farmable=True
+                )
+            if pair_sides == ("yes", "no"):
+                containments.append((a_i, b_i))
+                notes.append(
+                    f"advance complement equivalence: joint = "
+                    f"P({legs[a_i].market_ticker} yes)"
+                )
+            elif pair_sides == ("no", "yes"):
+                containments.append((b_i, a_i))
+                notes.append(
+                    f"advance complement equivalence: joint = "
+                    f"P({legs[b_i].market_ticker} yes)"
+                )
+
     # TAXONOMY-IMPOSSIBLE TRIPWIRE (2026-07-11, V3 robustness §2.4-1 —
     # judge-mandated). The shipped impossibility families above have all had
     # their say (each returns immediately on its own impossible mixes, with
@@ -1033,11 +1112,21 @@ def classify_legs(
         for low_i, _high_i in all_bands:
             game = game_keys[low_i]
             if sum(1 for k in game_keys if k == game) != 2:
+                # Band/window + same-game neighbour. The super-leg collapse can't
+                # correlate a window with a same-game neighbour, but the STRUCTURAL
+                # scoreline model prices P(window ∧ neighbour) natively — route
+                # there (engine declines only if structural can't represent it).
                 notes.append(
-                    f"nested band game {game} carries other legs: "
-                    "band-vs-neighbour correlation unmodeled"
+                    f"band+same-game-neighbour game {game}: routing to structural "
+                    "(scoreline prices window×neighbour natively)"
                 )
-                return Relationship(RelationshipKind.UNKNOWN, (), tuple(notes))
+                return Relationship(
+                    RelationshipKind.NESTED_BAND,
+                    tuple(groups),
+                    tuple(notes),
+                    bands=tuple(all_bands),
+                    band_with_neighbour=True,
+                )
         return Relationship(
             RelationshipKind.NESTED_BAND,
             tuple(groups),

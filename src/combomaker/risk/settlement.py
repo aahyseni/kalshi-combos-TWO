@@ -41,7 +41,7 @@ from combomaker.core.money import (
     ZERO,
     CentiCents,
     MoneyParseError,
-    cc_from_dollars_str,
+    fee_cc_from_dollars_str,
 )
 from combomaker.core.reasons import ReasonCode
 from combomaker.ops.logging import get_logger
@@ -180,13 +180,16 @@ def _parse_cents_field(row: JsonDict, key: str, ticker: str) -> CentiCents:
 
 
 def _parse_dollars_field(row: JsonDict, key: str, ticker: str) -> CentiCents:
-    """Fixed-point ``*_dollars`` string field → cc. Absent ⇒ $0 (many rows omit a
-    zero fee), but a PRESENT unparseable value raises (never guess)."""
+    """Fixed-point ``*_dollars`` string FEE field → cc. Absent ⇒ $0 (many rows omit
+    a zero fee). A present value is booked at cc granularity, rounding UP a sub-cc
+    fee (Kalshi can charge one, e.g. ``"0.000080"`` = 0.8 cc — observed live on a
+    combo settlement) so we never understate a cost we paid; a genuinely
+    unparseable value still raises (never guess). Used only for ``fee_cost``."""
     raw = row.get(key)
     if raw is None:
         return ZERO
     try:
-        return cc_from_dollars_str(str(raw))
+        return fee_cc_from_dollars_str(str(raw))
     except MoneyParseError as exc:
         raise SettlementReconcileError(
             f"settlement {ticker}: bad {key} {raw!r}: {exc}"
@@ -236,6 +239,15 @@ class SettlementHandler:
 
         A single unreadable row or a mismatch HALTs immediately; already-halted
         ⇒ we stop (cancel-all already ran)."""
+        # P1-7 MUTEX-METADATA SETTLEMENT TRIPWIRE. Audit the WHOLE batch for a
+        # violation of the mutual-exclusivity our risk netting trusted, BEFORE any
+        # settled position is booked+removed (the map is derived from held legs).
+        # If ≥2 distinct outcome markets of one explicit-True ME event both settled
+        # YES, the exclusivity our loss/directional netting credited was FALSE — a
+        # classification/metadata failure that UNDER-stated risk → HALT (defense
+        # #2/#3), never a log. A metadata-read error must fail closed like the
+        # farmed tripwire, so this runs before we touch the ledger.
+        await self._audit_mutex_metadata(rows)
         results: list[ReconcileResult] = []
         for row in rows:
             if self._killswitch.halted:
@@ -244,6 +256,36 @@ class SettlementHandler:
             if result is not None:
                 results.append(result)
         return results
+
+    async def _audit_mutex_metadata(self, rows: list[JsonDict]) -> None:
+        """Collect the market tickers this batch settled YES and HALT if any
+        explicit-True ME event we netted on saw ≥2 of its outcome markets settle
+        YES (the exclusivity was false → our netting under-stated risk)."""
+        settled_yes: list[str] = []
+        for row in rows:
+            ticker = str(row.get("ticker") or "")
+            if not ticker:
+                continue
+            # A market "settled YES" iff its binary result is yes. A scalar result
+            # is a graded payout, not a mutually-exclusive YES outcome, so it never
+            # participates in the exclusivity audit (the netting only ever credited
+            # binary yes/no outcome markets of a RESULT event).
+            if str(row.get("market_result") or "") == "yes":
+                settled_yes.append(ticker)
+        if not settled_yes:
+            return
+        violations = self._exposure.audit_mutex_settlements(settled_yes)
+        if not violations:
+            return
+        detail = "; ".join(
+            f"{event}: {sorted(markets)}" for event, markets in sorted(violations.items())
+        )
+        await self._killswitch.halt(
+            ReasonCode.HALT_RECONCILIATION_MISMATCH,
+            f"mutex-metadata tripwire: {len(violations)} netted mutually-exclusive "
+            f"event(s) settled ≥2 outcome markets YES — exclusivity FALSE, risk "
+            f"netting under-stated exposure ({detail})",
+        )
 
     async def _handle_one(self, row: JsonDict) -> ReconcileResult | None:
         try:

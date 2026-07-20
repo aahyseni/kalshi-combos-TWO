@@ -69,6 +69,7 @@ from combomaker.pricing.legtypes import (
     classify_leg,
     classify_sport,
     is_period_leg,
+    resolve_pricing_alias,
 )
 from combomaker.pricing.margin_total import (
     GameTotalOver,
@@ -191,7 +192,11 @@ def _parse_total_line(raw: str) -> int | None:
 
 def _parse_leg(ticker: str, match: _Match, *, fmt: MatchFormat) -> LegSpec | str:
     """One leg's spec (with its rule-book settlement window), or a reason
-    string when we cannot be certain."""
+    string when we cannot be certain. Pricing aliases resolve HERE (the shared
+    parse boundary): the pricing adapter AND the risk MC's game plans
+    (``sim.structural_book`` reuses this helper) settle an aliased champion
+    leg identically — never one without the other."""
+    ticker = resolve_pricing_alias(ticker)
     parts = ticker.split("-")
     leg_type = classify_leg(ticker)
     knockout = fmt is MatchFormat.KNOCKOUT
@@ -289,7 +294,7 @@ class StructuralPricer:
         self._mlb = mlb_config or MlbRunsConfig()
 
     def _match_format(self, ticker: str) -> MatchFormat:
-        series = ticker.split("-", 1)[0].upper()
+        series = resolve_pricing_alias(ticker).split("-", 1)[0].upper()
         for prefix in self._cfg.knockout_series:
             if series.startswith(prefix.upper()):
                 return MatchFormat.KNOCKOUT
@@ -352,7 +357,7 @@ class StructuralPricer:
 
         matches = []
         for leg in legs:
-            parts = leg.market_ticker.split("-")
+            parts = resolve_pricing_alias(leg.market_ticker).split("-")
             if len(parts) < 2:
                 raise StructuralError(f"malformed ticker {leg.market_ticker!r}")
             match = _parse_match(parts[1])
@@ -474,6 +479,7 @@ class StructuralPricer:
             uncertainty=uncertainty,
             frechet_lo=lo,
             frechet_hi=hi,
+            residual=base_model.residual,
             notes=(
                 *base_model.notes,
                 f"structural: format={fmt} legs={len(legs)}"
@@ -487,7 +493,10 @@ class StructuralPricer:
     # --- margin/total sports (NFL, NBA, WNBA) ------------------------------
 
     def _parse_mt_leg(self, ticker: str, match: _Match) -> MTLegSpec | str:
-        parts = ticker.split("-")
+        # Alias-resolved for symmetry with _parse_leg (verify follow-up
+        # 2026-07-16): inert today (aliases target soccer), but a future alias
+        # onto an MT sport would otherwise read team/line off the raw suffix.
+        parts = resolve_pricing_alias(ticker).split("-")
         leg_type = classify_leg(ticker)
         if leg_type is LegType.MONEYLINE:
             team = _team_of(parts[-1], match)
@@ -538,7 +547,7 @@ class StructuralPricer:
 
         matches = []
         for leg in legs:
-            parts = leg.market_ticker.split("-")
+            parts = resolve_pricing_alias(leg.market_ticker).split("-")
             if len(parts) < 2:
                 raise StructuralError(f"malformed ticker {leg.market_ticker!r}")
             match = _parse_match(parts[1])
@@ -626,6 +635,7 @@ class StructuralPricer:
             uncertainty=uncertainty,
             frechet_lo=lo,
             frechet_hi=hi,
+            residual=base_inv.residual,
             notes=(
                 *base_inv.notes,
                 f"structural-mt: sport={sport} legs={len(legs)} "
@@ -645,7 +655,7 @@ class StructuralPricer:
 
         matches = []
         for leg in legs:
-            parts = leg.market_ticker.split("-")
+            parts = resolve_pricing_alias(leg.market_ticker).split("-")
             if len(parts) < 2:
                 raise StructuralError(f"malformed ticker {leg.market_ticker!r}")
             match = _parse_match(parts[1])
@@ -715,6 +725,7 @@ class StructuralPricer:
             uncertainty=uncertainty,
             frechet_lo=lo,
             frechet_hi=hi,
+            residual=base.residual,
             notes=(
                 *base.notes,
                 f"structural-mlb: legs={len(legs)} "

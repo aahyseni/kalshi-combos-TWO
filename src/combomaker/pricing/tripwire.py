@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from combomaker.ops.logging import get_logger
-from combomaker.pricing.legtypes import classify_leg, classify_sport
+from combomaker.pricing.legtypes import classify_leg, classify_sport, resolve_pricing_alias
 from combomaker.rfq.models import RfqLeg
 
 log = get_logger(__name__)
@@ -107,11 +107,17 @@ class TripwireFixtureError(ValueError):
 
 
 def _series(ticker: str) -> str:
-    return ticker.split("-", 1)[0].upper()
+    # Pricing aliases resolve here (review 2026-07-16): classify_leg/game_key
+    # already resolve, so an aliased champion leg ENTERS the same-game scan —
+    # its team/suffix/line must then read off the SAME synthetic ticker
+    # ('ARG'), not the raw 2-letter champion code ('AR'), or the pinned
+    # advance cells both false-trip valid champion parlays and miss real
+    # impossibles.
+    return resolve_pricing_alias(ticker).split("-", 1)[0].upper()
 
 
 def _suffix(ticker: str) -> str:
-    return ticker.rsplit("-", 1)[-1].upper()
+    return resolve_pricing_alias(ticker).rsplit("-", 1)[-1].upper()
 
 
 def _line_of(ticker: str) -> int | None:
@@ -143,7 +149,10 @@ def _entity_of(ticker: str) -> str | None:
     """The player/entity segment: segment 2 of a ≥3-segment ticker (players
     sit there in every pinned shape: KXWCFIRSTGOAL-<g>-<P>, KXWCGOAL-<g>-<P>-1,
     KXWNBAPTS-<g>-<P>-15, KXPGATOUR-<t>-<P>)."""
-    parts = ticker.upper().split("-")
+    # Alias-resolved like _series/_suffix (verify follow-up 2026-07-16):
+    # unreachable for champion legs today (no same_entity cell matches an
+    # ADVANCE leg) — consistency, not a live fix.
+    parts = resolve_pricing_alias(ticker).upper().split("-")
     if len(parts) < 3 or not parts[2]:
         return None
     return parts[2]

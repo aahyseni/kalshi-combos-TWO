@@ -53,7 +53,7 @@ Money stays integer centi-cents; no binary floats (hard rule 5).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -68,6 +68,7 @@ from combomaker.risk.limits import (
     LimitChecker,
     PortfolioRisk,
     StartTimeProvider,
+    WaiverCertificate,
 )
 
 log = get_logger(__name__)
@@ -104,6 +105,59 @@ def open_combo_tickers_from_positions(positions_payload: dict[str, Any]) -> dict
         elif signed < 0:
             out[ticker] = Side.NO
         # signed == 0 ⇒ flat, not open
+    return out
+
+
+@dataclass(frozen=True, slots=True)
+class ExchangePosition:
+    """The exchange's AUTHORITATIVE view of one open market (P0-5): the ticker, the
+    side, and the ABSOLUTE quantity in centi-contracts read off ``position_fp``.
+    Quantity is exchange truth; local fills supply only cost basis/legs/fees."""
+
+    side: Side
+    contracts_centi: int  # ABS(position_fp) in centi-contracts; always > 0 here
+
+
+def open_combo_positions_from_positions(
+    positions_payload: dict[str, Any],
+) -> dict[str, ExchangePosition]:
+    """P0-5 exact exchange-quantity reconciliation. Map a ``GET /portfolio/positions``
+    payload to ``{combo_ticker: ExchangePosition}`` — the exchange's AUTHORITATIVE
+    ticker, side, AND quantity for every market it reports OPEN with a nonzero
+    position. Unlike :func:`open_combo_tickers_from_positions` (side only, used by
+    the reservation reconcile) this keeps the MAGNITUDE so the exposure book can be
+    rehydrated on the exchange's count rather than the reconstructed local one.
+
+    ``position_fp`` is a SIGNED count (index-scan §portfolio): NEGATIVE = a NO
+    position, POSITIVE = a YES position, 0 = flat. A flat/zero position is a
+    SETTLED or netted-out market — EXCLUDED here (never rehydrated). An unparseable
+    ``position_fp`` is SKIPPED (fail-closed: we never invent a quantity we can't
+    read; rule 6 / defense #3).
+
+    Subaccount pinning is NOT done here: the documented ``MarketPosition`` schema
+    (index-scan §portfolio: ticker / total_traded_dollars / position_fp /
+    market_exposure_dollars / realized_pnl_dollars / fees_paid_dollars /
+    last_updated_ts) carries NO per-row subaccount field, so there is nothing to
+    filter on. The pin is applied at the QUERY LAYER instead — the caller passes
+    ``subaccount`` to ``GET /portfolio/positions`` and the endpoint returns ONLY
+    that subaccount's positions (see ``QuoteApp._rehydrate_exposure_book``)."""
+    rows = positions_payload.get("market_positions") or positions_payload.get("positions") or []
+    out: dict[str, ExchangePosition] = {}
+    for row in rows:
+        ticker = str(row.get("ticker") or row.get("market_ticker") or "")
+        if not ticker:
+            continue
+        raw = row.get("position_fp")
+        if raw is None:
+            continue
+        try:
+            signed = int(qty_from_fp_str(str(raw)))
+        except ValueError:
+            continue  # fail-closed: unreadable count ⇒ not a provable open position
+        if signed == 0:
+            continue  # flat ⇒ settled / netted out, not open
+        side = Side.YES if signed > 0 else Side.NO
+        out[ticker] = ExchangePosition(side=side, contracts_centi=abs(signed))
     return out
 
 
@@ -231,6 +285,8 @@ class RiskReservationService:
         start_time_provider: StartTimeProvider | None = None,
         halt_inputs: HaltInputs | None = None,
         book_risk: PortfolioRisk | None = None,
+        waived_games: Mapping[str, WaiverCertificate] | None = None,
+        apply_resting_haircut: bool = False,
     ) -> ReserveResult:
         """Atomically reserve headroom for ``candidate`` if the limits allow it.
 
@@ -239,6 +295,15 @@ class RiskReservationService:
         reservation already holds. On PASS (no ENFORCED breach after the shadow
         split) the reservation is recorded and the version bumped; on FAIL nothing
         is recorded and the ENFORCED breaches are returned.
+
+        ``waived_games`` (CONFIRM-PATH last-look MC waiver): per-game
+        state-consistent worst-case certificates forwarded verbatim to
+        ``LimitChecker.check``, which skips ONLY the game-loss and
+        mutex-directional caps for exactly those games (re-validating each
+        certificate against the live game-loss budget). Passed ONLY by the
+        lifecycle's single waiver RETRY after a denial whose every enforced
+        breach was one of those two caps; every other caller leaves the default
+        None (byte-identical behaviour).
 
         Idempotent by ``reservation_id``: re-reserving an id already held returns
         the existing reservation WITHOUT re-checking or double-counting (a
@@ -266,6 +331,15 @@ class RiskReservationService:
         # the book snapshot's extra_positions so the game/slate/gross aggregates
         # count held-but-uncommitted headroom too.
         outstanding = self.outstanding_positions()
+        # ``apply_resting_haircut`` (2026-07-17, operator extension of the
+        # no-double-counting doctrine to CONFIRM): weights ONLY the resting
+        # open-quote fold. The candidate and every outstanding reservation ride
+        # in candidate_positions at 100% and the committed book folds at 100% —
+        # the terms that become REAL money are enforced exactly as before. A
+        # resting quote only ever becomes risk by passing through THIS check
+        # itself at 100% as the candidate, so its weighted presence here is
+        # pure double-count removal (same subset-validity argument as the
+        # quote-time haircut; E2 property test covers the confirm-armed path).
         raw = self._limits.check(
             self._exposure,
             marginals,
@@ -276,6 +350,8 @@ class RiskReservationService:
             start_time_provider=start_time_provider,
             halt_inputs=halt_inputs,
             book_risk=book_risk,
+            waived_games=waived_games,
+            apply_resting_haircut=apply_resting_haircut,
         )
         enforced = self._split(raw)
         if enforced:

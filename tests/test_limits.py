@@ -198,12 +198,17 @@ class TestEachLimitIndependently:
         assert "worst-case loss" in breaches[0].detail
 
     def test_unknown_marginals(self) -> None:
-        book = empty_book()
-        book.add_position(
-            make_position("p1", (LegRef("ZZZ", "EV9", "yes"),), contracts=1_000, entry_price=100)
+        # A CANDIDATE we cannot decompose (unavailable marginal) fails closed. NOTE
+        # a HELD position's missing marginal does NOT block — that would veto ALL
+        # quoting on one un-pricable held position (the 2026-07-15 rehydration
+        # regression); see tests/test_exposure.py.
+        candidate = make_position(
+            "cand", (LegRef("ZZZ", "EV9", "yes"),), contracts=100, entry_price=100
         )
-        breaches = LimitChecker(RiskLimits()).check(book, MARG, DailyPnl())
-        assert reasons(breaches) == [ReasonCode.SKIP_CLASSIFIER_UNKNOWN]
+        breaches = LimitChecker(RiskLimits()).check(
+            empty_book(), MARG, DailyPnl(), candidate_positions=[candidate]
+        )
+        assert ReasonCode.SKIP_CLASSIFIER_UNKNOWN in reasons(breaches)
 
 
 class TestDailyLoss:
@@ -303,3 +308,65 @@ class TestMassAcceptanceEnforcement:
         book = empty_book()
         book.upsert_quote(make_quote("q1", yes_bid=9_000, no_bid=9_000, contracts=10_000))
         assert enforced(LimitChecker(RiskLimits()).check(book, MARG, DailyPnl())) == []
+
+
+class TestOpenQuoteCountDirect:
+    """F5 (throughput synthesis 2026-07-16): ``check`` reads the open-quote count
+    DIRECTLY (``len(book.open_quotes)``) instead of building a full exposure
+    decomposition just to read ``.open_quote_count``. Value parity is pinned
+    against the snapshot field under mutation, and the count check must be
+    marginal-independent (an unreadable leg book never perturbs a pure count —
+    UNKNOWN marginals fail other caps closed on their own axis, never this one).
+    """
+
+    def test_direct_count_matches_snapshot_under_mutation(self) -> None:
+        book = empty_book()
+        for step in range(1, 6):
+            book.upsert_quote(make_quote(f"q{step}"))
+            assert (
+                len(book.open_quotes)
+                == book.snapshot(MARG, mass_acceptance=False).open_quote_count
+            )
+        book.remove_quote("q3")
+        book.remove_quote("q3")  # idempotent double-remove
+        book.add_position(make_position("p1"))  # positions never count as quotes
+        assert (
+            len(book.open_quotes)
+            == book.snapshot(MARG, mass_acceptance=False).open_quote_count
+            == 4
+        )
+
+    def test_max_open_quotes_breach_parity_at_boundary(self) -> None:
+        limits = RiskLimits(max_open_quotes=2)
+        book = empty_book()
+        book.upsert_quote(make_quote("q1"))
+        assert ReasonCode.SKIP_MAX_OPEN_QUOTES not in reasons(
+            LimitChecker(limits).check(book, MARG, DailyPnl(), adding_quote=True)
+        )
+        book.upsert_quote(make_quote("q2"))
+        assert ReasonCode.SKIP_MAX_OPEN_QUOTES in reasons(
+            LimitChecker(limits).check(book, MARG, DailyPnl(), adding_quote=True)
+        )
+        # Removing a quote frees the slot again (the direct count tracks the
+        # SAME dict the snapshot len() read — no stale/cached count).
+        book.remove_quote("q1")
+        assert ReasonCode.SKIP_MAX_OPEN_QUOTES not in reasons(
+            LimitChecker(limits).check(book, MARG, DailyPnl(), adding_quote=True)
+        )
+
+    def test_adversarial_unknown_marginals_never_perturb_the_count(self) -> None:
+        # ADVERSARIAL EDGE: every leg book unreadable (provider returns None for
+        # all tickers). The old snapshot-based count ran the full decomposition
+        # first; the count itself must stay exact and the max-open-quotes breach
+        # must fire on the count alone — while the unknown-marginal fail-closed
+        # breach still fires on ITS axis (never silently absorbed by the fix).
+        dead_marginals = provider({})
+        limits = RiskLimits(max_open_quotes=1)
+        book = empty_book()
+        book.upsert_quote(make_quote("q1"))
+        book.upsert_quote(make_quote("q2"))
+        rs = reasons(
+            LimitChecker(limits).check(book, dead_marginals, DailyPnl(), adding_quote=True)
+        )
+        assert ReasonCode.SKIP_MAX_OPEN_QUOTES in rs
+        assert ReasonCode.SKIP_CLASSIFIER_UNKNOWN in rs  # fail-closed axis intact

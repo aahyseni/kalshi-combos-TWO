@@ -11,7 +11,7 @@ from combomaker.core.reasons import ReasonCode
 from combomaker.ops.persistence import Store
 from combomaker.risk.limits import RiskLimits
 from tests.test_filters import Harness
-from tests.test_lifecycle import TEST_CONVENTIONS, Rig, accepted_msg, rfq
+from tests.test_lifecycle import JsonDict, TEST_CONVENTIONS, Rig, accepted_msg, rfq
 from tests.test_pricing_engine import CROSS_EVENT_LEGS, combo, seed_event
 
 
@@ -71,11 +71,21 @@ async def test_mass_acceptance_sees_target_cost_size(rig: Rig) -> None:
 
 # --- Finding 2: unknown accepted size must lapse, never guess --------------
 
+# Every wire field that can carry the accepted contract count (see
+# lifecycle._accepted_qty). Tests strip ALL of them to simulate "no size".
+_SIZE_FIELDS = ("contracts_accepted_fp", "no_contracts_offered_fp",
+                "yes_contracts_offered_fp")
+
+
+def _strip_size(msg: JsonDict) -> JsonDict:
+    for k in _SIZE_FIELDS:
+        msg.pop(k, None)
+    return msg
+
 
 async def test_missing_accepted_fp_on_target_cost_lapses(rig: Rig) -> None:
     await rig.lifecycle.handle_rfq(target_cost_rfq("15.00"))
-    msg = accepted_msg("q1", "yes")
-    del msg["contracts_accepted_fp"]
+    msg = _strip_size(accepted_msg("q1", "yes"))
     await rig.lifecycle.on_quote_accepted(msg)
     assert rig.sender.confirmed == []
     assert (
@@ -86,6 +96,8 @@ async def test_missing_accepted_fp_on_target_cost_lapses(rig: Rig) -> None:
 async def test_unparseable_accepted_fp_lapses_even_contracts_mode(rig: Rig) -> None:
     await rig.lifecycle.handle_rfq(rfq())
     msg = accepted_msg("q1", "yes")
+    # Corrupt the accepted-count field: present-but-unparseable = lapse,
+    # never fall through to another field and guess.
     msg["contracts_accepted_fp"] = "lots"
     await rig.lifecycle.on_quote_accepted(msg)
     assert rig.sender.confirmed == []
@@ -95,12 +107,36 @@ async def test_missing_accepted_fp_contracts_mode_falls_back_to_rfq_size(rig: Ri
     # contracts-mode: the quote covers the RFQ's full size by wire contract —
     # that fallback is doc-anchored, not a guess.
     await rig.lifecycle.handle_rfq(rfq())
-    msg = accepted_msg("q1", "yes")
-    del msg["contracts_accepted_fp"]
+    msg = _strip_size(accepted_msg("q1", "yes"))
     await rig.lifecycle.on_quote_accepted(msg)
     assert rig.sender.confirmed == ["q1"]
     position = next(iter(rig.exposure.positions.values()))
     assert int(position.contracts) == 1_000  # the RFQ's 10.00 contracts
+
+
+async def test_ground_truth_accept_fields_size_target_cost_rfq(rig: Rig) -> None:
+    # REGRESSION for the 2026-07-14 fill-killer. On a TARGET-COST RFQ (95% of
+    # live flow) the quote_accepted WS message has contracts_accepted_fp=null;
+    # the accepted size is the contracts we OFFERED on the accepted side
+    # (yes/no_contracts_offered_fp), verified against the live tape + the docs
+    # (docs.kalshi.com/websockets/communications). The old code read only
+    # contracts_accepted_fp and lapsed EVERY won auction. This replays the real
+    # target-cost accept shape and asserts we size the fill from the offered
+    # count and confirm it.
+    await rig.lifecycle.handle_rfq(target_cost_rfq("15.00"))
+    msg = {
+        "quote_id": "q1",
+        "rfq_id": "rfq_1",
+        "accepted_side": "yes",
+        "contracts_accepted_fp": None,          # null on a target-cost accept
+        "yes_contracts_offered_fp": "51.00",    # our offered size = the fill
+        "no_contracts_offered_fp": "0.00",
+        "rfq_target_cost_dollars": "15.0000",
+    }
+    await rig.lifecycle.on_quote_accepted(msg)
+    assert rig.sender.confirmed == ["q1"]
+    position = next(iter(rig.exposure.positions.values()))
+    assert int(position.contracts) == 5_100  # 51.00 contracts, from offered
 
 
 # --- Findings 3+4: position booked at confirm; confirm failure parks state --

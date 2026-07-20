@@ -150,18 +150,25 @@ LOOSE: dict[str, object] = {
     "drawdown_frac": Fraction(99, 100),
     "hard_trip_frac": Fraction(99, 100),
     "portfolio_cvar_frac": Fraction(99, 100),
+    "portfolio_det_max_frac": Fraction(99, 100),
     "absolute_notional_multiple": 999,
 }
 
 
 @dataclass(frozen=True, slots=True)
 class FakeBookRisk:
-    """Minimal PortfolioRisk stand-in for the CVaR cap tests (a real
-    ``BookRiskSnapshot`` is heavier to build; only ``usable`` +
-    ``operative_es_99_cc`` are read by the cap)."""
+    """Minimal PortfolioRisk stand-in for the CVaR + ruin cap tests (a real
+    ``BookRiskSnapshot`` is heavier to build; the caps read ``usable`` +
+    ``governing_model_es_99_cc`` + ``deterministic_max_loss_cc`` + ``p_ruin``).
+
+    P0-3: the sampled-ES and deterministic-max axes gate INDEPENDENTLY;
+    ``deterministic_max_loss_cc`` defaults to 0.0 so the model-ES tests exercise
+    only the CVaR gate."""
 
     usable: bool
-    operative_es_99_cc: float
+    governing_model_es_99_cc: float
+    deterministic_max_loss_cc: float = 0.0
+    p_ruin: float = 0.0
 
 
 class TestThresholdExactness:
@@ -666,30 +673,62 @@ class TestPortfolioCvarCap:
         )
         return r2_reasons(breaches)
 
-    def test_fires_when_operative_es_over_ceiling(self) -> None:
+    def test_fires_when_governing_model_es_over_ceiling(self) -> None:
         # 15% of $2,000 = $300 = 3_000_000 cc. ES 3_000_001 → fires.
         thr = threshold_cc(Fraction(15, 100), BANKROLL_2K)
-        risk = FakeBookRisk(usable=True, operative_es_99_cc=float(thr + 1))
+        risk = FakeBookRisk(usable=True, governing_model_es_99_cc=float(thr + 1))
         assert ReasonCode.SKIP_PORTFOLIO_CVAR in self._check(risk, Fraction(15, 100))
 
     def test_passes_at_or_below_ceiling(self) -> None:
         thr = threshold_cc(Fraction(15, 100), BANKROLL_2K)
-        risk = FakeBookRisk(usable=True, operative_es_99_cc=float(thr))
+        risk = FakeBookRisk(usable=True, governing_model_es_99_cc=float(thr))
         assert ReasonCode.SKIP_PORTFOLIO_CVAR not in self._check(risk, Fraction(15, 100))
 
     def test_unusable_snapshot_fails_closed(self) -> None:
         # An UNKNOWN/empty snapshot ⇒ breach regardless of the ES value.
-        risk = FakeBookRisk(usable=False, operative_es_99_cc=0.0)
+        risk = FakeBookRisk(usable=False, governing_model_es_99_cc=0.0)
         assert ReasonCode.SKIP_PORTFOLIO_CVAR in self._check(risk, Fraction(15, 100))
 
     def test_no_snapshot_not_evaluated(self) -> None:
         # None (no MC yet) ⇒ the cap simply doesn't run; no CVaR breach.
         assert ReasonCode.SKIP_PORTFOLIO_CVAR not in self._check(None, Fraction(15, 100))
 
+
+class TestPortfolioRuinCap:
+    """A2 P(ruin) cap: the structural-MC ``p_ruin`` (P(equity < ruin floor this
+    settlement wave)) vs a probability budget. Reads the latest snapshot, never
+    re-runs MC; fails closed with the CVaR cap on an unusable snapshot."""
+
+    def _check(self, p_ruin: float, budget: Fraction) -> list[ReasonCode]:
+        limits = {**LOOSE, "portfolio_ruin_prob_budget": budget}
+        risk = FakeBookRisk(usable=True, governing_model_es_99_cc=0.0, p_ruin=p_ruin)
+        breaches = LimitChecker(RiskLimits(**limits)).check(  # type: ignore[arg-type]
+            empty_book(), MARG, DailyPnl(), risk_bankroll_cc=BANKROLL_2K,
+            book_risk=risk,  # type: ignore[arg-type]
+        )
+        return r2_reasons(breaches)
+
+    def test_fires_over_budget(self) -> None:
+        assert ReasonCode.SKIP_PORTFOLIO_RUIN in self._check(0.06, Fraction(5, 100))
+
+    def test_passes_at_or_below_budget(self) -> None:
+        assert ReasonCode.SKIP_PORTFOLIO_RUIN not in self._check(0.05, Fraction(5, 100))
+
+    def test_unusable_snapshot_no_ruin_breach(self) -> None:
+        # An unusable snapshot fails closed via SKIP_PORTFOLIO_CVAR; the ruin cap is
+        # guarded by ``usable`` so it does not also fire on a stale p_ruin.
+        limits = {**LOOSE, "portfolio_ruin_prob_budget": Fraction(1, 100)}
+        risk = FakeBookRisk(usable=False, governing_model_es_99_cc=0.0, p_ruin=0.9)
+        breaches = LimitChecker(RiskLimits(**limits)).check(  # type: ignore[arg-type]
+            empty_book(), MARG, DailyPnl(), risk_bankroll_cc=BANKROLL_2K,
+            book_risk=risk,  # type: ignore[arg-type]
+        )
+        assert ReasonCode.SKIP_PORTFOLIO_RUIN not in r2_reasons(breaches)
+
     def test_shadow_flag_set_in_shadow_mode(self) -> None:
         # In caps_shadow_mode (LOOSE pins it True), the CVaR breach is log-only.
         thr = threshold_cc(Fraction(15, 100), BANKROLL_2K)
-        risk = FakeBookRisk(usable=True, operative_es_99_cc=float(thr + 1))
+        risk = FakeBookRisk(usable=True, governing_model_es_99_cc=float(thr + 1))
         limits = RiskLimits(**{**LOOSE, "portfolio_cvar_frac": Fraction(15, 100)})  # type: ignore[arg-type]
         breaches = LimitChecker(limits).check(
             empty_book(),
@@ -714,3 +753,48 @@ class TestPortfolioCvarCap:
 
         with pytest.raises(ValidationError):
             RiskConfig(portfolio_cvar_frac="1.5")
+
+
+class TestAllReservedBookGating:
+    """P0-4 end-to-end (live blocker 2026-07-16): a book whose ONLY holdings are
+    conservatively-reserved yields a REAL snapshot with n_positions=0 and a
+    nonzero deterministic reserve. It must gate the reserve on the deterministic
+    axis — never blanket-fail-close every quote as 'unusable' (that declined
+    3k/8min quotes live when the one rehydrated gated-series position was the
+    whole book)."""
+
+    def _check(self, snap: object, det_frac: Fraction) -> list[ReasonCode]:
+        limits = {**LOOSE, "portfolio_det_max_frac": det_frac}
+        breaches = LimitChecker(RiskLimits(**limits)).check(  # type: ignore[arg-type]
+            empty_book(),
+            MARG,
+            DailyPnl(),
+            risk_bankroll_cc=BANKROLL_2K,
+            book_risk=snap,  # type: ignore[arg-type]
+        )
+        return r2_reasons(breaches)
+
+    def _snap(self, reserve_cc: float) -> object:
+        from combomaker.sim.book_risk import BookRiskSnapshot
+
+        # Exactly the shape compute_book_risk returns for an ALL-RESERVED book.
+        return BookRiskSnapshot(
+            unknown=False,
+            band="high",
+            n_samples=1,
+            seed=1,
+            n_positions=0,
+            deterministic_max_loss_cc=reserve_cc,
+        )
+
+    def test_reserve_under_det_ceiling_quotes(self) -> None:
+        snap = self._snap(210_000.0)  # $21 reserve on a $2k bankroll
+        assert snap.usable is True  # type: ignore[attr-defined]
+        reasons = self._check(snap, Fraction(15, 100))
+        assert ReasonCode.SKIP_PORTFOLIO_CVAR not in reasons
+        assert ReasonCode.SKIP_PORTFOLIO_DET_MAX not in reasons
+
+    def test_reserve_over_det_ceiling_still_gates(self) -> None:
+        thr = threshold_cc(Fraction(15, 100), BANKROLL_2K)
+        reasons = self._check(self._snap(float(thr + 1)), Fraction(15, 100))
+        assert ReasonCode.SKIP_PORTFOLIO_DET_MAX in reasons

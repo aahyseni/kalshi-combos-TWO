@@ -85,6 +85,63 @@ async def test_disconnect_clears_open_rfqs() -> None:
     assert intake.open_rfqs == {}
 
 
+# --- rfq_alive liveness view (F2 probe; risk audit fix 2026-07-16) ---
+
+
+async def test_rfq_alive_tracks_registry_and_positive_deletion() -> None:
+    intake, ws, _, _, _ = await make()
+    assert not intake.rfq_alive("rfq_1")  # never seen ⇒ not alive
+    await ws.deliver(envelope("rfq_created", RFQ_MSG))
+    assert intake.rfq_alive("rfq_1")
+    await ws.deliver(envelope("rfq_deleted", {"id": "rfq_1", "deleted_ts": "t"}))
+    assert not intake.rfq_alive("rfq_1")  # POSITIVE deletion ⇒ gone
+
+
+async def test_disconnect_cleared_ids_stay_alive_not_deleted() -> None:
+    # THE F2 FIX: a WS drop clears the registry, but absence-after-clear is
+    # UNKNOWN, not deletion — an RFQ received just before the blip is still
+    # live/winnable (the REST POST needs no WS) and must NOT be liveness-
+    # skipped as "deleted mid-flight".
+    intake, ws, _, _, _ = await make()
+    await ws.deliver(envelope("rfq_created", RFQ_MSG))
+    await ws.drop_connection()
+    assert intake.open_rfqs == {}          # registry itself IS cleared
+    assert intake.rfq_alive("rfq_1")       # ... but liveness reads UNKNOWN ⇒ alive
+    assert not intake.rfq_alive("never_seen")  # unrelated ids unchanged
+
+
+async def test_positive_delete_beats_stale_unknown() -> None:
+    # A deletion that arrives AFTER the disconnect cleared the registry must
+    # still flip the liveness answer (positive evidence beats UNKNOWN).
+    intake, ws, _, _, _ = await make()
+    await ws.deliver(envelope("rfq_created", RFQ_MSG))
+    await ws.drop_connection()
+    assert intake.rfq_alive("rfq_1")
+    await ws.deliver(envelope("rfq_deleted", {"id": "rfq_1", "deleted_ts": "t"}))
+    assert not intake.rfq_alive("rfq_1")
+
+
+async def test_deleted_before_disconnect_stays_dead_through_it() -> None:
+    intake, ws, _, _, _ = await make()
+    await ws.deliver(envelope("rfq_created", RFQ_MSG))
+    await ws.deliver(envelope("rfq_deleted", {"id": "rfq_1", "deleted_ts": "t"}))
+    await ws.drop_connection()
+    assert not intake.rfq_alive("rfq_1")  # a dead RFQ must not resurrect
+
+
+async def test_stale_ids_age_out_after_two_more_disconnects() -> None:
+    # Memory bound: disconnect-cleared ids survive exactly two generations
+    # (far past the pipeline's ~2s budget for them), then age out.
+    intake, ws, _, _, _ = await make()
+    await ws.deliver(envelope("rfq_created", RFQ_MSG))
+    await ws.drop_connection()             # generation 1: parked
+    assert intake.rfq_alive("rfq_1")
+    await ws.drop_connection()             # generation 2: still parked
+    assert intake.rfq_alive("rfq_1")
+    await ws.drop_connection()             # rotated out
+    assert not intake.rfq_alive("rfq_1")
+
+
 async def test_inject_deduplicates() -> None:
     intake, ws, seen, _, _ = await make()
     await ws.deliver(envelope("rfq_created", RFQ_MSG))

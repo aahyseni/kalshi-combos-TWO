@@ -292,14 +292,25 @@ class FakeFeed:
 
 
 class FakeLifecycle:
-    """Minimal QuoteLifecycle double: only the marginal_of accessor the breaker
-    sampler uses. ``marginals`` maps market_ticker → P(YES) (None = unreadable)."""
+    """Minimal QuoteLifecycle double: the marginal_of accessor the breaker
+    sampler uses plus the settled-watch exemption (2026-07-18). ``marginals``
+    maps market_ticker → P(YES) (None = unreadable); ``settled`` is the set of
+    tickers the exchange confirmed no longer live (default empty — the strict
+    pre-fix watch)."""
 
-    def __init__(self, marginals: dict[str, float | None] | None = None) -> None:
+    def __init__(
+        self,
+        marginals: dict[str, float | None] | None = None,
+        settled: set[str] | None = None,
+    ) -> None:
         self._m = marginals or {}
+        self._s = settled or set()
 
     def marginal_of(self, market_ticker: str) -> float | None:
         return self._m.get(market_ticker)
+
+    def settled_watch_exempt(self, market_ticker: str) -> bool:
+        return market_ticker in self._s
 
 
 def _empty_book() -> ExposureBook:
@@ -694,3 +705,39 @@ async def test_rate_limit_window_burst_trips_breaker_from_confirm_429s(
     verdict = breakers.evaluate(inputs)
     assert verdict.tripped is True
     assert verdict.reason is ReasonCode.HALT_RATE_LIMIT_BURST
+
+
+def test_supervisor_launch_cmd_forwards_config_path(tmp_path: Path) -> None:
+    # Problem B (2026-07-15 heartbeat kills): the supervisor subprocess re-loads
+    # config itself; if the launcher omits --config, a local-override launch
+    # config (e.g. supervisor.heartbeat_timeout_s) applies to the bot but NOT to
+    # the watchdog that enforces it. The launch argv must forward the SAME file
+    # the bot was started with.
+    from combomaker.ops.quote_app import supervisor_launch_cmd
+
+    cfg_file = tmp_path / "prod-live.local.yaml"
+    config = AppConfig(
+        env=Env.PROD,
+        mode=Mode.QUOTE,
+        endpoints=EndpointsConfig.for_env(Env.PROD),
+        source_path=cfg_file,
+    )
+    cmd = supervisor_launch_cmd(config)
+    assert cmd[1:3] == ["-m", "combomaker.ops.supervisor"]
+    assert cmd[cmd.index("--env") + 1] == "prod"
+    assert cmd[cmd.index("--config") + 1] == str(cfg_file)
+
+
+def test_supervisor_launch_cmd_without_source_path(tmp_path: Path) -> None:
+    # No explicit config file (base per-env launch) ⇒ no --config flag, the
+    # supervisor derives config/{env}.yaml exactly as before.
+    from combomaker.ops.quote_app import supervisor_launch_cmd
+
+    config = AppConfig(
+        env=Env.DEMO,
+        mode=Mode.QUOTE,
+        endpoints=EndpointsConfig.for_env(Env.DEMO),
+    )
+    cmd = supervisor_launch_cmd(config)
+    assert "--config" not in cmd
+    assert cmd[cmd.index("--env") + 1] == "demo"

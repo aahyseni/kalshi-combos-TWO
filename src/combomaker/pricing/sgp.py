@@ -35,6 +35,7 @@ from combomaker.pricing.legtypes import (
     classify_leg,
     classify_sport,
     pair_key,
+    resolve_pricing_alias,
 )
 from combomaker.rfq.models import RfqLeg
 
@@ -206,8 +207,9 @@ def _spread_team(ticker: str) -> str | None:
     the trailing line digits removed (``…-FRA2`` -> ``FRA``). Same TEAM+digits
     shape as team-corners, so it reuses ``_CORNERS_TEAM_SUFFIX`` (whole-suffix
     ``_winner_team`` would read the line digits as part of the team). None when
-    the suffix isn't a team-code + optional digits shape (don't guess)."""
-    return _corners_team_name(ticker)
+    the suffix isn't a team-code + optional digits shape (don't guess). Pricing
+    aliases resolve first (identity when unaliased)."""
+    return _corners_team_name(resolve_pricing_alias(ticker))
 
 
 def _spread_pair_prior(
@@ -253,11 +255,15 @@ def _spread_winner_prior(
 
 
 def _winner_team(ticker: str) -> str | None:
-    """The team code a (1H- or full-game) moneyline leg names — its ticker's
-    last hyphen segment. None for a draw side, which has no measured 1H×FT
-    orientation. Two same-game winner legs name the SAME team iff these strings
-    match (both are drawn from the one game's team-code vocabulary)."""
-    suffix = ticker.rsplit("-", 1)[-1].upper()
+    """The team code a (1H- or full-game) moneyline/advance leg names — its
+    ticker's last hyphen segment. None for a draw side, which has no measured
+    1H×FT orientation. Two same-game winner legs name the SAME team iff these
+    strings match (both are drawn from the one game's team-code vocabulary).
+    Pricing aliases resolve first: a champion leg's RAW suffix is a 2-letter
+    country code (``…-AR``) that startswith-collides with the 3-letter player
+    codes (``ARGMESSI``) only by luck — the synthetic advance suffix (``ARG``)
+    is the one from the game's actual vocabulary."""
+    suffix = resolve_pricing_alias(ticker).rsplit("-", 1)[-1].upper()
     if not suffix or suffix in _DRAW_SUFFIXES:
         return None
     return suffix

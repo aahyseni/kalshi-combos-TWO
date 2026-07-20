@@ -1,5 +1,13 @@
 ================================================================================
-kalshi-combos-TWO  —  LIVE ISSUES (current)
+*** HISTORICAL (2026-07-14 SNAPSHOT) — SUPERSEDED, DO NOT TREAT AS CURRENT. ***
+This "current" snapshot predates the risk-engine upgrade, the accepted-size fix,
+the held-positions SQL FANOUT FIX (which restored 228+ live quotes), and the live
+quote recovery. Its cap/decline framing (skip_game_loss_cap, skip_classifier_unknown
+as the ceiling) is stale. For current state see RISK_ENGINE_AUDIT_ACTION_PLAN.txt,
+the risk-audit-overnight commits (45164f1..HEAD), and the SUPERSEDED banner on
+docs/reports/2026-07-15-risk-engine-upgrade-final-report.md. Retained for history.
+================================================================================
+kalshi-combos-TWO  —  LIVE ISSUES (HISTORICAL snapshot — see banner above)
 Snapshot: 2026-07-14 03:31 UTC   |   Run: live_wc15, stable on ONE connection 6+ min
 ================================================================================
 

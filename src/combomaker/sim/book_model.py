@@ -98,8 +98,19 @@ class BookModel:
     global block-diagonal correlation matrices (identical shape ``(n, n)``); risk
     gates on ``corr_high``. ``leg_index`` maps a ticker to its latent index (for
     tail attribution). ``event_by_index`` maps a latent index to that leg's
-    ``event_ticker`` (for per-game tail attribution). ``unknown`` is True iff any
-    marginal was missing — the whole model is then no-go (fail-closed)."""
+    ``event_ticker`` (for per-game tail attribution). ``unknown`` is True iff a
+    marginal for a RISK-MODELED position was missing — the whole model is then
+    no-go (fail-closed).
+
+    ``reserved_loss_cc`` (P0-4) is the exact total premium of the
+    CONSERVATIVELY-RESERVED holdings (``OpenPosition.risk_modeled=False`` — e.g.
+    gated-off series with no subscribed leg books). Those positions are NOT
+    sampled (their marginals are unavailable, so they never enter the leg
+    universe or the correlation matrix, and a missing reserved marginal never
+    forces the whole model UNKNOWN), but their premium is carried here as a
+    DETERMINISTIC reserve the risk MC adds OUTSIDE model ES — so their
+    whole-account risk never vanishes from the tail number while never being
+    scored against a fabricated p=0.5."""
 
     legs: tuple[LegModel, ...]
     positions: tuple[ComboPosition, ...]
@@ -109,6 +120,7 @@ class BookModel:
     leg_index: dict[str, int]
     event_by_index: dict[int, str | None]
     unknown: bool
+    reserved_loss_cc: float = 0.0
 
     def corr_for_band(self, band: str) -> NDArray[np.float64]:
         """The correlation matrix for a band name ("point"|"low"|"high")."""
@@ -132,8 +144,12 @@ def _position_to_combo(
       instead of an independent complement pseudo-leg.
     - ``side`` = the POSITION side we hold (from ``our_side``): a long NO pays
       ``$1 − payout`` per contract (``combo_no_pays_complement``, promoted).
-    - ``contracts`` = centi-contracts → contracts, floored at 1 (a real position
-      never rounds to 0 — the ``max(1, …)`` guard the report MC already used).
+    - ``contracts`` = centi-contracts converted EXACTLY to fractional contracts
+      (``centi_contracts / 100``): 3727 → 37.27, 40 → 0.40 (P0-6). NO forced
+      one-contract minimum — a fractional position is scored at its true size, so
+      the simulated per-contract·contracts P&L matches the analytic
+      ``contracts·entry_price//100`` max loss to the cent. (The old
+      ``max(1, centi//100)`` floored 37.27→37 and inflated 0.40→1.)
     - ``price_cc`` = the premium PAID per contract; fee 0 here (reconciled
       elsewhere).
     """
@@ -144,7 +160,7 @@ def _position_to_combo(
     return ComboPosition(
         leg_indices=indices,
         side="yes" if position.our_side is Side.YES else "no",
-        contracts=max(1, int(position.contracts) // 100),
+        contracts=int(position.contracts) / 100,
         price_cc=int(position.entry_price_cc),
         leg_sides=leg_sides,  # type: ignore[arg-type]  # narrowed to yes|no above
     )
@@ -165,14 +181,31 @@ def build_book_model(
     ``within_game_rho`` (or the flat band when the pair has none). NO-selected
     legs are handled per position via ``leg_sides`` (no complement pseudo-leg).
 
-    Fail-closed: a missing marginal anywhere ⇒ ``unknown=True``; the model is
-    still assembled (so the caller can inspect it) but ``unknown`` marks it no-go.
-    A leg whose marginal is missing gets ``p=0.5`` ONLY so the matrix has a valid
-    entry — the ``unknown`` flag forbids using any stat computed from it. This is
-    the opposite of the old report MC, which fed the 0.5 into the stats and merely
-    flagged it: here the flag is a HARD no-score for gating.
+    Fail-closed: a missing marginal on a RISK-MODELED position ⇒ ``unknown=True``;
+    the model is still assembled (so the caller can inspect it) but ``unknown``
+    marks it no-go. A leg whose marginal is missing gets ``p=0.5`` ONLY so the
+    matrix has a valid entry — the ``unknown`` flag forbids using any stat
+    computed from it. This is the opposite of the old report MC, which fed the 0.5
+    into the stats and merely flagged it: here the flag is a HARD no-score for
+    gating.
+
+    P0-4 (usable MC without hiding unmodeled holdings): a CONSERVATIVELY-RESERVED
+    position (``risk_modeled=False`` — a gated-off holding with no subscribed leg
+    books, so its marginals are UNAVAILABLE) is NOT sampled. Its legs never enter
+    the leg universe or the correlation matrix, so its missing marginal can NEVER
+    force the whole model UNKNOWN and can NEVER poison the decomposition of the
+    quote-eligible (risk-modeled) positions. Instead its EXACT premium is summed
+    into ``reserved_loss_cc`` — a deterministic reserve the risk MC adds OUTSIDE
+    the model ES. Its whole-account risk therefore stays in global capital
+    accounting without ever being scored against a fabricated ``p=0.5``.
     """
     positions = list(positions)
+    # P0-4: split the book. Only RISK-MODELED positions are sampled; RESERVED
+    # holdings (unavailable marginals) carry a deterministic premium reserve.
+    modeled_positions = [p for p in positions if p.risk_modeled]
+    reserved_loss_cc = float(
+        sum(p.max_loss_cc for p in positions if not p.risk_modeled)
+    )
 
     # --- global leg universe: one LegModel per distinct ticker, YES marginal ---
     leg_index: dict[str, int] = {}
@@ -180,7 +213,7 @@ def build_book_model(
     event_by_index: dict[int, str | None] = {}
     game_of_index: dict[int, str | None] = {}
     unknown = False
-    for position in positions:
+    for position in modeled_positions:
         for leg in position.legs:
             if leg.market_ticker in leg_index:
                 continue
@@ -198,8 +231,10 @@ def build_book_model(
 
     n = len(legs)
 
-    # --- positions → engine ComboPositions -----------------------------------
-    combos = tuple(_position_to_combo(position, leg_index) for position in positions)
+    # --- positions → engine ComboPositions (RISK-MODELED only; P0-4) ----------
+    combos = tuple(
+        _position_to_combo(position, leg_index) for position in modeled_positions
+    )
 
     if n == 0:
         empty = np.zeros((0, 0), dtype=np.float64)
@@ -212,6 +247,7 @@ def build_book_model(
             leg_index=leg_index,
             event_by_index=event_by_index,
             unknown=unknown,
+            reserved_loss_cc=reserved_loss_cc,
         )
 
     # --- within-game blocks: index sets keyed on the game code ---------------
@@ -281,6 +317,7 @@ def build_book_model(
         leg_index=leg_index,
         event_by_index=event_by_index,
         unknown=unknown,
+        reserved_loss_cc=reserved_loss_cc,
     )
 
 
@@ -315,3 +352,15 @@ def combo_positions_for_quotes(
     already in ``leg_index`` raises (the caller builds the universe with the
     quotes included first)."""
     return tuple(_position_to_combo(h, leg_index) for h in hypotheticals)
+
+
+def position_to_combo(
+    position: OpenPosition, leg_index: dict[str, int]
+) -> ComboPosition:
+    """Public alias of :func:`_position_to_combo` (P0-1). Maps ONE risk-modeled
+    ``OpenPosition`` to its engine ``ComboPosition`` against an EXISTING shared
+    ``leg_index``. Used by the candidate-aware evaluator to build the PRE and POST
+    combo lists against the SAME merged leg universe, so both are scored on the
+    SAME sampled leg-value matrix (common random numbers). Any leg not already in
+    ``leg_index`` raises (the caller assembled the merged universe first)."""
+    return _position_to_combo(position, leg_index)

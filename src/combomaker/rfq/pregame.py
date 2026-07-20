@@ -119,6 +119,7 @@ class ComboStartStatus:
 
     any_started: bool  # a leg's game has started (now >= start − margin)
     any_unknown: bool  # a leg had no usable start-time source
+    any_too_far: bool = False  # a leg's game is beyond the per-prefix max horizon
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,18 +171,57 @@ class PregameGate:
     def _status(self, legs: Sequence[RfqLeg], *, confirm: bool) -> ComboStartStatus:
         if self._config.allow_inplay_legs:
             # Operator re-enabled in-play quoting: the schedule gate stands
-            # down entirely (motion detector + close-time gate stay active).
-            return ComboStartStatus(any_started=False, any_unknown=False)
+            # down entirely (motion detector + close-time gate stay active). The
+            # too-far horizon is independent of in-play, so still enforce it.
+            now = self._clock.now().astimezone(UTC)
+            too_far = any(self._leg_too_far(leg.market_ticker, now) for leg in legs)
+            return ComboStartStatus(
+                any_started=False, any_unknown=False, any_too_far=too_far
+            )
         now = self._clock.now().astimezone(UTC)
-        started = False
-        unknown = False
+        started = unknown = too_far = False
         for leg in legs:
-            cutoff = self._cutoff_time(leg.market_ticker, confirm=confirm)
-            if cutoff is None:
+            resolved = self.leg_start(leg.market_ticker)
+            if resolved is None:
                 unknown = True
-            elif now >= cutoff:
+                continue
+            # STARTED: now >= start − margin (precise) / bare estimate (buffered).
+            if resolved.precise:
+                margin_s = (
+                    self._confirm_margin_s(leg.market_ticker)
+                    if confirm
+                    else self._quote_margin_s(leg.market_ticker)
+                )
+                cutoff = resolved.start - timedelta(seconds=margin_s)
+            else:
+                cutoff = resolved.start
+            if now >= cutoff:
                 started = True
-        return ComboStartStatus(any_started=started, any_unknown=unknown)
+            # TOO FAR OUT: a game beyond the per-prefix horizon has an UNINFORMED
+            # Kalshi leg book that diverges from the sharp consensus, so pricing a
+            # combo off it invites adverse selection (2026-07-14: an MLB leg priced
+            # 41% vs 58% true, ~3 days out, got picked off). Uses the SAME resolved
+            # start (Kalshi's embedded/precise time for MLB). Default = no limit.
+            max_h = self._max_pregame_hours(leg.market_ticker)
+            if max_h is not None and (resolved.start - now) > timedelta(hours=max_h):
+                too_far = True
+        return ComboStartStatus(
+            any_started=started, any_unknown=unknown, any_too_far=too_far
+        )
+
+    def _leg_too_far(self, ticker: str, now: datetime) -> bool:
+        max_h = self._max_pregame_hours(ticker)
+        if max_h is None:
+            return False
+        resolved = self.leg_start(ticker)
+        return resolved is not None and (resolved.start - now) > timedelta(hours=max_h)
+
+    def _max_pregame_hours(self, ticker: str) -> float | None:
+        t = ticker.upper()
+        for prefix, hours in self._config.max_pregame_hours_by_prefix.items():
+            if t.startswith(prefix.upper()):
+                return hours
+        return None
 
     def _cutoff_time(self, ticker: str, *, confirm: bool) -> datetime | None:
         """The clock instant at/after which this leg declines: ``start − margin``

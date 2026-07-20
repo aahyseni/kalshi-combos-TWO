@@ -126,6 +126,33 @@ async def test_unknown_start_time_declines() -> None:
     assert ReasonCode.SKIP_START_TIME_UNKNOWN in h.filter.evaluate(combo_rfq())
 
 
+async def test_too_far_out_game_declines() -> None:
+    # 30h to start (close 34.5h out − 4.5h offset) with a 24h horizon ⇒ TOO FAR.
+    h = await pregame_harness(
+        FiltersConfig(max_pregame_hours_by_prefix={"M": 24.0})
+    )
+    h.with_meta("M1", close_in_s=(30 + 4.5) * 3600.0)
+    reasons = h.filter.evaluate(combo_rfq())
+    assert ReasonCode.SKIP_GAME_TOO_FAR in reasons
+    assert ReasonCode.SKIP_INPLAY_LEG not in reasons  # far out, NOT started
+
+
+async def test_within_horizon_not_too_far() -> None:
+    # 12h to start, 24h horizon ⇒ within horizon, no too-far decline.
+    h = await pregame_harness(
+        FiltersConfig(max_pregame_hours_by_prefix={"M": 24.0})
+    )
+    h.with_meta("M1", close_in_s=(12 + 4.5) * 3600.0)
+    assert ReasonCode.SKIP_GAME_TOO_FAR not in h.filter.evaluate(combo_rfq())
+
+
+async def test_no_horizon_default_never_too_far() -> None:
+    # Default empty horizon table ⇒ a very-far game is never declined too-far.
+    h = await pregame_harness()
+    h.with_meta("M1", close_in_s=(200 + 4.5) * 3600.0)
+    assert ReasonCode.SKIP_GAME_TOO_FAR not in h.filter.evaluate(combo_rfq())
+
+
 async def test_missing_metadata_is_unknown_start() -> None:
     h = Harness()
     await h.with_books(["M1", "M2"])

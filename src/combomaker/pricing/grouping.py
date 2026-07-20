@@ -17,6 +17,8 @@ string, so a leg whose event carries no game code NEVER merges with another.
 
 from __future__ import annotations
 
+from combomaker.pricing.legtypes import resolve_pricing_event_alias
+
 
 def game_key(event_ticker: str) -> str:
     """The game a leg belongs to, for correlation grouping and risk aggregation.
@@ -25,6 +27,12 @@ def game_key(event_ticker: str) -> str:
     No hyphen (synthetic/degenerate ticker) -> the whole string, so an ungamed
     leg never merges with another game.
 
+    PRICING EVENT ALIASES resolve here (2026-07-16) — and ONLY here, so the
+    copula same-game regroup and every risk aggregation (exposure / limits /
+    skew / book-risk game plans) move together by construction: an aliased
+    champion event (``KXMENWORLDCUP-26`` -> ``KXWCADVANCE-26JUL19ESPARG``)
+    joins the final's game everywhere at once. Identity when unaliased.
+
     Period/derived markets (first/second half — series like ``KXWC1HTOTAL``) DO
     key on the game code and rejoin the full-game same-game block, so the copula
     can correlate a modeled 1H leg with its full-time siblings. They are kept off
@@ -32,7 +40,7 @@ def game_key(event_ticker: str) -> str:
     grouping them out here (which used to leave a real 1H x FT combo pricing at
     independence).
     """
-    _series, sep, game = event_ticker.partition("-")
+    _series, sep, game = resolve_pricing_event_alias(event_ticker).partition("-")
     if not sep:
         return event_ticker
     return game

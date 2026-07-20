@@ -192,8 +192,36 @@ def test_window_pair_with_same_game_extra_leg_declines_unknown() -> None:
         leg(TOT3, ev(TOT3), "yes"),
     )
     rel = classify_legs(legs, ExplodingProvider())
-    assert rel.kind is RelationshipKind.UNKNOWN
-    assert any("band-vs-neighbour" in n or "carries other legs" in n for n in rel.notes)
+    # 2026-07-14: a {1H-BTTS no, FT-BTTS yes} window + total neighbour is
+    # DC-representable, so it now ROUTES TO STRUCTURAL (which prices P(window ∧
+    # neighbour) exactly) instead of the old blanket UNKNOWN decline.
+    assert rel.kind is RelationshipKind.NESTED_BAND
+    assert rel.band_with_neighbour is True
+    assert any("routing to structural" in n for n in rel.notes)
+
+
+def test_band_with_neighbour_prices_exact_via_structural() -> None:
+    """The DC-representable band×neighbour (FRA win × spread window + total) prices
+    via the structural scoreline model — exact + arb-safe — where it used to decline
+    UNKNOWN (2026-07-14). Validates the routing target, not just the classifier."""
+    from combomaker.ops.config import PricingConfig
+    from combomaker.pricing.legs import LegBelief
+    from combomaker.pricing.structural import StructuralPricer
+    from combomaker.rfq.models import RfqLeg
+
+    cfg = PricingConfig()
+    sp = StructuralPricer(cfg.structural, cfg.margin_total, cfg.mlb_runs)
+    legs = [
+        RfqLeg("KXWCGAME-26JUL14FRAESP-FRA", "KXWCGAME-26JUL14FRAESP", "yes", None),
+        RfqLeg("KXWCSPREAD-26JUL14FRAESP-FRA2", "KXWCSPREAD-26JUL14FRAESP", "no", None),
+        RfqLeg("KXWCTOTAL-26JUL14FRAESP-3", "KXWCTOTAL-26JUL14FRAESP", "yes", None),
+    ]
+    sides = ["yes", "no", "yes"]
+    beliefs = [LegBelief(0.55, 0.02, "book"), LegBelief(0.32, 0.02, "book"), LegBelief(0.48, 0.02, "book")]
+    joint, reason = sp.try_price(legs, beliefs, sides)
+    assert joint is not None, reason
+    # arb-safe: 0 < P(win ∧ ¬cover ∧ total) <= the tightest selected-side marginal
+    assert 0.0 < joint.p <= min(0.55, 1 - 0.32, 0.48) + 1e-9
 
 
 def test_cyclic_implication_without_kept_witness_declines_unknown() -> None:

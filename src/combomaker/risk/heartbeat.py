@@ -79,9 +79,20 @@ def _atomic_write(
 class Heartbeat:
     """The bot's side: write a fresh wall timestamp every tick."""
 
+    # Write throttle (adversarial verify 2026-07-16): the wedge fix beats once
+    # per swept quote + per recovery poll, i.e. N atomic file replaces per
+    # 0.5s tick on an N-quote book — and on the degraded-disk conditions where
+    # wedge detection matters, each synchronous replace can stall the loop the
+    # heartbeat defends. 100ms caps writes at 10/s while keeping granularity
+    # far inside the supervisor's 30s staleness window. Beat CALLS stay
+    # unthrottled (progress signalling is the caller's semantics); only the
+    # file write dedupes.
+    _MIN_WRITE_INTERVAL_NS = 100_000_000
+
     def __init__(self, clock: Clock, path: Path) -> None:
         self._clock = clock
         self._path = path
+        self._last_write_mono_ns: int | None = None
 
     @property
     def path(self) -> Path:
@@ -92,8 +103,22 @@ class Heartbeat:
         retried next tick — a transient disk hiccup must not crash the hot path,
         and a genuinely stuck disk shows up to the supervisor as a stale beat
         (fail-closed) exactly as a wedged bot would."""
+        now_ns = self._clock.monotonic_ns()
+        if (
+            self._last_write_mono_ns is not None
+            and now_ns - self._last_write_mono_ns < self._MIN_WRITE_INTERVAL_NS
+            # An externally-wiped file must be healed IMMEDIATELY (the
+            # supervisor latch keeps proving liveness; relaunch purges delete
+            # these files) — a stat on the throttled path is far cheaper than
+            # the write it replaces.
+            and self._path.exists()
+        ):
+            return
         try:
             _atomic_write(self._path, self._clock.now().isoformat())
+            # Only a SUCCESSFUL write arms the throttle — a failed one retries
+            # on the very next beat.
+            self._last_write_mono_ns = now_ns
         except OSError as exc:  # pragma: no cover - disk failure path
             log.warning("heartbeat_write_failed", path=str(self._path), error=repr(exc))
 

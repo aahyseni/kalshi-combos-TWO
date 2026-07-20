@@ -59,6 +59,16 @@ class RfqIntake:
         self._on_quote_event: list[QuoteEventHandler] = []
         self._on_channel_lost: list[ChannelLostHandler] = []
         self.open_rfqs: dict[str, Rfq] = {}
+        # F2 liveness fix (risk audit 2026-07-16): a comms-WS drop CLEARS
+        # open_rfqs (no replay on reconnect), but absence-after-clear is
+        # UNKNOWN, not positive deletion — the lifecycle's liveness probe must
+        # keep treating those ids as alive, or every RFQ queued just before a
+        # blip gets mislabeled skip_rfq_deleted_midflight (the REST POST does
+        # not need the WS and could still win). Two GENERATIONS bound memory:
+        # ids cleared by a disconnect stay "stale-alive" until the second
+        # subsequent disconnect, far past the pipeline's ~2s queue/retry
+        # budget for them. A positive rfq_deleted removes an id immediately.
+        self._stale_open: tuple[set[str], set[str]] = (set(), set())
 
         ws.add_subscription(["communications"], on_subscribed=self._on_subscribed)
         ws.on_message("rfq_created", self._handle_rfq_created)
@@ -82,6 +92,20 @@ class RfqIntake:
 
     def on_channel_lost(self, handler: ChannelLostHandler) -> None:
         self._on_channel_lost.append(handler)
+
+    # --- liveness view (F2 mid-pipeline probe) ---
+
+    def rfq_alive(self, rfq_id: str) -> bool:
+        """Liveness answer for the lifecycle's F2 probe (wired by quote_app).
+
+        True means alive OR unknown; False ONLY when the registry positively
+        saw the RFQ die (``rfq_deleted``) — or never saw it at all (the probe
+        is only ever asked about RFQs this intake fanned out). Ids cleared by
+        a disconnect are UNKNOWN, not deleted, so they answer True until aged
+        out of the stale generations (see ``_handle_disconnect``)."""
+        if rfq_id in self.open_rfqs:
+            return True
+        return any(rfq_id in gen for gen in self._stale_open)
 
     # --- injection point for REST reconciliation ---
 
@@ -127,6 +151,10 @@ class RfqIntake:
         rfq_id = str(msg.get("id", ""))
         self._metrics.inc("rfq.deleted")
         self.open_rfqs.pop(rfq_id, None)
+        # Positive deletion beats stale-UNKNOWN: a delete that arrives after a
+        # disconnect cleared the registry must flip the liveness answer too.
+        for gen in self._stale_open:
+            gen.discard(rfq_id)
         for handler in self._on_rfq_deleted:
             try:
                 await handler(rfq_id, msg)
@@ -162,7 +190,12 @@ class RfqIntake:
 
     async def _handle_disconnect(self) -> None:
         # Open-RFQ registry is only as fresh as the stream; a reconnect gets
-        # no replay, so REST reconciliation must rebuild it.
+        # no replay, so REST reconciliation must rebuild it. Clearing is NOT
+        # positive deletion: park the cleared ids in the stale generations so
+        # ``rfq_alive`` keeps answering True (UNKNOWN ⇒ proceed-as-today) for
+        # RFQs already in the pipeline; rotate out the oldest generation.
+        self._metrics.inc("rfq.registry_reset")
+        self._stale_open = (set(self.open_rfqs), self._stale_open[0])
         self.open_rfqs.clear()
 
     async def _fan_out_rfq(self, rfq: Rfq) -> None:

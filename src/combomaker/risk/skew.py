@@ -31,11 +31,17 @@ The CLASSIFIER convention (``skew_cc`` and the ``concentration_cc`` /
 
 So the honest classifier is::
 
-    skew_cc(C) =  Σ_game concentration_term(game)     # ≥ 0, CONCENTRATING
-                − Σ_game offset_term(game)            # ≥ 0, OFFSETTING
-      clamped to [−skew_max_tighten_cc, +skew_max_widen_cc]
+    skew_cc(C) =  clamp( Σ_game concentration_term(game)   # ≥ 0, CONCENTRATING
+                       − Σ_game offset_term(game),         # ≥ 0, OFFSETTING
+                       [−skew_max_tighten_cc, +skew_max_widen_cc] )
+                + clamp( peak_component(C),                # 2026-07-18 steer
+                       [−peak_tighten_max_cc, +peak_widen_max_cc] )
 
-and the pricer receives ``applied_cc = −skew_cc`` (when enabled). Because the
+(the PEAK-CONCENTRATION component — a candidate stacking on / provably missing
+the cached committed-book worst scorelines, ``_peak_component`` — composes
+ADDITIVELY under its own independent clamp, so the total is bounded by the sum
+of the two cap pairs; see ``SkewParams``) and the pricer receives
+``applied_cc = −skew_cc`` (when enabled). Because the
 NEGATION swaps sides, the OFFSETTING rebate — now the POSITIVE, no_bid-RAISING,
 free-money-dangerous direction at the pricer — is the one bounded by the small
 ``skew_max_tighten_cc`` cap (and doubly contained by the free-money clamp in
@@ -60,15 +66,24 @@ markout-validated enable flips it live (never refit on a P&L window).
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from combomaker.core.conventions import Conventions
+from combomaker.core.conventions import Conventions, Side
+from combomaker.core.money import CC_PER_DOLLAR
 from combomaker.risk.exposure import (
+    DirEntry,
     ExposureSnapshot,
+    LegRef,
     MarginalProvider,
     OpenPosition,
     analytic_leg_deltas,
+    mutex_directional_alignment_cc,
 )
+
+if TYPE_CHECKING:  # runtime import stays local (keep this module import-light)
+    from combomaker.sim.peak_profile import PeakProfile
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +115,26 @@ class SkewParams:
     skew_max_widen_cc: int = 600
     skew_max_tighten_cc: int = 150
     enabled: bool = False
+    # --- PEAK-CONCENTRATION pricing steer (operator directive 2026-07-18) ----
+    # A SECOND, ADDITIVE classifier component fed by the cached committed-book
+    # peak-state profile (sim/peak_profile.py). A candidate that HITS the
+    # book's cached worst scoreline(s) — or, MULTI-CLUSTER (2026-07-19), ANY
+    # cached loss cluster, scaled by that cluster's loss relative to the top —
+    # widens by up to ``peak_widen_max_cc``
+    # extra; one that provably MISSES the ENTIRE top-loss plateau (certified
+    # against the full argmax level, 2026-07-18 verify fix) AND every cached
+    # lower cluster (2026-07-19) rebates by up to
+    # ``peak_tighten_max_cc`` extra. Each side is HARD-clamped independently of
+    # the directional caps above, so the COMPOSED classifier is bounded by
+    #   [-(skew_max_tighten_cc + peak_tighten_max_cc),
+    #    +(skew_max_widen_cc  + peak_widen_max_cc)]
+    # (defaults [-300cc, +1200cc] = [-3c, +12c]) — the documented overall
+    # clamp. PRICING ONLY, never a refusal; any doubt (no profile, stale
+    # generation, unparseable candidate) contributes exactly 0 (fail-safe
+    # NEUTRAL — UNKNOWN can never widen at all, let alone de-facto block).
+    peak_enabled: bool = True
+    peak_widen_max_cc: int = 600
+    peak_tighten_max_cc: int = 150
 
     def validate(self) -> None:
         if self.w_conc < 0.0 or self.w_off < 0.0:
@@ -112,6 +147,11 @@ class SkewParams:
             raise ValueError(
                 "skew caps must be >= 0 "
                 f"(widen={self.skew_max_widen_cc}, tighten={self.skew_max_tighten_cc})"
+            )
+        if self.peak_widen_max_cc < 0 or self.peak_tighten_max_cc < 0:
+            raise ValueError(
+                "peak skew caps must be >= 0 "
+                f"(widen={self.peak_widen_max_cc}, tighten={self.peak_tighten_max_cc})"
             )
 
 
@@ -171,6 +211,30 @@ class InventorySkew:
     offset_cc: int
     per_game: tuple[tuple[str, int], ...]  # (game, signed contribution cc)
     enabled: bool
+    # SKEW MUTEX FIX (2026-07-18): the games whose classification came from the
+    # P0-9 mutex-aware branch-max fold (``mutex_directional_alignment_cc``)
+    # instead of the raw delta-sum sign — the shadow-verification key (grep the
+    # ``inventory_skew_shadow`` log for it to measure the ARG-champ flip live).
+    mutex_direction_games: tuple[str, ...] = ()
+    # PEAK-CONCENTRATION component (2026-07-18). ``peak_cc`` is the CLAMPED
+    # signed component ALREADY INCLUDED in ``skew_cc`` (classifier convention:
+    # >= 0 widens a peak-stacker, <= 0 rebates an anti-peak candidate), so the
+    # composed ``skew_cc`` = clamped-directional + ``peak_cc`` and is bounded by
+    # the SkewParams-documented overall clamp. ``peak_widen_cc`` /
+    # ``peak_tighten_cc`` are the pre-clamp non-negative halves;
+    # ``peak_per_game`` is the debug-level explanation: one
+    # ``(game, adder_cc, factor, reason)`` row per candidate game — ``factor``
+    # is the hit_severity on peak_hit/peak_partial_offset rows and the
+    # peak_ratio on peak_miss_rebate rows (2026-07-19 magnitude recalibration:
+    # the candidate-size factor is gone). Reasons:
+    # peak_hit / peak_miss_rebate / peak_partial_offset (certified top-miss
+    # with a reachable lower cluster — NET adder, 2026-07-19 asymmetry
+    # hotfix) / no_peak_profile / peak_not_a_loss /
+    # unknown / neutral, plus the global stale_profile / disabled sentinels.
+    peak_cc: int = 0
+    peak_widen_cc: int = 0
+    peak_tighten_cc: int = 0
+    peak_per_game: tuple[tuple[str, int, float, str], ...] = ()
 
     @property
     def applied_cc(self) -> int:
@@ -208,6 +272,11 @@ def compute_inventory_skew(
     params: SkewParams,
     *,
     cache: GameSkewCache | None = None,
+    dir_entries_by_game: Mapping[str, Sequence[DirEntry]] | None = None,
+    committed_dir_entries_by_game: Mapping[str, Sequence[DirEntry]] | None = None,
+    is_me_event: Callable[[str], bool | None] | None = None,
+    peak_profile: PeakProfile | None = None,
+    peak_book_generation: int | None = None,
 ) -> InventorySkew:
     """Compute the inventory skew for ``candidate`` against the current book.
 
@@ -218,6 +287,90 @@ def compute_inventory_skew(
     ``analytic_leg_deltas``. ``limits`` gives the headroom denominators;
     ``cache`` optionally overrides the per-game direction from the Phase-4 sim.
 
+    SKEW MUTEX FIX (2026-07-18). ``dir_entries_by_game`` (the snapshot's
+    exported P0-9 directional entries) + ``is_me_event`` (the exposure book's
+    OWN metadata answer) arm the mutex-aware classifier: where the candidate's
+    this-game legs carry exactly ONE explicit-ME event, the concentrating /
+    offsetting split comes from how much the candidate RAISES the book's P0-9
+    branch-max directional bound (``mutex_directional_alignment_cc`` — reused,
+    never reimplemented). A long-NO candidate on outcome B of the event the
+    book is short outcome A of NETS there (marginal 0 ⇒ full rebate) even
+    though its raw delta sign MATCHES the book's — the mutex-blind raw read
+    mis-widened exactly that hedge 63/63 on the live shadow tape. Anything the
+    single-ME math cannot certify (no entries, 0 or >= 2 ME events among the
+    candidate's legs, non-requires-all) FALLS BACK to the raw delta-sum read —
+    never a larger rebate than the mutex math justifies. Omitting any new
+    argument (every pre-existing caller) is byte-identical to the raw
+    classifier.
+
+    COMMITTED SECOND-ME-EVENT FALLBACK (2026-07-18 verify fix).
+    ``committed_dir_entries_by_game`` (the snapshot's COMMITTED-positions-only
+    entry subset) is REQUIRED for the mutex path to engage: a committed leg on
+    a second explicit-ME event of the same game (champion event + regulation
+    moneyline) is correlated mass the single-event fold rides as COMMON —
+    inflating base and full equally, cancelling out of the marginal and
+    OVER-REBATING a candidate that truly concentrates against it (see
+    ``mutex_directional_alignment_cc``). Such games — and any caller that
+    omits the committed census — fall back to the raw read (fail-closed).
+    Resting-quote entries deliberately do NOT drive that fallback: the live
+    200-slot book spans both ME events, and a quote-driven fallback would
+    suppress the fix on exactly the shape it was built for.
+
+    PEAK-CONCENTRATION STEER (operator directive 2026-07-18 evening).
+    ``peak_profile`` (the cached committed-book peak-state profile —
+    ``sim/peak_profile.build_peak_profile``, computed OFF the hot path on
+    position-generation change) + ``peak_book_generation`` (the CURRENT
+    ``ExposureBook.position_generation``) arm a SECOND additive classifier
+    component: per candidate game, a structural containment check against the
+    <= K cached peak scorelines (O(K x legs), no MC, no enumeration). Defining
+
+        hit_severity = relative loss of the worst cached state/cluster the
+                       candidate's parlay can still HIT (state loss / the
+                       game's top loss, in [0, 1])
+        peak_ratio   = min(1, game peak loss / game-loss budget)
+
+    a HIT contributes  ``+ peak_widen_max_cc x hit_severity x peak_ratio**gamma``
+    (convex in how close the book's peak already is to its budget: a small book
+    is nearly free, a peak near budget pays the full widen). MAGNITUDE
+    RECALIBRATION (operator directive 2026-07-19 evening): the old
+    candidate-size factor ``min(1, candidate premium / budget)`` is GONE from
+    both sides — a quote's per-contract price reflects WHERE its risk lands,
+    never the clip size (size is the caps'/velocity brake's job; on the live
+    tape the ~0.015 size factor of realistic clips multiplied against
+    peak_ratio**2 and zeroed the whole steer — a $15 rung on a ~$300 cluster
+    priced at ~0.01c). MULTI-CLUSTER
+    (operator directive 2026-07-19): ``hit_severity`` is the max over ALL
+    cached loss clusters of (cluster_loss / top_loss) x hit-indicator — the
+    top plateau at weight 1.0 plus the cached lower clusters at their level
+    weights (folded with the K-row severity; ``peak_n_clusters=1`` restores
+    the K-sample-only read) — so stacking a SECOND loss
+    cluster on a mutually exclusive branch (the live ESPARG ARG-champ+Messi
+    ladder) now pays a widen scaled by that cluster's relative loss instead of
+    riding free. A candidate
+    that provably MISSES the ENTIRE top-loss plateau — certified against the
+    FULL argmax level cached in the profile, never just the K sampled rows
+    (2026-07-18 verify fix: on a plateau wider than K a plateau-stacking
+    refinement missed all K rows and pocketed the rebate while raising the
+    certified worst case) — contributes
+    ``- peak_tighten_max_cc x peak_ratio x (1 - hit_severity)`` (2026-07-19
+    cluster-asymmetry hotfix: the certified top-miss ALONE triggers the
+    rebate — the old all-clusters trigger graded genuinely balancing flow
+    neutral whenever it could reach any lower loss state; a lower-cluster hit
+    now discounts the rebate via (1 - severity) AND pays its own widen, so
+    both halves can fire on one candidate. Its premium provably pays into
+    every argmax state, so we quote TIGHTER to win those auctions; an
+    uncached/oversized plateau ⇒ no rebate, neutral).
+    Summed over the candidate's games, then clamped to
+    [-peak_tighten_max_cc, +peak_widen_max_cc] and ADDED to the independently
+    clamped directional classifier, so the composed ``skew_cc`` obeys the
+    overall clamp documented on :class:`SkewParams`. FAIL-SAFE: profile absent
+    / generation-stale / candidate unparseable / any doubt => the component is
+    EXACTLY 0 (neutral pricing — never a refusal, never a crash, and UNKNOWN
+    can never produce a widen). The component NEVER feeds ``per_game`` (only
+    ``peak_per_game``), so the widen-vs-decline policy can never decline on it
+    — pricing only, by construction. Omitting both new arguments (every
+    pre-existing caller) is byte-identical to the directional-only classifier.
+
     Returns an :class:`InventorySkew` whose ``applied_cc`` is 0 while
     ``params.enabled`` is False (dark ship) and the honest ``skew_cc`` otherwise.
     ``skew_cc`` itself is ALWAYS the honest number (for shadow logging).
@@ -226,8 +379,10 @@ def compute_inventory_skew(
     cand_deltas = analytic_leg_deltas(candidate, marginals)
 
     # Per-game candidate delta (contracts-equivalent), aggregated the same way
-    # the book does — Σ over the legs the candidate touches per game.
+    # the book does — Σ over the legs the candidate touches per game — plus the
+    # per-game legs themselves (the mutex classifier's candidate entry).
     cand_by_game: dict[str, float] = {}
+    cand_legs_by_game: dict[str, list[LegRef]] = {}
     if cand_deltas is not None:
         for leg in candidate.legs:
             if leg.event_ticker is None:
@@ -236,6 +391,7 @@ def compute_inventory_skew(
             cand_by_game[game] = cand_by_game.get(game, 0.0) + cand_deltas.get(
                 leg.market_ticker, 0.0
             )
+            cand_legs_by_game.setdefault(game, []).append(leg)
 
     max_delta = limits.max_event_delta_contracts
     max_loss_cc = limits.max_event_worst_case_loss_dollars * 10_000.0
@@ -244,6 +400,7 @@ def compute_inventory_skew(
     concentration = 0.0
     offset = 0.0
     per_game: list[tuple[str, int]] = []
+    mutex_games: list[str] = []
 
     for game, cand_delta in cand_by_game.items():
         net = snapshot.delta_by_game.get(game, 0.0)
@@ -266,6 +423,31 @@ def compute_inventory_skew(
         cand_dir = _sign(cand_delta)
         aligns = cand_dir == book_dir
 
+        # P0-9 mutex-aware direction (2026-07-18): applicable only where the
+        # candidate's this-game legs carry exactly ONE explicit-ME event AND
+        # the game's COMMITTED census certifies the single-event fold (no
+        # committed leg on a second explicit-ME event — 2026-07-18 verify fix);
+        # else None ⇒ the raw sign-alignment read below (fail-safe).
+        mutex: tuple[float, float] | None = None
+        if dir_entries_by_game is not None and is_me_event is not None:
+            entries = dir_entries_by_game.get(game)
+            if entries:
+                committed_entries = (
+                    committed_dir_entries_by_game.get(game, ())
+                    if committed_dir_entries_by_game is not None
+                    else None                   # census unavailable ⇒ raw read
+                )
+                mutex = mutex_directional_alignment_cc(
+                    entries,
+                    (
+                        tuple(cand_legs_by_game.get(game, ())),
+                        d_e * CC_PER_DOLLAR,
+                        candidate.our_side is Side.NO,
+                    ),
+                    is_me_event,
+                    committed_entries=committed_entries,
+                )
+
         # Utilisation: how little headroom is left before a real cap binds. Take
         # the MAX over the delta / loss / notional axes so the tightest binds.
         util = 0.0
@@ -278,7 +460,22 @@ def compute_inventory_skew(
         if max_notional_cc > 0.0:
             util = max(util, min(1.0, notional_cc / max_notional_cc))
 
-        if aligns:
+        if mutex is not None:
+            # Split the candidate's magnitude by the mutex math: only the part
+            # that RAISES the book's branch-max bound concentrates (pays the
+            # convex widen); the netted remainder rebates, bounded by the
+            # book's own mutex-aware magnitude on the event (never rebate more
+            # direction than the book actually holds there).
+            marginal_cc, base_cc = mutex
+            conc_mag = marginal_cc / CC_PER_DOLLAR
+            off_mag = max(0.0, d_e - conc_mag)
+            term = params.w_conc * conc_mag * (util**params.gamma)
+            rebate = params.w_off * min(off_mag, base_cc / CC_PER_DOLLAR) * util
+            concentration += term
+            offset += rebate
+            per_game.append((game, int(round(term)) - int(round(rebate))))
+            mutex_games.append(game)
+        elif aligns:
             # concentration_term = d_e · f(util), f(u) = u**gamma (convex): a
             # near-empty book is nearly free, a near-limit book pays the full
             # widen. WIDEN (positive) when the candidate ADDS to the net.
@@ -297,9 +494,19 @@ def compute_inventory_skew(
     conc_cc = int(round(concentration))
     off_cc = int(round(offset))
     raw = conc_cc - off_cc
-    # Clamp: [−skew_max_tighten_cc, +skew_max_widen_cc]. The tighten side is the
-    # dangerous one and is doubly contained (here + the free-money clamp).
-    skew_cc = max(-params.skew_max_tighten_cc, min(params.skew_max_widen_cc, raw))
+    # Directional clamp: [−skew_max_tighten_cc, +skew_max_widen_cc]. The tighten
+    # side is the dangerous one and is doubly contained (here + the free-money
+    # clamp in construct_quote).
+    directional_cc = max(-params.skew_max_tighten_cc, min(params.skew_max_widen_cc, raw))
+
+    # PEAK-CONCENTRATION component (2026-07-18): independently clamped to
+    # [−peak_tighten_max_cc, +peak_widen_max_cc], then ADDED — so the composed
+    # classifier obeys the overall clamp documented on SkewParams by
+    # construction (each addend is bounded by its own cap).
+    peak_widen_cc, peak_tighten_cc, peak_cc, peak_per_game = _peak_component(
+        candidate, params, limits, peak_profile, peak_book_generation
+    )
+    skew_cc = directional_cc + peak_cc
 
     return InventorySkew(
         skew_cc=skew_cc,
@@ -307,7 +514,136 @@ def compute_inventory_skew(
         offset_cc=off_cc,
         per_game=tuple(per_game),
         enabled=params.enabled,
+        mutex_direction_games=tuple(mutex_games),
+        peak_cc=peak_cc,
+        peak_widen_cc=peak_widen_cc,
+        peak_tighten_cc=peak_tighten_cc,
+        peak_per_game=peak_per_game,
     )
+
+
+def _peak_component(
+    candidate: OpenPosition,
+    params: SkewParams,
+    limits: SkewLimits,
+    profile: PeakProfile | None,
+    book_generation: int | None,
+) -> tuple[int, int, int, tuple[tuple[str, int, float, str], ...]]:
+    """The peak-concentration classifier component (see compute_inventory_skew).
+
+    Returns ``(widen_cc, tighten_cc, clamped_component_cc, per_game_debug)``
+    where the component is clamped to [−peak_tighten_max_cc, +peak_widen_max_cc]
+    and the debug rows are ``(game, adder_cc, factor, reason)`` — ``factor`` is
+    the ``hit_severity`` on ``peak_hit`` rows and the ``peak_ratio`` on
+    ``peak_miss_rebate`` rows (the one variable input of each side's price
+    after the 2026-07-19 magnitude recalibration).
+
+    Pure O((K + cached cluster states) x legs) arithmetic on the CACHED
+    profile rows — the containment indicator
+    (``sim.peak_profile.evaluate_peak_containment``) is <= one vectorised
+    numpy op per structural leg per slice, over the K sample plus the cached
+    cluster level sets (all clusters together bounded by the shared 4096-state
+    cap; ``hit_severity`` is the max over ALL cached clusters of
+    (cluster_loss/top_loss) x hit — see the multi-cluster notes there).
+    FAIL-SAFE: every
+    doubt branch returns a hard 0 (neutral), never raises, never refuses."""
+    if not params.peak_enabled or profile is None:
+        return 0, 0, 0, ()
+    if book_generation is None or profile.input_generation != book_generation:
+        # Stale (or unverifiable) profile: the committed book moved since the
+        # peaks were cached — NEUTRAL until the off-hot-path rebuild lands.
+        return 0, 0, 0, (("*", 0, 0.0, "stale_profile"),)
+    if candidate.our_side is not Side.NO:
+        # Sell-only seller: the hit-loss framing below is long-NO premium-at-
+        # risk. Anything else is outside the certified semantics -> neutral.
+        return 0, 0, 0, (("*", 0, 0.0, "non_no_candidate"),)
+    budget_cc = limits.max_event_worst_case_loss_dollars * 10_000.0
+    if budget_cc <= 0.0:
+        return 0, 0, 0, (("*", 0, 0.0, "no_budget"),)
+    # MAGNITUDE RECALIBRATION (operator directive 2026-07-19 evening): the old
+    # candidate-size factor min(1, candidate.max_loss_cc / budget) is GONE — a
+    # quote's per-contract price reflects WHERE its risk lands (severity x
+    # book-peak ratio), never the clip size. Size is already governed exactly
+    # by the caps / last-look / velocity brake; multiplying the ~0.015 size
+    # factor of a realistic clip against peak_ratio**gamma zeroed the steer on
+    # the live tape (a $15 rung on a ~$300 cluster priced at ~0.01c).
+
+    legs_by_game: dict[str, list[LegRef]] = {}
+    for leg in candidate.legs:
+        if leg.event_ticker is None:
+            continue
+        legs_by_game.setdefault(_game_key(leg.event_ticker), []).append(leg)
+    if not legs_by_game:
+        return 0, 0, 0, ()
+
+    # Local import: keeps this module import-light for every consumer that
+    # never wires a profile (and avoids a hard risk->sim dependency at import).
+    from combomaker.sim.peak_profile import evaluate_peak_containment
+
+    widen = 0.0
+    tighten = 0.0
+    rows: list[tuple[str, int, float, str]] = []
+    for game, legs in legs_by_game.items():
+        gp = profile.by_game.get(game)
+        if gp is None:
+            rows.append((game, 0, 0.0, "no_peak_profile"))
+            continue
+        peak_ratio = min(1.0, max(0, gp.top_loss_cc) / budget_cc)
+        if peak_ratio <= 0.0:
+            # The committed book's worst state for this game is not even a
+            # loss — nothing to protect, nothing to rebate (tiny-book branch).
+            rows.append((game, 0, 0.0, "peak_not_a_loss"))
+            continue
+        containment = evaluate_peak_containment(profile, game, legs)
+        if containment is None:
+            rows.append((game, 0, 0.0, "unknown"))
+            continue
+        # CLUSTER-ASYMMETRY composition (2026-07-19 hotfix, operator
+        # directive — the zero-rebate live tape): the widen prices WHAT the
+        # candidate can still hit (severity x ratio**gamma); the rebate
+        # prices the CERTIFIED top-cluster miss (its premium provably pays
+        # into every argmax state — the invariant on PeakContainment),
+        # discounted by the severity it can still reach:
+        #     tighten_max x peak_ratio x (1 - hit_severity).
+        # BOTH can fire on one candidate (miss-top-hit-lower-cluster flow):
+        # the halves accumulate separately (peak_widen_cc / peak_tighten_cc
+        # stay the honest non-negative decomposition) and the per-game row
+        # carries the NET adder with reason "peak_partial_offset".
+        severity = containment.hit_severity
+        term = 0.0
+        if severity > 0.0:
+            term = params.peak_widen_max_cc * severity * (peak_ratio**params.gamma)
+            widen += term
+        rebate = 0.0
+        if containment.provably_misses_top:
+            rebate = params.peak_tighten_max_cc * peak_ratio * (1.0 - severity)
+            tighten += rebate
+        if severity > 0.0 and containment.provably_misses_top:
+            rows.append(
+                (
+                    game,
+                    int(round(term)) - int(round(rebate)),
+                    round(severity, 6),
+                    "peak_partial_offset",
+                )
+            )
+        elif severity > 0.0:
+            rows.append((game, int(round(term)), round(severity, 6), "peak_hit"))
+        elif containment.provably_misses_top:
+            rows.append(
+                (game, -int(round(rebate)), round(peak_ratio, 6), "peak_miss_rebate")
+            )
+        else:
+            # Hits only non-loss peak rows / no certificate: neither stacking
+            # nor certified flattening.
+            rows.append((game, 0, 0.0, "neutral"))
+    widen_cc = int(round(widen))
+    tighten_cc = int(round(tighten))
+    component = max(
+        -params.peak_tighten_max_cc,
+        min(params.peak_widen_max_cc, widen_cc - tighten_cc),
+    )
+    return widen_cc, tighten_cc, component, tuple(rows)
 
 
 def _game_key(event_ticker: str) -> str:

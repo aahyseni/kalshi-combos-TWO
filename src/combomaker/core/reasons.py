@@ -15,6 +15,7 @@ class ReasonCode(StrEnum):
     # --- RFQ filter (no-quote) ---
     SKIP_NOT_WHITELISTED = "skip_not_whitelisted"
     SKIP_SERIES_NOT_ALLOWED = "skip_series_not_allowed"
+    SKIP_OPERATOR_LEG_BLOCK = "skip_operator_leg_block"
     SKIP_TOO_MANY_LEGS = "skip_too_many_legs"
     SKIP_SIZE_BELOW_MIN = "skip_size_below_min"
     SKIP_SIZE_ABOVE_MAX = "skip_size_above_max"
@@ -31,6 +32,9 @@ class ReasonCode(StrEnum):
     # Pregame-only gate: no usable start-time source for a leg. UNKNOWN means
     # decline, never "probably pregame" (quiet-failure defense #2).
     SKIP_START_TIME_UNKNOWN = "skip_start_time_unknown"
+    # Too-far horizon gate: a leg's game is beyond the per-prefix max horizon
+    # (uninformed far-out book ⇒ adverse-selection risk). Per max_pregame_hours.
+    SKIP_GAME_TOO_FAR = "skip_game_too_far"
     SKIP_EXCHANGE_INACTIVE = "skip_exchange_inactive"
     SKIP_RISK_HEADROOM = "skip_risk_headroom"
     SKIP_MASS_ACCEPTANCE_BREACH = "skip_mass_acceptance_breach"
@@ -53,12 +57,25 @@ class ReasonCode(StrEnum):
     # (multiple × bankroll). A stale bankroll fails closed (SKIP_BANKROLL_
     # UNAVAILABLE) instead — a stricter block than a loose multiple.
     SKIP_UTILIZATION_BACKSTOP = "skip_utilization_backstop"
-    # Portfolio joint-tail cap (Phase 4 / M1 §5): the book's operative ES_0.99
-    # (max of production-copula ES at the corr-high band, the correlation-inflated
-    # challenger ES, and the exact all-hit deterministic stress) exceeds its
-    # %-of-bankroll ceiling. Read off the LATEST full-MC BookRiskSnapshot (never
-    # re-run in check); a stale/UNKNOWN snapshot fails closed. SHADOW in Phase 4.
+    # Portfolio joint-tail cap (Phase 4 / M1 §5): the book's GOVERNING MODEL
+    # ES_0.99 (max of production-copula ES at the corr-high band and the
+    # correlation-inflated challenger ES — the worst SAMPLED CVaR) exceeds its
+    # %-of-bankroll ceiling. P0-3: this is the SAMPLED tail ONLY; the deterministic
+    # all-hit maximum is a SEPARATE axis (SKIP_PORTFOLIO_DET_MAX) so it can no
+    # longer dominate and silence this gate. Read off the LATEST full-MC
+    # BookRiskSnapshot (never re-run in check); a stale/UNKNOWN snapshot fails
+    # closed. SHADOW in Phase 4.
     SKIP_PORTFOLIO_CVAR = "skip_portfolio_cvar"
+    # Portfolio deterministic maximum-loss cap (P0-3): the exact all-hit
+    # premium-at-risk (+ reserved holdings) — an unconditional upper bound the
+    # sampled ES can never exceed — exceeds its %-of-bankroll ceiling. Gated
+    # INDEPENDENTLY of the sampled-ES cap so the deterministic maximum is a hard
+    # premium-at-risk backstop, not folded into the ES axis. Fails closed on a
+    # stale/UNKNOWN snapshot via the shared ``usable`` guard.
+    SKIP_PORTFOLIO_DET_MAX = "skip_portfolio_det_max"
+    # A2: P(this settlement wave drops equity below the ruin floor) exceeds the
+    # probability budget (structural-MC book-risk snapshot).
+    SKIP_PORTFOLIO_RUIN = "skip_portfolio_ruin"
     # The %-of-bankroll caps cannot be computed because the live bankroll reading
     # is unavailable/stale (BalanceTracker fails closed → None). UNKNOWN bankroll
     # ⇒ fail-closed (widen-or-no-quote), NEVER a convenient default. In shadow
@@ -74,16 +91,56 @@ class ReasonCode(StrEnum):
     SKIP_WIDEN_AVOIDED = "skip_widen_avoided"
     SKIP_HALTED = "skip_halted"
     SKIP_PRICING_FAILED = "skip_pricing_failed"
+    # The off-loop joint pricing exceeded its latency DEADLINE — we DELIBERATELY
+    # dropped a combo too slow to price-and-POST inside its RFQ window (the
+    # throughput/wedge guard). NOT a pricer failure; distinct so "pricing failed"
+    # only ever means a genuine error.
+    SKIP_PRICE_DEADLINE = "skip_price_deadline"
+    # The RFQ's window closed before our quote POST landed — a normal taker-race
+    # loss (we were not first to the taker), not an error.
+    SKIP_RFQ_CLOSED = "skip_rfq_closed"
+    # F2 mid-pipeline liveness (throughput synthesis 2026-07-16): the intake's
+    # open-RFQ registry says this RFQ was ALREADY DELETED while it sat in our
+    # queue / pricing pool / risk checks — we stop the pipeline early instead of
+    # spending joint pricing, snapshots, and a doomed REST POST on it. Strictly
+    # additive waste removal: a deleted RFQ can never fill, and the POST-time
+    # ``rfq_closed`` handling (SKIP_RFQ_CLOSED above) remains the backstop for
+    # deletes that land during the POST itself. The pipeline stage that caught
+    # it ("pre_price" / "post_price" / "pre_post") is in the decision context +
+    # per-stage metrics, so the tape can attribute where mid-flight deletes die.
+    SKIP_RFQ_DELETED_MIDFLIGHT = "skip_rfq_deleted_midflight"
     SKIP_NEGATIVE_MARGINAL_EV = "skip_negative_marginal_ev"
     SKIP_SOURCES_DISAGREE = "skip_sources_disagree"
     SKIP_NO_FREE_MONEY_CHECK = "skip_no_free_money_check"
     SKIP_WS_UNHEALTHY = "skip_ws_unhealthy"
     # A classifier (leg relationship, settlement rules, market family) returned
     # UNKNOWN. UNKNOWN always means widen-or-no-quote, never a convenient default.
+    # NOTE (2026-07-14): this MUST mean a genuine relationship-UNKNOWN only. The
+    # three below used to share this code (no combo grid, unresolvable size,
+    # malformed combo), inflating the "classifier unknown" tally with non-classifier
+    # causes — now split out so the count is honest.
     SKIP_CLASSIFIER_UNKNOWN = "skip_classifier_unknown"
+    # We have no PRICE GRID for the combo market (metadata not fetched / no grid on
+    # an RFQ-generated multi-game market). Missing data ⇒ no-quote (rule 6); NOT a
+    # classifier failure.
+    SKIP_NO_COMBO_GRID = "skip_no_combo_grid"
+    # The RFQ size could not be resolved (target-cost→contracts conversion). NOT a
+    # classifier failure.
+    SKIP_SIZE_UNRESOLVABLE = "skip_size_unresolvable"
+    # The RFQ is not a well-formed combo (not a combo, or a leg side is unknown).
+    SKIP_MALFORMED_COMBO = "skip_malformed_combo"
     # The combo is logically impossible (e.g. two YES legs of a mutually
     # exclusive event). v1 policy: no-quote, don't try to arb it.
     SKIP_LOGICALLY_IMPOSSIBLE = "skip_logically_impossible"
+    # P0-5 exact exchange-quantity reconciliation: the exchange's authoritative
+    # position (ticker/side/position_fp for the pinned subaccount) disagrees with
+    # our reconstructed local book — a size mismatch, an opposite side, or a
+    # holding with no local fill record (a manual/external trade). The exchange
+    # ledger is ground truth (defense #3): we reserve the LARGER exposure (never a
+    # convenient smaller default) and tag it with this code so the caps bind on the
+    # conservative quantity and the mismatch is diagnosable, never silently
+    # papered over by the local number.
+    SKIP_RECONCILE_QUANTITY_MISMATCH = "skip_reconcile_quantity_mismatch"
     # An unmodeled market regime we deliberately decline (e.g. two-legged-tie
     # UCL/UEL/UECL knockouts, where "advance" != a single-match win and the
     # single-match soccer priors do not apply). Gated off until its own regime
@@ -101,6 +158,14 @@ class ReasonCode(StrEnum):
     DELETE_KILL_SWITCH = "delete_kill_switch"
     DELETE_WS_GAP = "delete_ws_gap"
     DELETE_RFQ_GONE = "delete_rfq_gone"
+    # Event-driven post-fill risk pull (resting-quote haircut, 2026-07-17): a
+    # committed fill consumed budget, and this resting quote's game now shows
+    # an ENFORCED quote-time breach (haircut semantics) — pulled immediately
+    # (analytic-only pass, same-game quotes first) instead of waiting for an
+    # accept to be declined at confirm. Armed only while resting_quote_weight
+    # < 1; a failed pull fails SAFE (quotes stay; confirm-time exactness and
+    # TTL/reprice sweeps remain the backstop).
+    DELETE_RISK_EVICTED_ON_FILL = "delete_risk_evicted_on_fill"
 
     # --- Last look (confirm decision) ---
     CONFIRM_OK = "confirm_ok"
@@ -123,6 +188,16 @@ class ReasonCode(StrEnum):
     # (a per-leg market-motion signal); this is our OWN acceptance rate.
     DECLINE_FILL_VELOCITY = "decline_fill_velocity"
     DECLINE_RISK_LIMIT = "decline_risk_limit"
+    # P0-1 candidate-aware portfolio-risk gate (last look). AFTER the existing
+    # analytic/gross/burst gates ADMIT a confirm, a candidate-aware ~20k-sample
+    # portfolio MC scores the PRE (committed + reservations) and POST (+ this fill)
+    # books on COMMON sampled states: confirm ONLY when the candidate's marginal EV
+    # is positive, the POST joint-tail / ruin / deterministic / gross budgets pass,
+    # and no fail-closed condition tripped. STRICTLY ADDITIVE — it can only DECLINE
+    # a fill the other gates admit, never turn a decline into an admit. An UNKNOWN
+    # merged marginal, an over-budget POST book, or ANY error in the off-loop eval
+    # DECLINES here (fail-closed; an unmeasured/errored joint tail is never safe).
+    DECLINE_CANDIDATE_RISK = "decline_candidate_risk"
     DECLINE_MASS_ACCEPTANCE = "decline_mass_acceptance"
     DECLINE_KILL_SWITCH = "decline_kill_switch"
     DECLINE_EXCHANGE_INACTIVE = "decline_exchange_inactive"

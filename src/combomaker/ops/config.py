@@ -23,10 +23,13 @@ from pydantic import (
     model_validator,
 )
 
+from combomaker.ops.logging import get_logger
 from combomaker.risk.limits import RiskLimits
 
 if TYPE_CHECKING:
     from combomaker.risk.breakers import BreakerThresholds
+
+log = get_logger(__name__)
 
 
 class Env(StrEnum):
@@ -90,6 +93,25 @@ class SafetyConfig(StrictModel):
     # checks both). Defaults ON. An operator can only disable it deliberately;
     # everything ships NOT-LIVE, so prod stays off regardless.
     prod_require_supervisor: bool = True
+    # P0-5 (exact exchange-quantity reconciliation): the ONE subaccount all
+    # account endpoints (positions, and by extension order placement) are pinned
+    # to. Kalshi's GET /portfolio/positions takes a ``subaccount`` query param
+    # that DEFAULTS to 0 (=primary); 1–63 are numbered subaccounts
+    # (docs/api-notes/index-scan.md §portfolio). We pin every positions read to
+    # this value so the exposure book reconciles to EXACTLY the exchange's
+    # quantity/side FOR THE ACCOUNT WE TRADE ON — a position held under a
+    # different subaccount must never leak into (nor be missing from) this book.
+    # Default 0 matches the exchange default and the single-account posture; an
+    # operator only sets this if the bot trades under a numbered subaccount.
+    subaccount: int = 0
+
+    @field_validator("subaccount")
+    @classmethod
+    def _valid_subaccount(cls, v: int) -> int:
+        # 0 = primary; 1–63 = numbered subaccounts (Kalshi caps at 64 total).
+        if not (0 <= v <= 63):
+            raise ValueError(f"subaccount must be in 0..63 (0=primary), got {v}")
+        return v
 
 
 class SupervisorConfig(StrictModel):
@@ -188,6 +210,12 @@ class FiltersConfig(StrictModel):
     # YAML) once its classification + priors exist; null disables the gate;
     # empty list blocks ALL combos (fail-closed).
     allowed_leg_series_prefixes: list[str] | None = ["KXWC", "KXMLB"]
+    # OPERATOR LEG BLOCKLIST (2026-07-18, FRAENG game day): no-quote any combo
+    # containing a NON-"no"-side leg whose market ticker contains one of these
+    # substrings. Side-aware on purpose: "no" side of a blocked ticker is a
+    # HEDGE against that exposure and stays quotable; "yes" or unknown/garbage
+    # side is blocked (fail-closed on unknown). Empty = gate off.
+    blocked_leg_yes_substrings: list[str] = []
     combos_only: bool = True          # skip single-market RFQs
     # Quote-time feed-freshness gate: refuse to POST a quote when the WS feed's
     # rx-age exceeds this. Keep it >= breakers.max_rx_age_s (5s) so that a feed
@@ -235,6 +263,58 @@ class FiltersConfig(StrictModel):
     # normally wins for KXMLB*; API-measured expected_expiration = start+3h,
     # so 4.0 lands 1h before first pitch).
     pregame_start_offset_hours_by_prefix: dict[str, float] = {"KXMLB": 4.0}
+    # MAX pregame horizon per prefix (hours): decline a combo whose leg game is
+    # more than this far out. Far-out Kalshi leg books are UNINFORMED and diverge
+    # from the sharp consensus, so pricing off them invites adverse selection
+    # (2026-07-14: an MLB leg priced 41% vs 58% true, ~3 days out, got picked off).
+    # Empty default = no horizon limit; the armed config sets KXMLB: 24.0.
+    max_pregame_hours_by_prefix: dict[str, float] = {}
+    # EXPLICIT scheduled starts (event_ticker -> ISO-8601 UTC datetime string),
+    # the pregame ladder's precision tier a2 (``ScheduleCache``). An OPERATOR-SET
+    # table for exact keys only (defense #2: no fuzzy matching) — for markets
+    # whose expiry-minus-offset estimate is unusable. Motivating case
+    # (2026-07-16): KXMENWORLDCUP-26 expected_expiration is 14:00Z on final day
+    # — 5h BEFORE kickoff — so the estimate declared champion legs in-play from
+    # 09:30Z; a negative offset was rejected as fail-OPEN (Kalshi shifting the
+    # anchor would admit hours of in-play), while a fixed absolute start cannot
+    # drift. Entries must parse tz-aware; naive/invalid ⇒ load error. Empty
+    # default = tier inactive (bit-identical).
+    pregame_scheduled_starts: dict[str, str] = {}
+
+    @field_validator("pregame_scheduled_starts")
+    @classmethod
+    def _validate_scheduled_starts(cls, v: dict[str, str]) -> dict[str, str]:
+        from datetime import datetime
+
+        for event_ticker, raw in v.items():
+            # Canonical-key check (adversarial verify 2026-07-16): lookup is an
+            # EXACT match against the exchange's uppercase event ticker — a
+            # lowercase/whitespace key validates, installs, and silently never
+            # matches, so the tier is inert and the champion legs fall back to
+            # the broken expiry estimate (the exact flow-kill this table fixes).
+            if (
+                not event_ticker
+                or event_ticker != event_ticker.strip()
+                or event_ticker != event_ticker.upper()
+            ):
+                raise ValueError(
+                    f"pregame_scheduled_starts key {event_ticker!r}: not canonical "
+                    "(non-empty, uppercase, no surrounding whitespace) — would "
+                    "never match a live event ticker"
+                )
+            try:
+                parsed = datetime.fromisoformat(raw)
+            except ValueError as exc:
+                raise ValueError(
+                    f"pregame_scheduled_starts[{event_ticker}]: unparseable "
+                    f"datetime {raw!r}"
+                ) from exc
+            if parsed.tzinfo is None:
+                raise ValueError(
+                    f"pregame_scheduled_starts[{event_ticker}]: naive datetime "
+                    f"{raw!r} — no clock, would misgate (must be tz-aware UTC)"
+                )
+        return v
 
     # --- Precision ladder margins (Phase 5, R3 Part B) -----------------------
     # Split the single start buffer into TWO margins applied to a PRECISE start
@@ -325,6 +405,36 @@ class FeeConfig(StrictModel):
     # default; overrides keyed by series/collection ticker prefix.
     default_fee_type: str = "quadratic"
     default_multiplier: str = "1.0"
+    # MAKER-FEE LIST (operator directive 2026-07-16 — Kalshi is adding maker
+    # fees for combos). Series/collection-ticker PREFIXES on which OUR maker
+    # fills pay the maker fee (0.0175, verified vs the official schedule). The
+    # operator flips this in the local YAML when Kalshi's maker-fee list changes
+    # (monitor GET /series/fee_changes; defense #3 still reconciles predicted vs
+    # actual to the cent on real fills). DOCTRINE = EAT THE FEE: quoted prices
+    # stay unchanged/competitive — the fee is never added to the quote width; it
+    # is ACCOUNTED everywhere downstream instead (the fills ledger fee_cc,
+    # realized P&L, expected_edge_cc at fill recording, and the Problem-A waiver
+    # candidate's per-state P&L). Empty (the default) ⇒ bit-identical behaviour:
+    # quadratic combo maker fills keep computing $0.
+    maker_fee_active_prefixes: tuple[str, ...] = ()
+
+    @field_validator("maker_fee_active_prefixes")
+    @classmethod
+    def _validate_maker_fee_prefixes(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        # Canonical-prefix check (adversarial verify 2026-07-16): matching is
+        # str.startswith against uppercase tickers. An EMPTY string (a stray
+        # "- " in yaml) matches EVERY combo — maker fee booked on all series;
+        # a lowercase/whitespace entry silently never matches — fee eaten but
+        # never accounted. Both are the quiet-failure direction this feature
+        # exists to close.
+        for prefix in v:
+            if not prefix or prefix != prefix.strip() or prefix != prefix.upper():
+                raise ValueError(
+                    f"maker_fee_active_prefixes entry {prefix!r}: not canonical "
+                    "(non-empty, uppercase, no surrounding whitespace) — an empty "
+                    "entry fees EVERY series, a non-canonical one fees none"
+                )
+        return v
 
 
 class CorrelationConfig(StrictModel):
@@ -492,7 +602,17 @@ class CorrelationConfig(StrictModel):
             # (symmetric→0) — see memory, wire by ticker series when it lists.
             "advance|total": 0.12,
             "advance|btts": -0.07,
-            "advance|player_goal:same": 0.45,
+            # 2026-07-19 PROMOTE 0.45 -> 0.52 (operator-approved, rule 8b):
+            # the 0.45 was inherited from the regulation ml|player_goal
+            # measurement, but ADVANCE settles incl ET/pens and scorer props
+            # ALSO settle incl ET - the regulation attenuation does not apply
+            # (measured retention ~104% of the ml level). DC model identified
+            # from the ESPARG final's live books three ways: conditional
+            # P(scorer 1+ | team advances) ~53.6-54.9% => rho 0.51-0.53.
+            # Field raw fills ~25.7c vs our 23.6c corroborated the direction
+            # (fee-print theory REFUTED by 12/12 ledger reconciliation - tape
+            # prints are RAW). docs/reports/2026-07-19-argmessi-fair-vs-field.md
+            "advance|player_goal:same": 0.52,
             "advance|player_goal:opp": -0.45,
             "advance|spread": 0.95,
             # SPREAD (win-by-margin) × full-time markets — also UNLISTED → +0.6
@@ -1705,6 +1825,53 @@ class SkewConfig(StrictModel):
     gamma: float = 2.0                 # convex headroom ramp f(u)=u**gamma
     skew_max_widen_cc: int = 600       # cap on the positive (concentrating) side
     skew_max_tighten_cc: int = 150     # cap on the negative (offsetting) rebate
+    # PEAK-CONCENTRATION pricing steer (operator directive 2026-07-18 evening;
+    # risk/skew._peak_component + sim/peak_profile.py). An ADDITIVE second
+    # classifier component riding the SAME armed skew seam: a candidate that
+    # HITS the committed book's cached worst scorelines/clusters widens by
+    # ``peak_widen_max_cc x hit_severity x peak_ratio**gamma`` (severity = the
+    # hit cluster's loss relative to the top; ratio = how close that game's
+    # peak already is to the game-loss budget — MAGNITUDE RECALIBRATION
+    # 2026-07-19 evening: the old candidate-size factor is GONE, the price
+    # reflects WHERE the risk lands, never the clip size, which the caps/
+    # velocity brake already govern); one that provably MISSES the ENTIRE
+    # top-loss plateau (certified against the full argmax level, not the K
+    # sample — 2026-07-18 verify fix) rebates
+    # ``peak_tighten_max_cc x peak_ratio x (1 - hit_severity)`` (2026-07-19
+    # cluster-asymmetry hotfix: a lower-cluster hit discounts the rebate and
+    # pays its own widen instead of voiding it) — balancing flow, whose
+    # premium provably pays into every argmax state, is quoted TIGHTER to win
+    # its auctions. Composed total stays inside
+    # [-(skew_max_tighten_cc+peak_tighten_max_cc),
+    #  +(skew_max_widen_cc+peak_widen_max_cc)]. PRICING ONLY — no new caps, no
+    # new skip reasons; any doubt (no profile / stale generation / unparseable
+    # legs) is a hard ZERO adder. It takes effect only while ``enabled`` is
+    # True (the seam's dark-ship master switch). ``peak_topk_states`` is the K
+    # of the off-hot-path profile build (per game, per position-generation).
+    peak_enabled: bool = True
+    peak_widen_max_cc: int = 600       # extra widen cap for peak-stackers (+6c)
+    peak_tighten_max_cc: int = 150     # extra rebate cap for anti-peak flow
+    peak_topk_states: int = 5          # cached worst scorelines per game
+    # MULTI-CLUSTER peak steer (operator directive 2026-07-19 — the live
+    # ESPARG two-cluster book: only the argmax plateau was cached, so the
+    # ARG-champ+Messi cluster at ~60-80% of the top loss rode nearly free).
+    # Up to ``peak_n_clusters`` DISTINCT loss levels are cached per game
+    # (descending; a level qualifies at >= peak_cluster_min_frac x top loss),
+    # each as its FULL level set under the shared state-cache cap (131,072
+    # since the 2026-07-19 zero-rebate hotfix — the old 4096 overflowed on
+    # with-halves grids and the cascade silently disabled every rebate;
+    # overflow still drops the LOWEST clusters first and an uncached cluster
+    # is neutral). Hitting ANY cached cluster widens, scaled
+    # by that cluster's loss relative to the top; the anti-peak rebate
+    # certifies a provable miss of the FULL TOP cluster, discounted by
+    # (1 - hit_severity) for any lower cluster still reachable (2026-07-19).
+    # ``peak_n_clusters: 1`` restores the single-plateau CLUSTER semantics
+    # exactly (the cluster-view rollback knob; the 2026-07-19 magnitude
+    # recalibration applies at every n). ``peak_cluster_min_frac`` is a
+    # decimal STRING parsed to an exact Fraction in (0, 1] (house convention;
+    # floats banned for thresholds).
+    peak_n_clusters: int = 3
+    peak_cluster_min_frac: str = "0.30"
 
     @field_validator("w_conc", "w_off")
     @classmethod
@@ -1720,11 +1887,46 @@ class SkewConfig(StrictModel):
             raise ValueError(f"skew gamma must be > 0, got {v}")
         return v
 
-    @field_validator("skew_max_widen_cc", "skew_max_tighten_cc")
+    @field_validator(
+        "skew_max_widen_cc",
+        "skew_max_tighten_cc",
+        "peak_widen_max_cc",
+        "peak_tighten_max_cc",
+    )
     @classmethod
     def _nonneg_cap(cls, v: int) -> int:
         if v < 0:
             raise ValueError(f"skew cap must be >= 0, got {v}")
+        return v
+
+    @field_validator("peak_topk_states")
+    @classmethod
+    def _valid_topk(cls, v: int) -> int:
+        if not 1 <= v <= 64:
+            raise ValueError(f"peak_topk_states must be in [1, 64], got {v}")
+        return v
+
+    @field_validator("peak_n_clusters")
+    @classmethod
+    def _valid_n_clusters(cls, v: int) -> int:
+        if not 1 <= v <= 8:
+            raise ValueError(f"peak_n_clusters must be in [1, 8], got {v}")
+        return v
+
+    @field_validator("peak_cluster_min_frac")
+    @classmethod
+    def _valid_cluster_min_frac(cls, v: str) -> str:
+        try:
+            d = Decimal(v)
+        except InvalidOperation as exc:
+            raise ValueError(f"peak_cluster_min_frac {v!r} is not a decimal") from exc
+        # `not d.is_finite()` catches NaN/sNaN/±Infinity BEFORE the range
+        # compare (a signaling-NaN comparison itself raises InvalidOperation).
+        if not d.is_finite() or not (Decimal(0) < d <= Decimal(1)):
+            raise ValueError(
+                f"peak_cluster_min_frac {v!r} must be a finite fraction in "
+                f"(0, 1] — a fraction of the game's top loss (e.g. '0.30')"
+            )
         return v
 
 
@@ -1817,6 +2019,16 @@ class StructuralConfig(StrictModel):
     # KXWC match would be misclassified (fine for the current knockout
     # rounds; revisit for the next tournament's group stage).
     knockout_series: list[str] = ["KXWC"]
+    # P0-7 PREFERRED — CONSERVATIVE shared-factor loading for the risk-MC
+    # conditioning of a KNOCKOUT total-corners fallback leg on its game's sampled
+    # scoreline intensity (corners settle including ET, so a level-after-90 scoreline
+    # opens an extra corners window — config ``pair_rho`` ``advance|corners`` measured
+    # a dog +0.23 ↔ fav −0.23 ET strength curve, pooled ~0). Small + width-bearing:
+    # NOT a fabricated strong correlation. 0.0 ⇒ conditioning off (production sample
+    # = the independent structural split). Applied ONLY to knockout total corners;
+    # group-format corners are measured ⊥ goals (``corners|total`` = 0.00) and cards
+    # have no defensible link ⇒ 0 (independence + the worse-tail challenger backstop).
+    corners_et_loading: float = 0.10
 
 
 class MarginTotalConfig(StrictModel):
@@ -1881,16 +2093,46 @@ class MlbRunsConfig(StrictModel):
     misfit_uncertainty_scale: float = 1.0
 
 
+class MarkupTier(StrictModel):
+    """One fair-dependent markup tier: applies when the combo's fair (YES, cc)
+    is strictly below ``fair_below_cc``."""
+
+    fair_below_cc: int
+    markup_cc: int
+
+    @field_validator("fair_below_cc", "markup_cc")
+    @classmethod
+    def _positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"tier values must be > 0, got {v}")
+        return v
+
+
 class SportMarkupConfig(StrictModel):
-    """Per-sport maker markup. A FLAT (uniform) markup over fair. Because a taker
-    only fills us when the combo clears at >= our ask (= fair + markup), the
-    markup itself SELF-SELECTS the FAT tier (room >= markup) and auto-declines
-    competitive/NORMAL flow — no room classifier needed for v1. The explicit
-    FAT/NORMAL room-predictor tiering slots in later behind the same MarkupPolicy.
-    """
+    """Per-sport maker markup. Because a taker only fills us when the combo
+    clears at >= our ask (= fair + markup), the markup itself SELF-SELECTS the
+    FAT tier (room >= markup) and auto-declines competitive/NORMAL flow.
+
+    ``markup_cc`` is the FLAT base. ``tiers`` (optional) make the markup
+    FAIR-DEPENDENT: the first tier whose ``fair_below_cc`` exceeds the combo's
+    fair applies; above every tier the flat base applies. Rationale
+    (2026-07-16 operator directive + measurement): competitors pad longshot
+    parlays fair+2-8c while mains cluster fair+1.5-2.2c — a flat markup is
+    simultaneously too loose on longshots (leaves the pad on the table; every
+    auction we won 2026-07-16 was a longshot at fair+1-1.2c) and as tight as
+    safe on mains. Tiers recapture the longshot pad without touching mains."""
 
     enabled: bool = False
     markup_cc: int = 0  # centi-cents over fair (400 = 4¢); self-selects FAT
+    tiers: list[MarkupTier] = Field(default_factory=list)
+
+    @field_validator("tiers")
+    @classmethod
+    def _tiers_ascending(cls, v: list[MarkupTier]) -> list[MarkupTier]:
+        bounds = [t.fair_below_cc for t in v]
+        if bounds != sorted(bounds) or len(set(bounds)) != len(bounds):
+            raise ValueError("tiers must have strictly ascending fair_below_cc")
+        return v
 
 
 class MarkupConfig(StrictModel):
@@ -1904,6 +2146,25 @@ class MarkupConfig(StrictModel):
     enabled: bool = False  # master switch
     soccer: SportMarkupConfig = Field(default_factory=SportMarkupConfig)
     mlb: SportMarkupConfig = Field(default_factory=SportMarkupConfig)
+    # Per-leg-series defensive markup ADDERS (series ticker prefix -> extra cc on
+    # top of the sport markup). First use: the #37 corners edge-floor — corners
+    # combos measured 3-5c RICH vs our (correct) fair (2026-07-15 rho measurement:
+    # corners⊥goals confirmed at every traded line, so the gap is market richness,
+    # NOT a correlation error) ⇒ quote them fair + markup + 3c instead of leaking
+    # the richness to adverse selection. Applied ONCE per combo (max matching
+    # adder, never summed) and ONLY when the combo's sport markup is enabled —
+    # a dark sport stays bit-identical dark.
+    series_adders_cc: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator("series_adders_cc")
+    @classmethod
+    def _adders_sane(cls, v: dict[str, int]) -> dict[str, int]:
+        for key, cc in v.items():
+            if not key:
+                raise ValueError("series_adders_cc key must be a non-empty prefix")
+            if cc < 0:
+                raise ValueError(f"series_adders_cc[{key}] must be >= 0, got {cc}")
+        return v
 
 
 class PricingConfig(StrictModel):
@@ -1922,6 +2183,26 @@ class PricingConfig(StrictModel):
     # would-be decision is logged, the quote still goes out.
     widen: WidenConfig = Field(default_factory=WidenConfig)
     max_source_disagreement: float = 0.08
+    # PRICING ALIASES (2026-07-16, operator-directed): exact-ticker aliases the
+    # pricing-classification layer reasons through (classification, same-game
+    # grouping, structural parsing, sgp orientation, markup sport) while the
+    # exchange-facing identity (books, marginals, quoting, settlement) keeps the
+    # REAL ticker. Motivating case: the WC final has no KXWCADVANCE series, so
+    # the champion legs KXMENWORLDCUP-26-{AR,ES} — settlement-identical to
+    # advancing the final (win incl. ET/pens) — alias to synthetic
+    # KXWCADVANCE-26JUL19ESPARG-{ARG,ESP} legs. Committed default {} is
+    # bit-identical to pre-alias behavior. Only UNKNOWN-classifying tickers may
+    # be aliased and the target must be a modeled family (validated below at
+    # load time AND again at install time by ``legtypes.set_pricing_aliases``,
+    # so a programmatic bypass of config still cannot install a bad mapping).
+    leg_pricing_aliases: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_leg_pricing_aliases(self) -> Self:
+        from combomaker.pricing.legtypes import validate_pricing_aliases
+
+        validate_pricing_aliases(self.leg_pricing_aliases)
+        return self
 
 
 class RiskConfig(StrictModel):
@@ -1931,6 +2212,29 @@ class RiskConfig(StrictModel):
     max_notional_per_quote_dollars: float = 500.0
     max_market_delta_contracts: float = 300.0
     max_event_delta_contracts: float = 500.0
+    # --- AUTO-SCALING DELTA CAPS (operator directive 2026-07-19: "I don't
+    # like manually moving stuff like this, it should be automatic"). The
+    # delta caps were the LAST absolute numbers in the risk stack — hand-bumped
+    # three times the week of 7/13 (300/500 → 900/1500 → 1500/2500) as bankroll
+    # and book size moved. When set (non-None), each cap's CONTRACT threshold
+    # derives at check time from the SAME live risk bankroll every loss budget
+    # scales from (BalanceTracker.risk_bankroll_cc = min(start-of-day equity,
+    # cash + haircut·portfolio_value); recomputed per check, no caching):
+    #     cap_contracts = frac × bankroll_cc / 10_000
+    # (1 contract ≈ $1 max payout, so this is frac × bankroll-in-dollars).
+    # PRECEDENCE: a set frac WINS — the absolute knob above is IGNORED while a
+    # usable bankroll reading exists (it stands in only when the bankroll is
+    # unavailable, where SKIP_BANKROLL_UNAVAILABLE already blocks quoting).
+    # Which mode is active per cap is logged once at startup
+    # (``delta_cap_mode`` in to_risk_limits). Decimal strings → exact
+    # Fractions (house convention; floats banned for thresholds). UNLIKE the
+    # loss fracs these may exceed 1 — the delta axis is a directional
+    # contract bound, not premium at risk. OPERATOR RATIOS at design time
+    # (2026-07-19, $1,910 cash): the hand-set 1500/2500 ≈ 0.785/1.31 of cash
+    # → suggested arming values "0.80" (market) / "1.30" (event). Defaults
+    # None = absolute caps behave exactly as today (no change until armed).
+    max_market_delta_frac: str | None = None
+    max_event_delta_frac: str | None = None
     max_gross_notional_dollars: float = 5_000.0
     max_open_quotes: int = 20
     max_daily_loss_dollars: float = 500.0
@@ -1959,6 +2263,174 @@ class RiskConfig(StrictModel):
     # no-quote on a stale bankroll (never a permanent halt) and the give-back
     # halts skip when peak/current equity is unavailable (no invented peak). ---
     caps_shadow_mode: bool = False
+    # P0-1 candidate-aware portfolio-risk gate at CONFIRM. ENFORCED by default: a
+    # confirm the existing analytic/gross/burst gates already admit runs an
+    # ADDITIONAL candidate-aware ~20k-sample portfolio MC (off the loop) and confirms
+    # ONLY when the candidate's marginal EV is positive AND the POST-book joint-tail
+    # / ruin / deterministic / gross budgets pass. STRICTLY ADDITIVE (only ever
+    # DECLINES a fill the other gates admit). Set candidate_gate_enabled: false in
+    # YAML to disable it (the kill switch for this gate; preserves prior behaviour).
+    candidate_gate_enabled: bool = True
+    # P0-2 candidate-gate wall budget at CONFIRM (game-day wiring, 2026-07-16):
+    # the seconds of the exchange's 3s confirm window the ATOMIC candidate gate
+    # (MC + bounded rebuild retries) may consume — previously only the
+    # LifecycleConfig default (2.0), now operator-settable in YAML so the window
+    # can be rebalanced against the last-look MC waiver on game days. Exceeding
+    # the budget FAILS CLOSED (declines). Validated to (0, 3]; when the waiver
+    # is enabled the SUM of both budgets must fit the 3s window (model
+    # validator below).
+    candidate_gate_deadline_s: float = 2.0
+    # P1 EV VISIBILITY (audit "+EV IS PRODUCTION-MODEL EV, NOT ROBUST EV"). The
+    # candidate gate always LOGS the production candidate EV alongside the
+    # challenger / bridge / split candidate EVs. This OPTIONAL tolerance (float cc)
+    # ONLY ADDS a decline: a +production-EV candidate whose WORST credible challenger
+    # EV falls below it is declined too. DEFAULTS to −inf ⇒ no behaviour change
+    # (worst >= −inf is always true); set a finite NEGATIVE value in YAML (e.g.
+    # -50.0 to allow the worst challenger EV down to −0.50 of edge) to opt in.
+    # Strictly additive — it can only flip an already-admitted confirm to a decline.
+    worst_challenger_ev_tolerance_cc: float = float("-inf")
+    # LAST-LOOK MC WAIVER (handoff Problem A — CONFIRM-PATH ONLY). When a
+    # confirm-time risk denial's ENFORCED breaches are ALL game-loss and/or
+    # mutex-directional cap breaches (the two deliberately comonotone-OVERSTATED
+    # analytic per-game bounds; every other cap still declines as today), the
+    # lifecycle computes the STATE-CONSISTENT per-game worst case by EXACT
+    # enumeration over the Dixon-Coles scoreline grid (sim/state_worst_case.py —
+    # finite support, no MC sampling miss) OFF-LOOP, and — ONLY if every breached
+    # game is CERTIFIED and its state-consistent worst case fits the SAME
+    # game-loss budget (threshold_cc(game_loss_frac, bankroll), never a raised
+    # one) — retries the reservation ONCE with a per-game waiver certificate that
+    # skips exactly those two caps for exactly those games. The QUOTE-TIME
+    # analytic caps are UNTOUCHED (the E2 mass-acceptance dominance invariant
+    # requires them to stay monotone); open quotes contribute adversarially
+    # (max(0, loss) per state — a resting unfilled hedge never earns credit).
+    # Any error / timeout / uncertified game / over-budget / version conflict
+    # after one rebuild ⇒ decline exactly as today (fail-closed). Committed
+    # default OFF; the operator arms it in the local YAML.
+    lastlook_mc_waiver_enabled: bool = False
+    # Wall budget (seconds) for the whole waiver evaluation (build + off-loop
+    # enumeration + at most one rebuild). Must fit inside the exchange's 3s
+    # confirm window ALONGSIDE the candidate gate (candidate_gate_deadline_s,
+    # default 2.0s), so it is validated to (0, 3].
+    lastlook_mc_waiver_deadline_s: float = 1.0
+    # WAIVER ENTITY-SET TRIM (2026-07-18 — burst-floor doctrine inside the
+    # enumeration). The full ~200-entity resting-quote set made the live waiver
+    # enumeration exceed even a 1.8s deadline (two timeouts observed 2026-07-17
+    # night; the 87ms benchmark was a 20-quote book), declining +EV wins. When
+    # > 0, the waiver enumerates committed entities + reservations + the
+    # candidate (never trimmed) + only the K LARGEST resting quotes per
+    # BREACHED game (ranked by comonotone worst-side loss); every dropped
+    # resting quote touching a breached game folds into a CONSTANT conservative
+    # adder on that game's certificate — state-independent, so it can only
+    # RAISE the certified worst case (fail-closed; sim/state_worst_case.
+    # trim_open_quotes_for_games). 0 (default) = today's full-set enumeration
+    # byte-identical; the operator arms the profiled K (12 sizes the worst-case
+    # runtime under ~0.8s on the live book shape — tools/
+    # profile_waiver_entity_trim.py) in the local YAML.
+    lastlook_waiver_topk_resting: int = 0
+    # CERTIFIED-HEDGE EV BUDGET (2026-07-18). The P0-1 candidate gate's
+    # negative-EV exception, now VERIFIED: arming ``allow_negative_ev_hedge``
+    # admits a negative-EV fill ONLY when the gate CERTIFIES it risk-reducing —
+    # POST governing model UNCLAMPED expected tail loss <= PRE on the same
+    # common-random-numbers sample (sim/book_risk._candidate_gate; UNCLAMPED so
+    # the certification is never vacuous on a book whose sampled 1% tail is
+    # still net-profitable, where a clamped-ES comparison degenerates to 0 <= 0
+    # and would admit every pickoff) — AND its EV
+    # cost fits ``hedge_cost_budget_cc`` (int centi-cents of EV given up per
+    # fill). Semantics of arming: "pay up to $X of EV only for fills that
+    # measurably shrink the book's tail" — a stale-quote sniper pickoff is
+    # negative-EV WITHOUT shrinking the tail and still declines. All POST
+    # budgets (CVaR / det-max / ruin / notional) still gate afterwards. BOTH
+    # default to the P0-1 safety default (disabled / 0 = today's behaviour).
+    allow_negative_ev_hedge: bool = False
+    hedge_cost_budget_cc: int = 0
+    # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1). Seconds after a SUCCESSFUL
+    # confirm before the maintenance sweep polls REST GET quote for a fill whose
+    # quote_executed WS message never arrived (the WS channel has no replay; a
+    # missed message left a REAL 2026-07-16 fill out of the ledger until the
+    # next-restart reconcile). Far beyond the combo 1s execution timer so a poll
+    # fires only on a genuinely lost message. Must be a positive, finite number
+    # (validator below); LifecycleConfig.fill_record_recovery_after_s downstream.
+    fill_record_recovery_after_s: float = 10.0
+    # CANCEL-REPORT VERIFY-BEFORE-DISCARD (2026-07-18, two live incidents the
+    # same day — quotes 903935fc/7d79f32b). A CONFIRMED quote whose REST status
+    # comes back CANCELLED ("execution failed") is NOT discarded on the report
+    # alone: /portfolio/fills is polled ``fill_cancel_verify_attempts`` times,
+    # ``fill_cancel_verify_delay_s`` apart (defaults: 3 polls over ~3 min —
+    # covers the observed late taker-style execution), before the phantom is
+    # removed. A matching exchange fill KEEPS the position and writes the
+    # fills row via the normal writer (fill_recovery_late_execution).
+    # attempts = 0 disables verification (the pre-incident immediate discard —
+    # not recommended live); the delay must be a positive finite number.
+    fill_cancel_verify_attempts: int = 3
+    fill_cancel_verify_delay_s: float = 90.0
+    # SETTLED-LEG MARGINAL RESOLUTION (2026-07-18 live outage: FRAENG settled
+    # while cross-game combos holding FRAENG legs stayed open — the settled
+    # legs' books left the feed, the book-risk model went UNKNOWN and the
+    # portfolio-CVaR cap failed closed on EVERY quote until the last leg would
+    # have settled). True (default): the app wires a SettledMarginalResolver —
+    # a COMMITTED leg whose order book is gone from the feed resolves its
+    # marginal to the exchange-GRADED settlement fact (GET /markets/{ticker}
+    # `result`: yes ⇒ 1.0 / no ⇒ 0.0; accepted only under status determined/
+    # finalized — verified against the live openapi.yaml 2026-07-18), fetched
+    # OFF the hot path on the maintenance tick and cached permanently (a
+    # settlement never changes). Precedence: feed first, settled-cache second,
+    # else UNKNOWN — an UNRESOLVED closed market (game over, not yet graded)
+    # stays UNKNOWN/fail-closed; outcomes are NEVER inferred from scores or
+    # feeds. Risk numbers become CONDITIONAL on the settled facts (a lost-leg
+    # combo contributes zero further loss; a won-leg combo carries full
+    # conditional exposure on its remaining legs). False: no resolver is wired
+    # — the pre-fix behaviour (settled legs leave the snapshot unusable).
+    settled_marginal_resolution: bool = True
+    # Backoff (seconds) between REST re-fetch attempts for a pending ticker
+    # whose result is not graded yet (or whose fetch errored). Positive finite
+    # (validator below); the fetch pass is bounded and single-flight.
+    settled_resolution_retry_s: float = 30.0
+    # PERIODIC POSITION-RECONCILE NET (2026-07-18 requirement 3). Every this
+    # many seconds the app compares the exchange's open positions
+    # (GET /portfolio/positions, read-only, subaccount-pinned) against the
+    # in-memory exposure book and alarms position_reconcile_unmodeled on any
+    # exchange position the book does not know — alarm-only, NEVER an
+    # auto-insert (fail-safe direction). Default 300 s (5 min).
+    position_reconcile_interval_s: float = 300.0
+    # F1 MONOTONE PRE-PRICING GATE (throughput synthesis 2026-07-16). When True,
+    # handle_rfq consults a CANDIDATE-FREE limits check (cached ≤0.5s per
+    # exposure generation + bankroll) BEFORE the expensive joint pricing and
+    # pre-declines on the candidate-monotone breach subset
+    # (risk/limits.PRE_PRICING_MONOTONE_REASONS: max-open-quotes, game-loss,
+    # utilization backstop, bankroll-unavailable) — provably the SAME decline
+    # the full post-pricing check produces, just earlier, freeing the pool for
+    # live RFQs (48.2% of the game-day window's no-quotes carried an
+    # allowlisted reason). Identical reason codes; the "pre_pricing" stage rides
+    # the decision context. STRICTLY ADDITIVE (can only add earlier declines,
+    # never admit) and prototype-validated (tools/proto_pre_pricing_gate.py).
+    # Default False = today's behaviour byte-identical; the operator arms it in
+    # the local YAML after game-day review.
+    pre_pricing_gate_enabled: bool = False
+    # CONFIRM-TIME resting haircut (2026-07-17): weight the RESTING open-quote
+    # fold at resting_quote_weight inside the reservation check too (committed +
+    # reservations + candidate stay 100%). Removes the standing directional/
+    # mass-acceptance breach that 200 resting slots exert AT CONFIRM (which
+    # co-breached every denial and disarmed the Problem-A waiver — 37/37
+    # auction wins auto-declined 2026-07-17). Default False = today.
+    resting_haircut_at_confirm: bool = False
+    # QUOTE-TIME RESTING-QUOTE HAIRCUT (operator design 2026-07-17). Weight on
+    # every resting (open) quote's contribution to the QUOTE-TIME
+    # mass-acceptance folds (game-loss / slate / directional / delta / notional
+    # / utilization), with a BURST FLOOR: never less than the FULL (100%)
+    # contribution of the ``resting_floor_count`` largest resting quotes per
+    # axis/bucket. Rationale: the quote-time 100% fold double-counted the
+    # confirm path's EXACT enforcement (serial reservations + analytic caps at
+    # confirm + candidate MC + waiver) and was the #1 measured flow killer
+    # (skip_game_loss_cap). CONFIRM-TIME checks are UNTOUCHED (pinned at 100%;
+    # regression-tested bit-identical armed vs not). Arming the weight below 1
+    # ALSO arms the event-driven post-fill risk pull: on a committed fill the
+    # lifecycle re-runs the quote-time analytic check and deletes resting
+    # quotes on enforced-breached games (delete_risk_evicted_on_fill).
+    # DEFAULT "1.0" = today's behaviour byte-identical; the operator arms
+    # "0.40" in the local YAML. Decimal string (exact Fraction; floats banned
+    # for risk weights), validated to (0, 1].
+    resting_quote_weight: str = "1.0"
+    resting_floor_count: int = 3
     game_loss_frac: str = "0.08"          # %-of-GAME correlated loss
     per_combo_loss_frac: str = "0.01"     # single position max_loss
     directional_frac: str = "0.10"        # net one-directional / theme
@@ -1966,7 +2438,26 @@ class RiskConfig(StrictModel):
     daily_loss_frac: str = "0.06"         # soft daily-loss halt
     drawdown_frac: str = "0.10"           # peak-drawdown halt
     hard_trip_frac: str = "0.12"          # hard-trip KILL
-    portfolio_cvar_frac: str = "0.15"     # portfolio joint-tail (operative ES_0.99)
+    portfolio_cvar_frac: str = "0.15"     # portfolio joint-tail (governing model ES_0.99)
+    portfolio_det_max_frac: str = "0.15"  # P0-3: deterministic all-hit max-loss cap
+    # MUTEX/SCENARIO-AWARE det-max gating (operator directive 2026-07-18). The
+    # comonotone all-hit det-max charges mutually exclusive parlays (opposing
+    # moneylines of one game; two champion outcomes) as if they could all hit
+    # SIMULTANEOUSLY — impossible — and refused diversifying +EV flow at the
+    # portfolio det-max caps (live 2026-07-17 night: ENG-win / ARG-champ / tie
+    # combos declined at $453 of the $500 budget while ES/CVaR sat far from
+    # binding). True (default): the SKIP_PORTFOLIO_DET_MAX cap and the P0-1
+    # candidate gate's post_deterministic_max_over_budget budget gate on the
+    # sound scenario-aware bound (within a game: max over provably-exclusive
+    # outcome branches; across games: sum; comonotone fallback for every
+    # unproven slice — always <= the comonotone number, which keeps emitting
+    # unchanged for telemetry). False: byte-identical old comonotone gating at
+    # BOTH sites — the quote-time cap reads it from RiskLimits and the
+    # candidate gate receives it via CandidateBookRiskInputs.det_max_mutex_aware
+    # (threaded in QuoteLifecycle._build_candidate_gate_inputs).
+    # Reason codes and budgets are unchanged.
+    portfolio_det_max_mutex_aware: bool = True
+    portfolio_ruin_prob_budget: str = "0.05"  # A2: max P(equity < ruin floor this wave)
     absolute_notional_multiple: int = 3   # utilization backstop (× bankroll)
     fill_velocity_window_s: float = 2.0
     fill_velocity_soft_frac: str = "0.05"
@@ -1989,6 +2480,8 @@ class RiskConfig(StrictModel):
         "drawdown_frac",
         "hard_trip_frac",
         "portfolio_cvar_frac",
+        "portfolio_det_max_frac",
+        "portfolio_ruin_prob_budget",
         "fill_velocity_soft_frac",
         "fill_velocity_hard_frac",
     )
@@ -2008,8 +2501,37 @@ class RiskConfig(StrictModel):
             )
         return v
 
+    # The auto-scaling delta-cap fracs get their OWN validator: None is a
+    # meaningful value (frac mode disarmed → absolute knob governs), and the
+    # legal range differs from the loss fracs — a delta cap is a directional
+    # CONTRACT bound (frac × bankroll dollars), not premium at risk, so > 1 is
+    # legitimate (the suggested event arming value is "1.30"). Bounded at 10:
+    # a cap above 10× bankroll is not a cap (catches the "80"-for-"0.80" typo
+    # the loss-frac validator catches at 1).
+    @field_validator("max_market_delta_frac", "max_event_delta_frac")
+    @classmethod
+    def _valid_delta_frac(cls, v: str | None, info: ValidationInfo) -> str | None:
+        if v is None:
+            return v
+        try:
+            d = Decimal(v)
+        except InvalidOperation as exc:
+            raise ValueError(f"{info.field_name} {v!r} is not a decimal") from exc
+        # is_finite() first: NaN/sNaN/±Infinity rejected before the range
+        # compare (a signaling-NaN comparison would raise InvalidOperation).
+        if not d.is_finite() or not (Decimal(0) < d <= Decimal(10)):
+            raise ValueError(
+                f"{info.field_name} {v!r} must be a finite fraction of bankroll "
+                f"in (0, 10] (delta cap in contracts = frac × bankroll dollars; "
+                f"e.g. '0.80'), not {d}"
+            )
+        return v
+
     @field_validator(
-        "absolute_notional_multiple", "fill_velocity_max_fills", "starvation_threshold"
+        "absolute_notional_multiple",
+        "fill_velocity_max_fills",
+        "starvation_threshold",
+        "resting_floor_count",
     )
     @classmethod
     def _positive_int_knob(cls, v: int) -> int:
@@ -2017,15 +2539,156 @@ class RiskConfig(StrictModel):
             raise ValueError(f"must be >= 1, got {v}")
         return v
 
+    # 0 is a MEANINGFUL value for these two (trim disabled / zero hedge budget
+    # = today's behaviour), so they get their own >= 0 validator rather than
+    # joining the >= 1 knob set above.
+    @field_validator("lastlook_waiver_topk_resting", "hedge_cost_budget_cc")
+    @classmethod
+    def _nonnegative_int_knob(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"must be >= 0, got {v}")
+        return v
+
+    # The resting-quote weight is a fraction of the resting mass-acceptance
+    # contribution, NOT a percentage of bankroll — its own validator so the
+    # error message says what it is. (0, 1]: 0 would erase the resting fold
+    # entirely below the burst floor (never intended), > 1 would over-count.
+    @field_validator("resting_quote_weight")
+    @classmethod
+    def _valid_resting_weight(cls, v: str) -> str:
+        try:
+            d = Decimal(v)
+        except InvalidOperation as exc:
+            raise ValueError(f"resting_quote_weight {v!r} is not a decimal") from exc
+        if not d.is_finite() or not (Decimal(0) < d <= Decimal(1)):
+            raise ValueError(
+                f"resting_quote_weight {v!r} must be a finite fraction in (0, 1] "
+                f"(1.0 = today's full fold; the operator arms 0.40), not {d}"
+            )
+        return v
+
+    # The recovery delay must be a positive finite number of seconds. NaN fails
+    # the comparison and infinity is an always-never sweep dressed up as a
+    # config — both rejected loudly rather than silently disabling a real-money
+    # ledger repair path (the lifecycle ALSO fail-closes on a non-positive
+    # value, belt-and-braces).
+    @field_validator("fill_record_recovery_after_s")
+    @classmethod
+    def _valid_recovery_delay(cls, v: float) -> float:
+        if not (0.0 < v < float("inf")):
+            raise ValueError(
+                f"fill_record_recovery_after_s must be a positive finite number "
+                f"of seconds, got {v}"
+            )
+        return v
+
+    # Cancel-report verification (2026-07-18): the delay must be positive and
+    # finite (NaN fails the comparison ⇒ rejected — never a silent stall), and
+    # the poll budget non-negative (0 = verification explicitly disabled).
+    @field_validator(
+        "fill_cancel_verify_delay_s",
+        "position_reconcile_interval_s",
+        "settled_resolution_retry_s",
+    )
+    @classmethod
+    def _valid_verify_intervals(cls, v: float, info: ValidationInfo) -> float:
+        if not (0.0 < v < float("inf")):
+            raise ValueError(
+                f"{info.field_name} must be a positive finite number of "
+                f"seconds, got {v}"
+            )
+        return v
+
+    @field_validator("fill_cancel_verify_attempts")
+    @classmethod
+    def _valid_verify_attempts(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(
+                f"fill_cancel_verify_attempts must be >= 0 (0 disables "
+                f"verification), got {v}"
+            )
+        return v
+
+    # Each confirm-window wall budget must FIT INSIDE the exchange's 3s confirm
+    # window on its own (waiver + candidate gate run alongside each other; their
+    # SUM is checked by the model validator below when the waiver is armed).
+    # NaN fails both comparisons ⇒ rejected too (never a silent unbounded
+    # deadline).
+    @field_validator("lastlook_mc_waiver_deadline_s", "candidate_gate_deadline_s")
+    @classmethod
+    def _valid_confirm_window_budget(cls, v: float) -> float:
+        if not (0.0 < v <= 3.0):
+            raise ValueError(
+                f"confirm-window budget must be in (0, 3] seconds (the "
+                f"exchange confirm window), got {v}"
+            )
+        return v
+
+    # When the last-look MC waiver is ARMED it runs IN ADDITION to the candidate
+    # gate inside the SAME exchange confirm window (3s for combos/HVM,
+    # docs/api-notes/openapi-comms.md): both wall budgets must fit together, or
+    # an operator could configure a confirm path that mathematically cannot
+    # finish inside the window (every waived confirm would then lapse). Checked
+    # only when the waiver is enabled — with it off, only the per-field (0, 3]
+    # bound applies (the gate runs alone).
+    @model_validator(mode="after")
+    def _confirm_window_budgets_fit_together(self) -> RiskConfig:
+        if self.lastlook_mc_waiver_enabled:
+            total = self.lastlook_mc_waiver_deadline_s + self.candidate_gate_deadline_s
+            if total > 3.0:
+                raise ValueError(
+                    f"lastlook_mc_waiver_deadline_s "
+                    f"({self.lastlook_mc_waiver_deadline_s}) + "
+                    f"candidate_gate_deadline_s ({self.candidate_gate_deadline_s}) "
+                    f"= {total}s exceeds the exchange's 3s confirm window — with "
+                    "the waiver enabled both budgets share the window; lower one "
+                    "(or disable lastlook_mc_waiver_enabled)"
+                )
+        return self
+
     def to_risk_limits(self) -> RiskLimits:
         """Build the ``RiskLimits`` the checker uses, parsing the decimal-string
         percentages into exact Fractions (via Decimal so "0.08" is EXACTLY 8/100,
-        never a binary-float approximation). The one place config → limits."""
+        never a binary-float approximation). The one place config → limits.
+
+        Also emits the ``delta_cap_mode`` startup record (which mode — frac or
+        absolute — is active per directional delta cap): this seam runs exactly
+        once at quote-app startup, so logging here IS the log-once-at-startup
+        required by the auto-scaling delta-cap directive (2026-07-19)."""
+        log.info(
+            "delta_cap_mode",
+            market_mode=(
+                "frac" if self.max_market_delta_frac is not None else "absolute"
+            ),
+            market_value=(
+                self.max_market_delta_frac
+                if self.max_market_delta_frac is not None
+                else self.max_market_delta_contracts
+            ),
+            event_mode=(
+                "frac" if self.max_event_delta_frac is not None else "absolute"
+            ),
+            event_value=(
+                self.max_event_delta_frac
+                if self.max_event_delta_frac is not None
+                else self.max_event_delta_contracts
+            ),
+        )
         return RiskLimits(
             max_contracts_per_quote=self.max_contracts_per_quote,
             max_notional_per_quote_dollars=self.max_notional_per_quote_dollars,
             max_market_delta_contracts=self.max_market_delta_contracts,
             max_event_delta_contracts=self.max_event_delta_contracts,
+            max_market_delta_frac=(
+                None
+                if self.max_market_delta_frac is None
+                else Fraction(Decimal(self.max_market_delta_frac))
+            ),
+            max_event_delta_frac=(
+                None
+                if self.max_event_delta_frac is None
+                else Fraction(Decimal(self.max_event_delta_frac))
+            ),
             max_gross_notional_dollars=self.max_gross_notional_dollars,
             max_open_quotes=self.max_open_quotes,
             max_daily_loss_dollars=self.max_daily_loss_dollars,
@@ -2039,11 +2702,16 @@ class RiskConfig(StrictModel):
             drawdown_frac=Fraction(Decimal(self.drawdown_frac)),
             hard_trip_frac=Fraction(Decimal(self.hard_trip_frac)),
             portfolio_cvar_frac=Fraction(Decimal(self.portfolio_cvar_frac)),
+            portfolio_det_max_frac=Fraction(Decimal(self.portfolio_det_max_frac)),
+            portfolio_det_max_mutex_aware=self.portfolio_det_max_mutex_aware,
+            portfolio_ruin_prob_budget=Fraction(Decimal(self.portfolio_ruin_prob_budget)),
             absolute_notional_multiple=self.absolute_notional_multiple,
             fill_velocity_window_s=self.fill_velocity_window_s,
             fill_velocity_soft_frac=Fraction(Decimal(self.fill_velocity_soft_frac)),
             fill_velocity_hard_frac=Fraction(Decimal(self.fill_velocity_hard_frac)),
             fill_velocity_max_fills=self.fill_velocity_max_fills,
+            resting_quote_weight=Fraction(Decimal(self.resting_quote_weight)),
+            resting_floor_count=self.resting_floor_count,
         )
 
 
@@ -2075,6 +2743,12 @@ class AppConfig(StrictModel):
     # confirm_live comes only from the CLI flag --confirm-live, never from YAML:
     # a file can't accidentally arm production.
     confirm_live: bool = Field(default=False, exclude=True)
+    # The YAML file this config was loaded from (recorded by load_config, never
+    # settable from YAML itself). Subprocesses that re-load config (the safety
+    # supervisor) must receive THIS path, not re-derive the base per-env file —
+    # otherwise local-override values (e.g. supervisor.heartbeat_timeout_s) load
+    # in the bot but silently not in the watchdog that enforces them.
+    source_path: Path | None = Field(default=None, exclude=True)
 
     def assert_safe_to_run(self) -> None:
         """Hardcoded production guard (the STATIC go-live gates). Raises
@@ -2142,4 +2816,4 @@ def load_config(
     raw.setdefault("endpoints", EndpointsConfig.for_env(resolved_env).model_dump())
 
     config = AppConfig.model_validate(raw)
-    return config.model_copy(update={"confirm_live": confirm_live})
+    return config.model_copy(update={"confirm_live": confirm_live, "source_path": path})

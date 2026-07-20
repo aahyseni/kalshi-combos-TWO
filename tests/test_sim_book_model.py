@@ -20,7 +20,13 @@ from combomaker.sim.book_model import (
     DEFAULT_FLAT_BAND,
     build_book_model,
 )
-from combomaker.sim.engine import ComboPosition, LegModel, simulate
+from combomaker.sim.engine import (
+    ComboPosition,
+    LegModel,
+    book_pnl,
+    position_pnl,
+    simulate,
+)
 
 N = 200_000
 DOLLAR_CC = 10_000.0
@@ -253,3 +259,98 @@ class TestBuildBookModel:
         expected = 1.0 - analytic_yes
         sigma = math.sqrt(analytic_yes * (1 - analytic_yes)) / math.sqrt(N)
         assert abs(mc_no - expected) < 4.0 * sigma
+
+
+# ---------------------------------------------------------------------------
+# P0-6: Fractional contracts in MC.
+#
+# build_book_model must convert centi-contracts to fractional contracts EXACTLY
+# (centi/100), with NO forced one-contract minimum. The old code did
+# max(1, centi//100), which turned 37.27 -> 37 (dropped 0.27 of a contract) and
+# 0.40 -> 1 (inflated a sub-contract position 2.5x). These tests pin the exact
+# per-scenario P&L at the plan's mandatory contract sizes and prove the
+# analytic (exposure.max_loss_cc) and simulated maximum losses match to the cent.
+# ---------------------------------------------------------------------------
+
+# The plan's mandatory contract sizes, as (whole contracts, centi-contracts).
+_FRACTIONAL_CASES = [
+    (0.01, 1),
+    (0.40, 40),
+    (1.25, 125),
+    (37.27, 3727),
+    (100.99, 10099),
+]
+
+
+class TestFractionalContractsP0_6:
+    def test_build_book_model_preserves_fractional_contracts_exactly(self) -> None:
+        # centi/100, no floor: 40 -> 0.40 (NOT 1), 3727 -> 37.27 (NOT 37).
+        for whole, centi in _FRACTIONAL_CASES:
+            p = _pos(
+                "p1",
+                (_leg("A", "KXWCGAME-G1", "yes"),),
+                our_side=Side.NO,
+                contracts=centi,
+                price_cc=5_000,
+            )
+            m = build_book_model([p], marginals=lambda t: 0.5)
+            assert m.positions[0].contracts == whole
+
+    @pytest.mark.parametrize("whole, centi", _FRACTIONAL_CASES)
+    def test_exact_per_scenario_pnl_at_fractional_size(
+        self, whole: float, centi: int
+    ) -> None:
+        # A single-leg NO position bought at 5_000 cc. Build a deterministic value
+        # matrix (no sampling): row 0 = leg HITS (value 1.0), row 1 = leg MISSES
+        # (value 0.0). Per-contract NO P&L:
+        #   hit:  (10_000 - 10_000) - 5_000 = -5_000  (max loss = the premium)
+        #   miss: (10_000 -      0) - 5_000 = +5_000  (max win = $1 - premium)
+        # Total scales by the FRACTIONAL contract count exactly.
+        price_cc = 5_000
+        p = _pos(
+            "p1",
+            (_leg("A", "KXWCGAME-G1", "yes"),),
+            our_side=Side.NO,
+            contracts=centi,
+            price_cc=price_cc,
+        )
+        m = build_book_model([p], marginals=lambda t: 0.5)
+        combo = m.positions[0]
+        # values[:, leg_index] — one leg, two scenarios (hit, miss).
+        values = np.array([[1.0], [0.0]], dtype=np.float64)
+        pnl = position_pnl(values, combo)
+        assert pnl[0] == pytest.approx(-price_cc * whole)  # exact fractional loss
+        assert pnl[1] == pytest.approx((DOLLAR_CC - price_cc) * whole)  # exact win
+        # book_pnl over the single-position book equals the position P&L.
+        assert np.array_equal(book_pnl(values, [combo]), pnl)
+
+    @pytest.mark.parametrize("whole, centi", _FRACTIONAL_CASES)
+    def test_analytic_and_simulated_max_loss_match_to_the_cent(
+        self, whole: float, centi: int
+    ) -> None:
+        # ANALYTIC max loss (exposure.max_loss_cc) = centi * price // 100.
+        # SIMULATED max loss = the worst per-scenario loss magnitude for the NO
+        # position = price * fractional_contracts. price_cc=5_000 is a multiple of
+        # 100, so centi*price is always divisible by 100 and integer-division ==
+        # true division: the two agree exactly, to the cent, at every size.
+        price_cc = 5_000
+        p = _pos(
+            "p1",
+            (_leg("A", "KXWCGAME-G1", "yes"),),
+            our_side=Side.NO,
+            contracts=centi,
+            price_cc=price_cc,
+        )
+        analytic_max_loss = p.max_loss_cc  # int cc
+        m = build_book_model([p], marginals=lambda t: 0.5)
+        combo = m.positions[0]
+        # The NO position's max loss is the leg-HITS scenario (payout $1).
+        values = np.array([[1.0]], dtype=np.float64)
+        simulated_pnl = position_pnl(values, combo)[0]
+        simulated_max_loss = -simulated_pnl  # positive loss magnitude, float cc
+        assert simulated_max_loss == pytest.approx(float(analytic_max_loss))
+        # Parity to the cent: rounding the float simulated loss onto the cc grid
+        # recovers the analytic integer exactly (37.27*5_000 = 186350.00000000003
+        # in float differs from 186350 only by ~3e-11 cc — far under a cent).
+        assert round(simulated_max_loss) == analytic_max_loss
+        assert abs(simulated_max_loss - analytic_max_loss) < 1.0

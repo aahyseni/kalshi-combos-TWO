@@ -37,6 +37,7 @@ from combomaker.risk.exposure import (
     ExposureSnapshot,
     LegRef,
     OpenPosition,
+    OpenQuoteRisk,
 )
 from combomaker.risk.skew import (
     GameSkewCache,
@@ -559,3 +560,253 @@ class TestPricerBoundarySign:
         conc_ask = _implied_yes_ask_cc(_skew_for("yes").applied_cc)
         off_ask = _implied_yes_ask_cc(_skew_for("no").applied_cc)
         assert off_ask < base_ask < conc_ask
+
+
+# ---------------------------------------------------------------------------
+# SKEW MUTEX FIX (2026-07-18) — P0-9 mutex-aware per-game direction.
+# The raw delta-sum classifier is MUTEX-BLIND: long-NO on outcome B of an ME
+# event where the book is short outcome A carries the SAME delta sign, so the
+# hedge was widened (measured live: ARG-champ vs short-ESP-champion, 63/63).
+# ---------------------------------------------------------------------------
+
+CHAMP_EV = "KXCHAMP-G1"      # game key "G1" — same game bucket as EVENT
+ML_EV = "KXML-G1"
+ESP = "KXCHAMP-G1-ESP"
+ARG = "KXCHAMP-G1-ARG"
+ARG_ML = "KXML-G1-ARGML"
+
+
+def champ_me(event: str) -> bool | None:
+    """Explicit-True ME metadata for the champion + moneyline events (None
+    elsewhere — never a convenient default)."""
+    return True if event in (CHAMP_EV, ML_EV) else None
+
+
+def me_leg(market: str, event: str = CHAMP_EV, side: str = "yes") -> LegRef:
+    return LegRef(market_ticker=market, event_ticker=event, side=side)
+
+
+class TestMutexAwareDirection:
+    def _skew(
+        self,
+        book: ExposureBook,
+        candidate: OpenPosition,
+        marginals: dict[str, float],
+        *,
+        mutex: bool,
+        limits: SkewLimits = LIMITS,
+    ) -> InventorySkew:
+        snap = book.snapshot(provider(marginals), mass_acceptance=False)
+        if not mutex:
+            return compute_inventory_skew(
+                candidate, snap, provider(marginals), CONVENTIONS, limits, PARAMS
+            )
+        return compute_inventory_skew(
+            candidate, snap, provider(marginals), CONVENTIONS, limits, PARAMS,
+            dir_entries_by_game=snap.dir_entries_by_game,
+            committed_dir_entries_by_game=snap.committed_dir_entries_by_game,
+            is_me_event=book.is_me_event,
+        )
+
+    def test_live_scenario_arg_champ_hedge_flips_to_offsetting(self) -> None:
+        """THE 2026-07-17 live shadow scenario: short-ESP-champion committed
+        book, ARG-champ candidate. Raw read: same delta sign => widened (the
+        63/63 mis-classification). Mutex-aware read: opposing outcomes of ONE
+        ME event land in different branches of the P0-9 fold => the candidate
+        raises the book's directional bound by NOTHING => OFFSETTING, skew <= 0
+        = a rebate at the pricer."""
+        book = ExposureBook(CONVENTIONS, is_me_event=champ_me)
+        marginals = {ESP: 0.4, ARG: 0.4}
+        book.add_position(no_position("held", (me_leg(ESP),), contracts=60_000))
+        candidate = no_position("cand", (me_leg(ARG),), contracts=30_000)
+
+        raw = self._skew(book, candidate, marginals, mutex=False)
+        assert raw.skew_cc > 0                      # the measured mis-widen
+        assert raw.mutex_direction_games == ()
+
+        fixed = self._skew(book, candidate, marginals, mutex=True)
+        assert fixed.mutex_direction_games == ("G1",)
+        assert fixed.concentration_cc == 0          # nothing concentrates
+        assert fixed.offset_cc > 0                  # the hedge earns a rebate
+        assert fixed.skew_cc < 0                    # classifier: OFFSETTING
+        assert fixed.skew_cc >= -PARAMS.skew_max_tighten_cc  # clamp holds
+        assert fixed.shadow_applied_cc > 0          # pricer frame: cheaper combo
+        # And the widen-vs-decline policy no longer sees a concentrating game.
+        decision = decide_widen_or_decline(
+            fixed,
+            book.snapshot(provider(marginals), mass_acceptance=False),
+            candidate,
+            LIMITS,
+            WidenPolicyParams(enabled=True, util_threshold=0.5),
+        )
+        assert decision.would_decline is False
+
+    def test_partial_overhang_splits_into_both_terms_exactly(self) -> None:
+        """Candidate magnitude 80 vs a 60-contract opposing book on the same ME
+        event: 60 nets (rebate), the 20 overhang concentrates. Exact split at
+        util == 1 (delta axis binding)."""
+        tight = SkewLimits(
+            max_event_delta_contracts=60.0,
+            max_event_worst_case_loss_dollars=1e9,
+            max_event_gross_notional_dollars=1e9,
+        )
+        book = ExposureBook(CONVENTIONS, is_me_event=champ_me)
+        marginals = {ESP: 0.4, ARG: 0.4}
+        book.add_position(no_position("held", (me_leg(ESP),), contracts=6_000))
+        candidate = no_position("cand", (me_leg(ARG),), contracts=8_000)
+        skew = self._skew(book, candidate, marginals, mutex=True, limits=tight)
+        assert skew.mutex_direction_games == ("G1",)
+        assert skew.concentration_cc == 20   # the overhang beyond the book's 60
+        assert skew.offset_cc == 60          # netted, capped by the book's bound
+        assert skew.skew_cc == -40
+        assert skew.per_game == (("G1", -40),)
+
+    def test_two_me_events_on_candidate_falls_back_to_raw(self) -> None:
+        """Adversarial edge: a candidate whose this-game legs carry TWO
+        explicit-ME events is OUTSIDE the single-ME math — falls back to the
+        raw read (concentrating here; never a mutex rebate the math can't
+        certify). The >= 2-ME netting belongs to the parked hedge-pair build."""
+        book = ExposureBook(CONVENTIONS, is_me_event=champ_me)
+        marginals = {ESP: 0.4, ARG: 0.4, ARG_ML: 0.5}
+        book.add_position(no_position("held", (me_leg(ESP),), contracts=60_000))
+        candidate = no_position(
+            "cand", (me_leg(ARG), me_leg(ARG_ML, event=ML_EV)), contracts=30_000
+        )
+        skew = self._skew(book, candidate, marginals, mutex=True)
+        assert skew.mutex_direction_games == ()     # not applicable => raw read
+        assert skew.skew_cc >= 0                    # raw: same sign, concentrating
+        assert skew.offset_cc == 0
+
+    def test_no_me_metadata_is_byte_identical_to_raw(self) -> None:
+        """A book with NO ME metadata (is_me_event=None) must classify exactly
+        as the raw read even when the entries are passed — the mutex path arms
+        only with BOTH inputs."""
+        book = ExposureBook(CONVENTIONS)  # no is_me_event
+        marginals = {ESP: 0.4, ARG: 0.4}
+        book.add_position(no_position("held", (me_leg(ESP),), contracts=60_000))
+        candidate = no_position("cand", (me_leg(ARG),), contracts=30_000)
+        snap = book.snapshot(provider(marginals), mass_acceptance=False)
+        with_entries = compute_inventory_skew(
+            candidate, snap, provider(marginals), CONVENTIONS, LIMITS, PARAMS,
+            dir_entries_by_game=snap.dir_entries_by_game,
+            committed_dir_entries_by_game=snap.committed_dir_entries_by_game,
+            is_me_event=book.is_me_event,        # None => raw
+        )
+        plain = compute_inventory_skew(
+            candidate, snap, provider(marginals), CONVENTIONS, LIMITS, PARAMS
+        )
+        assert with_entries.skew_cc == plain.skew_cc
+        assert with_entries.per_game == plain.per_game
+        assert with_entries.mutex_direction_games == ()
+
+    def test_committed_second_me_event_falls_back_to_raw(self) -> None:
+        """2026-07-18 verify fix (the over-rebate corner): book = short
+        ESP-champ (CHAMP event) + short ARG-ML (a SECOND explicit-ME event of
+        the SAME game, correlated with ARG-champ); candidate = short ARG-champ.
+        The single-event fold rides the ARG-ML entry as COMMON — inflating base
+        and full equally, cancelling out of the marginal — so it would report
+        marginal 0 => a FULL rebate for a candidate that truly CONCENTRATES
+        against the real ARG branch (true 2-ME-aware split: concentration 30 /
+        nettable 50 on the 100/50/80 shape). The committed census detects the
+        second ME event and falls back to the raw read (today's behaviour —
+        never an uncertified rebate)."""
+        book = ExposureBook(CONVENTIONS, is_me_event=champ_me)
+        marginals = {ESP: 0.4, ARG: 0.4, ARG_ML: 0.5}
+        book.add_position(no_position("esp", (me_leg(ESP),), contracts=100_000))
+        book.add_position(
+            no_position("argml", (me_leg(ARG_ML, event=ML_EV),), contracts=50_000)
+        )
+        candidate = no_position("cand", (me_leg(ARG),), contracts=80_000)
+        skew = self._skew(book, candidate, marginals, mutex=True)
+        assert skew.mutex_direction_games == ()   # fallback: not a mutex game
+        assert skew.offset_cc == 0                # NO rebate the math can't certify
+        assert skew.skew_cc > 0                   # raw read: same sign => widen
+
+    def test_resting_quote_on_second_me_event_does_not_suppress(self) -> None:
+        """The live-shape guard: a RESTING QUOTE on the second ME event must
+        NOT drive the fallback (the live 200-slot book spans both ME events of
+        its games — a quote-driven fallback would kill the mutex fix exactly
+        where it was built to act). Committed book on CHAMP only + a resting
+        quote on ARG-ML: the mutex path stays engaged and the ARG-champ hedge
+        still earns its rebate."""
+        book = ExposureBook(CONVENTIONS, is_me_event=champ_me)
+        marginals = {ESP: 0.4, ARG: 0.4, ARG_ML: 0.5}
+        book.add_position(no_position("held", (me_leg(ESP),), contracts=60_000))
+        book.upsert_quote(
+            OpenQuoteRisk(
+                quote_id="q-ml",
+                rfq_id="r-ml",
+                combo_ticker="COMBO-ML",
+                collection=None,
+                yes_bid_cc=CC(0),
+                no_bid_cc=CC(4_000),
+                contracts=Q(10_000),
+                legs=(me_leg(ARG_ML, event=ML_EV),),
+            )
+        )
+        candidate = no_position("cand", (me_leg(ARG),), contracts=30_000)
+        snap = book.snapshot(provider(marginals), mass_acceptance=True)
+        skew = compute_inventory_skew(
+            candidate, snap, provider(marginals), CONVENTIONS, LIMITS, PARAMS,
+            dir_entries_by_game=snap.dir_entries_by_game,
+            committed_dir_entries_by_game=snap.committed_dir_entries_by_game,
+            is_me_event=book.is_me_event,
+        )
+        assert skew.mutex_direction_games == ("G1",)   # still the mutex path
+        assert skew.offset_cc > 0                      # the hedge still rebates
+        assert skew.skew_cc < 0
+
+    def test_committed_census_unavailable_falls_back_to_raw(self) -> None:
+        """Fail-closed: passing the fold entries WITHOUT the committed census
+        (``committed_dir_entries_by_game`` omitted) must classify raw — the
+        mutex path never engages on an unverifiable committed book."""
+        book = ExposureBook(CONVENTIONS, is_me_event=champ_me)
+        marginals = {ESP: 0.4, ARG: 0.4}
+        book.add_position(no_position("held", (me_leg(ESP),), contracts=60_000))
+        candidate = no_position("cand", (me_leg(ARG),), contracts=30_000)
+        snap = book.snapshot(provider(marginals), mass_acceptance=False)
+        skew = compute_inventory_skew(
+            candidate, snap, provider(marginals), CONVENTIONS, LIMITS, PARAMS,
+            dir_entries_by_game=snap.dir_entries_by_game,
+            is_me_event=book.is_me_event,
+        )
+        plain = compute_inventory_skew(
+            candidate, snap, provider(marginals), CONVENTIONS, LIMITS, PARAMS
+        )
+        assert skew.mutex_direction_games == ()
+        assert skew.skew_cc == plain.skew_cc
+        assert skew.per_game == plain.per_game
+
+    def test_snapshot_exports_dir_entries_including_quote_mass(self) -> None:
+        """The snapshot's ``dir_entries_by_game`` carries the P0-9 entries the
+        directional fold consumed: positions always, resting quotes under mass
+        acceptance."""
+        book = ExposureBook(CONVENTIONS, is_me_event=champ_me)
+        marginals = {ESP: 0.4, ARG: 0.4}
+        book.add_position(no_position("held", (me_leg(ESP),), contracts=60_000))
+        book.upsert_quote(
+            OpenQuoteRisk(
+                quote_id="q1",
+                rfq_id="r1",
+                combo_ticker="COMBO-Q",
+                collection=None,
+                yes_bid_cc=CC(0),
+                no_bid_cc=CC(4_000),
+                contracts=Q(10_000),
+                legs=(me_leg(ARG),),
+            )
+        )
+        assert book.is_me_event is champ_me      # the property is the callable
+        no_mass = book.snapshot(provider(marginals), mass_acceptance=False)
+        assert len(no_mass.dir_entries_by_game["G1"]) == 1
+        mass = book.snapshot(provider(marginals), mass_acceptance=True)
+        assert len(mass.dir_entries_by_game["G1"]) == 2
+        # 2026-07-18 verify fix: the COMMITTED-only census is positions-only in
+        # BOTH modes — the resting quote never enters it (quote entries must
+        # not drive the second-ME-event fallback).
+        assert len(no_mass.committed_dir_entries_by_game["G1"]) == 1
+        assert len(mass.committed_dir_entries_by_game["G1"]) == 1
+        assert (
+            mass.committed_dir_entries_by_game["G1"]
+            == no_mass.committed_dir_entries_by_game["G1"]
+        )

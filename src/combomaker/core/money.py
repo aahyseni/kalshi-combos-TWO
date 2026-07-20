@@ -11,7 +11,7 @@ and probability happens only through the helpers here.
 
 from __future__ import annotations
 
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Literal, NewType
 
 CentiCents = NewType("CentiCents", int)
@@ -43,6 +43,27 @@ def cc_from_dollars_str(s: str) -> CentiCents:
     except InvalidOperation as exc:
         raise MoneyParseError(f"unparseable dollars string: {s!r}") from exc
     return cc_from_decimal_dollars(value)
+
+
+def fee_cc_from_dollars_str(s: str) -> CentiCents:
+    """Parse a Kalshi FEE ``*_dollars`` string to centi-cents, rounding UP to the
+    next whole cc when it is sub-centi-cent.
+
+    Prices, revenue, and settlement values are EXACT cc (``cc_from_dollars_str``) —
+    a fractional cc there is a genuine wire error and must raise. FEES are the one
+    exception: Kalshi can charge a sub-cc settlement fee (observed live
+    ``fee_cost="0.000080"`` = 0.8 cc on a combo settlement) that has no exact cc
+    representation. We book it at cc granularity, rounding UP (ROUND_CEILING) so we
+    never UNDERSTATE a cost we actually paid — maker-conservative for P&L. The
+    over-statement is at most 0.99 cc = <$0.0001."""
+    try:
+        value = Decimal(s)
+    except InvalidOperation as exc:
+        raise MoneyParseError(f"unparseable dollars string: {s!r}") from exc
+    if value < 0:
+        raise MoneyParseError(f"negative fee {value}")
+    scaled = (value / _CC_QUANTUM).to_integral_value(rounding=ROUND_CEILING)
+    return CentiCents(int(scaled))
 
 
 def cc_to_decimal_dollars(cc: CentiCents) -> Decimal:

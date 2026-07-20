@@ -89,6 +89,10 @@ class Rig:
         *,
         fee_model: FeeModel | None = None,
         fee_type: FeeType = FeeType.QUADRATIC,
+        joint_pool: Any = None,
+        risk_limits: RiskLimits | None = None,
+        lifecycle_config: LifecycleConfig | None = None,
+        rfq_alive: Any = None,
     ) -> None:
         self.h = h
         self.sender = FakeSender()
@@ -106,7 +110,7 @@ class Rig:
                     update={"allowed_leg_series_prefixes": None}),
                 h.feed, h.metadata, h.killswitch, h.clock,
             ),
-            limits=LimitChecker(RiskLimits()),
+            limits=LimitChecker(risk_limits or RiskLimits()),
             exposure=self.exposure,
             feed=h.feed,
             metadata=h.metadata,
@@ -116,9 +120,12 @@ class Rig:
             store=store,
             metrics=self.metrics,
             lastlook_policy=LastLookPolicy(),
-            config=LifecycleConfig(quote_ttl_s=30.0, reprice_threshold_cc=100),
+            config=lifecycle_config
+            or LifecycleConfig(quote_ttl_s=30.0, reprice_threshold_cc=100),
             fee_model=fee_model,
             fee_type=fee_type,
+            joint_pool=joint_pool,
+            rfq_alive=rfq_alive,
         )
 
 
@@ -159,6 +166,11 @@ def rfq() -> Rfq:
 
 
 def accepted_msg(quote_id: str, side: str = "yes") -> JsonDict:
+    # Real Kalshi quote_accepted WS shape (docs.kalshi.com/websockets/
+    # communications): a CONTRACTS-mode accept carries the count in
+    # contracts_accepted_fp. A TARGET-COST accept has contracts_accepted_fp=null
+    # and carries yes/no_contracts_offered_fp instead — see
+    # test_ground_truth_accept_fields_size_target_cost_rfq for that path.
     return {
         "quote_id": quote_id,
         "rfq_id": "rfq_1",
@@ -578,3 +590,319 @@ async def test_fill_fee_zero_for_combo_maker_quadratic() -> None:
     )
     assert lc._fill_fee_cc(CentiCents(5_000), CentiContracts(100)) == 0
     await store.close()
+
+
+# --------------------------------------------------------------------------
+# P2-4: per-quote/confirm risk-audit log line (RISK_ENGINE_AUDIT_ACTION_PLAN
+# P2 item 4). One consolidated ``risk_audit`` structured line carries every
+# enumerated field: book/snapshot generation + age, candidate EV, ES/P(ruin),
+# deterministic loss, gross, direction, reservations, model split/residual,
+# fallback reason, and the binding cap.
+# --------------------------------------------------------------------------
+
+import structlog  # noqa: E402
+
+# The exact fields the audit spec enumerates — every one must be present on the
+# line so the operator never has to reconstruct a decision from scattered logs.
+_AUDIT_FIELDS = {
+    "snapshot_generation",
+    "live_generation",
+    "snapshot_age_s",
+    "candidate_ev_cc",
+    "es_99_cc",
+    "p_ruin",
+    "p_ruin_upper",
+    "deterministic_max_loss_cc",
+    "gross_cc",
+    "direction_cc",
+    "reservations",
+    "production_es_99_cc",
+    "challenger_es_99_cc",
+    "bridge_es_99_cc",
+    "bridge_active",
+    "es_residual_cc",
+    "fallback_reason",
+    "binding_cap",
+}
+
+
+def _audit_lines(cap: list[dict[str, Any]], phase: str) -> list[dict[str, Any]]:
+    return [
+        e for e in cap if e.get("event") == "risk_audit" and e.get("phase") == phase
+    ]
+
+
+async def test_quote_emits_risk_audit_line_with_all_fields(rig: Rig) -> None:
+    with structlog.testing.capture_logs() as cap:
+        await rig.lifecycle.handle_rfq(rfq())
+    lines = _audit_lines(cap, "quote")
+    assert len(lines) == 1
+    line = lines[0]
+    # Every enumerated field is present.
+    assert _AUDIT_FIELDS <= set(line.keys())
+    # A cleanly-sent quote has no binding cap / fallback and a real candidate EV.
+    assert line["binding_cap"] == ""
+    assert line["fallback_reason"] == ""
+    assert line["reason"] == str(ReasonCode.QUOTE_SENT)
+    assert isinstance(line["candidate_ev_cc"], int)
+    # No COMMITTED positions ⇒ no committed tail to gate on (fields honestly
+    # None, not 0). The gross axis DOES reflect the just-sent open quote's
+    # mass-acceptance premium (it is upserted into the book before the audit),
+    # so gross_cc is a positive integer, not zero.
+    assert line["es_99_cc"] is None
+    assert line["p_ruin"] is None
+    assert isinstance(line["gross_cc"], int) and line["gross_cc"] > 0
+    assert line["reservations"] == 0
+
+
+async def test_confirm_emits_risk_audit_line(rig: Rig) -> None:
+    await rig.lifecycle.handle_rfq(rfq())
+    with structlog.testing.capture_logs() as cap:
+        await rig.lifecycle.on_quote_accepted(accepted_msg("q1", "yes"))
+    lines = _audit_lines(cap, "confirm")
+    assert len(lines) == 1
+    line = lines[0]
+    assert _AUDIT_FIELDS <= set(line.keys())
+    # The confirmed fill carries a sized candidate EV from side/bid/qty.
+    assert isinstance(line["candidate_ev_cc"], int)
+    assert line["binding_cap"] == ""
+    assert line["quote_id"] == "q1"
+
+
+async def test_risk_declined_quote_audit_reports_binding_cap(rig: Rig) -> None:
+    # A too-big quote is risk-declined; the audit line names the binding cap.
+    big = combo(CROSS_EVENT_LEGS, contracts_fp="9999.00")
+    with structlog.testing.capture_logs() as cap:
+        await rig.lifecycle.handle_rfq(big)
+    lines = _audit_lines(cap, "quote")
+    assert len(lines) == 1
+    line = lines[0]
+    assert line["binding_cap"] != ""  # a cap bound this quote
+    assert line["reason"] == line["binding_cap"]
+
+
+async def test_decline_audit_reports_binding_cap(rig: Rig) -> None:
+    # Kill switch between accept and last look declines the confirm; the audit
+    # line's binding cap is the decline reason.
+    await rig.lifecycle.handle_rfq(rfq())
+    await rig.killswitch.halt(ReasonCode.HALT_MANUAL)
+    with structlog.testing.capture_logs() as cap:
+        await rig.lifecycle.on_quote_accepted(accepted_msg("q1", "yes"))
+    lines = _audit_lines(cap, "decline")
+    assert len(lines) == 1
+    assert lines[0]["binding_cap"] == str(ReasonCode.DECLINE_KILL_SWITCH)
+
+
+async def test_risk_audit_fallback_reason_on_unmeasured_book(rig: Rig) -> None:
+    # A NON-EMPTY book with NO book-risk snapshot must fail closed: the audit
+    # reports the fail-closed FALLBACK reason and honestly None tail numbers
+    # (an unmeasured joint tail is never a convenient value — hard rule 6).
+    rig.exposure.add_position(
+        OpenPosition(
+            position_id="p1",
+            combo_ticker="KXMVE-C1",
+            collection="KXMVE-C1",
+            our_side=Side.YES,
+            contracts=CentiContracts(1_000),
+            entry_price_cc=CentiCents(5_000),
+            legs=(LegRef("M1", "E1", "yes"), LegRef("M2", "E2", "yes")),
+        )
+    )
+    fields = rig.lifecycle._risk_audit_fields(  # noqa: SLF001
+        candidate_ev_cc=None, binding_cap="", fallback_reason=""
+    )
+    assert fields["fallback_reason"] == "book_risk_never_measured"
+    assert fields["es_99_cc"] is None
+    assert fields["deterministic_max_loss_cc"] is None
+    assert fields["p_ruin"] is None
+
+
+# --- WEDGE-HARDENED reprice sweep (2026-07-16 — the 18:13Z heartbeat kill) ---
+
+
+async def _open_n_quotes(rig: Rig, n: int) -> None:
+    await rig.lifecycle.handle_rfq(rfq())
+    for i in range(2, n + 1):
+        await rig.lifecycle.handle_rfq(combo(CROSS_EVENT_LEGS, id=f"rfq_{i}"))
+    assert rig.lifecycle.open_quote_count == n
+
+
+async def test_reprice_pool_circuit_breaker_trips_and_defers(rig: Rig) -> None:
+    """Two consecutive pool-deadline results presume the pool FROZEN: the
+    tripped quotes get today's fail-safe deletion, the REST of the book defers
+    to the next tick instead of serially burning one pool deadline per quote
+    (the 62s grind that aged the heartbeat into an emergency kill)."""
+    from combomaker.pricing.quote import NoQuote
+
+    await _open_n_quotes(rig, 4)
+    calls = 0
+
+    async def frozen_pool(rfq_, **_: object) -> NoQuote:
+        nonlocal calls
+        calls += 1
+        return NoQuote(ReasonCode.SKIP_PRICE_DEADLINE, "pool frozen (test)")
+
+    rig.lifecycle._price_async = frozen_pool  # type: ignore[method-assign]
+    await rig.lifecycle.maintenance_tick()
+    assert calls == 2  # tripped after _REPRICE_POOL_TRIP consecutive deadlines
+    assert rig.lifecycle.open_quote_count == 2  # remaining book NOT liquidated
+    assert rig.metrics.counter("reprice.pool_trip") == 1
+    # the two swept quotes keep the pre-fix fail-safe deletion
+    assert len(rig.sender.deleted) == 2
+
+
+async def test_reprice_non_deadline_noquote_does_not_trip(rig: Rig) -> None:
+    """A genuine stale-leg NoQuote resets the breaker — the whole book still
+    sweeps in one tick exactly as before the fix."""
+    from combomaker.pricing.quote import NoQuote
+
+    await _open_n_quotes(rig, 4)
+    calls = 0
+
+    async def stale(rfq_, **_: object) -> NoQuote:
+        nonlocal calls
+        calls += 1
+        return NoQuote(ReasonCode.SKIP_LEG_STALE, "stale (test)")
+
+    rig.lifecycle._price_async = stale  # type: ignore[method-assign]
+    await rig.lifecycle.maintenance_tick()
+    assert calls == 4
+    assert rig.lifecycle.open_quote_count == 0
+    assert rig.metrics.counter("reprice.pool_trip") == 0
+
+
+async def test_reprice_sweep_wall_budget_defers_remainder(rig: Rig) -> None:
+    """Many slow-but-not-timeout awaits cannot eat the tick either: past the
+    wall budget the remainder defers to the next tick (0.5s away)."""
+    await _open_n_quotes(rig, 4)
+    calls = 0
+
+    async def slow_but_fine(rfq_, **_: object):  # noqa: ANN202
+        nonlocal calls
+        calls += 1
+        rig.h.clock.advance(1.5)  # each call chews 1.5s of the 2.5s budget
+        state = next(iter(rig.lifecycle._open.values()))
+        return state.constructed  # unchanged fair — no reprice action
+
+    rig.lifecycle._price_async = slow_but_fine  # type: ignore[method-assign]
+    await rig.lifecycle.maintenance_tick()
+    assert calls == 2  # 0s -> price(1.5s) -> price(3.0s) -> budget break
+    assert rig.lifecycle.open_quote_count == 4  # nothing deleted, just deferred
+    assert rig.metrics.counter("reprice.sweep_budget_deferred") == 1
+
+
+async def test_reprice_sweep_rotates_after_budget_break(rig: Rig) -> None:
+    """A budget/trip deferral RESUMES after the last handled quote next tick
+    (review 2026-07-16): without the rotation marker, the same front quotes —
+    whose unmoved fair neither replaces nor deletes them — re-consumed the
+    budget every tick and back-of-book quotes starved un-repriced for their
+    whole TTL under sustained load."""
+    await _open_n_quotes(rig, 4)
+    priced: list[str] = []
+
+    async def slow_but_fine(rfq_, **_: object):  # noqa: ANN202
+        priced.append(rfq_.rfq_id)
+        rig.h.clock.advance(1.5)
+        state = next(iter(rig.lifecycle._open.values()))
+        return state.constructed  # unchanged fair — no reprice action
+
+    rig.lifecycle._price_async = slow_but_fine  # type: ignore[method-assign]
+    await rig.lifecycle.maintenance_tick()
+    assert len(priced) == 2  # budget break mid-book
+    first_pass = list(priced)
+    await rig.lifecycle.maintenance_tick()
+    # The second tick starts where the first left off — the two quotes the
+    # break skipped are priced BEFORE the front pair comes around again.
+    assert len(priced) >= 4
+    assert set(priced[2:4]).isdisjoint(first_pass)
+    assert set(priced[:4]) == {s.rfq.rfq_id for s in rig.lifecycle._open.values()}
+
+
+async def test_reprice_sweep_trip_marker_names_a_surviving_quote(rig: Rig) -> None:
+    """The circuit-breaker break resumes after the last SURVIVING handled quote
+    (verify follow-up 2026-07-16): the tripped quote itself was fail-safe
+    DELETED, so a marker naming it fails next tick's index lookup and the
+    rotation silently restarts from the front on every trip."""
+    from combomaker.pricing.quote import NoQuote
+
+    await _open_n_quotes(rig, 4)
+    order = [s.rfq.rfq_id for s in rig.lifecycle._open.values()]
+    priced: list[str] = []
+
+    async def pool(rfq_, **_: object):  # noqa: ANN202
+        priced.append(rfq_.rfq_id)
+        if len(priced) in (2, 3):  # q2+q3 hit the frozen pool -> trip
+            return NoQuote(ReasonCode.SKIP_PRICE_DEADLINE, "pool frozen (test)")
+        state = next(iter(rig.lifecycle._open.values()))
+        return state.constructed  # unchanged fair — no reprice action
+
+    rig.lifecycle._price_async = pool  # type: ignore[method-assign]
+    await rig.lifecycle.maintenance_tick()
+    # q1 priced fine; q2+q3 fail-safe deleted; trip breaks with q4 unswept.
+    assert priced == order[:3]
+    assert rig.lifecycle.open_quote_count == 2
+    # The marker names q1 — the last handled quote that still EXISTS.
+    assert rig.lifecycle._reprice_resume_after == next(iter(rig.lifecycle._open))
+    await rig.lifecycle.maintenance_tick()  # pool thawed
+    # Resumes after q1: the starved q4 prices BEFORE q1 comes around again.
+    assert priced[3] == order[3]
+    assert priced[4] == order[0]
+
+
+async def test_reprice_sweep_budget_marker_skips_deleted_quotes(rig: Rig) -> None:
+    """A TTL-deleted quote never becomes the resume marker (verify follow-up
+    2026-07-16): the budget break after a deletion resumes from the last
+    SURVIVING handled quote, not the removed id (which would discard the
+    rotation and re-walk the front)."""
+    await _open_n_quotes(rig, 4)
+    states = list(rig.lifecycle._open.values())
+    order = [s.rfq.rfq_id for s in states]
+    # Age ONLY q2 past its TTL (the sweep ages against tick-start time).
+    states[1].created_mono_ns -= int((rig.lifecycle._config.quote_ttl_s + 1) * 1e9)
+    priced: list[str] = []
+
+    async def slow_but_fine(rfq_, **_: object):  # noqa: ANN202
+        priced.append(rfq_.rfq_id)
+        rig.h.clock.advance(3.0)  # one pricing blows the whole 2.5s budget
+        state = next(iter(rig.lifecycle._open.values()))
+        return state.constructed  # unchanged fair — no reprice action
+
+    rig.lifecycle._price_async = slow_but_fine  # type: ignore[method-assign]
+    await rig.lifecycle.maintenance_tick()
+    # q1 priced (3.0s), q2 TTL-deleted, q3 hits the budget break.
+    assert priced == [order[0]]
+    assert rig.lifecycle.open_quote_count == 3
+    # Marker = q1, the last SURVIVOR — not the deleted q2.
+    assert rig.lifecycle._reprice_resume_after == next(iter(rig.lifecycle._open))
+    await rig.lifecycle.maintenance_tick()
+    # Second tick resumes after q1: the deferred q3 prices first, not the front.
+    assert priced[1] == order[2]
+
+
+async def test_reprice_sweep_beats_heartbeat_per_iteration(rig: Rig) -> None:
+    """The beat callback fires once per swept quote — a loop making progress
+    never reads as a wedge, while a true event-loop wedge still cannot beat."""
+    beats = 0
+
+    def beat() -> None:
+        nonlocal beats
+        beats += 1
+
+    rig.lifecycle._beat_cb = beat
+    await _open_n_quotes(rig, 3)
+    beats = 0
+    await rig.lifecycle.maintenance_tick()
+    assert beats >= 3
+
+
+async def test_beat_failure_never_breaks_the_tick(rig: Rig) -> None:
+    """A heartbeat write failure is logged, never raised: the file going stale
+    IS the fail-closed signal."""
+
+    def broken() -> None:
+        raise OSError("disk full (test)")
+
+    rig.lifecycle._beat_cb = broken
+    await _open_n_quotes(rig, 2)
+    await rig.lifecycle.maintenance_tick()  # must not raise
+    assert rig.lifecycle.open_quote_count == 2

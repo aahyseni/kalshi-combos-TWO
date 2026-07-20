@@ -59,6 +59,14 @@ class _FixedBankroll:
     def exchange_equity_cc_or_none(self) -> int | None:
         return self._current
 
+    def available_cash_cc_or_none(self) -> int | None:
+        # P1-3: the lifecycle builds the ruin equity basis on available cash +
+        # modeled entry cost (cost basis, no double count). This stub does not
+        # split cash vs mark, so it returns the same fixed figure the give-back
+        # accessor does; tests that assert on p_ruin VALUES drive compute_book_risk
+        # directly with an explicit equity, not through this stub.
+        return self._current
+
 
 def _build_lifecycle(
     h: Harness,

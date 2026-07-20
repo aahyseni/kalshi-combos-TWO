@@ -77,6 +77,17 @@ class RfqFilter:
         ):
             reasons.append(ReasonCode.SKIP_SERIES_NOT_ALLOWED)
 
+        # Operator leg blocklist (2026-07-18): refuse NEW exposure on blocked
+        # tickers. Side-aware — only the "no" side (a hedge against the blocked
+        # exposure) passes; "yes" AND unknown/garbage sides are blocked
+        # (fail-closed: an unparseable side must never sneak blocked exposure).
+        if cfg.blocked_leg_yes_substrings and any(
+            leg.side != "no"
+            and any(sub in leg.market_ticker for sub in cfg.blocked_leg_yes_substrings)
+            for leg in rfq.legs
+        ):
+            reasons.append(ReasonCode.SKIP_OPERATOR_LEG_BLOCK)
+
         n_legs = len(rfq.legs)
         if rfq.is_combo and not (cfg.min_legs <= n_legs <= cfg.max_legs):
             reasons.append(ReasonCode.SKIP_TOO_MANY_LEGS)
@@ -148,6 +159,8 @@ class RfqFilter:
             reasons.append(ReasonCode.SKIP_INPLAY_LEG)
         if status.any_unknown:
             reasons.append(ReasonCode.SKIP_START_TIME_UNKNOWN)
+        if status.any_too_far:
+            reasons.append(ReasonCode.SKIP_GAME_TOO_FAR)
         return reasons
 
     def _size_reasons(self, rfq: Rfq) -> list[ReasonCode]:

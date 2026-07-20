@@ -211,7 +211,7 @@ async def test_missing_combo_grid_is_no_quote() -> None:
     del h.metadata._markets["KXMVE-C1"]  # noqa: SLF001
     result = engine.price(combo(CROSS_EVENT_LEGS), time_to_close_s=100_000)
     assert isinstance(result, NoQuote)
-    assert result.reason == ReasonCode.SKIP_CLASSIFIER_UNKNOWN
+    assert result.reason == ReasonCode.SKIP_NO_COMBO_GRID  # not a classifier failure
 
 
 async def test_invalid_leg_book_is_pricing_failure() -> None:
@@ -236,7 +236,7 @@ async def test_no_sizing_mode_is_unknown() -> None:
     rfq = combo(CROSS_EVENT_LEGS, contracts_fp=None)
     result = engine.price(rfq, time_to_close_s=100_000)
     assert isinstance(result, NoQuote)
-    assert result.reason == ReasonCode.SKIP_CLASSIFIER_UNKNOWN
+    assert result.reason == ReasonCode.SKIP_SIZE_UNRESOLVABLE  # not a classifier failure
 
 
 async def test_farmable_impossible_is_farmed_not_declined() -> None:
