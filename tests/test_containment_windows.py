@@ -273,17 +273,21 @@ def test_tb_hrr1_exact_cells_wired_with_measured_ns() -> None:
 
 def test_preexisting_cells_untouched_and_table_size() -> None:
     """Pre-existing cells stay byte-identical (spot checks on the hit⟹hrr /
-    hr⟹hrr exact cells earlier passes singled out) and the table is exactly
-    149 + 84 (M2 zero-gaps wire, 2026-07-12: 37 exact + 47 measured) = 233
-    cells / 40 + 37 = 77 exact."""
+    hr⟹hrr exact cells earlier passes singled out) and the table grew by the
+    OUTS/RBI/SB wire (2026-07-22): 233 + 70 (7 exact hr⟹rbi / rbi⟹hrr cells +
+    63 measured RBI/SB same-player cells) = 303 cells / 77 + 7 = 84 exact."""
     assert SAME_PLAYER_CONDITIONALS[("hit", 2, "hrr", 2)] == (1.0, 212_507, "exact")
     assert SAME_PLAYER_CONDITIONALS[("hit", 3, "hrr", 3)] == (1.0, 48_375, "exact")
     assert SAME_PLAYER_CONDITIONALS[("hr", 1, "hrr", 2)] == (1.0, 101_186, "exact")
     assert SAME_PLAYER_CONDITIONALS[("hr", 1, "hrr", 3)] == (1.0, 101_186, "exact")
     assert SAME_PLAYER_CONDITIONALS[("hr", 2, "hrr", 5)] == (1.0, 6_195, "exact")
-    assert len(SAME_PLAYER_CONDITIONALS) == 233
+    # OUTS/RBI/SB wire spot checks (2026-07-22): the new exact containments.
+    assert SAME_PLAYER_CONDITIONALS[("hr", 1, "rbi", 1)] == (1.0, 100_369, "exact")
+    assert SAME_PLAYER_CONDITIONALS[("rbi", 1, "hrr", 1)] == (1.0, 277_025, "exact")
+    assert SAME_PLAYER_CONDITIONALS[("sb", 1, "hit", 1)] == (0.828043, 51_321, "measured")
+    assert len(SAME_PLAYER_CONDITIONALS) == 303
     n_exact = sum(1 for v in SAME_PLAYER_CONDITIONALS.values() if v[2] == "exact")
-    assert n_exact == 77
+    assert n_exact == 84
 
 
 def test_s41_classifier_verdicts() -> None:

@@ -1329,6 +1329,182 @@ class CorrelationConfig(StrictModel):
             "rfi|spread:r3": 0.079,                  # (M2)
             "rfi|spread:r4": 0.097,                  # (M2)
             "rfi|spread:r5": 0.107,                  # (M2)
+            # ==== NEW PROP FAMILIES OUTS / RBI / SB (wired 2026-07-22; measured
+            # 2026-07-21, Retrosheet 2005-25, 49,490 games; source
+            # docs/calibration/staged_mlb_new_props.md §4; live series verified
+            # docs/reports/2026-07-22-mlb-newprop-series-kalshi-verification.md).
+            # All base keys via EXECUTING legtypes.pair_key (sort traps confirmed:
+            # player_ks|player_outs, player_hr|player_rbi, player_hit|player_sb).
+            # OUTS/RBI are rung-keyed; SB is 1+-only. ====
+            # -- OUTS (KXMLBOUTS). ks×outs ladder NOT flat -> per-rung, rung =
+            # OUTS line (ks never runged); same-PITCHER copula rho routed :same.
+            "player_ks|player_outs:same": 0.56,
+            "player_ks|player_outs:same:r12": 0.61,
+            "player_ks|player_outs:same:r15": 0.53,
+            "player_ks|player_outs:same:r18": 0.44,
+            "player_ks|player_outs:same:r21": 0.36,   # NO interpolation, ever
+            "player_ks|player_outs:opp": 0.045,       # opposing starters (= ks|ks)
+            "player_ks|player_outs": 0.30,            # parse-fail; spans +0.045..+0.61
+            "player_outs|total": -0.50,               # orientation-free; recent-era anchor
+            "moneyline|player_outs:same": 0.43,       # own team wins; negation VERIFIED
+            "moneyline|player_outs:opp": -0.43,
+            "moneyline|player_outs": 0.00,            # fail-closed, sign-spanning band
+            # outs×spread is BOTH-rung-keyed -> the resolver chains
+            # :r{outs}:r{spread}, so single-spread-rung keys are DEAD config. The
+            # :same/:opp ladders (0.38..0.32 / -0.49..-0.55) are spanned by the
+            # un-runged oriented values (bands 0.09/0.11); collapsed 2026-07-22
+            # after the gap-tranche judge caught the dead per-rung keys.
+            "player_outs|spread:same": 0.35,
+            "player_outs|spread:opp": -0.52,
+            "player_outs|spread": 0.00,               # plain fail-closed
+            "player_outs|rfi": -0.24,                 # orientation-free, era-stable
+            # -- RBI (KXMLBRBI). Rung-keyed 1+/2+/3+, rung-monotone like hit/hr.
+            "player_rbi|total:r1": 0.31,
+            "player_rbi|total:r2": 0.38,
+            "player_rbi|total:r3": 0.42,
+            "player_rbi|total": 0.31,                 # un-runged fallback over the ladder
+            "moneyline|player_rbi:same:r1": 0.33,
+            "moneyline|player_rbi:same:r2": 0.36,
+            "moneyline|player_rbi:same:r3": 0.38,
+            "moneyline|player_rbi:opp:r1": -0.33,     # exact negation, verified direct
+            "moneyline|player_rbi:opp:r2": -0.36,
+            "moneyline|player_rbi:opp:r3": -0.38,
+            "moneyline|player_rbi:same": 0.33,        # un-runged oriented fallbacks
+            "moneyline|player_rbi:opp": -0.33,
+            "moneyline|player_rbi": 0.00,             # fail-closed, spans ±0.38
+            "player_hr|player_rbi:same": 0.02,        # TEAMMATE (distinct players)
+            "player_hr|player_rbi:opp": 0.00,         # opponent ≈0 (matches [B]/[D])
+            "player_hr|player_rbi": 0.01,             # unrouted fallback
+            # SAME-PLAYER hr×rbi is CONTAINMENT (conditionals_mlb) — routed there
+            # BEFORE these rho keys, exactly like hit/hr/tb/hrr today.
+            # -- SB (KXMLBSB). 1+-only; ALL WIDEN-ONLY.
+            "player_sb|total": 0.02,                  # ≈0 as predicted (CI spans 0)
+            "moneyline|player_sb:same": 0.15,         # DIVERGED from ≈0 prior (WIDEN-ONLY)
+            "moneyline|player_sb:opp": -0.15,
+            "moneyline|player_sb": 0.00,              # plain fail-closed
+            "player_sb|player_sb:same": 0.10,         # teammate (running-team common factor)
+            "player_sb|player_sb": 0.05,              # unrouted; :opp UNMEASURED
+            "player_sb|player_sb:opp": 0.00,          # opponent split (teammate 0.10 above)
+            # ==== GAP-PAIRS TRANCHE (wired 2026-07-22; measured 2026-07-22,
+            # Retrosheet 2005-25; source docs/calibration/staged_mlb_gap_pairs.md,
+            # report 2026-07-22-mlb-gap-pairs-measured.md). Closes the 16 reachable
+            # flat-gaps so NO OUTS/RBI/SB pair prices the +0.6 default (zero-gaps
+            # mandate). Keys via EXECUTING legtypes.pair_key; :same/:opp both
+            # MEASURED (never negated). ====
+            # -- OUTS × batter: :opp = batter FACES that starter (NEGATIVE, ~2x the
+            # ks siblings — deeper-start channel); :same = teammate ≈0.
+            "player_hit|player_outs:opp": -0.21,
+            "player_hit|player_outs:same": 0.03,
+            "player_hr|player_outs:opp": -0.17,
+            "player_hr|player_outs:same": 0.01,
+            "player_outs|player_tb:opp": -0.23,
+            "player_outs|player_tb:same": 0.02,
+            "player_hrr|player_outs:opp": -0.32,
+            "player_hrr|player_outs:same": 0.02,
+            "player_outs|player_sb:opp": -0.13,
+            "player_outs|player_sb:same": 0.05,
+            # outs×rbi is BOTH-rung-keyed -> _pair_rung_suffix chains :r{outs}:r{rbi},
+            # so a single-rbi-rung key would be DEAD. The :opp ladder (-0.29..-0.34)
+            # is spanned by the un-runged :opp -0.30 (band 0.06) -> wired un-runged.
+            "player_outs|player_rbi:opp": -0.30,
+            "player_outs|player_rbi:same": 0.01,
+            # plain sign-spanning fallbacks (orientation unresolved):
+            "player_hit|player_outs": 0.00,
+            "player_hr|player_outs": 0.00,
+            "player_outs|player_tb": 0.00,
+            "player_hrr|player_outs": 0.00,
+            "player_outs|player_rbi": 0.00,
+            "player_outs|player_sb": 0.00,
+            # -- OUTS × OUTS (opposing starters, like ks|ks +0.04, deeper):
+            "player_outs|player_outs": 0.16,
+            # -- SB × batter distinct-player teammate/opp (like hr|hr), WIDEN-ONLY:
+            "player_hr|player_sb:same": 0.01,
+            "player_hr|player_sb:opp": -0.02,
+            "player_sb|player_tb:same": 0.02,
+            "player_sb|player_tb:opp": -0.02,
+            "player_hrr|player_sb:same": 0.04,
+            "player_hrr|player_sb:opp": -0.03,
+            "player_hr|player_sb": 0.00,
+            "player_sb|player_tb": 0.00,
+            "player_hrr|player_sb": 0.00,
+            # -- SB × KS: :opp = baserunner FACES the starter (small negative):
+            "player_ks|player_sb:opp": -0.04,
+            "player_ks|player_sb:same": 0.03,
+            "player_ks|player_sb": 0.00,
+            # -- RBI × SPREAD, team-signed, CHAINED rungs (rbi rung : spread margin;
+            # pair_key order = rbi first). :same rises with rbi rung; :opp declines
+            # with margin, deepens with rbi rung.
+            "player_rbi|spread:same:r1:r2": 0.33,
+            "player_rbi|spread:same:r1:r3": 0.34,
+            "player_rbi|spread:same:r1:r4": 0.34,
+            "player_rbi|spread:same:r1:r5": 0.34,
+            "player_rbi|spread:same:r2:r2": 0.38,
+            "player_rbi|spread:same:r2:r3": 0.38,
+            "player_rbi|spread:same:r2:r4": 0.39,
+            "player_rbi|spread:same:r2:r5": 0.39,
+            "player_rbi|spread:same:r3:r2": 0.40,
+            "player_rbi|spread:same:r3:r3": 0.41,
+            "player_rbi|spread:same:r3:r4": 0.42,
+            "player_rbi|spread:same:r3:r5": 0.42,
+            "player_rbi|spread:opp:r1:r2": -0.30,
+            "player_rbi|spread:opp:r1:r3": -0.27,
+            "player_rbi|spread:opp:r1:r4": -0.26,
+            "player_rbi|spread:opp:r1:r5": -0.24,
+            "player_rbi|spread:opp:r2:r2": -0.33,
+            "player_rbi|spread:opp:r2:r3": -0.31,
+            "player_rbi|spread:opp:r2:r4": -0.29,
+            "player_rbi|spread:opp:r2:r5": -0.28,
+            "player_rbi|spread:opp:r3:r2": -0.35,
+            "player_rbi|spread:opp:r3:r3": -0.33,
+            "player_rbi|spread:opp:r3:r4": -0.31,
+            "player_rbi|spread:opp:r3:r5": -0.30,
+            "player_rbi|spread:same": 0.35,           # un-runged oriented fallbacks
+            "player_rbi|spread:opp": -0.30,
+            "player_rbi|spread": 0.00,                # plain fail-closed
+            # -- SB × SPREAD, per spread-margin rung (sb 1+-only), asymmetric:
+            "player_sb|spread:same:r2": 0.13,
+            "player_sb|spread:same:r3": 0.11,
+            "player_sb|spread:same:r4": 0.09,
+            "player_sb|spread:same:r5": 0.06,
+            "player_sb|spread:opp:r2": -0.17,
+            "player_sb|spread:opp:r3": -0.18,
+            "player_sb|spread:opp:r4": -0.18,
+            "player_sb|spread:opp:r5": -0.18,
+            "player_sb|spread:same": 0.10,
+            "player_sb|spread:opp": -0.18,
+            "player_sb|spread": 0.00,
+            # -- RBI/SB × RFI (orientation-FREE plain scalar):
+            "player_rbi|rfi": 0.10,
+            "player_sb|rfi": 0.02,
+            # -- RBI × RBI distinct-player. BOTH-rung-keyed -> resolver chains
+            # :r{a}:r{b}; single-rung keys DEAD; ladder (0.06..0.08) spanned by
+            # un-runged :same 0.07 -> wired un-runged.
+            "player_rbi|player_rbi:same": 0.07,
+            "player_rbi|player_rbi:opp": 0.00,
+            "player_rbi|player_rbi": 0.03,
+            # -- LABELED PRIORS -> now MEASURED (gap tranche; each confirms the
+            # tranche-1 guess SIGN and tightens it):
+            "player_hit|player_rbi:same": 0.08,       # was 0.06
+            "player_hit|player_rbi:opp": 0.00,
+            "player_hit|player_rbi": 0.04,            # was 0.03
+            "player_hrr|player_rbi:same": 0.14,       # was 0.10 (< hrr|hrr 0.17 cap)
+            "player_hrr|player_rbi:opp": 0.00,
+            "player_hrr|player_rbi": 0.07,            # was 0.05
+            "player_rbi|player_tb:same": 0.08,        # CONFIRMED
+            "player_rbi|player_tb:opp": 0.00,
+            "player_rbi|player_tb": 0.04,             # CONFIRMED
+            "player_hit|player_sb:same": 0.01,        # was 0.05 (tightened DOWN, ~0)
+            "player_hit|player_sb:opp": -0.02,
+            "player_hit|player_sb": 0.00,             # was 0.03
+            "player_rbi|player_sb:same": 0.05,        # new oriented split
+            "player_rbi|player_sb:opp": -0.03,
+            "player_rbi|player_sb": 0.02,             # was 0.03
+            "player_ks|player_rbi:opp:r1": -0.16,     # FACING; was flat -0.12 -> per-rung
+            "player_ks|player_rbi:opp:r2": -0.16,
+            "player_ks|player_rbi:opp:r3": -0.17,     # bounded by hit|ks -0.126 / hrr|ks -0.19
+            "player_ks|player_rbi:opp": -0.16,        # un-runged FACING (was -0.12)
+            "player_ks|player_rbi:same": 0.01,        # CONFIRMED
+            "player_ks|player_rbi": 0.00,             # CONFIRMED
         },
     }
     # Band overrides: sport-prefixed keys ("nfl:moneyline|total") for
@@ -1724,6 +1900,104 @@ class CorrelationConfig(StrictModel):
         "mlb:rfi|spread:r3": 0.04,
         "mlb:rfi|spread:r4": 0.04,
         "mlb:rfi|spread:r5": 0.04,
+        # ==== NEW PROP FAMILIES OUTS / RBI / SB bands (wired 2026-07-22; 1:1
+        # with the OUTS/RBI/SB rho block above — count-verified, zero orphans;
+        # staged_mlb_new_props.md §4). SB bands are all WIDEN-ONLY (cluster CIs
+        # 3-4x naive); OUTS spread:opp deep rungs carry era-drift bands. ====
+        "mlb:player_ks|player_outs:same": 0.15,      # covers the self-relative ladder ±3
+        "mlb:player_ks|player_outs:same:r12": 0.10,
+        "mlb:player_ks|player_outs:same:r15": 0.06,
+        "mlb:player_ks|player_outs:same:r18": 0.05,
+        "mlb:player_ks|player_outs:same:r21": 0.05,
+        "mlb:player_ks|player_outs:opp": 0.05,
+        "mlb:player_ks|player_outs": 0.35,           # spans +0.045..+0.61 around 0.30
+        "mlb:player_outs|total": 0.12,               # covers pooled -0.536 & recent -0.45
+        "mlb:moneyline|player_outs:same": 0.08,      # covers era +0.450->+0.406
+        "mlb:moneyline|player_outs:opp": 0.08,
+        "mlb:moneyline|player_outs": 0.50,           # sign-spanning ±0.44
+        "mlb:player_outs|spread:same": 0.09,         # spans the :same ladder 0.38..0.32
+        "mlb:player_outs|spread:opp": 0.11,          # spans the :opp ladder -0.49..-0.55
+        "mlb:player_outs|spread": 0.60,              # plain must span ±0.55
+        "mlb:player_outs|rfi": 0.06,
+        "mlb:player_rbi|total:r1": 0.07,             # cluster hw 0.023 + starters-frame gap
+        "mlb:player_rbi|total:r2": 0.07,
+        "mlb:player_rbi|total:r3": 0.09,             # cluster hw 0.063
+        "mlb:player_rbi|total": 0.13,                # plain spans r1..r3 + frame
+        "mlb:moneyline|player_rbi:same:r1": 0.06,
+        "mlb:moneyline|player_rbi:same:r2": 0.06,
+        "mlb:moneyline|player_rbi:same:r3": 0.07,
+        "mlb:moneyline|player_rbi:opp:r1": 0.06,
+        "mlb:moneyline|player_rbi:opp:r2": 0.06,
+        "mlb:moneyline|player_rbi:opp:r3": 0.07,
+        "mlb:moneyline|player_rbi:same": 0.09,
+        "mlb:moneyline|player_rbi:opp": 0.09,
+        "mlb:moneyline|player_rbi": 0.40,            # sign-spanning ±0.38
+        "mlb:player_hr|player_rbi:same": 0.05,
+        "mlb:player_hr|player_rbi:opp": 0.04,
+        "mlb:player_hr|player_rbi": 0.05,
+        "mlb:player_sb|total": 0.06,
+        "mlb:moneyline|player_sb:same": 0.07,        # cluster hw 0.035 + era d 0.021
+        "mlb:moneyline|player_sb:opp": 0.07,
+        "mlb:moneyline|player_sb": 0.25,
+        "mlb:player_sb|player_sb:same": 0.06,
+        "mlb:player_sb|player_sb:opp": 0.06,         # ~0 WIDEN-ONLY (cluster CI99 hw 0.055)
+        "mlb:player_sb|player_sb": 0.11,             # spans teammate 0.10 / opp 0
+        # ==== GAP-PAIRS TRANCHE bands (2026-07-22; 1:1 with the gap-pairs rho
+        # block; on the 0.04 judge floor unless era shift / low-base-rate cluster
+        # CI pushes higher). ====
+        "mlb:player_hit|player_outs:opp": 0.04, "mlb:player_hit|player_outs:same": 0.04,
+        "mlb:player_hr|player_outs:opp": 0.04,  "mlb:player_hr|player_outs:same": 0.04,
+        "mlb:player_outs|player_tb:opp": 0.04,  "mlb:player_outs|player_tb:same": 0.04,
+        "mlb:player_hrr|player_outs:opp": 0.04, "mlb:player_hrr|player_outs:same": 0.04,
+        "mlb:player_outs|player_sb:opp": 0.04,  "mlb:player_outs|player_sb:same": 0.04,
+        "mlb:player_outs|player_rbi:opp": 0.06, "mlb:player_outs|player_rbi:same": 0.04,
+        "mlb:player_hit|player_outs": 0.25, "mlb:player_hr|player_outs": 0.20,
+        "mlb:player_outs|player_tb": 0.28, "mlb:player_hrr|player_outs": 0.35,
+        "mlb:player_outs|player_rbi": 0.36, "mlb:player_outs|player_sb": 0.20,
+        "mlb:player_outs|player_outs": 0.05,    # covers era shift -0.042
+        "mlb:player_hr|player_sb:same": 0.04, "mlb:player_hr|player_sb:opp": 0.05,
+        "mlb:player_sb|player_tb:same": 0.04, "mlb:player_sb|player_tb:opp": 0.04,
+        "mlb:player_hrr|player_sb:same": 0.04, "mlb:player_hrr|player_sb:opp": 0.04,
+        "mlb:player_hr|player_sb": 0.06, "mlb:player_sb|player_tb": 0.06,
+        "mlb:player_hrr|player_sb": 0.07,
+        "mlb:player_ks|player_sb:opp": 0.04, "mlb:player_ks|player_sb:same": 0.04,
+        "mlb:player_ks|player_sb": 0.08,
+        "mlb:player_rbi|spread:same:r1:r2": 0.04, "mlb:player_rbi|spread:same:r1:r3": 0.04,
+        "mlb:player_rbi|spread:same:r1:r4": 0.04, "mlb:player_rbi|spread:same:r1:r5": 0.04,
+        "mlb:player_rbi|spread:same:r2:r2": 0.04, "mlb:player_rbi|spread:same:r2:r3": 0.04,
+        "mlb:player_rbi|spread:same:r2:r4": 0.04, "mlb:player_rbi|spread:same:r2:r5": 0.04,
+        "mlb:player_rbi|spread:same:r3:r2": 0.04, "mlb:player_rbi|spread:same:r3:r3": 0.04,
+        "mlb:player_rbi|spread:same:r3:r4": 0.04, "mlb:player_rbi|spread:same:r3:r5": 0.04,
+        "mlb:player_rbi|spread:opp:r1:r2": 0.04, "mlb:player_rbi|spread:opp:r1:r3": 0.04,
+        "mlb:player_rbi|spread:opp:r1:r4": 0.04, "mlb:player_rbi|spread:opp:r1:r5": 0.04,
+        "mlb:player_rbi|spread:opp:r2:r2": 0.04, "mlb:player_rbi|spread:opp:r2:r3": 0.04,
+        "mlb:player_rbi|spread:opp:r2:r4": 0.04, "mlb:player_rbi|spread:opp:r2:r5": 0.04,
+        "mlb:player_rbi|spread:opp:r3:r2": 0.04, "mlb:player_rbi|spread:opp:r3:r3": 0.04,
+        "mlb:player_rbi|spread:opp:r3:r4": 0.04, "mlb:player_rbi|spread:opp:r3:r5": 0.04,
+        "mlb:player_rbi|spread:same": 0.07, "mlb:player_rbi|spread:opp": 0.07,
+        "mlb:player_rbi|spread": 0.45,
+        "mlb:player_sb|spread:same:r2": 0.04, "mlb:player_sb|spread:same:r3": 0.04,
+        "mlb:player_sb|spread:same:r4": 0.04, "mlb:player_sb|spread:same:r5": 0.04,
+        "mlb:player_sb|spread:opp:r2": 0.04, "mlb:player_sb|spread:opp:r3": 0.04,
+        "mlb:player_sb|spread:opp:r4": 0.04, "mlb:player_sb|spread:opp:r5": 0.04,
+        "mlb:player_sb|spread:same": 0.06, "mlb:player_sb|spread:opp": 0.04,
+        "mlb:player_sb|spread": 0.25,
+        "mlb:player_rbi|rfi": 0.04, "mlb:player_sb|rfi": 0.04,
+        "mlb:player_rbi|player_rbi:same": 0.04, "mlb:player_rbi|player_rbi:opp": 0.04,
+        "mlb:player_rbi|player_rbi": 0.11,
+        "mlb:player_hit|player_rbi:same": 0.04, "mlb:player_hit|player_rbi:opp": 0.04,
+        "mlb:player_hit|player_rbi": 0.08,
+        "mlb:player_hrr|player_rbi:same": 0.04, "mlb:player_hrr|player_rbi:opp": 0.04,
+        "mlb:player_hrr|player_rbi": 0.10,
+        "mlb:player_rbi|player_tb:same": 0.04, "mlb:player_rbi|player_tb:opp": 0.04,
+        "mlb:player_rbi|player_tb": 0.08,
+        "mlb:player_hit|player_sb:same": 0.04, "mlb:player_hit|player_sb:opp": 0.05,
+        "mlb:player_hit|player_sb": 0.06,
+        "mlb:player_rbi|player_sb:same": 0.04, "mlb:player_rbi|player_sb:opp": 0.04,
+        "mlb:player_rbi|player_sb": 0.08,
+        "mlb:player_ks|player_rbi:opp:r1": 0.04, "mlb:player_ks|player_rbi:opp:r2": 0.04,
+        "mlb:player_ks|player_rbi:opp:r3": 0.04, "mlb:player_ks|player_rbi:opp": 0.04,
+        "mlb:player_ks|player_rbi:same": 0.04, "mlb:player_ks|player_rbi": 0.20,
     }
     # Orientation CURVES: a pair whose YES-YES rho is a monotone function of one
     # leg's marginal (not a single scalar or a fav/dog step). Keyed

@@ -476,7 +476,14 @@ _MLB_PLAYER_PROP_TYPES = frozenset({
     LegType.PLAYER_KS,
     LegType.PLAYER_TB,
     LegType.PLAYER_HRR,
+    LegType.PLAYER_OUTS,
+    LegType.PLAYER_RBI,
+    LegType.PLAYER_SB,
 })
+# Starting-pitcher stat families. Two pitcher props on the SAME ticker player
+# segment (ks × outs) are a genuine copula rho (routed ``:same``), NOT the
+# arithmetic containment a same-player BATTER cross-family pair is.
+_MLB_PITCHER_PROP_TYPES = frozenset({LegType.PLAYER_KS, LegType.PLAYER_OUTS})
 
 # --- :rN rung keys (Phase 2 wire-list convention line 2) ------------------------
 # A rung key pins a pair prior to the Kalshi ticker LINE INTEGER of a
@@ -501,6 +508,9 @@ _RUNG_KEYED_PROP_TYPES = frozenset({
     LegType.PLAYER_HR,
     LegType.PLAYER_TB,
     LegType.PLAYER_HRR,
+    LegType.PLAYER_RBI,     # rung-keyed 1+/2+/3+ (rung-monotone like hit/hr)
+    LegType.PLAYER_OUTS,    # rung = OUTS line (ks×outs ladder NOT flat; spread rungs)
+    # PLAYER_SB is 1+-only (no live rungs) -> deliberately NOT rung-keyed.
 })
 _RUNG_KEYED_TYPES = _RUNG_KEYED_PROP_TYPES | {LegType.SPREAD}
 
@@ -614,7 +624,8 @@ def _mlb_player_side(player_seg: str, blob: str) -> str | None:
 
 
 def _mlb_prop_pair_prior(
-    key: str, sport: str, params: SgpParams, ticker_a: str, ticker_b: str
+    key: str, sport: str, params: SgpParams, ticker_a: str, ticker_b: str,
+    *, pitcher_pair: bool = False,
 ) -> _PairPrior | None:
     """MLB prop × prop prior, resolved to ``:same`` / ``:opp`` by whether the
     two players' team prefixes anchor to the same side of the game blob.
@@ -622,10 +633,12 @@ def _mlb_prop_pair_prior(
     facing case (a batter bats against the OPPOSING starter) and carries the
     measured negative; ``:same`` is the teammate case. Guards: both legs must
     carry the identical raw game-code segment (doubleheader-safe), and an
-    IDENTICAL player segment (same player, cross-family) refuses — that pair
-    is containment-shaped (HR⇒HIT/TB/HRR), never a copula rho; the
-    containment phase owns it. Unparseable anything → None (caller falls back
-    to the plain unrouted entry; never invent an orientation)."""
+    IDENTICAL player segment refuses for BATTERS (same player, cross-family is
+    containment-shaped — HR⇒HIT/TB/HRR/RBI — never a copula rho; the containment
+    phase owns it) EXCEPT same-pitcher ks×outs, which IS a genuine copula rho
+    routed ``:same`` when ``pitcher_pair`` is set. Unparseable anything → None
+    (caller falls back to the plain unrouted entry; never invent an
+    orientation)."""
     game_a = _mlb_team_blob(ticker_a)
     game_b = _mlb_team_blob(ticker_b)
     if game_a is None or game_b is None or game_a != game_b:
@@ -636,7 +649,16 @@ def _mlb_prop_pair_prior(
         return None
     seg_a, seg_b = parts_a[2], parts_b[2]
     if seg_a == seg_b:
-        return None  # same player cross-family: containment, not a rho
+        if pitcher_pair:
+            # Same PITCHER, two stat families (ks × outs): a genuine copula rho
+            # (a start can be high-K/low-outs or low-K/high-outs), routed
+            # ``:same``. Rung = the OUTS leg's line (ks is never rung-keyed),
+            # else the un-runged :same aggregate.
+            return _lookup_pair_runged(
+                f"{key}:same", sport, params,
+                _pair_rung_suffix(ticker_a, ticker_b),
+            )
+        return None  # same-player BATTER cross-family: containment, not a rho
     side_a = _mlb_player_side(seg_a, game_a[1])
     side_b = _mlb_player_side(seg_b, game_b[1])
     if side_a is None or side_b is None:
@@ -1135,6 +1157,10 @@ def build_sgp_correlation(
                         prior = _mlb_prop_pair_prior(
                             key, sport, params,
                             legs[i].market_ticker, legs[j].market_ticker,
+                            pitcher_pair=(
+                                types[i] in _MLB_PITCHER_PROP_TYPES
+                                and types[j] in _MLB_PITCHER_PROP_TYPES
+                            ),
                         )
                 elif (
                     pair_types == {LegType.MONEYLINE, LegType.SPREAD}

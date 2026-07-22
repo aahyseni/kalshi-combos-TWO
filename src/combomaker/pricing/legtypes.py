@@ -206,6 +206,17 @@ class LegType(StrEnum):
     # settles on a first-inning window (never a game TOTAL), and the market
     # ticker has NO outcome suffix (KXMLBRFI-<gamecode> is the full ticker).
     RFI = "rfi"
+    # MLB starting-pitcher OUTS recorded N+ (KXMLBOUTS). 4-segment ticker with
+    # the rung as the LAST hyphen segment (the player-id token also ends in
+    # digits — live-verified 2026-07-22, 352 markets / 0 mismatches). ks×outs is
+    # a genuine same-PITCHER copula rho, never a containment.
+    PLAYER_OUTS = "player_outs"
+    # MLB batter RBIs N+ (KXMLBRBI). Rung-keyed 1+/2+/3+; same-player HR⇒RBI and
+    # RBI⇒HRR are EXACT containments (conditionals_mlb).
+    PLAYER_RBI = "player_rbi"
+    # MLB batter stolen bases (KXMLBSB). 1+-only live (no rungs). SB⇒HIT is NOT a
+    # containment (17.2% hitless-SB games) — a measured conditional cell only.
+    PLAYER_SB = "player_sb"
     UNKNOWN = "unknown"
 
 
@@ -243,6 +254,15 @@ _KEYWORDS: tuple[tuple[str, LegType], ...] = (
     ("MLBKS", LegType.PLAYER_KS),
     ("MLBTB", LegType.PLAYER_TB),
     ("MLBRFI", LegType.RFI),
+    # OUTS / RBI / SB — combo-eligible + live-verified 2026-07-22
+    # (docs/reports/2026-07-22-mlb-newprop-series-kalshi-verification.md). Each
+    # is MLB-anchored so the bare-substring traps don't fire (bare "SB" would
+    # hit KXMLSBTTS = MLS soccer BTTS, but "MLBSB" is NOT a substring of it); the
+    # LEADERMLB / MLBHRDERBY / F5* blockers above still precede. No superstring
+    # ordering needed among the three (none contains another).
+    ("MLBOUTS", LegType.PLAYER_OUTS),
+    ("MLBRBI", LegType.PLAYER_RBI),
+    ("MLBSB", LegType.PLAYER_SB),
     ("TOTAL", LegType.TOTAL),
     # TCORNERS must precede CORNERS (it contains it). SOURCE OF TRUTH (RFQ tape
     # 2026-07-07): team corners = KXWCTCORNERS, total corners = KXWCCORNERS.

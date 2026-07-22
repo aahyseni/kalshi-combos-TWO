@@ -177,13 +177,13 @@ def test_advance_corners_curve_knots_verbatim() -> None:
 
 
 def test_table_sizes_and_zero_orphans_both_sports() -> None:
-    """MLB 165 -> 186 (21 new rung keys; rfi|spread value replaced in place),
-    soccer 96 -> 110 (14 new oriented/draw/containment keys). Every table key
-    has a sport-prefixed band and vice versa — a point without a band gets
-    the default width (wrong confidence), a band without a point is dead
-    config."""
+    """MLB 186 -> 247 (new-props) -> 327 (gap-pairs tranche closing the 16 flat-gaps
+    to zero) -> 319 (8 dead outs×spread single-rung keys removed — both-rung-keyed
+    pair chains :r:r), 2026-07-22; soccer 110. Every table key has a sport-prefixed
+    band and vice versa — a point without a band gets the default width (wrong
+    confidence), a band without a point is dead config."""
     cfg = CorrelationConfig()
-    for sport, expected in (("mlb", 186), ("soccer", 110)):
+    for sport, expected in (("mlb", 319), ("soccer", 110)):
         table = cfg.pair_rho_by_sport[sport]
         assert len(table) == expected, sport
         band_keys = {

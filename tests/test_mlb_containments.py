@@ -85,7 +85,7 @@ def test_exact_cells_are_exactly_one() -> None:
 
 
 def test_table_covers_only_cross_family_batter_cells() -> None:
-    fams = {"hit", "hr", "tb", "hrr"}
+    fams = {"hit", "hr", "tb", "hrr", "rbi", "sb"}  # + rbi/sb (2026-07-22 wire)
     for fam_a, _rung_a, fam_b, _rung_b in SAME_PLAYER_CONDITIONALS:
         assert fam_a in fams and fam_b in fams
         assert fam_a != fam_b  # same-family rungs are a ladder, never a cell

@@ -304,6 +304,81 @@ SAME_PLAYER_CONDITIONALS: dict[_Key, _CellValue] = {
     ('tb', 4, 'hr', 3): (0.0018161977936560136, 133796, 'measured'),
     ('tb', 5, 'hit', 4): (0.08519941284862113, 64038, 'measured'),
     ('tb', 5, 'hr', 3): (0.0037946219432212123, 64038, 'measured'),
+    # ---- RBI + SB same-player cells (wired 2026-07-22; measured 2026-07-21,
+    # Retrosheet 2005-25, rbi/sb-reconciled rows; source
+    # docs/calibration/staged_mlb_new_props.md §4). HR⇒RBI and RBI⇒HRR verified
+    # EXACT (0 violations on the full corpus: hr1⇒rbi1 n=101,201, etc.); SB⇒HIT
+    # is NOT a containment (17.2% hitless-SB games) -> measured cell only.
+    ('hr', 1, 'rbi', 1): (1.0, 100369, 'exact'),
+    ('hr', 1, 'rbi', 2): (0.555630, 100369, 'measured'),
+    ('hr', 1, 'rbi', 3): (0.243960, 100369, 'measured'),
+    ('hr', 2, 'rbi', 1): (1.0, 6144, 'exact'),
+    ('hr', 2, 'rbi', 2): (1.0, 6144, 'exact'),
+    ('hr', 2, 'rbi', 3): (0.721029, 6144, 'measured'),
+    ('rbi', 1, 'hr', 1): (0.362310, 277025, 'measured'),
+    ('rbi', 1, 'hr', 2): (0.022179, 277025, 'measured'),
+    ('rbi', 2, 'hr', 1): (0.577470, 96573, 'measured'),
+    ('rbi', 2, 'hr', 2): (0.063620, 96573, 'measured'),
+    ('rbi', 3, 'hr', 1): (0.763089, 32088, 'measured'),
+    ('rbi', 3, 'hr', 2): (0.138058, 32088, 'measured'),
+    ('rbi', 1, 'hit', 1): (0.918621, 277025, 'measured'),
+    ('rbi', 1, 'hit', 2): (0.448959, 277025, 'measured'),
+    ('rbi', 1, 'hit', 3): (0.123350, 277025, 'measured'),
+    ('rbi', 2, 'hit', 1): (0.993601, 96573, 'measured'),
+    ('rbi', 2, 'hit', 2): (0.609539, 96573, 'measured'),
+    ('rbi', 2, 'hit', 3): (0.203670, 96573, 'measured'),
+    ('rbi', 3, 'hit', 1): (0.999844, 32088, 'measured'),
+    ('rbi', 3, 'hit', 2): (0.735103, 32088, 'measured'),
+    ('rbi', 3, 'hit', 3): (0.296933, 32088, 'measured'),
+    ('hit', 1, 'rbi', 1): (0.436912, 582454, 'measured'),
+    ('hit', 1, 'rbi', 2): (0.164743, 582454, 'measured'),
+    ('hit', 1, 'rbi', 3): (0.055082, 582454, 'measured'),
+    ('hit', 2, 'rbi', 1): (0.591289, 210342, 'measured'),
+    ('hit', 2, 'rbi', 2): (0.279854, 210342, 'measured'),
+    ('hit', 2, 'rbi', 3): (0.112141, 210342, 'measured'),
+    ('hit', 3, 'rbi', 1): (0.714262, 47841, 'measured'),
+    ('hit', 3, 'rbi', 2): (0.411133, 47841, 'measured'),
+    ('hit', 3, 'rbi', 3): (0.199160, 47841, 'measured'),
+    ('rbi', 1, 'tb', 2): (0.720545, 277025, 'measured'),
+    ('rbi', 1, 'tb', 3): (0.536461, 277025, 'measured'),
+    ('rbi', 1, 'tb', 4): (0.432499, 277025, 'measured'),
+    ('rbi', 2, 'tb', 2): (0.908391, 96573, 'measured'),
+    ('rbi', 2, 'tb', 3): (0.769884, 96573, 'measured'),
+    ('rbi', 2, 'tb', 4): (0.668665, 96573, 'measured'),
+    ('rbi', 3, 'tb', 2): (0.987004, 32088, 'measured'),
+    ('rbi', 3, 'tb', 3): (0.923772, 32088, 'measured'),
+    ('rbi', 3, 'tb', 4): (0.853933, 32088, 'measured'),
+    ('rbi', 1, 'hrr', 1): (1.0, 277025, 'exact'),
+    ('rbi', 1, 'hrr', 2): (0.932724, 277025, 'measured'),
+    ('rbi', 1, 'hrr', 3): (0.761971, 277025, 'measured'),
+    ('rbi', 1, 'hrr', 4): (0.509127, 277025, 'measured'),
+    ('rbi', 1, 'hrr', 5): (0.308669, 277025, 'measured'),
+    ('rbi', 2, 'hrr', 2): (1.0, 96573, 'exact'),
+    ('rbi', 2, 'hrr', 3): (0.994936, 96573, 'measured'),
+    ('rbi', 2, 'hrr', 4): (0.896358, 96573, 'measured'),
+    ('rbi', 2, 'hrr', 5): (0.652294, 96573, 'measured'),
+    ('rbi', 3, 'hrr', 2): (1.0, 32088, 'exact'),
+    ('rbi', 3, 'hrr', 3): (1.0, 32088, 'exact'),
+    ('rbi', 3, 'hrr', 4): (0.999875, 32088, 'measured'),
+    ('rbi', 3, 'hrr', 5): (0.968057, 32088, 'measured'),
+    ('hrr', 2, 'rbi', 1): (0.596136, 433438, 'measured'),
+    ('hrr', 2, 'rbi', 2): (0.222807, 433438, 'measured'),
+    ('hrr', 2, 'rbi', 3): (0.074031, 433438, 'measured'),
+    ('hrr', 3, 'rbi', 1): (0.771056, 273761, 'measured'),
+    ('hrr', 3, 'rbi', 2): (0.350978, 273761, 'measured'),
+    ('hrr', 3, 'rbi', 3): (0.117212, 273761, 'measured'),
+    ('hrr', 4, 'rbi', 1): (0.871953, 161753, 'measured'),
+    ('hrr', 4, 'rbi', 2): (0.535162, 161753, 'measured'),
+    ('hrr', 4, 'rbi', 3): (0.198352, 161753, 'measured'),
+    ('hrr', 5, 'rbi', 1): (0.939887, 90978, 'measured'),
+    ('hrr', 5, 'rbi', 2): (0.692409, 90978, 'measured'),
+    ('hrr', 5, 'rbi', 3): (0.341434, 90978, 'measured'),
+    ('sb', 1, 'hit', 1): (0.828043, 51321, 'measured'),
+    ('sb', 1, 'hit', 2): (0.417665, 51321, 'measured'),
+    ('sb', 1, 'hit', 3): (0.121744, 51321, 'measured'),
+    ('hit', 1, 'sb', 1): (0.072269, 588028, 'measured'),
+    ('hit', 2, 'sb', 1): (0.100861, 212521, 'measured'),
+    ('hit', 3, 'sb', 1): (0.129147, 48379, 'measured'),
 }
 
 # A measured cell prices only when its conditioning sample is at least this
@@ -321,15 +396,18 @@ MIN_CONDITIONAL_N = 50_000
 SAME_PLAYER_RHO_BAND = 0.12
 
 # The batter-stat leg types the same-player table covers, mapped to the
-# table's family names. PLAYER_KS is deliberately ABSENT: a starter's Ks and
-# a batter's stats are DIFFERENT entities, so their ticker player segments
-# can never match — same-player KS x batter is structurally unreachable and
-# needs no branch anywhere.
+# table's family names. PLAYER_KS and PLAYER_OUTS are deliberately ABSENT: both
+# are starting-PITCHER stats, so their ticker player segments can never match a
+# batter's — same-player (pitcher stat) × batter is structurally unreachable and
+# needs no branch here (ks×outs, two pitcher stats on one pitcher, is a copula
+# rho routed in sgp._mlb_prop_pair_prior, never a same-player conditional).
 BATTER_FAMILIES: dict[LegType, str] = {
     LegType.PLAYER_HIT: "hit",
     LegType.PLAYER_HR: "hr",
     LegType.PLAYER_TB: "tb",
     LegType.PLAYER_HRR: "hrr",
+    LegType.PLAYER_RBI: "rbi",
+    LegType.PLAYER_SB: "sb",
 }
 
 
