@@ -2567,6 +2567,29 @@ class RiskConfig(StrictModel):
     # no-quote on a stale bankroll (never a permanent halt) and the give-back
     # halts skip when peak/current equity is unavailable (no invented peak). ---
     caps_shadow_mode: bool = False
+    # --- Correlation-adaptive cap layer (CLAUDE.md North Star, 2026-07-22). The
+    # deploy + halt caps are DERIVED nightly from measured per-game vol (sigma1)
+    # and cross-game rho (-> G_eff) instead of static fractions (risk/cap_family
+    # + adaptive_caps + derived_cap_engine). Modes (validated at use-site):
+    #   off     — engine not instantiated; the static fracs above enforce (default).
+    #   shadow  — engine derives + LOGS the caps beside the enforced static ones
+    #             (watch it derive against a live slate; zero enforcement change).
+    #   enforce — LimitChecker.set_limits(derived); the brain owns the caps.
+    # Cold-starts at the provisional bootstrap (slate 0.15) until MLB sigma1/rho
+    # are measured on real nights, then breathes (cross-rho ratchet-gated). ---
+    adaptive_caps_mode: str = "off"
+    # Bootstrap slate size the deploy budget spreads across (game = f_slate /
+    # expected_games). Conservative MLB-night estimate until the live slate is
+    # auto-counted (fast-follow). Only read when adaptive_caps_mode != off.
+    adaptive_caps_expected_games: int = 12
+    # The OPERATOR'S DRAWDOWN TOLERANCE — the ONE risk-appetite dial (layer-2 policy
+    # anchor). The KILL fires at this fraction of bankroll; f_slate is SOLVED so the
+    # KILL sits at k_trip (5) sigma of a night's P&L, and daily/drawdown halts follow
+    # from the resulting sigma_day. 0.12 = the conservative anchor; the operator may
+    # raise it (0.30 / 0.45) for proportionally larger deployment (see the sim table
+    # in the cap-refactor spec). Everything else FLOWS from this — it is the only
+    # hand-set risk number, and it is an appetite, not a knob.
+    adaptive_caps_kill_anchor: float = 0.12
     # P0-1 candidate-aware portfolio-risk gate at CONFIRM. ENFORCED by default: a
     # confirm the existing analytic/gross/burst gates already admit runs an
     # ADDITIONAL candidate-aware ~20k-sample portfolio MC (off the loop) and confirms

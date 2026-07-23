@@ -489,6 +489,15 @@ class LimitChecker:
         from the SAME limits the caps use."""
         return self._limits
 
+    def set_limits(self, limits: RiskLimits) -> None:
+        """Atomically swap the enforced ``RiskLimits``. The correlation-adaptive
+        cap engine (`risk/derived_cap_engine.py`) calls this at the nightly
+        refresh so the deploy/halt caps track measured vol + correlation instead
+        of a static config. ``check`` reads ``self._limits`` per call, so the
+        swap takes effect on the next check — a single reference assignment,
+        atomic within the single-threaded event loop. The caller logs the diff."""
+        self._limits = limits
+
     def check(
         self,
         book: ExposureBook,

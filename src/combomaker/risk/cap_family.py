@@ -61,6 +61,8 @@ class CapFractions:
     cross_game_rho: float | None
     within_game_rho: float | None
     sigma_day_over_bank: float
+    kill_sigma_multiple: float      # kill_anchor / sigma_day_over_bank (>= k_trip healthy)
+    kill_prob_60n: float            # projected P(KILL fires over 60 nights) — startup alarm
     measured: bool
     provisional: bool
     ratchet_held: bool              # a solved INCREASE was blocked by the cross-rho gate
@@ -93,6 +95,32 @@ def g_eff_from_cross_rho(n_games: int, cross_rho: float) -> float:
     return min(float(n_games), max(1.0, n_games / denom))
 
 
+def kill_covers_drawdown(
+    kill_anchor: float, sigma_day_over_bank: float, k_dd: float = K_DD
+) -> bool:
+    """VALIDATION GUARD (spec, critical). True iff the KILL sits at least ``k_dd``
+    sigma above break-even — i.e. it covers the drawdown halt. FALSE is the
+    old-model failure mode: a slate set so high (relative to the KILL) that a
+    routine ``k_dd``-sigma down-night exceeds the KILL, so the book halts itself in
+    the first weeks (the measured slate-65%/KILL-12% config sat at ~1.5 sigma)."""
+    return kill_anchor >= k_dd * sigma_day_over_bank
+
+
+def projected_kill_prob(
+    sigma_day_over_bank: float, kill_anchor: float, nights: int = 60
+) -> float:
+    """P(the KILL fires at least once over ``nights``), ~Normal nightly P&L with
+    std ``sigma_day``. The KILL sits at ``kill_anchor/sigma_day`` sigma; a healthy
+    matched book keeps that >= ``k_trip`` (5) so this is ~0. A mismatched pair (old
+    model, KILL at ~1.5 sigma) makes it ~1 — logged at startup as the alarm that a
+    (f_slate, kill_anchor) pair will self-destruct BEFORE capital is deployed."""
+    if sigma_day_over_bank <= 0:
+        return 0.0
+    z = kill_anchor / sigma_day_over_bank
+    p_night = 0.5 * math.erfc(z / math.sqrt(2.0))   # one-sided Normal tail
+    return 1.0 - (1.0 - p_night) ** nights
+
+
 def derive_cap_fractions(
     *,
     expected_games: int,
@@ -120,11 +148,7 @@ def derive_cap_fractions(
     if not (0 < kill_anchor < 1) or k_trip <= 0:
         raise ValueError("kill_anchor in (0,1) and k_trip > 0 required")
 
-    # Halts: the KILL anchor pins sigma_day/bank; daily/dd/trip are FIXED z-anchors.
-    sdob = kill_anchor / k_trip                       # 0.024 @ (0.12, 5)
-    daily = k_daily * sdob                             # 0.072
-    drawdown = k_dd * sdob                             # 0.096
-    hard_trip = kill_anchor                            # 0.12
+    hard_trip = kill_anchor                            # the operator's drawdown tolerance
 
     measured = sigma1 is not None and g_eff is not None
     held = False
@@ -151,7 +175,38 @@ def derive_cap_fractions(
     if provisional:
         f_slate = min(f_slate, f_slate_provisional_cap)
 
-    game = f_slate / expected_games                    # forces spreading across games
+    # Halts track the ACTUAL deployed vol: sigma_day is derived from the FINAL
+    # (post-clamp / post-ratchet) f_slate, so clamping the slate ALSO tightens the
+    # daily/drawdown halts (a matched pair). When measured this equals the solved
+    # z-anchor kill_anchor/k_trip iff f_slate is un-clamped; a clamp shrinks it.
+    # Unmeasured -> the z-anchor is the only value available (no sigma1 to scale by;
+    # treats the provisional slate as if it were the solved one).
+    if measured and sigma1 is not None and g_eff is not None:
+        sdob = sigma1 * f_slate / math.sqrt(g_eff)
+    else:
+        sdob = kill_anchor / k_trip                    # 0.024 @ (0.12, 5)
+    daily = k_daily * sdob
+    drawdown = k_dd * sdob
+
+    # VALIDATION GUARD (spec, critical): the KILL must cover the k_dd-sigma drawdown
+    # halt. This solver keeps f_slate <= solved so it never trips here, but it is a
+    # hard assertion against any future path that sets f_slate above the vol budget
+    # (the old-model failure: big slate + tight KILL that self-destructs).
+    if not kill_covers_drawdown(kill_anchor, sdob, k_dd):
+        raise ValueError(
+            f"kill_anchor {kill_anchor:.4f} < k_dd*sigma_day/bank {k_dd * sdob:.4f}"
+            f" (f_slate {f_slate:.4f} exceeds the vol budget — old-model mismatch)"
+        )
+    kill_sig = kill_anchor / sdob if sdob > 0 else float("inf")
+    kill_prob = projected_kill_prob(sdob, kill_anchor)
+
+    # A per-game cap BELOW the per-combo cap is incoherent — a game could not hold
+    # even one per-combo position, so every RFQ declines on skip_game_loss_cap and
+    # quoting bricks (observed live 2026-07-22: expected_games auto-counted a 3-day
+    # window -> game 0.0043 < per_combo 0.01 -> 100% decline). Floor it: a game
+    # holds AT LEAST one combo. Binds only when f_slate/expected_games < per_combo
+    # (a large/over-counted slate); no effect when the split is already coherent.
+    game = max(f_slate / expected_games, per_combo)    # forces spread, >= one combo
 
     def mc(x: float | None) -> float | None:
         return None if x is None else mc_headroom * x
@@ -169,6 +224,6 @@ def derive_cap_fractions(
         portfolio_cvar_frac=mc(mc_cvar),
         sigma1=sigma1, g_eff=g_eff, expected_games=expected_games,
         cross_game_rho=cross_game_rho, within_game_rho=within_game_rho,
-        sigma_day_over_bank=sdob, measured=measured, provisional=provisional,
-        ratchet_held=held,
+        sigma_day_over_bank=sdob, kill_sigma_multiple=kill_sig, kill_prob_60n=kill_prob,
+        measured=measured, provisional=provisional, ratchet_held=held,
     )

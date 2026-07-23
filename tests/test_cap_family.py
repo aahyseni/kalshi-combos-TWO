@@ -176,3 +176,70 @@ def test_replay_correlated_night_ratchets_down() -> None:
     # the lumpy night deploys strictly less, before any fills
     assert lumpy.slate_loss_frac < calm.slate_loss_frac
     assert lumpy.game_loss_frac < calm.game_loss_frac
+
+
+# --- consolidated-spec reconciliation (2026-07-22) --------------------------------
+
+from combomaker.risk.cap_family import (  # noqa: E402
+    kill_covers_drawdown,
+    projected_kill_prob,
+)
+
+
+def test_validation_guard_rejects_old_model_config() -> None:
+    # slate 0.65 with realistic MLB vol -> sigma_day/bank far above kill/k_dd:
+    # the KILL (0.12) does NOT cover the 4-sigma drawdown -> guard is False.
+    sigma1, g_eff = 0.30, 12.0
+    sdob_old = sigma1 * 0.65 / math.sqrt(g_eff)
+    assert not kill_covers_drawdown(0.12, sdob_old, K_DD)
+    # a matched solved pair always passes (KILL at 5 sigma, drawdown at 4)
+    sdob_solved = 0.12 / K_TRIP
+    assert kill_covers_drawdown(0.12, sdob_solved, K_DD)
+
+
+def test_projected_kill_prob_healthy_vs_mismatched() -> None:
+    # solved matched pair: KILL at k_trip=5 sigma -> ~0 over 60 nights
+    assert projected_kill_prob(0.12 / K_TRIP, 0.12) < 1e-3
+    # old-model mismatch: KILL at ~1.5 sigma -> nearly certain over 60 nights
+    assert projected_kill_prob(0.12 / 1.5, 0.12) > 0.9
+
+
+def test_halts_track_deployed_vol_when_clamped() -> None:
+    # measured but clamped BELOW the solved slate -> sigma_day (hence daily/dd)
+    # shrinks with the clamp; NOT the fixed z-anchor.
+    clamped = derive_cap_fractions(
+        expected_games=12, sigma1=0.20, g_eff=12.0, provisional=True)  # clamps to 0.15
+    solved = derive_cap_fractions(
+        expected_games=12, sigma1=0.20, g_eff=12.0, provisional=False)
+    assert clamped.slate_loss_frac == 0.15 < solved.slate_loss_frac
+    assert clamped.daily_loss_frac < solved.daily_loss_frac        # halt tightened
+    # the un-clamped solve still lands the halts on the z-anchors
+    assert abs(solved.daily_loss_frac - K_DAILY * KILL_ANCHOR / K_TRIP) < 1e-12
+    assert abs(solved.hard_trip_frac - KILL_ANCHOR) < 1e-15
+
+
+def test_kill_anchor_is_an_operator_dial() -> None:
+    # raising the drawdown tolerance proportionally raises the solved slate
+    lo = derive_cap_fractions(expected_games=12, sigma1=0.30, g_eff=12.0,
+                              provisional=False, kill_anchor=0.12)
+    hi = derive_cap_fractions(expected_games=12, sigma1=0.30, g_eff=12.0,
+                              provisional=False, kill_anchor=0.30)
+    assert hi.slate_loss_frac > lo.slate_loss_frac
+    assert abs(hi.slate_loss_frac / lo.slate_loss_frac - 0.30 / 0.12) < 1e-9
+    assert hi.hard_trip_frac == 0.30                               # KILL == the dial
+
+
+def test_kill_sigma_multiple_is_k_trip_when_solved() -> None:
+    c = derive_cap_fractions(expected_games=12, sigma1=0.25, g_eff=9.0, provisional=False)
+    assert abs(c.kill_sigma_multiple - K_TRIP) < 1e-9              # KILL at 5 sigma
+    assert c.kill_prob_60n < 1e-3
+
+
+def test_game_cap_never_below_per_combo_coherence() -> None:
+    # over-counted slate (e.g. multi-day market window) must NOT push the per-game
+    # cap below the per-combo cap — a game must hold >= one combo or quoting bricks.
+    c = derive_cap_fractions(expected_games=35, provisional=True)   # slate 0.15 / 35
+    assert c.game_loss_frac == c.per_combo_loss_frac == 0.01
+    # a coherent split is unaffected (slate/N stays above per_combo)
+    c2 = derive_cap_fractions(expected_games=10, provisional=True)
+    assert abs(c2.game_loss_frac - 0.015) < 1e-12 > 0

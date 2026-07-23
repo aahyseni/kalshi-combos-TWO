@@ -65,6 +65,7 @@ from combomaker.rfq.models import Rfq, RfqLeg
 from combomaker.rfq.schedule import ScheduleCache
 from combomaker.risk.balance import BalanceTracker, StaleBalanceError
 from combomaker.risk.breakers import BreakerInputs, CircuitBreakers, RateLimitWindow
+from combomaker.risk.derived_cap_engine import DerivedCapEngine
 from combomaker.risk.exposure import ExposureBook, LegRef, OpenPosition
 from combomaker.risk.heartbeat import Heartbeat, ReconcileMarker
 from combomaker.risk.inplay import InPlayDetector
@@ -92,6 +93,13 @@ JsonDict = dict[str, Any]
 # caps fail closed (SKIP_BANKROLL_UNAVAILABLE). Poll interval is well inside it.
 BALANCE_STALE_AFTER_S = 30.0
 BALANCE_POLL_INTERVAL_S = 10.0
+# Correlation-adaptive cap refresh cadence (North Star). The derived deploy/halt
+# caps only change when the measured vol/rho or the projected-book MC change, so a
+# slow loop is enough — it re-derives at startup (first tick) then every interval.
+# Nightly slate-boundary detection is a fast-follow; a 30-min tick is safe because
+# the bootstrap caps are constant within a night and the measured regime updates as
+# the P&L sensor accumulates whole nights.
+ADAPTIVE_CAPS_REFRESH_S = 1800.0
 # Settlement poll cadence: combos settle at game end, so a slow poll is fine — the
 # handler is idempotent per position, so a re-poll never double-books. Kept modest
 # so realized P&L lands promptly for the enforced daily-loss cap.
@@ -909,7 +917,43 @@ class QuoteApp:
             # RiskLimits now carries the R2 %-of-bankroll cap layer (Phase 2,
             # SHADOW by default); to_risk_limits() parses the decimal-string
             # percentages into exact Fractions (no binary-float money).
-            limits = LimitChecker(risk_cfg.to_risk_limits())
+            base_limits = risk_cfg.to_risk_limits()
+            limits = LimitChecker(base_limits)
+            # Correlation-adaptive cap engine (North Star). off -> None (the static
+            # fracs above enforce, byte-identical to prior behaviour); shadow/enforce
+            # -> the _adaptive_caps_loop derives the deploy+halt caps nightly and, in
+            # enforce, swaps them onto `limits` via set_limits. Invalid mode fails
+            # CLOSED at startup rather than silently enforcing an unintended layer.
+            if risk_cfg.adaptive_caps_mode not in ("off", "shadow", "enforce"):
+                raise ValueError(
+                    "risk.adaptive_caps_mode must be off/shadow/enforce, got "
+                    f"{risk_cfg.adaptive_caps_mode!r}"
+                )
+            cap_engine = (
+                DerivedCapEngine(
+                    base_limits, kill_anchor=risk_cfg.adaptive_caps_kill_anchor
+                )
+                if risk_cfg.adaptive_caps_mode in ("shadow", "enforce")
+                else None
+            )
+            # GAME series to count tonight's slate from (the per-game cap divisor):
+            # the "<prefix>GAME" series of the allowlist (KXMLB -> KXMLBGAME).
+            # Distinct game_keys across their OPEN markets = the live slate size —
+            # the fully-adaptive source for expected_games (config value is only a
+            # bootstrap fallback if the count is unavailable). No hand-set slate size.
+            game_series = tuple(p + "GAME" for p in (allowed or ()))
+            # Derive the caps ONCE now — before the RFQ workers can quote — so the
+            # FIRST fill is bound by the DERIVED caps, never the looser static config
+            # caps that sit underneath only as a fallback. The _adaptive_caps_loop
+            # then re-derives nightly. shadow just logs; enforce swaps immediately.
+            if cap_engine is not None:
+                _eg = await self._count_slate_games(rest, game_series)
+                self._refresh_adaptive_caps_once(
+                    limits,
+                    cap_engine,
+                    risk_cfg.adaptive_caps_mode,
+                    _eg or risk_cfg.adaptive_caps_expected_games,
+                )
             # Live bankroll denominator for the %-caps (fail-closed on stale) +
             # the starvation watchdog. The tracker is polled in _balance_loop.
             balance_tracker = BalanceTracker(
@@ -1459,6 +1503,17 @@ class QuoteApp:
                 ),
                 asyncio.create_task(
                     self._balance_loop(rest, balance_tracker), name="balance-poll"
+                ),
+                asyncio.create_task(
+                    self._adaptive_caps_loop(
+                        rest,
+                        limits,
+                        cap_engine,
+                        risk_cfg.adaptive_caps_mode,
+                        risk_cfg.adaptive_caps_expected_games,
+                        game_series,
+                    ),
+                    name="adaptive-caps",
                 ),
                 asyncio.create_task(
                     self._settlement_loop(settlement_poller), name="settlement-poll"
@@ -2228,6 +2283,130 @@ class QuoteApp:
             except Exception as exc:
                 log.warning("balance_poll_failed", error=repr(exc))
             await asyncio.sleep(BALANCE_POLL_INTERVAL_S)
+
+    def _refresh_adaptive_caps_once(
+        self,
+        limits: LimitChecker,
+        cap_engine: DerivedCapEngine,
+        mode: str,
+        expected_games: int,
+    ) -> None:
+        """One correlation-adaptive cap derivation → log → (enforce) swap.
+
+        Derives the deploy + halt caps from measured per-game vol / cross-game rho
+        and, in ``enforce``, swaps them onto the LimitChecker (``set_limits``); in
+        ``shadow`` it only LOGS the derived caps beside the enforced ones so the
+        operator can watch it derive against a live slate with zero enforcement
+        change. FAIL-SAFE: any error keeps the current limits (the adaptation is
+        repaired, never silently widened on a bug).
+
+        Bootstrap regime: no per-game P&L history is wired yet (the DB
+        reconstruction that feeds the sensor is the fast-follow) so history is
+        empty ⇒ the conservative provisional caps (slate 0.15), and the book caps
+        sit at their bootstrap floor until the projected-book MC is hooked in (also
+        fast-follow). Both fast-follows only ever let the caps BREATHE WIDER with
+        evidence; their absence just holds the safe bootstrap."""
+        try:
+            new_limits, caps, est = cap_engine.refresh(
+                expected_games=expected_games,
+                pnl_history=[],
+            )
+            cur = limits.limits
+            # Startup alarm (spec): a mismatched (f_slate, kill_anchor) pair is
+            # visible BEFORE capital deploys. Healthy = kill_sigma_multiple >= k_trip
+            # (5) and kill_prob_60n ~ 0; a self-destructing config lights this up.
+            if caps.kill_prob_60n > 0.10 or caps.kill_sigma_multiple < 4.0:
+                log.warning(
+                    "adaptive_caps_kill_mismatch",
+                    kill_sigma_multiple=caps.kill_sigma_multiple,
+                    kill_prob_60n=caps.kill_prob_60n,
+                    detail="KILL sits too few sigma above the daily swing — the "
+                    "(f_slate, kill_anchor) pair will self-destruct; check config",
+                )
+            log.info(
+                "adaptive_caps_refresh",
+                mode=mode,
+                provisional=caps.provisional,
+                measured=caps.measured,
+                stable=est.stable,
+                g_eff=est.g_eff,
+                kill_sigma_multiple=caps.kill_sigma_multiple,
+                kill_prob_60n=caps.kill_prob_60n,
+                ratchet_held=caps.ratchet_held,
+                slate_frac=str(new_limits.slate_loss_frac),
+                game_frac=str(new_limits.game_loss_frac),
+                per_combo_frac=str(new_limits.per_combo_loss_frac),
+                daily_frac=str(new_limits.daily_loss_frac),
+                drawdown_frac=str(new_limits.drawdown_frac),
+                hard_trip_frac=str(new_limits.hard_trip_frac),
+                directional_frac=str(new_limits.directional_frac),
+                det_max_frac=str(new_limits.portfolio_det_max_frac),
+                cvar_frac=str(new_limits.portfolio_cvar_frac),
+                enforced_slate_before=str(cur.slate_loss_frac),
+                expected_games=expected_games,
+            )
+            if mode == "enforce":
+                limits.set_limits(new_limits)
+        except Exception:
+            log.exception("adaptive_caps_refresh_failed")  # keep current limits
+
+    async def _count_slate_games(
+        self, rest: KalshiRestClient, game_series: tuple[str, ...]
+    ) -> int | None:
+        """Distinct games in tonight's live slate = distinct ``game_key``s across
+        the OPEN markets of the allowed GAME series — the fully-adaptive source for
+        expected_games (the per-game cap divisor ``game = slate / expected_games``).
+        Returns None on any error / empty result so the caller falls back to the
+        config bootstrap estimate; NEVER blocks or crashes the refresh (a slow-loop
+        read must never reach the pricing path — fix-isolation rule)."""
+        games: set[str] = set()
+        try:
+            for series in game_series:
+                cursor = ""
+                for _ in range(20):
+                    params: dict[str, str | int] = {
+                        "series_ticker": series,
+                        "status": "open",
+                        "limit": 1000,
+                    }
+                    if cursor:
+                        params["cursor"] = cursor
+                    payload = await rest.get_markets(**params)
+                    for m in payload.get("markets") or []:
+                        ev = m.get("event_ticker")
+                        if ev:
+                            games.add(game_key(ev))
+                    cursor = str(payload.get("cursor") or "")
+                    if not cursor:
+                        break
+        except Exception:
+            log.warning("adaptive_caps_slate_count_failed", exc_info=True)
+            return None
+        return len(games) or None
+
+    async def _adaptive_caps_loop(
+        self,
+        rest: KalshiRestClient,
+        limits: LimitChecker,
+        cap_engine: DerivedCapEngine | None,
+        mode: str,
+        expected_games_fallback: int,
+        game_series: tuple[str, ...],
+    ) -> None:
+        """PERIODIC re-derivation of the correlation-adaptive caps (North Star).
+        The FIRST derivation runs at startup (in run(), before the RFQ workers can
+        quote) so the DERIVED caps — not the looser static config caps that sit
+        underneath as a fallback — bind the very first fill. This loop re-derives
+        nightly as the P&L sensor accumulates whole nights AND re-counts the live
+        slate (expected_games); the caps change slowly, so a coarse tick suffices."""
+        if cap_engine is None:
+            return  # mode=off — the static config fracs enforce, unchanged
+        while True:
+            await asyncio.sleep(ADAPTIVE_CAPS_REFRESH_S)
+            eg = await self._count_slate_games(rest, game_series)
+            self._refresh_adaptive_caps_once(
+                limits, cap_engine, mode, eg or expected_games_fallback
+            )
 
     async def _settlement_loop(self, poller: SettlementPoller) -> None:
         """Poll GET /portfolio/settlements and book+reconcile each settled

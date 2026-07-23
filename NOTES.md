@@ -626,3 +626,24 @@ conflicts surfaced for operator resolution first (spec Step 0).**
   vol-budget derivation, the two estimators, the ratchet, the 1.3×MC semantic, the
   provisional clamp. `sigma1`/`G_eff`/within-rho/cross-rho ⇒ **UNVERIFIED** rows in
   the assumption audit when built.
+
+### Cap layer WIRED + made fully adaptive (2026-07-22 PM) — assumption audit
+
+| # | Assumption | Where | Source |
+|---|-----------|-------|--------|
+| CA1 | Under `adaptive_caps_mode: enforce`, ALL nine cap axes are OVERRIDDEN by `derived_cap_engine` (measured + policy anchors only); no static config fraction governs (config = off/fail-safe fallback). Verified base-independent. | `risk/derived_cap_engine.refresh`, `ops/quote_app._refresh_adaptive_caps_once` | `tests/test_derived_cap_engine.py::test_no_static_config_number_governs_base_independent` |
+| CA2 | `daily/dd/hard_trip` = z-anchors (3/4/5) × KILL(12%)/5σ = 0.072/0.096/0.12; the enforced daily 0.072 SUPERSEDES the config 0.06 (operator: adaptive beats manual). | `cap_family` | operator directive 2026-07-22 ("no manual numbers, all adaptive") + spec |
+| CA3 | Book-cap bootstrap floors are the DERIVED budget: directional/det_max = slate, cvar = drawdown; then `max(1.3×MC, floor)`. No hand-set floor. | `derived_cap_engine.refresh` `book()` | design; `test_book_floors_are_the_derived_budget_when_no_mc` |
+| CA4 | `expected_games` (per-game cap divisor) is AUTO-COUNTED = distinct `game_key`s across OPEN `<prefix>GAME` markets (`series_ticker`+`status=open`+`cursor`/`limit` on GET /markets); config value is fallback only. | `ops/quote_app._count_slate_games` | doc:GET /markets params (docs.kalshi.com, WebFetch-verified 2026-07-22: series_ticker/status/cursor/limit accepted, market.event_ticker present); markets api down/empty ⇒ None ⇒ config fallback (fail-safe, never blocks refresh) |
+
+### Consolidated-spec reconciliation (2026-07-22, supersedes earlier caps prompt)
+
+Built cap layer reconciled against the operator's consolidated spec. Full report:
+`docs/reports/2026-07-22-cap-family-spec-reconciliation.md`. Gaps closed:
+
+| # | Assumption | Where | Source |
+|---|-----------|-------|--------|
+| CA5 | `daily`/`drawdown` = `k·sigma_day/bank`, `sigma_day = σ₁·f_slate/√G_eff` from the FINAL (post-clamp/ratchet) f_slate — halts track ACTUAL deployed vol (clamp tightens halts). = z-anchor iff f_slate un-clamped or unmeasured. | `cap_family.derive_cap_fractions` | spec formula block; `test_halts_track_deployed_vol_when_clamped`. **Behavior change: measured+clamped regime softer-halts tighten; does NOT affect the unmeasured bootstrap (still 0.072/0.096).** |
+| CA6 | VALIDATION GUARD: reject any pair with `kill_anchor < k_dd·sigma_day/bank` (old-model self-destruct). Startup alarm `kill_prob_60n` = P(KILL/60 nights) + `kill_sigma_multiple`; WARN if <4σ or P>0.10. | `cap_family.kill_covers_drawdown` / `projected_kill_prob`, `ops/quote_app` log | spec ("critical"); verified formula reproduces spec sim table at kill 30% (67/53/32) + old model = 2.1σ/P0.63 |
+| CA7 | `kill_anchor` is the OPERATOR INPUT (drawdown tolerance, `RiskConfig.adaptive_caps_kill_anchor` default 0.12); f_slate solved from it; the only hand-set risk number (a layer-2 appetite). | `config.py` → `DerivedCapEngine` → `compute_nightly_caps` → `derive_cap_fractions` | spec ("kill_anchor is an operator input, NOT hardcoded") |
+| CA8 | ρ_wg (within-game rho) is UNMEASURED — `within_game_rho` is provenance pass-through, not computed; σ₁ (measured per-game P&L std) already carries its effect. A distinct ρ_wg read needs per-COMBO P&L within a game (richer than per-game `GamePnl`). **UNVERIFIED-until-per-combo-reconstruction.** No behavior depends on it. | `pnl_measurement.estimate_vol_corr` | spec §"three correlations" (ρ_wg → σ₁); flagged open per Step 0 |

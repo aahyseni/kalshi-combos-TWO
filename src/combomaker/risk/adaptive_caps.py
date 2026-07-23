@@ -11,7 +11,11 @@ a pure, testable function of (history, bankroll, tonight's slate, projected MC).
 """
 from __future__ import annotations
 
-from combomaker.risk.cap_family import CapFractions, derive_cap_fractions
+from combomaker.risk.cap_family import (
+    KILL_ANCHOR,
+    CapFractions,
+    derive_cap_fractions,
+)
 from combomaker.risk.pnl_measurement import (
     NightPnl,
     VolCorrEstimate,
@@ -28,6 +32,7 @@ def compute_nightly_caps(
     mc_det_max: float | None = None,
     mc_cvar: float | None = None,
     force_provisional: bool = False,
+    kill_anchor: float = KILL_ANCHOR,
 ) -> tuple[CapFractions, VolCorrEstimate]:
     """Tonight's derived caps + the measurement behind them.
 
@@ -49,5 +54,6 @@ def compute_nightly_caps(
         mc_directional=mc_directional,
         mc_det_max=mc_det_max,
         mc_cvar=mc_cvar,
+        kill_anchor=kill_anchor,
     )
     return caps, est
