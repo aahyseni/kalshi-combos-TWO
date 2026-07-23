@@ -558,3 +558,71 @@ position in dollars"; query params `ticker`/`count_filter`/`limit≤1000`/`curso
 | AS2 | A withdrawal debits the balance at the `applied` transition (not at request/pending) — the transfer watch keys its anchor shift on that status | `ops/quote_app.py new_external_transfer_deltas` | doc:get-withdrawals.md ("applied: funds have been deducted from balance"); the pending-state debit question is doc-silent — if Kalshi ever debits at request time, the P&L-space K-ledger still self-corrects at the applied transition; residual = a transient give-back reading during pending, bounded by the 60s watch cadence once applied |
 | AS3 | `market_exposure_dollars` is the premium at risk of the remaining open position (the adopted-reserve max-loss basis, ceil'd fail-safe LARGER) | `ops/quote_app.py _exchange_exposure_cc_by_ticker` | doc:get-positions.md ("Cost of the aggregate market position") |
 | AS4 | Scalar/DNP-settled legs never produce a receivable (resolver caches binary facts only) — the give-back cascade shield does NOT cover rain-shortened/void settlements; their trough can still trip the halts (fail-closed, no phony scalar prediction) | `marketdata/settled.py` + `rfq/lifecycle.py _refresh_settlement_receivables` | by construction; FLAGGED for the MLB gating decision (rain-shortened games are routine there) |
+
+## Cap refactor — reconciliation (2026-07-22, Step 0 before any code)
+
+Reconciling the correlation-adaptive risk-cap spec (operator 2026-07-22) against the
+CURRENT `risk/limits.py` + `RiskConfig`/`RiskLimits`. **No cap code written yet —
+conflicts surfaced for operator resolution first (spec Step 0).**
+
+### (a) Where caps are hardcoded fractions today
+- `RiskLimits` (`risk/limits.py:150-214`): `per_combo_loss_frac`, `game_loss_frac`,
+  `slate_loss_frac`, `directional_frac`, `portfolio_det_max_frac` (0.15),
+  `portfolio_cvar_frac` (0.15), `daily_loss_frac`, `drawdown_frac`, `hard_trip_frac`
+  (0.12) — static `Fraction`s; the ARMED yaml overrides to WC values (game 0.50 /
+  slate 0.65 / per_combo 0.05 / directional 0.40 / det_max 0.36 / cvar 0.35 /
+  drawdown 0.10). Hand-tuned per campaign.
+- Absolute backstops (`RiskConfig`, `config.py:2515-2545`): `max_daily_loss_dollars`
+  $500, `max_contracts_per_quote`, `max_notional_per_quote_dollars` $500,
+  `max_gross_notional_dollars`, `max_open_quotes`, `max_market/event_delta_contracts`.
+
+### (b) What the current code ALREADY has (do NOT rebuild — the refactor sits on top)
+- **Frac-of-bankroll caps, recomputed per check, NO caching** — `threshold_cc(frac,
+  bankroll_cc)` (`limits.py:74`) at every check site; updating a `RiskLimits` frac
+  takes effect on the next check. "Caps as a fraction of live bankroll" is DONE; the
+  refactor only changes HOW the fracs are produced.
+- **Auto-scaling delta caps** (`scaled_delta_cap_contracts`, `limits.py:84-110`) —
+  the frac-of-bankroll precedent, already dynamic.
+- **Give-back HALTS are already frac-based** (`limits.py:946-974`): `give_back =
+  max(0, peak−current−receivables)`; `HALT_DRAWDOWN` @ `drawdown_frac`,
+  `HALT_HARD_TRIP` @ `hard_trip_frac` via `threshold_cc`, + the receivable shield.
+- **Portfolio MC** (`sim/book_risk.py`): `deterministic_max_loss_cc`,
+  `governing_model_es_99_cc` (ES99/CVaR), `p_ruin` — this IS
+  `portfolio_MC(projected_book)`; det_max/cvar checks already read it
+  (`limits.py:991-1052`).
+- **`game_key` grouping, per-game exposure, mutex-aware det-max, last-look waiver,
+  and `caps_shadow_mode`** (log-only, `config.py:2569`) — the safe-rollout switch
+  already exists. Bankroll = `min(SOD equity, cash + 0.5·portfolio_value)`, ~10s
+  refresh, stale ⇒ fail-closed.
+
+### (c) CONFLICTS / decisions flagged for the operator (resolve before I build)
+- **C1 — "halts are fixed-dollar" is inaccurate.** They are WC-tuned FRACS (dd 0.10 /
+  trip 0.12) + a SEPARATE absolute `max_daily_loss_dollars` $500 (`limits.py:698`).
+  Fix = re-derive the frac VALUES (z-anchored 0.072/0.096/0.12), not fixed→frac.
+  **DECIDE:** keep or retire the $500 absolute daily backstop? (derived daily 7.2% =
+  ~$172 < $500 now, so $500 non-binding until bank > ~$2.4k.)
+- **C2 — daily/dd/trip DO NOT breathe; only deploy caps do.** The f_slate solve pins
+  `sigma_day = (kill_anchor/k_trip)·bank = 0.024·bank` independent of σ1/G_eff, so
+  daily/dd/trip = 0.072/0.096/0.12 are FIXED z-anchors (backstop @ 12%=5σ). Only
+  slate/game/per_combo breathe. Matches "hold KILL fixed at 0.12" — CONFIRM the halts
+  are intended fixed.
+- **C3 — `directional/det_max/cvar = 1.3×MC` needs an absolute ceiling.** Today fixed
+  fracs checked against the MC. Making CAP = 1.3×MC(projected) is adaptive HEADROOM
+  with NO absolute ceiling — could walk up as the book grows (only ruin floor 0.30 +
+  loss caps bound it). **RECOMMEND** `cap = min(1.3×MC, absolute_frac)`; DECIDE the
+  absolute frac (e.g. ≤0.30) or confirm ruin+loss caps suffice.
+- **C4 — σ1 / within-rho / cross-rho / G_eff are UNMEASURED; the per-game P&L index
+  does not exist.** Must build fills→positions→legs→`game_key`→rolling vol/corr. MLB
+  has ZERO P&L → the measured regime is **UNVERIFIED-until-measured**; the provisional
+  `f_slate=0.15` clamp holds until a stable multi-week MLB read.
+- **C5 — the pre-fill ratchet needs a cross-rho SIGNAL on tonight's projected book.**
+  Fast-tighten reacts WITHIN the slate to rising cross-rho, but pre-fill there is no
+  realized P&L to measure. **DECIDE the pre-fill cross-rho source:** (i) model-implied
+  cross-game rho on tonight's games (copula/structural overlap), or (ii) trailing
+  measured cross-rho (stale, night-level). Lean (i) for the pre-fill ratchet, (ii) for
+  the nightly f_slate walk-up.
+- **C6 — scope:** enforcement + halt mechanics + last-look veto + ruin_floor +
+  max_open_quotes/contracts UNCHANGED (read derived thresholds). Refactor ADDS: the
+  vol-budget derivation, the two estimators, the ratchet, the 1.3×MC semantic, the
+  provisional clamp. `sigma1`/`G_eff`/within-rho/cross-rho ⇒ **UNVERIFIED** rows in
+  the assumption audit when built.

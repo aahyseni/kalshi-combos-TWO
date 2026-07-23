@@ -3,6 +3,35 @@
 Working agreement and decision log for this repo. Keep this current: architecture
 decisions, current phase, open questions.
 
+## ⭐ NORTH STAR — fully autonomous & self-adapting (operator directive 2026-07-22)
+
+**The bot is AUTONOMOUS and AUTOMATIC. Nothing is hand-set except the CORRELATION
+model.** Every size, cap, halt, and exposure limit FLOWS — the bot continuously
+reads its own risk, positions, book, and outcomes and adapts: to gains, losses,
+settlements, the live book, the MC P(book), and the risk of ruin. **A number a
+human has to move by hand is a bug in the adaptation, not a knob to tune.** When
+something looks wrong, repair the *mechanism* that should have adapted — never
+patch the number (this is the enforcement teeth of "no manual risk intervention").
+
+Three layers; only the first two carry fixed values:
+
+1. **MEASURED / CALIBRATED** (from data, refreshed, never hand-set): correlation
+   (ρ tables, copula), per-game vol σ₁, cross-game ρ → G_eff, the portfolio MC
+   (P(book), ES/CVaR, det-max, P(ruin)).
+2. **POLICY ANCHORS** — the operator's RISK APPETITE, stated ONCE, not per-night:
+   KILL at 12% = 5σ, ruin floor 30%, z-scores (daily 3 / dd 4 / trip 5),
+   per-combo 1%. The constitution, not knobs.
+3. **DERIVED / ADAPTIVE** — EVERYTHING else, computed continuously from (1)+(2)+
+   the live state: every deploy cap (slate/game), the book caps (directional /
+   det-max / CVaR = f(MC)), the correlation ratchet, sizing. Never a static
+   fraction that ages.
+
+This governs every future change. `risk/cap_family.py` is the first pillar (caps
+= f(measured vol, correlation, bankroll)). Standing rules that serve it: NO manual
+risk intervention (repair the mechanism), NO P&L refit (adapt from measurement /
+structure, never a P&L window), auto-scale everything off live bankroll. A "set
+number" that survives outside layers 1–2 is tech debt, tracked to be dissolved.
+
 ## Mission (one paragraph)
 
 Maker-side automated market maker for Kalshi combo RFQs. Top-down derivative
