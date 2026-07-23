@@ -6,6 +6,8 @@ fail-closed UNKNOWN path.
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -46,9 +48,25 @@ def _leg(ticker: str, event: str, side: str = "yes") -> LegRef:
 
 
 class TestFailClosed:
-    def test_unknown_model_no_usable_stats(self) -> None:
+    def test_unpriceable_held_position_reserves_usable(self) -> None:
+        # 2026-07-23 fix: a held position whose leg cannot be priced (in-play empty
+        # book / closed-ungraded) is RESERVED at its max loss, NOT flagged unknown —
+        # the snapshot stays USABLE (bounded deterministically) so the book keeps
+        # quoting instead of darking on one held combo with a live leg.
         pos = _pos("p1", (_leg("A", "KXWCGAME-G1"),))
         m = build_book_model([pos], marginals=lambda t: None)
+        snap = compute_book_risk(m, n_samples=1_000, seed=1)
+        assert not snap.unknown
+        assert snap.usable                                    # via the reserve
+        assert snap.es_99_cc == 0.0                           # nothing sampled
+        assert snap.deterministic_max_loss_cc == float(pos.max_loss_cc)  # worst case
+
+    def test_genuinely_unknown_model_no_usable_stats(self) -> None:
+        # The fail-closed invariant is preserved for a model that IS unknown (the
+        # belt-and-braces path): no stat may drive a gate.
+        pos = _pos("p1", (_leg("A", "KXWCGAME-G1"),))
+        m = dataclasses.replace(build_book_model([pos], marginals=lambda t: 0.5),
+                                unknown=True)
         snap = compute_book_risk(m, n_samples=1_000, seed=1)
         assert snap.unknown
         assert not snap.usable

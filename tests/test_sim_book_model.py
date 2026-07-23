@@ -146,11 +146,29 @@ class TestBuildBookModel:
         assert m.corr_point.shape == (0, 0)
         assert not m.unknown
 
-    def test_missing_marginal_flags_unknown(self) -> None:
-        legs = (_leg("A", "KXWCGAME-26X"),)
-        pos = _pos("p1", legs)
+    def test_unpriceable_held_leg_reserves_not_unknown(self) -> None:
+        # 2026-07-23 fix: a held risk-modeled position whose leg cannot be priced
+        # (in-play empty book / closed-but-ungraded) is RESERVED at its max loss —
+        # a deterministic conservative bound — NOT flagged unknown. One held combo
+        # with an in-play leg must never dark the whole book.
+        pos = _pos("p1", (_leg("A", "KXWCGAME-26X"),))
         m = build_book_model([pos], marginals=lambda t: None)
-        assert m.unknown  # fail-closed: any missing marginal ⇒ no-go
+        assert not m.unknown                              # no longer fail-closed
+        assert m.legs == ()                               # unpriceable pos not sampled
+        assert m.positions == ()
+        assert m.reserved_loss_cc == float(pos.max_loss_cc)  # bounded deterministically
+        assert m.reserved_loss_cc > 0
+
+    def test_mixed_priceable_and_unpriceable_positions(self) -> None:
+        # a priceable position is SAMPLED; an unpriceable one is RESERVED alongside —
+        # the good book still models, the stuck one bounds deterministically.
+        good = _pos("good", (_leg("A", "KXWCGAME-26X"),))
+        stuck = _pos("stuck", (_leg("B", "KXWCGAME-26Y"),))
+        m = build_book_model([good, stuck], marginals=lambda t: None if t == "B" else 0.5)
+        assert not m.unknown
+        assert m.leg_index == {"A": 0}                    # only the priceable leg
+        assert len(m.positions) == 1                      # only the good position sampled
+        assert m.reserved_loss_cc == float(stuck.max_loss_cc)
 
     def test_leg_universe_dedups_tickers(self) -> None:
         # Two positions sharing a leg ticker collapse to one latent index.

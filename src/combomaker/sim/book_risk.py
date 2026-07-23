@@ -1916,11 +1916,38 @@ def evaluate_candidate_book_risk(
     # index the SAME sampled columns). Reserved (unmodeled) holdings are not sampled
     # — their premium rides in via _det_and_gross / gross below.
     leg_index = model.leg_index
-    pre_combos = [
-        position_to_combo(p, leg_index) for p in pre_positions if p.risk_modeled
-    ]
+
+    def _modeled(p: OpenPosition) -> bool:
+        # SAMPLED iff risk-modeled AND every leg entered the merged universe. A leg
+        # with no marginal (in-play empty book / closed-ungraded) RESERVED the
+        # position out in build_book_model — it is bounded deterministically, never
+        # sampled — so its legs are absent from ``leg_index``.
+        return p.risk_modeled and all(
+            leg.market_ticker in leg_index for leg in p.legs
+        )
+
+    # The CANDIDATE itself must be priceable — we will NOT quote a combo whose own
+    # leg has no marginal. A HELD position with such a leg only RESERVES (keeping the
+    # book quoting); the CANDIDATE fail-closes. A reserved candidate is absent from
+    # the leg universe, so projecting it would KeyError — decline first.
+    if candidate.risk_modeled and not _modeled(candidate):
+        return CandidateBookRisk(
+            unknown=True,
+            band=band,
+            n_samples=n_samples,
+            seed=seed,
+            n_pre_positions=len(pre_positions),
+            n_post_positions=len(all_positions),
+            pre=empty,
+            post=empty,
+            candidate_ev_cc=0.0,
+            confirm=False,
+            decline_reason="unknown_marginal",
+        )
+
+    pre_combos = [position_to_combo(p, leg_index) for p in pre_positions if _modeled(p)]
     cand_combos = (
-        [position_to_combo(candidate, leg_index)] if candidate.risk_modeled else []
+        [position_to_combo(candidate, leg_index)] if _modeled(candidate) else []
     )
     post_combos = [*pre_combos, *cand_combos]
 

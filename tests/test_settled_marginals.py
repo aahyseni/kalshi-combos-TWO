@@ -492,9 +492,11 @@ class TestLifecycleWiring:
     async def test_unresolved_closed_market_stays_fail_closed(
         self, harness: tuple[Harness, Store]
     ) -> None:
-        # Game over but the exchange has NOT graded the result yet: no outcome
-        # is inferred — the model stays UNKNOWN, the snapshot unusable, and
-        # the CVaR cap keeps declining (fail-closed pinned).
+        # Game over but the exchange has NOT graded the result yet: no outcome is
+        # inferred. 2026-07-23 fix: the held position is RESERVED at its max loss
+        # (a known fact — conservative worst case), NOT flagged unknown, so the
+        # snapshot stays USABLE and the book keeps quoting on OTHER games instead of
+        # darking on one held combo whose leg cannot be priced.
         h, store = harness
         source = FakeMarketSource()
         for t in (FRA_WIN, FRAENG_O5):
@@ -508,10 +510,11 @@ class TestLifecycleWiring:
         lifecycle.recompute_book_risk()
         snap = lifecycle._book_risk  # noqa: SLF001
         assert snap is not None
-        assert snap.unknown is True
-        assert not snap.usable
+        assert snap.unknown is False                     # reserved, not unknown
+        assert snap.usable                               # usable via the reserve
+        assert snap.deterministic_max_loss_cc > 0.0      # the held combo is bounded
         await lifecycle.handle_rfq(rfq())
-        assert sender.created == []
+        assert sender.created != []                      # book keeps quoting
 
     async def test_feed_alive_leg_unaffected_feed_takes_precedence(
         self, harness: tuple[Harness, Store]
@@ -538,9 +541,11 @@ class TestLifecycleWiring:
     async def test_knob_false_no_resolver_old_behaviour(
         self, harness: tuple[Harness, Store]
     ) -> None:
-        # risk.settled_marginal_resolution=False ⇒ build_settled_resolver
-        # wires NOTHING ⇒ the lifecycle behaves exactly as before the fix:
-        # the settled-leg book stays UNKNOWN and no quote goes out.
+        # risk.settled_marginal_resolution=False ⇒ build_settled_resolver wires
+        # NOTHING (no grading of settled legs to exact facts). The held unpriceable
+        # position is still RESERVED at its max loss (build_book_model reserves
+        # independent of the resolver), so the snapshot stays USABLE and quoting
+        # continues — the knob only controls the EXACTNESS of settled-leg risk.
         h, store = harness
         clock = FakeClock()
         assert (
@@ -563,9 +568,9 @@ class TestLifecycleWiring:
         assert lifecycle._settled_task is None  # noqa: SLF001 — nothing launched
         lifecycle.recompute_book_risk()
         snap = lifecycle._book_risk  # noqa: SLF001
-        assert snap is not None and snap.unknown and not snap.usable
+        assert snap is not None and not snap.unknown and snap.usable
         await lifecycle.handle_rfq(rfq())
-        assert sender.created == []
+        assert sender.created != []
 
     def test_retry_knob_validators(self) -> None:
         assert RiskConfig().settled_marginal_resolution is True
@@ -609,12 +614,16 @@ class TestLifecycleWiring:
             )
         assert len(exposure.positions) == 9
 
-        # BEFORE: the outage — UNKNOWN snapshot, CVaR fails closed, no quote.
+        # BEFORE resolution (2026-07-23 fix): the 6 combos with unresolved FRAENG
+        # legs RESERVE at their max loss; the 3 pure-live positions still model. The
+        # snapshot is USABLE (no outage) and a quote goes out — the book no longer
+        # darks on the held unpriceable legs.
         lifecycle.recompute_book_risk()
         snap = lifecycle._book_risk  # noqa: SLF001
-        assert snap is not None and snap.unknown and not snap.usable
+        assert snap is not None and not snap.unknown and snap.usable
+        assert snap.n_positions == 3                      # 6 reserved, 3 modeled
         await lifecycle.handle_rfq(rfq())
-        assert sender.created == []
+        assert len(sender.created) == 1
 
         # AFTER: the maintenance tick registers + fetches the graded results…
         await _resolve_via_maintenance(lifecycle)
@@ -626,11 +635,12 @@ class TestLifecycleWiring:
         assert snap.unknown is False
         assert snap.usable
         assert snap.n_positions == 9
-        # …and the public risk path passes a quote again.
+        # …and the public risk path passes a quote again (now on the fully-modeled
+        # book, conditional on the graded facts — the 2nd quote overall).
         risk = lifecycle._book_risk_for_check()  # noqa: SLF001 — audit's view
         assert risk is snap
         await lifecycle.handle_rfq(rfq())
-        assert len(sender.created) == 1
+        assert len(sender.created) == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -976,10 +986,12 @@ class TestBatchRegistrationAndPriority:
             assert settled.resolved(_graded_ticker(i)) == 1.0  # within 2 passes
         assert settled.resolved(UNGRADED_BLOCKER) is None
         assert UNGRADED_BLOCKER in settled._pending  # noqa: SLF001 — retried
-        # Fail-closed: the truly-ungraded leg still blocks every position.
+        # 2026-07-23: the truly-ungraded blocker RESERVES every position at its max
+        # loss (bounded, conservative) — the snapshot is USABLE, not blocked — until
+        # the exchange grades it and the exact settled-fact conditional takes over.
         lifecycle.recompute_book_risk()
         snap = lifecycle._book_risk  # noqa: SLF001
-        assert snap is not None and snap.unknown and not snap.usable
+        assert snap is not None and not snap.unknown and snap.usable
         # The exchange grades the blocker ⇒ the next backoff retry resolves it
         # ⇒ the snapshot becomes usable (facts now suffice).
         source.payloads[UNGRADED_BLOCKER] = market_payload(

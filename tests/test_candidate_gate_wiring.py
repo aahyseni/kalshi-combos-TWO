@@ -322,12 +322,16 @@ async def test_existing_decline_never_consults_candidate_gate(tmp_path: Path) ->
 # --------------------------------------------------------------------------- #
 
 
-async def test_unknown_marginal_declines_real_inline_eval(tmp_path: Path) -> None:
-    # No pool ⇒ the gate runs the REAL evaluate_candidate_book_risk INLINE. The
-    # candidate legs (M1/M2) have books, so last-look PASSES and the gate runs. But
-    # a risk-modeled COMMITTED position on ticker "GHOST" (no feed book ⇒ no
-    # marginal) poisons the MERGED model to UNKNOWN ⇒ the gate declines (fail-closed
-    # — a missing marginal is never scored as an ordinary p=0.5).
+async def test_held_unpriceable_position_reserves_candidate_confirms(
+    tmp_path: Path,
+) -> None:
+    # 2026-07-23 fix, real inline eval: a risk-modeled COMMITTED position on ticker
+    # "GHOST" (no feed book ⇒ no marginal) no longer poisons the MERGED model to
+    # UNKNOWN. It is RESERVED at its max loss (bounded, conservative), so the
+    # priceable candidate (M1/M2 with books, +EV) is evaluated on its own merits and
+    # CONFIRMS — one held combo with an unpriceable/in-play leg never darks the
+    # confirm path (the CANDIDATE would still decline if ITS own leg were unpriceable;
+    # that fail-closed is unit-tested in test_candidate_book_risk).
     rig = await _make_rig(tmp_path, pool=None)
     ghost = OpenPosition(
         position_id="held:ghost",
@@ -337,18 +341,16 @@ async def test_unknown_marginal_declines_real_inline_eval(tmp_path: Path) -> Non
         contracts=CentiContracts(100),
         entry_price_cc=CentiCents(5_000),
         legs=(LegRef("GHOST", "E9", "yes"),),
-        risk_modeled=True,  # priced ⇒ its missing marginal forces UNKNOWN
+        risk_modeled=True,  # unpriceable ⇒ RESERVED, not UNKNOWN
     )
     rig.exposure.add_position(ghost)
     await rig.lifecycle.handle_rfq(rfq())
     await rig.lifecycle.on_quote_accepted(accepted_msg("q1", "yes"))
-    assert rig.sender.confirmed == []
+    assert rig.sender.confirmed == ["q1"]                # candidate evaluated + confirmed
     assert (
         rig.metrics.counter(f"confirm.declined.{ReasonCode.DECLINE_CANDIDATE_RISK}")
-        == 1
+        == 0
     )
-    # The held ghost stays; no new fill booked.
-    assert len(rig.exposure.positions) == 1
 
 
 async def test_positive_ev_real_inline_eval_confirms(tmp_path: Path) -> None:

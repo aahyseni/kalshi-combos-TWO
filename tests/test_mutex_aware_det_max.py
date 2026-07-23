@@ -31,6 +31,7 @@ Mandated coverage (task items 1-9):
 
 from __future__ import annotations
 
+import dataclasses
 import random
 from dataclasses import dataclass
 from fractions import Fraction
@@ -635,8 +636,12 @@ class TestSnapshotInvariants:
         assert snap.deterministic_max_loss_cc == float(held.max_loss_cc)
 
     def test_unknown_snapshot_leaves_field_none(self) -> None:
+        # A missing marginal now RESERVES the held position (usable), so force a
+        # genuinely-unknown model to pin the invariant: unknown ⇒ no usable field.
         p1 = _pos("p1", (_leg("NOMARG", "KXWCGAME-G9"),))
-        m = build_book_model([p1], marginals=lambda t: None)
+        m = dataclasses.replace(
+            build_book_model([p1], marginals=lambda t: 0.5), unknown=True
+        )
         snap = compute_book_risk(m, n_samples=2_000, seed=0, structural_cfg=CFG)
         assert not snap.usable
         assert snap.mutex_aware_det_max_cc is None

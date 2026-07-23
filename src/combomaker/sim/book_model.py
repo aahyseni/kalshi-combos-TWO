@@ -200,12 +200,35 @@ def build_book_model(
     accounting without ever being scored against a fabricated ``p=0.5``.
     """
     positions = list(positions)
-    # P0-4: split the book. Only RISK-MODELED positions are sampled; RESERVED
-    # holdings (unavailable marginals) carry a deterministic premium reserve.
-    modeled_positions = [p for p in positions if p.risk_modeled]
-    reserved_loss_cc = float(
-        sum(p.max_loss_cc for p in positions if not p.risk_modeled)
-    )
+    # Resolve each distinct leg's marginal ONCE (the provider walks feed → settled
+    # cache; call it per ticker, not per occurrence).
+    _marg: dict[str, float | None] = {}
+
+    def _priced(ticker: str) -> float | None:
+        if ticker not in _marg:
+            _marg[ticker] = marginals(ticker)
+        return _marg[ticker]
+
+    # P0-4 + 2026-07-23 fix: split the book. A position is SAMPLED only if it is
+    # risk-modeled AND every one of its legs has a marginal. A ``risk_modeled=False``
+    # holding (gated series) OR a risk-modeled position with an UNPRICEABLE/UNGRADED
+    # leg — an active-but-EMPTY in-play book, or a closed-but-not-yet-graded leg — is
+    # RESERVED instead: its EXACT max loss folds into the deterministic reserve. A
+    # held position's max loss is a known FACT even when its leg cannot be priced, so
+    # reserving it (conservative — assumes it loses in full) keeps the snapshot
+    # USABLE rather than forcing the WHOLE model UNKNOWN, which historically darked
+    # EVERY quote while one held combo's game was in progress (live 2026-07-23: a $5
+    # combo with an in-play, empty-book leg blocked the entire book). Fail-closed
+    # paired with the known-max-loss fact (the standing "full state awareness" rule).
+    modeled_positions: list[OpenPosition] = []
+    reserved_loss_cc = 0.0
+    for position in positions:
+        if position.risk_modeled and all(
+            _priced(leg.market_ticker) is not None for leg in position.legs
+        ):
+            modeled_positions.append(position)
+        else:
+            reserved_loss_cc += float(position.max_loss_cc)
 
     # --- global leg universe: one LegModel per distinct ticker, YES marginal ---
     leg_index: dict[str, int] = {}
@@ -217,8 +240,11 @@ def build_book_model(
         for leg in position.legs:
             if leg.market_ticker in leg_index:
                 continue
-            p = marginals(leg.market_ticker)
+            p = _priced(leg.market_ticker)
             if p is None:
+                # Unreachable: modeled_positions are all-priced by construction.
+                # Kept as belt-and-braces fail-closed if a provider ever returns
+                # non-deterministically within one build.
                 unknown = True
                 p = 0.5  # placeholder ONLY; `unknown` forbids using the stats
             idx = len(legs)
