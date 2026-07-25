@@ -75,6 +75,27 @@ Two launcher defects, found from the live log, fixed + pushed same hour:
    quote --confirm-live --config config\prod-live-wc.local.yaml`.
    The false-positive KILL + stale heartbeats were cleared;
    `needs_reconcile` left for the bot's own boot reconcile.
+4. **venv SHIM DOUBLING — a day-long misdiagnosis, corrected (`b61a411`).**
+   The venv `python.exe` is a launcher shim that spawns the real
+   interpreter as a CHILD with an IDENTICAL command line (proven: one
+   sleeper launch = 2 processes, parent = shim). Every "duplicate stack"
+   seen today was ONE healthy stack seen double — **including the morning
+   "zombie v5 pair" (its 429-storm attribution is RETRACTED; the storm was
+   the ordinary cold-cache boot burst) and the afternoon "two bots
+   double-quoting one account" (I killed the operator's healthy,
+   correctly-launched 3:09p bot on that misread).** The launcher's
+   post-launch verification now counts ROOT processes only (matched
+   processes whose parent is not itself in the matched set).
+5. **Launch-guard race + stale-shell block (`b61a411`).** The process-count
+   guard was check-then-act; a named OS mutex
+   (`Global\combomaker_start_bot`) now makes the launch atomic. Dead
+   cmd/powershell shell windows from a stopped stack (command lines still
+   name the bot) are swept instead of blocking the start; `STOP_BOT` also
+   reaps orphaned pool workers (spawn_main pythons with a dead parent).
+   **Final state: START_BOT.bat executed end-to-end by Claude — stale
+   sweep fired, mutex+guard passed, "VERIFIED: exactly one bot process",
+   `startup_reconciled` cancelled 32 leftover quotes,
+   `prod_preflight_green` 3:22:08p ET, leg-axis shadow steering live.**
 
 ## Build 1 — LEG-DIRECTION AXIS (operator: "recognize direction for all legs, know when to raise markups")
 
