@@ -853,6 +853,33 @@ class LimitChecker:
                         shadow=shadow,
                     )
                 )
+        # (3b) ACCUMULATED per-combo loss (2026-07-25 — the 7/23 re-hit
+        # bypass: mass-acceptance re-hits of ONE structure grew a $74 combo
+        # to $149.24 past the 5% cap because only the CANDIDATE was ever
+        # checked). ``loss_by_combo_cc`` folds committed + reserved positions
+        # + this check's candidates/reservations on the same combo MARKET
+        # (never resting quotes — the serial reservation chain re-checks at
+        # every fill, so the accumulation binds exactly there). SAME anchor,
+        # SAME reason code: enforcement repair, not a new number. Emitted
+        # only when there IS accumulation beyond the candidate itself (a lone
+        # candidate is exactly check (3) above).
+        seen_combo: set[str] = set()
+        for position in candidates:
+            ticker = position.combo_ticker
+            if ticker in seen_combo:
+                continue
+            seen_combo.add(ticker)
+            total = snapshot.loss_by_combo_cc.get(ticker, 0)
+            if total > combo_thr and total > position.max_loss_cc:
+                out.append(
+                    Breach(
+                        ReasonCode.SKIP_PER_COMBO_LOSS_CAP,
+                        f"combo {ticker} ACCUMULATED loss {total}cc "
+                        f"(committed+reserved+candidate) > "
+                        f"{limits.per_combo_loss_frac} bankroll = {combo_thr}cc",
+                        shadow=shadow,
+                    )
+                )
 
         # (4) One-directional / theme cap (P0-9: mutex-aware hedge semantics).
         # INTERPRETATION: the net directional exposure to a game's single RESULT

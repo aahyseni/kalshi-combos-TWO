@@ -249,6 +249,74 @@ class TestPerComboLossCap:
         )
         assert ReasonCode.SKIP_PER_COMBO_LOSS_CAP not in r2_reasons(breaches)
 
+    # --- ACCUMULATED per-combo bound (2026-07-25 — the 7/23 re-hit bypass:
+    # mass-acceptance re-hits of ONE structure grew a $74 combo to $149.24
+    # past the 5% cap because only the CANDIDATE was ever checked). Same
+    # anchor, same reason code — enforcement repaired. ---------------------
+
+    def test_accumulated_re_hits_fire_the_same_anchor(self) -> None:
+        from dataclasses import replace
+
+        committed = make_position("re", LEG_A, contracts=10_000, entry_price=1_500)
+        assert committed.max_loss_cc == 150_000  # $15 committed on COMBO-re
+        book = empty_book()
+        book.add_position(committed)
+        # A re-hit of the SAME combo market: alone $10 (under the $20 cap),
+        # accumulated $25 (over it).
+        cand = replace(committed, position_id="re-cand", entry_price_cc=CC(1_000))
+        assert cand.combo_ticker == committed.combo_ticker
+        assert cand.max_loss_cc == 100_000
+        breaches = checker(per_combo_loss_frac=Fraction(1, 100), **{
+            k: v for k, v in LOOSE.items() if k != "per_combo_loss_frac"
+        }).check(
+            book, MARG, DailyPnl(),
+            candidate_positions=[cand], risk_bankroll_cc=BANKROLL_2K,
+        )
+        assert ReasonCode.SKIP_PER_COMBO_LOSS_CAP in r2_reasons(breaches)
+        breach = next(
+            b for b in r2(breaches)
+            if b.reason is ReasonCode.SKIP_PER_COMBO_LOSS_CAP
+        )
+        assert "ACCUMULATED" in breach.detail
+
+    def test_different_combo_market_does_not_accumulate(self) -> None:
+        committed = make_position("a", LEG_A, contracts=10_000, entry_price=1_500)
+        book = empty_book()
+        book.add_position(committed)
+        cand = make_position("b", LEG_A, contracts=10_000, entry_price=1_000)
+        breaches = checker(per_combo_loss_frac=Fraction(1, 100), **{
+            k: v for k, v in LOOSE.items() if k != "per_combo_loss_frac"
+        }).check(
+            book, MARG, DailyPnl(),
+            candidate_positions=[cand], risk_bankroll_cc=BANKROLL_2K,
+        )
+        assert ReasonCode.SKIP_PER_COMBO_LOSS_CAP not in r2_reasons(breaches)
+
+    def test_reserved_holding_counts_in_the_accumulation(self) -> None:
+        """A conservatively-reserved (risk_modeled=False) holding on the same
+        combo market is REAL premium at risk — it accumulates too."""
+        from dataclasses import replace
+
+        committed = replace(
+            make_position("re", LEG_A, contracts=10_000, entry_price=1_500),
+            risk_modeled=False,
+        )
+        book = empty_book()
+        book.add_position(committed)
+        cand = replace(
+            committed,
+            position_id="re-cand",
+            entry_price_cc=CC(1_000),
+            risk_modeled=True,
+        )
+        breaches = checker(per_combo_loss_frac=Fraction(1, 100), **{
+            k: v for k, v in LOOSE.items() if k != "per_combo_loss_frac"
+        }).check(
+            book, MARG, DailyPnl(),
+            candidate_positions=[cand], risk_bankroll_cc=BANKROLL_2K,
+        )
+        assert ReasonCode.SKIP_PER_COMBO_LOSS_CAP in r2_reasons(breaches)
+
 
 class TestUtilizationBackstop:
     def test_binds_on_notional_axis_even_when_loss_is_tiny(self) -> None:

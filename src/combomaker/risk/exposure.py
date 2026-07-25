@@ -504,6 +504,17 @@ class ExposureSnapshot:
     # the KEY is now the game code (B2, 2026-07-12).
     delta_by_game: dict[str, float]
     gross_notional_cc: int                  # Σ max_loss_cc (premium at risk)
+    # ACCUMULATED per-combo-MARKET loss (2026-07-25 — the 7/23 re-hit bypass:
+    # mass-acceptance re-hits of ONE structure grew a $74 combo to $149.24
+    # past the 5% per-combo cap because only the CANDIDATE was ever checked).
+    # Σ max_loss_cc keyed by ``combo_ticker`` over COMMITTED + RESERVED
+    # positions + the check's candidates/reservations — deliberately NEVER
+    # resting quotes (every fill re-checks through the serial reservation
+    # chain, so the accumulation binds exactly at each fill; a sell-only
+    # quote's YES-side hypothetical carries 0 loss, so quote-time candidate
+    # folds cannot double-count). The per-combo cap reads this for its
+    # ACCUMULATED bound — the same 1%/5% anchor, enforcement repaired.
+    loss_by_combo_cc: dict[str, int]
     # LOSS axis, per game: Σ max_loss_cc over positions touching the game (the
     # comonotone premium worst case — every combo on the game resolving adverse
     # together). This is genuine P&L-at-risk.
@@ -1160,6 +1171,9 @@ class ExposureBook:
         # entries (skew mutex fallback census — see ExposureSnapshot field).
         committed_dir_entries: dict[str, list[_DirEntry]] = defaultdict(list)
         game_notional: dict[str, int] = defaultdict(int)   # NOTIONAL axis ($1/ct)
+        # ACCUMULATED per-combo-market loss (2026-07-25 re-hit fix): committed
+        # + candidates/reservations only — see the ExposureSnapshot field.
+        loss_combo: dict[str, int] = defaultdict(int)
         gross_cc = 0
         unknown = False
 
@@ -1168,6 +1182,7 @@ class ExposureBook:
         for i, position in enumerate(committed + list(extra_positions)):
             is_committed = i < n_committed
             gross_cc += position.max_loss_cc
+            loss_combo[position.combo_ticker] += position.max_loss_cc
             # P0-4: a CONSERVATIVELY-RESERVED holding (risk_modeled=False) has no
             # available marginals — we do NOT even query them (so a missing
             # marginal is never turned into an ordinary usable p=0.5). Its exact
@@ -1457,6 +1472,7 @@ class ExposureBook:
             delta_by_market=dict(delta_market),
             delta_by_game=dict(delta_game),
             gross_notional_cc=gross_cc,
+            loss_by_combo_cc=dict(loss_combo),
             worst_case_loss_by_game_cc=game_worst,
             gross_settlement_notional_by_game_cc=dict(game_notional),
             directional_by_game_cc=game_directional,
