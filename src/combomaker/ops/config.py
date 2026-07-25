@@ -2748,6 +2748,13 @@ class RiskConfig(StrictModel):
     # enumeration no longer kills a certificate it cannot affect (the
     # "book moved during every enumeration" peak-flow reneges).
     waiver_game_scoped_stability: bool = False
+    # (6) EV-BASED SLOT EVICTION (2026-07-25 big-fill audit: max_open_quotes
+    # was arrival-order-blind — $3.2M/day of flow died while low-EV
+    # leftovers held slots). At the slot cap, the weakest stored-EV resting
+    # quote is evicted for a strictly-higher-EV candidate; every other
+    # enforced wall stands untouched. The cap ITSELF remains hand-set
+    # tech-debt (dissolution into measured capacity is the follow-up build).
+    open_quote_ev_eviction: bool = False
     # (5) P(BOOK) NON-DECREASE (operator doctrine 2026-07-25: "anything we
     # take in should push it up, or neutral"): the candidate gate declines a
     # fill whose measured ΔP(book) is negative beyond the CRN noise floor

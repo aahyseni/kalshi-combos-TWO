@@ -326,6 +326,7 @@ def build_lifecycle_config(
         waiver_game_scoped_stability=risk_cfg.waiver_game_scoped_stability,
         release_accepted_quote_exposure=risk_cfg.release_accepted_quote_exposure,
         require_p_book_non_decreasing=risk_cfg.require_p_book_non_decreasing,
+        open_quote_ev_eviction=risk_cfg.open_quote_ev_eviction,
         # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): poll REST for a confirmed
         # fill whose quote_executed WS message never arrived.
         fill_record_recovery_after_s=risk_cfg.fill_record_recovery_after_s,

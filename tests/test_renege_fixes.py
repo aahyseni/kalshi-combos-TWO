@@ -194,6 +194,149 @@ class TestGateEvSource:
         assert r.decline_reason == "negative_ev_no_hedge_budget"
 
 
+class TestSlotEvEviction:
+    """EV-BASED SLOT EVICTION (2026-07-25 big-fill audit): at the slot cap
+    the weakest stored-EV resting quote is evicted for a strictly-higher-EV
+    candidate; any other enforced wall stands untouched."""
+
+    def _resting(self, qid: str, edge_cc: int | None):
+        from combomaker.core.money import CentiCents as CC
+        from combomaker.risk.exposure import OpenQuoteRisk
+
+        return OpenQuoteRisk(
+            quote_id=qid, rfq_id=f"r-{qid}", combo_ticker=f"C-{qid}",
+            collection=None, yes_bid_cc=CC(0), no_bid_cc=CC(5_000),
+            contracts=CentiContracts(100),
+            legs=(LegRef(f"L-{qid}", f"KX-G-{qid}", "yes"),),
+            expected_edge_cc=edge_cc,
+        )
+
+    async def _rig(self, tmp_path: Path, *, cap: int = 2):
+        from fractions import Fraction
+
+        lc = await _lifecycle(
+            tmp_path, LifecycleConfig(open_quote_ev_eviction=True)
+        )
+        lc._limits = LimitChecker(  # noqa: SLF001 — test rig wiring
+            RiskLimits(
+                max_open_quotes=cap,
+                caps_shadow_mode=True,
+                per_combo_loss_frac=Fraction(99, 100),
+            )
+        )
+        lc._marginals = lambda t: 0.5  # noqa: SLF001 — resolvable deltas
+        return lc
+
+    def _cand(self, no_bid_cc: int, fair_cc: int) -> ConstructedQuote:
+        return ConstructedQuote(
+            yes_bid_cc=CentiCents(0),
+            no_bid_cc=CentiCents(no_bid_cc),
+            fair_cc=CentiCents(fair_cc),
+            width_components_cc={},
+        )
+
+    async def test_evicts_weakest_and_admits(self, tmp_path: Path) -> None:
+        from combomaker.core.reasons import ReasonCode
+        from combomaker.risk.limits import Breach
+
+        lc = await self._rig(tmp_path)
+        lc._exposure.upsert_quote(self._resting("weak", 100))  # noqa: SLF001
+        lc._exposure.upsert_quote(self._resting("strong", 9_000))  # noqa: SLF001
+        rfq = combo(
+            [{"market_ticker": "A", "side": "yes", "event_ticker": "KX-G1"}],
+            id="rc", market_ticker="KXMVE-C", contracts_fp="1.00",
+        )
+        # NO at 4_000 on a fair of 3_000 ⇒ NO-side fair = 7_000 ⇒ edge
+        # (7_000 − 4_000) × 1 contract = 3_000cc > weakest 100cc.
+        result = self._cand(no_bid_cc=4_000, fair_cc=3_000)
+        qrisk = lc._quote_risk(  # noqa: SLF001
+            rfq, result, quote_id="pending", qty=CentiContracts(100)
+        )
+        breaches = [
+            Breach(ReasonCode.SKIP_MAX_OPEN_QUOTES, "2 at cap 2", shadow=False)
+        ]
+        out = await lc._try_slot_eviction(  # noqa: SLF001
+            rfq, result, CentiContracts(100), qrisk, breaches
+        )
+        assert "weak" not in lc._exposure.open_quotes  # noqa: SLF001
+        assert "strong" in lc._exposure.open_quotes  # noqa: SLF001
+        assert not [b for b in out if not b.shadow]  # slot breach cleared
+
+    async def test_lower_ev_candidate_does_not_evict(
+        self, tmp_path: Path
+    ) -> None:
+        from combomaker.core.reasons import ReasonCode
+        from combomaker.risk.limits import Breach
+
+        lc = await self._rig(tmp_path)
+        lc._exposure.upsert_quote(self._resting("weak", 5_000))  # noqa: SLF001
+        rfq = combo(
+            [{"market_ticker": "A", "side": "yes", "event_ticker": "KX-G1"}],
+            id="rc2", market_ticker="KXMVE-C2", contracts_fp="1.00",
+        )
+        result = self._cand(no_bid_cc=6_900, fair_cc=3_000)  # edge 100cc
+        qrisk = lc._quote_risk(  # noqa: SLF001
+            rfq, result, quote_id="pending", qty=CentiContracts(100)
+        )
+        breaches = [
+            Breach(ReasonCode.SKIP_MAX_OPEN_QUOTES, "at cap", shadow=False)
+        ]
+        out = await lc._try_slot_eviction(  # noqa: SLF001
+            rfq, result, CentiContracts(100), qrisk, breaches
+        )
+        assert out is breaches  # unchanged — no eviction
+        assert "weak" in lc._exposure.open_quotes  # noqa: SLF001
+
+    async def test_other_enforced_breach_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        from combomaker.core.reasons import ReasonCode
+        from combomaker.risk.limits import Breach
+
+        lc = await self._rig(tmp_path)
+        lc._exposure.upsert_quote(self._resting("weak", 100))  # noqa: SLF001
+        rfq = combo(
+            [{"market_ticker": "A", "side": "yes", "event_ticker": "KX-G1"}],
+            id="rc3", market_ticker="KXMVE-C3", contracts_fp="1.00",
+        )
+        result = self._cand(no_bid_cc=4_000, fair_cc=3_000)
+        qrisk = lc._quote_risk(  # noqa: SLF001
+            rfq, result, quote_id="pending", qty=CentiContracts(100)
+        )
+        breaches = [
+            Breach(ReasonCode.SKIP_MAX_OPEN_QUOTES, "at cap", shadow=False),
+            Breach(ReasonCode.SKIP_PER_COMBO_LOSS_CAP, "loss", shadow=False),
+        ]
+        out = await lc._try_slot_eviction(  # noqa: SLF001
+            rfq, result, CentiContracts(100), qrisk, breaches
+        )
+        assert out is breaches  # a real risk wall present — never loosened
+        assert "weak" in lc._exposure.open_quotes  # noqa: SLF001
+
+    async def test_unknown_ev_never_evicted(self, tmp_path: Path) -> None:
+        from combomaker.core.reasons import ReasonCode
+        from combomaker.risk.limits import Breach
+
+        lc = await self._rig(tmp_path)
+        lc._exposure.upsert_quote(self._resting("mystery", None))  # noqa: SLF001
+        rfq = combo(
+            [{"market_ticker": "A", "side": "yes", "event_ticker": "KX-G1"}],
+            id="rc4", market_ticker="KXMVE-C4", contracts_fp="1.00",
+        )
+        result = self._cand(no_bid_cc=4_000, fair_cc=3_000)
+        qrisk = lc._quote_risk(  # noqa: SLF001
+            rfq, result, quote_id="pending", qty=CentiContracts(100)
+        )
+        breaches = [
+            Breach(ReasonCode.SKIP_MAX_OPEN_QUOTES, "at cap", shadow=False)
+        ]
+        out = await lc._try_slot_eviction(  # noqa: SLF001
+            rfq, result, CentiContracts(100), qrisk, breaches
+        )
+        assert out is breaches
+        assert "mystery" in lc._exposure.open_quotes  # noqa: SLF001
+
+
 class TestWaiverScopedStability:
     async def test_unrelated_fill_no_longer_invalidates(
         self, tmp_path: Path

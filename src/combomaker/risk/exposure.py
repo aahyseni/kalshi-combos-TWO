@@ -236,6 +236,11 @@ class OpenQuoteRisk:
     no_bid_cc: CentiCents
     contracts: CentiContracts
     legs: tuple[LegRef, ...]
+    # QUOTE-TIME expected edge (2026-07-25 EV-based slot eviction): the
+    # engine's candidate EV at issue, refreshed on every reprice (a reprice
+    # replaces the record). None = unknown ⇒ NEVER evicted on EV grounds
+    # (UNKNOWN is never a convenient loser).
+    expected_edge_cc: int | None = None
 
     def hypothetical_positions(self, conventions: Conventions) -> list[OpenPosition]:
         """The position each acceptable side would create, at quoted price."""

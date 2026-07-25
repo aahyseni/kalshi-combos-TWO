@@ -158,6 +158,11 @@ class ReasonCode(StrEnum):
     DELETE_KILL_SWITCH = "delete_kill_switch"
     DELETE_WS_GAP = "delete_ws_gap"
     DELETE_RFQ_GONE = "delete_rfq_gone"
+    # EV-BASED SLOT EVICTION (2026-07-25 big-fill audit: the open-quote slot
+    # cap was arrival-order-blind — a $60 4-leg parlay died unseen while a
+    # $2 leftover held a slot). At capacity, the weakest-EV resting quote is
+    # evicted for a HIGHER-EV candidate.
+    DELETE_EVICTED_LOWER_EV = "delete_evicted_lower_ev"
     # Event-driven post-fill risk pull (resting-quote haircut, 2026-07-17): a
     # committed fill consumed budget, and this resting quote's game now shows
     # an ENFORCED quote-time breach (haircut semantics) — pulled immediately

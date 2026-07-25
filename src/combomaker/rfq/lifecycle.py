@@ -547,6 +547,10 @@ class LifecycleConfig:
     # p_book, worst −0.226). Gate declines ΔP(book) < −3×SE fills unless
     # they certifiably reduce the governing tail. Default OFF.
     require_p_book_non_decreasing: bool = False
+    # EV-BASED SLOT EVICTION (2026-07-25 big-fill audit): at the open-quote
+    # slot cap, evict the weakest-EV resting quote for a strictly-higher-EV
+    # candidate instead of blind-declining by arrival order. Default OFF.
+    open_quote_ev_eviction: bool = False
     # PEAK-CONCENTRATION pricing steer (operator directive 2026-07-18 evening).
     # K cached worst scorelines per game for the committed-book peak profile
     # (sim/peak_profile.build_peak_profile) — rebuilt OFF the hot path on the
@@ -2705,6 +2709,67 @@ class QuoteLifecycle:
             )
         return _worker_state_worst_case(inputs)
 
+    async def _try_slot_eviction(
+        self,
+        rfq: Rfq,
+        result: ConstructedQuote,
+        risk_qty: CentiContracts,
+        quote_risk: OpenQuoteRisk,
+        raw_breaches: list[Breach],
+    ) -> list[Breach]:
+        """EV-BASED SLOT EVICTION (2026-07-25 big-fill audit). Fires ONLY when
+        every ENFORCED breach is the slot-count cap (any other enforced wall
+        stands untouched — this must never loosen a risk cap). Compares the
+        candidate's quote-time EV against the weakest STORED quote-time EV in
+        the resting book (apples to apples — both computed by the same
+        ``_quote_candidate_ev_cc`` at issue/reprice time; a quote with
+        UNKNOWN stored EV is never chosen as the loser). Strict ``>`` plus
+        one attempt per RFQ bounds churn; the reprice cadence refreshes
+        stored EVs. On eviction the SAME check re-runs once against the
+        freed book — any surviving breach declines exactly as before."""
+        enforced = [b for b in raw_breaches if not b.shadow]
+        if not enforced or any(
+            b.reason is not ReasonCode.SKIP_MAX_OPEN_QUOTES for b in enforced
+        ):
+            return raw_breaches
+        cand_ev = self._quote_candidate_ev_cc(result, risk_qty)
+        if cand_ev is None:
+            return raw_breaches
+        loser: OpenQuoteRisk | None = None
+        for q in self._exposure.open_quotes.values():
+            if q.expected_edge_cc is None:
+                continue
+            if loser is None or q.expected_edge_cc < (
+                loser.expected_edge_cc or 0
+            ):
+                loser = q
+        if loser is None or loser.expected_edge_cc is None:
+            return raw_breaches
+        if cand_ev <= loser.expected_edge_cc:
+            return raw_breaches
+        self._metrics.inc("quote.slot_evictions")
+        log.info(
+            "open_quote_evicted",
+            evicted_quote_id=loser.quote_id,
+            evicted_ev_cc=loser.expected_edge_cc,
+            candidate_rfq_id=rfq.rfq_id,
+            candidate_ev_cc=cand_ev,
+        )
+        await self._delete_quote(loser.quote_id, ReasonCode.DELETE_EVICTED_LOWER_EV)
+        return self._limits.check(
+            self._exposure,
+            self._marginals,
+            self.daily_pnl,
+            candidate_positions=quote_risk.hypothetical_positions(self._conventions),
+            adding_quote=True,
+            risk_bankroll_cc=self._risk_bankroll_cc(),
+            bankroll_source_configured=self._bankroll_source_configured(),
+            start_time_provider=self._start_time_provider,
+            halt_inputs=self._halt_inputs(),
+            book_risk=self._book_risk_for_check(),
+            apply_resting_haircut=True,
+        )
+
     def _note_watchdog(self, *, risk_declined: bool) -> None:
         """Feed the starvation watchdog one quote decision. ``risk_declined`` is
         True when the quote WOULD be declined for a risk reason — either an
@@ -2902,6 +2967,15 @@ class QuoteLifecycle:
             # default weight 1.
             apply_resting_haircut=True,
         )
+        # EV-BASED SLOT EVICTION (2026-07-25 big-fill audit: the slot cap was
+        # arrival-order-blind — $3.2M/day of flow died while low-EV leftovers
+        # held slots): when the ONLY enforced blocker is SKIP_MAX_OPEN_QUOTES
+        # and this candidate's quote-time EV beats the weakest resting
+        # quote's stored EV, evict the loser and re-check once.
+        if self._config.open_quote_ev_eviction and raw_breaches:
+            raw_breaches = await self._try_slot_eviction(
+                rfq, result, risk_qty, quote_risk, raw_breaches
+            )
         # Watchdog sees the ISSUE decision: any breach (enforced OR shadow) is a
         # would-be decline; only a fully clean check is a real issue (reset). This
         # lets a mis-set cap surface in SHADOW mode even though the quote goes out.
@@ -5717,6 +5791,9 @@ class QuoteLifecycle:
             no_bid_cc=constructed.no_bid_cc,
             contracts=qty,
             legs=self._leg_refs(rfq),
+            # Quote-time expected edge for EV-based slot eviction (2026-07-25):
+            # refreshed on every reprice (a reprice re-builds this record).
+            expected_edge_cc=self._quote_candidate_ev_cc(constructed, qty),
         )
 
     def _accepted_qty(
