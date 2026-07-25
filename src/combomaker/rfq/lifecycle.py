@@ -64,7 +64,13 @@ from combomaker.pricing.quote import ConstructedQuote, NoQuote
 from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.models import Rfq
 from combomaker.risk.balance import BalanceTracker
-from combomaker.risk.exposure import ExposureBook, LegRef, OpenPosition, OpenQuoteRisk
+from combomaker.risk.exposure import (
+    ExposureBook,
+    ExposureSnapshot,
+    LegRef,
+    OpenPosition,
+    OpenQuoteRisk,
+)
 from combomaker.risk.fill_velocity import FillVelocityTracker
 from combomaker.risk.inplay import InPlayDetector
 from combomaker.risk.killswitch import KillSwitch
@@ -88,6 +94,7 @@ from combomaker.risk.markouts import MarkoutSubject, MarkoutTracker
 from combomaker.risk.reservation import ReserveResult, RiskReservationService
 from combomaker.risk.skew import (
     GameSkewCache,
+    LegAxisProfile,
     PBookProfile,
     SkewLimits,
     SkewParams,
@@ -1028,21 +1035,10 @@ class QuoteLifecycle:
         # burn (2026-07-25 review: the static SkewLimits dollar made the
         # steer inert at 7/23 scale; this adapts with the bankroll).
         if snap.usable:
-            limits = self._limits.limits
-            budget_candidates = [
-                limits.max_event_worst_case_loss_dollars * 10_000.0
-            ]
-            bankroll_cc = self._risk_bankroll_cc()
-            if bankroll_cc is not None and bankroll_cc > 0:
-                budget_candidates.append(
-                    float(threshold_cc(limits.game_loss_frac, bankroll_cc))
-                )
-                budget_candidates.append(
-                    float(threshold_cc(limits.hard_trip_frac, bankroll_cc))
-                )
             self._pbook_profile = _pbook_profile_from_snapshot(
-                snap, game_budget_cc=min(budget_candidates)
+                snap, game_budget_cc=self._enforced_game_budget_cc()
             )
+            self._log_leg_axis_exposure()
         if snap.usable:
             log.info(
                 "book_risk_snapshot",
@@ -1072,6 +1068,88 @@ class QuoteLifecycle:
                     )[:3]
                 ],
             )
+
+    def _enforced_game_budget_cc(self) -> float:
+        """The tightest ENFORCED per-game loss budget in cc: min(hard game
+        $cap, game_loss_frac × bankroll, hard_trip/KILL frac × bankroll).
+        The ONE denominator every steering onset divides by (P(book) axis and
+        leg-direction axis) — computed here, the owner with the live bankroll,
+        so it adapts with equity and the derived-cap swap (2026-07-25 review:
+        a static dollar made the steer inert at 7/23 scale)."""
+        limits = self._limits.limits
+        budget_candidates = [
+            limits.max_event_worst_case_loss_dollars * 10_000.0
+        ]
+        bankroll_cc = self._risk_bankroll_cc()
+        if bankroll_cc is not None and bankroll_cc > 0:
+            budget_candidates.append(
+                float(threshold_cc(limits.game_loss_frac, bankroll_cc))
+            )
+            budget_candidates.append(
+                float(threshold_cc(limits.hard_trip_frac, bankroll_cc))
+            )
+        return min(budget_candidates)
+
+    def _leg_axis_profile_from(self, snap: ExposureSnapshot) -> LegAxisProfile:
+        """Build the leg-direction steering profile from THIS quote's exposure
+        snapshot (already computed for the limits — no extra aggregation).
+        Shares normalize the committed (family × side) / (entity × side) loss
+        attributions; ``p_book`` rides the cached MC profile ONLY when it is
+        generation-fresh (stale ⇒ None ⇒ the component is neutral: UNKNOWN
+        never widens). The budget is the same enforced denominator the
+        P(book) axis divides by."""
+        fam = snap.committed_loss_by_family_cc
+        ent = snap.committed_loss_by_entity_cc
+        total_fam = float(sum(fam.values()))
+        total_ent = float(sum(ent.values()))
+        p_book: float | None = None
+        profile = self._pbook_profile
+        if (
+            profile is not None
+            and profile.input_generation == self._exposure.position_generation
+        ):
+            p_book = profile.p_book
+        return LegAxisProfile(
+            shares_by_family=(
+                {k: v / total_fam for k, v in fam.items()} if total_fam > 0 else {}
+            ),
+            total_family_cc=total_fam,
+            shares_by_entity=(
+                {k: v / total_ent for k, v in ent.items()} if total_ent > 0 else {}
+            ),
+            total_entity_cc=total_ent,
+            budget_cc=self._enforced_game_budget_cc(),
+            p_book=p_book,
+        )
+
+    def _log_leg_axis_exposure(self) -> None:
+        """LEG-DIRECTION AXIS visibility (2026-07-25 operator directive): one
+        ``leg_axis_exposure`` line per accepted book-risk publish — the
+        committed book's premium-at-risk by (family × side) and (entity ×
+        side), top-8 each, so "short K-overs everywhere / one arm carrying
+        $127" is measured continuously instead of hand-decomposed. Slow-loop
+        only (rides the off-hot-path publish); any failure logs and returns —
+        fix-isolation: this can never touch the pricing path."""
+        try:
+            snap = self._exposure.snapshot(self._marginals, mass_acceptance=False)
+            fam = snap.committed_loss_by_family_cc
+            ent = snap.committed_loss_by_entity_cc
+            if not fam:
+                return
+            log.info(
+                "leg_axis_exposure",
+                n_family_keys=len(fam),
+                n_entity_keys=len(ent),
+                budget_cc=int(self._enforced_game_budget_cc()),
+                top_families=sorted(
+                    fam.items(), key=lambda kv: -kv[1]
+                )[:8],
+                top_entities=sorted(
+                    ent.items(), key=lambda kv: -kv[1]
+                )[:8],
+            )
+        except Exception:
+            log.exception("leg_axis_exposure_failed")
 
     def recompute_book_risk(self) -> None:
         """Arm the portfolio-CVaR cap: build a fresh full-MC ``BookRiskSnapshot``
@@ -5219,6 +5297,10 @@ class QuoteLifecycle:
             # on real flow (the derive-before-arm rule).
             pbook_profile=self._pbook_profile,
             pbook_book_generation=self._exposure.position_generation,
+            # LEG-DIRECTION AXIS (2026-07-25): built from THIS quote-time
+            # snapshot (no staleness window); p_book only when the cached MC
+            # profile is generation-fresh (None ⇒ the component is neutral).
+            leg_axis_profile=self._leg_axis_profile_from(snap),
         )
         log.info(
             "inventory_skew_shadow",
@@ -5239,6 +5321,15 @@ class QuoteLifecycle:
             pbook_per_game=[
                 (game, adder, round(factor, 4), reason)
                 for game, adder, factor, reason in skew.pbook_per_game
+            ],
+            # LEG-DIRECTION AXIS (2026-07-25, shadow): the family/entity
+            # concentration components + full row decomposition — everything
+            # the arming decision reads.
+            family_cc=skew.family_cc,
+            entity_cc=skew.entity_cc,
+            leg_axis_rows=[
+                (key, adder, round(factor, 4), reason)
+                for key, adder, factor, reason in skew.leg_axis_rows
             ],
         )
         if skew.pbook_per_game:
@@ -5700,6 +5791,10 @@ class QuoteLifecycle:
             rfq_id=state.rfq.rfq_id,
             quote_id=state.quote_id,
             reason=str(reason),
+            # 2026-07-25 operator directive: a decline's audit line must NAME the
+            # bound that fired (the gate's detail string carries the specific
+            # budget + post-book numbers) — DECLINE_CANDIDATE_RISK alone is opaque.
+            detail=detail,
             waiver_attempted=waiver is not None,
             waiver_granted=bool(waiver is not None and waiver.get("granted")),
             waiver_worst_case_cc=(

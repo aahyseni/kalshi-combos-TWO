@@ -79,6 +79,8 @@ from combomaker.risk.exposure import (
     MarginalProvider,
     OpenPosition,
     analytic_leg_deltas,
+    leg_entity_key,
+    leg_family_key,
     mutex_directional_alignment_cc,
 )
 
@@ -154,6 +156,13 @@ class SkewParams:
     # measured — the derive-before-arm rule).
     pbook_enabled: bool = True
     pbook_armed: bool = False
+    # LEG-DIRECTION AXIS component (2026-07-25): same shadow-first pair.
+    # ``leg_axis_enabled`` computes + logs the family/entity concentration
+    # component; ``leg_axis_armed`` adds it into ``skew_cc``. The composed
+    # overall clamp below bounds the armed total exactly as for pbook (the
+    # documented two-pair range is never expanded).
+    leg_axis_enabled: bool = True
+    leg_axis_armed: bool = False
 
     def validate(self) -> None:
         if self.w_conc < 0.0 or self.w_off < 0.0:
@@ -229,6 +238,35 @@ class PBookProfile:
 
 
 @dataclass(frozen=True, slots=True)
+class LegAxisProfile:
+    """LEG-DIRECTION AXIS steering profile (operator directive 2026-07-25:
+    "the bot needs to recognize direction for all legs, and know when to
+    start raising its markups").
+
+    Built at QUOTE TIME by the lifecycle from the SAME exposure snapshot the
+    limits just read (no cache, no staleness window): the committed book's
+    premium-at-risk shares per (family × required side) and
+    (family:entity × required side) key — ``exposure.leg_family_key`` /
+    ``leg_entity_key``. This is the axis the per-game aggregation cannot see:
+    six short-K-over combos across six games concentrate under ONE family key
+    (``KXMLBKS:yes``) and one arm concentrates under ONE entity key
+    (``KXMLBKS:BOSSGRAY54:yes`` — every rung folds together).
+
+    ``budget_cc`` is the SAME enforced loss budget the P(book) axis divides
+    by (min(hard game $cap, game_loss_frac × bank, KILL frac × bank) —
+    published from the live bankroll, never a static dollar). ``p_book`` is
+    the cached MC P(book P&L > 0) when generation-fresh, None otherwise —
+    None fails the component to NEUTRAL (UNKNOWN never widens)."""
+
+    shares_by_family: dict[str, float]
+    total_family_cc: float
+    shares_by_entity: dict[str, float]
+    total_entity_cc: float
+    budget_cc: float
+    p_book: float | None
+
+
+@dataclass(frozen=True, slots=True)
 class GameSkewCache:
     """OPTIONAL slow-path per-game direction hint from the Phase-4 sim.
 
@@ -301,6 +339,16 @@ class InventorySkew:
     # rows: (game, adder_cc, factor, reason).
     pbook_cc: int = 0
     pbook_per_game: tuple[tuple[str, int, float, str], ...] = ()
+    # LEG-DIRECTION AXIS component (2026-07-25). ``family_cc`` prices the
+    # candidate against the book's (family × side) premium concentration
+    # (short K-overs everywhere), ``entity_cc`` against the (family:entity ×
+    # side) concentration (one pitcher's arm carrying $127 across combos).
+    # Each independently clamped to the peak caps; SHADOW-FIRST — included in
+    # ``skew_cc`` only when ``SkewParams.leg_axis_armed``. ``leg_axis_rows``
+    # mirrors the pbook debug rows: (key, adder_cc, factor, reason).
+    family_cc: int = 0
+    entity_cc: int = 0
+    leg_axis_rows: tuple[tuple[str, int, float, str], ...] = ()
 
     @property
     def applied_cc(self) -> int:
@@ -345,6 +393,7 @@ def compute_inventory_skew(
     peak_book_generation: int | None = None,
     pbook_profile: PBookProfile | None = None,
     pbook_book_generation: int | None = None,
+    leg_axis_profile: LegAxisProfile | None = None,
 ) -> InventorySkew:
     """Compute the inventory skew for ``candidate`` against the current book.
 
@@ -588,9 +637,18 @@ def compute_inventory_skew(
     pbook_cc, pbook_per_game = _pbook_component(
         pbook_input, params, pbook_profile, pbook_book_generation
     )
+    # LEG-DIRECTION AXIS component (2026-07-25): the candidate against the
+    # committed book's (family × side) / (entity × side) premium shares —
+    # the cross-game direction concentration the game axes cannot see.
+    # SHADOW-FIRST like pbook: computed + logged, added only when armed.
+    family_cc, entity_cc, leg_axis_rows = _leg_axis_component(
+        candidate, params, leg_axis_profile
+    )
     skew_cc = directional_cc + peak_cc
     if params.pbook_armed:
         skew_cc += pbook_cc
+    if params.leg_axis_armed:
+        skew_cc += family_cc + entity_cc
     # COMPOSED OVERALL CLAMP (2026-07-25 review): the documented SkewParams
     # bound [−(skew_max_tighten+peak_tighten), +(skew_max_widen+peak_widen)]
     # stays TRUE with the pbook component armed — pbook shares the documented
@@ -615,6 +673,9 @@ def compute_inventory_skew(
         peak_per_game=peak_per_game,
         pbook_cc=pbook_cc,
         pbook_per_game=pbook_per_game,
+        family_cc=family_cc,
+        entity_cc=entity_cc,
+        leg_axis_rows=leg_axis_rows,
     )
 
 
@@ -739,6 +800,120 @@ def _pbook_component(
         max(-params.peak_tighten_max_cc, min(params.peak_widen_max_cc, total))
     )
     return clamped, tuple(rows)
+
+
+def _leg_axis_side(
+    keys: Sequence[str],
+    shares: Mapping[str, float],
+    total_cc: float,
+    budget_cc: float,
+    need: float,
+    params: SkewParams,
+) -> tuple[int, list[tuple[str, int, float, str]]]:
+    """One axis (family OR entity) of the leg-direction component.
+
+    The same measured-only math as ``_pbook_component``, keyed by leg
+    direction instead of game:
+
+      deficit_k = (loss_share_k − 1/n) / (1 − 1/n) ∈ [−1, 1]  (n = book keys
+                  on this axis; n == 1 ⇒ ±1, the continuous limit)
+      onset_k   = min(1, share_k × total / budget)  — the caps-derived "when":
+                  the dollars riding this leg direction vs the tightest
+                  ENFORCED loss budget (never a hand constant)
+      need      = 1 − p_book (passed in; a healthy book barely steers)
+
+    A candidate leg key can only ADD to its own direction (sell-only: our
+    loss rides the leg's stated side), so — unlike the game axis — there is
+    no contribution-sign split: overweight key ⇒ WIDEN (convex in onset,
+    the house asymmetry), underweight/absent key ⇒ REBATE (linear, keyed on
+    the book-level onset — the diversifying direction has ~no own dollars).
+    The OPPOSITE direction of a loaded key is a DIFFERENT key (…:no vs
+    …:yes), lands underweight/absent, and earns the rebate — that is exactly
+    "reward the other side of the K-ladder"."""
+    if not shares:
+        return 0, [("*", 0, 0.0, "no_book")]
+    if budget_cc <= 0.0 or total_cc <= 0.0:
+        return 0, [("*", 0, 0.0, "no_budget")]
+    n = len(shares)
+    uniform = 1.0 / n
+    onset_book = min(1.0, max(shares.values()) * total_cc / budget_cc)
+    total = 0.0
+    rows: list[tuple[str, int, float, str]] = []
+    for key in keys:
+        share = shares.get(key, 0.0)
+        if n > 1:
+            deficit = (share - uniform) / (1.0 - uniform)
+        else:
+            deficit = 1.0 if share > 0.0 else -1.0
+        deficit = max(-1.0, min(1.0, deficit))
+        if deficit > 0.0:
+            onset_k = min(1.0, share * total_cc / budget_cc)
+            factor = deficit * need * (onset_k**params.gamma)
+            adder = int(round(params.peak_widen_max_cc * factor))
+            rows.append((key, adder, factor, "leg_concentrating"))
+        elif deficit < 0.0:
+            factor = abs(deficit) * need * onset_book
+            adder = -int(round(params.peak_tighten_max_cc * factor))
+            rows.append((key, adder, factor, "leg_diversifying"))
+        else:
+            adder = 0
+            rows.append((key, 0, 0.0, "balanced"))
+        total += adder
+    clamped = int(
+        max(-params.peak_tighten_max_cc, min(params.peak_widen_max_cc, total))
+    )
+    return clamped, rows
+
+
+def _leg_axis_component(
+    candidate: OpenPosition,
+    params: SkewParams,
+    profile: LegAxisProfile | None,
+) -> tuple[int, int, tuple[tuple[str, int, float, str], ...]]:
+    """LEG-DIRECTION AXIS component (2026-07-25): ``(family_cc, entity_cc,
+    rows)`` — the candidate priced against the committed book's (family ×
+    side) and (family:entity × side) premium concentration.
+
+    The profile is built at QUOTE TIME from the same exposure snapshot the
+    limits read, so there is no staleness window; ``p_book`` is None when the
+    cached MC profile was generation-stale — the component is then NEUTRAL
+    (UNKNOWN never widens). FAIL-SAFE: disabled / no profile / no p_book /
+    empty book / no budget ⇒ zeros. Pricing-only: never feeds ``per_game``,
+    so widen-vs-decline cannot decline on it."""
+    if not params.leg_axis_enabled or profile is None:
+        return 0, 0, ()
+    if profile.p_book is None:
+        return 0, 0, (("*", 0, 0.0, "no_p_book"),)
+    need = max(0.0, min(1.0, 1.0 - profile.p_book))
+    fam_keys: list[str] = []
+    ent_keys: list[str] = []
+    seen: set[str] = set()
+    for leg in candidate.legs:
+        fk = leg_family_key(leg)
+        if fk not in seen:
+            seen.add(fk)
+            fam_keys.append(fk)
+        ek = leg_entity_key(leg)
+        if ek not in seen:
+            seen.add(ek)
+            ent_keys.append(ek)
+    family_cc, fam_rows = _leg_axis_side(
+        fam_keys,
+        profile.shares_by_family,
+        profile.total_family_cc,
+        profile.budget_cc,
+        need,
+        params,
+    )
+    entity_cc, ent_rows = _leg_axis_side(
+        ent_keys,
+        profile.shares_by_entity,
+        profile.total_entity_cc,
+        profile.budget_cc,
+        need,
+        params,
+    )
+    return family_cc, entity_cc, tuple(fam_rows + ent_rows)
 
 
 def _peak_component(

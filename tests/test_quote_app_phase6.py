@@ -131,6 +131,9 @@ async def test_ensure_watched_skips_out_of_allowlist_combos(tmp_path: Path) -> N
         def peek(self, ticker: str) -> Any:
             return object()  # non-None ⇒ combo market not re-fetched
 
+        def needs_revalidation(self, ticker: str) -> bool:
+            return False  # cached entries are fresh in this stub
+
         async def market(self, ticker: str) -> Any:
             class _M:
                 event_ticker = None

@@ -2190,6 +2190,18 @@ class SkewConfig(StrictModel):
     # arm (the derive-before-arm rule).
     pbook_enabled: bool = True
     pbook_armed: bool = False
+    # LEG-DIRECTION AXIS steer (operator directive 2026-07-25: "the bot needs
+    # to recognize direction for all legs, and know when to start raising its
+    # markups"). ``leg_axis_enabled`` computes + logs the (family × side) /
+    # (entity × side) concentration component on every quote
+    # (risk/skew._leg_axis_component — magnitudes fully DERIVED: loss-share
+    # deviation from the uniform book × the P(book) deficit × the SAME
+    # caps-derived onset denominator the pbook axis divides by).
+    # ``leg_axis_armed`` is the SEPARATE arming switch — default OFF:
+    # shadow-measure a live slate, validate the logged family_cc/entity_cc
+    # distribution, THEN arm (the derive-before-arm rule).
+    leg_axis_enabled: bool = True
+    leg_axis_armed: bool = False
 
     @field_validator("w_conc", "w_off")
     @classmethod

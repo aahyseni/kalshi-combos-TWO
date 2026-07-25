@@ -32,7 +32,11 @@ from combomaker.exchange.rest import KalshiApiError, KalshiRestClient, RateLimit
 from combomaker.exchange.ws import WsManager
 from combomaker.marketdata.feed import OrderbookFeed
 from combomaker.marketdata.grid import PriceGrid
-from combomaker.marketdata.metadata import MarketMeta, MetadataCache
+from combomaker.marketdata.metadata import (
+    MarketMeta,
+    MetadataCache,
+    write_persist_payload,
+)
 from combomaker.marketdata.settled import MarketSource, SettledMarginalResolver
 from combomaker.ops.config import AppConfig, Env, Mode, RiskConfig
 from combomaker.ops.logging import configure_logging, get_logger
@@ -813,6 +817,11 @@ class QuoteApp:
         # a collection shares one grid, so we fetch it ONCE per collection and reuse
         # it (metadata.put_combo_grid) for every other combo of that collection.
         self._collection_grid: dict[str, PriceGrid] = {}
+        # PERSISTENT METADATA CACHE (2026-07-25): set at boot in run();
+        # the maintenance loop flushes ~every 60s when dirty (off-loop).
+        self._metadata_cache: MetadataCache | None = None
+        self._metadata_cache_path = str(config.data_dir / "metadata_cache.json")
+        self._metadata_persist_ticks = 0
         self._stop = asyncio.Event()
         # Phase 6 out-of-process safety plumbing. The heartbeat file is what the
         # external supervisor reads; the reconcile marker enforces
@@ -897,6 +906,15 @@ class QuoteApp:
         external = self._build_external_odds()
         async with KalshiRestClient(config.endpoints.rest_base_url, signer) as rest:
             metadata = MetadataCache(rest, self._clock)
+            # PERSISTENT METADATA CACHE (2026-07-25): warm boot from the last
+            # run's still-live markets — kills the boot 429 burst (2,319
+            # failed fetches in 36s at the 7/25 v6 boot) that left low-flow
+            # families (HR/HIT/TB/RBI) unpriceable until sparse RFQ flow
+            # re-healed them. peek() serves instantly; the async path still
+            # revalidates each loaded entry on first touch (TTL-expired
+            # stamps). Corrupt/missing file ⇒ cold boot, never an error.
+            self._metadata_cache = metadata
+            metadata.load_persisted(self._metadata_cache_path)
             engine = PricingEngine(
                 feed,
                 metadata,
@@ -1019,6 +1037,11 @@ class QuoteApp:
                 # validates + adversarial review).
                 pbook_enabled=skew_cfg.pbook_enabled,
                 pbook_armed=skew_cfg.pbook_armed,
+                # LEG-DIRECTION AXIS steer (2026-07-25): shadow-computed by
+                # default; ``pricing.skew.leg_axis_armed: true`` is the ONE
+                # flip that adds it into pricing (after its shadow slate).
+                leg_axis_enabled=skew_cfg.leg_axis_enabled,
+                leg_axis_armed=skew_cfg.leg_axis_armed,
             )
             skew_limits = SkewLimits(
                 max_event_delta_contracts=risk_cfg.max_event_delta_contracts,
@@ -2238,8 +2261,17 @@ class QuoteApp:
         # committed leg without metadata loses its pregame start resolution
         # (⇒ the in-play watch exemption silently stands down and the halt
         # storm returns). peek-None retries on every RFQ naming the leg.
+        # 2026-07-25 review (HIGH): a WARM-LOADED (persisted) entry makes
+        # peek() non-None, so the peek-only gate would NEVER revalidate it —
+        # a stale later close_time could feed the in-play gate for the
+        # market's whole life and blind the metadata-change breaker.
+        # needs_revalidation() (cached but TTL-expired) counts as a fetch
+        # miss: pricing stays warm off peek(), while one spaced async
+        # refresh per stale leg heals status/close/expiry.
         for ticker in rfq.leg_tickers:
-            if metadata.peek(ticker) is not None:
+            if metadata.peek(ticker) is not None and not metadata.needs_revalidation(
+                ticker
+            ):
                 continue
             try:
                 meta = await metadata.market(ticker)
@@ -2279,6 +2311,32 @@ class QuoteApp:
                 await lifecycle.maintenance_tick()
             except Exception:
                 log.exception("maintenance_tick_failed")
+            # PERSISTENT METADATA CACHE flush (2026-07-25): ~every 60s (120
+            # ticks × 0.5s) when new metadata arrived. The SNAPSHOT is built
+            # ON the loop (cheap dict walks — iterating the live dicts from a
+            # thread would race refresh()); only the file write runs off-loop
+            # (to_thread) so a slow disk can never stall pricing. Failure
+            # logs inside the writer and retries next interval.
+            self._metadata_persist_ticks += 1
+            if (
+                self._metadata_persist_ticks >= 120
+                and self._metadata_cache is not None
+                and self._metadata_cache.dirty
+            ):
+                self._metadata_persist_ticks = 0
+                try:
+                    payload = self._metadata_cache.build_persist_payload()
+                    written = await asyncio.to_thread(
+                        write_persist_payload, self._metadata_cache_path, payload
+                    )
+                    if written < 0:
+                        # Failed write: the dirty flag was cleared at
+                        # snapshot time — re-arm it so the next interval
+                        # retries (2026-07-25 review).
+                        self._metadata_cache.mark_dirty()
+                except Exception:
+                    log.exception("metadata_cache_persist_errored")
+                    self._metadata_cache.mark_dirty()
 
     async def _balance_loop(
         self, rest: KalshiRestClient, tracker: BalanceTracker
@@ -2465,8 +2523,14 @@ class QuoteApp:
         if new:
             self._watched.update(new)
             feed.watch(new)
+        # Same warm-cache revalidation rule as _ensure_watched (2026-07-25
+        # review HIGH): a persisted, TTL-expired entry counts as a fetch
+        # miss — a rehydrated COMMITTED leg's start/close resolution must
+        # come off fresh metadata, not last run's.
         for ticker in tickers:
-            if metadata.peek(ticker) is not None:
+            if metadata.peek(ticker) is not None and not metadata.needs_revalidation(
+                ticker
+            ):
                 continue
             try:
                 meta = await metadata.market(ticker)

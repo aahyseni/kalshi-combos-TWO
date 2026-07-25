@@ -101,6 +101,40 @@ class LegRef:
     side: str  # selected side, "yes"|"no" (validated upstream)
 
 
+def leg_family_key(leg: LegRef) -> str:
+    """LEG-DIRECTION AXIS key: ``SERIES:required-side`` (2026-07-25).
+
+    The series prefix (segment 0 of the market ticker — ``KXMLBKS``,
+    ``KXMLBGAME``, ``KXMLBHR``…) is the leg's market FAMILY; the leg's required
+    side is its DIRECTION (sell-only: we lose the combo's premium only if every
+    leg resolves its stated side, so premium attributed to ``KXMLBKS:yes``
+    means "money riding strikeout OVERS hitting"). A book short K-overs in six
+    combos across six games concentrates under this ONE key — the axis the
+    per-game aggregation is structurally blind to (the 7/25 K-ladder book)."""
+    return f"{leg.market_ticker.split('-', 1)[0]}:{leg.side}"
+
+
+def leg_entity_key(leg: LegRef) -> str:
+    """LEG-DIRECTION AXIS key: ``SERIES:ENTITY:required-side`` (2026-07-25).
+
+    ENTITY = ticker segment 2 when present (the player/team code —
+    ``KXMLBKS-26JUL251610TORBOS-BOSSGRAY54-3`` → ``BOSSGRAY54``; rung/strike
+    segment 3 drops out, so every rung of one player's ladder folds into ONE
+    key), else segment 1 (game-scoped series like ``KXMLBRFI-…LAASF``), else
+    the whole ticker (unknown shape — never silently dropped). Raw segments
+    verified against live tickers 2026-07-25; VISIBILITY/steer axis only —
+    no cap binds on this parse, so an odd shape degrades to a coarser key,
+    never to a wrong refusal."""
+    parts = leg.market_ticker.split("-")
+    if len(parts) >= 3:
+        entity = parts[2]
+    elif len(parts) == 2:
+        entity = parts[1]
+    else:
+        entity = leg.market_ticker
+    return f"{parts[0]}:{entity}:{leg.side}"
+
+
 def leg_set_hash(legs: Iterable[LegRef]) -> str:
     """Stable, order-independent identity of a combo's leg SET for the durable
     position ledger (P1.10). Two positions are the same combo iff their sets of
@@ -557,6 +591,20 @@ class ExposureSnapshot:
     committed_dir_entries_by_game: dict[str, list[DirEntry]] = field(
         default_factory=dict
     )
+    # LEG-DIRECTION AXIS (2026-07-25 operator directive: "the bot needs to
+    # recognize direction for ALL legs" — the K-ladder blind spot: P0-9 nets
+    # only moneyline-family ME events, so six same-direction strikeout-over
+    # combos across six games looked directionless). COMMITTED premium-at-risk
+    # attributed to every leg (family × required side) and (family:entity ×
+    # required side) key — see ``leg_family_key`` / ``leg_entity_key``. Full
+    # combo loss attributed to EACH of its leg keys (comonotone, the same
+    # convention as the per-game loss attribution), deduped per position per
+    # key (two rungs of one player's ladder in one combo count its loss once).
+    # Committed positions ONLY — no resting quotes, no candidates: this is the
+    # book we actually hold, the measured input of the leg-axis steer and the
+    # ``leg_axis_exposure`` visibility event.
+    committed_loss_by_family_cc: dict[str, int] = field(default_factory=dict)
+    committed_loss_by_entity_cc: dict[str, int] = field(default_factory=dict)
 
     # --- back-compat aliases (old event-keyed names; now game-keyed data) ------
     # The pre-B2 field names ``delta_by_event`` / ``worst_case_loss_by_event_cc``
@@ -1174,6 +1222,10 @@ class ExposureBook:
         # ACCUMULATED per-combo-market loss (2026-07-25 re-hit fix): committed
         # + candidates/reservations only — see the ExposureSnapshot field.
         loss_combo: dict[str, int] = defaultdict(int)
+        # LEG-DIRECTION AXIS (2026-07-25): committed-only loss attribution per
+        # (family × side) and (family:entity × side) — see the snapshot fields.
+        loss_family: dict[str, int] = defaultdict(int)
+        loss_entity: dict[str, int] = defaultdict(int)
         gross_cc = 0
         unknown = False
 
@@ -1183,6 +1235,17 @@ class ExposureBook:
             is_committed = i < n_committed
             gross_cc += position.max_loss_cc
             loss_combo[position.combo_ticker] += position.max_loss_cc
+            if is_committed:
+                seen_keys: set[str] = set()
+                for leg in position.legs:
+                    fk = leg_family_key(leg)
+                    if fk not in seen_keys:
+                        seen_keys.add(fk)
+                        loss_family[fk] += position.max_loss_cc
+                    ek = leg_entity_key(leg)
+                    if ek not in seen_keys:
+                        seen_keys.add(ek)
+                        loss_entity[ek] += position.max_loss_cc
             # P0-4: a CONSERVATIVELY-RESERVED holding (risk_modeled=False) has no
             # available marginals — we do NOT even query them (so a missing
             # marginal is never turned into an ordinary usable p=0.5). Its exact
@@ -1473,6 +1536,8 @@ class ExposureBook:
             delta_by_game=dict(delta_game),
             gross_notional_cc=gross_cc,
             loss_by_combo_cc=dict(loss_combo),
+            committed_loss_by_family_cc=dict(loss_family),
+            committed_loss_by_entity_cc=dict(loss_entity),
             worst_case_loss_by_game_cc=game_worst,
             gross_settlement_notional_by_game_cc=dict(game_notional),
             directional_by_game_cc=game_directional,
