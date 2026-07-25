@@ -26,11 +26,11 @@ foreach ($hb in @("data\heartbeat.txt", "data\supervisor_heartbeat.txt")) {
     }
 }
 # A KILL file blocks startup BY DESIGN (real halt or supervisor emergency).
-# Never silently delete it — show it and ask. The needs_reconcile marker is
+# Never silently delete it - show it and ask. The needs_reconcile marker is
 # left alone: the bot reconciles against the exchange at boot and clears it
 # itself.
 if (Test-Path "KILL") {
-    Write-Host "A KILL file is present — the bot refuses to start with it:" -ForegroundColor Red
+    Write-Host "A KILL file is present - the bot refuses to start with it:" -ForegroundColor Red
     Get-Content "KILL" | ForEach-Object { Write-Host "   $_" -ForegroundColor Red }
     $ans = Read-Host "Reviewed and ready to relight? Delete the KILL file and start? (y/n)"
     if ($ans -ne "y") {

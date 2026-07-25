@@ -4,7 +4,7 @@ param([Parameter(Mandatory = $true)][string]$Log)
 
 $host.UI.RawUI.WindowTitle = "MONITOR (main) - $Log"
 # Boot events included (2026-07-25: four silent windows read as "nothing is
-# going on" — the monitor must SHOW the bot coming up, then go quiet-unless-
+# going on" - the monitor must SHOW the bot coming up, then go quiet-unless-
 # eventful).
 $boot = 'supervisor_starting|supervisor_launched|supervisor_heartbeat_wedged|supervisor_emergency_kill|kill_file_present|needs_reconcile_marker|quote_app_starting|prod_preflight_green|metadata_cache_loaded|ws_connected|communications_subscribed|exposure_rehydrated|rehydrated_legs_armed|startup_reconciled|account_standing'
 $pattern = "halted|kill_switch|quote_executed_msg|fill_recovery_late|fill_recovery_quote_cancelled|fills_ledger_missing|fills_ledger_sweep_summary|hard_trip|give_back|Traceback|CRITICAL|preflight_fail|supervisor_killed|ACCUMULATED|`"phase`": `"decline`"|waiver_granted|lastlook_waiver_retry|HALT|$boot"
