@@ -52,6 +52,14 @@ class RfqFilter:
         # pregame precision ladder; the gate owns the M_q/M_c margin split.
         self._pregame = PregameGate(config, metadata, clock, schedule)
 
+    @property
+    def inplay_shadow_enabled(self) -> bool:
+        """In-play shadow instrumentation flag (FiltersConfig.
+        inplay_shadow_enabled). Read by the lifecycle's skip path — the flag
+        lives on FiltersConfig because it is a property of the SAME pregame
+        gate whose declines it measures. Measurement only; never a quote."""
+        return self._config.inplay_shadow_enabled
+
     def evaluate(self, rfq: Rfq) -> list[ReasonCode]:
         """Empty list = quotable. Uses only in-memory state (hot-path safe)."""
         reasons: list[ReasonCode] = []

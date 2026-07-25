@@ -251,6 +251,17 @@ class FiltersConfig(StrictModel):
     # WITHOUT code changes; the market-motion detector (risk/inplay.py) and
     # min_time_to_close_s stay active regardless. See rfq/pregame.py.
     allow_inplay_legs: bool = False
+    # IN-PLAY SHADOW INSTRUMENTATION (2026-07-25, measurement only — NO quote
+    # is ever sent). The pregame-only gate kills ~$1.15M of RFQ flow per
+    # evening (measured 2026-07-25); before EVER arming in-play quoting we
+    # must MEASURE in-play adverse selection. When true, an RFQ skipped SOLELY
+    # for in-play reasons (skip_inplay_leg, ± skip_in_play) is additionally
+    # priced via the live engine with in_play=True and the would-be quote is
+    # recorded to the would_quotes_inplay table; the skip itself is unchanged.
+    # Throughput-isolated (only when the RFQ work queue is idle, single-flight)
+    # and failure-isolated (any error logs inplay_shadow_errored and never
+    # touches the skip decision). Default False = byte-identical behaviour.
+    inplay_shadow_enabled: bool = False
     # Estimate offset (hours) for chain (b). The LIVE-GATE default is 4.5h —
     # deliberately larger than the backtest harnesses' soccer 2.5h: measured
     # 2026-07-10 on real WC markets, expected_expiration lands 2.95-3.95h

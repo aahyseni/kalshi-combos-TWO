@@ -79,6 +79,30 @@ CREATE TABLE IF NOT EXISTS would_quotes (
 );
 CREATE INDEX IF NOT EXISTS idx_would_quotes_rfq ON would_quotes (rfq_id);
 
+-- IN-PLAY SHADOW (2026-07-25, measurement only — no quote is ever sent).
+-- One row per in-play-skipped RFQ the shadow priced: the would-be quote the
+-- pregame gate declined, for the in-play adverse-selection study that gates
+-- ever arming in-play quoting. Kept SEPARATE from would_quotes: that table's
+-- schema (fair_prob/width/leg_probs, no bids/ticker/sizing/leg timing) is the
+-- Phase-2 observe shape and lacks every column this measurement needs.
+-- leg_time_to_start_s_json: {leg_ticker: seconds to scheduled start} from the
+-- SAME pregame ladder that produced the skip — NEGATIVE = seconds INTO the
+-- game (the depth axis of the study); null = that leg's start UNKNOWN.
+CREATE TABLE IF NOT EXISTS would_quotes_inplay (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL,
+    rfq_id TEXT NOT NULL,
+    market_ticker TEXT NOT NULL,
+    fair_cc INTEGER NOT NULL,
+    yes_bid_cc INTEGER NOT NULL,
+    no_bid_cc INTEGER NOT NULL,
+    target_cost_cc INTEGER,
+    contracts_centi INTEGER,
+    leg_time_to_start_s_json TEXT NOT NULL,
+    context_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_would_quotes_inplay_rfq ON would_quotes_inplay (rfq_id);
+
 CREATE TABLE IF NOT EXISTS fills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     at TEXT NOT NULL,
@@ -464,6 +488,45 @@ class Store:
         )
         await self._db.commit()
 
+    async def record_would_quote_inplay(
+        self,
+        rfq_id: str,
+        *,
+        market_ticker: str,
+        fair_cc: int,
+        yes_bid_cc: int,
+        no_bid_cc: int,
+        target_cost_cc: int | None,
+        contracts_centi: int | None,
+        leg_time_to_start_s: dict[str, float | None],
+        context: JsonDict,
+    ) -> None:
+        """One in-play shadow row (measurement tape, 2026-07-25): the would-be
+        quote on an RFQ skipped SOLELY for in-play reasons. Money is int
+        centi-cents; ``leg_time_to_start_s`` maps each leg ticker to seconds
+        until its scheduled start (NEGATIVE = seconds into the game; None =
+        UNKNOWN). Goes through the non-critical ``_write`` tape path — with
+        the background writer running it enqueues (drop-on-overflow) and can
+        never block or delay the hot pricing path (fix isolation)."""
+        await self._write(
+            "INSERT INTO would_quotes_inplay (at, rfq_id, market_ticker,"
+            " fair_cc, yes_bid_cc, no_bid_cc, target_cost_cc, contracts_centi,"
+            " leg_time_to_start_s_json, context_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                self._now(),
+                rfq_id,
+                market_ticker,
+                fair_cc,
+                yes_bid_cc,
+                no_bid_cc,
+                target_cost_cc,
+                contracts_centi,
+                json.dumps(leg_time_to_start_s),
+                json.dumps(context),
+            ),
+        )
+
     async def record_structural_fit(
         self,
         *,
@@ -829,6 +892,7 @@ class Store:
             "rfq_deletions",
             "decisions",
             "would_quotes",
+            "would_quotes_inplay",
             "fills",
             "markouts",
             "ev_ledger",

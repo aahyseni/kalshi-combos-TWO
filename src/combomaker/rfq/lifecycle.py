@@ -322,6 +322,25 @@ _REPRICE_SWEEP_BUDGET_S = 2.5
 # re-checked at anyway.
 _PRE_GATE_CACHE_TTL_S = 0.5
 
+# IN-PLAY SHADOW eligibility (2026-07-25): the reason set an RFQ may carry to
+# count as skipped SOLELY for being in-play. SKIP_INPLAY_LEG is the schedule
+# gate (required); SKIP_IN_PLAY is the close-time proximity proxy that fires
+# ALONGSIDE it once a game is deep enough in-play (MLB close = start+3h, the
+# 1h min_time_to_close bar trips ~2h in). Any reason outside this set means
+# the RFQ would have been declined even with in-play quoting armed, so pricing
+# it would poison the adverse-selection measurement.
+_INPLAY_ONLY_SKIPS = frozenset(
+    {ReasonCode.SKIP_INPLAY_LEG, ReasonCode.SKIP_IN_PLAY}
+)
+
+# IN-PLAY SHADOW recorded-RFQ dedupe cap (a MEMORY bound, not a behaviour
+# knob): quote_app's pending-retry loop re-runs handle_rfq up to 5x per RFQ
+# within ~2s, and each re-skip would re-shadow an idle-pool RFQ into duplicate
+# rows. One row per rfq_id: recorded ids are remembered insertion-ordered and
+# evicted FIFO past this cap (the standing 4096 cache-cap precedent — an
+# eviction can only ever cost a duplicate row, never a wrong number).
+_INPLAY_SHADOW_DEDUPE_CAP = 4096
+
 
 @dataclass(frozen=True, slots=True)
 class LifecycleConfig:
@@ -860,6 +879,21 @@ class QuoteLifecycle:
         # None (backtests / tests) ⇒ no liveness view ⇒ behaviour identical to
         # today. Wired in BOTH paper and quote modes (additive skips only).
         self._rfq_alive = rfq_alive
+        # IN-PLAY SHADOW (2026-07-25, measurement only): the RFQ work queue's
+        # depth probe (quote_app attaches ``rfq_work.qsize`` post-construction,
+        # the attach_reservation pattern — the queue is created after this
+        # lifecycle). The shadow prices an in-play-skipped RFQ ONLY when this
+        # reads 0 (no queued live work to delay); None (tests/backtests/paper
+        # rigs without the pool) reads as idle — the shadow is measurement-only
+        # and cannot affect quoting there. ``_inplay_shadow_inflight`` is the
+        # single-flight guard: at most ONE shadow pricing ever runs at a time.
+        self._rfq_backlog_depth: Callable[[], int] | None = None
+        self._inplay_shadow_inflight = False
+        # rfq_ids already RECORDED by the shadow (insertion-ordered, FIFO-
+        # evicted at _INPLAY_SHADOW_DEDUPE_CAP): the pending-retry loop re-runs
+        # handle_rfq on skipped RFQs, and one RFQ must yield ONE row. Marked
+        # only on a successful record, so a warming-book NoQuote may retry.
+        self._inplay_shadow_done: dict[str, None] = {}
         # SETTLED-LEG MARGINAL RESOLUTION (2026-07-18 live outage: FRAENG
         # settled while cross-game combos with FRAENG legs stayed open — the
         # settled legs' feed books were gone, so build_book_model went UNKNOWN
@@ -929,6 +963,13 @@ class QuoteLifecycle:
         this lifecycle's shadow splitter, and this lifecycle needs the service —
         break the cycle by attaching post-construction). Set once."""
         self._reservation = reservation
+
+    def attach_rfq_backlog_probe(self, probe: Callable[[], int]) -> None:
+        """Wire the RFQ work queue's depth probe in AFTER construction (the
+        queue is created inside quote_app.run, after this lifecycle exists —
+        the attach_reservation pattern). The in-play shadow's throughput gate:
+        it prices only when this reads 0 (the pool is provably idle)."""
+        self._rfq_backlog_depth = probe
 
     def _risk_bankroll_cc(self) -> int | None:
         """The live risk-capital denominator in cc for the %-of-bankroll caps,
@@ -2876,6 +2917,9 @@ class QuoteLifecycle:
         reasons = self._filter.evaluate(rfq)
         if reasons:
             await self._record_skip(rfq, reasons, self._pregame_flow_context(rfq, reasons))
+            # IN-PLAY SHADOW (2026-07-25): AFTER the skip is durably recorded —
+            # measurement only, exception-proof, can never touch the decision.
+            await self._maybe_shadow_inplay(rfq, reasons)
             return
         # F1 monotone pre-pricing gate (default OFF = today's behaviour). A
         # candidate-monotone cap already breached WITHOUT this RFQ means the
@@ -5445,18 +5489,21 @@ class QuoteLifecycle:
         return stats
 
     def _price(
-        self, rfq: Rfq, *, inventory_skew_cc: int = 0
+        self, rfq: Rfq, *, inventory_skew_cc: int = 0, force_in_play: bool = False
     ) -> ConstructedQuote | NoQuote:
         time_to_close = self._min_time_to_close_s(rfq)
         return self._engine.price(
             rfq,
             time_to_close_s=time_to_close if time_to_close is not None else -1.0,
-            in_play=self._inplay.any_anomalous(list(rfq.leg_tickers)),
+            # force_in_play: the in-play SHADOW path (a leg is KNOWN started —
+            # the schedule gate said so) prices with the engine's in-play
+            # treatment regardless of the motion detector's read.
+            in_play=force_in_play or self._inplay.any_anomalous(list(rfq.leg_tickers)),
             inventory_skew_cc=inventory_skew_cc,
         )
 
     async def _price_async(
-        self, rfq: Rfq, *, inventory_skew_cc: int = 0
+        self, rfq: Rfq, *, inventory_skew_cc: int = 0, force_in_play: bool = False
     ) -> ConstructedQuote | NoQuote:
         """Async pricing for the hot RFQ path. With a joint pool configured the
         expensive joint step runs off-loop with a deadline (warm memo hits stay
@@ -5464,13 +5511,16 @@ class QuoteLifecycle:
         ``_price`` — the pool runs the same pure joint code (pool_parity_check).
         A deadline breach or worker error is a fail-closed decline (no wedge)."""
         if self._joint_pool is None:
-            return self._price(rfq, inventory_skew_cc=inventory_skew_cc)
+            return self._price(
+                rfq, inventory_skew_cc=inventory_skew_cc, force_in_play=force_in_play
+            )
         time_to_close = self._min_time_to_close_s(rfq)
         try:
             return await self._engine.price_offloaded(
                 rfq,
                 time_to_close_s=time_to_close if time_to_close is not None else -1.0,
-                in_play=self._inplay.any_anomalous(list(rfq.leg_tickers)),
+                in_play=force_in_play
+                or self._inplay.any_anomalous(list(rfq.leg_tickers)),
                 inventory_skew_cc=inventory_skew_cc,
                 run_joint=self._joint_pool.run_joint,
             )
@@ -6026,6 +6076,111 @@ class QuoteLifecycle:
         await self._store.record_decision(
             "no_quote", rfq.rfq_id, [str(r) for r in reasons], context
         )
+
+    async def _maybe_shadow_inplay(
+        self, rfq: Rfq, reasons: list[ReasonCode]
+    ) -> None:
+        """IN-PLAY SHADOW INSTRUMENTATION (2026-07-25; measurement ONLY — no
+        quote is ever sent, the skip already happened and is already recorded).
+
+        Fires only when EVERY skip reason is in-play (``skip_inplay_leg``
+        present, optionally accompanied by the close-time proxy
+        ``skip_in_play`` — for MLB close = start+3h, so a game deep enough
+        in-play trips both). Any OTHER reason (thin book, size, stale feed,
+        halt, UNKNOWNs) means the RFQ would have been declined even with
+        in-play quoting armed — pricing it would poison the measurement.
+
+        THROUGHPUT ISOLATION (hard requirement — shadow work must never delay
+        live pregame pricing). Bounded by the pool's own MEASURED state, not a
+        hand-tuned sample rate (north star: a number a human must move is a
+        bug):
+        - queue-idle gate: prices only when the RFQ work queue depth reads 0
+          (``attach_rfq_backlog_probe`` ← quote_app's ``rfq_work.qsize``). By
+          construction there is zero queued live work to delay; an evening
+          in-play burst — exactly when live pregame flow is also heaviest —
+          suppresses the shadow entirely instead of competing with it.
+        - single-flight: at most ONE shadow pricing in flight process-wide, so
+          shadow occupancy is bounded at 1 of the 8 RFQ workers and 1 of the 8
+          joint-pool slots even if a burst of in-play skips lands on many
+          workers at once.
+        - per-pricing bound: the shadow prices via ``_price_async``, so in live
+          quote mode the joint runs off-loop under the SAME pool deadline as
+          live pricing (a cold in-play joint can never wedge the event loop).
+        Skipped samples are counted (``inplay_shadow.skipped_*``) and every
+        in-play skip is on the decisions tape regardless, so measurement
+        coverage (rows / eligible skips) stays computable — sampling density
+        adapts to live load instead of a static 1-in-N.
+
+        FAILURE ISOLATION: the entire body is exception-proof — any error logs
+        ``inplay_shadow_errored`` and returns; the skip decision (already
+        recorded by the caller) is untouched."""
+        try:
+            if not self._filter.inplay_shadow_enabled:
+                return  # default OFF: byte-identical behaviour
+            rs = set(reasons)
+            if ReasonCode.SKIP_INPLAY_LEG not in rs or not rs <= _INPLAY_ONLY_SKIPS:
+                return
+            if rfq.rfq_id in self._inplay_shadow_done:
+                return  # pending-retry re-skip: one recorded row per RFQ
+            if self._inplay_shadow_inflight:
+                self._metrics.inc("inplay_shadow.skipped_busy")
+                return
+            if self._rfq_backlog_depth is not None and self._rfq_backlog_depth() > 0:
+                self._metrics.inc("inplay_shadow.skipped_backlog")
+                return
+            self._inplay_shadow_inflight = True
+            try:
+                await self._shadow_price_inplay(rfq, reasons)
+            finally:
+                self._inplay_shadow_inflight = False
+        except Exception:
+            self._metrics.inc("inplay_shadow.errored")
+            log.exception("inplay_shadow_errored", rfq_id=rfq.rfq_id)
+
+    async def _shadow_price_inplay(
+        self, rfq: Rfq, reasons: list[ReasonCode]
+    ) -> None:
+        """Price the in-play-skipped RFQ with the LIVE engine (in_play=True)
+        and record the would-be quote to ``would_quotes_inplay``. Per-leg
+        time-to-start comes from the SAME pregame ladder that produced the
+        skip (negative = seconds INTO the game — the depth axis of the
+        adverse-selection study); a leg with UNKNOWN start records null."""
+        result = await self._price_async(rfq, force_in_play=True)
+        if isinstance(result, NoQuote):
+            # The engine itself declined (books moved, deadline, …): count it —
+            # it is the "we could not even price this in-play" bucket.
+            self._metrics.inc("inplay_shadow.noquote")
+            return
+        now = self._clock.now().astimezone(UTC)
+        leg_tts: dict[str, float | None] = {}
+        for leg in rfq.legs:
+            start = self._filter.leg_start_time(leg.market_ticker)
+            leg_tts[leg.market_ticker] = (
+                None
+                if start is None
+                else round((start.astimezone(UTC) - now).total_seconds(), 1)
+            )
+        await self._store.record_would_quote_inplay(
+            rfq.rfq_id,
+            market_ticker=rfq.market_ticker,
+            fair_cc=int(result.fair_cc),
+            yes_bid_cc=int(result.yes_bid_cc),
+            no_bid_cc=int(result.no_bid_cc),
+            target_cost_cc=(
+                None if rfq.target_cost_cc is None else int(rfq.target_cost_cc)
+            ),
+            contracts_centi=None if rfq.contracts is None else int(rfq.contracts),
+            leg_time_to_start_s=leg_tts,
+            context={
+                "collection": rfq.mve_collection_ticker,
+                "width_cc": int(result.total_width_cc),
+                "skip_reasons": [str(r) for r in reasons],
+            },
+        )
+        self._inplay_shadow_done[rfq.rfq_id] = None
+        while len(self._inplay_shadow_done) > _INPLAY_SHADOW_DEDUPE_CAP:
+            del self._inplay_shadow_done[next(iter(self._inplay_shadow_done))]
+        self._metrics.inc("inplay_shadow.recorded")
 
     async def _record_confirm_decision(
         self,

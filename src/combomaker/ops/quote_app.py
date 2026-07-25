@@ -1423,6 +1423,14 @@ class QuoteApp:
             RFQ_MAX_QUEUE_DWELL_S = 1.5
             RFQ_RETRY_WINDOW_S = 2.0     # stop retrying a pending RFQ once it's this old
             rfq_work: asyncio.Queue[tuple[Rfq, int]] = asyncio.Queue(maxsize=RFQ_QUEUE_MAX)
+            # IN-PLAY SHADOW throughput isolation (2026-07-25): the lifecycle's
+            # measurement-only shadow pricer (filters.inplay_shadow_enabled,
+            # default OFF) may price an in-play-skipped RFQ ONLY while this
+            # queue is idle (qsize == 0 ⇒ zero queued live RFQs to delay); the
+            # bound is the pool's own measured state, not a hand-tuned sample
+            # rate. Attached post-construction because the queue is created
+            # here, after the lifecycle (the attach_reservation pattern).
+            lifecycle.attach_rfq_backlog_probe(rfq_work.qsize)
 
             async def handle_rfq(rfq: Rfq, recv_mono: int) -> None:
                 # RECORD-AFTER-PRICE FAST-LANE (2026-07-16 B6): pricing first,
