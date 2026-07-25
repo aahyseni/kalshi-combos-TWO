@@ -135,6 +135,19 @@ class SkewParams:
     peak_enabled: bool = True
     peak_widen_max_cc: int = 600
     peak_tighten_max_cc: int = 150
+    # --- P(BOOK) STEER, Phase B1 (operator directive 2026-07-25: "Pbook
+    # should be steering our betting, more variance = higher Pbook") --------
+    # A THIRD additive classifier component fed by the cached P(book)
+    # concentration profile (published off the book-risk snapshot). Fully
+    # DERIVED from measured state — tail-share deviation from the uniform
+    # 1/G book × the P(book) deficit (1 − p_book) — reusing the DOCUMENTED
+    # peak hard caps as its outer bounds (no new tuning number).
+    # ``pbook_enabled`` computes + logs the component; ``pbook_armed`` is the
+    # SEPARATE switch that adds it into ``skew_cc`` (default OFF = pure
+    # shadow: pricing byte-identical while the live magnitude distribution is
+    # measured — the derive-before-arm rule).
+    pbook_enabled: bool = True
+    pbook_armed: bool = False
 
     def validate(self) -> None:
         if self.w_conc < 0.0 or self.w_off < 0.0:
@@ -169,6 +182,24 @@ class SkewLimits:
     max_event_delta_contracts: float
     max_event_worst_case_loss_dollars: float
     max_event_gross_notional_dollars: float
+
+
+@dataclass(frozen=True, slots=True)
+class PBookProfile:
+    """Cached committed-book P(book) concentration profile (2026-07-25).
+
+    Published OFF the hot path from every accepted book-risk snapshot
+    (``lifecycle._publish_book_risk``): the book's P(P&L > 0) under the
+    production MC, and each game's SHARE of the tail loss
+    (``per_game_tail_cc`` normalized — the additive CVaR decomposition, so
+    shares sum to ~1 over games with tail presence). A perfectly diversified
+    G-game book has share ≈ 1/G per game; the deviation IS the measured
+    concentration, so the steer needs no target number. Generation-stamped:
+    stale ⇒ the component is a hard ZERO (the peak-profile discipline)."""
+
+    input_generation: int
+    p_book: float
+    tail_share_by_game: dict[str, float]
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +266,15 @@ class InventorySkew:
     peak_widen_cc: int = 0
     peak_tighten_cc: int = 0
     peak_per_game: tuple[tuple[str, int, float, str], ...] = ()
+    # P(BOOK) STEER component, Phase B1 (2026-07-25). ``pbook_cc`` is the
+    # CLAMPED signed component (classifier convention: >= 0 widens a
+    # same-way add on an overweight game, <= 0 rebates variance-adding /
+    # offsetting flow). SHADOW-FIRST: included in ``skew_cc`` ONLY when
+    # ``SkewParams.pbook_armed`` — until then it is computed + logged and
+    # pricing is byte-identical. ``pbook_per_game`` mirrors the peak debug
+    # rows: (game, adder_cc, factor, reason).
+    pbook_cc: int = 0
+    pbook_per_game: tuple[tuple[str, int, float, str], ...] = ()
 
     @property
     def applied_cc(self) -> int:
@@ -277,6 +317,8 @@ def compute_inventory_skew(
     is_me_event: Callable[[str], bool | None] | None = None,
     peak_profile: PeakProfile | None = None,
     peak_book_generation: int | None = None,
+    pbook_profile: PBookProfile | None = None,
+    pbook_book_generation: int | None = None,
 ) -> InventorySkew:
     """Compute the inventory skew for ``candidate`` against the current book.
 
@@ -506,7 +548,16 @@ def compute_inventory_skew(
     peak_widen_cc, peak_tighten_cc, peak_cc, peak_per_game = _peak_component(
         candidate, params, limits, peak_profile, peak_book_generation
     )
+    # P(BOOK) STEER component, Phase B1 (2026-07-25): computed from the
+    # per-game contributions the loop above already classified — SHADOW by
+    # default (pbook_armed=False keeps skew_cc byte-identical while the live
+    # magnitude distribution is measured).
+    pbook_cc, pbook_per_game = _pbook_component(
+        per_game, params, pbook_profile, pbook_book_generation
+    )
     skew_cc = directional_cc + peak_cc
+    if params.pbook_armed:
+        skew_cc += pbook_cc
 
     return InventorySkew(
         skew_cc=skew_cc,
@@ -519,7 +570,92 @@ def compute_inventory_skew(
         peak_widen_cc=peak_widen_cc,
         peak_tighten_cc=peak_tighten_cc,
         peak_per_game=peak_per_game,
+        pbook_cc=pbook_cc,
+        pbook_per_game=pbook_per_game,
     )
+
+
+def _pbook_component(
+    per_game: Sequence[tuple[str, int]],
+    params: SkewParams,
+    profile: PBookProfile | None,
+    book_generation: int | None,
+) -> tuple[int, tuple[tuple[str, int, float, str], ...]]:
+    """The P(book) steering component (operator directive 2026-07-25: P(book)
+    steers the betting; more variance/diversity = higher P(book)).
+
+    Inputs are all MEASURED — no target number exists anywhere:
+      deficit_g = (tail_share_g − 1/G) / (1 − 1/G)   ∈ [−1, 1]
+                  (0 on a perfectly diversified G-game book — deviation from
+                  uniformity IS the concentration; G = games with tail
+                  presence in the cached profile)
+      need      = 1 − p_book                          ∈ [0, 1]
+                  (a book already winning 90% of nights barely steers; the
+                  7/23 one-way 0.40 book steers hard)
+      factor    = |deficit_g| × need
+
+    Per candidate game, using the directional loop's OWN classification
+    (``per_game`` contribution sign — concentrating > 0, offsetting < 0):
+      - same-way add on an OVERWEIGHT game (deficit > 0, contrib > 0) ⇒
+        WIDEN  +peak_widen_max_cc × factor  (the DET shape pays)
+      - offsetting an OVERWEIGHT game (deficit > 0, contrib < 0) ⇒
+        REBATE −peak_tighten_max_cc × factor (the missing other side earns)
+      - ANY flow on an UNDERWEIGHT game (deficit < 0) ⇒
+        REBATE −peak_tighten_max_cc × factor (a different game IS variance —
+        game-level diversification regardless of side)
+      - deficit == 0 / no tail share / neutral contribution ⇒ 0
+
+    Outer bounds REUSE the documented peak hard caps (hard safety, not
+    tuning — no new number); the free-money clamp in construct_quote remains
+    the final bound when armed. FAIL-SAFE: profile absent / generation-stale
+    / disabled ⇒ EXACTLY 0 (neutral; UNKNOWN can never widen). Pricing-only
+    by construction: never feeds ``per_game``, so widen-vs-decline cannot
+    decline on it."""
+    if not params.pbook_enabled or profile is None:
+        return 0, ()
+    if book_generation is None or profile.input_generation != book_generation:
+        return 0, (("*", 0, 0.0, "stale_profile"),)
+    shares = profile.tail_share_by_game
+    if not shares:
+        return 0, (("*", 0, 0.0, "no_tail"),)
+    n = len(shares)
+    uniform = 1.0 / n
+    need = max(0.0, min(1.0, 1.0 - profile.p_book))
+    total = 0.0
+    rows: list[tuple[str, int, float, str]] = []
+    for game, contrib_cc in per_game:
+        share = shares.get(game)
+        if share is None:
+            # A game with NO tail presence at all: maximally underweight —
+            # flow here is pure game-level diversification.
+            share = 0.0
+        deficit = (
+            (share - uniform) / (1.0 - uniform) if n > 1
+            else (1.0 if share > 0.0 else 0.0)
+        )
+        deficit = max(-1.0, min(1.0, deficit))
+        factor = abs(deficit) * need
+        if deficit > 0.0 and contrib_cc > 0:
+            adder = int(round(params.peak_widen_max_cc * factor))
+            rows.append((game, adder, factor, "pbook_concentrating"))
+        elif deficit > 0.0 and contrib_cc < 0:
+            adder = -int(round(params.peak_tighten_max_cc * factor))
+            rows.append((game, adder, factor, "pbook_offsetting"))
+        elif deficit < 0.0:
+            # ANY flow on an underweight game — including the directional
+            # loop's neutral contrib on an EMPTY-book game (a brand-new game
+            # is the purest variance-adder: exactly the flow the 7/23 book
+            # was missing) — earns the diversification rebate.
+            adder = -int(round(params.peak_tighten_max_cc * factor))
+            rows.append((game, adder, factor, "pbook_diversifying"))
+        else:
+            adder = 0
+            rows.append((game, 0, 0.0, "balanced"))
+        total += adder
+    clamped = int(
+        max(-params.peak_tighten_max_cc, min(params.peak_widen_max_cc, total))
+    )
+    return clamped, tuple(rows)
 
 
 def _peak_component(

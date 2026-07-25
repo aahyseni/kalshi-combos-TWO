@@ -1,4 +1,15 @@
-# 2026-07-25 — P(book) steering, Phase A: the signal is live (shadow)
+# 2026-07-25 — P(book) steering: Phase A (signal) + Phase B1 (the steer, shadow)
+
+> **UPDATE (same session): Phase B1 SHIPPED too** — the P(book) steering
+> component now lives in the skew (`_pbook_component`, `PBookProfile`
+> published from every accepted snapshot). Semantics: same-way on an
+> overweight game widens; offsetting it rebates; ANY flow on an
+> underweight/empty game rebates (new-game variance). Magnitudes fully
+> derived: |tail-share deviation from uniform 1/G| × (1 − p_book), bounded by
+> the documented peak hard caps. **SHADOW-FIRST: `pbook_armed=False`** —
+> pricing byte-identical (test-pinned) while `pbook_cc` is logged on every
+> quote. Arming = one param flip after the shadow record validates the
+> magnitude distribution + adversarial review. Suite 2706/0.
 
 **Operator directive (2026-07-25, verbatim intent).** The DET directional $
 size was fine; the failure was a NO-VARIANCE one-way book — the two variance

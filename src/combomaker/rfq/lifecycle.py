@@ -88,6 +88,7 @@ from combomaker.risk.markouts import MarkoutSubject, MarkoutTracker
 from combomaker.risk.reservation import ReserveResult, RiskReservationService
 from combomaker.risk.skew import (
     GameSkewCache,
+    PBookProfile,
     SkewLimits,
     SkewParams,
     WidenPolicyParams,
@@ -674,6 +675,11 @@ class QuoteLifecycle:
         # on the 0.5s maintenance cadence).
         self._peak_profile: PeakProfile | None = None
         self._peak_profile_failed_generation: int | None = None
+        # P(BOOK) STEER profile, Phase B1 (2026-07-25): the cached P(book) +
+        # per-game tail-share profile, published from every ACCEPTED book-risk
+        # snapshot (same generation-stamp discipline as the snapshot itself).
+        # Absent/stale ⇒ the skew's pbook component is a hard ZERO (neutral).
+        self._pbook_profile: PBookProfile | None = None
         # Fee model for the REAL fill fee booked at execution (defense #3): our
         # combo maker quadratic fills compute $0 (pricing/fees.py + ground truth),
         # correct for any nonzero-fee series. None ⇒ book fee UNKNOWN (None) — the
@@ -942,6 +948,26 @@ class QuoteLifecycle:
             return
         self._book_risk = snap
         self._book_risk_mono_ns = self._clock.monotonic_ns()
+        # P(BOOK) STEER profile (2026-07-25): publish the measured P(book) +
+        # per-game tail shares alongside the snapshot — the skew's pbook
+        # component reads this cached profile at quote time (generation-
+        # checked there; a stale profile is a hard ZERO adder). Only a USABLE
+        # snapshot publishes (an UNKNOWN book must not steer anything).
+        if snap.usable:
+            total_tail = sum(tc.loss_cc for tc in snap.per_game_tail_cc)
+            self._pbook_profile = PBookProfile(
+                input_generation=snap.input_generation,
+                p_book=snap.p_profit,
+                tail_share_by_game=(
+                    {
+                        tc.key: tc.loss_cc / total_tail
+                        for tc in snap.per_game_tail_cc
+                        if tc.loss_cc > 0.0
+                    }
+                    if total_tail > 0.0
+                    else {}
+                ),
+            )
         if snap.usable:
             log.info(
                 "book_risk_snapshot",
@@ -5082,6 +5108,12 @@ class QuoteLifecycle:
             # the hot path only reads <= K cached state rows per game).
             peak_profile=self._peak_profile_for_quote(),
             peak_book_generation=self._exposure.position_generation,
+            # P(BOOK) STEER, Phase B1 (2026-07-25): the cached P(book)/tail-
+            # share profile. SHADOW — pbook_armed defaults False, so skew_cc
+            # (and pricing) stay byte-identical while pbook_cc is measured
+            # on real flow (the derive-before-arm rule).
+            pbook_profile=self._pbook_profile,
+            pbook_book_generation=self._exposure.position_generation,
         )
         log.info(
             "inventory_skew_shadow",
@@ -5095,7 +5127,23 @@ class QuoteLifecycle:
             per_game=list(skew.per_game),
             mutex_direction_games=list(skew.mutex_direction_games),
             peak_cc=skew.peak_cc,                        # composed peak component
+            pbook_cc=skew.pbook_cc,                      # P(book) steer (shadow)
         )
+        if skew.pbook_per_game:
+            log.debug(
+                "pbook_steer_detail",
+                rfq_id=rfq.rfq_id,
+                pbook_cc=skew.pbook_cc,
+                per_game=[
+                    {
+                        "game": game,
+                        "adder_cc": adder_cc,
+                        "factor": round(factor, 4),
+                        "reason": reason,
+                    }
+                    for game, adder_cc, factor, reason in skew.pbook_per_game
+                ],
+            )
         if skew.peak_per_game:
             # DEBUG-level explainability (operator directive: every peak adder
             # decision explainable — peak_overlap + adder_cc per game — without
