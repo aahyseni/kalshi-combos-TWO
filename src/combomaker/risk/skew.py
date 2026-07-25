@@ -140,8 +140,14 @@ class SkewParams:
     # A THIRD additive classifier component fed by the cached P(book)
     # concentration profile (published off the book-risk snapshot). Fully
     # DERIVED from measured state — tail-share deviation from the uniform
-    # 1/G book × the P(book) deficit (1 − p_book) — reusing the DOCUMENTED
-    # peak hard caps as its outer bounds (no new tuning number).
+    # 1/G book × the P(book) deficit (1 − p_book) × a caps-derived onset —
+    # reusing the DOCUMENTED peak hard caps as its own component bounds (no
+    # new tuning number). COMPOSITION (2026-07-25 review): when ARMED the
+    # pbook component shares the documented two-pair overall clamp
+    # [−(skew_max_tighten+peak_tighten), +(skew_max_widen+peak_widen)] —
+    # the composed ``skew_cc`` is re-clamped to that bound, so arming NEVER
+    # expands the documented range (a triple-stacked rebate cannot exceed
+    # what the two-pair bound authorizes).
     # ``pbook_enabled`` computes + logs the component; ``pbook_armed`` is the
     # SEPARATE switch that adds it into ``skew_cc`` (default OFF = pure
     # shadow: pricing byte-identical while the live magnitude distribution is
@@ -200,6 +206,26 @@ class PBookProfile:
     input_generation: int
     p_book: float
     tail_share_by_game: dict[str, float]
+    # The book's POSITIVE tail mass (float cc, Σ positive per_game_tail_cc —
+    # 2026-07-25 review: negative attribution entries excluded from BOTH the
+    # numerator and denominator so shares sum to 1) — the SIZE of the hole.
+    # The onset factor divides (share × total) by the ENFORCED budget so the
+    # steer derives its "when" from the caps (operator 2026-07-25: never a
+    # dollar constant, never too early): a $20 book is nearly free no matter
+    # how "concentrated" its shares look.
+    total_tail_cc: float = 0.0
+    # The ENFORCED per-game loss budget in cc, published by the lifecycle
+    # (the one owner that knows the live bankroll): min(hard $ game cap,
+    # game_loss_frac × bankroll, hard_trip/KILL frac × bankroll) — the
+    # tightest enforced loss bound a one-way game can burn (2026-07-25
+    # review: the static SkewLimits dollar made the steer inert at 7/23
+    # scale; this adapts with the bankroll and the derived-cap swap).
+    game_budget_cc: float = 0.0
+    # Games whose tail attribution is ZERO/NEGATIVE (hedged/protective —
+    # they REDUCE the tail): excluded from shares, but flow there must not
+    # collect the underweight rebate (it can erode the hedge) — the
+    # component reads these as neutral "hedged_protected".
+    protected_games: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -552,12 +578,29 @@ def compute_inventory_skew(
     # per-game contributions the loop above already classified — SHADOW by
     # default (pbook_armed=False keeps skew_cc byte-identical while the live
     # magnitude distribution is measured).
+    # Include candidate games the directional loop never appended (zero
+    # analytic delta — 2026-07-25 review: a delta-neutral variance-adder on a
+    # new game must still reach the diversification rebate).
+    seen_games = {g for g, _c in per_game}
+    pbook_input = list(per_game) + [
+        (g, 0) for g in cand_by_game if g not in seen_games
+    ]
     pbook_cc, pbook_per_game = _pbook_component(
-        per_game, params, pbook_profile, pbook_book_generation
+        pbook_input, params, pbook_profile, pbook_book_generation
     )
     skew_cc = directional_cc + peak_cc
     if params.pbook_armed:
         skew_cc += pbook_cc
+    # COMPOSED OVERALL CLAMP (2026-07-25 review): the documented SkewParams
+    # bound [−(skew_max_tighten+peak_tighten), +(skew_max_widen+peak_widen)]
+    # stays TRUE with the pbook component armed — pbook shares the documented
+    # budget rather than expanding it (a triple-stacked rebate must never
+    # exceed what the two-pair bound already authorizes). A no-op while
+    # unarmed (directional + peak are each inside their own clamps).
+    skew_cc = max(
+        -(params.skew_max_tighten_cc + params.peak_tighten_max_cc),
+        min(params.skew_max_widen_cc + params.peak_widen_max_cc, skew_cc),
+    )
 
     return InventorySkew(
         skew_cc=skew_cc,
@@ -582,35 +625,53 @@ def _pbook_component(
     book_generation: int | None,
 ) -> tuple[int, tuple[tuple[str, int, float, str], ...]]:
     """The P(book) steering component (operator directive 2026-07-25: P(book)
-    steers the betting; more variance/diversity = higher P(book)).
+    steers the betting; more variance/diversity = higher P(book); onset off
+    the CAPS, never a dollar constant, never too early).
 
     Inputs are all MEASURED — no target number exists anywhere:
-      deficit_g = (tail_share_g − 1/G) / (1 − 1/G)   ∈ [−1, 1]
-                  (0 on a perfectly diversified G-game book — deviation from
-                  uniformity IS the concentration; G = games with tail
-                  presence in the cached profile)
-      need      = 1 − p_book                          ∈ [0, 1]
-                  (a book already winning 90% of nights barely steers; the
-                  7/23 one-way 0.40 book steers hard)
-      factor    = |deficit_g| × need
+      deficit_g   = (tail_share_g − 1/G) / (1 − 1/G)   ∈ [−1, 1]
+                    (0 on a perfectly diversified G-game book — deviation
+                    from uniformity IS the concentration; G = games with
+                    tail presence in the cached profile)
+      need        = 1 − p_book                          ∈ [0, 1]
+                    (a book already winning 90% of nights barely steers;
+                    the 7/23 one-way 0.40 book steers hard)
+      onset_g     = min(1, share_g × total_tail / profile.game_budget_cc)
+                    — the CAPS-DERIVED "when": how close this game's
+                    concentrated tail sits to the tightest ENFORCED loss
+                    budget (published by the lifecycle from the live
+                    bankroll: min(hard game $cap, game_loss_frac × bank,
+                    KILL frac × bank) — 2026-07-25 review: one denominator,
+                    one owner, adapts with the bankroll). A $20 book is
+                    ~free however concentrated its shares look; the steer
+                    bites as the hole approaches the cap (the operator's
+                    "does it go off the caps" — yes).
+      onset_book  = max over games of onset_g — the book-level hole depth
+                    the diversification REBATE keys on (an underweight game
+                    has ~no own tail, so its rebate must read the book).
 
     Per candidate game, using the directional loop's OWN classification
-    (``per_game`` contribution sign — concentrating > 0, offsetting < 0):
+    (``per_game`` contribution sign — concentrating > 0, offsetting < 0),
+    with the HOUSE ASYMMETRY (widen convex, rebate linear — the directional
+    component's own util shape, so widens start LATE and rebates start
+    gently but earlier):
       - same-way add on an OVERWEIGHT game (deficit > 0, contrib > 0) ⇒
-        WIDEN  +peak_widen_max_cc × factor  (the DET shape pays)
+        WIDEN  +peak_widen_max_cc × deficit × need × onset_g**gamma
       - offsetting an OVERWEIGHT game (deficit > 0, contrib < 0) ⇒
-        REBATE −peak_tighten_max_cc × factor (the missing other side earns)
-      - ANY flow on an UNDERWEIGHT game (deficit < 0) ⇒
-        REBATE −peak_tighten_max_cc × factor (a different game IS variance —
-        game-level diversification regardless of side)
-      - deficit == 0 / no tail share / neutral contribution ⇒ 0
+        REBATE −peak_tighten_max_cc × deficit × need × onset_g
+      - ANY flow on an UNDERWEIGHT game (deficit < 0) — including the
+        directional loop's neutral contrib on an EMPTY-book game (a
+        brand-new game is the purest variance-adder: exactly the flow the
+        7/23 book was missing) ⇒
+        REBATE −peak_tighten_max_cc × |deficit| × need × onset_book
+      - deficit == 0 / no budget / neutral ⇒ 0
 
     Outer bounds REUSE the documented peak hard caps (hard safety, not
     tuning — no new number); the free-money clamp in construct_quote remains
     the final bound when armed. FAIL-SAFE: profile absent / generation-stale
-    / disabled ⇒ EXACTLY 0 (neutral; UNKNOWN can never widen). Pricing-only
-    by construction: never feeds ``per_game``, so widen-vs-decline cannot
-    decline on it."""
+    / disabled / no budget ⇒ EXACTLY 0 (neutral; UNKNOWN can never widen).
+    Pricing-only by construction: never feeds ``per_game``, so
+    widen-vs-decline cannot decline on it."""
     if not params.pbook_enabled or profile is None:
         return 0, ()
     if book_generation is None or profile.input_generation != book_generation:
@@ -618,34 +679,56 @@ def _pbook_component(
     shares = profile.tail_share_by_game
     if not shares:
         return 0, (("*", 0, 0.0, "no_tail"),)
+    budget_cc = profile.game_budget_cc
+    if budget_cc <= 0.0 or profile.total_tail_cc <= 0.0:
+        return 0, (("*", 0, 0.0, "no_budget"),)
     n = len(shares)
     uniform = 1.0 / n
     need = max(0.0, min(1.0, 1.0 - profile.p_book))
+    onset_book = min(
+        1.0, max(shares.values()) * profile.total_tail_cc / budget_cc
+    )
     total = 0.0
     rows: list[tuple[str, int, float, str]] = []
     for game, contrib_cc in per_game:
         share = shares.get(game)
+        if share is None and game in profile.protected_games:
+            # Zero/negative tail attribution = a hedged/protective game
+            # (2026-07-25 review): flow there must NOT collect the
+            # underweight rebate — it can erode the hedge. Neutral.
+            rows.append((game, 0, 0.0, "hedged_protected"))
+            continue
         if share is None:
             # A game with NO tail presence at all: maximally underweight —
             # flow here is pure game-level diversification.
             share = 0.0
-        deficit = (
-            (share - uniform) / (1.0 - uniform) if n > 1
-            else (1.0 if share > 0.0 else 0.0)
-        )
+        if n > 1:
+            deficit = (share - uniform) / (1.0 - uniform)
+        else:
+            # n == 1 (2026-07-25 review HIGH): the sole tail game is fully
+            # overweight (+1); an ABSENT game is maximally underweight (−1)
+            # — the continuous limit of the n>1 formula as the second share
+            # → 0. The old 0.0 read zeroed the new-game rebate on exactly
+            # the purest one-way (7/23) shape.
+            deficit = 1.0 if share > 0.0 else -1.0
         deficit = max(-1.0, min(1.0, deficit))
-        factor = abs(deficit) * need
+        onset_g = min(1.0, share * profile.total_tail_cc / budget_cc)
         if deficit > 0.0 and contrib_cc > 0:
+            factor = deficit * need * (onset_g**params.gamma)
             adder = int(round(params.peak_widen_max_cc * factor))
             rows.append((game, adder, factor, "pbook_concentrating"))
         elif deficit > 0.0 and contrib_cc < 0:
+            factor = deficit * need * onset_g
             adder = -int(round(params.peak_tighten_max_cc * factor))
             rows.append((game, adder, factor, "pbook_offsetting"))
+        elif deficit > 0.0:
+            # Overweight game, delta-neutral contribution (2026-07-25
+            # review): named so the shadow record can measure how often the
+            # shape occurs before deciding whether it deserves a widen.
+            adder = 0
+            rows.append((game, 0, 0.0, "delta_neutral_on_overweight"))
         elif deficit < 0.0:
-            # ANY flow on an underweight game — including the directional
-            # loop's neutral contrib on an EMPTY-book game (a brand-new game
-            # is the purest variance-adder: exactly the flow the 7/23 book
-            # was missing) — earns the diversification rebate.
+            factor = abs(deficit) * need * onset_book
             adder = -int(round(params.peak_tighten_max_cc * factor))
             rows.append((game, adder, factor, "pbook_diversifying"))
         else:

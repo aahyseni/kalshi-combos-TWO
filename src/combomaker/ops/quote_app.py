@@ -1008,6 +1008,12 @@ class QuoteApp:
                 peak_enabled=skew_cfg.peak_enabled,
                 peak_widen_max_cc=skew_cfg.peak_widen_max_cc,
                 peak_tighten_max_cc=skew_cfg.peak_tighten_max_cc,
+                # P(BOOK) STEER (2026-07-25): shadow-computed by default;
+                # ``pricing.skew.pbook_armed: true`` in the armed YAML is the
+                # ONE flip that adds it into pricing (after the shadow slate
+                # validates + adversarial review).
+                pbook_enabled=skew_cfg.pbook_enabled,
+                pbook_armed=skew_cfg.pbook_armed,
             )
             skew_limits = SkewLimits(
                 max_event_delta_contracts=risk_cfg.max_event_delta_contracts,

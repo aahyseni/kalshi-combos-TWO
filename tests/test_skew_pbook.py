@@ -82,7 +82,15 @@ def _one_way_book() -> tuple[ExposureBook, dict[str, float]]:
 
 
 def _profile(
-    *, p_book: float = 0.40, shares: dict[str, float] | None = None, gen: int = GEN
+    *,
+    p_book: float = 0.40,
+    shares: dict[str, float] | None = None,
+    gen: int = GEN,
+    total_tail_cc: float = 1.0e9,  # sized ~= game_budget_cc so the
+    # caps-derived onset is ~1 in the semantics tests (onset itself is pinned
+    # separately in TestCapsDerivedOnset)
+    game_budget_cc: float = 1.0e9,
+    protected: frozenset[str] = frozenset(),
 ) -> PBookProfile:
     return PBookProfile(
         input_generation=gen,
@@ -90,6 +98,9 @@ def _profile(
         tail_share_by_game=(
             {"G1": 0.90, "G2": 0.10} if shares is None else shares
         ),
+        total_tail_cc=total_tail_cc,
+        game_budget_cc=game_budget_cc,
+        protected_games=protected,
     )
 
 
@@ -179,6 +190,145 @@ class TestSteeringSemantics:
             _profile(shares={"G1": 0.5, "G2": 0.5}, p_book=0.40),
         )
         assert skew.pbook_cc == 0
+
+
+class TestCapsDerivedOnset:
+    """The operator's 'at what point is it too much' (2026-07-25): the onset
+    DERIVES from the caps — concentration pays only as the concentrated tail
+    approaches the game-loss budget, convex (a small book is nearly free;
+    never a $100/$200 constant, never an early over-markup)."""
+
+    def test_tiny_book_is_nearly_free(self) -> None:
+        """A $100-scale concentrated tail against the test budget steers
+        ~nothing — the 'does it start at $100' answer is NO."""
+        book, marginals = _one_way_book()
+        cand = no_position("cand", (leg("A", "KX-G1"),))
+        skew = _skew(
+            cand, book, marginals, _profile(total_tail_cc=1_000_000.0)  # ~$100
+        )
+        assert skew.pbook_cc == 0
+
+    def test_widen_grows_with_hole_depth(self) -> None:
+        book, marginals = _one_way_book()
+        cand = no_position("cand", (leg("A", "KX-G1"),))
+        shallow = _skew(cand, book, marginals, _profile(total_tail_cc=2.5e8))
+        deep = _skew(cand, book, marginals, _profile(total_tail_cc=1.0e9))
+        assert 0 <= shallow.pbook_cc < deep.pbook_cc
+
+    def test_widen_onset_is_convex(self) -> None:
+        """Half the hole pays much less than half the widen (gamma=2): the
+        steer stays out of the way early and bites late."""
+        book, marginals = _one_way_book()
+        cand = no_position("cand", (leg("A", "KX-G1"),))
+        # onset_g = share x total / budget: 0.9 at full, 0.45 at half.
+        full = _skew(cand, book, marginals, _profile(total_tail_cc=1.0e9))
+        half = _skew(cand, book, marginals, _profile(total_tail_cc=0.5e9))
+        assert full.pbook_cc > 0
+        assert half.pbook_cc < full.pbook_cc / 2
+
+    def test_rebate_reads_the_book_level_hole(self) -> None:
+        """The diversification rebate keys on the BOOK's hole depth (the
+        underweight game has no tail of its own) — deep hole, bigger reward
+        for the variance-adder; shallow hole, smaller."""
+        book, marginals = _one_way_book()
+        cand = no_position("cand", (leg("C", "KX-G3"),))
+        shallow = _skew(cand, book, marginals, _profile(total_tail_cc=2.5e8))
+        deep = _skew(cand, book, marginals, _profile(total_tail_cc=1.0e9))
+        assert deep.pbook_cc < shallow.pbook_cc <= 0
+
+
+class TestReviewRegressions:
+    """2026-07-25 adversarial-review regressions (15 confirmed findings)."""
+
+    def test_single_game_book_still_rebates_new_game_flow(self) -> None:
+        """Review HIGH (n=1 discontinuity): the PUREST one-way shape — tail
+        on exactly ONE game — must reward a new-game diversifier, matching
+        the epsilon-split book's rebate (the old code paid 0)."""
+        book, marginals = _one_way_book()
+        cand = no_position("cand", (leg("C", "KX-G3"),))
+        single = _skew(
+            cand, book, marginals, _profile(shares={"G1": 1.0})
+        )
+        epsilon = _skew(
+            cand, book, marginals, _profile(shares={"G1": 0.999, "G2": 0.001})
+        )
+        assert single.pbook_cc < 0
+        assert any(r[3] == "pbook_diversifying" for r in single.pbook_per_game)
+        # Continuous: the single-game rebate ~= the epsilon-split rebate.
+        assert abs(single.pbook_cc - epsilon.pbook_cc) <= 2
+
+    def test_hedged_protected_game_earns_no_rebate(self) -> None:
+        """Review LOW (hedge erosion): a game whose tail attribution is
+        zero/negative (it PROTECTS the book) is not 'underweight' — flow
+        there gets no diversification rebate."""
+        book, marginals = _one_way_book()
+        cand = no_position("cand", (leg("C", "KX-G3"),))
+        skew = _skew(
+            cand, book, marginals,
+            _profile(protected=frozenset({"G3"})),
+        )
+        assert skew.pbook_cc == 0
+        assert any(r[3] == "hedged_protected" for r in skew.pbook_per_game)
+
+    def test_armed_composed_skew_obeys_documented_two_pair_bound(self) -> None:
+        """Review MEDIUM (stale clamp doc): arming pbook must NOT expand the
+        documented overall clamp — the composed skew_cc is re-clamped to
+        [−(skew_tighten+peak_tighten), +(skew_widen+peak_widen)]."""
+        book, marginals = _one_way_book()
+        armed = SkewParams(enabled=True, pbook_armed=True)
+        lo = -(armed.skew_max_tighten_cc + armed.peak_tighten_max_cc)
+        hi = armed.skew_max_widen_cc + armed.peak_widen_max_cc
+        for cand, profile in (
+            (  # maximal widen stack: same-way into a full one-way hole
+                no_position("c1", (leg("A", "KX-G1"),), contracts=60_000),
+                _profile(p_book=0.0, shares={"G1": 1.0}),
+            ),
+            (  # maximal rebate stack: new-game flow against the same hole
+                no_position("c2", (leg("C", "KX-G3"),), contracts=60_000),
+                _profile(p_book=0.0, shares={"G1": 1.0}),
+            ),
+        ):
+            skew = _skew(cand, book, marginals, profile, params=armed)
+            assert lo <= skew.skew_cc <= hi
+
+    def test_delta_neutral_on_overweight_is_named(self) -> None:
+        """Review LOW: an overweight game reached with a delta-neutral
+        contribution is measurable in the shadow record under its own
+        reason, not silently 'balanced'."""
+        from combomaker.risk.skew import _pbook_component
+
+        pbook_cc, rows = _pbook_component(
+            [("G1", 0)],
+            PARAMS,
+            _profile(shares={"G1": 0.9, "G2": 0.1}),
+            GEN,
+        )
+        assert pbook_cc == 0
+        assert rows[0][3] == "delta_neutral_on_overweight"
+
+    def test_profile_builder_normalizes_by_positive_mass(self) -> None:
+        """Review HIGH (shares don't sum to 1): negative attribution entries
+        are excluded from numerator AND denominator; they publish as
+        PROTECTED games instead."""
+        from types import SimpleNamespace
+
+        from combomaker.rfq.lifecycle import _pbook_profile_from_snapshot
+
+        snap = SimpleNamespace(
+            input_generation=GEN,
+            p_profit=0.55,
+            per_game_tail_cc=(
+                SimpleNamespace(key="G1", loss_cc=600.0),
+                SimpleNamespace(key="G2", loss_cc=400.0),
+                SimpleNamespace(key="G3", loss_cc=-250.0),  # hedged
+            ),
+        )
+        profile = _pbook_profile_from_snapshot(snap, game_budget_cc=5_000.0)
+        assert profile.tail_share_by_game == {"G1": 0.6, "G2": 0.4}
+        assert sum(profile.tail_share_by_game.values()) == 1.0
+        assert profile.total_tail_cc == 1_000.0
+        assert profile.protected_games == frozenset({"G3"})
+        assert profile.game_budget_cc == 5_000.0
 
 
 class TestFailSafe:

@@ -129,6 +129,44 @@ def _fmt_opt_cc(value_cc: float | None) -> str:
 
 JsonDict = dict[str, Any]
 
+
+def _pbook_profile_from_snapshot(
+    snap: Any, *, game_budget_cc: float
+) -> PBookProfile:
+    """The P(book) steer profile from an ACCEPTED book-risk snapshot — pure
+    (extracted for direct testing; 2026-07-25 review).
+
+    Shares normalize by the POSITIVE tail mass only (negative attribution
+    entries — hedged/protective games — are excluded from BOTH numerator and
+    denominator so shares sum to 1; a perfectly uniform book must never read
+    as concentrated). Zero/negative-attribution games are published as
+    PROTECTED: flow there gets no underweight rebate (it can erode the
+    hedge). ``share × total_tail_cc`` reproduces each game's own tail loss
+    exactly, so the component's onset ratio is that loss vs the enforced
+    budget."""
+    positive_tail = sum(
+        tc.loss_cc for tc in snap.per_game_tail_cc if tc.loss_cc > 0.0
+    )
+    return PBookProfile(
+        input_generation=snap.input_generation,
+        p_book=snap.p_profit,
+        tail_share_by_game=(
+            {
+                tc.key: tc.loss_cc / positive_tail
+                for tc in snap.per_game_tail_cc
+                if tc.loss_cc > 0.0
+            }
+            if positive_tail > 0.0
+            else {}
+        ),
+        total_tail_cc=positive_tail,
+        game_budget_cc=game_budget_cc,
+        protected_games=frozenset(
+            tc.key for tc in snap.per_game_tail_cc if tc.loss_cc <= 0.0
+        ),
+    )
+
+
 # CONFIRM-PATH LAST-LOOK MC WAIVER (handoff Problem A): the ONLY reservation-
 # denial breach reasons the waiver may lift — the two deliberately comonotone-
 # OVERSTATED analytic per-game bounds whose true state-consistent loss the exact
@@ -952,21 +990,27 @@ class QuoteLifecycle:
         # per-game tail shares alongside the snapshot — the skew's pbook
         # component reads this cached profile at quote time (generation-
         # checked there; a stale profile is a hard ZERO adder). Only a USABLE
-        # snapshot publishes (an UNKNOWN book must not steer anything).
+        # snapshot publishes (an UNKNOWN book must not steer anything). The
+        # ENFORCED per-game budget is computed HERE (the one owner with the
+        # live bankroll): min(hard game $cap, game_loss_frac × bank, KILL
+        # frac × bank) — the tightest enforced loss bound a one-way game can
+        # burn (2026-07-25 review: the static SkewLimits dollar made the
+        # steer inert at 7/23 scale; this adapts with the bankroll).
         if snap.usable:
-            total_tail = sum(tc.loss_cc for tc in snap.per_game_tail_cc)
-            self._pbook_profile = PBookProfile(
-                input_generation=snap.input_generation,
-                p_book=snap.p_profit,
-                tail_share_by_game=(
-                    {
-                        tc.key: tc.loss_cc / total_tail
-                        for tc in snap.per_game_tail_cc
-                        if tc.loss_cc > 0.0
-                    }
-                    if total_tail > 0.0
-                    else {}
-                ),
+            limits = self._limits.limits
+            budget_candidates = [
+                limits.max_event_worst_case_loss_dollars * 10_000.0
+            ]
+            bankroll_cc = self._risk_bankroll_cc()
+            if bankroll_cc is not None and bankroll_cc > 0:
+                budget_candidates.append(
+                    float(threshold_cc(limits.game_loss_frac, bankroll_cc))
+                )
+                budget_candidates.append(
+                    float(threshold_cc(limits.hard_trip_frac, bankroll_cc))
+                )
+            self._pbook_profile = _pbook_profile_from_snapshot(
+                snap, game_budget_cc=min(budget_candidates)
             )
         if snap.usable:
             log.info(
@@ -5128,6 +5172,13 @@ class QuoteLifecycle:
             mutex_direction_games=list(skew.mutex_direction_games),
             peak_cc=skew.peak_cc,                        # composed peak component
             pbook_cc=skew.pbook_cc,                      # P(book) steer (shadow)
+            # Full pbook decomposition at INFO (2026-07-25 review: the shadow
+            # record must carry everything the ARMING decision reads —
+            # factors + reasons per game, not just the composed number).
+            pbook_per_game=[
+                (game, adder, round(factor, 4), reason)
+                for game, adder, factor, reason in skew.pbook_per_game
+            ],
         )
         if skew.pbook_per_game:
             log.debug(

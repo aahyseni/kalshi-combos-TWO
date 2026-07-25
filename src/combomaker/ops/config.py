@@ -2147,7 +2147,9 @@ class SkewConfig(StrictModel):
     # premium provably pays into every argmax state, is quoted TIGHTER to win
     # its auctions. Composed total stays inside
     # [-(skew_max_tighten_cc+peak_tighten_max_cc),
-    #  +(skew_max_widen_cc+peak_widen_max_cc)]. PRICING ONLY — no new caps, no
+    #  +(skew_max_widen_cc+peak_widen_max_cc)] — and REMAINS inside it when
+    # the pbook component is armed (the composed skew_cc is re-clamped to
+    # this same two-pair bound; 2026-07-25 review). PRICING ONLY — no new caps, no
     # new skip reasons; any doubt (no profile / stale generation / unparseable
     # legs) is a hard ZERO adder. It takes effect only while ``enabled`` is
     # True (the seam's dark-ship master switch). ``peak_topk_states`` is the K
@@ -2176,6 +2178,18 @@ class SkewConfig(StrictModel):
     # floats banned for thresholds).
     peak_n_clusters: int = 3
     peak_cluster_min_frac: str = "0.30"
+    # P(BOOK) STEER, Phase B1 (operator directive 2026-07-25: "Pbook should
+    # be steering our betting"). ``pbook_enabled`` computes + logs the
+    # component on every quote (risk/skew._pbook_component — magnitudes fully
+    # DERIVED: tail-share deviation from the uniform 1/G book × the P(book)
+    # deficit × a caps-derived onset ratio, so a small book is nearly free
+    # and the steer only bites as concentrated tail approaches the game-loss
+    # budget). ``pbook_armed`` is the SEPARATE arming switch that adds it
+    # into ``skew_cc`` (pricing) — default OFF: shadow-measure a live slate,
+    # validate the logged pbook_cc distribution + adversarial review, THEN
+    # arm (the derive-before-arm rule).
+    pbook_enabled: bool = True
+    pbook_armed: bool = False
 
     @field_validator("w_conc", "w_off")
     @classmethod
