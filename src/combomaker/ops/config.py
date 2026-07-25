@@ -2748,6 +2748,13 @@ class RiskConfig(StrictModel):
     # enumeration no longer kills a certificate it cannot affect (the
     # "book moved during every enumeration" peak-flow reneges).
     waiver_game_scoped_stability: bool = False
+    # (5) P(BOOK) NON-DECREASE (operator doctrine 2026-07-25: "anything we
+    # take in should push it up, or neutral"): the candidate gate declines a
+    # fill whose measured ΔP(book) is negative beyond the CRN noise floor
+    # (3× the paired-difference SE — derived, no hand tolerance) unless it
+    # certifiably reduces the governing tail (hedges keep their B2 path).
+    # Same-day measurement: 23 of 74 admits lowered p_book, worst −0.226.
+    require_p_book_non_decreasing: bool = False
     # (4) RELEASE ACCEPTED-QUOTE EXPOSURE: the accepted quote's own resting
     # entry is dropped before the confirm-path checks (it is economically
     # dead post-accept — the fill replaces it, a lapse voids it). Leaving it

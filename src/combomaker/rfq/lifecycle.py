@@ -542,6 +542,11 @@ class LifecycleConfig:
     # only changes which fair judges the candidate's own edge. Certified
     # negative-edge hedges still route through the B2 budget. Default OFF.
     gate_ev_from_pricing_fair: bool = False
+    # P(BOOK) NON-DECREASE (operator doctrine 2026-07-25: "anything we take
+    # in should push it up, or neutral" — 23 of 74 same-day admits LOWERED
+    # p_book, worst −0.226). Gate declines ΔP(book) < −3×SE fills unless
+    # they certifiably reduce the governing tail. Default OFF.
+    require_p_book_non_decreasing: bool = False
     # PEAK-CONCENTRATION pricing steer (operator directive 2026-07-18 evening).
     # K cached worst scorelines per game for the committed-book peak profile
     # (sim/peak_profile.build_peak_profile) — rebuilt OFF the hot path on the
@@ -1017,6 +1022,9 @@ class QuoteLifecycle:
             ruin_floor_frac=self._config.ruin_floor_frac,
             ruin_prob_ci_z=self._config.ruin_prob_ci_z,
             input_generation=gen,
+            # P(NIGHT) (2026-07-25 operator KPI): realized-so-far (settlements
+            # + fees; process-scoped until the day-anchored ledger lands).
+            realized_pnl_cc=self._realized_pnl_cc,
         )
 
     def _ruin_equity_basis_cc(self, model: BookModel) -> int | None:
@@ -1096,6 +1104,10 @@ class QuoteLifecycle:
                 # games (which game dominates the downside = the anti-variance
                 # concentration P(book) steering will price against).
                 p_book=round(snap.p_profit, 4),
+                # P(NIGHT) (2026-07-25 operator KPI): realized + open book —
+                # does not reset as winners settle out; the headline number.
+                p_night=round(snap.p_night, 4),
+                realized_pnl_cc=self._realized_pnl_cc,
                 ev_cc=int(snap.ev_cc),
                 top_tail_games=[
                     (tc.key, int(tc.loss_cc))
@@ -1219,6 +1231,7 @@ class QuoteLifecycle:
                 ruin_floor_frac=inputs.ruin_floor_frac,
                 ruin_prob_ci_z=inputs.ruin_prob_ci_z,
                 input_generation=inputs.input_generation,
+                realized_pnl_cc=inputs.realized_pnl_cc,
             )
             # Inline path builds the model and runs the MC without yielding, so the
             # generation cannot move between build and store; the publish gate is a
@@ -2026,6 +2039,10 @@ class QuoteLifecycle:
             # Fresh re-price only when armed (one engine call per confirm
             # attempt); OFF ⇒ None ⇒ the gate keeps its MC EV, byte-identical.
             pricing_edge_cc=self._gate_pricing_edge(state),
+            # P(BOOK) NON-DECREASE doctrine gate (2026-07-25). Default OFF.
+            require_p_book_non_decreasing=(
+                self._config.require_p_book_non_decreasing
+            ),
             # P1 EV VISIBILITY: the OPTIONAL worst-challenger-EV tolerance. −inf by
             # default (no behaviour change — the gate stays production-model-EV only);
             # a finite operator value ALSO declines a +production-EV candidate whose

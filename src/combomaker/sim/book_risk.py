@@ -144,6 +144,10 @@ class BookRiskSnapshot:
     # from this; () on empty/legacy snapshots (the cap then falls back to the
     # ES form — never a free pass).
     loss_quantiles_cc: tuple[float, ...] = field(default_factory=tuple)
+    # P(NIGHT) (2026-07-25 operator KPI): P(realized-so-far + open book > 0)
+    # — does NOT reset as winners settle out. == p_profit when no realized
+    # feed was supplied.
+    p_night: float = 0.0
     # A2: P(this settlement wave drops equity BELOW the ruin floor) =
     # P(current_equity + book_pnl < ruin_floor_frac·bankroll). 0.0 when equity/
     # bankroll unavailable (the ruin cap then does not evaluate). Reflects the
@@ -996,6 +1000,7 @@ def compute_book_risk(
     ruin_floor_frac: float = 0.70,
     ruin_prob_ci_z: float = 0.0,
     input_generation: int = -1,
+    realized_pnl_cc: int | None = None,
 ) -> BookRiskSnapshot:
     """Run the full book-risk MC and build the halt-feeding snapshot.
 
@@ -1088,6 +1093,19 @@ def compute_book_risk(
     std = float(book.std(ddof=1)) if book.size > 1 else 0.0
     ev_stderr = std / math.sqrt(book.size) if book.size > 0 else 0.0
     p_profit = float(np.mean(book > 0.0))
+    # P(NIGHT) (operator KPI 2026-07-25: "we just want the day to end
+    # positive"): P(realized-so-far + open-book P&L > 0) on the production
+    # book. Unlike ``p_profit`` (which RESETS as winning positions settle out
+    # of the book — the 0.81→0.51 confusion), this number keeps the banked
+    # edge: once realized profit exceeds the open book's plausible downside
+    # it pins toward 1.0. None realized ⇒ equals p_profit. NOTE: the realized
+    # feed resets at process start (restart-scoped) until the day-anchored
+    # settlement-ledger reconstruction lands.
+    p_night = (
+        float(np.mean(book + float(realized_pnl_cc) > 0.0))
+        if realized_pnl_cc is not None and book.size
+        else p_profit
+    )
     var_99, es_99 = _es_from_pnl(book, HEADLINE_LEVEL)
     p_loss_worse_than = {
         float(t): float(np.mean(book < -float(t))) for t in loss_thresholds_cc
@@ -1285,6 +1303,7 @@ def compute_book_risk(
         es_99_cc=es_99,
         p_loss_worse_than=p_loss_worse_than,
         loss_quantiles_cc=loss_quantiles_cc,
+        p_night=p_night,
         p_ruin=p_ruin,
         p_ruin_upper=p_ruin_upper,
         production_es_99_cc=es_99,
@@ -1911,6 +1930,7 @@ def evaluate_candidate_book_risk(
     kill_tail_prob: float = 0.02,
     gate_ev_from_pricing_fair: bool = False,
     pricing_edge_cc: float | None = None,
+    require_p_book_non_decreasing: bool = False,
     worst_challenger_ev_tolerance: float = float("-inf"),
     det_max_mutex_aware: bool = True,
 ) -> CandidateBookRisk:
@@ -2211,6 +2231,17 @@ def evaluate_candidate_book_risk(
         admission_ev_source = (
             "mc_fallback" if gate_ev_from_pricing_fair else "mc"
         )
+    # P(BOOK) NON-DECREASE noise floor (1c): the paired-difference standard
+    # error of ΔP(book) on the shared CRN sample — the derived tolerance.
+    delta_p_book = post_axes.p_profit - pre_axes.p_profit
+    delta_p_book_se = 0.0
+    if post_pnl.size > 1 and pre_pnl.size == post_pnl.size:
+        diff_ind = (post_pnl > 0.0).astype(np.float64) - (
+            pre_pnl > 0.0
+        ).astype(np.float64)
+        delta_p_book_se = float(
+            diff_ind.std(ddof=1) / math.sqrt(diff_ind.size)
+        )
     confirm, reason = _candidate_gate(
         admission_ev=admission_ev,
         worst_credible_candidate_ev=worst_credible_candidate_ev,
@@ -2227,6 +2258,9 @@ def evaluate_candidate_book_risk(
         hedge_budget_tail_derived=hedge_budget_tail_derived,
         tail_prob_gate=tail_prob_gate,
         kill_tail_prob=kill_tail_prob,
+        require_p_book_non_decreasing=require_p_book_non_decreasing,
+        delta_p_book=delta_p_book,
+        delta_p_book_se=delta_p_book_se,
         # Every post-book model vector that ran, on the shared CRN sample —
         # the tail-probability form gates on the WORST model's P(KILL night).
         post_pnls=(post_pnl, post_pnl_c, post_bridge_pnl, post_split_pnl),
@@ -2273,6 +2307,9 @@ def _candidate_gate(
     hedge_budget_tail_derived: bool = False,
     tail_prob_gate: bool = False,
     kill_tail_prob: float = 0.02,
+    require_p_book_non_decreasing: bool = False,
+    delta_p_book: float = 0.0,
+    delta_p_book_se: float = 0.0,
     post_pnls: Sequence["NDArray[np.float64] | None"] = (),
     n_samples: int = 0,
     ruin_prob_ci_z: float = 0.0,
@@ -2350,6 +2387,21 @@ def _candidate_gate(
             )
         if -admission_ev > budget:
             return False, "negative_ev_exceeds_hedge_budget"
+
+    # (1c) P(BOOK) NON-DECREASE (operator doctrine 2026-07-25: "anything we
+    # take in should push it up, or neutral" — measured same day: 23 of 74
+    # admitted fills LOWERED p_book, worst −0.226). Declines a fill whose
+    # measured ΔP(book) is negative beyond the MC NOISE FLOOR (3× the
+    # paired-difference standard error on the shared CRN sample — fully
+    # derived, no hand tolerance), UNLESS the fill CERTIFIABLY reduces the
+    # governing tail (a hedge may pay P(book) to cut the tail — that trade
+    # is priced by the B2 budget, not refused here). Default OFF.
+    if (
+        require_p_book_non_decreasing
+        and delta_p_book < -3.0 * delta_p_book_se
+        and post.governing_model_tail_loss_cc > pre.governing_model_tail_loss_cc
+    ):
+        return False, "lowers_p_book"
 
     # (1b) OPTIONAL worst-challenger-EV tolerance (audit "+EV IS PRODUCTION-MODEL EV").
     # The admission policy above stays production-model-EV based; this ONLY ADDS a

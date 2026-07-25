@@ -297,6 +297,10 @@ class BookRiskInputs:
     # unchanged); a positive z (e.g. 1.645 for a one-sided 95% level) makes the
     # ruin gate fail-closed against MC sampling error near the budget.
     ruin_prob_ci_z: float = 0.0
+    # P(NIGHT) (2026-07-25 operator KPI): realized P&L so far (process-scoped)
+    # — the snapshot's p_night = P(realized + open book > 0). None ⇒ p_night
+    # == p_profit.
+    realized_pnl_cc: int | None = None
 
 
 def _worker_book_risk(inputs: BookRiskInputs) -> BookRiskSnapshot:
@@ -314,6 +318,7 @@ def _worker_book_risk(inputs: BookRiskInputs) -> BookRiskSnapshot:
         ruin_floor_frac=inputs.ruin_floor_frac,
         ruin_prob_ci_z=inputs.ruin_prob_ci_z,
         input_generation=inputs.input_generation,
+        realized_pnl_cc=inputs.realized_pnl_cc,
     )
 
 
@@ -417,6 +422,10 @@ class CandidateBookRiskInputs:
     # ⇒ MC EV (fail-safe). Default OFF (byte-identical).
     gate_ev_from_pricing_fair: bool = False
     pricing_edge_cc: float | None = None
+    # P(BOOK) NON-DECREASE (operator doctrine 2026-07-25): decline fills whose
+    # measured ΔP(book) is negative beyond the CRN noise floor unless they
+    # certifiably reduce the governing tail. Default OFF.
+    require_p_book_non_decreasing: bool = False
     # P1 EV VISIBILITY (audit "+EV IS PRODUCTION-MODEL EV"): the OPTIONAL worst-
     # challenger-EV tolerance. Defaults to −inf ⇒ the gate is production-model-EV
     # only (no behaviour change); the operator sets a finite (negative) tolerance to
@@ -543,6 +552,7 @@ def _worker_candidate_book_risk(
         kill_tail_prob=inputs.kill_tail_prob,
         gate_ev_from_pricing_fair=inputs.gate_ev_from_pricing_fair,
         pricing_edge_cc=inputs.pricing_edge_cc,
+        require_p_book_non_decreasing=inputs.require_p_book_non_decreasing,
         worst_challenger_ev_tolerance=inputs.worst_challenger_ev_tolerance,
         det_max_mutex_aware=inputs.det_max_mutex_aware,
     )
