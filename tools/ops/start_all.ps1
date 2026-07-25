@@ -49,9 +49,13 @@ Set-Content -Path "data\CURRENT_LOG.txt" -Value "$botLog`r`n$proberLog" -Encodin
 
 Write-Host "Starting bot stack (logs: $botLog / $proberLog)" -ForegroundColor Cyan
 
-# 1) Supervisor (spawns + respawns the quote app). All output -> dated log,
-#    so this window is quiet BY DESIGN - the echo says where to look.
-Start-Process cmd -ArgumentList "/k", "title BOT supervisor && echo Bot running. This window is quiet BY DESIGN - all output goes to $botLog && echo Watch the MONITOR window for live events. Closing THIS window kills the supervisor. && .venv\Scripts\python.exe -m combomaker.ops.supervisor --env prod --config config\prod-live-wc.local.yaml > $botLog 2>&1"
+# 1) THE BOT (cli run, quote mode). It spawns the safety supervisor as its
+#    OWN subprocess (quote_app.supervisor_launch_cmd) - launching
+#    `-m combomaker.ops.supervisor` standalone insta-kills on the missing
+#    heartbeat the not-yet-started bot hasn't written (2026-07-25 launch
+#    failures #1 and #3; entrypoint verified against the live process list).
+#    All output -> dated log, so this window is quiet BY DESIGN.
+Start-Process cmd -ArgumentList "/k", "title BOT (quote mode) && echo Bot running. This window is quiet BY DESIGN - all output goes to $botLog && echo Watch the MONITOR window for live events. Closing THIS window kills the bot. && .venv\Scripts\python.exe -m combomaker.ops.cli run --env prod --mode quote --confirm-live --config config\prod-live-wc.local.yaml > $botLog 2>&1"
 
 # 2) Main monitor (halts / fills / declines / waivers / errors).
 Start-Process powershell -ArgumentList "-NoExit", "-ExecutionPolicy", "Bypass", "-File", "tools\ops\watch_main.ps1", "-Log", $botLog
