@@ -2729,6 +2729,32 @@ class RiskConfig(StrictModel):
     # night. Default OFF = byte-identical ES form.
     portfolio_tail_prob_gate: bool = False
     portfolio_kill_tail_prob: str = "0.02"  # decimal string (house convention)
+    # RENEGE FIXES (2026-07-25 big-fill audit — 49 auctions won, 15 filled,
+    # $355 premium won-then-declined in one evening). Both default OFF
+    # (byte-identical); arm together at a pregame restart after review.
+    # (1) AWARD SIZING: quote-time risk sizes target-cost candidates at the
+    # exchange's actual award (target / taker price, fee-free UPPER bound)
+    # instead of our own cheapest bid, which understated longshot fills
+    # 3.6-4.7x and guaranteed a quote-passes/confirm-declines renege zone.
+    risk_qty_award_sizing: bool = False
+    # (2) GATE EV SOURCE: the candidate gate's admission-EV sign check uses
+    # the calibrated pricing fair's edge (the number that priced the quote)
+    # instead of the band-high risk-copula EV that structurally scores
+    # same-game combos negative. Tail budgets keep the risk models.
+    gate_ev_from_pricing_fair: bool = False
+    # (3) WAIVER GAME-SCOPED STABILITY: the waiver's stability key compares
+    # the breached games' position/reservation CONTENT instead of the global
+    # generation/version counters — an unrelated-game fill during the
+    # enumeration no longer kills a certificate it cannot affect (the
+    # "book moved during every enumeration" peak-flow reneges).
+    waiver_game_scoped_stability: bool = False
+    # (4) RELEASE ACCEPTED-QUOTE EXPOSURE: the accepted quote's own resting
+    # entry is dropped before the confirm-path checks (it is economically
+    # dead post-accept — the fill replaces it, a lapse voids it). Leaving it
+    # made confirm demand ~2× the headroom quote-time admitted (the fill
+    # counted twice: resting hypothetical + true candidate) — the second
+    # half of the renege zone. Arm WITH risk_qty_award_sizing.
+    release_accepted_quote_exposure: bool = False
     # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1). Seconds after a SUCCESSFUL
     # confirm before the maintenance sweep polls REST GET quote for a fill whose
     # quote_executed WS message never arrived (the WS channel has no replay; a

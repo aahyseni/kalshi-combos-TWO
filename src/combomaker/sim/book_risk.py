@@ -1443,6 +1443,13 @@ class CandidateBookRisk:
     # mechanism (Phase B) derives from this measured signal.
     candidate_delta_p_book: float = 0.0
 
+    # GATE EV SOURCE audit trail (2026-07-25 review): the EV that actually
+    # judged admission and which fair produced it — "mc" (default),
+    # "pricing_fair" (armed, fresh re-price succeeded), or "mc_fallback"
+    # (armed but the fresh re-price failed/no-quoted ⇒ MC judged).
+    admission_ev_cc: float = 0.0
+    admission_ev_source: str = "mc"
+
     # The final gate verdict + the first reason it was declined (empty ⇒ confirm).
     confirm: bool = False
     decline_reason: str = ""
@@ -1902,6 +1909,8 @@ def evaluate_candidate_book_risk(
     hedge_budget_tail_derived: bool = False,
     tail_prob_gate: bool = False,
     kill_tail_prob: float = 0.02,
+    gate_ev_from_pricing_fair: bool = False,
+    pricing_edge_cc: float | None = None,
     worst_challenger_ev_tolerance: float = float("-inf"),
     det_max_mutex_aware: bool = True,
 ) -> CandidateBookRisk:
@@ -2191,8 +2200,19 @@ def evaluate_candidate_book_risk(
         if ev is not None
     )
 
+    # GATE EV SOURCE (2026-07-25): choose the admission EV HERE so the result
+    # records WHICH fair judged the fill (audit trail — the decline detail
+    # and gate logs carry both the value and the source).
+    if gate_ev_from_pricing_fair and pricing_edge_cc is not None:
+        admission_ev = float(pricing_edge_cc)
+        admission_ev_source = "pricing_fair"
+    else:
+        admission_ev = candidate_ev
+        admission_ev_source = (
+            "mc_fallback" if gate_ev_from_pricing_fair else "mc"
+        )
     confirm, reason = _candidate_gate(
-        candidate_ev=candidate_ev,
+        admission_ev=admission_ev,
         worst_credible_candidate_ev=worst_credible_candidate_ev,
         worst_challenger_ev_tolerance=worst_challenger_ev_tolerance,
         pre=pre_axes,
@@ -2229,6 +2249,8 @@ def evaluate_candidate_book_risk(
         split_candidate_ev_cc=split_candidate_ev,
         worst_credible_candidate_ev_cc=worst_credible_candidate_ev,
         candidate_delta_p_book=post_axes.p_profit - pre_axes.p_profit,
+        admission_ev_cc=admission_ev,
+        admission_ev_source=admission_ev_source,
         confirm=confirm,
         decline_reason=reason,
     )
@@ -2236,7 +2258,7 @@ def evaluate_candidate_book_risk(
 
 def _candidate_gate(
     *,
-    candidate_ev: float,
+    admission_ev: float,
     worst_credible_candidate_ev: float,
     worst_challenger_ev_tolerance: float,
     pre: _TailAxes,
@@ -2296,12 +2318,20 @@ def _candidate_gate(
     # budget (3) below still gates POST det-max against its ABSOLUTE
     # %-of-bankroll ceiling, so a certified hedge that would push the all-hit
     # maximum over the det budget still declines there.
-    if candidate_ev <= 0.0:
+    # GATE EV SOURCE (2026-07-25 renege root cause #2): ``admission_ev`` is
+    # chosen by the caller — the CALIBRATED PRICING fair's FRESH edge when
+    # armed (the same model that priced the quote — the backtested moat;
+    # re-priced at confirm so stale-quote pickoffs still show up), else the
+    # band-high MC EV, which scores heavily-correlated same-game combos
+    # structurally negative and reneged 20 won auctions in one evening.
+    # Tail budgets below still gate on the conservative risk models; only
+    # the candidate's OWN edge judgment switches.
+    if admission_ev <= 0.0:
         if not allow_negative_ev_hedge:
             return False, "negative_ev_no_hedge_budget"
         if post.governing_model_tail_loss_cc > pre.governing_model_tail_loss_cc:
             return False, "negative_ev_not_risk_reducing"
-        # The hedge's cost is the EV we give up = −candidate_ev (a positive $).
+        # The hedge's cost is the EV we give up = −admission_ev (a positive $).
         budget = float(hedge_cost_budget_cc)
         if hedge_budget_tail_derived:
             # B2 DERIVED BUDGET (operator directive 2026-07-25: the book pays
@@ -2318,7 +2348,7 @@ def _candidate_gate(
                 pre.governing_model_tail_loss_cc
                 - post.governing_model_tail_loss_cc,
             )
-        if -candidate_ev > budget:
+        if -admission_ev > budget:
             return False, "negative_ev_exceeds_hedge_budget"
 
     # (1b) OPTIONAL worst-challenger-EV tolerance (audit "+EV IS PRODUCTION-MODEL EV").

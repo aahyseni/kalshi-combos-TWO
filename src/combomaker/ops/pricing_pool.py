@@ -411,6 +411,12 @@ class CandidateBookRiskInputs:
     # form of the joint-tail budget. Default OFF (byte-identical ES form).
     tail_prob_gate: bool = False
     kill_tail_prob: float = 0.02
+    # GATE EV SOURCE (2026-07-25 renege root cause #2): when armed, the
+    # admission EV sign check uses the calibrated pricing fair's edge for
+    # this fill (pricing_edge_cc) instead of the band-high MC EV. None edge
+    # ⇒ MC EV (fail-safe). Default OFF (byte-identical).
+    gate_ev_from_pricing_fair: bool = False
+    pricing_edge_cc: float | None = None
     # P1 EV VISIBILITY (audit "+EV IS PRODUCTION-MODEL EV"): the OPTIONAL worst-
     # challenger-EV tolerance. Defaults to −inf ⇒ the gate is production-model-EV
     # only (no behaviour change); the operator sets a finite (negative) tolerance to
@@ -535,6 +541,8 @@ def _worker_candidate_book_risk(
         hedge_budget_tail_derived=inputs.hedge_budget_tail_derived,
         tail_prob_gate=inputs.tail_prob_gate,
         kill_tail_prob=inputs.kill_tail_prob,
+        gate_ev_from_pricing_fair=inputs.gate_ev_from_pricing_fair,
+        pricing_edge_cc=inputs.pricing_edge_cc,
         worst_challenger_ev_tolerance=inputs.worst_challenger_ev_tolerance,
         det_max_mutex_aware=inputs.det_max_mutex_aware,
     )

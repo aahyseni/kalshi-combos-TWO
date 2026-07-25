@@ -368,21 +368,21 @@ class TestNegativeEvHedge:
             hedge_budget_tail_derived=True,
         )
         ok, reason = _candidate_gate(
-            candidate_ev=-50.0, hedge_cost_budget_cc=0, **common
+            admission_ev=-50.0, hedge_cost_budget_cc=0, **common
         )
         assert ok and reason == ""
         ok, reason = _candidate_gate(
-            candidate_ev=-150.0, hedge_cost_budget_cc=0, **common
+            admission_ev=-150.0, hedge_cost_budget_cc=0, **common
         )
         assert not ok and reason == "negative_ev_exceeds_hedge_budget"
         # The static budget floors the derived value (manual override up).
         ok, reason = _candidate_gate(
-            candidate_ev=-150.0, hedge_cost_budget_cc=200, **common
+            admission_ev=-150.0, hedge_cost_budget_cc=200, **common
         )
         assert ok
         # Derived OFF ⇒ today's static-only behaviour.
         ok, reason = _candidate_gate(
-            candidate_ev=-50.0,
+            admission_ev=-50.0,
             hedge_cost_budget_cc=0,
             **{**common, "hedge_budget_tail_derived": False},
         )

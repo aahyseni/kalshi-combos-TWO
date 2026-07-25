@@ -514,6 +514,34 @@ class LifecycleConfig:
     # a one-way book stays hard-blocked. Default OFF (byte-identical ES form).
     tail_prob_gate: bool = False
     kill_tail_prob: float = 0.02
+    # AWARD SIZING (2026-07-25 big-fill audit, renege root cause #1): size
+    # target-cost candidates at the exchange's actual award (target / taker
+    # price, fee-free upper bound) instead of our own cheapest bid — see
+    # ``_risk_qty``. Default OFF (byte-identical legacy sizing).
+    risk_qty_award_sizing: bool = False
+    # WAIVER GAME-SCOPED STABILITY (2026-07-25 peak-flow gap): compare the
+    # breached games' position/reservation CONTENT instead of the global
+    # generation/version counters, so an unrelated-game fill landing during
+    # the enumeration no longer invalidates a certificate it cannot affect.
+    # Default OFF (byte-identical global-counter stability).
+    waiver_game_scoped_stability: bool = False
+    # RELEASE ACCEPTED-QUOTE EXPOSURE (2026-07-25 review HIGH): drop the
+    # accepted quote's own resting entry before the confirm-path checks —
+    # it is economically dead post-accept (fill replaces it; lapse voids it)
+    # and leaving it double-counted this fill's exposure at confirm (~2× the
+    # quote-time admission on the summing axes = the renege zone's second
+    # half). Default OFF (byte-identical double-count).
+    release_accepted_quote_exposure: bool = False
+    # GATE EV SOURCE (2026-07-25 big-fill audit, renege root cause #2): when
+    # True the candidate gate's ADMISSION EV sign check uses the CALIBRATED
+    # PRICING fair's edge (the same number that priced the quote — the
+    # backtested moat) instead of the risk copula's band-high EV, which
+    # scores heavily-correlated same-game combos structurally negative and
+    # reneged 20 won auctions tonight (pricing said +EV, gate said −EV).
+    # The TAIL budgets still gate on the conservative risk models — this
+    # only changes which fair judges the candidate's own edge. Certified
+    # negative-edge hedges still route through the B2 budget. Default OFF.
+    gate_ev_from_pricing_fair: bool = False
     # PEAK-CONCENTRATION pricing steer (operator directive 2026-07-18 evening).
     # K cached worst scorelines per game for the committed-book peak profile
     # (sim/peak_profile.build_peak_profile) — rebuilt OFF the hot path on the
@@ -1399,6 +1427,57 @@ class QuoteLifecycle:
             return (side_fair - int(bid_cc)) * contracts // 100
         return None
 
+    def _gate_pricing_edge(self, state: OpenQuoteState) -> float | None:
+        """``_pricing_edge_cc`` gated on the arming flag, with the FALLBACK
+        made VISIBLE (2026-07-25 review: an armed gate silently reverting to
+        MC EV was indistinguishable from a pricing-edge verdict)."""
+        if not self._config.gate_ev_from_pricing_fair:
+            return None
+        edge = self._pricing_edge_cc(state)
+        if edge is None:
+            self._metrics.inc("candidate_gate.pricing_edge_fallback")
+            log.info(
+                "candidate_gate_pricing_edge_fallback",
+                quote_id=state.quote_id,
+                detail="fresh re-price unavailable — MC EV judges admission",
+            )
+        return edge
+
+    def _pricing_edge_cc(self, state: OpenQuoteState) -> float | None:
+        """The CALIBRATED pricing fair's edge for the pending fill, float cc,
+        computed against a FRESH engine fair at CONFIRM time (2026-07-25
+        renege root cause #2: the candidate gate's band-high risk copula
+        scores heavily-correlated same-game combos structurally negative-EV
+        even when the calibrated pricing fair — the model that priced the
+        quote — says +EV; 20 won auctions reneged tonight). The gate's
+        admission-EV source can be switched to THIS number
+        (``gate_ev_from_pricing_fair``); tail budgets keep the risk models.
+
+        FRESH, never the frozen quote-time fair: the MC EV's one real virtue
+        at admission is catching STALE-QUOTE PICKOFFS (the fair moved between
+        quote and accept — a −$4.96 catch live tonight). Re-pricing the RFQ
+        off the LIVE books preserves that: a moved fair shows up in the fresh
+        edge exactly as it does in the MC, while a pure model disagreement on
+        same-game structure (fair unchanged) admits. Any failure to re-price
+        (stale legs, no-quote, error) returns None ⇒ the gate keeps its MC EV
+        — fail-safe, never a loosened admission."""
+        if state.pending_fill is None:
+            return None
+        accepted_side, bid, qty = state.pending_fill
+        try:
+            fresh = self._price(state.rfq)
+        except Exception:
+            return None
+        if not isinstance(fresh, ConstructedQuote):
+            return None  # engine no-quotes the RFQ NOW ⇒ no calibrated fair
+        edge = self._candidate_edge_cc(
+            int(fresh.fair_cc),
+            int(bid),
+            qty,
+            self._conventions.maker_position_side(accepted_side),
+        )
+        return None if edge is None else float(edge)
+
     def _quote_candidate_ev_cc(
         self, result: ConstructedQuote, qty: CentiContracts
     ) -> int | None:
@@ -1702,7 +1781,9 @@ class QuoteLifecycle:
             if not result.confirm:
                 return False, (
                     f"candidate gate declined: {result.decline_reason} "
-                    f"(cand_ev_cc={result.candidate_ev_cc:.1f}, "
+                    f"(admission_ev_cc={result.admission_ev_cc:.1f} "
+                    f"[{result.admission_ev_source}], "
+                    f"cand_ev_cc={result.candidate_ev_cc:.1f}, "
                     f"worst_challenger_ev_cc="
                     f"{result.worst_credible_candidate_ev_cc:.1f}, "
                     f"post_es_cc={result.post.governing_model_es_99_cc:.0f}, "
@@ -1799,6 +1880,10 @@ class QuoteLifecycle:
             pre_p_book=round(result.pre.p_profit, 4),
             post_p_book=round(result.post.p_profit, 4),
             delta_p_book=round(result.candidate_delta_p_book, 4),
+            # GATE EV SOURCE audit (2026-07-25 review): the EV that judged
+            # admission and which fair produced it — verifiable per fill.
+            admission_ev_cc=round(result.admission_ev_cc, 2),
+            admission_ev_source=result.admission_ev_source,
         )
 
     def _build_candidate_gate_inputs(
@@ -1933,6 +2018,14 @@ class QuoteLifecycle:
             # P(KILL-distance night) instead of the ES99 average. Default OFF.
             tail_prob_gate=self._config.tail_prob_gate,
             kill_tail_prob=self._config.kill_tail_prob,
+            # GATE EV SOURCE (2026-07-25 renege root cause #2): the CALIBRATED
+            # pricing fair's edge for THIS fill — the same fair that priced
+            # the quote. None when no sized pending fill (the gate then keeps
+            # its MC EV, fail-safe). Armed via gate_ev_from_pricing_fair.
+            gate_ev_from_pricing_fair=self._config.gate_ev_from_pricing_fair,
+            # Fresh re-price only when armed (one engine call per confirm
+            # attempt); OFF ⇒ None ⇒ the gate keeps its MC EV, byte-identical.
+            pricing_edge_cc=self._gate_pricing_edge(state),
             # P1 EV VISIBILITY: the OPTIONAL worst-challenger-EV tolerance. −inf by
             # default (no behaviour change — the gate stays production-model-EV only);
             # a finite operator value ALSO declines a +production-EV candidate whose
@@ -2223,10 +2316,13 @@ class QuoteLifecycle:
                 # adder, so the stability key is that certificate's own
                 # support — not the full same-game id set (churn among small
                 # quotes the trim never priced was invalidating certificates
-                # whose bound still held). The stamps (position generation +
-                # reservation version) stay EXACT: committed fills and
-                # reservation churn are real risk changes, never waived
-                # through. Quote churn is then judged by grant-time
+                # whose bound still held). The stamps stay EXACT — global
+                # position generation + reservation version by default, or
+                # (``waiver_game_scoped_stability``, 2026-07-25) the BREACHED
+                # GAMES' position/reservation content, so a same-game fill or
+                # reservation still invalidates while an unrelated-game one
+                # no longer does (the retry re-checks live cross-game state
+                # anyway). Quote churn is then judged by grant-time
                 # revalidation (``_waiver_trim_revalidate``): the certificate
                 # stays valid iff every still-present SELECTED quote is
                 # byte-identical (id + priced size) and the CURRENT outside-
@@ -2457,10 +2553,13 @@ class QuoteLifecycle:
 
     def _waiver_games_fingerprint(
         self, games: list[str]
-    ) -> tuple[int, int, tuple[str, ...]]:
+    ) -> tuple[object, object, tuple[str, ...]]:
         """Stability key for a waiver enumeration (2026-07-18): the POSITION
         generation + reservation version + the ids of the resting quotes
-        touching the BREACHED games. A quote landing/expiring on an UNRELATED
+        touching the BREACHED games — or, with ``waiver_game_scoped_stability``
+        (2026-07-25), the breached games' position/reservation CONTENT in
+        place of the global counters (same-game changes still invalidate;
+        unrelated-game fills no longer do — see the scoped branch below). A quote landing/expiring on an UNRELATED
         game cannot change the breached games' certified worst case, so it no
         longer invalidates the run — at 400+ quotes/min the old FULL-generation
         stamp made the waiver un-runnable ("book moved during every
@@ -2485,6 +2584,40 @@ class QuoteLifecycle:
                 for leg in q.legs
             )
         ))
+        if self._config.waiver_game_scoped_stability:
+            # GAME-SCOPED STABILITY (2026-07-25 — the peak-flow waiver gap):
+            # the GLOBAL position generation / reservation version bump on
+            # EVERY concurrent fill anywhere, so at tonight's fill rate the
+            # waiver conflicted on every attempt ("book moved during every
+            # enumeration", $1.99-EV wins reneged twice). A game's EXACT
+            # certificate depends only on SAME-GAME entities; cross-game
+            # moves are re-checked anyway by the reservation retry against
+            # the LIVE book (certificates replace only the breached games'
+            # terms). So compare the breached games' POSITION/RESERVATION
+            # CONTENT instead of the global counters: any same-game change
+            # (id or size) still invalidates — an unrelated-game fill no
+            # longer does.
+            def _touches(pos: OpenPosition) -> bool:
+                return any(
+                    leg.event_ticker and game_key(leg.event_ticker) in gset
+                    for leg in pos.legs
+                )
+
+            scoped_positions = tuple(sorted(
+                (p.position_id, int(p.contracts), int(p.entry_price_cc))
+                for p in self._exposure.positions.values()
+                if _touches(p)
+            ))
+            scoped_reservations = tuple(sorted(
+                (p.position_id, int(p.contracts), int(p.entry_price_cc))
+                for p in (
+                    self._reservation.outstanding_positions()
+                    if self._reservation is not None
+                    else ()
+                )
+                if _touches(p)
+            ))
+            return (scoped_positions, scoped_reservations, qids)
         return (
             self._exposure.position_generation,
             self._reservation.version if self._reservation is not None else -1,
@@ -2922,6 +3055,20 @@ class QuoteLifecycle:
             self._metrics.inc(f"confirm.declined.{ReasonCode.DECLINE_CONVENTION_UNKNOWN}")
             self._drop_quote(quote_id)
             return
+
+        # RELEASE THE ACCEPTED QUOTE'S OWN EXPOSURE (2026-07-25 review HIGH —
+        # the renege zone's second half): once ACCEPTED, this quote's resting
+        # entry is ECONOMICALLY DEAD in every outcome (confirm ⇒ the fill
+        # position replaces it; lapse/decline ⇒ the exchange voids it — no
+        # post-accept decline mechanism exists, NOTES.md). Leaving it in the
+        # book made every confirm-path check count this fill's exposure TWICE
+        # (once as the resting mass-acceptance hypothetical, once as the true
+        # candidate) — confirm demanded ~2× the headroom quote-time admitted,
+        # so won auctions on the summing axes (game/slate/directional) still
+        # reneged even with award sizing. Removing it here restores the
+        # no-double-risk-layers invariant; ``_drop_quote`` later is idempotent.
+        if self._config.release_accepted_quote_exposure:
+            self._exposure.remove_quote(quote_id)
 
         inputs = self._last_look_inputs(state, accepted_side, bid, qty)
         decision = decide_confirm(inputs, self._policy)
@@ -5489,9 +5636,33 @@ class QuoteLifecycle:
         )
 
     def _risk_qty(self, rfq: Rfq, constructed: ConstructedQuote) -> CentiContracts | None:
-        """Full-RFQ size for the risk system. Target-cost RFQs convert at the
-        CHEAPEST quoted side (most contracts) — the conservative ceiling.
-        None = unresolvable = no-quote (never a placeholder)."""
+        """Full-RFQ size for the risk system. None = unresolvable = no-quote.
+
+        TARGET-COST conversion — TWO FORMS (2026-07-25 big-fill audit):
+
+        LEGACY (default): convert at the CHEAPEST quoted side's OWN bid. On a
+        sell-only book this is the NO bid (~80¢ on longshots) — but the
+        exchange awards contracts at the TAKER'S price for the side they buy
+        (~1 − our bid), so the quote-time candidate was 3.6–4.7× SMALLER than
+        the fill that arrived at confirm. Quote-time caps passed a phantom-
+        small candidate, we WON the auction, and the confirm reservation
+        (true size) correctly declined: tonight 49 auctions won → only 15
+        filled, $355 premium won-then-reneged. The old "conservative ceiling"
+        claim was true only for favorites.
+
+        AWARD SIZING (``risk_qty_award_sizing``, arm-gated): contracts =
+        target / (taker's price on the accepted side) = target / ($1 − our
+        bid), worst (largest) across the sides we actually quote. Fees are
+        deliberately EXCLUDED from the denominator: the taker pays price+fee
+        per contract, so the fee only SHRINKS the awarded count — excluding
+        it keeps this a strict UPPER bound on the exchange's award (~5% over
+        on tonight's tape: $50 @ no_bid 0.8210 → 279.3 here vs 264.13
+        awarded). A bid above 99¢ is unresolvable (the bound would invert)
+        ⇒ None ⇒ no-quote. Size-layer coherence — quote-time admission never
+        looser than confirm enforcement, closing the renege zone — holds when
+        this is armed TOGETHER with ``release_accepted_quote_exposure``
+        (2026-07-25 review: without the release, the accepted quote's own
+        resting entry still double-counted the fill at confirm)."""
         if rfq.contracts is not None:
             return rfq.contracts
         if rfq.target_cost_cc is not None:
@@ -5502,7 +5673,18 @@ class QuoteLifecycle:
             ]
             if not bids:
                 return None
-            denom = max(100, min(bids))
+            if self._config.risk_qty_award_sizing:
+                # Taker price for accepting side s = $1 − our bid on s; the
+                # worst case (most contracts) is the side with the HIGHEST
+                # bid. A bid above 99¢ would make the 1¢ floor an UNDER-
+                # estimate of the award (the ceiling inverts — 2026-07-25
+                # review): unresolvable ⇒ no-quote, never an understated
+                # candidate (hard rule 6).
+                denom = CC_PER_DOLLAR - max(bids)
+                if denom < 100:
+                    return None
+            else:
+                denom = max(100, min(bids))
             return CentiContracts(-(-int(rfq.target_cost_cc) * 100 // denom))
         return None
 

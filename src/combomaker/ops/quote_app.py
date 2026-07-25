@@ -317,6 +317,13 @@ def build_lifecycle_config(
         kill_tail_prob=float(
             Fraction(Decimal(risk_cfg.portfolio_kill_tail_prob))
         ),
+        # RENEGE FIXES (2026-07-25 big-fill audit): award-true candidate
+        # sizing + pricing-fair admission EV + game-scoped waiver stability.
+        # All default OFF.
+        risk_qty_award_sizing=risk_cfg.risk_qty_award_sizing,
+        gate_ev_from_pricing_fair=risk_cfg.gate_ev_from_pricing_fair,
+        waiver_game_scoped_stability=risk_cfg.waiver_game_scoped_stability,
+        release_accepted_quote_exposure=risk_cfg.release_accepted_quote_exposure,
         # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): poll REST for a confirmed
         # fill whose quote_executed WS message never arrived.
         fill_record_recovery_after_s=risk_cfg.fill_record_recovery_after_s,
