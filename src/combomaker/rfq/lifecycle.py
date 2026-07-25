@@ -468,6 +468,15 @@ class LifecycleConfig:
     # sniper-tax subsidy on stale quotes.
     allow_negative_ev_hedge: bool = False
     hedge_cost_budget_cc: int = 0
+    # B2 DERIVED HEDGE BUDGET (operator directive 2026-07-25: pay up to win
+    # offsetting flow when lopsided, no manual number). When True the
+    # certified-hedge budget becomes max(static budget, PRE−POST certified
+    # governing-tail reduction) — pay up to $1 of EV per $1 of tail actually
+    # removed, measured on common random numbers. Effective only alongside
+    # ``allow_negative_ev_hedge``; default OFF (byte-identical prior
+    # behaviour). Armed together with the P(book) steer after the shadow
+    # slate validates.
+    hedge_budget_tail_derived: bool = False
     # PEAK-CONCENTRATION pricing steer (operator directive 2026-07-18 evening).
     # K cached worst scorelines per game for the committed-book peak profile
     # (sim/peak_profile.build_peak_profile) — rebuilt OFF the hot path on the
@@ -1808,6 +1817,10 @@ class QuoteLifecycle:
             # EV cost fits the budget — sim/book_risk._candidate_gate.
             hedge_cost_budget_cc=self._config.hedge_cost_budget_cc,
             allow_negative_ev_hedge=self._config.allow_negative_ev_hedge,
+            # B2 (2026-07-25): derived budget = certified tail reduction —
+            # pay $1 of EV per $1 of risk removed; static budget stays a
+            # manual floor. Default OFF.
+            hedge_budget_tail_derived=self._config.hedge_budget_tail_derived,
             # P1 EV VISIBILITY: the OPTIONAL worst-challenger-EV tolerance. −inf by
             # default (no behaviour change — the gate stays production-model-EV only);
             # a finite operator value ALSO declines a +production-EV candidate whose

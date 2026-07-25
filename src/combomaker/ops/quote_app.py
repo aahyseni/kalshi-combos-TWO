@@ -301,6 +301,8 @@ def build_lifecycle_config(
         # negative-EV hedge exception. Default disabled / 0 = today.
         allow_negative_ev_hedge=risk_cfg.allow_negative_ev_hedge,
         hedge_cost_budget_cc=risk_cfg.hedge_cost_budget_cc,
+        # B2 (2026-07-25): derived certified-hedge budget = tail reduction.
+        hedge_budget_tail_derived=risk_cfg.hedge_budget_tail_derived,
         # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): poll REST for a confirmed
         # fill whose quote_executed WS message never arrived.
         fill_record_recovery_after_s=risk_cfg.fill_record_recovery_after_s,

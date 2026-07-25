@@ -1842,6 +1842,7 @@ def evaluate_candidate_book_risk(
     absolute_notional_multiple: int | None = None,
     hedge_cost_budget_cc: int = 0,
     allow_negative_ev_hedge: bool = False,
+    hedge_budget_tail_derived: bool = False,
     worst_challenger_ev_tolerance: float = float("-inf"),
     det_max_mutex_aware: bool = True,
 ) -> CandidateBookRisk:
@@ -2144,6 +2145,7 @@ def evaluate_candidate_book_risk(
         absolute_notional_multiple=absolute_notional_multiple,
         hedge_cost_budget_cc=hedge_cost_budget_cc,
         allow_negative_ev_hedge=allow_negative_ev_hedge,
+        hedge_budget_tail_derived=hedge_budget_tail_derived,
     )
 
     return CandidateBookRisk(
@@ -2180,6 +2182,7 @@ def _candidate_gate(
     absolute_notional_multiple: int | None,
     hedge_cost_budget_cc: int,
     allow_negative_ev_hedge: bool,
+    hedge_budget_tail_derived: bool = False,
 ) -> tuple[bool, str]:
     """The confirm/decline decision from the candidate EV + PRE/POST tail axes.
 
@@ -2228,7 +2231,23 @@ def _candidate_gate(
         if post.governing_model_tail_loss_cc > pre.governing_model_tail_loss_cc:
             return False, "negative_ev_not_risk_reducing"
         # The hedge's cost is the EV we give up = −candidate_ev (a positive $).
-        if -candidate_ev > float(hedge_cost_budget_cc):
+        budget = float(hedge_cost_budget_cc)
+        if hedge_budget_tail_derived:
+            # B2 DERIVED BUDGET (operator directive 2026-07-25: the book pays
+            # up to win offsetting flow when lopsided — with no manual
+            # number): pay up to $1 of EV per $1 of CERTIFIED governing-tail
+            # reduction, both sides measured on the SAME common-random-number
+            # sample. Self-scaling: a one-way book offers a large budget for
+            # exactly the balancing flow it lacks; a balanced book offers
+            # ~nothing (no reduction to buy); and the price can never exceed
+            # the risk actually removed (ES reduction valued at par). The
+            # static ``hedge_cost_budget_cc`` remains a manual floor/override.
+            budget = max(
+                budget,
+                pre.governing_model_tail_loss_cc
+                - post.governing_model_tail_loss_cc,
+            )
+        if -candidate_ev > budget:
             return False, "negative_ev_exceeds_hedge_budget"
 
     # (1b) OPTIONAL worst-challenger-EV tolerance (audit "+EV IS PRODUCTION-MODEL EV").

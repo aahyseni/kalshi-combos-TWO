@@ -2684,6 +2684,17 @@ class RiskConfig(StrictModel):
     # default to the P0-1 safety default (disabled / 0 = today's behaviour).
     allow_negative_ev_hedge: bool = False
     hedge_cost_budget_cc: int = 0
+    # B2 DERIVED HEDGE BUDGET (operator directive 2026-07-25: pay up to win
+    # offsetting flow when the book is lopsided — with no manual number).
+    # When True the certified-hedge budget becomes max(hedge_cost_budget_cc,
+    # PRE−POST certified governing-tail reduction): pay up to $1 of EV per
+    # $1 of tail actually removed, both sides measured on the same
+    # common-random-numbers sample — self-scaling (a one-way book offers a
+    # large budget for exactly the balancing flow it lacks; a balanced book
+    # offers ~nothing) and bounded by the risk removed. Effective only with
+    # ``allow_negative_ev_hedge``; default OFF (byte-identical). Armed
+    # together with pricing.skew.pbook_armed after the shadow slate.
+    hedge_budget_tail_derived: bool = False
     # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1). Seconds after a SUCCESSFUL
     # confirm before the maintenance sweep polls REST GET quote for a fill whose
     # quote_executed WS message never arrived (the WS channel has no replay; a

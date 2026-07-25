@@ -403,6 +403,10 @@ class CandidateBookRiskInputs:
     absolute_notional_multiple: int | None
     hedge_cost_budget_cc: int
     allow_negative_ev_hedge: bool
+    # B2 (2026-07-25): derived certified-hedge budget = PRE−POST certified
+    # tail reduction (pay $1 of EV per $1 of risk removed); the static budget
+    # stays a manual floor. Default OFF (byte-identical prior behaviour).
+    hedge_budget_tail_derived: bool = False
     # P1 EV VISIBILITY (audit "+EV IS PRODUCTION-MODEL EV"): the OPTIONAL worst-
     # challenger-EV tolerance. Defaults to −inf ⇒ the gate is production-model-EV
     # only (no behaviour change); the operator sets a finite (negative) tolerance to
@@ -524,6 +528,7 @@ def _worker_candidate_book_risk(
         absolute_notional_multiple=inputs.absolute_notional_multiple,
         hedge_cost_budget_cc=inputs.hedge_cost_budget_cc,
         allow_negative_ev_hedge=inputs.allow_negative_ev_hedge,
+        hedge_budget_tail_derived=inputs.hedge_budget_tail_derived,
         worst_challenger_ev_tolerance=inputs.worst_challenger_ev_tolerance,
         det_max_mutex_aware=inputs.det_max_mutex_aware,
     )

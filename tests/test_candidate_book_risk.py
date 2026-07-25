@@ -309,6 +309,85 @@ class TestNegativeEvHedge:
         assert r.candidate_ev_cc < 0.0
         assert r.confirm  # authorized hedge within budget, no post budgets tripped
 
+    # --- B2 DERIVED BUDGET (2026-07-25): pay up to $1 of EV per $1 of
+    # certified tail reduction — self-scaling, no manual number. -----------
+
+    def test_derived_budget_refuses_overpriced_hedge_end_to_end(self) -> None:
+        """The fixture hedge is deliberately EXPENSIVE (EV cost ≫ the tail it
+        removes): the derived budget must refuse it with no static budget —
+        we never pay more EV than the risk actually removed."""
+        committed, hedge = self._hedge_inputs()
+        r = evaluate_candidate_book_risk(
+            committed,
+            hedge,
+            marginals=lambda t: 0.05,
+            n_samples=40_000,
+            seed=2,
+            allow_negative_ev_hedge=True,
+            hedge_cost_budget_cc=0,  # no static budget — only the reduction
+            hedge_budget_tail_derived=True,
+        )
+        reduction = (
+            r.pre.governing_model_tail_loss_cc
+            - r.post.governing_model_tail_loss_cc
+        )
+        cost = -r.candidate_ev_cc
+        assert r.candidate_ev_cc < 0.0
+        assert 0.0 < reduction < cost  # certified reducing, but over-priced
+        assert not r.confirm
+        assert r.decline_reason == "negative_ev_exceeds_hedge_budget"
+
+    def test_derived_budget_gate_math(self) -> None:
+        """White-box: cost ≤ certified reduction admits; cost > reduction
+        declines; the static budget stays a floor under the derived value."""
+        from combomaker.sim.book_risk import _candidate_gate, _TailAxes
+
+        def axes(tail: float) -> _TailAxes:
+            return _TailAxes(
+                ev_cc=0.0,
+                es_99_cc=0.0,
+                challenger_es_99_cc=0.0,
+                governing_model_es_99_cc=0.0,
+                deterministic_max_loss_cc=0.0,
+                gross_settlement_notional_cc=0.0,
+                p_ruin=0.0,
+                governing_model_tail_loss_cc=tail,
+            )
+
+        common = dict(
+            worst_credible_candidate_ev=0.0,
+            worst_challenger_ev_tolerance=float("-inf"),
+            pre=axes(1_000.0),
+            post=axes(900.0),  # certified reduction = 100cc
+            bankroll_cc=None,
+            portfolio_cvar_frac=None,
+            portfolio_det_max_frac=None,
+            portfolio_ruin_prob_budget=None,
+            absolute_notional_multiple=None,
+            allow_negative_ev_hedge=True,
+            hedge_budget_tail_derived=True,
+        )
+        ok, reason = _candidate_gate(
+            candidate_ev=-50.0, hedge_cost_budget_cc=0, **common
+        )
+        assert ok and reason == ""
+        ok, reason = _candidate_gate(
+            candidate_ev=-150.0, hedge_cost_budget_cc=0, **common
+        )
+        assert not ok and reason == "negative_ev_exceeds_hedge_budget"
+        # The static budget floors the derived value (manual override up).
+        ok, reason = _candidate_gate(
+            candidate_ev=-150.0, hedge_cost_budget_cc=200, **common
+        )
+        assert ok
+        # Derived OFF ⇒ today's static-only behaviour.
+        ok, reason = _candidate_gate(
+            candidate_ev=-50.0,
+            hedge_cost_budget_cc=0,
+            **{**common, "hedge_budget_tail_derived": False},
+        )
+        assert not ok and reason == "negative_ev_exceeds_hedge_budget"
+
 
 class TestNewGameCandidate:
     def test_new_game_candidate_included(self) -> None:
