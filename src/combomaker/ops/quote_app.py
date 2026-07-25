@@ -2986,7 +2986,22 @@ class QuoteApp:
             if meta is None:
                 continue
             fingerprint = self._settlement_fingerprint(meta)
-            horizon = meta.close_time or meta.expected_expiration_time
+            # SETTLEMENT HORIZON = the EARLIEST tz-aware end-of-life stamp
+            # (2026-07-25 THIRD halt of this class): props carry a
+            # far-future LISTED close (a KS market showed close_time two days
+            # out) alongside a same-day expected_expiration — taking
+            # close_time first made the horizon meaningless for exactly the
+            # prop families that resolve intraday, so their normal in-game
+            # expiry/status bookkeeping kept tripping the breaker. Earliest
+            # is the honest "this market's life is ending" signal; a genuine
+            # PREGAME reschedule (both stamps still in the future) still
+            # trips.
+            horizons = [
+                h
+                for h in (meta.close_time, meta.expected_expiration_time)
+                if h is not None and h.tzinfo is not None
+            ]
+            horizon = min(horizons) if horizons else None
             # Terminal settlement statuses (doc:kalshi market lifecycle —
             # active → closed → determined → settled/finalized). A transition
             # INTO one of these is the market COMPLETING (props determine

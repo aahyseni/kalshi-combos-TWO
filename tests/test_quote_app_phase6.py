@@ -593,7 +593,11 @@ def test_unmapped_game_breaker_fires_on_none_event_ticker(tmp_path: Path) -> Non
 
 
 def _market_meta(
-    ticker: str, *, status: str, close_time: datetime | None
+    ticker: str,
+    *,
+    status: str,
+    close_time: datetime | None,
+    expected_expiration_time: datetime | None = None,
 ) -> MarketMeta:
     return MarketMeta(
         ticker=ticker,
@@ -601,7 +605,7 @@ def _market_meta(
         grid=None,
         event_ticker="KXWCGAME-26JUL05MEXENG",
         close_time=close_time,
-        expected_expiration_time=None,
+        expected_expiration_time=expected_expiration_time,
         raw={},
         fetched_mono_ns=0,
     )
@@ -672,6 +676,54 @@ def test_metadata_change_breaker_exempts_post_close_settling(
         metadata=meta_v2,
     )
     assert second.changed_markets == ()  # benign: horizon already passed
+    assert breakers.evaluate(second).tripped is False
+
+
+def test_metadata_change_breaker_uses_earliest_horizon(tmp_path: Path) -> None:
+    # THIRD-HALT FIX (2026-07-25 7:32p): a strikeout prop carried a LISTED
+    # close two days out beside a same-day expected_expiration; taking
+    # close_time first made the horizon meaningless for intraday-resolving
+    # props, so their normal in-game expiry bookkeeping kept tripping the
+    # breaker. The horizon is now the EARLIEST tz-aware stamp: once THAT has
+    # passed, changes are lifecycle, not a reschedule.
+    app = _demo_app(tmp_path)
+    breakers = _breakers(app)
+    legs = (LegRef("LEG", "KXWCGAME-26JUL05MEXENG", "yes"),)
+    book = _book_with_quote_legs(legs)
+    feed = FakeFeed(rx_age_s=0.1, warm=True, seq_gap=False)
+    far_close = datetime(2099, 7, 5, 18, 0, tzinfo=UTC)
+    past_expiry = datetime(2020, 7, 5, 23, 5, tzinfo=UTC)
+    meta_v1 = FakeMetadata(
+        {
+            "LEG": _market_meta(
+                "LEG",
+                status="active",
+                close_time=far_close,
+                expected_expiration_time=past_expiry,
+            )
+        }
+    )
+    first = _sample(
+        app, feed, lifecycle=FakeLifecycle({"LEG": 0.50}), exposure=book,
+        metadata=meta_v1,
+    )
+    assert first.changed_markets == ()
+    meta_v2 = FakeMetadata(
+        {
+            "LEG": _market_meta(
+                "LEG",
+                status="active",
+                close_time=far_close,
+                # expiry drifts as the game runs long — in-game bookkeeping
+                expected_expiration_time=datetime(2020, 7, 5, 23, 35, tzinfo=UTC),
+            )
+        }
+    )
+    second = _sample(
+        app, feed, lifecycle=FakeLifecycle({"LEG": 0.50}), exposure=book,
+        metadata=meta_v2,
+    )
+    assert second.changed_markets == ()  # benign: earliest horizon passed
     assert breakers.evaluate(second).tripped is False
 
 
