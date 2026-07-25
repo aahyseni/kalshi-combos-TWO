@@ -407,6 +407,10 @@ class CandidateBookRiskInputs:
     # tail reduction (pay $1 of EV per $1 of risk removed); the static budget
     # stays a manual floor. Default OFF (byte-identical prior behaviour).
     hedge_budget_tail_derived: bool = False
+    # TAIL-PROBABILITY BOOK GATE (2026-07-25 operator anchor): P(KILL night)
+    # form of the joint-tail budget. Default OFF (byte-identical ES form).
+    tail_prob_gate: bool = False
+    kill_tail_prob: float = 0.02
     # P1 EV VISIBILITY (audit "+EV IS PRODUCTION-MODEL EV"): the OPTIONAL worst-
     # challenger-EV tolerance. Defaults to −inf ⇒ the gate is production-model-EV
     # only (no behaviour change); the operator sets a finite (negative) tolerance to
@@ -529,6 +533,8 @@ def _worker_candidate_book_risk(
         hedge_cost_budget_cc=inputs.hedge_cost_budget_cc,
         allow_negative_ev_hedge=inputs.allow_negative_ev_hedge,
         hedge_budget_tail_derived=inputs.hedge_budget_tail_derived,
+        tail_prob_gate=inputs.tail_prob_gate,
+        kill_tail_prob=inputs.kill_tail_prob,
         worst_challenger_ev_tolerance=inputs.worst_challenger_ev_tolerance,
         det_max_mutex_aware=inputs.det_max_mutex_aware,
     )

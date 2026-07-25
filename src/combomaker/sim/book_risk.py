@@ -138,6 +138,12 @@ class BookRiskSnapshot:
     var_99_cc: float = 0.0
     es_99_cc: float = 0.0  # production-copula CVaR at ``band`` (== production_es_99_cc)
     p_loss_worse_than: dict[float, float] = field(default_factory=dict)
+    # LOSS-QUANTILE ENVELOPE (2026-07-25): 1001 evenly spaced LOSS quantiles,
+    # elementwise worst over every model book that ran. The quote-time
+    # tail-probability portfolio cap computes P(loss ≥ any live threshold)
+    # from this; () on empty/legacy snapshots (the cap then falls back to the
+    # ES form — never a free pass).
+    loss_quantiles_cc: tuple[float, ...] = field(default_factory=tuple)
     # A2: P(this settlement wave drops equity BELOW the ruin floor) =
     # P(current_equity + book_pnl < ruin_floor_frac·bankroll). 0.0 when equity/
     # bankroll unavailable (the ruin cap then does not evaluate). Reflects the
@@ -286,6 +292,34 @@ def _p_ruin_from_pnl(
     if current_equity_cc is None or ruin_floor_cc is None or pnl.size == 0:
         return 0.0
     return float(np.mean(current_equity_cc + pnl < ruin_floor_cc))
+
+
+def kill_tail_prob_upper(
+    pnls: Sequence["NDArray[np.float64] | None"],
+    threshold_cc: float,
+    n_samples: int,
+    z: float,
+) -> float:
+    """GOVERNING P(book loss ≥ ``threshold_cc``) with a fail-closed Wilson
+    upper bound (operator anchor ratified 2026-07-25: the TOTAL-book gate
+    binds the PROBABILITY of a KILL-distance night, not the ES99 average —
+    "more bets = more variance = more money"; diversification directly buys
+    capacity while a one-way book stays hard-blocked).
+
+    ``pnls`` are the per-model P&L vectors (production / challenger / bridge
+    / split — None or empty entries skipped); the returned probability is the
+    MAX over models (gate on the worst credible model, mirroring the
+    governing ES), each wrapped in the one-sided Wilson upper bound at ``z``
+    (0 ⇒ the point estimate) so a p̂ that only clears the budget by sampling
+    luck is treated as over-budget. Empty books (no vectors) return 0.0 —
+    the deterministic caps still bound them."""
+    worst = 0.0
+    for pnl in pnls:
+        if pnl is None or pnl.size == 0:
+            continue
+        p_hat = float(np.mean(pnl <= -float(threshold_cc)))
+        worst = max(worst, wilson_upper_bound(p_hat, n_samples, z))
+    return worst
 
 
 def wilson_upper_bound(p_hat: float, n: int, z: float) -> float:
@@ -1087,6 +1121,9 @@ def compute_book_risk(
     rng_c = np.random.default_rng(seq_chal)  # spawned substream (M2 §4.3)
     values_c = _sampler(model.legs, challenger_corr, n_samples, rng_c)
     book_c = _book_pnl_from_values(values_c, model.positions)
+    # LOSS-QUANTILE ENVELOPE books (2026-07-25 tail-probability gate): every
+    # model book that runs joins the envelope; branches below append theirs.
+    envelope_books: list[NDArray[np.float64]] = [book, book_c]
     _, challenger_es = _es_from_pnl(book_c, HEADLINE_LEVEL)
     # P1-1: challenger P(ruin) on the SAME equity/floor. The correlation-inflated
     # book breaks more shared games together, so its ruin probability is the
@@ -1109,6 +1146,7 @@ def compute_book_risk(
         rng_b = np.random.default_rng(seq_bridge)  # spawned substream (M2 §4.3)
         values_b = sample_leg_values(model.legs, challenger_corr, n_samples, rng_b)
         book_b = _book_pnl_from_values(values_b, model.positions)
+        envelope_books.append(book_b)
         _, bridge_es = _es_from_pnl(book_b, HEADLINE_LEVEL)
         # P1-1: bridge P(ruin) too (full-copula same-game dependence), folded into
         # the governing max — the ruin axis gates on the worse of the three books.
@@ -1127,6 +1165,7 @@ def compute_book_risk(
         rng_sp = np.random.default_rng(seq_split)  # spawned substream (M2 §4.3)
         values_sp = bundle.split_sampler(model.legs, corr, n_samples, rng_sp)
         book_sp = _book_pnl_from_values(values_sp, model.positions)
+        envelope_books.append(book_sp)
         _, split_es = _es_from_pnl(book_sp, HEADLINE_LEVEL)
         split_p_ruin = _p_ruin_from_pnl(book_sp, current_equity_cc, ruin_floor_cc)
 
@@ -1155,6 +1194,7 @@ def compute_book_risk(
             # not the copula correlation — that is the OTHER challenger's job).
             values_s = struct_bundle.sampler(model.legs, corr, n_samples, rng_s)
             book_s = _book_pnl_from_values(values_s, model.positions)
+            envelope_books.append(book_s)
             _, struct_es = _es_from_pnl(book_s, HEADLINE_LEVEL)
             struct_p_ruin = _p_ruin_from_pnl(book_s, current_equity_cc, ruin_floor_cc)
 
@@ -1214,6 +1254,22 @@ def compute_book_risk(
     # unchanged unless an operator opts into a positive ruin confidence level.
     p_ruin_upper = wilson_upper_bound(p_ruin, n_samples, ruin_prob_ci_z)
 
+    # LOSS-QUANTILE ENVELOPE (2026-07-25 tail-probability book gate): 1001
+    # evenly spaced quantiles of LOSS (−P&L), elementwise MAX over every model
+    # book that ran (worst credible model per quantile — the same governing
+    # discipline as the ES/ruin axes). The quote-time portfolio cap reads
+    # P(loss ≥ live threshold) off this grid for ANY threshold (the bankroll
+    # moves between snapshot and check), conservative by construction.
+    # Sampled books only — conservatively-reserved holdings stay on the
+    # deterministic axis, exactly as they do for the ES axes.
+    loss_quantiles_cc: tuple[float, ...] = ()
+    if book.size:
+        q_grid = np.linspace(0.0, 1.0, 1001)
+        envelope = np.maximum.reduce(
+            [np.quantile(-b, q_grid) for b in envelope_books]
+        )
+        loss_quantiles_cc = tuple(float(x) for x in envelope)
+
     return BookRiskSnapshot(
         unknown=False,
         band=band,
@@ -1228,6 +1284,7 @@ def compute_book_risk(
         var_99_cc=var_99,
         es_99_cc=es_99,
         p_loss_worse_than=p_loss_worse_than,
+        loss_quantiles_cc=loss_quantiles_cc,
         p_ruin=p_ruin,
         p_ruin_upper=p_ruin_upper,
         production_es_99_cc=es_99,
@@ -1843,6 +1900,8 @@ def evaluate_candidate_book_risk(
     hedge_cost_budget_cc: int = 0,
     allow_negative_ev_hedge: bool = False,
     hedge_budget_tail_derived: bool = False,
+    tail_prob_gate: bool = False,
+    kill_tail_prob: float = 0.02,
     worst_challenger_ev_tolerance: float = float("-inf"),
     det_max_mutex_aware: bool = True,
 ) -> CandidateBookRisk:
@@ -2146,6 +2205,13 @@ def evaluate_candidate_book_risk(
         hedge_cost_budget_cc=hedge_cost_budget_cc,
         allow_negative_ev_hedge=allow_negative_ev_hedge,
         hedge_budget_tail_derived=hedge_budget_tail_derived,
+        tail_prob_gate=tail_prob_gate,
+        kill_tail_prob=kill_tail_prob,
+        # Every post-book model vector that ran, on the shared CRN sample —
+        # the tail-probability form gates on the WORST model's P(KILL night).
+        post_pnls=(post_pnl, post_pnl_c, post_bridge_pnl, post_split_pnl),
+        n_samples=n_samples,
+        ruin_prob_ci_z=ruin_prob_ci_z,
     )
 
     return CandidateBookRisk(
@@ -2183,6 +2249,11 @@ def _candidate_gate(
     hedge_cost_budget_cc: int,
     allow_negative_ev_hedge: bool,
     hedge_budget_tail_derived: bool = False,
+    tail_prob_gate: bool = False,
+    kill_tail_prob: float = 0.02,
+    post_pnls: Sequence["NDArray[np.float64] | None"] = (),
+    n_samples: int = 0,
+    ruin_prob_ci_z: float = 0.0,
 ) -> tuple[bool, str]:
     """The confirm/decline decision from the candidate EV + PRE/POST tail axes.
 
@@ -2260,14 +2331,39 @@ def _candidate_gate(
     if worst_credible_candidate_ev < worst_challenger_ev_tolerance:
         return False, "worst_challenger_ev_below_tolerance"
 
-    # (2) POST governing model ES_0.99 vs the %-of-bankroll CVaR ceiling.
+    # (2) The TOTAL-book joint-tail budget. TWO FORMS, operator-selected:
+    #
+    # DEFAULT (tail_prob_gate False, byte-identical): POST governing model
+    # ES_0.99 vs the %-of-bankroll CVaR ceiling — "the average of the worst
+    # 1% of nights stays under the KILL distance". At small N with ~50%-loss
+    # positions this barely credits diversification (the worst 1% is "most
+    # lose at once" even independent), so it caps TOTAL premium near the
+    # KILL distance regardless of variance.
+    #
+    # TAIL-PROBABILITY FORM (operator anchor ratified 2026-07-25: "more bets
+    # = more variance = more money"; risk-on per bet, one-sided concentration
+    # capped by the per-game/direction/structure walls, the TOTAL book bound
+    # by the PROBABILITY of a KILL night): decline iff the governing
+    # (worst-model, Wilson-upper) P(post-book loss ≥ the SAME cvar threshold)
+    # exceeds ``kill_tail_prob``. Diversification directly buys capacity —
+    # ~40 independent bets clear at 3-8x the premium a one-way book is
+    # blocked at (P ≈ 40% there) — while every concentration wall and the
+    # realized-P&L halts (daily/KILL) stand unchanged. Empty vectors (an
+    # all-reserved book) fail back to the ES form (never a free pass).
     if (
         portfolio_cvar_frac is not None
         and bankroll_cc is not None
         and bankroll_cc > 0
     ):
         cvar_thr = portfolio_cvar_frac * bankroll_cc
-        if post.governing_model_es_99_cc > cvar_thr:
+        has_vectors = any(p is not None and p.size for p in post_pnls)
+        if tail_prob_gate and has_vectors and n_samples > 0:
+            p_kill = kill_tail_prob_upper(
+                post_pnls, cvar_thr, n_samples, ruin_prob_ci_z
+            )
+            if p_kill > kill_tail_prob:
+                return False, "post_kill_tail_prob_over_budget"
+        elif post.governing_model_es_99_cc > cvar_thr:
             return False, "post_governing_model_es_over_budget"
 
     # (3) POST deterministic maximum vs its INDEPENDENT %-of-bankroll ceiling

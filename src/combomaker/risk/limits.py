@@ -36,6 +36,7 @@ dark). UNKNOWN bankroll is never a convenient default.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
@@ -79,6 +80,21 @@ def threshold_cc(frac: Fraction, bankroll_cc: int) -> int:
     are banned for money/thresholds; a Fraction percentage keeps it exact.
     """
     return frac.numerator * bankroll_cc // frac.denominator
+
+
+def _wilson_upper(p_hat: float, n: int, z: float) -> float:
+    """One-sided Wilson-score upper bound — KEEP IN SYNC with
+    ``sim.book_risk.wilson_upper_bound`` (limits must not import sim.book_risk:
+    the documented import cycle behind the PortfolioRisk Protocol). Used by the
+    tail-probability form of the portfolio joint-tail cap (2026-07-25)."""
+    if z <= 0.0 or n <= 0:
+        return p_hat
+    p = min(1.0, max(0.0, p_hat))
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    centre = (p + z2 / (2.0 * n)) / denom
+    halfwidth = (z / denom) * math.sqrt(p * (1.0 - p) / n + z2 / (4.0 * n * n))
+    return min(1.0, centre + halfwidth)
 
 
 def scaled_delta_cap_contracts(
@@ -191,6 +207,21 @@ class RiskLimits:
     # BookRiskSnapshot (never re-run MC in check); a stale/UNKNOWN snapshot fails
     # closed.
     portfolio_cvar_frac: Fraction = Fraction(15, 100)
+    # TAIL-PROBABILITY FORM of the portfolio joint-tail cap (operator anchor
+    # ratified 2026-07-25: "more bets = more variance = more money" — risk-on
+    # per bet, one-sided concentration capped by the per-game/direction/
+    # structure walls, the TOTAL book bound by the PROBABILITY of a
+    # KILL-distance night, not the ES99 average, which at small N with
+    # ~50%-loss positions barely credits diversification and capped total
+    # premium near the KILL distance regardless of variance). When armed, the
+    # CVaR-axis check binds `P(book loss >= portfolio_cvar_frac x bankroll)
+    # <= portfolio_kill_tail_prob` off the snapshot's loss-quantile envelope
+    # (worst credible model, Wilson-upper at portfolio_tail_prob_ci_z);
+    # legacy snapshots without the envelope fall back to the ES form (never
+    # a free pass). Default OFF = byte-identical ES behavior.
+    portfolio_tail_prob_gate: bool = False
+    portfolio_kill_tail_prob: float = 0.02
+    portfolio_tail_prob_ci_z: float = 0.0
     # Portfolio DETERMINISTIC maximum-loss cap (P0-3): the exact all-hit
     # premium-at-risk (+ reserved holdings) as a %-of-bankroll ceiling. Gated
     # INDEPENDENTLY of the sampled-ES cap so the deterministic maximum is its own
@@ -1046,8 +1077,39 @@ class LimitChecker:
                     )
                 )
             else:
-                # (8a) SAMPLED model-ES axis — fires on the correlated joint tail.
-                if book_risk.governing_model_es_99_cc > cvar_thr:
+                # (8a) SAMPLED joint-tail axis. TWO FORMS (operator anchor
+                # ratified 2026-07-25): the tail-PROBABILITY form binds
+                # P(book loss ≥ the same cvar threshold) ≤
+                # portfolio_kill_tail_prob off the snapshot's loss-quantile
+                # envelope (worst credible model per quantile; Wilson-upper
+                # against MC sampling error) — diversification directly buys
+                # capacity while a one-way book stays hard-blocked. Legacy
+                # snapshots without the envelope, or the flag off, bind the
+                # governing model ES_0.99 exactly as before (never a free
+                # pass).
+                quantiles = getattr(book_risk, "loss_quantiles_cc", ()) or ()
+                n_mc = int(getattr(book_risk, "n_samples", 0) or 0)
+                if limits.portfolio_tail_prob_gate and quantiles and n_mc > 0:
+                    # Each grid point carries 1/(len-1) probability mass;
+                    # counting POINTS ≥ thr rounds the mass UP (conservative).
+                    n_grid = len(quantiles)
+                    k_ge = sum(1 for q in quantiles if q >= cvar_thr)
+                    p_hat = k_ge / max(1, n_grid - 1)
+                    p_upper = _wilson_upper(
+                        min(1.0, p_hat), n_mc, limits.portfolio_tail_prob_ci_z
+                    )
+                    if p_upper > limits.portfolio_kill_tail_prob:
+                        out.append(
+                            Breach(
+                                ReasonCode.SKIP_PORTFOLIO_CVAR,
+                                f"P(book loss >= {cvar_thr}cc) = "
+                                f"{p_upper:.4f} (upper) > kill tail budget "
+                                f"{limits.portfolio_kill_tail_prob:.4f} "
+                                f"(tail-probability form)",
+                                shadow=shadow,
+                            )
+                        )
+                elif book_risk.governing_model_es_99_cc > cvar_thr:
                     out.append(
                         Breach(
                             ReasonCode.SKIP_PORTFOLIO_CVAR,

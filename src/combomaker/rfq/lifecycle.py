@@ -506,6 +506,14 @@ class LifecycleConfig:
     # behaviour). Armed together with the P(book) steer after the shadow
     # slate validates.
     hedge_budget_tail_derived: bool = False
+    # TAIL-PROBABILITY BOOK GATE (operator anchor ratified 2026-07-25: "more
+    # bets = more variance = more money"). When armed the candidate gate's
+    # joint-tail budget binds P(post-book loss ≥ the cvar threshold) ≤
+    # ``kill_tail_prob`` (worst credible model, Wilson-upper at the ruin CI z)
+    # instead of the ES99 average — diversification directly buys capacity;
+    # a one-way book stays hard-blocked. Default OFF (byte-identical ES form).
+    tail_prob_gate: bool = False
+    kill_tail_prob: float = 0.02
     # PEAK-CONCENTRATION pricing steer (operator directive 2026-07-18 evening).
     # K cached worst scorelines per game for the committed-book peak profile
     # (sim/peak_profile.build_peak_profile) — rebuilt OFF the hot path on the
@@ -1921,6 +1929,10 @@ class QuoteLifecycle:
             # pay $1 of EV per $1 of risk removed; static budget stays a
             # manual floor. Default OFF.
             hedge_budget_tail_derived=self._config.hedge_budget_tail_derived,
+            # TAIL-PROBABILITY BOOK GATE (2026-07-25 operator anchor): bind
+            # P(KILL-distance night) instead of the ES99 average. Default OFF.
+            tail_prob_gate=self._config.tail_prob_gate,
+            kill_tail_prob=self._config.kill_tail_prob,
             # P1 EV VISIBILITY: the OPTIONAL worst-challenger-EV tolerance. −inf by
             # default (no behaviour change — the gate stays production-model-EV only);
             # a finite operator value ALSO declines a +production-EV candidate whose

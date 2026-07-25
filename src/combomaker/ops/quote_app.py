@@ -310,6 +310,13 @@ def build_lifecycle_config(
         hedge_cost_budget_cc=risk_cfg.hedge_cost_budget_cc,
         # B2 (2026-07-25): derived certified-hedge budget = tail reduction.
         hedge_budget_tail_derived=risk_cfg.hedge_budget_tail_derived,
+        # TAIL-PROBABILITY BOOK GATE (2026-07-25 operator anchor): the
+        # candidate gate binds P(KILL-distance night) when armed; the SAME
+        # flag drives the quote-time cap via RiskLimits (one YAML key).
+        tail_prob_gate=risk_cfg.portfolio_tail_prob_gate,
+        kill_tail_prob=float(
+            Fraction(Decimal(risk_cfg.portfolio_kill_tail_prob))
+        ),
         # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): poll REST for a confirmed
         # fill whose quote_executed WS message never arrived.
         fill_record_recovery_after_s=risk_cfg.fill_record_recovery_after_s,
@@ -838,12 +845,13 @@ class QuoteApp:
         # book-reconciled preflight gate reads this.
         self._book_reconciled = config.mode is not Mode.QUOTE
         # Metadata-change breaker baseline: the last sampled settlement-relevant
-        # fingerprint per market ticker (close_time / status / event / expiry).
-        # The breaker sampler compares the current metadata cache against this and
-        # trips HALT_METADATA_CHANGE if a market the risk path touches changed
-        # settlement-relevant metadata tick-over-tick. First sighting seeds the
-        # baseline (no trip); it is off the hot path (status loop, 15s cadence).
-        self._metadata_fingerprints: dict[str, str] = {}
+        # fingerprint per market ticker (close_time / status / event / expiry)
+        # PLUS the close horizon seen at seed time — the end-of-life exemption
+        # (2026-07-25) compares the PRIOR horizon against wall-now so a
+        # finished game's markets settling never trips the breaker while a
+        # reschedule (horizon still in the future) still does. First sighting
+        # seeds the baseline (no trip); off the hot path (status loop, 15s).
+        self._metadata_fingerprints: dict[str, tuple[str, datetime | None]] = {}
         # The external SafetySupervisor subprocess (launched on startup in quote
         # mode). A SEPARATE OS process so its kill path survives the bot's own
         # host deadlocking; None until launched / when launch is skipped.
@@ -2921,15 +2929,42 @@ class QuoteApp:
         safe); a market with no cached metadata yet is skipped (nothing to
         fingerprint — the staleness/no-quote gates cover an unpriceable market)."""
         changed: list[str] = []
+        now_wall = self._clock.now()
         for leg in legs:
             meta = metadata.peek(leg.market_ticker)
             if meta is None:
                 continue
             fingerprint = self._settlement_fingerprint(meta)
+            horizon = meta.close_time or meta.expected_expiration_time
             prior = self._metadata_fingerprints.get(leg.market_ticker)
-            if prior is not None and prior != fingerprint:
-                changed.append(leg.market_ticker)
-            self._metadata_fingerprints[leg.market_ticker] = fingerprint
+            if prior is not None and prior[0] != fingerprint:
+                # END-OF-LIFE EXEMPTION (2026-07-25 ~3:40p halt): a market
+                # whose PRIOR close horizon had already PASSED is simply
+                # completing its lifecycle (game over → status flips toward
+                # settled) — the settlement-resolution machinery owns it and
+                # the pregame/in-play gates already refuse to quote it. The
+                # 2026-07-25 revalidation fix un-blinded this breaker (stale
+                # entries now refresh mid-run) and its FIRST observation — the
+                # finished 1:10p KC@DET markets settling — hard-halted the
+                # bot on an expected transition. A change while the horizon
+                # is STILL IN THE FUTURE (a reschedule, a settlement-model
+                # move) trips exactly as before.
+                prior_horizon = prior[1]
+                # A naive (malformed) horizon must trip, not crash: only a
+                # tz-aware horizon provably in the past earns the exemption.
+                if (
+                    prior_horizon is not None
+                    and prior_horizon.tzinfo is not None
+                    and prior_horizon <= now_wall
+                ):
+                    log.info(
+                        "metadata_change_post_close_benign",
+                        ticker=leg.market_ticker,
+                        prior_horizon=prior_horizon.isoformat(),
+                    )
+                else:
+                    changed.append(leg.market_ticker)
+            self._metadata_fingerprints[leg.market_ticker] = (fingerprint, horizon)
         return tuple(changed)
 
     @staticmethod

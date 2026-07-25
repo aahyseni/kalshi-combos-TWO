@@ -2717,6 +2717,18 @@ class RiskConfig(StrictModel):
     # ``allow_negative_ev_hedge``; default OFF (byte-identical). Armed
     # together with pricing.skew.pbook_armed after the shadow slate.
     hedge_budget_tail_derived: bool = False
+    # TAIL-PROBABILITY BOOK GATE (operator anchor ratified 2026-07-25: "more
+    # bets = more variance = more money" — risk-on per bet with the one-sided
+    # concentration walls unchanged; the TOTAL book binds the PROBABILITY of
+    # a KILL-distance night instead of the ES99 average, which at small N
+    # with ~50%-loss positions barely credits diversification and capped
+    # total premium near the KILL distance regardless of variance). Applies
+    # to BOTH the candidate gate and the quote-time portfolio-CVaR cap.
+    # ``portfolio_kill_tail_prob`` is an OPERATOR POLICY ANCHOR (layer 2 of
+    # the North Star), stated once: the accepted probability of a KILL-scale
+    # night. Default OFF = byte-identical ES form.
+    portfolio_tail_prob_gate: bool = False
+    portfolio_kill_tail_prob: str = "0.02"  # decimal string (house convention)
     # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1). Seconds after a SUCCESSFUL
     # confirm before the maintenance sweep polls REST GET quote for a fill whose
     # quote_executed WS message never arrived (the WS channel has no replay; a
@@ -2868,6 +2880,7 @@ class RiskConfig(StrictModel):
         "portfolio_cvar_frac",
         "portfolio_det_max_frac",
         "portfolio_ruin_prob_budget",
+        "portfolio_kill_tail_prob",
         "fill_velocity_soft_frac",
         "fill_velocity_hard_frac",
     )
@@ -3092,6 +3105,10 @@ class RiskConfig(StrictModel):
             portfolio_cvar_frac=Fraction(Decimal(self.portfolio_cvar_frac)),
             portfolio_det_max_frac=Fraction(Decimal(self.portfolio_det_max_frac)),
             portfolio_det_max_mutex_aware=self.portfolio_det_max_mutex_aware,
+            portfolio_tail_prob_gate=self.portfolio_tail_prob_gate,
+            portfolio_kill_tail_prob=float(
+                Fraction(Decimal(self.portfolio_kill_tail_prob))
+            ),
             portfolio_ruin_prob_budget=Fraction(Decimal(self.portfolio_ruin_prob_budget)),
             absolute_notional_multiple=self.absolute_notional_multiple,
             fill_velocity_window_s=self.fill_velocity_window_s,

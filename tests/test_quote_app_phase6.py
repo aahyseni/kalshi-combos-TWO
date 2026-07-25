@@ -610,15 +610,18 @@ def _market_meta(
 def test_metadata_change_breaker_fires_on_settlement_meta_change(
     tmp_path: Path,
 ) -> None:
-    # A market whose settlement-relevant metadata (close_time / status) changes
-    # tick-over-tick must trip HALT_METADATA_CHANGE. First sighting seeds the
-    # baseline (no trip); the change on the next sample trips.
+    # A LIVE market (close horizon still in the FUTURE) whose settlement-
+    # relevant metadata (close_time / status) changes tick-over-tick must trip
+    # HALT_METADATA_CHANGE — a reschedule moved the settlement window under
+    # us. First sighting seeds the baseline (no trip); the change on the next
+    # sample trips. (Future dates: the 2026-07-25 end-of-life exemption
+    # deliberately ignores changes on markets whose horizon already passed.)
     app = _demo_app(tmp_path)
     breakers = _breakers(app)
     legs = (LegRef("LEG", "KXWCGAME-26JUL05MEXENG", "yes"),)
     book = _book_with_quote_legs(legs)
     feed = FakeFeed(rx_age_s=0.1, warm=True, seq_gap=False)
-    t0 = datetime(2026, 7, 5, 18, 0, tzinfo=UTC)
+    t0 = datetime(2099, 7, 5, 18, 0, tzinfo=UTC)
     meta_v1 = FakeMetadata({"LEG": _market_meta("LEG", status="active", close_time=t0)})
     first = _sample(
         app, feed, lifecycle=FakeLifecycle({"LEG": 0.50}), exposure=book,
@@ -626,8 +629,8 @@ def test_metadata_change_breaker_fires_on_settlement_meta_change(
     )
     assert first.changed_markets == ()  # baseline seeded, no change yet
     assert breakers.evaluate(first).tripped is False
-    # The close_time moved under us (settlement window changed).
-    t1 = datetime(2026, 7, 5, 20, 0, tzinfo=UTC)
+    # The close_time moved under us (settlement window changed) while LIVE.
+    t1 = datetime(2099, 7, 5, 20, 0, tzinfo=UTC)
     meta_v2 = FakeMetadata({"LEG": _market_meta("LEG", status="active", close_time=t1)})
     second = _sample(
         app, feed, lifecycle=FakeLifecycle({"LEG": 0.50}), exposure=book,
@@ -637,6 +640,39 @@ def test_metadata_change_breaker_fires_on_settlement_meta_change(
     verdict = breakers.evaluate(second)
     assert verdict.tripped is True
     assert verdict.reason is ReasonCode.HALT_METADATA_CHANGE
+
+
+def test_metadata_change_breaker_exempts_post_close_settling(
+    tmp_path: Path,
+) -> None:
+    # END-OF-LIFE EXEMPTION (2026-07-25 ~3:40p live halt): a FINISHED game's
+    # markets flipping toward settled (status change AFTER the close horizon
+    # passed) is expected lifecycle — the settlement machinery owns it. The
+    # breaker must NOT trip (it hard-halted the live bot on exactly this the
+    # first time the revalidation fix let it see any change at all).
+    app = _demo_app(tmp_path)
+    breakers = _breakers(app)
+    legs = (LegRef("LEG", "KXWCGAME-26JUL05MEXENG", "yes"),)
+    book = _book_with_quote_legs(legs)
+    feed = FakeFeed(rx_age_s=0.1, warm=True, seq_gap=False)
+    t_past = datetime(2020, 7, 5, 18, 0, tzinfo=UTC)
+    meta_v1 = FakeMetadata(
+        {"LEG": _market_meta("LEG", status="active", close_time=t_past)}
+    )
+    first = _sample(
+        app, feed, lifecycle=FakeLifecycle({"LEG": 0.50}), exposure=book,
+        metadata=meta_v1,
+    )
+    assert first.changed_markets == ()
+    meta_v2 = FakeMetadata(
+        {"LEG": _market_meta("LEG", status="settled", close_time=t_past)}
+    )
+    second = _sample(
+        app, feed, lifecycle=FakeLifecycle({"LEG": 0.50}), exposure=book,
+        metadata=meta_v2,
+    )
+    assert second.changed_markets == ()  # benign: horizon already passed
+    assert breakers.evaluate(second).tripped is False
 
 
 def test_metadata_change_breaker_quiet_on_first_sighting(tmp_path: Path) -> None:
