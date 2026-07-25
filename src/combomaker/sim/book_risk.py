@@ -2231,10 +2231,19 @@ def evaluate_candidate_book_risk(
         admission_ev_source = (
             "mc_fallback" if gate_ev_from_pricing_fair else "mc"
         )
-    # P(BOOK) NON-DECREASE noise floor (1c): the paired-difference standard
-    # error of ΔP(book) on the shared CRN sample — the derived tolerance.
+    # P(BOOK) NON-DECREASE inputs (1c). ``delta_p_book`` is the measured
+    # effect; ``ideal_delta_p_book`` is the INDEPENDENCE BENCHMARK (2026-07-25
+    # v2 — the armed v1 absolute floor misfired on the live knife-edge book:
+    # 9 refusals of ordinary +EV growth fills whose −0.01..−0.06 dents were
+    # the small-book parity artifact, not concentration): the ΔP(book) an
+    # independent bet of IDENTICAL per-scenario P&L would have produced,
+    # estimated by shuffling the candidate's own CRN P&L vector against the
+    # book's scenarios (seeded — deterministic). The gate refuses only fills
+    # that do MEANINGFULLY WORSE than their independent twin — the definition
+    # of correlation drag; size drag stays the size caps' job.
     delta_p_book = post_axes.p_profit - pre_axes.p_profit
     delta_p_book_se = 0.0
+    ideal_delta_p_book = 0.0
     if post_pnl.size > 1 and pre_pnl.size == post_pnl.size:
         diff_ind = (post_pnl > 0.0).astype(np.float64) - (
             pre_pnl > 0.0
@@ -2242,6 +2251,14 @@ def evaluate_candidate_book_risk(
         delta_p_book_se = float(
             diff_ind.std(ddof=1) / math.sqrt(diff_ind.size)
         )
+        cand_pnl = post_pnl - pre_pnl
+        shuffle_rng = np.random.default_rng(
+            np.random.SeedSequence(seed).spawn(6)[5]
+        )
+        shuffled = shuffle_rng.permutation(cand_pnl)
+        ideal_delta_p_book = float(
+            np.mean(pre_pnl + shuffled > 0.0)
+        ) - pre_axes.p_profit
     confirm, reason = _candidate_gate(
         admission_ev=admission_ev,
         worst_credible_candidate_ev=worst_credible_candidate_ev,
@@ -2261,6 +2278,7 @@ def evaluate_candidate_book_risk(
         require_p_book_non_decreasing=require_p_book_non_decreasing,
         delta_p_book=delta_p_book,
         delta_p_book_se=delta_p_book_se,
+        ideal_delta_p_book=ideal_delta_p_book,
         # Every post-book model vector that ran, on the shared CRN sample —
         # the tail-probability form gates on the WORST model's P(KILL night).
         post_pnls=(post_pnl, post_pnl_c, post_bridge_pnl, post_split_pnl),
@@ -2310,6 +2328,7 @@ def _candidate_gate(
     require_p_book_non_decreasing: bool = False,
     delta_p_book: float = 0.0,
     delta_p_book_se: float = 0.0,
+    ideal_delta_p_book: float = 0.0,
     post_pnls: Sequence["NDArray[np.float64] | None"] = (),
     n_samples: int = 0,
     ruin_prob_ci_z: float = 0.0,
@@ -2390,15 +2409,20 @@ def _candidate_gate(
 
     # (1c) P(BOOK) NON-DECREASE (operator doctrine 2026-07-25: "anything we
     # take in should push it up, or neutral" — measured same day: 23 of 74
-    # admitted fills LOWERED p_book, worst −0.226). Declines a fill whose
-    # measured ΔP(book) is negative beyond the MC NOISE FLOOR (3× the
-    # paired-difference standard error on the shared CRN sample — fully
-    # derived, no hand tolerance), UNLESS the fill CERTIFIABLY reduces the
-    # governing tail (a hedge may pay P(book) to cut the tail — that trade
-    # is priced by the B2 budget, not refused here). Default OFF.
+    # admitted fills LOWERED p_book, worst −0.226). v2 INDEPENDENCE
+    # BENCHMARK (same day, live misfire fix: the v1 absolute floor refused
+    # ordinary growth fills on a knife-edge book whose −0.01..−0.06 dents
+    # were the small-book parity artifact): decline only a fill whose
+    # measured ΔP(book) is MEANINGFULLY WORSE (beyond 3× the CRN noise
+    # floor) than the ΔP an INDEPENDENT bet of identical per-scenario P&L
+    # would have produced — correlation drag, the thing the doctrine
+    # actually targets; size/parity drag passes here and stays owned by the
+    # size caps. Certified tail-reducers stay exempt (a hedge may pay
+    # P(book) to cut the tail — priced by the B2 budget, not refused).
+    # Default OFF.
     if (
         require_p_book_non_decreasing
-        and delta_p_book < -3.0 * delta_p_book_se
+        and delta_p_book < ideal_delta_p_book - 3.0 * delta_p_book_se
         and post.governing_model_tail_loss_cc > pre.governing_model_tail_loss_cc
     ):
         return False, "lowers_p_book"

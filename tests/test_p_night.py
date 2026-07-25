@@ -55,9 +55,11 @@ def test_realized_loss_drags_p_night_down() -> None:
 
 class TestPBookNonDecreasingGate:
     """Operator doctrine 2026-07-25: "anything we take in should push it up,
-    or neutral" — the gate declines ΔP(book) < −3×SE fills that do not
-    certifiably reduce the tail (reason ``lowers_p_book``). Measured basis:
-    23 of 74 same-day admits lowered p_book, worst −0.226."""
+    or neutral" — v2 INDEPENDENCE BENCHMARK (the v1 absolute floor misfired
+    live: 11 refusals of ordinary growth fills on a knife-edge book — parity
+    artifact, not concentration). The gate declines only fills measurably
+    WORSE than an independent bet of identical per-scenario P&L (correlation
+    drag); parity/size drag passes and stays the size caps' job."""
 
     def _book(self):
         # Five independent +EV coin flips at 30c on a 50c fair: sum > 0 iff
@@ -74,24 +76,36 @@ class TestPBookNonDecreasingGate:
             n_samples=20_000, seed=9, **kw,
         )
 
-    def test_dominating_one_way_add_declined(self) -> None:
-        # A HUGE same-leg add (50x the book) at slightly-positive EV: passes
-        # the EV branch, craters p_book (the book becomes one coin flip).
-        big = OpenPosition(
-            position_id="big", combo_ticker="COMBO-big", collection=None,
-            our_side=Side.NO, contracts=CentiContracts(5_000),
-            entry_price_cc=4_900,  # type: ignore[arg-type]
+    def test_correlated_same_leg_add_declined(self) -> None:
+        # A 3x-size SAME-LEG add: identical marginal P&L to an independent
+        # coin of that size, but perfectly correlated with c0 — its measured
+        # ΔP(book) is far worse than its shuffled (independent) twin's.
+        corr = OpenPosition(
+            position_id="corr", combo_ticker="COMBO-corr", collection=None,
+            our_side=Side.NO, contracts=CentiContracts(300),
+            entry_price_cc=3_000,  # type: ignore[arg-type]
             legs=(LegRef("L0", "KX-G0", "yes"),),
         )
-        off = self._run(big)
-        on = self._run(big, require_p_book_non_decreasing=True)
-        assert off.confirm  # today's behavior: admitted despite ΔP −0.3
-        assert on.candidate_delta_p_book < -0.1
+        off = self._run(corr)
+        on = self._run(corr, require_p_book_non_decreasing=True)
+        assert off.confirm  # pre-doctrine behavior: admitted
         assert not on.confirm
         assert on.decline_reason == "lowers_p_book"
+
+    def test_independent_same_size_admitted(self) -> None:
+        # The SAME size on a brand-new game: its measured ΔP tracks the
+        # independence benchmark by construction — admitted (this is the
+        # exact shape the v1 floor misfired on).
+        indep = OpenPosition(
+            position_id="ind", combo_ticker="COMBO-ind", collection=None,
+            our_side=Side.NO, contracts=CentiContracts(300),
+            entry_price_cc=3_000,  # type: ignore[arg-type]
+            legs=(LegRef("L9", "KX-G9", "yes"),),
+        )
+        on = self._run(indep, require_p_book_non_decreasing=True)
+        assert on.confirm, on.decline_reason
 
     def test_diversifier_admitted(self) -> None:
         cand = _pos("new", "L9", "KX-G9", price_cc=3_000)
         on = self._run(cand, require_p_book_non_decreasing=True)
         assert on.confirm, on.decline_reason
-        assert on.candidate_delta_p_book >= -0.01

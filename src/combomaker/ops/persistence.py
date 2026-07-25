@@ -641,6 +641,30 @@ class Store:
         ) as cursor:
             return await cursor.fetchone() is not None
 
+    async def day_realized_pnl_cc(self, start_iso: str, end_iso: str) -> int:
+        """DAY-ANCHORED realized P&L reconstruction (2026-07-25 operator KPI:
+        p_night must roll across restarts — the in-process accumulator resets
+        at boot). Mirrors exactly what ``record_realized_pnl`` accumulates in
+        one process: Σ settlement ``realized_pnl_cc`` reconciled in the window
+        plus Σ(−fill fee) for fills in the window. ISO-UTC string bounds
+        (lexicographic — the ledger stamps are tz-aware isoformat)."""
+        async with self._db.execute(
+            "SELECT COALESCE(SUM(realized_pnl_cc), 0) FROM position_ledger"
+            " WHERE reconciled_at IS NOT NULL"
+            " AND reconciled_at >= ? AND reconciled_at < ?",
+            (start_iso, end_iso),
+        ) as cursor:
+            row = await cursor.fetchone()
+            settled = int(row[0]) if row and row[0] is not None else 0
+        async with self._db.execute(
+            "SELECT COALESCE(SUM(fee_cc), 0) FROM fills"
+            " WHERE fee_cc IS NOT NULL AND at >= ? AND at < ?",
+            (start_iso, end_iso),
+        ) as cursor:
+            row = await cursor.fetchone()
+            fees = int(row[0]) if row and row[0] is not None else 0
+        return settled - fees
+
     async def fill_order_ids(self) -> set[str]:
         """Every non-NULL exchange ``order_id`` in the fills ledger — one read
         per fills-ledger sweep (2026-07-24 incident-C review: hundreds of

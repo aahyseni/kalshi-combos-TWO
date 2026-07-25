@@ -16,7 +16,8 @@ import asyncio
 import itertools
 import sys
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 from fractions import Fraction
 from typing import Any, Protocol
@@ -1333,6 +1334,39 @@ class QuoteApp:
                 # measured book for the first ~40s (69 skip_portfolio_cvar
                 # warmup declines, report 2026-07-16-heartbeat-config-fix…).
                 # Bounded; on timeout/error startup proceeds exactly as today.
+                # DAY-ANCHORED REALIZED SEED (2026-07-25 operator KPI: p_night
+                # = P(the DAY ends positive) must roll across restarts — the
+                # in-process realized accumulator resets at boot). Reconstruct
+                # today's realized P&L (ET day, the slate convention) from the
+                # durable position ledger + fills fees, and seed the lifecycle
+                # accumulator BEFORE the first book-risk snapshot so p_night
+                # carries the banked day from the first publish. Failure ⇒
+                # p_night degrades to p_book (never blocks boot).
+                try:
+                    now_et = self._clock.now().astimezone(
+                        ZoneInfo("America/New_York")
+                    )
+                    day_start = now_et.replace(
+                        hour=0, minute=0, second=0, microsecond=0
+                    )
+                    start_iso = day_start.astimezone(timezone.utc).isoformat()
+                    end_iso = (
+                        (day_start + timedelta(days=1))
+                        .astimezone(timezone.utc)
+                        .isoformat()
+                    )
+                    seeded_cc = await store.day_realized_pnl_cc(
+                        start_iso, end_iso
+                    )
+                    if seeded_cc:
+                        lifecycle.record_realized_pnl(seeded_cc)
+                    log.info(
+                        "realized_pnl_day_seeded",
+                        realized_cc=seeded_cc,
+                        day_start_utc=start_iso,
+                    )
+                except Exception:
+                    log.exception("realized_pnl_seed_failed")
                 await self._startup_book_risk_snapshot(lifecycle)
                 # LAUNCH THE EXTERNAL SUPERVISOR (separate OS process) BEFORE the
                 # preflight so its own-heartbeat is beating when external_kill_
