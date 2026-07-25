@@ -7,7 +7,7 @@ $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $root
 
 $procs = Get-CimInstance Win32_Process |
-    Where-Object { $_.CommandLine -match 'combomaker|fill_prober' }
+    Where-Object { $_.CommandLine -match 'combomaker|fill_prober' -and $_.ProcessId -ne $PID }
 if (-not $procs) {
     Write-Host "Nothing running (no combomaker/prober processes found)." -ForegroundColor Green
 } else {
@@ -31,6 +31,19 @@ if (-not $procs) {
         exit 1
     }
     Write-Host "All combomaker/prober processes stopped." -ForegroundColor Green
+}
+
+# ORPHANED POOL WORKERS (2026-07-25: four multiprocessing spawn workers from a
+# force-killed morning stack idled for 2h). A spawn_main python whose PARENT
+# is dead is an orphan of a killed bot - safe to reap. Workers with a live
+# parent (any other app's) are left alone.
+$workers = Get-CimInstance Win32_Process |
+    Where-Object { $_.Name -match '^python' -and $_.CommandLine -match 'multiprocessing\.spawn' }
+foreach ($w in $workers) {
+    $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($w.ParentProcessId)" -ErrorAction SilentlyContinue
+    if (-not $parent) {
+        try { Stop-Process -Id $w.ProcessId -Force; Write-Host "Reaped orphaned pool worker PID $($w.ProcessId)" -ForegroundColor Yellow } catch {}
+    }
 }
 
 # Resting quotes from a hard kill lapse on their own TTL; a cancel-all clears
