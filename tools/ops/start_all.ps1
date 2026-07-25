@@ -15,6 +15,32 @@ if ($running) {
     exit 1
 }
 
+# PRE-START HYGIENE (2026-07-25: the first operator launch failed here).
+# Nothing is running (guard above), so liveness files are stale leftovers:
+# a stale heartbeat makes the supervisor declare "wedged" instantly and
+# emergency-KILL before the bot even starts. Delete them.
+foreach ($hb in @("data\heartbeat.txt", "data\supervisor_heartbeat.txt")) {
+    if (Test-Path $hb) {
+        Remove-Item -Force $hb
+        Write-Host "Removed stale $hb (nothing was running)" -ForegroundColor Yellow
+    }
+}
+# A KILL file blocks startup BY DESIGN (real halt or supervisor emergency).
+# Never silently delete it — show it and ask. The needs_reconcile marker is
+# left alone: the bot reconciles against the exchange at boot and clears it
+# itself.
+if (Test-Path "KILL") {
+    Write-Host "A KILL file is present — the bot refuses to start with it:" -ForegroundColor Red
+    Get-Content "KILL" | ForEach-Object { Write-Host "   $_" -ForegroundColor Red }
+    $ans = Read-Host "Reviewed and ready to relight? Delete the KILL file and start? (y/n)"
+    if ($ans -ne "y") {
+        Write-Host "Leaving KILL in place. Not starting." -ForegroundColor Red
+        exit 1
+    }
+    Remove-Item -Force "KILL"
+    Write-Host "KILL file cleared - relighting." -ForegroundColor Yellow
+}
+
 $stamp = Get-Date -Format "yyyyMMdd_HHmm"
 $botLog = "data\live_$stamp.log"
 $proberLog = "data\fill_prober_$stamp.log"
@@ -23,8 +49,9 @@ Set-Content -Path "data\CURRENT_LOG.txt" -Value "$botLog`r`n$proberLog" -Encodin
 
 Write-Host "Starting bot stack (logs: $botLog / $proberLog)" -ForegroundColor Cyan
 
-# 1) Supervisor (spawns + respawns the quote app). All output -> dated log.
-Start-Process cmd -ArgumentList "/k", "title BOT supervisor && .venv\Scripts\python.exe -m combomaker.ops.supervisor --env prod --config config\prod-live-wc.local.yaml > $botLog 2>&1"
+# 1) Supervisor (spawns + respawns the quote app). All output -> dated log,
+#    so this window is quiet BY DESIGN - the echo says where to look.
+Start-Process cmd -ArgumentList "/k", "title BOT supervisor && echo Bot running. This window is quiet BY DESIGN - all output goes to $botLog && echo Watch the MONITOR window for live events. Closing THIS window kills the supervisor. && .venv\Scripts\python.exe -m combomaker.ops.supervisor --env prod --config config\prod-live-wc.local.yaml > $botLog 2>&1"
 
 # 2) Main monitor (halts / fills / declines / waivers / errors).
 Start-Process powershell -ArgumentList "-NoExit", "-ExecutionPolicy", "Bypass", "-File", "tools\ops\watch_main.ps1", "-Log", $botLog
