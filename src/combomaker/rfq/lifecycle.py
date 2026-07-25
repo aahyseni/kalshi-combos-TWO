@@ -178,8 +178,12 @@ def _pbook_profile_from_snapshot(
 # enumeration deadline (each game adds scoreline-enumeration work; the
 # deadline fail-closes regardless), never a risk number: every certificate is
 # still validated against the unchanged game budget and the slate threshold
-# is never raised.
-_SLATE_WAIVER_MAX_GAMES = 6
+# is never raised. RAISED 6→16 same day: the first live attempt (11:58a)
+# certified the top-6 but the UNCERTIFIED tail games' analytic terms alone
+# kept the sum over threshold on a 13-game slate — while the enumeration ran
+# in ~190ms, far under the 1.0s deadline. 16 covers a full MLB slate; the
+# deadline remains the guard on pathological nights.
+_SLATE_WAIVER_MAX_GAMES = 16
 
 WAIVABLE_RESERVATION_BREACHES: frozenset[ReasonCode] = frozenset(
     {
