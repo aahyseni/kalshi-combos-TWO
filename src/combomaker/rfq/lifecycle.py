@@ -957,6 +957,19 @@ class QuoteLifecycle:
                     else int(snap.mutex_aware_det_max_cc)
                 ),
                 p_ruin=round(snap.p_ruin, 4),
+                # P(BOOK) VISIBILITY (2026-07-25 operator directive: P(book)
+                # must steer — Phase A publishes the signal every refresh):
+                # P(book P&L > 0), the book EV, and the top tail-concentration
+                # games (which game dominates the downside = the anti-variance
+                # concentration P(book) steering will price against).
+                p_book=round(snap.p_profit, 4),
+                ev_cc=int(snap.ev_cc),
+                top_tail_games=[
+                    (tc.key, int(tc.loss_cc))
+                    for tc in sorted(
+                        snap.per_game_tail_cc, key=lambda tc: -tc.loss_cc
+                    )[:3]
+                ],
             )
 
     def recompute_book_risk(self) -> None:
@@ -1524,6 +1537,11 @@ class QuoteLifecycle:
                     else int(result.post.mutex_aware_det_max_cc)
                 ),
                 post_p_ruin=round(result.post.p_ruin, 4),
+                # ΔP(book) VISIBILITY (2026-07-25): does THIS fill add
+                # variance/diversity (delta > 0) or concentrate one-way
+                # (delta < 0)? Shadow — logged on every admitted fill.
+                post_p_book=round(result.post.p_profit, 4),
+                delta_p_book=round(result.candidate_delta_p_book, 4),
                 n_pre=result.n_pre_positions,
             )
             return True, ""
@@ -1586,6 +1604,14 @@ class QuoteLifecycle:
             worst_challenger_ev_tolerance_cc=(
                 self._config.worst_challenger_ev_tolerance_cc
             ),
+            # ΔP(book) VISIBILITY (2026-07-25 operator directive): logged on
+            # EVERY gate verdict (admit or decline) so the shadow record shows
+            # which flow raises P(book) (variance/diversifiers/offsetting) and
+            # which lowers it (one-way concentration) — the measured input the
+            # Phase-B steering derives from.
+            pre_p_book=round(result.pre.p_profit, 4),
+            post_p_book=round(result.post.p_profit, 4),
+            delta_p_book=round(result.candidate_delta_p_book, 4),
         )
 
     def _build_candidate_gate_inputs(

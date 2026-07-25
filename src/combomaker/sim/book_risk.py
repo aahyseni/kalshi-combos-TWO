@@ -1284,6 +1284,13 @@ class _TailAxes:
     # estimate, so a p̂ that is only statistically-indistinguishable-from-safe near
     # the budget is declined (fail-closed against MC sampling error).
     p_ruin_upper: float = 0.0
+    # P(book) — P(this book state's P&L > 0) under the PRODUCTION model
+    # (2026-07-25 operator directive: P(book) must STEER the betting — more
+    # variance/diversity = higher P(book)). Phase A is VISIBILITY: candidate
+    # ΔP(book) = post − pre is logged at the gate, gated on by NOTHING yet.
+    # 0.0 when nothing was sampled (empty/all-reserved book — honest unknown
+    # in a shadow-only field).
+    p_profit: float = 0.0
     # P1 EV VISIBILITY (audit "+EV IS PRODUCTION-MODEL EV"): the mean book P&L under
     # each CHALLENGER book state, mirroring ``ev_cc`` (the production EV). ``ev_cc``
     # is the production-model EV the ADMISSION policy still gates on; these are the
@@ -1369,6 +1376,15 @@ class CandidateBookRisk:
     bridge_candidate_ev_cc: float | None = None
     split_candidate_ev_cc: float | None = None
     worst_credible_candidate_ev_cc: float = 0.0
+
+    # ΔP(book) (2026-07-25 operator directive — "P(book) should be steering
+    # our betting"): the candidate's marginal effect on P(book P&L > 0) under
+    # the production model, post − pre on COMMON random numbers. POSITIVE ⇒
+    # the fill ADDS variance/diversity (a balancing/offsetting/variance bet);
+    # NEGATIVE ⇒ it concentrates the book further one-way. Phase A: logged at
+    # every gate verdict (visibility), gated on by NOTHING — the steering
+    # mechanism (Phase B) derives from this measured signal.
+    candidate_delta_p_book: float = 0.0
 
     # The final gate verdict + the first reason it was declined (empty ⇒ confirm).
     confirm: bool = False
@@ -1491,6 +1507,7 @@ def _tail_axes_from_pnl(
         governing_model_es_99_cc=max(es, challenger_es, bridge_es, split_es),
         deterministic_max_loss_cc=deterministic_max_loss_cc,
         gross_settlement_notional_cc=gross_cc,
+        p_profit=float(np.mean(pnl > 0.0)) if pnl.size else 0.0,
         p_ruin=p_ruin,
         p_ruin_upper=p_ruin_upper,
         challenger_ev_cc=challenger_ev,
@@ -2143,6 +2160,7 @@ def evaluate_candidate_book_risk(
         bridge_candidate_ev_cc=bridge_candidate_ev,
         split_candidate_ev_cc=split_candidate_ev,
         worst_credible_candidate_ev_cc=worst_credible_candidate_ev,
+        candidate_delta_p_book=post_axes.p_profit - pre_axes.p_profit,
         confirm=confirm,
         decline_reason=reason,
     )
