@@ -2978,6 +2978,15 @@ class QuoteApp:
                 continue
             fingerprint = self._settlement_fingerprint(meta)
             horizon = meta.close_time or meta.expected_expiration_time
+            # Terminal settlement statuses (doc:kalshi market lifecycle —
+            # active → closed → determined → settled/finalized). A transition
+            # INTO one of these is the market COMPLETING (props determine
+            # EARLY all the time: the 6:47p live halt was a same-day RBI
+            # resolving mid-game while its listed close sat two days out) —
+            # settlement machinery owns it, never a reschedule. Any OTHER
+            # status change (halted/paused/unknown strings) still trips
+            # (fail-toward-trip).
+            terminal = meta.status in ("closed", "determined", "settled", "finalized")
             prior = self._metadata_fingerprints.get(leg.market_ticker)
             if prior is not None and prior[0] != fingerprint:
                 # END-OF-LIFE EXEMPTION (2026-07-25 ~3:40p halt): a market
@@ -2992,9 +3001,12 @@ class QuoteApp:
                 # is STILL IN THE FUTURE (a reschedule, a settlement-model
                 # move) trips exactly as before.
                 prior_horizon = prior[1]
-                # A naive (malformed) horizon must trip, not crash: only a
-                # tz-aware horizon provably in the past earns the exemption.
-                if (
+                # Benign iff the market's prior horizon already PASSED (post-
+                # game settling) OR the NEW status is TERMINAL (early
+                # determination — 2026-07-25 6:47p halt). A naive (malformed)
+                # horizon must trip, not crash: only a tz-aware horizon
+                # provably in the past earns the time-based exemption.
+                if terminal or (
                     prior_horizon is not None
                     and prior_horizon.tzinfo is not None
                     and prior_horizon <= now_wall
@@ -3002,7 +3014,12 @@ class QuoteApp:
                     log.info(
                         "metadata_change_post_close_benign",
                         ticker=leg.market_ticker,
-                        prior_horizon=prior_horizon.isoformat(),
+                        new_status=meta.status,
+                        prior_horizon=(
+                            prior_horizon.isoformat()
+                            if prior_horizon is not None
+                            else None
+                        ),
                     )
                 else:
                     changed.append(leg.market_ticker)

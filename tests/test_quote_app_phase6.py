@@ -675,6 +675,40 @@ def test_metadata_change_breaker_exempts_post_close_settling(
     assert breakers.evaluate(second).tripped is False
 
 
+def test_metadata_change_breaker_exempts_early_determination(
+    tmp_path: Path,
+) -> None:
+    # EARLY DETERMINATION (2026-07-25 6:47p live halt): a same-day prop
+    # (RBI) resolved MID-GAME — status active → determined while its listed
+    # close sat two days in the FUTURE. A transition INTO a terminal
+    # settlement status is the market completing, never a reschedule — the
+    # breaker must not trip. A reschedule (status stays active, close moves)
+    # still trips (pinned by the fires_on_settlement_meta_change test).
+    app = _demo_app(tmp_path)
+    breakers = _breakers(app)
+    legs = (LegRef("LEG", "KXWCGAME-26JUL05MEXENG", "yes"),)
+    book = _book_with_quote_legs(legs)
+    feed = FakeFeed(rx_age_s=0.1, warm=True, seq_gap=False)
+    t_future = datetime(2099, 7, 5, 18, 0, tzinfo=UTC)
+    meta_v1 = FakeMetadata(
+        {"LEG": _market_meta("LEG", status="active", close_time=t_future)}
+    )
+    first = _sample(
+        app, feed, lifecycle=FakeLifecycle({"LEG": 0.50}), exposure=book,
+        metadata=meta_v1,
+    )
+    assert first.changed_markets == ()
+    meta_v2 = FakeMetadata(
+        {"LEG": _market_meta("LEG", status="determined", close_time=t_future)}
+    )
+    second = _sample(
+        app, feed, lifecycle=FakeLifecycle({"LEG": 0.50}), exposure=book,
+        metadata=meta_v2,
+    )
+    assert second.changed_markets == ()  # benign: terminal transition
+    assert breakers.evaluate(second).tripped is False
+
+
 def test_metadata_change_breaker_quiet_on_first_sighting(tmp_path: Path) -> None:
     # A newly-quoted market is NOT a change (it seeds the baseline) — the breaker
     # must not self-trip on every fresh market.
