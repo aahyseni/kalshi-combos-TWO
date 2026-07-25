@@ -2690,6 +2690,15 @@ class RiskConfig(StrictModel):
     # not recommended live); the delay must be a positive finite number.
     fill_cancel_verify_attempts: int = 3
     fill_cancel_verify_delay_s: float = 90.0
+    # FILLS-LEDGER SWEEP (2026-07-24 incident C). Cadence of the account-wide
+    # /portfolio/fills vs local-fills-ledger diff (ALARM-ONLY — the ledger's
+    # one-writer rule holds: a miss is a loud error + metric, never an
+    # auto-written row) and the initial lookback window of the first fetch
+    # after start. Both must be positive finite (validator below); the sweep
+    # is additionally disabled wherever no fills getter is wired
+    # (paper/backtests/minimal rigs).
+    fills_ledger_sweep_interval_s: float = 900.0
+    fills_ledger_sweep_lookback_s: float = 3600.0
     # SETTLED-LEG MARGINAL RESOLUTION (2026-07-18 live outage: FRAENG settled
     # while cross-game combos holding FRAENG legs stayed open — the settled
     # legs' books left the feed, the book-risk model went UNKNOWN and the
@@ -2919,6 +2928,8 @@ class RiskConfig(StrictModel):
         "fill_cancel_verify_delay_s",
         "position_reconcile_interval_s",
         "settled_resolution_retry_s",
+        "fills_ledger_sweep_interval_s",
+        "fills_ledger_sweep_lookback_s",
     )
     @classmethod
     def _valid_verify_intervals(cls, v: float, info: ValidationInfo) -> float:

@@ -112,11 +112,46 @@ path):**
   candidate-aware MC lags the book at high flow; relevant to P(book)-steering
   design (staleness must fail toward the coarse caps, which it does).
 
+## 5. BUILD + ADVERSARIAL REVIEW (2026-07-24/25) — SHIPPED
+
+The fix spec above was built, then a 3-lens adversarial review (default-refute,
+per-finding verification, executable PoCs) **confirmed 20 findings against the
+first draft — including two HIGHs that recreated incident C's failure shape
+inside the fix itself**:
+
+1. **Cross-quote steal:** the naive `count ≤ pending` rule let quote B adopt
+   quote A's unledgered same-ticker fill — shrinking a REAL position on
+   foreign evidence and double-writing one exchange order (PoC ran green
+   against the draft).
+2. **Multi-print residual:** one order printing at two levels adopted only the
+   largest print; the remainder was silently invisible forever (PoC green).
+
+**Hardening shipped (all PoC attacks now fail):**
+
+| defense | mechanism |
+|---|---|
+| Exact-key verification | cancelled-quote payload's `creator_order_id` (doc-verified == `Fill.order_id`) captured; `/portfolio/fills` queried + matched by it; structural matching demoted to fallback |
+| Multi-print aggregation | matcher groups prints by `order_id`, adopts the SUM (≤ pending), fees summed per print (any unreadable ⇒ honest UNKNOWN), raw prints ride the ledger row |
+| Ambiguity fail-safe | with no exact key and another in-flight quote on the ticker, a partial group is REFUSED and the round can never conclude "genuinely absent" — position KEPT, loud (`verify_ambiguous_kept`) |
+| Discard guards | `fill_recorded` bail-outs in resolution AND `_discard_phantom_position` (WS landing inside the final attempt's awaits can no longer discard a real, recorded fill) |
+| Writer uniqueness | one exchange order = one ledger row (`fill_ledger.order_id_conflict` terminal + loud); executed-status recovery CLAIMS its order id while its write retries |
+| Sweep robustness | whole diff phase inside try/except (store errors contained); 2.5s/page ×3 pages, limit 1000; truncation is loud + watermark clamped to oldest scanned; batched ledger reads (2 SELECTs, never 600 point reads); naive/legacy timestamps parsed as UTC; unparseable-timestamp misses HOLD the watermark; exhausted states no longer suppress alarms; claimed-unwritten rows visible; null-order-id ledger rows matched by (ticker,count) instead of false-alarming; unresolvable misses age out loudly instead of pinning the window |
+
+**Accepted residuals (documented, narrow):** a print of an adopted order that
+posts only AFTER adoption is invisible to the order-id-keyed sweep (position
+reconciler + restart reconcile remain the backstops); an EXACT-count foreign
+fill whose owner quote exhausted its whole recovery budget can still be
+adopted by a same-size same-ticker verifier (pre-existing class, now bounded
+by the writer-uniqueness guard); the sweep runs inline in the maintenance tick
+(bounded ≤ ~7.5s worst-case + 2 batched reads — house REST-bound style).
+
+Suite: full green incl. 18 new tests (8 incident-C + 10 review regressions);
+ruff/mypy clean on every changed file.
+
 ## NEXT STEPS
 
-- **Build (owner: me, next):** incident-C fix per spec above (count-tolerant
-  match + skip logging + fills-sweep reconciler) — ships BEFORE any relight;
-  it is a state-awareness precondition for P1.
+- **DONE (owner: me):** incident-C fix + adversarial hardening (section 5) —
+  shipped BEFORE any relight; the state-awareness precondition for P1 holds.
 - **Build (owner: me, the main line):** P1 concentration/hedge rebuild (hard
   net-bounds incl. per-entity, P(book)-aware sizing, arm the mutex-aware skew,
   relight neutrality) — design dossier in progress via the code-read fan-out.

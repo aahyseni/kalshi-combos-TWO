@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from fractions import Fraction
 from typing import Any, Protocol
 
@@ -226,6 +227,31 @@ _FILL_RECOVERY_MAX_ATTEMPTS = 10
 _CANCEL_VERIFY_MAX_ROUNDS = 3
 _CANCEL_VERIFY_MIN_TS_SLACK_S = 60
 
+
+def _parse_epoch_s(raw: object) -> int | None:
+    """Fill-row timestamp → epoch seconds; None on absent/unreadable
+    (fills-ledger sweep watermark input — a row whose timestamp cannot be
+    read still gets its ledger check; the sweep then refuses to advance its
+    watermark past it). Accepts ISO-8601 (Z or offset; a NAIVE parse is
+    treated as UTC — .timestamp() on a naive datetime would read it in LOCAL
+    time and shift the watermark hours ahead) and the legacy integer-epoch
+    ``ts`` form."""
+    if raw is None or raw == "":
+        return None
+    text = str(raw)
+    if text.lstrip("-").isdigit():
+        try:
+            return int(text)
+        except ValueError:  # pragma: no cover — isdigit guarded
+            return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return int(dt.timestamp())
+
 # REPRICE-SWEEP WEDGE DEFENSES (2026-07-16 — the 18:13Z heartbeat kill; see
 # maintenance_tick). Consecutive pool-deadline results that trip the frozen-pool
 # circuit breaker, and the sweep's total wall budget per tick.
@@ -347,6 +373,19 @@ class LifecycleConfig:
     # pre-2026-07-18 immediate discard; not recommended live).
     fill_cancel_verify_attempts: int = 3
     fill_cancel_verify_delay_s: float = 90.0
+    # FILLS-LEDGER SWEEP (2026-07-24 incident C). Periodic account-wide diff of
+    # /portfolio/fills against the local fills ledger (order_id keyed) — the
+    # generic backstop under ANY writer-path miss (incident C: a partial
+    # execution behind a cancel report was structurally rejected and its fill
+    # landed nowhere until the settlement reconciliation found it a day later).
+    # ALARM-ONLY: the fills ledger keeps its ONE writer (on_quote_executed) —
+    # a miss is a loud ERROR + metric, never an auto-written row; rows owned by
+    # an in-flight verification/recovery are excluded. The first maintenance
+    # tick only stamps the cadence; the first fetch runs one interval later
+    # (keeps scripted per-ticker test fakes off the account-wide query).
+    # Non-positive/NaN interval ⇒ sweep disabled (belt to the config validator).
+    fills_ledger_sweep_interval_s: float = 900.0
+    fills_ledger_sweep_lookback_s: float = 3600.0
     # F1 MONOTONE PRE-PRICING GATE (throughput synthesis 2026-07-16, lens-3 F1).
     # When True, handle_rfq consults a CANDIDATE-FREE limits check (cached per
     # exposure generation + bankroll, ≤0.5s) BEFORE the expensive joint pricing
@@ -477,6 +516,17 @@ class OpenQuoteState:
     # terminal "this fill is REAL" state; the ledger row is then written via
     # the normal on_quote_executed path (retried boundedly if the write fails).
     cancel_verified_fill: JsonDict | None = None
+    # EXACT verification key (2026-07-24 incident-C review): the quote
+    # payload's ``creator_order_id`` (docs: Quote.creator_order_id ==
+    # Fill.order_id after execution) captured off the CANCELLED-status
+    # payload. When present, verification queries + matches by THIS id only —
+    # structural guessing is the fallback, never the primary.
+    cancel_expected_order_id: str | None = None
+    # Set when a structurally-plausible PARTIAL group was REFUSED because the
+    # evidence was ambiguous (no expected order id + another in-flight quote
+    # on the same ticker). Ambiguous evidence must never conclude "genuinely
+    # absent" — resolution keeps the position instead of discarding.
+    cancel_verify_ambiguous: bool = False
     # The cancel report's cancellation_reason, kept for the resolution log.
     cancel_reported_reason: str | None = None
 
@@ -659,6 +709,12 @@ class QuoteLifecycle:
         # claim is released once the fills row exists (the ledger's own
         # order_id guard takes over from there).
         self._claimed_exchange_order_ids: set[str] = set()
+        # FILLS-LEDGER SWEEP cadence/window state (2026-07-24 incident C):
+        # monotonic stamp of the last sweep (None = first tick stamps, no
+        # fetch) and the advancing min_ts watermark — held back to the OLDEST
+        # unresolved miss so a persistent miss re-alarms every interval.
+        self._fills_sweep_last_mono_ns: int | None = None
+        self._fills_sweep_min_ts: int | None = None
         # HEARTBEAT BEAT (2026-07-16 wedge fix): quote_app's Heartbeat.beat,
         # invoked per iteration inside the long maintenance sub-loops (reprice
         # sweep, recovery polls) so a loop that is genuinely MAKING PROGRESS
@@ -3007,6 +3063,20 @@ class QuoteLifecycle:
         # confirm-path pull is a cheap no-op re-check (single-flight, and a
         # clean book breaks the pass on its first iteration).
         self._schedule_risk_evict_on_fill(state)
+        # WS/poll COUNT CROSS-CHECK (2026-07-24 review): live combo executed
+        # messages usually carry NO count field — but when one IS present and
+        # reads SMALLER than pending, the exchange count is the truth (the
+        # rule the cancel-verification path enforces). Runs AFTER the booking
+        # block so the resize's remove+rebook always acts on a booked
+        # position (reserved == booked stays exact through the commit).
+        # Absent/unreadable keeps the larger booked size — bit-identical
+        # prior behaviour on every live message observed so far.
+        if "exchange_fill" not in msg:
+            ws_count_raw = msg.get("contracts_accepted_fp") or msg.get("count_fp")
+            if ws_count_raw is not None:
+                self._resize_pending_to_exchange_count(
+                    quote_id, state, {"count_fp": ws_count_raw}
+                )
         fill_ref = f"fill:{quote_id}"
         # LEDGER-WRITE HARDENING (2026-07-18 requirement 2): the in-memory
         # commit above SUCCEEDED (position booked / evictions scheduled), so a
@@ -3019,6 +3089,12 @@ class QuoteLifecycle:
         # the quote status comes back cancelled.
         try:
             await self._record_executed_fill(quote_id, state, msg, fill_ref)
+            # CLAIM RELEASE (2026-07-24 review): once the row exists (or the
+            # writer terminally refused it) the ledger's own order_id guard
+            # owns dedupe — release any transient claim held for this order
+            # (executed-status recovery claims; a no-op for plain WS fills).
+            if state.fill_recorded and msg.get("order_id"):
+                self._claimed_exchange_order_ids.discard(str(msg["order_id"]))
         except Exception:
             self._metrics.inc("fill_ledger.write_failed")
             if state.fill_confirmed_mono_ns is None:
@@ -3051,6 +3127,28 @@ class QuoteLifecycle:
         if state.fill_recorded or await self._store.has_fill(fill_ref):
             state.fill_recorded = True
             log.info("fill_replay_skipped", quote_id=quote_id, fill_ref=fill_ref)
+            return
+        # ORDER-ID UNIQUENESS (2026-07-24 review): one exchange order must
+        # never produce two ledger rows — fill_ref dedupes per QUOTE, not per
+        # exchange order, so a cross-quote misattribution upstream (another
+        # quote adopted this order's fill) would otherwise double-write it.
+        # Terminal + LOUD; never a second row.
+        order_id_raw = msg.get("order_id")
+        if order_id_raw and await self._store.has_fill_for_order_id(
+            str(order_id_raw)
+        ):
+            state.fill_recorded = True
+            self._metrics.inc("fill_ledger.order_id_conflict")
+            log.error(
+                "fill_order_id_already_in_ledger",
+                quote_id=quote_id,
+                fill_ref=fill_ref,
+                order_id=str(order_id_raw),
+                detail="a fills row for this exchange order already exists "
+                "under ANOTHER fill_ref — refusing a second row (one "
+                "exchange order = one ledger row); this signals a cross-"
+                "quote misattribution upstream: reconcile by hand",
+            )
             return
         assert state.pending_fill is not None  # caller verified
         accepted_side, bid, qty = state.pending_fill
@@ -3320,6 +3418,11 @@ class QuoteLifecycle:
                 )
                 if order_id:
                     msg["order_id"] = str(order_id)
+                    # CLAIM (2026-07-24 review): while this recovery is in
+                    # flight, a concurrently-verifying quote on the same
+                    # ticker must not adopt this order's fill (the cross-
+                    # quote-steal hole); released once the row lands.
+                    self._claimed_exchange_order_ids.add(str(order_id))
                 self._metrics.inc("fill_recovery.recovered")
                 log.warning(
                     "fill_record_recovered_via_poll",
@@ -3393,17 +3496,26 @@ class QuoteLifecycle:
         state.cancel_reported_reason = (
             None if cancellation_reason is None else str(cancellation_reason)
         )
+        # EXACT KEY (2026-07-24 incident-C review): the quote payload exposes
+        # ``creator_order_id`` after ANY execution (doc-verified: it equals
+        # Fill.order_id and /portfolio/fills filters by it). Capturing it here
+        # turns verification from structural guessing into an exact join —
+        # a partially-executed "cancelled" quote's prints carry this id.
+        expected = quote.get("creator_order_id") if isinstance(quote, dict) else None
+        state.cancel_expected_order_id = str(expected) if expected else None
         self._metrics.inc("fill_recovery.cancel_verify_started")
         log.warning(
             "fill_recovery_cancel_report_verifying",
             quote_id=quote_id,
             cancellation_reason=cancellation_reason,
+            expected_order_id=state.cancel_expected_order_id,
             attempts=self._config.fill_cancel_verify_attempts,
             delay_s=self._config.fill_cancel_verify_delay_s,
             detail="confirmed quote came back CANCELLED from REST — NOT "
             "discarding yet; the position stays in the risk book while "
             "/portfolio/fills is checked for a late/taker-style execution "
-            "(both 2026-07-18 cancel reports were REAL executed fills)",
+            "(both 2026-07-18 cancel reports were REAL executed fills; the "
+            "2026-07-23 one was a PARTIAL execution)",
         )
         self._drop_quote(quote_id)
 
@@ -3423,7 +3535,20 @@ class QuoteLifecycle:
         own removal — bumps the position generation so stale snapshots
         invalidate), and un-park the state exactly like the decline paths do.
         The ONLY writer of ``fill_recovery_quote_cancelled`` — every discard
-        carries its verification evidence."""
+        carries its verification evidence. DEFENSIVE GUARD (2026-07-24
+        review): a fill that was RECORDED (WS raced the verification) is real
+        by definition — refuse the discard no matter what the caller
+        concluded."""
+        if state.fill_recorded:
+            self._release_fill_claim(state)
+            self._executed_states.pop(quote_id, None)
+            log.warning(
+                "fill_recovery_discard_refused_fill_recorded",
+                quote_id=quote_id,
+                detail="discard requested for a quote whose fills row exists "
+                "— refused (a recorded fill is a real position)",
+            )
+            return
         self._metrics.inc("fill_recovery.cancelled")
         log.warning(
             "fill_recovery_quote_cancelled",
@@ -3504,7 +3629,11 @@ class QuoteLifecycle:
             min_ts = max(0, state.fill_confirmed_wall_ts - _CANCEL_VERIFY_MIN_TS_SLACK_S)
         try:
             payload = await asyncio.wait_for(
-                self._get_portfolio_fills(state.rfq.market_ticker, min_ts=min_ts),
+                self._get_portfolio_fills(
+                    state.rfq.market_ticker,
+                    min_ts=min_ts,
+                    order_id=state.cancel_expected_order_id,
+                ),
                 timeout=2.5,
             )
         except Exception as exc:  # noqa: BLE001 — any poll error retries on cadence
@@ -3528,15 +3657,14 @@ class QuoteLifecycle:
                 quote_id=quote_id,
                 combo_ticker=state.rfq.market_ticker,
                 order_id=match.get("order_id"),
-                count_fp=match.get("count_fp"),
-                fee_cost=match.get("fee_cost"),
+                aggregate=match.get("_aggregate"),
                 is_taker=match.get("is_taker"),
                 created_time=match.get("created_time"),
                 attempts=state.cancel_verify_attempts,
                 detail="quote status said CANCELLED but /portfolio/fills shows "
-                "the execution (late/taker-style) — position KEPT in the risk "
-                "book; fills row now written via the normal on_quote_executed "
-                "writer",
+                "the execution (late/taker-style/partial) — position KEPT in "
+                "the risk book; fills row now written via the normal "
+                "on_quote_executed writer",
             )
             await self._replay_verified_fill(quote_id, state)
             if state.fill_recorded:
@@ -3564,7 +3692,44 @@ class QuoteLifecycle:
         transient 429 storm must not pin a phantom's budget until restart),
         bounded by ``_CANCEL_VERIFY_MAX_ROUNDS``; only then the loud ERROR
         give-up (position still kept — fail-safe; the next-restart exchange
-        reconcile owns it from there)."""
+        reconcile owns it from there).
+
+        2026-07-24 review guards: a fill RECORDED mid-verification (the late
+        WS message landing inside the final attempt's awaits) is terminal
+        success — never a discard; and an AMBIGUOUS round (a plausible
+        partial group refused because another in-flight quote shares the
+        ticker and no exact order id exists) is not proof of absence — the
+        position is KEPT with the loud unresolved give-up instead."""
+        if state.fill_recorded:
+            # The late WS quote_executed (or the replay) landed the row while
+            # this resolution was pending: the fill is REAL — un-park, never
+            # discard (the discard would remove a real, ledger-recorded
+            # position and cancel its receivable).
+            self._release_fill_claim(state)
+            self._executed_states.pop(quote_id, None)
+            log.info(
+                "fill_recovery_verify_resolved_by_recorded_fill",
+                quote_id=quote_id,
+            )
+            return
+        if state.cancel_verify_ok_reads > 0 and state.cancel_verify_ambiguous:
+            self._release_fill_claim(state)  # defensive — no adoption happened
+            self._metrics.inc("fill_recovery.verify_ambiguous_kept")
+            log.error(
+                "fill_recovery_verify_ambiguous_kept",
+                quote_id=quote_id,
+                combo_ticker=state.rfq.market_ticker,
+                verify_attempts=state.cancel_verify_attempts,
+                verify_ok_reads=state.cancel_verify_ok_reads,
+                detail="verification saw a structurally-plausible PARTIAL "
+                "fill it could not attribute (no creator_order_id and "
+                "another in-flight quote on the same ticker) — ambiguous "
+                "evidence never discards: position KEPT (fail-safe, "
+                "undercounting is the dangerous direction); the next-restart "
+                "exchange reconcile owns it",
+            )
+            self._executed_states.pop(quote_id, None)
+            return
         if state.cancel_verify_ok_reads > 0:
             self._release_fill_claim(state)  # defensive — no adoption happened
             self._discard_phantom_position(
@@ -3609,15 +3774,20 @@ class QuoteLifecycle:
         self._executed_states.pop(quote_id, None)
 
     async def _get_portfolio_fills(
-        self, ticker: str, *, min_ts: int | None = None
+        self, ticker: str, *, min_ts: int | None = None, order_id: str | None = None
     ) -> JsonDict:
         """GET /portfolio/fills for one combo ticker (read-only), pinned to our
-        subaccount when configured (P0-5 query-layer pin) and time-scoped by
-        ``min_ts`` (epoch seconds — index-scan §portfolio fills) when given."""
+        subaccount when configured (P0-5 query-layer pin), time-scoped by
+        ``min_ts`` (epoch seconds — index-scan §portfolio fills) when given,
+        and — 2026-07-24 incident-C review — filtered by ``order_id`` when the
+        quote's ``creator_order_id`` is known (the documented exact join:
+        Quote.creator_order_id == Fill.order_id)."""
         assert self._fills_getter is not None
         params: dict[str, str | int] = {"ticker": ticker, "limit": 100}
         if min_ts is not None:
             params["min_ts"] = min_ts
+        if order_id is not None:
+            params["order_id"] = order_id
         if self._fills_subaccount is not None:
             params["subaccount"] = self._fills_subaccount
         return await self._fills_getter.get_fills(**params)
@@ -3625,8 +3795,12 @@ class QuoteLifecycle:
     async def _adopt_exchange_fill(
         self, quote_id: str, state: OpenQuoteState, payload: JsonDict
     ) -> JsonDict | None:
-        """The first structurally-matching exchange fill that passes the
-        ADOPTION GUARDS (2026-07-18 review), with its order_id CLAIMED — or
+        """The first admissible exchange fill GROUP — all prints of ONE order
+        (one Kalshi order can cross the public book at several levels, so one
+        execution is one ``order_id`` across possibly-many /portfolio/fills
+        rows; 2026-07-24 incident-C review) — that passes the ADOPTION GUARDS
+        (2026-07-18 review), with its order_id CLAIMED. Returns an AGGREGATE
+        fill dict (total count + summed fee + the raw prints as evidence) or
         None. Guards, each independently load-bearing against double-count:
 
         - ``order_id`` present (the dedupe key; the documented Fill schema
@@ -3641,31 +3815,63 @@ class QuoteLifecycle:
 
         Rejected candidates are logged + counted per reason so a guard firing
         live is visible evidence, not silence."""
-        for row in self._match_exchange_fill(state, payload):
-            order_id_raw = row.get("order_id")
-            if not order_id_raw:
+        groups, ambiguous = self._match_exchange_fill_groups(state, payload)
+        if ambiguous:
+            # Ambiguous partial evidence (see _match_exchange_fill_groups):
+            # resolution must NOT conclude "genuinely absent" this round.
+            state.cancel_verify_ambiguous = True
+        for group in groups:
+            order_id = group["order_id"]
+            if not order_id:
                 reason = "order_id_missing"
+            elif order_id in self._claimed_exchange_order_ids:
+                reason = "already_claimed"
+            elif await self._store.has_fill_for_order_id(order_id):
+                reason = "already_in_ledger"
             else:
-                order_id = str(order_id_raw)
-                if order_id in self._claimed_exchange_order_ids:
-                    reason = "already_claimed"
-                elif await self._store.has_fill_for_order_id(order_id):
-                    reason = "already_in_ledger"
-                else:
-                    self._claimed_exchange_order_ids.add(order_id)
-                    return row
+                self._claimed_exchange_order_ids.add(order_id)
+                return self._aggregate_fill(group)
             self._metrics.inc("fill_recovery.verify_match_rejected")
             self._metrics.inc(f"fill_recovery.verify_match_rejected.{reason}")
             log.warning(
                 "fill_recovery_verify_match_rejected",
                 quote_id=quote_id,
                 combo_ticker=state.rfq.market_ticker,
-                order_id=row.get("order_id"),
+                order_id=order_id,
+                n_prints=len(group["rows"]),
+                total_cc=group["total_cc"],
                 reason=reason,
-                detail="structurally-matching exchange fill NOT adopted — "
-                "adoption guard refused it (double-count protection)",
+                detail="structurally-matching exchange fill group NOT adopted "
+                "— adoption guard refused it (double-count protection)",
             )
         return None
+
+    def _aggregate_fill(self, group: JsonDict) -> JsonDict:
+        """One adoptable fill dict from a group of prints sharing one
+        ``order_id``: the first print's fields ride through (created_time,
+        is_taker, prices — evidence), with the group TOTAL count, the summed
+        exchange fee (None if ANY print's fee is unreadable — an honest
+        UNKNOWN, never a partial sum booked as complete), and every raw print
+        attached. Downstream readers (``_resize_pending_to_exchange_count``,
+        ``_exchange_fill_fee_cc``) prefer the ``_aggregate`` block."""
+        rows: list[JsonDict] = group["rows"]
+        fee_cc_total: int | None = 0
+        for row in rows:
+            fee = self._exchange_fill_fee_cc(row)
+            if fee is None or fee_cc_total is None:
+                fee_cc_total = None
+                break
+            fee_cc_total = fee_cc_total + fee
+        return {
+            **dict(rows[0]),
+            "order_id": group["order_id"],
+            "prints": [dict(r) for r in rows],
+            "_aggregate": {
+                "count_cc": int(group["total_cc"]),
+                "fee_cc": fee_cc_total,
+                "n_prints": len(rows),
+            },
+        }
 
     def _release_fill_claim(self, state: OpenQuoteState) -> None:
         """Release this state's claimed exchange order_id (once the ledger row
@@ -3678,28 +3884,69 @@ class QuoteLifecycle:
         if order_id:
             self._claimed_exchange_order_ids.discard(str(order_id))
 
-    def _match_exchange_fill(
+    def _match_exchange_fill_groups(
         self, state: OpenQuoteState, payload: JsonDict
-    ) -> list[JsonDict]:
-        """Every exchange fill STRUCTURALLY matching this quote's pending fill
-        (adoption guards — order_id/claim/ledger — are applied by
-        ``_adopt_exchange_fill``).
+    ) -> tuple[list[JsonDict], bool]:
+        """(admissible groups, ambiguous_partial_refused) for this quote's
+        pending fill. A GROUP is every structurally-matching print sharing one
+        ``order_id`` (one order can cross the public book at several levels),
+        with its TOTAL count — adoption guards are applied per group by
+        ``_adopt_exchange_fill``.
 
-        Structural match = same combo ticker (queried, but re-checked) + same
-        OUR side (``outcome_side``, legacy ``side`` fallback — index-scan
-        §portfolio fills) + EXACT centi-contract count (``count_fp``). Price is
-        deliberately NOT matched: incident A executed at 0.7660 against our
-        0.7670 bid — the taker-style variant can fill off our exact bid; the
-        raw fill rides the ledger row for the evidence. Any unreadable field
-        skips that row (fail-closed: a fill is never matched from a guess)."""
+        INCIDENT C (2026-07-23, quote 7824bf04): a target-cost RFQ's
+        "execution failed" cancel can mean PARTIALLY EXECUTED — the exchange
+        filled 38.15 of the 57.44 we offered, and the old EXACT-count rule
+        silently rejected the real fill on all three verification reads, so
+        the "phantom" removal deleted a REAL $28.69 position.
+
+        Matching rules (2026-07-24 adversarial review hardening):
+        - EXACT KEY FIRST: when ``state.cancel_expected_order_id`` (the quote
+          payload's ``creator_order_id`` — doc-verified == Fill.order_id) is
+          known, ONLY that order's group is admissible; every other same-
+          ticker row is a logged skip. Structural matching is the FALLBACK
+          for payloads that omit the id, never the primary.
+        - Structural screen per print: same combo ticker (queried, but
+          re-checked) + same OUR side (``outcome_side``, legacy ``side``
+          fallback) + readable positive count. Price is deliberately NOT
+          matched (incident A executed at 0.7660 against our 0.7670 bid).
+        - Group admissible when 0 < total <= pending; a total LARGER than
+          pending is never ours (Kalshi cannot fill beyond the offered size).
+        - AMBIGUITY GUARD (review finding: the <=-count rule let quote B
+          adopt quote A's unledgered same-ticker fill, shrinking a REAL
+          position on foreign evidence): with NO expected order id, a
+          PARTIAL group (total < pending) is REFUSED while another
+          not-yet-recorded quote state exists on the same ticker — and the
+          refusal poisons "genuinely absent" (the caller keeps the position
+          rather than discarding on ambiguous evidence). Exact-total groups
+          keep the pre-incident-C behaviour (ledger/claim guards own them).
+        - Ordering: exact-total groups first, then largest total.
+        - Every same-ticker row/group the matcher refuses is LOGGED
+          (incident C's rejections were invisible; a real fill must never be
+          silently skipped again). Unreadable fields skip fail-closed — a
+          fill is never matched from a guess."""
         if state.pending_fill is None:
-            return []
+            return [], False
         accepted_side, _bid, qty = state.pending_fill
         our_side = self._conventions.maker_position_side(accepted_side)
         rows = payload.get("fills") or []
         if not isinstance(rows, list):
-            return []
-        matches: list[JsonDict] = []
+            return [], False
+        expected = state.cancel_expected_order_id
+        by_order: dict[str, list[tuple[int, JsonDict]]] = {}
+        keyless: list[tuple[int, JsonDict]] = []
+        skips: list[JsonDict] = []
+
+        def skip(row: JsonDict, side_raw: str, count_raw: object, why: str) -> None:
+            skips.append(
+                {
+                    "order_id": row.get("order_id"),
+                    "outcome_side": side_raw,
+                    "count_fp": count_raw,
+                    "created_time": row.get("created_time"),
+                    "reason": why,
+                }
+            )
+
         for row in rows:
             if not isinstance(row, dict):
                 continue
@@ -3707,29 +3954,138 @@ class QuoteLifecycle:
             if ticker != state.rfq.market_ticker:
                 continue
             side_raw = str(row.get("outcome_side") or row.get("side") or "").lower()
-            if side_raw != our_side.value:
-                continue
             count_raw = row.get("count_fp") or row.get("count")
-            if count_raw is None:
-                continue
+            count: int | None
             try:
-                count = int(qty_from_fp_str(str(count_raw)))
+                count = (
+                    int(qty_from_fp_str(str(count_raw)))
+                    if count_raw is not None
+                    else None
+                )
             except ValueError:
+                count = None
+            if side_raw != our_side.value or count is None or count <= 0:
+                skip(row, side_raw, count_raw, "side_or_count_unreadable")
                 continue
-            if count != int(qty):
+            order_id_raw = row.get("order_id")
+            order_id = str(order_id_raw) if order_id_raw else None
+            if expected is not None and order_id != expected:
+                skip(row, side_raw, count_raw, "order_id_mismatch")
                 continue
-            matches.append(row)
-        return matches
+            if order_id is None:
+                keyless.append((count, row))
+            else:
+                by_order.setdefault(order_id, []).append((count, row))
+
+        others_in_flight = any(
+            s is not state and not s.fill_recorded
+            and s.rfq.market_ticker == state.rfq.market_ticker
+            for s in self._executed_states.values()
+        )
+        groups: list[JsonDict] = []
+        ambiguous = False
+        candidates: list[tuple[str | None, list[tuple[int, JsonDict]]]] = [
+            *by_order.items(),
+            *[(None, [pair]) for pair in keyless],
+        ]
+        for order_id, pairs in candidates:
+            total = sum(c for c, _r in pairs)
+            if total > int(qty):
+                skip(pairs[0][1], our_side.value, total, "group_exceeds_pending")
+                continue
+            if (
+                expected is None
+                and total < int(qty)
+                and others_in_flight
+            ):
+                ambiguous = True
+                skip(pairs[0][1], our_side.value, total, "ambiguous_partial_refused")
+                continue
+            groups.append(
+                {
+                    "order_id": order_id,
+                    "rows": [r for _c, r in pairs],
+                    "total_cc": total,
+                }
+            )
+        if skips:
+            self._metrics.inc("fill_recovery.verify_structural_skips")
+            log.warning(
+                "fill_recovery_verify_structural_skips",
+                combo_ticker=state.rfq.market_ticker,
+                pending_side=our_side.value,
+                pending_count_cc=int(qty),
+                expected_order_id=expected,
+                n_skipped=len(skips),
+                skipped=skips[:5],
+            )
+        groups.sort(key=lambda g: (g["total_cc"] != int(qty), -g["total_cc"]))
+        return groups, ambiguous
+
+    def _resize_pending_to_exchange_count(
+        self, quote_id: str, state: OpenQuoteState, fill: JsonDict
+    ) -> None:
+        """INCIDENT C (partial execution): the adopted exchange fill's count is
+        the TRUTH of what executed — when it is smaller than the pending
+        (offered/accepted) quantity, shrink the pending fill AND the booked
+        position to it BEFORE the replay writes the ledger row, so the ledger
+        row, the EV edge, and the risk book all carry the exchange's count
+        (the old path booked the offered 57.44 while the exchange held 38.15
+        — the position-reconcile count-divergence alarm class). Idempotent
+        (equal counts no-op, so the bounded replay retries re-enter safely);
+        an unreadable count keeps the LARGER booked size (fail-safe: risk is
+        never shrunk on a guess); growth is impossible (the matcher only
+        admits count <= pending). The remove+rebook pair goes through the
+        exposure book's own removal (position-generation bump — stale MC
+        snapshots invalidate) and the single ``_fill_position`` builder."""
+        if state.pending_fill is None:
+            return
+        exchange_qty: int | None = None
+        agg = fill.get("_aggregate")
+        if isinstance(agg, dict):
+            agg_count = agg.get("count_cc")
+            if isinstance(agg_count, int) and not isinstance(agg_count, bool):
+                exchange_qty = agg_count
+        if exchange_qty is None:
+            count_raw = fill.get("count_fp") or fill.get("count")
+            if count_raw is None:
+                return
+            try:
+                exchange_qty = int(qty_from_fp_str(str(count_raw)))
+            except ValueError:
+                return
+        accepted_side, bid, qty = state.pending_fill
+        if exchange_qty <= 0 or exchange_qty >= int(qty):
+            return
+        self._metrics.inc("fill_recovery.partial_execution_resize")
+        log.warning(
+            "fill_recovery_partial_execution_resize",
+            quote_id=quote_id,
+            combo_ticker=state.rfq.market_ticker,
+            pending_count_cc=int(qty),
+            exchange_count_cc=exchange_qty,
+            detail="cancel-verified exchange fill executed PARTIALLY — "
+            "pending fill and booked position resized to the exchange count "
+            "(ledger row, EV edge and risk book now carry the executed size)",
+        )
+        state.pending_fill = (accepted_side, bid, CentiContracts(exchange_qty))
+        position_id = f"fill:{quote_id}"
+        if position_id in self._exposure.positions:
+            self._exposure.remove_position(position_id)
+            self._book_position(quote_id, state)
 
     async def _replay_verified_fill(self, quote_id: str, state: OpenQuoteState) -> None:
         """Book the VERIFIED late execution through the NORMAL writer path —
         the same ``on_quote_executed`` every ordinary fill takes (never a
         hand-built ledger row). The position was never removed (verification
-        keeps it booked), so the booking side is an idempotent no-op; the
-        ledger tail writes the row, books the exchange-reported fee into
-        realized P&L, and tracks markouts exactly once (fill_ref guard)."""
+        keeps it booked) — though a PARTIAL execution first shrinks it to the
+        exchange count (incident C) — so the booking side is an idempotent
+        no-op; the ledger tail writes the row, books the exchange-reported
+        fee into realized P&L, and tracks markouts exactly once (fill_ref
+        guard)."""
         fill = state.cancel_verified_fill
         assert fill is not None
+        self._resize_pending_to_exchange_count(quote_id, state, fill)
         msg: JsonDict = {
             "quote_id": quote_id,
             "recovered_via_fills_poll": True,
@@ -3747,8 +4103,18 @@ class QuoteLifecycle:
     def _exchange_fill_fee_cc(fill: JsonDict) -> int | None:
         """The exchange fill's ``fee_cost`` (fixed-point dollars) in cc,
         rounded UP to a whole cc (fee_cc_from_dollars_str — never understate a
-        cost we paid). None when absent/unreadable — the ledger then records
-        the fee model's figure rather than a guessed number (defense #2)."""
+        cost we paid). An AGGREGATE fill (multi-print adoption, 2026-07-24)
+        carries its per-print-summed fee in ``_aggregate.fee_cc`` — preferred;
+        None there means some print's fee was unreadable (honest UNKNOWN,
+        never a partial sum). None otherwise when absent/unreadable — the
+        ledger then records the fee model's figure rather than a guessed
+        number (defense #2)."""
+        agg = fill.get("_aggregate")
+        if isinstance(agg, dict):
+            fee = agg.get("fee_cc")
+            if isinstance(fee, int) and not isinstance(fee, bool):
+                return fee
+            return None
         raw = fill.get("fee_cost")
         if raw is None:
             return None
@@ -3756,6 +4122,228 @@ class QuoteLifecycle:
             return int(fee_cc_from_dollars_str(str(raw)))
         except MoneyParseError:
             return None
+
+    # ------------------------------------ fills-ledger diff sweep (incident C)
+
+    async def _sweep_fills_ledger_diff(self) -> None:
+        """FILLS-LEDGER SWEEP (2026-07-24 incident C, backstop 3). Periodic
+        account-wide diff of /portfolio/fills against the local fills ledger,
+        keyed by ``order_id`` — the generic net under EVERY writer-path miss
+        (incident C's partial execution was invisible to the per-quote
+        verification for its whole bounded budget and to the ledger forever).
+
+        ALARM-ONLY by design: the fills ledger has ONE writer
+        (``on_quote_executed``) and this sweep never becomes a second one — a
+        miss is a loud ERROR + metric; adoption happens only through the
+        per-quote verification machinery (rows claimed by an in-flight
+        verification, or on a ticker a still-recovering quote owns, are
+        skipped). The min_ts watermark never advances past the OLDEST
+        unresolved miss, so a persistent miss re-alarms every interval until
+        resolved (the restart reconcile owns anything older than the
+        lookback).
+
+        Guards: no fills getter (paper/backtests) or a non-positive interval
+        ⇒ disabled. The first tick only stamps the cadence — the first fetch
+        runs one interval later. Bounded: ≤3 pages per sweep; any fetch error
+        logs + retries next interval (slow-loop isolation — never raises into
+        the maintenance tick, never touches the pricing path)."""
+        if self._fills_getter is None:
+            return
+        interval_s = self._config.fills_ledger_sweep_interval_s
+        if not (interval_s > 0.0):
+            return
+        now = self._clock.monotonic_ns()
+        if self._fills_sweep_last_mono_ns is None:
+            self._fills_sweep_last_mono_ns = now
+            return
+        if now - self._fills_sweep_last_mono_ns < int(interval_s * 1e9):
+            return
+        self._fills_sweep_last_mono_ns = now
+        try:
+            await self._fills_ledger_diff_once()
+        except Exception as exc:  # noqa: BLE001 — slow loop (2026-07-24 review):
+            # NOTHING here may raise into the maintenance tick — a store error
+            # mid-diff must not abort the enforced limit check / TTL / reprice
+            # behind this call. Log + retry next interval.
+            self._metrics.inc("fills_ledger_sweep.errors")
+            log.warning("fills_ledger_sweep_failed", error=repr(exc))
+
+    async def _fills_ledger_diff_once(self) -> None:
+        """One fills-ledger diff pass (called only under the cadence guard +
+        try/except of ``_sweep_fills_ledger_diff``). Review-hardened:
+        2.5s-per-page timeout (house REST bound), limit 1000, batched ledger
+        reads (two SELECTs, never per-row point reads), truncation clamp,
+        naive/legacy timestamp parsing, non-exhausted in-flight exclusion
+        only, and an age-out release so an unresolvable miss cannot pin the
+        watermark forever."""
+        assert self._fills_getter is not None
+        min_ts = self._fills_sweep_min_ts
+        now_wall = int(self._clock.now().timestamp())
+        lookback_s = int(self._config.fills_ledger_sweep_lookback_s)
+        if min_ts is None:
+            min_ts = now_wall - lookback_s
+        # In-flight exclusion ONLY for states still inside their recovery/
+        # verification budget (2026-07-24 review: an EXHAUSTED state parked
+        # forever must not suppress sweep alarms on its ticker — its missing
+        # fill is exactly what the sweep exists to keep loud).
+        in_flight_tickers = {
+            s.rfq.market_ticker
+            for s in self._executed_states.values()
+            if not s.fill_recorded
+            and s.fill_recovery_attempts < _FILL_RECOVERY_MAX_ATTEMPTS
+        }
+        ledger_ids = await self._store.fill_order_ids()
+        null_keys = await self._store.fill_null_order_id_keys()
+        rows: list[JsonDict] = []
+        cursor = ""
+        truncated = False
+        for _ in range(3):
+            params: dict[str, str | int] = {"limit": 1000, "min_ts": min_ts}
+            if self._fills_subaccount is not None:
+                params["subaccount"] = self._fills_subaccount
+            if cursor:
+                params["cursor"] = cursor
+            self._beat()
+            payload = await asyncio.wait_for(
+                self._fills_getter.get_fills(**params), timeout=2.5
+            )
+            page = payload.get("fills") or []
+            if isinstance(page, list):
+                rows.extend(r for r in page if isinstance(r, dict))
+            cursor = str(payload.get("cursor") or "")
+            if not cursor:
+                break
+        else:
+            truncated = bool(cursor)
+        self._metrics.inc("fills_ledger_sweep.ran")
+        max_seen_ts: int | None = None
+        oldest_scanned_ts: int | None = None
+        missing_ts: list[int] = []
+        missing_unparseable_ts = False
+        missing = 0
+        for row in rows:
+            created_ts = _parse_epoch_s(row.get("created_time")) or _parse_epoch_s(
+                row.get("ts")
+            )
+            if created_ts is not None:
+                max_seen_ts = (
+                    created_ts if max_seen_ts is None else max(max_seen_ts, created_ts)
+                )
+                oldest_scanned_ts = (
+                    created_ts
+                    if oldest_scanned_ts is None
+                    else min(oldest_scanned_ts, created_ts)
+                )
+            order_id_raw = row.get("order_id")
+            if not order_id_raw:
+                # Undedupable (the documented Fill schema always carries an
+                # order_id) — alarmed, never guessed into the ledger; holds
+                # the watermark like any other unattributable row.
+                self._metrics.inc("fills_ledger_sweep.no_order_id")
+                log.error("fills_ledger_sweep_row_without_order_id", row=row)
+                missing_unparseable_ts = missing_unparseable_ts or created_ts is None
+                continue
+            order_id = str(order_id_raw)
+            if order_id in ledger_ids:
+                continue
+            if order_id in self._claimed_exchange_order_ids:
+                # An in-flight adoption/recovery owns it — VISIBLE (2026-07-24
+                # review: a replay-exhausted claim must not be silent), and it
+                # self-resolves when the replay lands the row.
+                self._metrics.inc("fills_ledger_sweep.claimed_unwritten")
+                log.warning(
+                    "fills_ledger_sweep_claimed_unwritten",
+                    order_id=order_id,
+                    detail="tape fill claimed by an in-flight adoption whose "
+                    "ledger row has not landed yet — watching, not alarming",
+                )
+                continue
+            ticker = str(row.get("ticker") or row.get("market_ticker") or "")
+            count_cc: int | None
+            try:
+                raw_count = row.get("count_fp") or row.get("count")
+                count_cc = (
+                    int(qty_from_fp_str(str(raw_count)))
+                    if raw_count is not None
+                    else None
+                )
+            except ValueError:
+                count_cc = None
+            if count_cc is not None and (ticker, count_cc) in null_keys:
+                # A ledger row EXISTS for this ticker+count but carries no
+                # order_id (poll-recovered without creator_order_id) — a
+                # visible skip, never a permanent false alarm.
+                self._metrics.inc("fills_ledger_sweep.matched_null_order_id")
+                continue
+            if ticker in in_flight_tickers:
+                continue  # per-quote recovery/verification still owns it
+            missing += 1
+            if created_ts is not None:
+                missing_ts.append(created_ts)
+            else:
+                missing_unparseable_ts = True
+            self._metrics.inc("fills_ledger_sweep.missing")
+            log.error(
+                "fills_ledger_missing_exchange_fill",
+                order_id=order_id,
+                ticker=ticker,
+                count_fp=row.get("count_fp"),
+                outcome_side=row.get("outcome_side") or row.get("side"),
+                created_time=row.get("created_time"),
+                is_taker=row.get("is_taker"),
+                detail="exchange reports a fill our fills ledger does not "
+                "hold and no in-flight recovery owns — a writer-path miss "
+                "(incident-C class); NOT auto-written (one-writer rule): the "
+                "operator/restart reconcile owns adoption; re-alarms every "
+                "sweep until resolved",
+            )
+        if truncated:
+            # >3 pages in the window: unscanned rows exist — LOUD, and the
+            # watermark must not advance past the oldest row actually seen.
+            self._metrics.inc("fills_ledger_sweep.truncated")
+            log.error(
+                "fills_ledger_sweep_truncated",
+                scanned=len(rows),
+                detail="fills window exceeded the page budget — older rows "
+                "unscanned this sweep; watermark clamped to the oldest "
+                "scanned row so they are re-fetched next interval",
+            )
+        if missing_unparseable_ts:
+            # A miss whose timestamp cannot be read cannot be held-back by
+            # timestamp — refuse to advance at all (it would silently drop
+            # the row from every later window).
+            log.error(
+                "fills_ledger_sweep_watermark_held",
+                detail="a missing/unattributable row had no parseable "
+                "timestamp — watermark NOT advanced this sweep",
+            )
+        elif max_seen_ts is not None:
+            next_ts = max_seen_ts - 300
+            if truncated and oldest_scanned_ts is not None:
+                next_ts = min(next_ts, oldest_scanned_ts - 1)
+            # Hold the watermark at the oldest UNRESOLVED miss so it re-alarms
+            # every sweep — but AGE OUT misses older than the lookback (an
+            # unresolvable miss must not pin the window forever; it gets a
+            # distinct terminal alarm and belongs to the restart reconcile).
+            aged = [t for t in missing_ts if t < now_wall - lookback_s]
+            held = [t for t in missing_ts if t >= now_wall - lookback_s]
+            if aged:
+                self._metrics.inc("fills_ledger_sweep.miss_aged_out")
+                log.error(
+                    "fills_ledger_sweep_miss_aged_out",
+                    n=len(aged),
+                    oldest=min(aged),
+                    detail="unresolved ledger misses older than the lookback "
+                    "released from the watermark hold — final sweep alarm; "
+                    "the operator/restart reconcile owns them now",
+                )
+            if held:
+                next_ts = min(next_ts, min(held) - 1)
+            self._fills_sweep_min_ts = max(min_ts, next_ts)
+        if missing:
+            log.error(
+                "fills_ledger_sweep_summary", missing=missing, scanned=len(rows)
+            )
 
     def _note_fill_recovery_exhausted(
         self, quote_id: str, state: OpenQuoteState
@@ -4141,6 +4729,11 @@ class QuoteLifecycle:
         # recovered position counts against the caps this same tick. Runs even
         # when halted — recording exchange truth is reconciliation, not quoting.
         await self._sweep_unrecorded_fills()
+        # FILLS-LEDGER SWEEP (2026-07-24 incident C): slow-cadence account-wide
+        # /portfolio/fills vs local-ledger diff — the alarm-only backstop under
+        # every writer-path miss. Runs even when halted (reconciliation, not
+        # quoting).
+        await self._sweep_fills_ledger_diff()
         if not self._killswitch.halted:
             breaches = self._partition_breaches(
                 self._limits.check(

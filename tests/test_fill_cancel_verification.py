@@ -936,13 +936,24 @@ def test_verify_config_defaults_and_passthrough() -> None:
     assert rc.fill_cancel_verify_attempts == 3
     assert rc.fill_cancel_verify_delay_s == 90.0
     assert rc.position_reconcile_interval_s == 300.0
+    assert rc.fills_ledger_sweep_interval_s == 900.0
+    assert rc.fills_ledger_sweep_lookback_s == 3600.0
     assert LifecycleConfig().fill_cancel_verify_attempts == 3
     assert LifecycleConfig().fill_cancel_verify_delay_s == 90.0
+    assert LifecycleConfig().fills_ledger_sweep_interval_s == 900.0
+    assert LifecycleConfig().fills_ledger_sweep_lookback_s == 3600.0
     cfg = build_lifecycle_config(
-        RiskConfig(fill_cancel_verify_attempts=5, fill_cancel_verify_delay_s=30.0)
+        RiskConfig(
+            fill_cancel_verify_attempts=5,
+            fill_cancel_verify_delay_s=30.0,
+            fills_ledger_sweep_interval_s=600.0,
+            fills_ledger_sweep_lookback_s=7200.0,
+        )
     )
     assert cfg.fill_cancel_verify_attempts == 5
     assert cfg.fill_cancel_verify_delay_s == 30.0
+    assert cfg.fills_ledger_sweep_interval_s == 600.0
+    assert cfg.fills_ledger_sweep_lookback_s == 7200.0
     # 0 = verification explicitly disabled (immediate discard) — allowed.
     assert RiskConfig(fill_cancel_verify_attempts=0).fill_cancel_verify_attempts == 0
 
@@ -955,3 +966,491 @@ def test_verify_config_validation() -> None:
             RiskConfig(fill_cancel_verify_delay_s=bad)
         with pytest.raises(ValidationError):
             RiskConfig(position_reconcile_interval_s=bad)
+        with pytest.raises(ValidationError):
+            RiskConfig(fills_ledger_sweep_interval_s=bad)
+        with pytest.raises(ValidationError):
+            RiskConfig(fills_ledger_sweep_lookback_s=bad)
+
+
+# --------------------------------------------------------------------------- #
+# INCIDENT C (2026-07-23, quote 7824bf04): a target-cost RFQ's "execution      #
+# failed" cancel = PARTIALLY EXECUTED (38.15 of the 57.44 offered). The old    #
+# EXACT-count matcher silently rejected the real fill on all three reads and   #
+# the phantom removal deleted a REAL $28.69 position. Pinned here:             #
+# count-tolerant match (<= pending), exchange-count resize, exact preference,  #
+# skip visibility, and the account-wide fills-ledger diff sweep.               #
+# --------------------------------------------------------------------------- #
+
+
+class TestIncidentCPartialExecution:
+    async def test_partial_execution_adopted_and_resized(
+        self, tmp_path: Path
+    ) -> None:
+        """The incident-C shape: pending 10.00, exchange executed 3.80. The
+        matcher adopts the smaller REAL fill; the ledger row AND the booked
+        position carry the EXCHANGE count (the truth of what executed)."""
+        getter = FakeQuoteGetter()
+        fills = FakeFillsGetter()
+        rig = await _verify_rig(tmp_path, getter=getter, fills=fills, attempts=1)
+        fills.script(
+            COMBO_TICKER,
+            {"fills": [taker_fill(count_fp="3.80", order_id="ord-c-1")]},
+        )
+        quote_id = await _cancel_reported(rig, getter)
+        await rig.lifecycle.maintenance_tick()  # attempt 1 → partial match
+        assert rig.metrics.counter("fill_recovery.late_execution") == 1
+        assert rig.metrics.counter("fill_recovery.partial_execution_resize") == 1
+        assert rig.metrics.counter("fill_recovery.cancelled") == 0  # never discarded
+        assert await rig.store.count("fills") == 1
+        (row,) = await _fill_rows(rig.store)
+        assert row[1] == "ord-c-1"
+        assert row[4] == 380  # contracts_centi = the EXCHANGE count, not 1000
+        pos = rig.exposure.positions[f"fill:{quote_id}"]
+        assert int(pos.contracts) == 380  # booked position resized to the truth
+
+    async def test_exact_match_preferred_over_partial(self, tmp_path: Path) -> None:
+        """Both an exact-count and a partial-count row on the tape: the EXACT
+        execution is adopted; partials only matter when it is absent."""
+        getter = FakeQuoteGetter()
+        fills = FakeFillsGetter()
+        rig = await _verify_rig(tmp_path, getter=getter, fills=fills, attempts=1)
+        fills.script(
+            COMBO_TICKER,
+            {
+                "fills": [
+                    taker_fill(count_fp="3.80", order_id="ord-part"),
+                    taker_fill(order_id="ord-exact"),  # count 10.00 == pending
+                ]
+            },
+        )
+        quote_id = await _cancel_reported(rig, getter)
+        await rig.lifecycle.maintenance_tick()
+        assert rig.metrics.counter("fill_recovery.late_execution") == 1
+        assert rig.metrics.counter("fill_recovery.partial_execution_resize") == 0
+        (row,) = await _fill_rows(rig.store)
+        assert row[1] == "ord-exact"
+        assert row[4] == 1000
+        assert int(rig.exposure.positions[f"fill:{quote_id}"].contracts) == 1000
+
+    async def test_larger_count_still_never_matches(self, tmp_path: Path) -> None:
+        """A count LARGER than pending is never ours (Kalshi cannot fill
+        beyond the offered size) — still refused, and now VISIBLY (the skip
+        metric fires; incident C's rejections were silent)."""
+        getter = FakeQuoteGetter()
+        fills = FakeFillsGetter()
+        rig = await _verify_rig(tmp_path, getter=getter, fills=fills, attempts=1)
+        fills.script(
+            COMBO_TICKER,
+            {
+                "fills": [
+                    taker_fill(count_fp="99.00", order_id="ord-big"),
+                    taker_fill(outcome_side="no", order_id="ord-side"),
+                ]
+            },
+        )
+        quote_id = await _cancel_reported(rig, getter)
+        await rig.lifecycle.maintenance_tick()  # attempt 1 (final) → no match
+        assert rig.metrics.counter("fill_recovery.verify_structural_skips") == 1
+        assert rig.metrics.counter("fill_recovery.late_execution") == 0
+        assert await rig.store.count("fills") == 0
+        assert f"fill:{quote_id}" not in rig.exposure.positions
+        assert rig.metrics.counter("fill_recovery.cancelled") == 1
+
+    async def test_partial_resize_idempotent_across_write_retry(
+        self, tmp_path: Path
+    ) -> None:
+        """A flaky first ledger write after a PARTIAL adoption: the retry
+        re-enters the resize (idempotent no-op) and lands ONE row at the
+        exchange count — never a double-shrink or a second row."""
+        getter = FakeQuoteGetter()
+        fills = FakeFillsGetter()
+        rig = await _verify_rig(tmp_path, getter=getter, fills=fills)
+        fills.script(
+            COMBO_TICKER,
+            {"fills": [taker_fill(count_fp="3.80", order_id="ord-c-2")]},
+        )
+
+        original = rig.store.record_fill
+        boom = {"armed": True}
+
+        async def flaky(*args: Any, **kwargs: Any) -> bool:
+            if boom["armed"]:
+                boom["armed"] = False
+                raise RuntimeError("database table is locked")
+            return await original(*args, **kwargs)
+
+        rig.store.record_fill = flaky  # type: ignore[method-assign]
+
+        quote_id = await _cancel_reported(rig, getter)
+        await rig.lifecycle.maintenance_tick()  # adopt+resize → write FAILS
+        assert rig.metrics.counter("fill_recovery.partial_execution_resize") == 1
+        assert await rig.store.count("fills") == 0
+        assert int(rig.exposure.positions[f"fill:{quote_id}"].contracts) == 380
+
+        await rig.lifecycle.maintenance_tick()  # replay retry → row lands
+        assert await rig.store.count("fills") == 1
+        (row,) = await _fill_rows(rig.store)
+        assert row[4] == 380
+        assert rig.metrics.counter("fill_recovery.partial_execution_resize") == 1
+        assert int(rig.exposure.positions[f"fill:{quote_id}"].contracts) == 380
+
+
+class TestFillsLedgerSweep:
+    async def test_missing_exchange_fill_alarms_never_writes(
+        self, tmp_path: Path
+    ) -> None:
+        """An exchange fill our ledger does not hold (and no in-flight
+        recovery owns) is ALARMED — and never auto-written (one-writer
+        rule). Known rows stay quiet. First tick stamps only; the fetch runs
+        one interval later."""
+        getter = FakeQuoteGetter()
+        fills = FakeFillsGetter()
+        rig = await _verify_rig(tmp_path, getter=getter, fills=fills)
+
+        # A normal WS-recorded fill (known order id) + an orphan on the tape.
+        quote_id = await _confirmed_quote(rig)
+        await rig.lifecycle.on_quote_executed(
+            {"quote_id": quote_id, "order_id": "ord-known"}
+        )
+        fills.script(
+            "",  # the ACCOUNT-WIDE query carries no ticker param
+            {
+                "fills": [
+                    taker_fill(order_id="ord-known"),
+                    taker_fill(order_id="ord-orphan", ticker="KXMVE-ELSEWHERE"),
+                ]
+            },
+        )
+
+        await rig.lifecycle.maintenance_tick()  # first tick: stamps cadence only
+        assert all("ticker" in c for c in fills.calls)  # no account-wide fetch
+
+        rig.h.clock.advance(900.5)
+        await rig.lifecycle.maintenance_tick()  # sweep fires
+        account_calls = [c for c in fills.calls if "ticker" not in c]
+        assert len(account_calls) == 1
+        assert account_calls[0]["limit"] == 1000
+        assert "min_ts" in account_calls[0]
+        assert rig.metrics.counter("fills_ledger_sweep.ran") == 1
+        assert rig.metrics.counter("fills_ledger_sweep.missing") == 1
+        assert await rig.store.count("fills") == 1  # NEVER auto-written
+
+    async def test_in_flight_recovery_ticker_not_alarmed(
+        self, tmp_path: Path
+    ) -> None:
+        """A tape row on a ticker a still-recovering quote owns is the
+        per-quote machinery's to adopt — the sweep must not double-alarm it."""
+        getter = FakeQuoteGetter()
+        fills = FakeFillsGetter()
+        rig = await _verify_rig(tmp_path, getter=getter, fills=fills)
+        fills.script(COMBO_TICKER, {"fills": []})  # per-quote verification reads
+        fills.script("", {"fills": [taker_fill(order_id="ord-inflight")]})
+        await _cancel_reported(rig, getter)  # in-flight verification on COMBO_TICKER
+
+        rig.h.clock.advance(900.5)
+        await rig.lifecycle.maintenance_tick()
+        assert rig.metrics.counter("fills_ledger_sweep.ran") == 1
+        assert rig.metrics.counter("fills_ledger_sweep.missing") == 0
+
+    async def test_sweep_error_logs_and_retries_next_interval(
+        self, tmp_path: Path
+    ) -> None:
+        """A fetch error is a slow-loop log + retry next interval — never an
+        exception into the maintenance tick, never a false alarm."""
+        getter = FakeQuoteGetter()
+        fills = FakeFillsGetter()
+        rig = await _verify_rig(tmp_path, getter=getter, fills=fills)
+        fills.script("", RuntimeError("rest down"))
+
+        await rig.lifecycle.maintenance_tick()  # stamp
+        rig.h.clock.advance(900.5)
+        await rig.lifecycle.maintenance_tick()  # sweep → error → swallowed
+        assert rig.metrics.counter("fills_ledger_sweep.errors") == 1
+        assert rig.metrics.counter("fills_ledger_sweep.ran") == 0
+
+        fills.script("", {"fills": []})
+        rig.h.clock.advance(900.5)
+        await rig.lifecycle.maintenance_tick()  # next interval retries
+        assert rig.metrics.counter("fills_ledger_sweep.ran") == 1
+
+    async def test_no_fills_getter_disables_sweep(self, tmp_path: Path) -> None:
+        getter = FakeQuoteGetter()
+        rig = await _make_rig(tmp_path, getter=getter)  # fills_getter=None
+        await rig.lifecycle.maintenance_tick()
+        rig.h.clock.advance(900.5)
+        await rig.lifecycle.maintenance_tick()  # guard returns — nothing to call
+        assert rig.metrics.counter("fills_ledger_sweep.ran") == 0
+
+
+# --------------------------------------------------------------------------- #
+# 2026-07-24 ADVERSARIAL-REVIEW REGRESSIONS (20 confirmed findings → the       #
+# hardening pass): exact-key verification, multi-print aggregation, ambiguity  #
+# fail-safe, discard guards, writer order-id uniqueness, sweep robustness.     #
+# --------------------------------------------------------------------------- #
+
+
+class TestReviewHardening:
+    async def test_ambiguous_partial_never_stolen_never_discarded(
+        self, tmp_path: Path
+    ) -> None:
+        """Review HIGH 1 (cross-quote steal): quote A (same ticker) is
+        in-flight unrecovered; quote B's verification sees a PARTIAL fill it
+        cannot attribute (no creator_order_id). B must NOT adopt it — and the
+        ambiguity must not let B's position be discarded as 'genuinely
+        absent' either."""
+        getter = FakeQuoteGetter()
+        fills = FakeFillsGetter()
+        rig = await _verify_rig(tmp_path, getter=getter, fills=fills, attempts=1)
+        # Quote A: confirmed, never executed, never recovered (in-flight).
+        await _confirmed_quote(rig, rfq_id="rfq_A")
+        # Quote B: cancel-reported; the tape holds a PARTIAL that could be
+        # A's execution just as plausibly as B's.
+        fills.script(
+            COMBO_TICKER,
+            {"fills": [taker_fill(count_fp="2.00", order_id="ord-whose")]},
+        )
+        q_b = await _confirmed_quote(rig, rfq_id="rfq_B")
+        getter.script_status(q_b, "cancelled", cancellation_reason="execution failed")
+        rig.h.clock.advance(RECOVERY_AFTER_S + 0.5)
+        await rig.lifecycle.maintenance_tick()  # cancel discovered → verifying
+        await rig.lifecycle.maintenance_tick()  # attempt 1 (final): ambiguous
+        assert rig.metrics.counter("fill_recovery.late_execution") == 0
+        assert rig.metrics.counter("fill_recovery.partial_execution_resize") == 0
+        assert rig.metrics.counter("fill_recovery.cancelled") == 0  # NOT discarded
+        assert rig.metrics.counter("fill_recovery.verify_ambiguous_kept") == 1
+        assert f"fill:{q_b}" in rig.exposure.positions  # kept, full size
+        assert int(rig.exposure.positions[f"fill:{q_b}"].contracts) == 1000
+        assert await rig.store.count("fills") == 0
+
+    async def test_expected_order_id_rejects_foreign_fill_adopts_own(
+        self, tmp_path: Path
+    ) -> None:
+        """Exact-key verification: the cancelled-quote payload carries
+        creator_order_id — a same-ticker fill with a DIFFERENT order id is
+        refused even at exact count; the matching order's partial adopts."""
+        getter = FakeQuoteGetter()
+        fills = FakeFillsGetter()
+        rig = await _verify_rig(tmp_path, getter=getter, fills=fills, attempts=1)
+        fills.script(
+            COMBO_TICKER,
+            {
+                "fills": [
+                    taker_fill(order_id="ord-foreign"),  # exact count, wrong order
+                    taker_fill(count_fp="3.80", order_id="ord-mine"),
+                ]
+            },
+        )
+        quote_id = await _confirmed_quote(rig)
+        getter.script_status(
+            quote_id,
+            "cancelled",
+            cancellation_reason="execution failed",
+            creator_order_id="ord-mine",
+        )
+        rig.h.clock.advance(RECOVERY_AFTER_S + 0.5)
+        await rig.lifecycle.maintenance_tick()  # verifying (captures the key)
+        await rig.lifecycle.maintenance_tick()  # attempt 1 → adopt ord-mine
+        assert rig.metrics.counter("fill_recovery.late_execution") == 1
+        (row,) = await _fill_rows(rig.store)
+        assert row[1] == "ord-mine"
+        assert row[4] == 380
+        assert int(rig.exposure.positions[f"fill:{quote_id}"].contracts) == 380
+        # The query itself carried the exact key.
+        assert any(c.get("order_id") == "ord-mine" for c in fills.calls)
+
+    async def test_multi_print_execution_adopts_the_sum(
+        self, tmp_path: Path
+    ) -> None:
+        """Review HIGH 2 (multi-print residual): one order printing at two
+        levels (2.00 + 1.80 of a 10.00 offer) adopts the TOTAL 3.80 — never
+        just the largest print — with the fee summed across prints."""
+        getter = FakeQuoteGetter()
+        fills = FakeFillsGetter()
+        rig = await _verify_rig(tmp_path, getter=getter, fills=fills, attempts=1)
+        fills.script(
+            COMBO_TICKER,
+            {
+                "fills": [
+                    taker_fill(count_fp="2.00", order_id="ord-multi"),
+                    taker_fill(count_fp="1.80", order_id="ord-multi"),
+                ]
+            },
+        )
+        quote_id = await _cancel_reported(rig, getter)
+        await rig.lifecycle.maintenance_tick()  # attempt 1 → aggregate adopt
+        assert rig.metrics.counter("fill_recovery.late_execution") == 1
+        (row,) = await _fill_rows(rig.store)
+        assert row[1] == "ord-multi"
+        assert row[4] == 380  # 200 + 180: the SUM, not the max
+        assert row[6] == 2 * INCIDENT_FEE_CC  # per-print fees summed
+        assert int(rig.exposure.positions[f"fill:{quote_id}"].contracts) == 380
+        assert "prints" in str(row[8])  # raw evidence carries every print
+
+    async def test_ws_landing_inside_final_attempt_never_discards(
+        self, tmp_path: Path
+    ) -> None:
+        """Review MEDIUM (discard race): the WS quote_executed lands INSIDE
+        the final verification attempt's awaits — the row exists by resolve
+        time, so the discard must be refused (a recorded fill is real)."""
+        getter = FakeQuoteGetter()
+
+        class WsRacingFills(FakeFillsGetter):
+            def __init__(self) -> None:
+                super().__init__()
+                self.race: tuple[Any, str] | None = None  # (lifecycle, quote_id)
+
+            async def get_fills(self, **params: str | int) -> JsonDict:
+                if self.race is not None:
+                    lifecycle, quote_id = self.race
+                    self.race = None
+                    await lifecycle.on_quote_executed(
+                        {"quote_id": quote_id, "order_id": "ord-race"}
+                    )
+                return await super().get_fills(**params)
+
+        fills = WsRacingFills()
+        rig = await _verify_rig(tmp_path, getter=getter, fills=fills, attempts=1)
+        fills.script(COMBO_TICKER, {"fills": []})  # tape lags the WS
+        quote_id = await _cancel_reported(rig, getter)
+        fills.race = (rig.lifecycle, quote_id)
+        await rig.lifecycle.maintenance_tick()  # final attempt + the race
+        assert await rig.store.count("fills") == 1  # the WS row
+        assert f"fill:{quote_id}" in rig.exposure.positions  # NEVER discarded
+        assert rig.metrics.counter("fill_recovery.cancelled") == 0
+
+    async def test_writer_refuses_second_row_for_one_exchange_order(
+        self, tmp_path: Path
+    ) -> None:
+        """Review HIGH 1 (belt): one exchange order must never produce two
+        ledger rows — a second quote presenting the same order_id is refused
+        terminally and loudly."""
+        getter = FakeQuoteGetter()
+        rig = await _make_rig(tmp_path, getter=getter)
+        q1 = await _confirmed_quote(rig, rfq_id="rfq_1")
+        await rig.lifecycle.on_quote_executed({"quote_id": q1, "order_id": "ord-one"})
+        assert await rig.store.count("fills") == 1
+        q2 = await _confirmed_quote(rig, rfq_id="rfq_2")
+        await rig.lifecycle.on_quote_executed({"quote_id": q2, "order_id": "ord-one"})
+        assert await rig.store.count("fills") == 1  # refused — one row only
+        assert rig.metrics.counter("fill_ledger.order_id_conflict") == 1
+
+    async def test_claimed_order_blocks_concurrent_verification_steal(
+        self, tmp_path: Path
+    ) -> None:
+        """Review HIGH 1 (claim): an executed-status recovery CLAIMS its
+        order id even while its ledger write is failing — a concurrently-
+        verifying same-ticker quote cannot adopt that order's fill."""
+        getter = FakeQuoteGetter()
+        fills = FakeFillsGetter()
+        rig = await _verify_rig(tmp_path, getter=getter, fills=fills, attempts=1)
+
+        original = rig.store.record_fill
+        boom = {"left": 2}  # A's write fails TWICE so B's poll lands between
+        # A's claim and A's eventual successful write
+
+        async def flaky(*args: Any, **kwargs: Any) -> bool:
+            if boom["left"] > 0:
+                boom["left"] -= 1
+                raise RuntimeError("database table is locked")
+            return await original(*args, **kwargs)
+
+        rig.store.record_fill = flaky  # type: ignore[method-assign]
+
+        # Quote A: REST poll says EXECUTED (order ord-shared); the ledger
+        # write fails, so no row exists — only the claim protects the order.
+        q_a = await _confirmed_quote(rig, rfq_id="rfq_A")
+        getter.script_status(q_a, "executed", creator_order_id="ord-shared")
+        # Quote B: cancel-reported; the tape shows A's execution (exact count).
+        fills.script(COMBO_TICKER, {"fills": [taker_fill(order_id="ord-shared")]})
+        q_b = await _confirmed_quote(rig, rfq_id="rfq_B")
+        getter.script_status(q_b, "cancelled", cancellation_reason="execution failed")
+
+        rig.h.clock.advance(RECOVERY_AFTER_S + 0.5)
+        await rig.lifecycle.maintenance_tick()  # A recovers (claims, write fails);
+        # B's cancel discovered → verifying
+        await rig.lifecycle.maintenance_tick()  # A retry fails; B: already_claimed
+        assert (
+            rig.metrics.counter("fill_recovery.verify_match_rejected.already_claimed")
+            == 1
+        )
+        assert rig.metrics.counter("fill_recovery.late_execution") == 0
+        # A's next retry lands its own row with its own order id.
+        await rig.lifecycle.maintenance_tick()
+        rows = await _fill_rows(rig.store)
+        assert [r[0] for r in rows] == [f"fill:{q_a}"]
+        assert rows[0][1] == "ord-shared"
+
+    async def test_sweep_truncation_is_loud(self, tmp_path: Path) -> None:
+        """Review MEDIUM (silent truncation): a fills window exceeding the
+        page budget alarms and does not silently pretend full coverage."""
+        getter = FakeQuoteGetter()
+
+        class EndlessFills(FakeFillsGetter):
+            async def get_fills(self, **params: str | int) -> JsonDict:
+                self.calls.append(dict(params))
+                return {"fills": [taker_fill(order_id="ord-page")], "cursor": "more"}
+
+        fills = EndlessFills()
+        rig = await _verify_rig(tmp_path, getter=getter, fills=fills)
+        await rig.lifecycle.maintenance_tick()  # stamp
+        rig.h.clock.advance(900.5)
+        await rig.lifecycle.maintenance_tick()  # sweep: 3 pages, cursor remains
+        assert len(fills.calls) == 3  # bounded
+        assert rig.metrics.counter("fills_ledger_sweep.truncated") == 1
+        assert rig.metrics.counter("fills_ledger_sweep.ran") == 1
+
+    async def test_exhausted_state_no_longer_suppresses_sweep(
+        self, tmp_path: Path
+    ) -> None:
+        """Review HIGH (permanent suppression): a recovery state whose poll
+        budget exhausted must not hide its ticker from the sweep — its
+        missing fill is exactly what must stay loud."""
+        getter = FakeQuoteGetter()
+        fills = FakeFillsGetter()
+        rig = await _verify_rig(tmp_path, getter=getter, fills=fills)
+        quote_id = await _confirmed_quote(rig)
+        state = rig.lifecycle._executed_states[quote_id]  # noqa: SLF001
+        state.fill_recovery_attempts = 10  # exhausted — parked forever
+        fills.script("", {"fills": [taker_fill(order_id="ord-lost")]})
+        await rig.lifecycle.maintenance_tick()  # stamp
+        rig.h.clock.advance(900.5)
+        await rig.lifecycle.maintenance_tick()  # sweep fires
+        assert rig.metrics.counter("fills_ledger_sweep.missing") == 1
+
+    async def test_sweep_store_error_is_contained(self, tmp_path: Path) -> None:
+        """Review MEDIUM (isolation): a store error inside the diff phase is
+        swallowed + counted — never raised into the maintenance tick."""
+        getter = FakeQuoteGetter()
+        fills = FakeFillsGetter()
+        rig = await _verify_rig(tmp_path, getter=getter, fills=fills)
+        fills.script("", {"fills": [taker_fill(order_id="ord-x")]})
+
+        async def broken() -> set[str]:
+            raise RuntimeError("database table is locked")
+
+        rig.store.fill_order_ids = broken  # type: ignore[method-assign]
+        await rig.lifecycle.maintenance_tick()  # stamp
+        rig.h.clock.advance(900.5)
+        await rig.lifecycle.maintenance_tick()  # sweep → store error → contained
+        assert rig.metrics.counter("fills_ledger_sweep.errors") == 1
+        assert rig.metrics.counter("fills_ledger_sweep.ran") == 0
+
+    async def test_null_order_id_ledger_row_is_not_a_false_alarm(
+        self, tmp_path: Path
+    ) -> None:
+        """Review LOW (permanent false alarm): a legitimately-recorded fill
+        whose ledger row has NO order_id (poll-recovery without
+        creator_order_id) matches by (ticker, count) — a visible skip, not an
+        every-interval alarm."""
+        getter = FakeQuoteGetter()
+        fills = FakeFillsGetter()
+        rig = await _verify_rig(tmp_path, getter=getter, fills=fills)
+        q1 = await _confirmed_quote(rig)
+        await rig.lifecycle.on_quote_executed({"quote_id": q1})  # no order_id
+        assert await rig.store.count("fills") == 1
+        fills.script("", {"fills": [taker_fill(order_id="ord-unkeyed")]})
+        await rig.lifecycle.maintenance_tick()  # stamp
+        rig.h.clock.advance(900.5)
+        await rig.lifecycle.maintenance_tick()
+        assert rig.metrics.counter("fills_ledger_sweep.matched_null_order_id") == 1
+        assert rig.metrics.counter("fills_ledger_sweep.missing") == 0

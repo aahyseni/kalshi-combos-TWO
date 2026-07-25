@@ -310,6 +310,11 @@ def build_lifecycle_config(
         # executions behind a "cancelled" quote status).
         fill_cancel_verify_attempts=risk_cfg.fill_cancel_verify_attempts,
         fill_cancel_verify_delay_s=risk_cfg.fill_cancel_verify_delay_s,
+        # FILLS-LEDGER SWEEP (2026-07-24 incident C): account-wide
+        # /portfolio/fills vs local-ledger diff cadence + first-fetch lookback
+        # (alarm-only backstop under every writer-path miss).
+        fills_ledger_sweep_interval_s=risk_cfg.fills_ledger_sweep_interval_s,
+        fills_ledger_sweep_lookback_s=risk_cfg.fills_ledger_sweep_lookback_s,
         # F1 MONOTONE PRE-PRICING GATE (2026-07-16 throughput batch-1): decline
         # on already-breached candidate-monotone caps BEFORE pricing. Default
         # OFF (today's behaviour); the operator arms it in the local YAML.

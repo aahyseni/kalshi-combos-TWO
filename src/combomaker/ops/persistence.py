@@ -641,6 +641,28 @@ class Store:
         ) as cursor:
             return await cursor.fetchone() is not None
 
+    async def fill_order_ids(self) -> set[str]:
+        """Every non-NULL exchange ``order_id`` in the fills ledger — one read
+        per fills-ledger sweep (2026-07-24 incident-C review: hundreds of
+        serial point-reads inside the maintenance tick were a wedge risk; the
+        table is small, so one batched SELECT replaces them all)."""
+        async with self._db.execute(
+            "SELECT DISTINCT order_id FROM fills WHERE order_id IS NOT NULL"
+        ) as cursor:
+            return {str(row[0]) async for row in cursor}
+
+    async def fill_null_order_id_keys(self) -> set[tuple[str, int]]:
+        """(combo_ticker, contracts_centi) of every fills row WITHOUT an
+        exchange order_id (poll-recovered rows whose quote payload exposed no
+        creator_order_id). The fills-ledger sweep matches a tape row against
+        these BEFORE alarming, so a legitimately-recorded-but-unkeyed fill is
+        a visible skip, not a permanent false alarm pinning the watermark."""
+        async with self._db.execute(
+            "SELECT combo_ticker, contracts_centi FROM fills "
+            "WHERE order_id IS NULL"
+        ) as cursor:
+            return {(str(row[0]), int(row[1])) async for row in cursor}
+
     async def has_fill_for_ticker(self, combo_ticker: str) -> bool:
         """True iff ANY fills row exists for this combo ticker. Used by the
         periodic position-reconcile net (2026-07-18): an exchange position the
