@@ -40,6 +40,29 @@ caught). Claude's job = logs + code only. One-click launchers shipped:
 
 (`tools/ops/*.ps1` carry the logic; monitors colorize fills/declines/halts.)
 
+### Launcher incident log (2026-07-25 ~2:53–3:40p ET — first operator launch)
+
+Two launcher defects, found from the live log, fixed + pushed same hour:
+
+1. **Stale-heartbeat emergency kill (`8e07076`).** The first `START_BOT.bat`
+   run booted the supervisor into the DEAD morning stack's stale
+   `data/heartbeat.txt`; it declared "wedged" (age 3367s > 30s) at
+   2:53:46p and emergency-KILLed before the bot started — four silent
+   windows. START now purges stale heartbeat files when the process guard
+   proves nothing is running, and shows + PROMPTS y/n on a KILL file
+   (never silently deletes a safety artifact; `needs_reconcile` is left
+   for the bot's own boot reconcile). The monitor window now prints the
+   real boot sequence (`supervisor_starting → prod_preflight_green →
+   exposure_rehydrated → startup_reconciled`, names verified against the
+   live log) so a healthy start is VISIBLE.
+2. **Em-dash encoding parse failure (`4aedc90`).** The hygiene edit
+   introduced em dashes inside double-quoted strings; PowerShell 5.1 reads
+   BOM-less files as ANSI, where the em dash's final byte (0x94) decodes
+   as a closing smart-quote — the string terminated early and the whole
+   script failed to parse. All launcher scripts are now pure ASCII
+   (byte-scanned) and parser-checked. **Standing rule: `tools/ops/*.ps1`
+   stay pure ASCII.**
+
 ## Build 1 — LEG-DIRECTION AXIS (operator: "recognize direction for all legs, know when to raise markups")
 
 - `risk/exposure.py`: `leg_family_key` (`SERIES:side`, e.g. `KXMLBKS:yes` =
