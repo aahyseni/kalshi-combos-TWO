@@ -173,6 +173,14 @@ def _pbook_profile_from_snapshot(
 # scoreline enumeration can certify. ANY other enforced breach in the denial ⇒
 # decline exactly as today (the waiver never touches gross / per-combo / daily /
 # CVaR / ruin / notional / slate caps or any halt).
+# SLATE-AXIS WAIVER game-selection bound (2026-07-25): the max games a
+# slate-ONLY denial certifies in one waiver run — a COMPUTE bound under the
+# enumeration deadline (each game adds scoreline-enumeration work; the
+# deadline fail-closes regardless), never a risk number: every certificate is
+# still validated against the unchanged game budget and the slate threshold
+# is never raised.
+_SLATE_WAIVER_MAX_GAMES = 6
+
 WAIVABLE_RESERVATION_BREACHES: frozenset[ReasonCode] = frozenset(
     {
         ReasonCode.SKIP_GAME_LOSS_CAP,
@@ -385,6 +393,16 @@ class LifecycleConfig:
     # confirm window ALONGSIDE the candidate gate's own budget; exceeding it
     # DECLINES (fail-closed — never let the waiver silently consume the window).
     lastlook_mc_waiver_deadline_s: float = 1.0
+    # SLATE-AXIS WAIVER (2026-07-25). When True, a slate-ONLY reservation
+    # denial (every breach SKIP_SLATE_CAP — the 7/25 evidence: 7 accepted +EV
+    # fills bounced while real committed risk was ~$7, the resting burst-floor
+    # projection alone spanning the slate budget) certifies the largest
+    # analytic contributors and retries: the checker substitutes each
+    # certificate into the slate roll-up (2026-07-17 machinery) and re-checks
+    # the UNCHANGED slate threshold honestly. Default OFF = the
+    # pre-2026-07-25 decline, byte-identical. Requires
+    # ``lastlook_mc_waiver_enabled``.
+    lastlook_waiver_slate_axis: bool = False
     # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1, real-money bug). How long after
     # a SUCCESSFUL confirm (reservation committed / position booked) the sweep
     # waits for the exchange's quote_executed WS message before polling REST
@@ -1951,24 +1969,50 @@ class QuoteLifecycle:
             return False, ""
         if self._reservation is None:  # a denial implies a service; belt+braces
             return False, ""
-        # SLATE breaches are certificate-RESOLVABLE, not waivable (2026-07-17):
-        # the slate cap sums the per-game analytic losses, and the retry's
-        # certificate-aware roll-up substitutes each certified game's exact
-        # worst case — so a denial carrying slate breaches ALONGSIDE per-game
-        # waivable breaches still arms the waiver; the retry then re-checks
-        # the slate HONESTLY on the substituted sum (fail-closed if it still
-        # breaches). A slate-ONLY denial has no game to certify ⇒ decline.
+        # SLATE breaches are certificate-RESOLVABLE (2026-07-17): the slate cap
+        # sums the per-game analytic losses, and the retry's certificate-aware
+        # roll-up substitutes each certified game's exact worst case — so a
+        # denial carrying slate breaches ALONGSIDE per-game waivable breaches
+        # still arms the waiver; the retry then re-checks the slate HONESTLY on
+        # the substituted sum (fail-closed if it still breaches).
+        #
+        # SLATE-AXIS EXTENSION (2026-07-25, operator-armed via
+        # ``lastlook_waiver_slate_axis``; the 7/25 live evidence: 7 accepted
+        # +EV fills bounced on slate-ONLY denials while REAL committed risk was
+        # ~$7 — the burst-floor top-K resting projection alone spans the slate
+        # budget): a slate-ONLY denial now certifies the LARGEST analytic
+        # contributors to the slate sum (top ``_SLATE_WAIVER_MAX_GAMES`` by
+        # comonotone worst-case — a compute bound under the enumeration
+        # deadline, not a risk number; the deadline itself fail-closes). The
+        # SAME machinery runs: exact per-game state-consistent certificates,
+        # each re-validated against the UNCHANGED game budget, substituted into
+        # the slate roll-up by the retry's checker — the slate threshold is
+        # never raised; only the comonotone overstatement is disproved. Flag
+        # OFF (default) ⇒ the pre-2026-07-25 decline, byte-identical.
         core = [b for b in breaches if b.reason is not ReasonCode.SKIP_SLATE_CAP]
-        if not core or any(
+        slate_only = bool(breaches) and not core
+        if slate_only and self._config.lastlook_waiver_slate_axis:
+            snap = self._exposure.snapshot(self._marginals, mass_acceptance=True)
+            ranked = sorted(
+                snap.worst_case_loss_by_game_cc.items(), key=lambda kv: -kv[1]
+            )
+            games = sorted(
+                g for g, _loss in ranked[:_SLATE_WAIVER_MAX_GAMES]
+            )
+            if not games:
+                return False, "slate breach with no games to certify"
+        elif not core or any(
             b.reason not in WAIVABLE_RESERVATION_BREACHES for b in core
         ):
             # A non-waivable cap (gross/per-combo/daily/CVaR/ruin/notional/
-            # halt…) is part of the denial: never waived, decline as today.
+            # halt…) is part of the denial — or a slate-ONLY denial with the
+            # slate axis un-armed: never waived, decline as today.
             return False, "non-waivable breach in denial"
-        if any(b.game is None for b in core):
+        elif any(b.game is None for b in core):
             # A per-game breach without its game key cannot be certified.
             return False, "waivable breach missing its game key (fail-closed)"
-        games = sorted({b.game for b in core if b.game is not None})
+        else:
+            games = sorted({b.game for b in core if b.game is not None})
         bankroll_cc = self._risk_bankroll_cc()
         if bankroll_cc is None or bankroll_cc <= 0:
             # The %-caps needed a bankroll to breach, but it may have gone stale

@@ -498,6 +498,85 @@ async def test_slate_co_breach_resolved_by_certificates_end_to_end(
     _assert_waiver_counters(metrics, attempted=1, granted=1)
 
 
+async def test_slate_axis_armed_slate_only_denial_grants_end_to_end(
+    kxwc: tuple[Harness, Store],
+) -> None:
+    # SLATE-AXIS WAIVER (2026-07-25 — the live leak: 7 accepted +EV fills
+    # bounced on slate-ONLY denials while real committed risk was ~$7). With
+    # ``lastlook_waiver_slate_axis`` ARMED, a slate-ONLY denial certifies the
+    # top analytic contributors (selected from the snapshot — the breach
+    # carries no game key) and the retry's certificate-aware slate roll-up
+    # passes the UNCHANGED slate threshold on the certified exact sum — GRANT.
+    import dataclasses as _dc
+
+    h, store = kxwc
+    # Same certified-fits geometry as the co-breach grant test (slate thr =
+    # the base game budget the certificates are proven to fit under), but the
+    # PER-GAME caps are loosened so the denial is slate-ONLY.
+    slate_only_limits = _dc.replace(
+        WAIVER_LIMITS,
+        game_loss_frac=Fraction(90, 100),
+        directional_frac=Fraction(90, 100),
+        slate_loss_frac=WAIVER_LIMITS.game_loss_frac,
+    )
+    limits = LimitChecker(slate_only_limits)
+    lifecycle, _sender, exposure, reservation, metrics = _build_rig(
+        h,
+        store,
+        limits=limits,
+        bankroll_cc=BANKROLL_CC,
+        config=LifecycleConfig(
+            candidate_gate_enabled=False,
+            lastlook_mc_waiver_enabled=True,
+            lastlook_waiver_slate_axis=True,
+        ),
+    )
+    exposure.upsert_quote(_resting_quote("q:eng", ENG_ADV, ADV_EV))
+    state = _wc_state()
+
+    denied = lifecycle._reserve_headroom("fill:q1", "q1", state)  # noqa: SLF001
+    assert denied is not None and not denied.granted
+    reasons = {b.reason for b in denied.breaches}
+    assert reasons == {ReasonCode.SKIP_SLATE_CAP}  # slate-ONLY
+
+    ok, detail = await lifecycle._lastlook_mc_waiver(  # noqa: SLF001
+        "q1", state, "fill:q1", denied.breaches
+    )
+    assert ok is True and detail == ""
+    assert reservation.is_outstanding("fill:q1")
+    _assert_waiver_counters(metrics, attempted=1, granted=1)
+
+
+async def test_slate_axis_off_is_byte_identical_decline(
+    kxwc: tuple[Harness, Store],
+) -> None:
+    # The SAME slate-only denial with the axis OFF (default) declines exactly
+    # as 2026-07-17 shipped it — the arming flag is the only change agent.
+    import dataclasses as _dc
+
+    h, store = kxwc
+    slate_only_limits = _dc.replace(
+        WAIVER_LIMITS,
+        game_loss_frac=Fraction(90, 100),
+        directional_frac=Fraction(90, 100),
+        slate_loss_frac=WAIVER_LIMITS.game_loss_frac,
+    )
+    limits = LimitChecker(slate_only_limits)
+    lifecycle, _sender, exposure, reservation, metrics = _build_rig(
+        h, store, limits=limits, bankroll_cc=BANKROLL_CC
+    )
+    exposure.upsert_quote(_resting_quote("q:eng", ENG_ADV, ADV_EV))
+    state = _wc_state()
+    denied = lifecycle._reserve_headroom("fill:q1", "q1", state)  # noqa: SLF001
+    assert denied is not None and not denied.granted
+    ok, detail = await lifecycle._lastlook_mc_waiver(  # noqa: SLF001
+        "q1", state, "fill:q1", denied.breaches
+    )
+    assert ok is False and "non-waivable" in detail
+    assert reservation.outstanding_count == 0
+    _assert_waiver_counters(metrics)
+
+
 async def test_delta_style_mass_acceptance_breach_still_fails_closed(
     kxwc: tuple[Harness, Store],
 ) -> None:

@@ -293,6 +293,9 @@ def build_lifecycle_config(
         worst_challenger_ev_tolerance_cc=risk_cfg.worst_challenger_ev_tolerance_cc,
         lastlook_mc_waiver_enabled=risk_cfg.lastlook_mc_waiver_enabled,
         lastlook_mc_waiver_deadline_s=risk_cfg.lastlook_mc_waiver_deadline_s,
+        # SLATE-AXIS WAIVER (2026-07-25): slate-ONLY denials certify the top
+        # analytic contributors — armed in the local YAML with operator go.
+        lastlook_waiver_slate_axis=risk_cfg.lastlook_waiver_slate_axis,
         # WAIVER ENTITY-SET TRIM (2026-07-18): K largest resting quotes per
         # breached game inside the waiver enumeration; dropped tail rides as a
         # constant conservative adder. 0 (default) = full-set enumeration.

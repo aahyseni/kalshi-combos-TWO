@@ -2648,6 +2648,16 @@ class RiskConfig(StrictModel):
     # after one rebuild ⇒ decline exactly as today (fail-closed). Committed
     # default OFF; the operator arms it in the local YAML.
     lastlook_mc_waiver_enabled: bool = False
+    # SLATE-AXIS WAIVER (2026-07-25). When True (and the waiver is enabled), a
+    # slate-ONLY reservation denial certifies the largest analytic
+    # contributors to the slate sum and retries — the checker substitutes the
+    # exact per-game certificates into the slate roll-up (2026-07-17
+    # machinery) and re-checks the UNCHANGED slate threshold honestly. The
+    # 7/25 live evidence for arming: 7 accepted +EV fills bounced on
+    # slate-ONLY denials while real committed risk was ~$7 (the resting
+    # burst-floor projection alone spans the slate budget on a 15-game
+    # night). Default OFF = byte-identical prior decline.
+    lastlook_waiver_slate_axis: bool = False
     # Wall budget (seconds) for the whole waiver evaluation (build + off-loop
     # enumeration + at most one rebuild). Must fit inside the exchange's 3s
     # confirm window ALONGSIDE the candidate gate (candidate_gate_deadline_s,
