@@ -62,6 +62,19 @@ Two launcher defects, found from the live log, fixed + pushed same hour:
    script failed to parse. All launcher scripts are now pure ASCII
    (byte-scanned) and parser-checked. **Standing rule: `tools/ops/*.ps1`
    stay pure ASCII.**
+3. **Wrong entrypoint (`a82df98`).** The launcher started
+   `-m combomaker.ops.supervisor` STANDALONE — but the architecture is the
+   reverse of that assumption: the BOT (`cli run`) spawns the supervisor as
+   its own subprocess (`quote_app.supervisor_launch_cmd`). A standalone
+   supervisor watches the bot's heartbeat, finds none (no bot), and
+   emergency-KILLs in ~43 ms — the second operator launch failed the same
+   way with "heartbeat missing/unreadable". Entrypoint now copied VERBATIM
+   from the live morning process list (the source-of-truth rule this
+   violated):
+   `.venv\Scripts\python.exe -m combomaker.ops.cli run --env prod --mode
+   quote --confirm-live --config config\prod-live-wc.local.yaml`.
+   The false-positive KILL + stale heartbeats were cleared;
+   `needs_reconcile` left for the bot's own boot reconcile.
 
 ## Build 1 — LEG-DIRECTION AXIS (operator: "recognize direction for all legs, know when to raise markups")
 
