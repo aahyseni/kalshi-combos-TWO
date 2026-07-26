@@ -2487,6 +2487,19 @@ class MarkupConfig(StrictModel):
     enabled: bool = False  # master switch
     soccer: SportMarkupConfig = Field(default_factory=SportMarkupConfig)
     mlb: SportMarkupConfig = Field(default_factory=SportMarkupConfig)
+    # ESPORTS / RACING (2026-07-26 operator: winners only; "could be a
+    # scarcely quoted RFQ area so we might as well mark it up" — 3-5c).
+    # Independent families: a CS/LoL match and an F1/NASCAR race carry no
+    # modeled correlation with each other or with MLB, so a combo spanning
+    # them is a pure product — the longshot shape the tiers target.
+    esports: SportMarkupConfig = Field(default_factory=SportMarkupConfig)
+    racing: SportMarkupConfig = Field(default_factory=SportMarkupConfig)
+    # CROSS-SPORT combos (2026-07-26 operator: 4-6c). Legs spanning MULTIPLE
+    # known+active sports previously tagged 'other' ⇒ markup 0, a systematic
+    # underprice on exactly the niche flow we want to be rich on. The
+    # fail-safe is unchanged: ANY leg whose sport is unknown or dark ⇒ 0,
+    # never a mixed markup.
+    mixed: SportMarkupConfig = Field(default_factory=SportMarkupConfig)
     # Per-leg-series defensive markup ADDERS (series ticker prefix -> extra cc on
     # top of the sport markup). First use: the #37 corners edge-floor — corners
     # combos measured 3-5c RICH vs our (correct) fair (2026-07-15 rho measurement:

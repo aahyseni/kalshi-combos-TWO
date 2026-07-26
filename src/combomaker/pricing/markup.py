@@ -82,7 +82,15 @@ class MarkupPolicy:
         adders: dict[str, int] = {}
         tiers: dict[str, tuple[tuple[int, int], ...]] = {}
         if cfg.enabled:
-            for name, sc in (("soccer", cfg.soccer), ("mlb", cfg.mlb)):
+            for name, sc in (
+                ("soccer", cfg.soccer),
+                ("mlb", cfg.mlb),
+                # 2026-07-26 operator wire: winners-only esports/racing and
+                # the cross-sport ("mixed") bucket.
+                ("esports", cfg.esports),
+                ("racing", cfg.racing),
+                ("mixed", cfg.mixed),
+            ):
                 if sc.enabled and sc.markup_cc > 0:
                     by[name] = int(sc.markup_cc)
                     sport_tiers = tuple(
@@ -142,10 +150,17 @@ class MarkupPolicy:
             # ride on a leaner sport's leg — and by requiring EVERY leg to
             # be a KNOWN sport with an ACTIVE markup (any unknown or dark
             # sport ⇒ 0, exactly as today).
+            # Every leg must be a KNOWN sport with an ACTIVE markup (any
+            # unknown/dark leg ⇒ 0, exactly as before). The cross-sport
+            # bucket then prices from its OWN config (operator 2026-07-26:
+            # 4-6c — richer than the per-sport tiers because these combos
+            # are the niche, scarcely-quoted, pure-product flow), falling
+            # back to the MINIMUM leg markup when 'mixed' is not configured
+            # (never leaks a richer sport's edge onto a leaner leg).
             per_leg = [self.markup_cc(_leg_sport(t)) for t in legs]
             if per_leg and all(cc > 0 for cc in per_leg):
                 sport = "mixed"
-                base = min(per_leg)
+                base = self.markup_cc("mixed") or min(per_leg)
         if base <= 0:
             return sport, base
         if fair_cc is not None:
