@@ -3053,18 +3053,28 @@ class QuoteApp:
     @staticmethod
     def _settlement_fingerprint(meta: MarketMeta) -> str:
         """A stable string of the settlement-relevant metadata fields. Any change
-        here means our model of when/how the market settles moved: close_time,
-        exchange status (e.g. active→settled/closed), the parent event, and the
-        expected expiration time. NOT the grid or the price — those move every
-        tick and are not settlement-relevant."""
+        here means our model of when/how the market settles moved: the exchange
+        status (e.g. active→settled/closed), the parent event, and the SCHEDULED
+        close. NOT the grid or the price — those move every tick and are not
+        settlement-relevant.
+
+        ``expected_expiration_time`` is DELIBERATELY EXCLUDED (2026-07-25, after
+        this breaker cost FOUR halts in one day — the last one on five CLE@TB
+        markets at once as that game ended). It is Kalshi's ESTIMATE of when the
+        market will expire, and it legitimately drifts as a game runs long or
+        short: the estimate moving is in-game bookkeeping, not a change to the
+        settlement RULE (who wins, when trading closes, which event governs).
+        Every halt of that class today was estimate drift on a game already
+        underway — never a real reschedule. The estimate is still READ for the
+        end-of-life horizon (a passed horizon makes changes benign); it just no
+        longer BY ITSELF trips a hard halt. A genuine reschedule moves
+        ``close_time`` and still trips; a resolution moves ``status`` and is
+        handled by the terminal-status exemption."""
         return "|".join(
             (
                 meta.status,
                 meta.event_ticker or "",
                 meta.close_time.isoformat() if meta.close_time else "",
-                meta.expected_expiration_time.isoformat()
-                if meta.expected_expiration_time
-                else "",
             )
         )
 

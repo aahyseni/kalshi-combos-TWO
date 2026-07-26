@@ -679,6 +679,54 @@ def test_metadata_change_breaker_exempts_post_close_settling(
     assert breakers.evaluate(second).tripped is False
 
 
+def test_metadata_change_breaker_ignores_expiry_estimate_drift(
+    tmp_path: Path,
+) -> None:
+    # FOURTH-HALT FIX (2026-07-25 8:37p, five CLE@TB markets at once as that
+    # game ended): expected_expiration_time is Kalshi's ESTIMATE and drifts
+    # while a game runs long — in-game bookkeeping, not a settlement-rule
+    # change. It no longer participates in the fingerprint, so drift alone
+    # cannot hard-halt the bot even while both horizons are in the future.
+    app = _demo_app(tmp_path)
+    breakers = _breakers(app)
+    legs = (LegRef("LEG", "KXWCGAME-26JUL05MEXENG", "yes"),)
+    book = _book_with_quote_legs(legs)
+    feed = FakeFeed(rx_age_s=0.1, warm=True, seq_gap=False)
+    close = datetime(2099, 7, 5, 22, 0, tzinfo=UTC)
+    meta_v1 = FakeMetadata(
+        {
+            "LEG": _market_meta(
+                "LEG",
+                status="active",
+                close_time=close,
+                expected_expiration_time=datetime(2099, 7, 5, 21, 10, tzinfo=UTC),
+            )
+        }
+    )
+    first = _sample(
+        app, feed, lifecycle=FakeLifecycle({"LEG": 0.50}), exposure=book,
+        metadata=meta_v1,
+    )
+    assert first.changed_markets == ()
+    meta_v2 = FakeMetadata(
+        {
+            "LEG": _market_meta(
+                "LEG",
+                status="active",
+                close_time=close,
+                # the game ran long — the ESTIMATE slid 40 minutes
+                expected_expiration_time=datetime(2099, 7, 5, 21, 50, tzinfo=UTC),
+            )
+        }
+    )
+    second = _sample(
+        app, feed, lifecycle=FakeLifecycle({"LEG": 0.50}), exposure=book,
+        metadata=meta_v2,
+    )
+    assert second.changed_markets == ()  # estimate drift is not a rule change
+    assert breakers.evaluate(second).tripped is False
+
+
 def test_metadata_change_breaker_uses_earliest_horizon(tmp_path: Path) -> None:
     # THIRD-HALT FIX (2026-07-25 7:32p): a strikeout prop carried a LISTED
     # close two days out beside a same-day expected_expiration; taking
