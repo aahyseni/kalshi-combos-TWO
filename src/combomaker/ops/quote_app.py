@@ -2365,7 +2365,24 @@ class QuoteApp:
             # presumes the bot wedged if this file goes stale. A slow/failed
             # maintenance_tick still leaves the last beat aging, which is exactly
             # the wedged signal the supervisor watches for (fail-closed).
-            self._heartbeat.beat()
+            #
+            # NEVER let a beat FAILURE kill this loop (2026-07-26: two live
+            # runs died 15 and 7 minutes in — supervisor emergency kill on
+            # "heartbeat wedged (age=30.3s)" with NO log gap and every other
+            # loop still logging, i.e. the beats stopped while the process
+            # was healthy). ``Heartbeat.beat`` write-temp-then-renames, and
+            # on Windows that rename raises PermissionError whenever the
+            # supervisor holds the target open; the retries can still lose
+            # the race, and an escaping exception ENDS the maintenance task
+            # — after which no beat ever lands again and the supervisor
+            # kills a perfectly healthy bot 30s later. Swallow + log: a
+            # genuinely stuck disk still ages the beat and still trips the
+            # (correct) wedged kill, so fail-closed is preserved.
+            try:
+                self._heartbeat.beat()
+            except Exception:
+                self._metrics.inc("heartbeat.beat_failed")
+                log.exception("heartbeat_beat_failed")
             try:
                 await lifecycle.maintenance_tick()
             except Exception:
