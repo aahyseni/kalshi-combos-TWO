@@ -123,3 +123,40 @@ verify against 3+ before trusting either number.
   fix; watch for `KXLOLGAME`/`KXCS2GAME` quotes and confirm the mixed-tier
   markup appears on any cross-sport combo.
 - **Next session**: §4 items 1–3 in order.
+
+---
+
+## §5 ADDENDUM (2026-07-26 morning) — the steer rebates are economically dead
+
+**Measured on 997,581 live skew events (current run):**
+
+| component | rebate (median) | widen (median) | widen (max) |
+|---|---|---|---|
+| P(book) | **−0.02¢** | +0.01¢ | +0.17¢ |
+| leg-family | −0.04¢ | +0.02¢ | +1.42¢ |
+| entity | −0.03¢ | +0.03¢ | +0.16¢ |
+
+The classifier WORKS — 2,390,157 `pbook_diversifying` classifications, i.e. it
+recognises diverse flow on nearly every quote — and then prices that
+recognition at a fiftieth of a cent against a 1–4¢ markup ladder. A taker
+cannot see 0.02¢, so **we are not rebating diversity at all**; we identify it
+and do nothing. Operator (2026-07-26): "why are we not giving rebates to more
+diverse [bets]" — correct diagnosis.
+
+**Root cause (mechanism, not a number):** each component is a product of
+sub-1 fractions — `deficit × need × onset^gamma` — and `onset` divides the
+concentrated tail by the ENFORCED cap (~$240). At the current book size that
+term is a few percent, so three fractions against a ~1.5¢ ceiling leave
+hundredths of a cent. It self-scaled to irrelevance. Note the ASYMMETRY: the
+widen side reaches 1.42¢ (concentration IS large today) while the rebate side
+never can — we effectively armed the penalty without the reward.
+
+**Fix (build #1, this session):** price the rebate against the VALUE it
+creates — the candidate's measured ΔP(book) converted into cents through the
+same EV frame the gate already computes — so the reward carries the same
+units as the markup, still fully derived (no hand-set constant). Shadow the
+new magnitudes first; arm only after the cent-distribution is eyeballed.
+
+**Separate and not composition:** p_book 0.365 today is partly the MARK — the
+book shows EV −$49 because in-progress games are moving against held
+positions. Even a balanced book prints a depressed p_book while marked down.
