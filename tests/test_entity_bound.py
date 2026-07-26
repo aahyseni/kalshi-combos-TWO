@@ -100,3 +100,21 @@ def test_opposite_direction_on_the_same_arm_is_a_different_key() -> None:
         legs=(LegRef(GREENE_4, "KX-G1", "no"),),  # opposite leg side
     )
     assert ReasonCode.SKIP_ENTITY_LOSS_CAP not in _check(book, other_side, "3/100")
+
+
+def test_over_limit_arm_does_not_block_unrelated_flow() -> None:
+    """LIVE BRICKING REGRESSION (2026-07-26). The first cut scanned EVERY
+    entity key in the book, so one already-over arm (Buehler, $134 against a
+    $74 wall) declined every quote — including combos with no exposure to him.
+    Result: 3,994 breaches, ZERO quotes sent. A cap must refuse only the flow
+    that WORSENS the breach."""
+    book = ExposureBook(CONVENTIONS)
+    # Greene is ALREADY far over the 3% ($60) wall on his own.
+    book.add_position(_pos("h1", GREENE_4, price_cc=5_000))
+    book.add_position(_pos("h2", GREENE_6, price_cc=5_000))
+    # A candidate on a completely different pitcher must still quote.
+    cand = _pos("cand", CEASE_5, price_cc=1_000)
+    assert ReasonCode.SKIP_ENTITY_LOSS_CAP not in _check(book, cand, "3/100")
+    # ...while more of Greene is still refused.
+    greene_more = _pos("cand2", GREENE_4, price_cc=1_000)
+    assert ReasonCode.SKIP_ENTITY_LOSS_CAP in _check(book, greene_more, "3/100")

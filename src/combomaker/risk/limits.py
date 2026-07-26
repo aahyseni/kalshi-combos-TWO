@@ -49,6 +49,7 @@ from combomaker.risk.exposure import (
     ExposureBook,
     MarginalProvider,
     OpenPosition,
+    leg_entity_key,
 )
 
 # Slate bucketing timezone. A "slate" = all unresolved games whose start falls on
@@ -929,9 +930,21 @@ class LimitChecker:
         # + reserved + this check's candidates (never resting quotes — the
         # serial reservation chain re-checks at every fill). Unset (None,
         # default) ⇒ the axis is not evaluated (byte-identical).
-        if limits.entity_loss_frac is not None:
+        if limits.entity_loss_frac is not None and candidates:
             entity_thr = threshold_cc(limits.entity_loss_frac, bankroll)
-            for key, loss_cc in sorted(snapshot.loss_by_entity_cc.items()):
+            # ONLY the entity keys THIS CANDIDATE touches (2026-07-26 live
+            # bricking): the first cut scanned every key in the book, so one
+            # already-over arm (Buehler at $134 vs a $74 wall) declined EVERY
+            # quote, including combos with no exposure to him — 0 quotes sent.
+            # A cap must refuse the flow that WORSENS the breach, never
+            # unrelated flow (and per the validate-caps-can-quote rule, it
+            # must be proven to still quote before arming).
+            candidate_keys: set[str] = set()
+            for position in candidates:
+                for leg in position.legs:
+                    candidate_keys.add(leg_entity_key(leg))
+            for key in sorted(candidate_keys):
+                loss_cc = snapshot.loss_by_entity_cc.get(key, 0)
                 if loss_cc <= entity_thr:
                     continue
                 out.append(
