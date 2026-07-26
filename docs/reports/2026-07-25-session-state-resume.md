@@ -8,26 +8,30 @@ strict clean. Bot is **DOWN** at handoff (see §0).
 
 ## §0 STATE AT HANDOFF (the five things a new session must know)
 
-1. **The bot is DOWN.** It halted 7:32p ET on `halt_metadata_change` (third
-   halt of that class today). The KILL file + `needs_reconcile` marker are
-   still in place; the fix for the halt cause is committed (`01b265d`).
-2. **A restart is BLOCKED pending operator confirmation** (operator: "only
-   restart the bot after they've been reviewed and confirmed"). An attempted
-   recovery restart was correctly refused by the permission layer.
-3. **The armed YAML** (`config/prod-live-wc.local.yaml`, gitignored, NEVER
-   commit) already has the full evening bundle switched ON, so the next
-   restart arms all of it at once — see §4 for the exact list and §5 for the
-   one HIGH finding that is still open.
-4. **Today's P&L**: realized **+$29** (process-scoped counter), open book 16
-   positions, tail ES99 ~$172 vs ~$235 budget, p_book/p_night ~0.34 at the
-   halt. Full settlement reconciliation for the day is NOT done (owed).
-5. **Open positions carry live risk while the bot is down** — they settle on
-   their own; nothing is at risk of runaway, but nothing is being managed.
+1. **The bot is RUNNING** — operator-confirmed restart at **8:07p ET**
+   (`data/live_20260725_2006.log`), preflight green, 0 leftover quotes,
+   319 quotes priced in the first minute, **p_book 0.78**, zero halts.
+   **The FULL evening bundle is ARMED** (§4). Running unattended by operator
+   directive ("start the bot but don't monitor anything... run it locally on
+   this PC") — **NO monitors are attached**; the four launcher windows are
+   independent OS processes and survive any Claude session ending.
+2. **Earlier tonight it was DOWN** from a 7:32p `halt_metadata_change`
+   (third of that class today); cause fixed in `01b265d` (settlement horizon
+   = EARLIEST tz-aware stamp). One start attempt (7:59p) died silently at
+   worker-pool creation and did not recur on the clean retry — **if a start
+   ever stalls before `worker_kill_job_created`, run `STOP_BOT.bat` first
+   (orphan probers make the guard refuse) and start again.**
+3. **Today's P&L**: realized **+$29** (process-scoped counter), open book
+   settled down through the evening. Full 7/25 settlement reconciliation is
+   NOT done (owed, §6).
+4. **Nothing is being watched.** No digest, no prober monitor. Next session
+   should check halts/fills/p_book first thing via `DECLINES.bat` +
+   `READOUT.bat` and the log named in `data/CURRENT_LOG.txt`.
+5. **The one HIGH finding (§5) is still open** — p_night's restart-roll is a
+   no-op because `position_ledger` has no live writers.
 
-Recovery command sequence (after the operator confirms):
-`STOP_BOT.bat` → delete `KILL` → `START_BOT.bat` → watch the MONITOR window
-for `prod_preflight_green` (the `needs_reconcile` marker clears itself on a
-successful boot reconcile).
+Operator controls: `START_BOT.bat` (refuses if anything is already live),
+`STOP_BOT.bat`, `DECLINES.bat`, `READOUT.bat`.
 
 ---
 
