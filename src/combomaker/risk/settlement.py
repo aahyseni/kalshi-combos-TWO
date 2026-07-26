@@ -205,6 +205,21 @@ class ReconcileResult:
     booked: bool  # False on a duplicate (already reconciled)
 
 
+class SettlementLedger(Protocol):
+    """The durable-ledger surface the handler needs (2026-07-26). Structural so
+    ``risk.settlement`` never imports ``ops.persistence``; the live wiring
+    passes a ``Store``-backed adapter, tests pass a stub, None disables it."""
+
+    def record_settled(
+        self,
+        *,
+        position_id: str,
+        settled_value: float,
+        realized_pnl_cc: int,
+        settlement_fee_cc: int,
+    ) -> None: ...
+
+
 class SettlementHandler:
     """Books + reconciles settled positions we HOLD. Owns no loop — the poller
     drives it, and tests call ``handle_settlements`` directly against fakes.
@@ -223,11 +238,21 @@ class SettlementHandler:
         balance_tracker: BalanceTracker,
         lifecycle: RecordsRealizedPnl,
         killswitch: KillSwitch,
+        ledger: SettlementLedger | None = None,
     ) -> None:
         self._exposure = exposure
         self._balance = balance_tracker
         self._lifecycle = lifecycle
         self._killswitch = killswitch
+        # DURABLE SETTLEMENT LEDGER (2026-07-26). Until now every settlement
+        # was booked ONLY into the in-memory realized accumulator, so
+        # ``position_ledger`` — the table that carries realized P&L across
+        # restarts and is the ONLY local record of how a combo settled — had
+        # no live writer at all. That made ``p_night``'s day-anchored seed a
+        # silent no-op AND made settlement calibration ("do our 4-6 leg K
+        # combos hit at the rate we price?") unanswerable from local data.
+        # None ⇒ ledger writes are skipped (tests/backtests), never an error.
+        self._ledger = ledger
         # Position ids we have already booked+reconciled (idempotency backstop on
         # top of the ledger's own dedup — a re-polled settlement never double-books
         # NOR re-runs the reconcile HALT check).
@@ -381,6 +406,22 @@ class SettlementHandler:
             self._exposure.remove_position(pos.position_id)
             # Feed the ENFORCED daily-loss cap's realized half.
             self._lifecycle.record_realized_pnl(realized_cc)
+            # Durable twin of the line above: the in-memory accumulator resets
+            # every restart, this does not. Best-effort — a ledger failure must
+            # never break settlement booking (the money path).
+            if self._ledger is not None:
+                try:
+                    self._ledger.record_settled(
+                        position_id=pos.position_id,
+                        settled_value=float(parsed.settled_value or 0.0),
+                        realized_pnl_cc=int(realized_cc),
+                        settlement_fee_cc=0,
+                    )
+                except Exception:
+                    log.exception(
+                        "settlement_ledger_write_failed",
+                        position_id=pos.position_id,
+                    )
             total_realized_cc += realized_cc
             log.info(
                 "settlement_reconciled",

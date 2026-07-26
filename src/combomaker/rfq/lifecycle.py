@@ -3353,6 +3353,15 @@ class QuoteLifecycle:
                     self._reservation.commit(reservation_id)
                 else:
                     self._book_position(quote_id, state)
+                # DURABLE POSITION LEDGER (2026-07-26): the open side of the
+                # ledger the settlement handler later marks SETTLED. Without
+                # this row the settled-write is a silent no-op (it UPDATEs
+                # WHERE status='open'), which is exactly why position_ledger
+                # was empty, p_night could not roll across restarts, and
+                # settlement calibration was unanswerable from local data.
+                # Fire-and-forget on the store's own queue; never blocks or
+                # breaks the confirm path.
+                self._ledger_record_open(quote_id, state)
                 # FILL-RECORD RECOVERY (2026-07-16 P1): the confirm SUCCEEDED —
                 # a quote_executed message is now EXPECTED. Stamp the clock so
                 # the maintenance sweep can poll REST if it never arrives (the
@@ -3432,6 +3441,25 @@ class QuoteLifecycle:
             legs=self._leg_refs(state.rfq),
             farmed=state.constructed.farmed,
         )
+
+    def _ledger_record_open(self, quote_id: str, state: OpenQuoteState) -> None:
+        """Write the OPEN row of the durable position ledger for a confirmed
+        fill (2026-07-26). Best-effort by construction: any failure logs and
+        the bot proceeds exactly as before (the in-memory book is unchanged
+        and remains the risk source of truth)."""
+        try:
+            position = self._fill_position(quote_id, state)
+            coro = self._store.record_position_open(
+                position,
+                subaccount=(
+                    str(self._fills_subaccount)
+                    if self._fills_subaccount is not None
+                    else ""
+                ),
+            )
+            asyncio.get_running_loop().create_task(coro)
+        except Exception:
+            log.exception("position_ledger_open_failed", quote_id=quote_id)
 
     def _book_position(self, quote_id: str, state: OpenQuoteState) -> None:
         """Idempotent: adds the confirmed fill's position to the exposure book.

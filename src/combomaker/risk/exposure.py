@@ -610,6 +610,12 @@ class ExposureSnapshot:
     # ``leg_axis_exposure`` visibility event.
     committed_loss_by_family_cc: dict[str, int] = field(default_factory=dict)
     committed_loss_by_entity_cc: dict[str, int] = field(default_factory=dict)
+    # ENTITY BOUND (2026-07-26 operator: "I wouldn't prefer having our book
+    # rely on 1 leg like that"). Same (family:entity x side) key as above but
+    # INCLUDING candidates/reservations — the committed-only maps above steer
+    # PRICING, this one is what the enforced per-entity cap binds on, exactly
+    # mirroring loss_by_combo_cc's committed+candidate accumulation.
+    loss_by_entity_cc: dict[str, int] = field(default_factory=dict)
 
     # --- back-compat aliases (old event-keyed names; now game-keyed data) ------
     # The pre-B2 field names ``delta_by_event`` / ``worst_case_loss_by_event_cc``
@@ -1231,6 +1237,8 @@ class ExposureBook:
         # (family × side) and (family:entity × side) — see the snapshot fields.
         loss_family: dict[str, int] = defaultdict(int)
         loss_entity: dict[str, int] = defaultdict(int)
+        # committed + candidates/reservations (the ENFORCED entity cap reads this)
+        loss_entity_all: dict[str, int] = defaultdict(int)
         gross_cc = 0
         unknown = False
 
@@ -1240,17 +1248,21 @@ class ExposureBook:
             is_committed = i < n_committed
             gross_cc += position.max_loss_cc
             loss_combo[position.combo_ticker] += position.max_loss_cc
-            if is_committed:
-                seen_keys: set[str] = set()
-                for leg in position.legs:
-                    fk = leg_family_key(leg)
+            seen_keys: set[str] = set()
+            for leg in position.legs:
+                fk = leg_family_key(leg)
+                ek = leg_entity_key(leg)
+                if is_committed:
                     if fk not in seen_keys:
-                        seen_keys.add(fk)
                         loss_family[fk] += position.max_loss_cc
-                    ek = leg_entity_key(leg)
                     if ek not in seen_keys:
-                        seen_keys.add(ek)
                         loss_entity[ek] += position.max_loss_cc
+                # The enforced axis counts committed AND candidates (one
+                # position contributes to a key at most once).
+                if ek not in seen_keys:
+                    loss_entity_all[ek] += position.max_loss_cc
+                seen_keys.add(fk)
+                seen_keys.add(ek)
             # P0-4: a CONSERVATIVELY-RESERVED holding (risk_modeled=False) has no
             # available marginals — we do NOT even query them (so a missing
             # marginal is never turned into an ordinary usable p=0.5). Its exact
@@ -1543,6 +1555,7 @@ class ExposureBook:
             loss_by_combo_cc=dict(loss_combo),
             committed_loss_by_family_cc=dict(loss_family),
             committed_loss_by_entity_cc=dict(loss_entity),
+            loss_by_entity_cc=dict(loss_entity_all),
             worst_case_loss_by_game_cc=game_worst,
             gross_settlement_notional_by_game_cc=dict(game_notional),
             directional_by_game_cc=game_directional,

@@ -51,6 +51,11 @@ class ReasonCode(StrEnum):
     # (R1/R2 invariant #2: the two money axes are NEVER summed).
     SKIP_GAME_LOSS_CAP = "skip_game_loss_cap"            # %-of-GAME correlated loss
     SKIP_PER_COMBO_LOSS_CAP = "skip_per_combo_loss_cap"  # single position max_loss
+    # ENTITY BOUND (2026-07-26): accumulated premium-at-risk on ONE
+    # (family:entity x direction) key — e.g. every combo riding "Hunter Greene
+    # 4+ Ks" — above its %-of-bankroll ceiling. The leg-axis steer PRICES this
+    # concentration; this is the hard wall that refuses it.
+    SKIP_ENTITY_LOSS_CAP = "skip_entity_loss_cap"
     SKIP_DIRECTIONAL_CAP = "skip_directional_cap"        # net one-directional theme
     SKIP_SLATE_CAP = "skip_slate_cap"                    # Σ game loss over a slate
     # Loose backstop ABOVE the % caps on the gross-settlement-notional axis

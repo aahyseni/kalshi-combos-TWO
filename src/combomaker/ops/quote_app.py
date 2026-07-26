@@ -811,6 +811,36 @@ async def position_reconcile_unmodeled_once(
     return unmodeled
 
 
+class _StoreSettlementLedger:
+    """Adapter: the settlement handler's tiny ledger surface onto the Store's
+    durable ``position_ledger`` (2026-07-26). Fire-and-forget on the store's
+    own writer queue so a settlement never blocks on disk; the handler already
+    wraps calls in try/except so a failure here degrades to today's
+    in-memory-only behaviour instead of breaking the money path."""
+
+    def __init__(self, store: Store) -> None:
+        self._store = store
+
+    def record_settled(
+        self,
+        *,
+        position_id: str,
+        settled_value: float,
+        realized_pnl_cc: int,
+        settlement_fee_cc: int,
+    ) -> None:
+        import asyncio
+
+        asyncio.get_running_loop().create_task(
+            self._store.record_position_settled(
+                position_id=position_id,
+                settled_value=settled_value,
+                realized_pnl_cc=realized_pnl_cc,
+                settlement_fee_cc=settlement_fee_cc,
+            )
+        )
+
+
 class QuoteApp:
     def __init__(self, config: AppConfig) -> None:
         if config.mode not in (Mode.PAPER, Mode.QUOTE):
@@ -1287,6 +1317,10 @@ class QuoteApp:
                 balance_tracker=balance_tracker,
                 lifecycle=lifecycle,
                 killswitch=killswitch,
+                # DURABLE SETTLEMENT LEDGER (2026-07-26): position_ledger had
+                # no live writer, so p_night's day-anchored seed was a silent
+                # no-op and settlement calibration was unanswerable locally.
+                ledger=_StoreSettlementLedger(store),
             )
             settlement_poller = SettlementPoller(
                 source=rest,

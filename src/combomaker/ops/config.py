@@ -2894,7 +2894,11 @@ class RiskConfig(StrictModel):
     resting_quote_weight: str = "1.0"
     resting_floor_count: int = 3
     game_loss_frac: str = "0.08"          # %-of-GAME correlated loss
-    per_combo_loss_frac: str = "0.01"     # single position max_loss
+    per_combo_loss_frac: str = "0.01"
+    # ENTITY BOUND (operator 2026-07-26): max %-of-bankroll premium-at-risk on
+    # ONE (family:entity x direction) key — every combo riding one player/team
+    # one way, across all games. Empty string = axis OFF (byte-identical).
+    entity_loss_frac: str = ""     # single position max_loss
     directional_frac: str = "0.10"        # net one-directional / theme
     slate_loss_frac: str = "0.08"         # Σ game loss over one slate
     daily_loss_frac: str = "0.06"         # soft daily-loss halt
@@ -3161,6 +3165,11 @@ class RiskConfig(StrictModel):
             caps_shadow_mode=self.caps_shadow_mode,
             game_loss_frac=Fraction(Decimal(self.game_loss_frac)),
             per_combo_loss_frac=Fraction(Decimal(self.per_combo_loss_frac)),
+            entity_loss_frac=(
+                Fraction(Decimal(self.entity_loss_frac))
+                if self.entity_loss_frac
+                else None
+            ),
             directional_frac=Fraction(Decimal(self.directional_frac)),
             slate_loss_frac=Fraction(Decimal(self.slate_loss_frac)),
             daily_loss_frac=Fraction(Decimal(self.daily_loss_frac)),

@@ -183,6 +183,13 @@ class RiskLimits:
     # Per-COMBO max LOSS, on a single candidate position's max_loss_cc (LOSS axis
     # — NOT the $1 notional). 1%.
     per_combo_loss_frac: Fraction = Fraction(1, 100)
+    # ENTITY BOUND (operator 2026-07-26: "I wouldn't prefer having our book rely
+    # on 1 leg like that"). Accumulated premium-at-risk on ONE
+    # (family:entity x direction) key — every combo riding "Hunter Greene 4+
+    # Ks" — as a %-of-bankroll ceiling. The leg-axis steer PRICES this
+    # concentration; this is the hard wall that REFUSES it. None (default) ⇒
+    # the axis is not evaluated (byte-identical to before).
+    entity_loss_frac: Fraction | None = None
     # One-directional / theme: net directional exposure to one leg outcome across
     # games (LOSS-equivalent; see the check site for the interpretation). 10%.
     directional_frac: Fraction = Fraction(10, 100)
@@ -908,6 +915,31 @@ class LimitChecker:
                         f"combo {ticker} ACCUMULATED loss {total}cc "
                         f"(committed+reserved+candidate) > "
                         f"{limits.per_combo_loss_frac} bankroll = {combo_thr}cc",
+                        shadow=shadow,
+                    )
+                )
+
+        # (3c) ENTITY BOUND (operator 2026-07-26: "I wouldn't prefer having our
+        # book rely on 1 leg like that"). Same accumulation shape as (3b) but
+        # keyed on (family:entity x DIRECTION) instead of the combo market: at
+        # most ``entity_loss_frac`` of bankroll may ride ONE player/team in ONE
+        # direction across ALL combos and games. The 7/25 book carried ~$420 on
+        # four pitchers' arms with nothing to refuse it — the leg-axis steer
+        # only PRICED that concentration. ``loss_by_entity_cc`` folds committed
+        # + reserved + this check's candidates (never resting quotes — the
+        # serial reservation chain re-checks at every fill). Unset (None,
+        # default) ⇒ the axis is not evaluated (byte-identical).
+        if limits.entity_loss_frac is not None:
+            entity_thr = threshold_cc(limits.entity_loss_frac, bankroll)
+            for key, loss_cc in sorted(snapshot.loss_by_entity_cc.items()):
+                if loss_cc <= entity_thr:
+                    continue
+                out.append(
+                    Breach(
+                        ReasonCode.SKIP_ENTITY_LOSS_CAP,
+                        f"entity {key} ACCUMULATED loss {loss_cc}cc "
+                        f"(committed+reserved+candidate) > "
+                        f"{limits.entity_loss_frac} bankroll = {entity_thr}cc",
                         shadow=shadow,
                     )
                 )
