@@ -80,6 +80,7 @@ from combomaker.risk.lastlook import (
     decide_confirm,
 )
 from combomaker.risk.limits import (
+    _SLATE_TZ,
     Breach,
     DailyPnl,
     HaltInputs,
@@ -946,6 +947,9 @@ class QuoteLifecycle:
         self._by_rfq: dict[str, str] = {}                # rfq_id → quote_id
         self._executed_states: dict[str, OpenQuoteState] = {}
         self._realized_pnl_cc = 0
+        # ET calendar date the realized accumulator belongs to (day-rollover
+        # reset — see _roll_realized_day). None until the first mark.
+        self._realized_day: str | None = None
         self._confirm_failures = 0
         self.daily_pnl = DailyPnl()
         self.exchange_active = config.exchange_active
@@ -4994,10 +4998,42 @@ class QuoteLifecycle:
             payout_per_ct = v_cc
         return contracts * payout_per_ct // 100
 
+    def _roll_realized_day(self) -> None:
+        """DAY ROLLOVER for the realized accumulator (2026-07-25, found while
+        answering "will it just keep running tomorrow?").
+
+        ``_realized_pnl_cc`` is the REALIZED half of ``DailyPnl``, which the
+        DAILY-LOSS halt and the give-back/KILL ladder bind on. It was only
+        ever zeroed in the constructor, so a process that lives across
+        midnight carried the PRIOR day's realized P&L into the new day's
+        halt baseline — a profitable day silently LOOSENS the next day's
+        daily-loss halt by exactly that profit (and a losing day tightens
+        it). The slate cap already rolls on the US/Eastern calendar date
+        (``slate_key_for_start``); this rolls the realized counter on the
+        SAME boundary so both agree. Idempotent: the date is captured on
+        first call, and a change zeroes the counter exactly once.
+        Unrealized needs no reset — it is recomputed from live marks."""
+        today = self._clock.now().astimezone(_SLATE_TZ).date().isoformat()
+        if self._realized_day is None:
+            self._realized_day = today
+            return
+        if self._realized_day != today:
+            log.info(
+                "realized_pnl_day_rolled",
+                prior_day=self._realized_day,
+                prior_realized_cc=self._realized_pnl_cc,
+                new_day=today,
+                detail="daily-loss/give-back baseline reset on the ET day "
+                "boundary (the slate cap's own boundary)",
+            )
+            self._realized_pnl_cc = 0
+            self._realized_day = today
+
     def _refresh_daily_pnl(self) -> None:
         """Mark open positions at current leg mids so the daily-loss limit
         actually binds. Any unmarkable position keeps the previous mark
         (limits also see UNKNOWN marginals as a breach on their own)."""
+        self._roll_realized_day()
         unrealized = 0
         for position in self._exposure.positions.values():
             if not position.risk_modeled:
