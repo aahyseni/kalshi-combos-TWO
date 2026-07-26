@@ -37,6 +37,13 @@ def _leg_sport(ticker: str) -> str:
         return "soccer"
     if ticker.startswith("KXMLB"):
         return "mlb"
+    # ESPORTS / RACING (2026-07-26 operator wire). Tape-verified prefixes:
+    # KXLOLGAME, KXF1RACE, KXNASCARRACE (CS/VALORANT/DOTA mapped ahead of
+    # any flow appearing — the allowlist still governs admission).
+    if ticker.startswith(("KXLOL", "KXCSGO", "KXCS2", "KXVALORANT", "KXDOTA")):
+        return "esports"
+    if ticker.startswith(("KXF1", "KXNASCAR")):
+        return "racing"
     return "other"
 
 
@@ -123,6 +130,22 @@ class MarkupPolicy:
         legs = list(leg_tickers)
         sport = sport_of(legs)
         base = self.markup_cc(sport)
+        if base <= 0 and sport == "other" and legs:
+            # MIXED-SPORT COMBO (2026-07-26, esports/racing wire — the
+            # operator's stated shape: "if someone mixes esports and racing
+            # and MLB it'll go thru"). ``sport_of`` tags any multi-sport
+            # combo 'other' ⇒ markup 0, which would systematically
+            # UNDERPRICE exactly those combos (the KXMENWORLDCUP
+            # zero-markup incident, one level up). Fail-safe intent is
+            # preserved by taking the MINIMUM active markup across the
+            # legs' sports — never lets a richer sport's validated edge
+            # ride on a leaner sport's leg — and by requiring EVERY leg to
+            # be a KNOWN sport with an ACTIVE markup (any unknown or dark
+            # sport ⇒ 0, exactly as today).
+            per_leg = [self.markup_cc(_leg_sport(t)) for t in legs]
+            if per_leg and all(cc > 0 for cc in per_leg):
+                sport = "mixed"
+                base = min(per_leg)
         if base <= 0:
             return sport, base
         if fair_cc is not None:

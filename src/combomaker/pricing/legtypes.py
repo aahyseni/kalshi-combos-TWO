@@ -280,6 +280,24 @@ _KEYWORDS: tuple[tuple[str, LegType], ...] = (
     ("MATCH", LegType.MONEYLINE),
 )
 
+# MOTORSPORT WINNER series — EXACT match, never a substring (2026-07-26).
+# SOURCE OF TRUTH: live GET /series?category=Sports (3,005 series) + a 400k-RFQ
+# tape scan. A "RACE" SUBSTRING rule would be a money hole: the exchange also
+# lists KXF1RACETOP5 / KXF1RACETOP10 / KXF1RACEPODIUM / KXF1RACETOPX /
+# KXF1RACESPRINT and KXNASCARTOP3/5/10/20 — "finish in the top N" markets that
+# are NOT one-of-N winner markets and are strongly correlated with the winner.
+# Classifying those as MONEYLINE would price a top-5 leg as if it were a win
+# leg. Exact-series matching leaves every one of them UNKNOWN ⇒ no-quote
+# (defense #2), which is the correct fail-closed answer until each family is
+# modeled. KXNASCARRACEOLD (deprecated series) is likewise excluded.
+_EXACT_SERIES: dict[str, LegType] = {
+    # "Will <driver> finish in first in the main race at the 2026 Belgian
+    # Grand Prix?" — a one-of-N field winner, the MONEYLINE shape. The field's
+    # mutual exclusivity comes from the event's OWN ME metadata, never assumed.
+    "KXF1RACE": LegType.MONEYLINE,
+    "KXNASCARRACE": LegType.MONEYLINE,
+}
+
 # Period / derived market families (first/second half, quarters). Matched
 # against the SERIES prefix only (KXWC1HTOTAL, KXWC2H, KX…FHTOTAL). These
 # settle on a different window than the full game and are structurally
@@ -320,6 +338,12 @@ def _classify_leg_raw(market_ticker: str) -> LegType:
     public ``classify_leg`` resolves first; the alias validator needs the raw
     verdict to enforce the only-UNKNOWN rule without registry recursion."""
     series = market_ticker.split("-", 1)[0].upper()
+    # EXACT-series families first (motorsport winners): these must never be
+    # reached by substring rules, and their near-neighbours (…TOP5, …PODIUM,
+    # …SPRINT) must stay UNKNOWN. See _EXACT_SERIES.
+    exact = _EXACT_SERIES.get(series)
+    if exact is not None:
+        return exact
     base = LegType.UNKNOWN
     for keyword, leg_type in _KEYWORDS:
         if keyword in series:
@@ -355,6 +379,13 @@ class Sport(StrEnum):
     NHL = "nhl"
     UFC = "ufc"
     TENNIS = "tennis"
+    # 2026-07-26 (operator): esports + motorsport, MONEYLINE-only families.
+    # Every leg is a one-of-N winner market; legs from DIFFERENT events are
+    # INDEPENDENT (no measured cross-event correlation — and none is
+    # assumed: they simply carry no same-game pair entry), legs within one
+    # event are mutually exclusive via the event's own ME metadata.
+    ESPORTS = "esports"
+    RACING = "racing"
     UNKNOWN = "unknown"
 
 
@@ -373,6 +404,21 @@ _SPORT_KEYWORDS: tuple[tuple[str, Sport], ...] = (
     # the tennis prefixes — so first-match order is safe wherever these sit.
     ("ATP", Sport.TENNIS),
     ("WTA", Sport.TENNIS),
+    # Esports / motorsport (2026-07-26). Tape-verified series prefixes:
+    # KXLOLGAME (League of Legends match winner), KXF1RACE, KXNASCARRACE.
+    # NASCAR before RACE-family ordering is immaterial (distinct keywords);
+    # none of LOL/F1/NASCAR/CSGO/CS2 is a substring of any prefix above, and
+    # none of those is a substring of these. CSGO/CS2 are listed by the
+    # exchange but showed ZERO combo flow in a 400k-RFQ tape scan — mapped
+    # here so that if flow appears it prices as a sport rather than as
+    # UNKNOWN-with-no-markup; the allowlist still governs admission.
+    ("LOL", Sport.ESPORTS),
+    ("CSGO", Sport.ESPORTS),
+    ("CS2", Sport.ESPORTS),
+    ("VALORANT", Sport.ESPORTS),
+    ("DOTA", Sport.ESPORTS),
+    ("F1", Sport.RACING),
+    ("NASCAR", Sport.RACING),
     ("WC", Sport.SOCCER),
     ("UCL", Sport.SOCCER),
     ("MLS", Sport.SOCCER),
