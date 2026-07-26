@@ -226,15 +226,30 @@ class TestCapsDerivedOnset:
         assert full.pbook_cc > 0
         assert half.pbook_cc < full.pbook_cc / 2
 
-    def test_rebate_reads_the_book_level_hole(self) -> None:
-        """The diversification rebate keys on the BOOK's hole depth (the
-        underweight game has no tail of its own) — deep hole, bigger reward
-        for the variance-adder; shallow hole, smaller."""
+    def test_rebate_is_book_size_invariant(self) -> None:
+        """SUPERSEDES ``test_rebate_reads_the_book_level_hole`` (2026-07-26).
+
+        The original design scaled the diversification REWARD by the book's
+        proximity to its cap (``onset_book``), so a deep hole paid more than
+        a shallow one. Live measurement killed that intent: at real book
+        sizes onset is a few percent, so rebates landed at a MEDIAN OF 0.02c
+        against a 1-4c markup ladder — invisible to any taker — while the
+        book filled one direction and p_book sat at 0.37 with zero legs live.
+
+        The corrected doctrine: the REWARD is size-invariant (a diversifier
+        is not worth less because the book is small) and scales on
+        COMPOSITION instead — ``deficit`` (how skewed the mix is) x ``need``
+        (1 - p_book). The "deeper hole pays more" intuition survives in the
+        honest place: a concentrating book has a LOWER p_book, so ``need``
+        rises and the rebate rises with it. Onset stays on the WIDEN branch
+        (never tax a small book), pinned by test_widen_onset_is_convex."""
         book, marginals = _one_way_book()
         cand = no_position("cand", (leg("C", "KX-G3"),))
         shallow = _skew(cand, book, marginals, _profile(total_tail_cc=2.5e8))
         deep = _skew(cand, book, marginals, _profile(total_tail_cc=1.0e9))
-        assert deep.pbook_cc < shallow.pbook_cc <= 0
+        assert deep.pbook_cc == shallow.pbook_cc < 0
+        # And it is a number a taker can actually see.
+        assert abs(deep.pbook_cc) >= 25
 
 
 class TestReviewRegressions:

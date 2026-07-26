@@ -157,6 +157,14 @@ same EV frame the gate already computes — so the reward carries the same
 units as the markup, still fully derived (no hand-set constant). Shadow the
 new magnitudes first; arm only after the cent-distribution is eyeballed.
 
-**Separate and not composition:** p_book 0.365 today is partly the MARK — the
-book shows EV −$49 because in-progress games are moving against held
-positions. Even a balanced book prints a depressed p_book while marked down.
+**CORRECTION (operator, verified):** an earlier draft of this note blamed the
+−$49 EV on in-progress games marking the book down. That was ASSUMED, not
+checked, and it is WRONG. Verified against the source of truth at 08:51 ET:
+every held game starts 13:35 ET or later — **ZERO legs were live**. So a
+book of 71 positions, each sold at a positive edge, shows expected P&L of
+−$48.67 and wins only 37% of nights BEFORE anything has happened. That is a
+design failure, not variance: the positions are the SAME BET REPEATED
+($282 short K-overs, four pitchers carrying ~$420), i.e. we have been
+QUOTING DIRECTIONAL. Directional quoting → correlated book → low p_book, and
+the mechanism meant to prevent it was rebating at 0.02¢. Lesson recorded:
+never assume an error's cause — check the source of truth.

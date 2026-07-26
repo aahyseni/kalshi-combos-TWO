@@ -165,6 +165,22 @@ def construct_quote(
     # default), so an un-set markup is BIT-IDENTICAL to the pre-markup pricer.
     margin = max(half, markup_cc)
 
+    # REBATE NEVER EXCEEDS THE EDGE (2026-07-26). The inventory steer's REBATE
+    # direction (positive ``inventory_skew_cc`` — it RAISES ``no_bid``, making
+    # the combo cheaper to attract balancing flow) is now economically
+    # meaningful rather than the hundredths-of-a-cent it used to be, so it can
+    # exceed the margin on a thin mains combo and quote us THROUGH fair. Such a
+    # quote is not just thin — it is negative-EV, and the confirm-time
+    # admission gate DECLINES negative-EV fills, so it would manufacture
+    # exactly the won-then-reneged auctions the 2026-07-25 audit eliminated.
+    # Cap the rebate at the margin we are charging: we may give away up to the
+    # whole edge to win balancing flow, never more. Derived (the margin is the
+    # live tier), no hand-set number. The WIDEN direction is untouched — making
+    # a combo dearer is always safe — and the free-money clamp still applies
+    # below.
+    if inventory_skew_cc > margin:
+        inventory_skew_cc = margin
+
     # The fill happens at the BID, not at fair, and the quadratic fee peaks at
     # $0.50 — computing it at fair under-charges the side whose bid sits
     # nearer $0.50. Take the max fee over the plausible fill range instead.

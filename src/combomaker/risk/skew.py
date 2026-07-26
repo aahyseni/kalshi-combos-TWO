@@ -779,7 +779,16 @@ def _pbook_component(
             adder = int(round(params.peak_widen_max_cc * factor))
             rows.append((game, adder, factor, "pbook_concentrating"))
         elif deficit > 0.0 and contrib_cc < 0:
-            factor = deficit * need * onset_g
+            # REWARD IS NOT ONSET-GATED (2026-07-26). ``onset`` measures how
+            # close this game's concentrated tail sits to the ENFORCED cap —
+            # the right gate for the PENALTY (never tax a small book) and the
+            # WRONG one for the REWARD: a fill that offsets concentration is
+            # not worth less because the book is small. Multiplying it in
+            # crushed live rebates to a MEDIAN OF 0.02c against a 1-4c markup
+            # ladder (997,581 skew events) — the steer recognised diverse flow
+            # 2.39M times and priced that recognition at nothing. deficit x
+            # need still scale it (both measured); the clamp still bounds it.
+            factor = deficit * need
             adder = -int(round(params.peak_tighten_max_cc * factor))
             rows.append((game, adder, factor, "pbook_offsetting"))
         elif deficit > 0.0:
@@ -789,7 +798,12 @@ def _pbook_component(
             adder = 0
             rows.append((game, 0, 0.0, "delta_neutral_on_overweight"))
         elif deficit < 0.0:
-            factor = abs(deficit) * need * onset_book
+            # Same asymmetry fix as pbook_offsetting: the diversification
+            # reward drops the book-level onset gate (see above). A brand-new
+            # game is the purest variance-adder whether the book is $200 or
+            # $2,000 — its value is the deficit it fills, not the book's
+            # proximity to a cap.
+            factor = abs(deficit) * need
             adder = -int(round(params.peak_tighten_max_cc * factor))
             rows.append((game, adder, factor, "pbook_diversifying"))
         else:
@@ -852,7 +866,11 @@ def _leg_axis_side(
             adder = int(round(params.peak_widen_max_cc * factor))
             rows.append((key, adder, factor, "leg_concentrating"))
         elif deficit < 0.0:
-            factor = abs(deficit) * need * onset_book
+            # REWARD IS NOT ONSET-GATED (2026-07-26) — see _pbook_component.
+            # The missing direction (the other side of a loaded ladder, a new
+            # family/entity) is worth its deficit regardless of how full the
+            # book is; onset stays on the WIDEN branch only.
+            factor = abs(deficit) * need
             adder = -int(round(params.peak_tighten_max_cc * factor))
             rows.append((key, adder, factor, "leg_diversifying"))
         else:

@@ -614,20 +614,29 @@ class TestSkewNoArb:
         # cap. Uses a fair (0.30) whose UNCLAMPED no_raw would exceed the cap, so
         # the clamp provably BINDS: base no_bid ≈ $0.70 − half; +9_000 skew would
         # drive it toward ~$1 but the cap at 7_000 − 100 holds.
+        # 2026-07-26: the rebate is now ALSO capped upstream at the margin
+        # (a rebate may give away the whole edge, never more — a through-fair
+        # quote is negative-EV and would renege at the confirm gate). So an
+        # absurd 9_000cc skew no longer reaches the pricer intact; markup_cc
+        # is raised here so a LEGITIMATE full-margin rebate still drives
+        # no_bid into the free-money cap, keeping this last-line-of-defence
+        # assertion meaningful.
         clamped = build_quote(
             joint=make_joint(0.30, 0.0),
             grid=deci_grid(),
-            inventory_skew_cc=9_000,           # absurd rebate toward the cap
-            no_cap_cc=CC(7_000),
+            markup_cc=2_000,                   # margin 2_000 ⇒ rebate cap 2_000
+            inventory_skew_cc=9_000,           # absurd rebate, clipped to 2_000
+            no_cap_cc=CC(6_500),
             yes_cap_cc=CC(9_900),
         )
         assert isinstance(clamped, ConstructedQuote)
-        assert int(clamped.no_bid_cc) == 7_000 - 100  # clamped to exactly the cap
+        assert int(clamped.no_bid_cc) == 6_500 - 100  # clamped to exactly the cap
         # Sanity: WITHOUT the skew the no_bid is strictly below the cap, proving
         # the +9_000 is what drove it into the clamp (not the base price alone).
         base = build_quote(
             joint=make_joint(0.30, 0.0),
             grid=deci_grid(),
+            markup_cc=2_000,
             inventory_skew_cc=0,
             no_cap_cc=CC(7_000),
             yes_cap_cc=CC(9_900),
