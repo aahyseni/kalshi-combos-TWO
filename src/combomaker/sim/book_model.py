@@ -24,10 +24,16 @@ this module supplies, is:
    sell-only parlay seller EVERY position is NO, so this is not a corner case —
    it is every position. The old report MC invented ``~ticker`` pseudo-legs at
    independence; that is the core inconsistency M1 removes.
-4. **Point / low / high bands.** Three global matrices from the three within-game
-   rho bands, so book risk can be reported at the correlation-uncertainty band —
-   CVaR at ``high`` is the conservative number that gates (the risk analogue of
-   the pricer widening on the rho band).
+4. **TWO NAMED JOINTS, split by AXIS (2026-07-26).** ``corr_location_point`` is
+   the EXACT per-pair matrix at the pricing band — the joint the fills were priced
+   on, and the only one the LOCATION axis (EV / P(book) / p_night) may use.
+   ``corr_tail_stress_{low,point,high}`` collapse each game to one conservative
+   scalar and are what EVERY ENFORCED GATE samples: CVaR at ``high`` is the
+   conservative number that gates (the risk analogue of the pricer widening on the
+   rho band) PLUS an explicit stand-in for the tail dependence a Gaussian copula
+   does not have. Neither joint is a knob and neither substitutes for the other —
+   the reasoning is written out in full at the construction site in
+   ``build_book_model``.
 
 **Reuse, not reimplementation (hard rule 8).** The block matrix is assembled by
 the pricer's own ``copula.build_block_corr`` (the exact function the pricer calls
@@ -89,18 +95,41 @@ DEFAULT_FLAT_BAND: tuple[float, float, float] = (-0.20, 0.10, 0.40)
 
 @dataclass(frozen=True, slots=True)
 class BookModel:
-    """The engine triple for one book, at all three correlation bands.
+    """The engine triple for one book, carrying TWO EXPLICITLY NAMED JOINTS.
 
     ``legs`` is the global leg universe (one ``LegModel`` per distinct
     ``market_ticker``, on its YES marginal). ``positions`` are the engine
     ``ComboPosition``s (leg_indices into ``legs``, per-leg NO handled via
-    ``leg_sides``). ``corr_point`` / ``corr_low`` / ``corr_high`` are the three
-    global block-diagonal correlation matrices (identical shape ``(n, n)``); risk
-    gates on ``corr_high``. ``leg_index`` maps a ticker to its latent index (for
-    tail attribution). ``event_by_index`` maps a latent index to that leg's
+    ``leg_sides``). ``leg_index`` maps a ticker to its latent index (for tail
+    attribution). ``event_by_index`` maps a latent index to that leg's
     ``event_ticker`` (for per-game tail attribution). ``unknown`` is True iff a
     marginal for a RISK-MODELED position was missing — the whole model is then
     no-go (fail-closed).
+
+    **THE TWO JOINTS (2026-07-26 AXIS SPLIT — read this before using either).**
+    Both are global block-diagonal-by-game matrices of identical shape ``(n, n)``
+    with cross-game pairs at ``cross_event_rho``; they differ ONLY in how a game's
+    WITHIN-game pairs are filled, and each one owns exactly one axis:
+
+    * ``corr_location_point`` — the **PRICING joint**. The EXACT per-pair matrix
+      at the POINT band: every within-game pair carries its own measured rho, so
+      this reproduces the pricer's own ``build_sgp_correlation`` for those legs.
+      This is the joint the fills were actually priced on, so it — and only it —
+      may produce the LOCATION axis (EV, P(book), p_night, std). It exists at the
+      point band ONLY, because the location axis is DEFINED at the pricing band;
+      there is no "location at high" to ask for.
+    * ``corr_tail_stress_point`` / ``_low`` / ``_high`` — the **TAIL-DEPENDENCE
+      STRESS joint**. Each game collapses to ONE scalar (max of its pair rhos at
+      ``high``, min at ``low``, mean at ``point``) written onto EVERY pair in that
+      game. Deliberately coarser and deliberately more adverse: it is a crude
+      stand-in for the TAIL DEPENDENCE a Gaussian copula at low per-pair rho does
+      not have (see the construction site in ``build_book_model``). EVERY ENFORCED
+      GATE reads this joint (ES/CVaR, governing model ES, P(ruin), the loss-quantile
+      envelope, det-max, tail attribution) — ``corr_tail_stress_high`` is the
+      gating matrix.
+
+    A field named plain ``corr_*`` no longer exists precisely so no caller can pick
+    a joint by accident: ask for the location joint or the stress joint by name.
 
     ``reserved_loss_cc`` (P0-4) is the exact total premium of the
     CONSERVATIVELY-RESERVED holdings (``OpenPosition.risk_modeled=False`` — e.g.
@@ -114,22 +143,30 @@ class BookModel:
 
     legs: tuple[LegModel, ...]
     positions: tuple[ComboPosition, ...]
-    corr_point: NDArray[np.float64]
-    corr_low: NDArray[np.float64]
-    corr_high: NDArray[np.float64]
+    # JOINT 1 — LOCATION / PRICING (exact per-pair, point band only).
+    corr_location_point: NDArray[np.float64]
+    # JOINT 2 — TAIL-DEPENDENCE STRESS (game-wide collapse, all three bands).
+    corr_tail_stress_point: NDArray[np.float64]
+    corr_tail_stress_low: NDArray[np.float64]
+    corr_tail_stress_high: NDArray[np.float64]
     leg_index: dict[str, int]
     event_by_index: dict[int, str | None]
     unknown: bool
     reserved_loss_cc: float = 0.0
 
-    def corr_for_band(self, band: str) -> NDArray[np.float64]:
-        """The correlation matrix for a band name ("point"|"low"|"high")."""
+    def corr_tail_stress_for_band(self, band: str) -> NDArray[np.float64]:
+        """The TAIL-DEPENDENCE STRESS matrix for a band ("point"|"low"|"high").
+
+        This is the joint EVERY ENFORCED GATE samples (ES/CVaR, governing model
+        ES, P(ruin), loss-quantile envelope, det-max, tail attribution). It is NOT
+        the joint the quotes were priced on — for that ask for
+        ``corr_location_point`` explicitly."""
         if band == "point":
-            return self.corr_point
+            return self.corr_tail_stress_point
         if band == "low":
-            return self.corr_low
+            return self.corr_tail_stress_low
         if band == "high":
-            return self.corr_high
+            return self.corr_tail_stress_high
         raise ValueError(f"band must be point|low|high, got {band!r}")
 
 
@@ -267,9 +304,10 @@ def build_book_model(
         return BookModel(
             legs=(),
             positions=combos,
-            corr_point=empty,
-            corr_low=empty.copy(),
-            corr_high=empty.copy(),
+            corr_location_point=empty,
+            corr_tail_stress_point=empty.copy(),
+            corr_tail_stress_low=empty.copy(),
+            corr_tail_stress_high=empty.copy(),
             leg_index=leg_index,
             event_by_index=event_by_index,
             unknown=unknown,
@@ -284,75 +322,154 @@ def build_book_model(
             continue  # an ungamed leg never correlates with another (fail-closed)
         game_members.setdefault(game, []).append(idx)
 
-    # For each band, collect the (indices, rho) blocks build_block_corr consumes.
-    # build_block_corr sets ONE pairwise-constant rho per block; when a game has a
-    # single calibrated pair we use it, and when a game holds >2 legs with mixed
-    # pair rhos we use the block's MOST CONSERVATIVE (max-magnitude-positive for
-    # `high`, min for `low`) rho so the reported tail never understates — a game
-    # block is a coarse but conservative summary of its pairwise structure, and
-    # the pricer's own per-combo matrix is the exact object for a specific combo;
-    # here we build the WHOLE-BOOK view where a single constant per game is the
-    # tractable, conservative choice.
-    def _blocks_for_band(band_idx: int) -> list[tuple[list[int], float]]:
+    # === THE TWO JOINTS (2026-07-26 AXIS SPLIT) ==============================
+    #
+    # This is the ONE place both within-game joints are built. They are built
+    # side by side, from the SAME resolved pair bands, because the whole point is
+    # that the difference between them is a deliberate modelling choice per AXIS —
+    # not an accident, and not something a later reader may "unify".
+    #
+    # (1) LOCATION / PRICING joint — ``corr_location_point``, EXACT PER-PAIR.
+    #     ``build_block_corr`` starts at ``default_rho`` and LATER blocks override
+    #     earlier ones on overlapping pairs (pricing/copula.py), so a 2-index block
+    #     ``([i, j], rho_ij)`` per within-game PAIR writes the exact per-pair
+    #     matrix — byte-for-byte the object the pricer's own
+    #     ``build_sgp_correlation`` produces (same provider, same pairs). It is the
+    #     joint the fills were PRICED on, so it is the correct — and the only
+    #     honest — joint for the LOCATION axis (EV, P(book), p_night, std). The
+    #     game-wide collapse below is measurably WRONG for that axis: on the live
+    #     48-position book it inflated 636 ordered pairs and deflated ZERO, lifted
+    #     the within-game off-diagonal mean from +0.077 to +0.755, and FLIPPED 53
+    #     measured-NEGATIVE pairs to +0.95 — real within-game HEDGES re-marked as
+    #     near-comonotone, so a fill sold at fair+markup marked NEGATIVE on
+    #     arrival BY CONSTRUCTION. It is also NON-STATIONARY on that axis: adding
+    #     ANY leg to a game can only raise that game's max, so the marked book
+    #     degraded monotonically as the book grew in a game, INCLUDING when the
+    #     added position HEDGED it (the mutex-blind failure the standing directive
+    #     flags as dangerous).
+    #
+    # (2) TAIL-DEPENDENCE STRESS joint — ``corr_tail_stress_{low,point,high}``,
+    #     the game-wide COLLAPSE, PRESERVED DELIBERATELY. Every ENFORCED gate
+    #     samples this one. **Why the tail keeps the collapse even though the
+    #     per-pair matrix is the more accurate description of the pairwise
+    #     structure:** the sampler is a GAUSSIAN COPULA, and a Gaussian copula has
+    #     ZERO tail dependence at any rho < 1 — at a low per-pair rho its joint
+    #     extremes are almost independent. Real games do NOT behave that way: one
+    #     blowout hits every over in that game at once, an early red card sinks
+    #     every side of the same match together, so the joint that prices the
+    #     CENTRE of the distribution understates the CORNER of it. The game-wide
+    #     max is a crude but explicit stand-in for that missing tail dependence:
+    #     it says "in the 1% corner, treat a game as moving as one". Replacing it
+    #     with the exact low-rho per-pair matrix does not merely re-describe the
+    #     joint, it DELETES that stress — measured on the 48-position/144-leg live
+    #     -shaped book (seed 7, 20k, band=high) the within-game off-diagonal mean
+    #     fell +0.9217 -> +0.1486 and the enforced gates collapsed with it:
+    #     governing_model_es_99 103,893 -> 0, es_99 83,971 -> 0, P(ruin) 0.0137 ->
+    #     0.0000, and the 99th loss quantile flipped from a +75,405 LOSS to a
+    #     48,393 GAIN. Those are exactly the objects ``risk/limits.py`` enforces
+    #     (portfolio_kill_tail_prob, portfolio_cvar_frac,
+    #     portfolio_ruin_prob_budget), so that change would have silently removed a
+    #     live safety layer. The correlation BAND is uncertainty about the centre;
+    #     it is not a tail-dependence model, and it cannot substitute for one.
+    #     Therefore: the tail keeps the conservative construction until the
+    #     sampler itself grows real tail dependence (a t-copula / explicit
+    #     same-game shock factor), at which point THIS is the comment to revisit.
+    #     No flag, no number: an axis chooses its joint by name, structurally.
+    #
+    # Both joints are PSD-repaired downstream by ``build_block_corr``
+    # (``nearest_psd``; measured max |delta| 0.0032 on the live book).
+    #
+    # Structural (Dixon-Coles) legs are unaffected by either: ``sim/structural_book``
+    # samples a plan's legs exactly from the scoreline joint and NEVER reads their
+    # corr entries, and the structural/copula split is decided downstream from the
+    # leg universe, which this does not touch.
+
+    # Ticker by latent index, resolved ONCE. (The pre-split path did an O(n)
+    # reverse scan of ``leg_index`` per leg per pair per band — O(n^3) — inside
+    # the pair loop.)
+    ticker_by_index: list[str] = [""] * n
+    for _ticker, _i in leg_index.items():
+        ticker_by_index[_i] = _ticker
+
+    # Resolve each unordered within-game PAIR's (low, point, high) band ONCE — the
+    # pre-split code re-queried the provider for every pair on EVERY band (3x the
+    # calls). Kept GROUPED BY GAME and in the original nested-loop order so the
+    # collapse below aggregates exactly the same rhos in exactly the same order as
+    # the pre-existing code did (float-identical max/min/mean).
+    pair_bands_by_game: list[
+        tuple[list[int], list[tuple[int, int, tuple[float, float, float]]]]
+    ] = []
+    for members in game_members.values():
+        if len(members) < 2:
+            continue
+        pairs: list[tuple[int, int, tuple[float, float, float]]] = []
+        for a_pos in range(len(members)):
+            i = members[a_pos]
+            for b_pos in range(a_pos + 1, len(members)):
+                j = members[b_pos]
+                band = (
+                    within_game_rho(ticker_by_index[i], ticker_by_index[j])
+                    if within_game_rho is not None
+                    else None
+                )
+                pairs.append((i, j, band if band is not None else flat_band))
+        pair_bands_by_game.append((members, pairs))
+
+    def _location_blocks() -> list[tuple[list[int], float]]:
+        """ONE 2-index block per within-game pair at the POINT band — the exact
+        per-pair matrix, no game-wide collapse (JOINT 1)."""
+        return [
+            ([i, j], _clamp_open_unit(band[1]))
+            for _members, pairs in pair_bands_by_game
+            for i, j, band in pairs
+        ]
+
+    def _tail_stress_blocks(band_idx: int) -> list[tuple[list[int], float]]:
+        """ONE whole-GAME block per game, carrying that game's most CONSERVATIVE
+        representative rho (JOINT 2 — the tail-dependence stress). ``high`` takes
+        the most positive pair rho (fattest joint tail), ``low`` the most
+        negative, ``point`` the average. Preserved verbatim from the pre-split
+        build so no enforced gate can move; see the block comment above for why
+        the tail keeps it."""
         blocks: list[tuple[list[int], float]] = []
-        for members in game_members.values():
-            if len(members) < 2:
-                continue
-            # Gather every pair's band rho; pick the conservative representative.
-            rhos: list[float] = []
-            for a_pos in range(len(members)):
-                for b_pos in range(a_pos + 1, len(members)):
-                    ta = _ticker_of(leg_index, members[a_pos])
-                    tb = _ticker_of(leg_index, members[b_pos])
-                    band = (
-                        within_game_rho(ta, tb) if within_game_rho is not None else None
-                    )
-                    if band is None:
-                        band = flat_band
-                    rhos.append(band[band_idx])
+        for members, pairs in pair_bands_by_game:
+            rhos = [band[band_idx] for _i, _j, band in pairs]
             if not rhos:
                 continue
-            # high band → the most positive rho (fattest joint tail); low band →
-            # the most negative; point → the average (a neutral representative).
             if band_idx == 2:
                 rho = max(rhos)
             elif band_idx == 0:
                 rho = min(rhos)
             else:
                 rho = float(np.mean(rhos))
-            rho = _clamp_open_unit(rho)
-            blocks.append((members, rho))
+            blocks.append((members, _clamp_open_unit(rho)))
         return blocks
 
-    corr_low = build_block_corr(
-        n, _blocks_for_band(0), default_rho=cross_event_rho
+    corr_location_point = build_block_corr(
+        n, _location_blocks(), default_rho=cross_event_rho
     )
-    corr_point = build_block_corr(
-        n, _blocks_for_band(1), default_rho=cross_event_rho
+    corr_tail_stress_low = build_block_corr(
+        n, _tail_stress_blocks(0), default_rho=cross_event_rho
     )
-    corr_high = build_block_corr(
-        n, _blocks_for_band(2), default_rho=cross_event_rho
+    corr_tail_stress_point = build_block_corr(
+        n, _tail_stress_blocks(1), default_rho=cross_event_rho
+    )
+    corr_tail_stress_high = build_block_corr(
+        n, _tail_stress_blocks(2), default_rho=cross_event_rho
     )
 
     return BookModel(
         legs=tuple(legs),
         positions=combos,
-        corr_point=corr_point,
-        corr_low=corr_low,
-        corr_high=corr_high,
+        corr_location_point=corr_location_point,
+        corr_tail_stress_point=corr_tail_stress_point,
+        corr_tail_stress_low=corr_tail_stress_low,
+        corr_tail_stress_high=corr_tail_stress_high,
         leg_index=leg_index,
         event_by_index=event_by_index,
         unknown=unknown,
         reserved_loss_cc=reserved_loss_cc,
     )
-
-
-def _ticker_of(leg_index: dict[str, int], idx: int) -> str:
-    """Inverse lookup ticker←index (small books; O(n) is fine and pure)."""
-    for ticker, i in leg_index.items():
-        if i == idx:
-            return ticker
-    raise KeyError(idx)  # pragma: no cover — indices always come from leg_index
 
 
 def _clamp_open_unit(rho: float) -> float:

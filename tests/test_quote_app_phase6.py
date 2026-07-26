@@ -29,10 +29,11 @@ from combomaker.ops.metrics import Metrics
 from combomaker.ops.preflight import PreflightError
 from combomaker.ops.quote_app import QuoteApp, RateLimitRecordingSender
 from combomaker.ops.supervisor import supervisor_heartbeat_path
+from combomaker.rfq.filters import RfqFilter
 from combomaker.risk.breakers import RateLimitWindow
 from combomaker.risk.exposure import ExposureBook, LegRef, OpenPosition, OpenQuoteRisk
 from combomaker.risk.heartbeat import Heartbeat, ReconcileMarker
-from combomaker.risk.killswitch import HaltEvent
+from combomaker.risk.killswitch import HaltEvent, KillSwitch
 from combomaker.risk.limits import DailyPnl, LimitChecker, RiskLimits
 from combomaker.risk.reservation import RiskReservationService
 
@@ -598,44 +599,106 @@ def _market_meta(
     status: str,
     close_time: datetime | None,
     expected_expiration_time: datetime | None = None,
+    event_ticker: str = "KXWCGAME-26JUL05MEXENG",
+    raw_overrides: dict[str, Any] | None = None,
 ) -> MarketMeta:
+    """A MarketMeta whose ``raw`` is a realistic Kalshi market payload (the
+    settlement fingerprint reads the raw fields — rules/strike/expiration —
+    that ``MarketMeta`` does not model as attributes). Field names and shapes
+    copied from a live payload (data/metadata_cache.json)."""
+    raw: dict[str, Any] = {
+        "ticker": ticker,
+        "status": status,
+        "event_ticker": event_ticker,
+        "close_time": close_time.isoformat() if close_time else "",
+        "expected_expiration_time": (
+            expected_expiration_time.isoformat() if expected_expiration_time else ""
+        ),
+        "expiration_time": "2099-07-08T18:00:00Z",
+        "latest_expiration_time": "2099-07-08T18:00:00Z",
+        "rules_primary": "If Mexico wins the Mexico vs England game, the market resolves to Yes.",
+        "rules_secondary": "If this game is postponed the market remains open (within two days).",
+        "strike_type": "structured",
+        "custom_strike": {"soccer_team": "abc-123"},
+        "market_type": "binary",
+        "notional_value_dollars": "1.0000",
+        "can_close_early": True,
+        "result": "",
+    }
+    raw.update(raw_overrides or {})
     return MarketMeta(
         ticker=ticker,
         status=status,
         grid=None,
-        event_ticker="KXWCGAME-26JUL05MEXENG",
+        event_ticker=event_ticker,
         close_time=close_time,
         expected_expiration_time=expected_expiration_time,
-        raw={},
+        raw=raw,
         fetched_mono_ns=0,
     )
+
+
+def _arm(app: QuoteApp) -> None:
+    """Arm the market quarantine the way production does — by constructing the
+    quote-refusal consumer (RfqFilter) over the app's quarantine object. Until a
+    consumer registers, the metadata breaker refuses the scoped lane and
+    hard-halts on lifecycle moves (fail-closed property 2)."""
+    RfqFilter(
+        app._config.filters,
+        _QuarantineFeedStub(),  # type: ignore[arg-type]
+        FakeMetadata(),  # type: ignore[arg-type]
+        KillSwitch(app._clock, kill_file=app._config.kill_file),
+        app._clock,
+        None,
+        app._market_quarantine,
+    )
+    assert app._market_quarantine.armed is True
+
+
+class _QuarantineFeedStub:
+    """Feed double for the arming helper — RfqFilter only stores it."""
+
+    feed_healthy = True
 
 
 def test_metadata_change_breaker_fires_on_settlement_meta_change(
     tmp_path: Path,
 ) -> None:
-    # A LIVE market (close horizon still in the FUTURE) whose settlement-
-    # relevant metadata (close_time / status) changes tick-over-tick must trip
-    # HALT_METADATA_CHANGE — a reschedule moved the settlement window under
-    # us. First sighting seeds the baseline (no trip); the change on the next
-    # sample trips. (Future dates: the 2026-07-25 end-of-life exemption
-    # deliberately ignores changes on markets whose horizon already passed.)
+    # A LIVE market whose SETTLEMENT metadata — the payoff function itself —
+    # changes tick-over-tick must trip HALT_METADATA_CHANGE. Here the strike
+    # moves (total 5.5 → 6.5): a different bet on the same game. First
+    # sighting seeds the baseline (no trip); the change on the next sample
+    # trips, EVEN with the scoped quarantine lane armed (2026-07-26 rebuild:
+    # the scoped lane is unreachable when the settlement fingerprint moves).
     app = _demo_app(tmp_path)
+    _arm(app)
     breakers = _breakers(app)
     legs = (LegRef("LEG", "KXWCGAME-26JUL05MEXENG", "yes"),)
     book = _book_with_quote_legs(legs)
     feed = FakeFeed(rx_age_s=0.1, warm=True, seq_gap=False)
     t0 = datetime(2099, 7, 5, 18, 0, tzinfo=UTC)
-    meta_v1 = FakeMetadata({"LEG": _market_meta("LEG", status="active", close_time=t0)})
+    meta_v1 = FakeMetadata(
+        {
+            "LEG": _market_meta(
+                "LEG", status="active", close_time=t0,
+                raw_overrides={"floor_strike": 5.5},
+            )
+        }
+    )
     first = _sample(
         app, feed, lifecycle=FakeLifecycle({"LEG": 0.50}), exposure=book,
         metadata=meta_v1,
     )
     assert first.changed_markets == ()  # baseline seeded, no change yet
     assert breakers.evaluate(first).tripped is False
-    # The close_time moved under us (settlement window changed) while LIVE.
-    t1 = datetime(2099, 7, 5, 20, 0, tzinfo=UTC)
-    meta_v2 = FakeMetadata({"LEG": _market_meta("LEG", status="active", close_time=t1)})
+    meta_v2 = FakeMetadata(
+        {
+            "LEG": _market_meta(
+                "LEG", status="active", close_time=t0,
+                raw_overrides={"floor_strike": 6.5},
+            )
+        }
+    )
     second = _sample(
         app, feed, lifecycle=FakeLifecycle({"LEG": 0.50}), exposure=book,
         metadata=meta_v2,
@@ -644,6 +707,9 @@ def test_metadata_change_breaker_fires_on_settlement_meta_change(
     verdict = breakers.evaluate(second)
     assert verdict.tripped is True
     assert verdict.reason is ReasonCode.HALT_METADATA_CHANGE
+    # And the scoped lane was NOT used: a settlement change is never a
+    # market-scoped quarantine.
+    assert app._market_quarantine.is_quarantined("LEG") is False
 
 
 def test_metadata_change_breaker_exempts_post_close_settling(
@@ -655,6 +721,9 @@ def test_metadata_change_breaker_exempts_post_close_settling(
     # breaker must NOT trip (it hard-halted the live bot on exactly this the
     # first time the revalidation fix let it see any change at all).
     app = _demo_app(tmp_path)
+    # 2026-07-26: arm the scoped quarantine lane the way production does.
+    # (Unarmed, a lifecycle move fails CLOSED to the whole-bot halt.)
+    _arm(app)
     breakers = _breakers(app)
     legs = (LegRef("LEG", "KXWCGAME-26JUL05MEXENG", "yes"),)
     book = _book_with_quote_legs(legs)
@@ -688,6 +757,9 @@ def test_metadata_change_breaker_ignores_expiry_estimate_drift(
     # change. It no longer participates in the fingerprint, so drift alone
     # cannot hard-halt the bot even while both horizons are in the future.
     app = _demo_app(tmp_path)
+    # 2026-07-26: arm the scoped quarantine lane the way production does.
+    # (Unarmed, a lifecycle move fails CLOSED to the whole-bot halt.)
+    _arm(app)
     breakers = _breakers(app)
     legs = (LegRef("LEG", "KXWCGAME-26JUL05MEXENG", "yes"),)
     book = _book_with_quote_legs(legs)
@@ -735,6 +807,9 @@ def test_metadata_change_breaker_uses_earliest_horizon(tmp_path: Path) -> None:
     # breaker. The horizon is now the EARLIEST tz-aware stamp: once THAT has
     # passed, changes are lifecycle, not a reschedule.
     app = _demo_app(tmp_path)
+    # 2026-07-26: arm the scoped quarantine lane the way production does.
+    # (Unarmed, a lifecycle move fails CLOSED to the whole-bot halt.)
+    _arm(app)
     breakers = _breakers(app)
     legs = (LegRef("LEG", "KXWCGAME-26JUL05MEXENG", "yes"),)
     book = _book_with_quote_legs(legs)
@@ -785,6 +860,9 @@ def test_metadata_change_breaker_exempts_early_determination(
     # breaker must not trip. A reschedule (status stays active, close moves)
     # still trips (pinned by the fires_on_settlement_meta_change test).
     app = _demo_app(tmp_path)
+    # 2026-07-26: arm the scoped quarantine lane the way production does.
+    # (Unarmed, a lifecycle move fails CLOSED to the whole-bot halt.)
+    _arm(app)
     breakers = _breakers(app)
     legs = (LegRef("LEG", "KXWCGAME-26JUL05MEXENG", "yes"),)
     book = _book_with_quote_legs(legs)

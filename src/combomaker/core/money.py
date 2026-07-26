@@ -45,6 +45,33 @@ def cc_from_dollars_str(s: str) -> CentiCents:
     return cc_from_decimal_dollars(value)
 
 
+def _ceil_cc_from_dollars_str(s: str, *, kind: str) -> CentiCents:
+    """Shared body for the two COST-side wire parsers below: a non-negative
+    fixed-point dollars string → cc, rounding UP (ROUND_CEILING) when the wire
+    carries more precision than a centi-cent.
+
+    Rounding UP is the whole point and is only ever correct for a figure that
+    counts AGAINST us (a fee we paid, an exposure we carry): the booked integer
+    is then never BELOW the truth. It must never be used for a price, a revenue,
+    a balance, or a settlement value — those are exact by construction and a
+    fractional cc there is a genuine wire error (``cc_from_dollars_str``).
+
+    Non-finite input (``"NaN"``, ``"Infinity"``) raises ``MoneyParseError`` like
+    any other garbage rather than escaping as an ``InvalidOperation`` — every
+    caller already handles ``MoneyParseError`` fail-safe, none handle
+    ``ArithmeticError``."""
+    try:
+        value = Decimal(s)
+    except InvalidOperation as exc:
+        raise MoneyParseError(f"unparseable dollars string: {s!r}") from exc
+    if not value.is_finite():
+        raise MoneyParseError(f"non-finite {kind} value: {s!r}")
+    if value < 0:
+        raise MoneyParseError(f"negative {kind} {value}")
+    scaled = (value / _CC_QUANTUM).to_integral_value(rounding=ROUND_CEILING)
+    return CentiCents(int(scaled))
+
+
 def fee_cc_from_dollars_str(s: str) -> CentiCents:
     """Parse a Kalshi FEE ``*_dollars`` string to centi-cents, rounding UP to the
     next whole cc when it is sub-centi-cent.
@@ -56,14 +83,34 @@ def fee_cc_from_dollars_str(s: str) -> CentiCents:
     representation. We book it at cc granularity, rounding UP (ROUND_CEILING) so we
     never UNDERSTATE a cost we actually paid — maker-conservative for P&L. The
     over-statement is at most 0.99 cc = <$0.0001."""
-    try:
-        value = Decimal(s)
-    except InvalidOperation as exc:
-        raise MoneyParseError(f"unparseable dollars string: {s!r}") from exc
-    if value < 0:
-        raise MoneyParseError(f"negative fee {value}")
-    scaled = (value / _CC_QUANTUM).to_integral_value(rounding=ROUND_CEILING)
-    return CentiCents(int(scaled))
+    return _ceil_cc_from_dollars_str(s, kind="fee")
+
+
+def exposure_cc_from_dollars_str(s: str) -> CentiCents:
+    """Parse a Kalshi EXCHANGE-REPORTED EXPOSURE ``*_dollars`` string (the
+    positions payload's ``market_exposure_dollars`` — "Cost of the aggregate
+    market position in dollars") to centi-cents, rounding UP to the next whole
+    cc when it is sub-centi-cent.
+
+    WHY THIS IS NOT ``cc_from_dollars_str`` (2026-07-26 live fail-open defect).
+    ``FixedPointDollars`` carries "up to 6 decimal places of precision"
+    (docs.kalshi.com/api-reference/portfolio/get-positions.md — the older
+    getting_started/fixed_point_migration.md still says 4; the WIRE is
+    authoritative and sends 6). Measured on the live account: 46/46 open rows
+    emit 6 decimals and 21/46 are NOT a whole number of centi-cents (e.g.
+    ``"2.688790"`` = 26.8879 cc). The exact parser RAISES on every one of those,
+    and the documented int-cents fallback ``market_exposure`` is absent from
+    46/46 rows — so the fail-CLOSED reserve built from these figures silently
+    did not fire at all.
+
+    ROUNDING: an exposure is a LOSS / at-risk figure feeding fail-closed caps,
+    so it rounds UP (ROUND_CEILING) — the booked exposure is never LESS than the
+    exchange's truth. Rounding to nearest (or down) would let a cap read below
+    reality, which is the failure direction that costs money. The overstatement
+    is at most 0.99 cc = <$0.0001 per position. Exactness-critical callers
+    (prices, balances, revenue, settlement values) keep the strict
+    ``cc_from_dollars_str`` — this is a separate name, not a loosened primitive."""
+    return _ceil_cc_from_dollars_str(s, kind="exposure")
 
 
 def cc_to_decimal_dollars(cc: CentiCents) -> Decimal:

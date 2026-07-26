@@ -5,9 +5,13 @@ Given a ``BookModel`` (sim/book_model.py — the pricer-consistent leg/corr/posi
 triple), this runs the portfolio MC and produces the five key risk outputs:
 
 1. **P&L distribution** — EV ± MC standard error, std, P(profit).
-2. **VaR / CVaR (tail loss)** at 0.95/0.99, reported at the ``corr_high`` band
-   (correlation uncertainty widens risk, never hides it) — **CVaR_0.99 is the
-   headline book-risk number** and the one the halts/limits consume.
+2. **VaR / CVaR (tail loss)** at 0.95/0.99, reported on the TAIL-DEPENDENCE
+   STRESS joint at the ``high`` band (``corr_tail_stress_high``: correlation
+   uncertainty widens risk, never hides it, and a game moves as one in the corner)
+   — **CVaR_0.99 is the headline book-risk number** and the one the halts/limits
+   consume. The EV/P(book) LOCATION axis rides the OTHER joint
+   (``corr_location_point``, the exact per-pair matrix the fills were priced on);
+   the split is spelled out on ``compute_book_risk`` and in ``sim/book_model.py``.
 3. **P(large drawdown / ruin)** — P(loss > threshold) at bankroll-tied thresholds
    (the ruin proxy for a NO-seller: many shared games break together).
 4. **Per-GAME and per-LEG tail attribution** — the one genuinely new computation:
@@ -79,6 +83,15 @@ HEADLINE_LEVEL = 0.99
 # each within-game rho halfway to +1; tunable via ``challenger_inflation``.
 DEFAULT_CHALLENGER_INFLATION = 0.5
 
+# JOINT NAMES (2026-07-26 axis split). Every snapshot and every book_risk_snapshot
+# log line stamps which of the TWO joints on ``BookModel`` produced which axis, so
+# the two can never be confused by a reader: the enforced gates ride the
+# game-collapsed tail-dependence STRESS joint, the EV/P(book) axis rides the exact
+# per-pair PRICING joint. ``NO_JOINT`` marks a snapshot that sampled nothing.
+TAIL_STRESS_JOINT = "corr_tail_stress"
+LOCATION_JOINT = "corr_location"
+NO_JOINT = "none"
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,7 +110,17 @@ class BookRiskSnapshot:
     """The persisted, halt-feeding book-risk view for one MC run.
 
     All money is float cc (simulator domain). ``band`` is the correlation band the
-    stats were computed at ("high" for the gating number).
+    TAIL/GATING stats were computed at ("high" for the gating number);
+    ``location_band`` is the band the LOCATION stats (EV, P(book), p_night) were
+    computed at — the PRICING joint, which is what the quotes were priced from
+    (2026-07-26 band-mismatch fix; see the field comment below).
+
+    Every snapshot ALSO stamps WHICH OF THE TWO JOINTS produced each axis —
+    ``tail_joint`` and ``location_joint`` (see :class:`sim.book_model.BookModel`):
+    ``corr_tail_stress`` is the game-collapsed tail-dependence stress joint that
+    every enforced gate rides, ``corr_location`` is the exact per-pair pricing
+    joint. A reader of one snapshot (or one log line) can therefore never mistake
+    one axis' joint for the other's.
 
     P0-3 separates the SAMPLED model tail from the DETERMINISTIC maximum loss so
     the all-hit maximum can no longer dominate (and thereby silence) the sampled
@@ -117,6 +140,31 @@ class BookRiskSnapshot:
     n_samples: int
     seed: int
     n_positions: int
+
+    # AXIS SPLIT (2026-07-26). ``band`` above is the ADVERSE band the TAIL axes
+    # gate at (es_99 / challenger / governing / p_ruin / loss_quantiles / det-max /
+    # tail attribution) — unchanged. ``location_band`` is the band the LOCATION
+    # axes (ev_cc, ev_stderr_cc, std_cc, p_profit, p_night, p_loss_worse_than) are
+    # sampled at: the PRICING joint ("point"), because those fills were PRICED on
+    # the point joint. Publishing them off the corr-HIGH book marked every fill
+    # sold at fair+markup NEGATIVE on arrival BY CONSTRUCTION (measured +5.78pp of
+    # p_book and ≈+$33 of EV on the live book). This is a CORRECTNESS split, not a
+    # policy knob — there is no flag to turn it off.
+    location_band: str = "point"
+
+    # WHICH JOINT PRODUCED WHICH AXIS (the other half of the split — the band alone
+    # does not identify a joint, because the two joints DIFFER AT THE SAME BAND).
+    #   tail_joint     — always ``corr_tail_stress`` for a sampled snapshot: the
+    #                    game-collapsed stress joint every ENFORCED gate rides.
+    #   location_joint — ``corr_location`` (the exact per-pair pricing joint) when
+    #                    the location axis drew its own sample; ``corr_tail_stress``
+    #                    when the two matrices were IDENTICAL and one shared CRN
+    #                    draw served both (then the numbers literally came off the
+    #                    stress sample, and saying otherwise would be a lie).
+    #   Both are ``none`` on a snapshot that sampled nothing (UNKNOWN / empty /
+    #   all-reserved) — it never advertises a joint it never used.
+    tail_joint: str = TAIL_STRESS_JOINT
+    location_joint: str = LOCATION_JOINT
 
     # P0-2 position generation this snapshot was computed against. The caller
     # records ``ExposureBook.position_generation`` at the instant it reads the
@@ -299,7 +347,7 @@ def _p_ruin_from_pnl(
 
 
 def kill_tail_prob_upper(
-    pnls: Sequence["NDArray[np.float64] | None"],
+    pnls: Sequence[NDArray[np.float64] | None],
     threshold_cc: float,
     n_samples: int,
     z: float,
@@ -1010,6 +1058,31 @@ def compute_book_risk(
     deterministic all-hit stress. ``ruin_fractions`` × ``bankroll_cc`` set the
     P(loss > threshold) thresholds (skipped when no bankroll).
 
+    AXIS SPLIT (2026-07-26 correctness fix, not a policy knob — there is no flag).
+    Two axes, two NAMED joints (see :class:`sim.book_model.BookModel`):
+      * TAIL / GATING axis — ``var_99_cc``, ``es_99_cc``, ``challenger_es_99_cc``,
+        ``bridge_es_99_cc``, ``governing_model_es_99_cc``, ``p_ruin`` (+ its Wilson
+        bound), ``loss_quantiles_cc``, the deterministic maxima and the per-game /
+        per-leg tail attribution — sampled on the TAIL-DEPENDENCE STRESS joint
+        ``model.corr_tail_stress_for_band(band)`` (the game-wide collapse at the
+        adverse band), EXACTLY as before this split existed. Every one of those
+        fields is BIT-IDENTICAL to the pre-split build; the exact per-pair matrix
+        is deliberately NOT used here, because a Gaussian copula at a low per-pair
+        rho has almost no tail dependence while real games blow up together.
+      * LOCATION axis — ``ev_cc``, ``ev_stderr_cc``, ``std_cc``, ``p_profit``
+        (P(book)), ``p_night`` and the report-only ``p_loss_worse_than`` — sampled
+        on the PRICING joint (``model.corr_location_point``, the exact per-pair
+        point matrix the quotes were actually priced from). Marking those on the
+        collapsed corr-HIGH book made every fill sold at fair+markup mark NEGATIVE
+        on arrival BY CONSTRUCTION (worth +5.78pp of P(book) and ≈+$33 of EV on the
+        live book).
+    When the two MATRICES coincide (a book whose games each carry one uniform rho)
+    ONE shared CRN sample serves both and the output is bit-identical to the
+    pre-split behaviour; otherwise the location book is one extra draw on its own
+    spawned substream (off the hot path — this function runs async/off-loop).
+    ``tail_joint`` / ``location_joint`` on the returned snapshot stamp which joint
+    actually produced which axis.
+
     UNKNOWN model or empty book → a no-go snapshot (``unknown``/no positions), no
     usable stats (fail-closed, hard rule 6).
 
@@ -1034,6 +1107,12 @@ def compute_book_risk(
         return BookRiskSnapshot(
             unknown=model.unknown,
             band=band,
+            # Nothing sampled ⇒ no location axis to split; stamp it == band and
+            # both joints "none" so an empty/UNKNOWN snapshot never advertises a
+            # joint it never used.
+            location_band=band,
+            tail_joint=NO_JOINT,
+            location_joint=NO_JOINT,
             n_samples=n_samples,
             seed=seed,
             n_positions=n_positions,
@@ -1047,6 +1126,9 @@ def compute_book_risk(
         return BookRiskSnapshot(
             unknown=False,
             band=band,
+            location_band=band,  # nothing sampled (all-reserved) — see above
+            tail_joint=NO_JOINT,
+            location_joint=NO_JOINT,
             n_samples=n_samples,
             seed=seed,
             n_positions=0,
@@ -1057,7 +1139,25 @@ def compute_book_risk(
             mutex_aware_det_max_cc=reserve,
         )
 
-    corr = model.corr_for_band(band)
+    # --- AXIS SPLIT (2026-07-26): two joints, chosen BY NAME, never by band ----
+    # ``corr`` is the TAIL-DEPENDENCE STRESS joint at the adverse band — the
+    # game-wide collapse. EVERYTHING ENFORCED samples it, unchanged. ``corr_loc``
+    # is the PRICING joint — the exact per-pair POINT matrix the quotes were
+    # actually priced from. The LOCATION axes (EV, p_profit/P(book), p_night,
+    # p_loss_worse_than) must ride ``corr_loc`` or a fill sold at fair+markup marks
+    # NEGATIVE on arrival BY CONSTRUCTION (the whole book re-marked on a joint
+    # nobody quoted). The tail must ride ``corr`` because a Gaussian copula at the
+    # exact low per-pair rho has essentially NO tail dependence while real games
+    # blow up together — see the construction site in ``sim/book_model.py``.
+    corr = model.corr_tail_stress_for_band(band)
+    corr_loc = model.corr_location_point
+    # When the two joints are the SAME matrix (a book whose games each carry one
+    # uniform rho — max == mean == min — so the collapse IS the per-pair matrix)
+    # the two samples are the same sample: share it (one CRN draw, byte-identical
+    # to the pre-split behaviour, and no extra MC cost). Band NAMES are never
+    # compared here: at ``band="point"`` the stress joint is still the collapse,
+    # so sharing on the name would have leaked the collapse into the location axis.
+    share_location_sample = bool(np.array_equal(corr, corr_loc))
     bundle = _select_sampler(model, structural_cfg)
     _sampler = bundle.sampler
     # THREE INDEPENDENT, reproducible RNG substreams (production + challenger +
@@ -1076,8 +1176,13 @@ def compute_book_risk(
     # be reported BELOW the independent split (the conditioning may only make the
     # modeled tail fatter or equal, never thinner — spec P0-7). Spawned uncondition-
     # ally so the other four streams are byte-identical whether or not it is consumed.
-    seq_prod, seq_chal, seq_bridge, seq_struct, seq_split = (
-        np.random.SeedSequence(seed).spawn(5)
+    # BAND-MISMATCH SPLIT: a SIXTH substream for the LOCATION (pricing-joint)
+    # sample, spawned unconditionally and consumed only when the location band
+    # differs from the gating band, so the five streams above stay byte-identical
+    # whether or not the location re-sample runs (``SeedSequence.spawn(6)`` yields
+    # the same first five children ``spawn(5)`` did).
+    seq_prod, seq_chal, seq_bridge, seq_struct, seq_split, seq_loc = (
+        np.random.SeedSequence(seed).spawn(6)
     )
     rng = np.random.default_rng(seq_prod)
     values = _sampler(model.legs, corr, n_samples, rng)
@@ -1089,10 +1194,25 @@ def compute_book_risk(
         else ()
     )
     book = _book_pnl_from_values(values, model.positions)
-    ev = float(book.mean())
-    std = float(book.std(ddof=1)) if book.size > 1 else 0.0
-    ev_stderr = std / math.sqrt(book.size) if book.size > 0 else 0.0
-    p_profit = float(np.mean(book > 0.0))
+    # LOCATION book: the SAME positions re-scored on the PRICING joint (per-pair
+    # point matrix). Shared with the gating book whenever the two matrices coincide
+    # (no extra draw, bit-identical to pre-split); otherwise one extra sample on the
+    # dedicated substream. Off the hot path (this whole function runs async /
+    # off-loop), so the extra draw costs the MC worker, never the quote path.
+    if share_location_sample:
+        book_loc = book
+    else:
+        values_loc = _sampler(
+            model.legs, corr_loc, n_samples, np.random.default_rng(seq_loc)
+        )
+        book_loc = _book_pnl_from_values(values_loc, model.positions)
+        # Release the (n_samples x n_legs) value matrix at once — only the P&L
+        # vector is used downstream, so peak memory stays where it was.
+        del values_loc
+    ev = float(book_loc.mean())
+    std = float(book_loc.std(ddof=1)) if book_loc.size > 1 else 0.0
+    ev_stderr = std / math.sqrt(book_loc.size) if book_loc.size > 0 else 0.0
+    p_profit = float(np.mean(book_loc > 0.0))
     # P(NIGHT) (operator KPI 2026-07-25: "we just want the day to end
     # positive"): P(realized-so-far + open-book P&L > 0) on the production
     # book. Unlike ``p_profit`` (which RESETS as winning positions settle out
@@ -1102,13 +1222,19 @@ def compute_book_risk(
     # feed resets at process start (restart-scoped) until the day-anchored
     # settlement-ledger reconstruction lands.
     p_night = (
-        float(np.mean(book + float(realized_pnl_cc) > 0.0))
-        if realized_pnl_cc is not None and book.size
+        float(np.mean(book_loc + float(realized_pnl_cc) > 0.0))
+        if realized_pnl_cc is not None and book_loc.size
         else p_profit
     )
+    # TAIL axis — stays on the ADVERSE band book (correlation uncertainty widens
+    # the tail; it must not relocate the mean, which is the location axis' job).
     var_99, es_99 = _es_from_pnl(book, HEADLINE_LEVEL)
+    # REPORT-ONLY loss probabilities: location axis (the operator-facing view of the
+    # book they actually priced). The GATING tail-probability object is
+    # ``loss_quantiles_cc`` below, which stays on the adverse-band envelope —
+    # risk/limits.py reads that, never this.
     p_loss_worse_than = {
-        float(t): float(np.mean(book < -float(t))) for t in loss_thresholds_cc
+        float(t): float(np.mean(book_loc < -float(t))) for t in loss_thresholds_cc
     }
     # A2 P(RUIN): P(current_equity + wave P&L < ruin floor). Uses live equity so it
     # tightens as we draw down (a fixed loss-threshold would understate ruin once
@@ -1291,6 +1417,11 @@ def compute_book_risk(
     return BookRiskSnapshot(
         unknown=False,
         band=band,
+        location_band=band if share_location_sample else "point",
+        tail_joint=TAIL_STRESS_JOINT,
+        location_joint=(
+            TAIL_STRESS_JOINT if share_location_sample else LOCATION_JOINT
+        ),
         n_samples=n_samples,
         seed=seed,
         n_positions=n_positions,
@@ -2070,7 +2201,13 @@ def evaluate_candidate_book_risk(
     pre_split_pnl: NDArray[np.float64] | None = None
     post_split_pnl: NDArray[np.float64] | None = None
     if model.legs:
-        corr = model.corr_for_band(band)
+        # THE QUOTE-TIME GATE IS 100% TAIL AXIS. Every number this evaluator
+        # produces — PRE/POST ES, P(ruin), det-max, and the CRN candidate EV
+        # DIFFERENCE that feeds the confirm decision — is a GATING number, so it
+        # rides the TAIL-DEPENDENCE STRESS joint end to end. The exact per-pair
+        # PRICING joint is deliberately never read here (2026-07-26 axis split):
+        # loosening a gate is the one thing that split must not do.
+        corr = model.corr_tail_stress_for_band(band)
         # P0-8: same-game-only inflation; cross-game rho preserved.
         challenger_corr = _inflate_corr(
             corr, challenger_inflation, _same_game_mask(model)
@@ -2329,7 +2466,7 @@ def _candidate_gate(
     delta_p_book: float = 0.0,
     delta_p_book_se: float = 0.0,
     ideal_delta_p_book: float = 0.0,
-    post_pnls: Sequence["NDArray[np.float64] | None"] = (),
+    post_pnls: Sequence[NDArray[np.float64] | None] = (),
     n_samples: int = 0,
     ruin_prob_ci_z: float = 0.0,
 ) -> tuple[bool, str]:

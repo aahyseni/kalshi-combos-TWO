@@ -130,9 +130,9 @@ class TestRealRhoCorrelatedTail:
         # DIRECT wiring proof: the high-band within-game off-diagonal carries the
         # PRICER's real btts|total high correlation (+0.82), NOT the flat default
         # band's high (+0.40). This is the number the MC samples the joint tail on.
-        assert float(real.corr_high[0, 1]) == pytest.approx(0.82, abs=1e-6)
-        assert float(flat.corr_high[0, 1]) == pytest.approx(DEFAULT_FLAT_BAND[2], abs=1e-6)
-        assert float(real.corr_high[0, 1]) > float(flat.corr_high[0, 1])
+        assert float(real.corr_tail_stress_high[0, 1]) == pytest.approx(0.82, abs=1e-6)
+        assert float(flat.corr_tail_stress_high[0, 1]) == pytest.approx(DEFAULT_FLAT_BAND[2], abs=1e-6)
+        assert float(real.corr_tail_stress_high[0, 1]) > float(flat.corr_tail_stress_high[0, 1])
 
         # TAIL proof: with a rare co-hit (each leg YES prob 0.10 ⇒ we lose a
         # premium only when a parlay HITS), the real +0.82 correlation makes BOTH

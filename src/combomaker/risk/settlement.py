@@ -47,7 +47,7 @@ from combomaker.core.money import (
 from combomaker.core.reasons import ReasonCode
 from combomaker.ops.logging import get_logger
 from combomaker.risk.balance import BalanceTracker, Settlement
-from combomaker.risk.exposure import ExposureBook, OpenPosition
+from combomaker.risk.exposure import ExposureBook, OpenPosition, stable_ledger_key
 from combomaker.risk.killswitch import KillSwitch
 
 log = get_logger(__name__)
@@ -208,7 +208,12 @@ class ReconcileResult:
 class SettlementLedger(Protocol):
     """The durable-ledger surface the handler needs (2026-07-26). Structural so
     ``risk.settlement`` never imports ``ops.persistence``; the live wiring
-    passes a ``Store``-backed adapter, tests pass a stub, None disables it."""
+    passes a ``Store``-backed adapter, tests pass a stub, None disables it.
+
+    The stable-identity fields (``leg_set_hash`` / ``combo_ticker`` /
+    ``our_side`` / ``contracts_centi``) are the DURABLE key: ``position_id`` is
+    volatile — a restart re-mints it (``rehydrate:<ticker>``), so a ledger
+    keyed on it alone can never match an open row written before the restart."""
 
     def record_settled(
         self,
@@ -217,6 +222,10 @@ class SettlementLedger(Protocol):
         settled_value: float,
         realized_pnl_cc: int,
         settlement_fee_cc: int,
+        leg_set_hash: str | None = None,
+        combo_ticker: str | None = None,
+        our_side: str | None = None,
+        contracts_centi: int | None = None,
     ) -> None: ...
 
 
@@ -411,11 +420,28 @@ class SettlementHandler:
             # never break settlement booking (the money path).
             if self._ledger is not None:
                 try:
+                    # DURABLE IDENTITY (2026-07-26): pass the restart-stable
+                    # key alongside the volatile position_id. After a restart
+                    # the rehydrator re-mints ids, so a position_id-only match
+                    # can NEVER hit the open row this position was written
+                    # under — every settled write silently vanished and the
+                    # ledger covered 3.74% of the book (6 rows / $27.35 of
+                    # $731.04), heading to 0% at the next restart.
                     self._ledger.record_settled(
                         position_id=pos.position_id,
                         settled_value=float(parsed.settled_value or 0.0),
                         realized_pnl_cc=int(realized_cc),
-                        settlement_fee_cc=0,
+                        # The EXACT per-position share of the exchange's
+                        # settlement fee (was hardcoded 0). Recorded only into
+                        # the ledger's fee columns — `realized_cc` above is
+                        # already NET of fees (balance.apply_settlement), and
+                        # `day_realized_pnl_cc` sums realized_pnl_cc + fills
+                        # fees, so this never double-counts a cost.
+                        settlement_fee_cc=int(settlement.fee_cc),
+                        leg_set_hash=stable_ledger_key(pos),
+                        combo_ticker=pos.combo_ticker,
+                        our_side=pos.our_side.value,
+                        contracts_centi=int(pos.contracts),
                     )
                 except Exception:
                     log.exception(

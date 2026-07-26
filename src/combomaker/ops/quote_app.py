@@ -14,17 +14,24 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import json
 import sys
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
 from typing import Any, Protocol
+from zoneinfo import ZoneInfo
 
 from combomaker.core.clock import Clock, SystemClock
 from combomaker.core.conventions import Side, load_conventions
-from combomaker.core.money import CentiCents, MoneyParseError, cc_from_dollars_str
+from combomaker.core.money import (
+    ONE_DOLLAR,
+    CentiCents,
+    MoneyParseError,
+    exposure_cc_from_dollars_str,
+)
 from combomaker.core.quantity import CentiContracts, qty_from_fp_str
 from combomaker.core.reasons import ReasonCode
 from combomaker.exchange.auth import Credentials, RequestSigner
@@ -77,6 +84,7 @@ from combomaker.risk.inplay import InPlayDetector
 from combomaker.risk.killswitch import HaltEvent, KillSwitch
 from combomaker.risk.lastlook import LastLookPolicy
 from combomaker.risk.limits import LimitChecker, StarvationWatchdog
+from combomaker.risk.quarantine import MarketQuarantine
 from combomaker.risk.reservation import (
     RiskReservationService,
     open_combo_positions_from_positions,
@@ -341,6 +349,11 @@ def build_lifecycle_config(
         # (alarm-only backstop under every writer-path miss).
         fills_ledger_sweep_interval_s=risk_cfg.fills_ledger_sweep_interval_s,
         fills_ledger_sweep_lookback_s=risk_cfg.fills_ledger_sweep_lookback_s,
+        # POSITION-LEDGER DIVERGENCE INVARIANT (2026-07-26): cadence of the
+        # open-positions vs open-ledger-rows count (alarm-only observability).
+        ledger_divergence_sweep_interval_s=(
+            risk_cfg.ledger_divergence_sweep_interval_s
+        ),
         # F1 MONOTONE PRE-PRICING GATE (2026-07-16 throughput batch-1): decline
         # on already-breached candidate-monotone caps BEFORE pricing. Default
         # OFF (today's behaviour); the operator arms it in the local YAML.
@@ -452,6 +465,114 @@ _HARD_HALT_REASONS: frozenset[ReasonCode] = frozenset(
         ReasonCode.HALT_BREAKER_ERROR,
     }
 )
+
+
+# --------------------------------------------------------------------------- #
+# Metadata-change breaker: the field partition (2026-07-26 rebuild).
+# Everything here is derived from measured exchange behaviour — see
+# QuoteApp._settlement_fingerprint for the per-field evidence.
+# --------------------------------------------------------------------------- #
+
+# Raw-payload keys that are terms in the PAYOFF FUNCTION. A move in any of them
+# is a settlement change: whole-bot halt + needs_reconcile.
+_SETTLEMENT_PAYOUT_FIELDS: tuple[str, ...] = (
+    "rules_primary",
+    "rules_secondary",
+    "strike_type",
+    "floor_strike",
+    "cap_strike",
+    "custom_strike",
+    "expiration_time",
+    "latest_expiration_time",
+    "market_type",
+    "notional_value_dollars",
+)
+
+# Sentinel for a key that is ABSENT from the payload, distinct from any value it
+# could hold (including None/"" ), so a rule or strike VANISHING is a change.
+_ABSENT = "\x00absent"
+
+
+def _canonical(value: object) -> str:
+    """Order-stable, type-stable rendering of a raw payload value. ``sort_keys``
+    means a dict (``custom_strike``) whose key order changes is NOT a change,
+    while any value change is. The type tag keeps 5.5 (float) distinct from
+    "5.5" (str) — a silent type flip on a strike is a real change."""
+    if value is _ABSENT:
+        return "\x00absent"
+    try:
+        return f"{type(value).__name__}:{json.dumps(value, sort_keys=True)}"
+    except (TypeError, ValueError):  # pragma: no cover - non-JSON payload value
+        return f"{type(value).__name__}:{value!r}"
+
+
+# Kalshi market statuses we MODEL as pure trading-state lifecycle. REST enum is
+# doc-verified (docs/api-notes/index-scan.md:106,149): initialized | inactive |
+# active | closed | determined | disputed | amended | finalized. `deactivated` /
+# `activated` are the explicit pause/unpause EVENTS that move active<->inactive;
+# active/inactive -> closed happens implicitly at close_time.
+_LIFECYCLE_STATUSES: frozenset[str] = frozenset(
+    {
+        "initialized",
+        "inactive",
+        "active",
+        "closed",
+        "determined",
+        "finalized",
+        # "settled" is a WEBSOCKET event name; REST never returns it (the
+        # pre-rebuild terminal tuple carried it as dead code). Kept modelled on
+        # purpose: if a WS-sourced status string ever reaches this baseline it
+        # means "settled", which is lifecycle — it must not read as an
+        # unmodelled value and hard-halt.
+        "settled",
+    }
+)
+
+# Statuses whose ARRIVAL is settlement-relevant: the graded result is being
+# contested (`disputed`) or changed (`amended`). Never exempted, at any horizon.
+_SETTLEMENT_STATUSES: frozenset[str] = frozenset({"disputed", "amended"})
+
+# The only status in which the exchange accepts orders on a market. Used for the
+# STRUCTURAL quarantine release (no timers): a paused market that never comes
+# back never leaves quarantine.
+_TRADABLE_STATUSES: frozenset[str] = frozenset({"active"})
+
+
+def _is_tradable_status(status: str) -> bool:
+    return status in _TRADABLE_STATUSES
+
+
+def _status_change_class(prior: str, current: str) -> str:
+    """Classify a status TRANSITION, not the field.
+
+    ``"none"`` — unchanged.
+    ``"lifecycle"`` — both ends are modelled trading-state values (pause,
+    unpause, close, determine, finalize). Scopes to a quarantine.
+    ``"settlement"`` — the new status is ``disputed``/``amended`` (the grade is
+    contested or changed), or is a string the REST enum does not contain
+    (fail-closed: a status we do not model is one we cannot call benign).
+    """
+    if prior == current:
+        return "none"
+    if current in _SETTLEMENT_STATUSES:
+        return "settlement"
+    if current in _LIFECYCLE_STATUSES:
+        return "lifecycle"
+    return "settlement"
+
+
+@dataclass(frozen=True, slots=True)
+class _MetaBaseline:
+    """Last sampled metadata state for one market — the metadata breaker's
+    per-ticker baseline. Two fingerprints (payoff vs trading-state), the raw
+    status and result the transition rules need, and the end-of-life horizon
+    kept for observability on the lifecycle lane."""
+
+    settlement_fp: str
+    lifecycle_fp: str
+    status: str
+    result: str
+    horizon: datetime | None
 
 
 class PaperSender:
@@ -566,16 +687,38 @@ class PositionsGetter(Protocol):
     async def get_positions(self, **params: str | int) -> JsonDict: ...
 
 
-def _exchange_exposure_cc_by_ticker(positions_payload: dict[str, Any]) -> dict[str, int]:
+def _exchange_exposure_cc_by_ticker(
+    positions_payload: dict[str, Any],
+) -> tuple[dict[str, int], dict[str, str]]:
     """Per-ticker cost basis of the remaining open position, in cc, from the
-    positions payload's own ``market_exposure_dollars`` (doc-verified
-    2026-07-21: "Cost of the aggregate market position in dollars" — the money
-    at risk on the open position). Prefers the exact fixed-point dollars
-    string; falls back to int-cents ``market_exposure``; a ticker with neither
-    (or an unparseable value) is simply absent — the caller must then leave
-    that position alarm-only rather than invent an at-risk figure (rule 6)."""
+    positions payload's own ``market_exposure_dollars`` ("Cost of the aggregate
+    market position in dollars" — the money at risk on the open position).
+
+    Returns ``(exposure_cc_by_ticker, unreadable_by_ticker)``: the second maps a
+    ticker whose at-risk figure could NOT be read to the raw wire value, so the
+    caller can adopt it fail-CLOSED and ALARM instead of silently booking zero.
+
+    PRECISION (2026-07-26 live fail-open defect — this is the whole fix).
+    ``market_exposure_dollars`` is a ``FixedPointDollars`` string with "up to 6
+    decimal places of precision" (get-positions.md). Measured on the live
+    account the same day: 46/46 open rows carry SIX decimals and 21/46 are not a
+    whole number of centi-cents ("2.688790" = 26.8879 cc). The exact parser
+    ``cc_from_dollars_str`` RAISES on every one of those, and the documented
+    int-cents fallback ``market_exposure`` is absent from 46/46 real rows — so
+    the fallback was dead code and this function returned NOTHING for 21 of 46
+    positions. ``reserve_from_exchange_figures`` then returned None for each and
+    the fail-CLOSED reserve — the entire safety net for positions no durable
+    source can model — never fired. Measured: 2 open positions worth $9.0106
+    contributed ZERO to deterministic max loss at boot AND after reconcile.
+    An EXPOSURE is a loss figure feeding fail-closed caps, so it now parses
+    through ``exposure_cc_from_dollars_str``, which rounds UP: the booked
+    exposure is never BELOW the exchange's truth.
+
+    The int-cents ``market_exposure`` fallback is KEPT (older payload eras and
+    the recorded fixtures still carry it) but is no longer load-bearing."""
     rows = positions_payload.get("market_positions") or positions_payload.get("positions") or []
     out: dict[str, int] = {}
+    unreadable: dict[str, str] = {}
     for row in rows:
         ticker = str(row.get("ticker") or row.get("market_ticker") or "")
         if not ticker:
@@ -583,14 +726,110 @@ def _exchange_exposure_cc_by_ticker(positions_payload: dict[str, Any]) -> dict[s
         dollars = row.get("market_exposure_dollars")
         if dollars is not None:
             try:
-                out[ticker] = int(cc_from_dollars_str(str(dollars)))
+                # Fail-CLOSED rounding: ceil to the next whole cc so a
+                # sub-cc wire figure is booked at or ABOVE truth, never below.
+                out[ticker] = int(exposure_cc_from_dollars_str(str(dollars)))
                 continue
             except MoneyParseError:
-                pass
+                unreadable[ticker] = str(dollars)
+                continue
         cents = row.get("market_exposure")
         if isinstance(cents, int) and not isinstance(cents, bool):
             out[ticker] = cents * 100
-    return out
+        else:
+            unreadable[ticker] = "" if cents is None else repr(cents)
+    return out, unreadable
+
+
+def _bump(metrics: Metrics | None, name: str) -> None:
+    """Counter bump that tolerates an absent Metrics sink. The boot rehydrator
+    takes ``metrics`` as an explicit optional argument (the live run always
+    passes ``self._metrics``) so the alarm never depends on instance state the
+    unit tests, which call it as an unbound method, do not construct."""
+    if metrics is not None:
+        metrics.inc(name)
+
+
+def reserve_from_exchange_figures(
+    ticker: str, side: Side, contracts_centi: int, exposure_cc: int | None
+) -> OpenPosition | None:
+    """Build the CONSERVATIVELY-RESERVED holding for an exchange position whose
+    legs no durable source can resolve (P0-4, ``risk_modeled=False``). ONE code
+    path, shared by the startup rehydrator and the runtime reconcile net, so the
+    two can never drift.
+
+    Everything comes from exchange truth: side/count from the signed position,
+    premium at risk from the exchange's own ``market_exposure``. The entry price
+    is rounded UP so the booked ``max_loss_cc`` (= contracts × entry // 100) is
+    never BELOW the exchange's figure (fail-safe LARGER). The reserve counts in
+    every deterministic / gross / concentration cap and enters the portfolio MC
+    as a deterministic reserve — never a leg sampled at a fabricated marginal.
+
+    Identity is a single self-leg (the combo market itself, its own cluster):
+    permanently unreadable ⇒ the marginal watch never baselines it (no false
+    trip), and its game key is its own singleton (it can't be netted with
+    anything anyway). Self-leg side is ALWAYS "yes": a combo settles YES iff its
+    own market settles YES — the leg encodes the combo's YES definition, and
+    direction lives SOLELY in ``our_side``. Writing our position side here would
+    double-complement every NO reserve downstream (receivable sweep, daily mark):
+    losers would shield the give-back halts with full notional and winners with
+    nothing — the exact inversion of the shield's contract (2026-07-21 review,
+    CRITICAL finding 2).
+
+    Returns ``None`` when there is no PROVABLE at-risk figure (missing/unreadable
+    /non-positive exposure, or a non-positive count). A caller ADOPTING a position
+    must then fall back to ``reserve_at_full_notional`` (fail-CLOSED upper bound)
+    and alarm — never to zero."""
+    if exposure_cc is None or exposure_cc <= 0 or contracts_centi <= 0:
+        return None
+    # Entry price per contract, rounded UP: booked max_loss_cc
+    # (= contracts × entry // 100) is then ≥ the exchange's exposure.
+    entry_cc = -(-exposure_cc * 100 // contracts_centi)  # ceil div
+    return _build_reserve(ticker, side, contracts_centi, CentiCents(entry_cc))
+
+
+def reserve_at_full_notional(
+    ticker: str, side: Side, contracts_centi: int
+) -> OpenPosition | None:
+    """FAIL-CLOSED LAST RESORT (2026-07-26): reserve an exchange position whose
+    at-risk figure is UNREADABLE at the maximum possible loss — $1.00 per
+    contract.
+
+    This is NOT an invented number (hard rule 6 is about guessing a *plausible*
+    figure): a Kalshi binary is bought for at most $1.00 per contract and can
+    never lose more than the premium paid, so ``contracts × $1.00`` is a PROVEN
+    upper bound on the position's cost basis, derived from nothing but the
+    exchange's own signed contract count. It is the only value that is safe in
+    the absence of a price, and it is deliberately punitive — an unreadable
+    exposure figure should make the caps bind HARDER, not vanish, which is what
+    forces the operator to fix the parse rather than quietly run fail-open.
+
+    Callers MUST pair this with an alarm (``exchange_exposure.unreadable``) so
+    the degraded state is visible instead of silent.
+
+    Returns ``None`` only for a non-positive contract count (nothing at risk)."""
+    if contracts_centi <= 0:
+        return None
+    return _build_reserve(ticker, side, contracts_centi, ONE_DOLLAR)
+
+
+def _build_reserve(
+    ticker: str, side: Side, contracts_centi: int, entry_price_cc: CentiCents
+) -> OpenPosition:
+    """The ONE reserve-holding constructor both routes above share, so the
+    identity contract documented in ``reserve_from_exchange_figures`` (self-leg
+    always "yes", ``risk_modeled=False``, ``reserve:<ticker>`` id) can never
+    drift between the priced and the fail-closed path."""
+    return OpenPosition(
+        position_id=f"reserve:{ticker}",
+        combo_ticker=ticker,
+        collection=None,
+        our_side=side,
+        contracts=CentiContracts(contracts_centi),
+        entry_price_cc=entry_price_cc,
+        legs=(LegRef(ticker, ticker, "yes"),),
+        risk_modeled=False,
+    )
 
 
 async def _exchange_position_confirmed_flat(
@@ -675,7 +914,21 @@ async def position_reconcile_unmodeled_once(
             break
     merged: dict[str, Any] = {"market_positions": rows}
     exch_by_ticker = open_combo_positions_from_positions(merged)
-    exposure_cc_by_ticker = _exchange_exposure_cc_by_ticker(merged)
+    exposure_cc_by_ticker, unreadable_exposure = _exchange_exposure_cc_by_ticker(merged)
+    if unreadable_exposure:
+        # OBSERVABLE, never silent (2026-07-26): a figure we cannot read is the
+        # precondition for the fail-open defect this fix closed. Alarm on every
+        # pass it persists — the adoption loop below still books these fail-CLOSED.
+        metrics.inc("exchange_exposure.unreadable")
+        log.error(
+            "exchange_exposure_unreadable",
+            tickers=sorted(unreadable_exposure),
+            raw_values=[unreadable_exposure[t] for t in sorted(unreadable_exposure)],
+            detail="the exchange's own at-risk figure could not be parsed for "
+            "these open positions — any position ADOPTED below is booked at the "
+            "$1.00/contract fail-closed upper bound, never at zero; investigate "
+            "the wire format immediately (this is the fail-open defect class)",
+        )
 
     # (3) release reserves the exchange no longer lists open — but ONLY on a
     # TARGETED read whose row parses to an explicit zero (review F3: absence
@@ -709,6 +962,169 @@ async def position_reconcile_unmodeled_once(
             reserved_max_loss_cc=pos.max_loss_cc,
             detail="targeted read confirms the reserved position flat (settled "
             "or externally exited) — reserve released",
+        )
+
+    # RESIDUAL-RESERVE REBUILD (2026-07-26, B1). A reserve is a placeholder for
+    # the part of an exchange holding that NO leg-aware record covers. The
+    # exchange reports ONE aggregate row per ticker, so once modeled positions
+    # appear on a reserved ticker there are exactly two wrong answers and one
+    # right one:
+    #
+    #   * keep both      ⇒ DOUBLE-COUNTS the modeled contracts in every
+    #                      deterministic / gross / concentration cap;
+    #   * drop the whole ⇒ FAILS OPEN. A ``fill:<quote_id>`` position carries
+    #     reserve         ONLY its own fill, never the aggregate; repeat fills
+    #                      on one combo ticker are NORMAL (the live store shows
+    #                      31 / 21 / 19 / 15 on single tickers), so a 200-centi
+    #                      fill would erase a 700-centi exchange holding — a 71%
+    #                      understatement with only the divergence line alarming;
+    #   * QUANTITY-AWARE ⇒ carry ``max(0, exchange − modeled)``, REBUILT from
+    #                      exchange truth on every pass. The book then EQUALS the
+    #                      exchange rather than choosing which way to be wrong.
+    #
+    # Premium for the residual comes from the exchange payload's OWN cost basis
+    # (``market_exposure``) MINUS the premium the modeled records already book
+    # (F1 below) — never an assumed price, never a per-contract average (hard
+    # rule 6). With no readable exposure figure, or no positive remainder, the
+    # existing reserve is HELD unchanged (fail-safe LARGER) and alarms. Modeled
+    # ≥ exchange clamps the reserve to zero (removed); any EXCESS is left to the
+    # quantity-divergence net below, which still alarms. And the reserve is only
+    # ever SHRUNK by a payload that accounts for the whole book on this ticker
+    # (F2 below) — never by one that lags a just-confirmed fill.
+    for reserve in [
+        p for p in exposure.positions.values() if p.position_id.startswith("reserve:")
+    ]:
+        ticker = reserve.combo_ticker
+        exch = exch_by_ticker.get(ticker)
+        if exch is None:
+            continue  # absence is owned by the stale-reserve pass above (HELD)
+        modeled = [
+            p
+            for p in exposure.positions.values()
+            if p.combo_ticker == ticker
+            and p.our_side is exch.side
+            and not p.position_id.startswith("reserve:")
+        ]
+        modeled_centi = sum(int(p.contracts) for p in modeled)
+        if modeled_centi <= 0:
+            continue  # nothing leg-aware covers this ticker — the reserve stands
+        residual_centi = max(0, exch.contracts_centi - modeled_centi)
+        # LAGGING-PAYLOAD GUARD (2026-07-26, F2). The positions payload is
+        # fetched at the TOP of this function (up to 25 sequential REST pages);
+        # ``modeled`` is read from the LIVE book here, many round trips later. A
+        # fill confirmed INSIDE that window is in the book but NOT yet in the
+        # exchange row, so ``exchange − modeled`` would subtract the brand-new
+        # fill FROM THE RESERVE — measured: a true 700-centi / 43,400cc holding
+        # collapsing to 500 centi / 31,000cc (a 28.6% undercount) while the
+        # divergence net stayed SILENT, because the shrunken book then matched
+        # the stale row exactly. Self-healing only at the next reconcile
+        # (``risk.position_reconcile_interval_s``) is not a defense.
+        #
+        # So the reserve is only ever SHRUNK by a payload that accounts for the
+        # WHOLE book on this ticker (exchange ≥ reserve + modeled). Otherwise
+        # the reserve is HELD at full size (fail-safe LARGER) and the condition
+        # is made OBSERVABLE: the held book necessarily exceeds the exchange row,
+        # so the quantity-divergence net below alarms, plus a dedicated counter
+        # here. A payload that has caught up shrinks it on the very next pass.
+        if 0 < residual_centi < int(reserve.contracts):
+            metrics.inc("position_reconcile.reserve_hold_lagging_payload")
+            log.warning(
+                "position_reconcile_reserve_hold_lagging_payload",
+                ticker=ticker,
+                exchange_contracts_centi=exch.contracts_centi,
+                modeled_contracts_centi=modeled_centi,
+                reserved_contracts_centi=int(reserve.contracts),
+                would_be_residual_contracts_centi=residual_centi,
+                detail="the exchange row does not account for the whole book on "
+                "this ticker (exchange < reserve + modeled) — a fill confirmed "
+                "after this pass's positions fetch reads exactly like this, and "
+                "shrinking would subtract that fill FROM the reserve — reserve "
+                "HELD at full size (fail-safe LARGER); the quantity-divergence "
+                "net alarms until the payload catches up",
+            )
+            continue
+        if residual_centi == 0:
+            exposure.remove_position(reserve.position_id)
+            if balance is not None:
+                # A receivable noted for this reserve is void with it (review F6).
+                balance.cancel_receivable(reserve.position_id)
+            log.info(
+                "position_reconcile_reserve_superseded",
+                ticker=ticker,
+                reserved_max_loss_cc=reserve.max_loss_cc,
+                exchange_contracts_centi=exch.contracts_centi,
+                modeled_contracts_centi=modeled_centi,
+                detail="leg-aware modeled positions now cover the WHOLE exchange "
+                "holding on this ticker — the unknown-legs reserve is superseded "
+                "(holding both would double-count identical contracts); any "
+                "modeled EXCESS is graded by the quantity-divergence net",
+            )
+            continue
+        exposure_cc = exposure_cc_by_ticker.get(ticker)
+        rebuilt = None
+        if exposure_cc is not None and exposure_cc > 0:
+            # RESIDUAL COST BASIS = exchange aggregate MINUS what the leg-aware
+            # records already book (2026-07-26, F1). Pro-rating the aggregate by
+            # CONTRACTS assumed every contract on the ticker was bought at the
+            # same price; on a price-skewed ticker that is simply false and it
+            # fails OPEN. Measured: a reserve bought at 90¢ (500 centi /
+            # 45,000cc) plus a modeled fill at 20¢ (200 centi / 4,000cc) —
+            # exchange 700 centi / 49,000cc — booked 39,000cc, a 20.4%
+            # UNDERSTATEMENT flowing straight into deterministic_max_loss_cc,
+            # gross, per-game and every cap that scales off det-max (the reverse
+            # skew OVERSTATED by 49.7%).
+            #
+            # Subtracting the modeled positions' OWN booked premium needs no
+            # price assumption at all and makes booked premium identically EQUAL
+            # to the exchange figure (reserve + modeled = exchange), not merely
+            # approximately. A non-positive remainder (modeled premium already
+            # covers the exchange figure — e.g. a lagging cost basis) yields no
+            # PROVABLE at-risk amount, so ``reserve_from_exchange_figures``
+            # returns None and the reserve is HELD unchanged below (fail-safe
+            # LARGER; an at-risk amount is never invented — hard rule 6).
+            residual_exposure_cc = max(
+                0, exposure_cc - sum(p.max_loss_cc for p in modeled)
+            )
+            rebuilt = reserve_from_exchange_figures(
+                ticker, exch.side, residual_centi, residual_exposure_cc
+            )
+        if rebuilt is None:
+            log.warning(
+                "position_reconcile_reserve_residual_unpriced",
+                ticker=ticker,
+                exchange_contracts_centi=exch.contracts_centi,
+                modeled_contracts_centi=modeled_centi,
+                residual_contracts_centi=residual_centi,
+                detail="modeled positions cover only part of this ticker but the "
+                "exchange payload carries no readable at-risk figure — the "
+                "existing reserve is HELD unchanged (fail-safe LARGER; an "
+                "at-risk amount is never invented)",
+            )
+            continue
+        if (
+            int(rebuilt.contracts) == int(reserve.contracts)
+            and int(rebuilt.entry_price_cc) == int(reserve.entry_price_cc)
+            and rebuilt.our_side is reserve.our_side
+        ):
+            continue  # already exact — no churn, no generation bump
+        # Same position_id ⇒ replaces the reserve in place.
+        exposure.add_position(rebuilt)
+        if balance is not None:
+            # The old size's cash claim is stale; the settlement-receivable
+            # refresh re-notes this position at its new size on the next tick.
+            balance.cancel_receivable(reserve.position_id)
+        log.info(
+            "position_reconcile_reserve_resized",
+            ticker=ticker,
+            exchange_contracts_centi=exch.contracts_centi,
+            modeled_contracts_centi=modeled_centi,
+            residual_contracts_centi=residual_centi,
+            previous_reserved_max_loss_cc=reserve.max_loss_cc,
+            reserved_max_loss_cc=rebuilt.max_loss_cc,
+            detail="leg-aware modeled positions cover part of this ticker — the "
+            "unknown-legs reserve is rebuilt from exchange truth to carry ONLY "
+            "the residual contracts, so the book equals the exchange aggregate "
+            "(no double count, no dropped premium)",
         )
 
     # QUANTITY divergence net (review F5): presence alone is not
@@ -748,39 +1164,56 @@ async def position_reconcile_unmodeled_once(
     local_fill_tickers = [
         t for t in unmodeled if await store.has_fill_for_ticker(t)
     ]
-    recovery_owned = set(local_fill_tickers)
+    # BOOK COMPLETENESS (2026-07-26): "a local fills row exists" is NOT enough to
+    # hand a ticker to the fill-recovery sweep. That sweep re-models from THIS
+    # run's in-memory quote state, and both it and the startup rehydrator need a
+    # resolvable LEG SET. A combo whose legs no durable source can answer (ledger
+    # ∪ tape) is re-modelable by NOBODY — the old ``recovery_owned`` skip made it
+    # count in NEITHER path, so its premium silently left deterministic max loss
+    # (measured live: 7 combos / $40.03, a 5.35% understatement of every cap that
+    # scales off det-max). Ownership now requires PROVEN leg resolvability.
+    resolvable = {
+        h["combo_ticker"] for h in await store.held_positions(local_fill_tickers)
+    }
+    recovery_owned = set(local_fill_tickers) & resolvable
+    unresolvable_legs = sorted(set(local_fill_tickers) - resolvable)
 
     adopted: list[str] = []
     alarm_only: list[str] = []
+    notional_floored: list[str] = []
     for ticker in unmodeled:
         if ticker in recovery_owned:
             continue  # class 1: the fill-recovery sweep re-models it exactly
         exch = exch_by_ticker[ticker]
         exposure_cc = exposure_cc_by_ticker.get(ticker)
-        if exposure_cc is None or exposure_cc <= 0 or exch.contracts_centi <= 0:
-            alarm_only.append(ticker)  # no provable at-risk figure — never guess
-            continue
-        # Entry price per contract, rounded UP: booked max_loss_cc
-        # (= contracts × entry // 100) is then ≥ the exchange's exposure.
-        entry_cc = -(-exposure_cc * 100 // exch.contracts_centi)  # ceil div
-        reserved = OpenPosition(
-            position_id=f"reserve:{ticker}",
-            combo_ticker=ticker,
-            collection=None,
-            our_side=exch.side,
-            contracts=CentiContracts(exch.contracts_centi),
-            entry_price_cc=CentiCents(entry_cc),
-            # Self-leg side is ALWAYS "yes": a combo settles YES iff its own
-            # market settles YES — the leg encodes the combo's YES definition,
-            # and direction lives SOLELY in our_side. Writing our position
-            # side here double-complements every NO reserve downstream
-            # (receivable sweep, daily mark): losers would shield the
-            # give-back halts with full notional and winners with nothing —
-            # the exact inversion of the shield's contract (2026-07-21
-            # review, CRITICAL finding 2).
-            legs=(LegRef(ticker, ticker, "yes"),),
-            risk_modeled=False,
+        reserved = reserve_from_exchange_figures(
+            ticker, exch.side, exch.contracts_centi, exposure_cc
         )
+        if reserved is None:
+            # FAIL-CLOSED, NEVER SILENT (2026-07-26). The old code left this
+            # position out of the book entirely ("alarm-only") — a real exchange
+            # holding contributing ZERO to every cap, which is exactly how the
+            # 6-decimal parse failure turned into a fail-OPEN book. An
+            # unreadable at-risk figure now books the PROVEN upper bound
+            # ($1.00/contract) instead of zero; only a non-positive contract
+            # count (nothing at risk) can still leave a ticker unbooked.
+            reserved = reserve_at_full_notional(ticker, exch.side, exch.contracts_centi)
+            if reserved is None:
+                alarm_only.append(ticker)
+                continue
+            notional_floored.append(ticker)
+            metrics.inc("exchange_exposure.reserved_at_full_notional")
+            log.error(
+                "position_reconcile_reserved_at_full_notional",
+                ticker=ticker,
+                contracts_centi=exch.contracts_centi,
+                raw_exposure=unreadable_exposure.get(ticker, ""),
+                reserved_max_loss_cc=reserved.max_loss_cc,
+                detail="the exchange's at-risk figure for this open position is "
+                "unreadable — booked at the $1.00/contract MAXIMUM POSSIBLE loss "
+                "so the caps bind harder, never at zero (fail-CLOSED). Fix the "
+                "exposure parse; this reserve deliberately overstates risk",
+            )
         exposure.add_position(reserved)
         adopted.append(ticker)
         log.warning(
@@ -790,23 +1223,33 @@ async def position_reconcile_unmodeled_once(
             contracts_centi=exch.contracts_centi,
             exchange_exposure_cc=exposure_cc,
             reserved_max_loss_cc=reserved.max_loss_cc,
-            detail="exchange position with NO local context adopted as a "
-            "conservatively-reserved holding (risk_modeled=False) — counted "
-            "in every deterministic/gross cap from exchange figures only",
+            unresolvable_legs=ticker in unresolvable_legs,
+            full_notional_fallback=ticker in notional_floored,
+            detail="exchange position with no MODELABLE local context adopted "
+            "as a conservatively-reserved holding (risk_modeled=False) — "
+            "counted in every deterministic/gross cap from exchange figures "
+            "only; unknown legs never mean zero exposure",
         )
 
     metrics.inc("position_reconcile.unmodeled")
+    if unresolvable_legs:
+        metrics.inc("position_reconcile.unresolvable_legs")
     log.warning(
         "position_reconcile_unmodeled",
         tickers=unmodeled,
         local_fill_tickers=local_fill_tickers,
+        unresolvable_leg_tickers=unresolvable_legs,
         adopted_as_reserve=adopted,
+        full_notional_fallback=notional_floored,
         alarm_only=alarm_only,
         detail="exchange reports open positions the in-memory risk book did "
-        "not model — no-context positions are adopted as reserved holdings "
-        "(exchange figures only); tickers with a local fills row are left to "
-        "the fill-recovery sweep (full re-model, 2026-07-18 incident class); "
-        "alarm-only rows had no readable exposure figure",
+        "not model — positions no durable source can re-model are adopted as "
+        "reserved holdings (exchange figures only); tickers with a local fills "
+        "row AND a resolvable leg set are left to the fill-recovery sweep "
+        "(full re-model, 2026-07-18 incident class); rows with an unreadable "
+        "exposure figure are booked at the $1.00/contract fail-closed bound "
+        "(full_notional_fallback) — only a non-positive contract count is "
+        "alarm-only now",
     )
     return unmodeled
 
@@ -820,6 +1263,10 @@ class _StoreSettlementLedger:
 
     def __init__(self, store: Store) -> None:
         self._store = store
+        # STRONG REFERENCES to in-flight writes. asyncio holds only a WEAK ref
+        # to a bare create_task, so a settled write could be garbage-collected
+        # mid-flight — the exact silent-drop species this fix exists to kill.
+        self._tasks: set[asyncio.Task[None]] = set()
 
     def record_settled(
         self,
@@ -828,17 +1275,76 @@ class _StoreSettlementLedger:
         settled_value: float,
         realized_pnl_cc: int,
         settlement_fee_cc: int,
+        leg_set_hash: str | None = None,
+        combo_ticker: str | None = None,
+        our_side: str | None = None,
+        contracts_centi: int | None = None,
     ) -> None:
         import asyncio
 
-        asyncio.get_running_loop().create_task(
-            self._store.record_position_settled(
+        task = asyncio.get_running_loop().create_task(
+            self._settle(
                 position_id=position_id,
                 settled_value=settled_value,
                 realized_pnl_cc=realized_pnl_cc,
                 settlement_fee_cc=settlement_fee_cc,
+                leg_set_hash=leg_set_hash,
+                combo_ticker=combo_ticker,
+                our_side=our_side,
+                contracts_centi=contracts_centi,
             )
         )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _settle(
+        self,
+        *,
+        position_id: str,
+        settled_value: float,
+        realized_pnl_cc: int,
+        settlement_fee_cc: int,
+        leg_set_hash: str | None,
+        combo_ticker: str | None,
+        our_side: str | None,
+        contracts_centi: int | None,
+    ) -> None:
+        """Write + REPORT. ``record_position_settled`` returns the row it
+        actually settled; None means the durable keyspace had no open row for
+        this position (pre-ledger fill, or a boot upsert that never ran) — a
+        silent drop before 2026-07-26, now a loud warning so the ledger's
+        coverage gap can never go unobserved again."""
+        landed = await self._store.record_position_settled(
+            position_id,
+            settled_value=settled_value,
+            realized_pnl_cc=realized_pnl_cc,
+            settlement_fee_cc=settlement_fee_cc,
+            leg_set_hash=leg_set_hash,
+            combo_ticker=combo_ticker,
+            our_side=our_side,
+            contracts_centi=contracts_centi,
+        )
+        if landed is None:
+            log.warning(
+                "position_ledger_settled_unmatched",
+                position_id=position_id,
+                combo_ticker=combo_ticker,
+                realized_pnl_cc=realized_pnl_cc,
+                detail="no OPEN position_ledger row matched this settlement by "
+                "position_id OR durable (leg_set_hash, combo_ticker, our_side) "
+                "key — realized P&L is booked in memory but NOT durable; the "
+                "day-anchored p_night seed and settlement calibration will "
+                "under-count it",
+            )
+        elif landed != position_id:
+            log.info(
+                "position_ledger_settled_by_stable_key",
+                position_id=position_id,
+                ledger_position_id=landed,
+                combo_ticker=combo_ticker,
+                detail="settled row matched across an id re-mint (restart) via "
+                "the durable leg-set identity",
+            )
 
 
 class QuoteApp:
@@ -884,14 +1390,18 @@ class QuoteApp:
         # Set once the startup reconcile succeeds and the marker is clear — the
         # book-reconciled preflight gate reads this.
         self._book_reconciled = config.mode is not Mode.QUOTE
-        # Metadata-change breaker baseline: the last sampled settlement-relevant
-        # fingerprint per market ticker (close_time / status / event / expiry)
-        # PLUS the close horizon seen at seed time — the end-of-life exemption
-        # (2026-07-25) compares the PRIOR horizon against wall-now so a
-        # finished game's markets settling never trips the breaker while a
-        # reschedule (horizon still in the future) still does. First sighting
+        # Metadata-change breaker baseline: per market ticker, the last sampled
+        # SETTLEMENT fingerprint (the payoff function) and LIFECYCLE fingerprint
+        # (the exchange's trading-state bookkeeping), plus the status/result the
+        # transition rules read and the end-of-life horizon. First sighting
         # seeds the baseline (no trip); off the hot path (status loop, 15s).
-        self._metadata_fingerprints: dict[str, tuple[str, datetime | None]] = {}
+        self._metadata_fingerprints: dict[str, _MetaBaseline] = {}
+        # SCOPED response for a LIFECYCLE-only metadata move (2026-07-26): the
+        # market is held out of quoting and its resting quotes pulled, instead
+        # of killing the whole book for one market's pause/close-time rewrite.
+        # Bounded by the markets this process has actually held. See
+        # risk/quarantine.py for the fail-closed properties.
+        self._market_quarantine = MarketQuarantine()
         # The external SafetySupervisor subprocess (launched on startup in quote
         # mode). A SEPARATE OS process so its kill path survives the bot's own
         # host deadlocking; None until launched / when launch is skipped.
@@ -1056,7 +1566,17 @@ class QuoteApp:
                     entries=dict(config.filters.pregame_scheduled_starts),
                 )
             rfq_filter = RfqFilter(
-                config.filters, feed, metadata, killswitch, self._clock, schedule
+                config.filters,
+                feed,
+                metadata,
+                killswitch,
+                self._clock,
+                schedule,
+                # ARMS the scoped metadata-change lane: the filter is the
+                # consumer that refuses NEW quotes on a quarantined market.
+                # Without this the breaker hard-halts on lifecycle moves as it
+                # did before (MarketQuarantine.armed).
+                self._market_quarantine,
             )
             # Phase 5 (R3): inventory skew + widen-vs-decline policies, both DARK
             # by default (SkewConfig.enabled / WidenConfig.enabled False ⇒ computed
@@ -1353,6 +1873,7 @@ class QuoteApp:
                     exposure,
                     config.filters.allowed_leg_series_prefixes,
                     subaccount=config.safety.subaccount,
+                    metrics=self._metrics,
                 )
                 # ARM THE REHYDRATED LEGS (2026-07-21 review, HIGH): watch
                 # their books and fetch their metadata NOW — a restarted bot
@@ -1384,10 +1905,10 @@ class QuoteApp:
                     day_start = now_et.replace(
                         hour=0, minute=0, second=0, microsecond=0
                     )
-                    start_iso = day_start.astimezone(timezone.utc).isoformat()
+                    start_iso = day_start.astimezone(UTC).isoformat()
                     end_iso = (
                         (day_start + timedelta(days=1))
-                        .astimezone(timezone.utc)
+                        .astimezone(UTC)
                         .isoformat()
                     )
                     seeded_cc = await store.day_realized_pnl_cc(
@@ -1828,6 +2349,7 @@ class QuoteApp:
         exposure: ExposureBook,
         allowed_series: list[str] | None = None,
         subaccount: int | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         """#33 (over-book reconciliation gap) + P0-5 (exact exchange-quantity
         reconciliation): after a restart the in-memory exposure book starts EMPTY,
@@ -1887,6 +2409,22 @@ class QuoteApp:
         exch_by_ticker = open_combo_positions_from_positions(payload)
         if not exch_by_ticker:
             return
+        # Exchange's own premium-at-risk per ticker — the ONLY input the
+        # fail-CLOSED reserve below is built from when legs are unresolvable.
+        exposure_cc_by_ticker, unreadable_exposure = _exchange_exposure_cc_by_ticker(payload)
+        if unreadable_exposure:
+            # OBSERVABLE, never silent (2026-07-26): an unreadable at-risk figure
+            # is the precondition for the fail-open book. Positions adopted below
+            # fall back to the $1.00/contract bound, never to zero.
+            _bump(metrics, "exchange_exposure.unreadable")
+            log.error(
+                "exchange_exposure_unreadable",
+                tickers=sorted(unreadable_exposure),
+                raw_values=[unreadable_exposure[t] for t in sorted(unreadable_exposure)],
+                detail="the exchange's own at-risk figure could not be parsed "
+                "for these open positions at BOOT — any adopted below is booked "
+                "at the $1.00/contract fail-closed upper bound, never at zero",
+            )
         # DROP-SETTLED-ON-REHYDRATION (2026-07-16, clears the stale $4.46
         # reserve): a position row on a market whose Market.status says the
         # market is DEFINITIVELY SETTLED carries no live risk — folding it back
@@ -1944,10 +2482,68 @@ class QuoteApp:
         reserved: set[str] = set()
         games: set[str] = set()
         mismatched: list[str] = []
+        # Tickers for which THIS boot wrote the missing OPEN ledger row (the
+        # historical-gap backfill — see the block below).
+        ledger_backfilled: list[str] = []
+        # Held positions whose LEGS no durable source can resolve — reserved
+        # from exchange figures rather than dropped (BOOK COMPLETENESS).
+        unknown_legs: list[str] = []
+        # Reserved at the $1.00/contract fail-closed bound because the exchange's
+        # own at-risk figure was unreadable (2026-07-26).
+        notional_floored: list[str] = []
+        legs_from_ledger: list[str] = []
         for ticker, exch in exch_by_ticker.items():
             h = held.get(ticker)
             if h is None:
-                continue  # no local fill/rfq record → surfaced as unmodeled below
+                # FAIL-CLOSED BOOK COMPLETENESS (2026-07-26). No durable source
+                # (position_ledger, then the rfqs tape) resolves this position's
+                # legs — and nothing downstream ever will: the fill-recovery
+                # sweep only re-models THIS run's own quotes, and the runtime
+                # reconcile net used to hand the ticker to that sweep on the
+                # mere presence of a fills row. So this ``continue`` dropped
+                # REAL exchange premium out of the risk book entirely —
+                # measured live 2026-07-26: 7 combos / $40.03, a 5.35%
+                # understatement of deterministic_max_loss_cc and of every cap
+                # that scales off it, on a book whose concentration was exactly
+                # that same KXMLBKS strikeout family. Fail-OPEN cap integrity.
+                # UNKNOWN LEGS MUST NEVER MEAN ZERO EXPOSURE: reserve it from
+                # EXCHANGE figures through the same single code path the
+                # runtime reconcile uses, so its premium counts in the
+                # deterministic/gross caps even though its legs — and hence its
+                # entity/family attribution — are unknowable. And a position
+                # whose at-risk FIGURE is also unreadable is no longer dropped
+                # either (2026-07-26 fail-open fix): it books at the PROVEN
+                # $1.00/contract upper bound + alarms, because "we can't read
+                # the price" must make the caps bind harder, never vanish.
+                unknown = reserve_from_exchange_figures(
+                    ticker,
+                    exch.side,
+                    exch.contracts_centi,
+                    exposure_cc_by_ticker.get(ticker),
+                )
+                if unknown is None:
+                    unknown = reserve_at_full_notional(
+                        ticker, exch.side, exch.contracts_centi
+                    )
+                    if unknown is None:
+                        continue  # non-positive count — genuinely nothing at risk
+                    notional_floored.append(ticker)
+                    _bump(metrics, "exchange_exposure.reserved_at_full_notional")
+                    log.error(
+                        "rehydrate_reserved_at_full_notional",
+                        ticker=ticker,
+                        contracts_centi=exch.contracts_centi,
+                        raw_exposure=unreadable_exposure.get(ticker, ""),
+                        reserved_max_loss_cc=unknown.max_loss_cc,
+                        detail="unreadable exchange at-risk figure at BOOT — "
+                        "booked at the $1.00/contract MAXIMUM POSSIBLE loss so "
+                        "the caps bind harder, never at zero (fail-CLOSED)",
+                    )
+                exposure.add_position(unknown)
+                unknown_legs.append(ticker)
+                continue
+            if h.get("legs_source") == "position_ledger":
+                legs_from_ledger.append(ticker)
             legs = tuple(
                 LegRef(
                     market_ticker=leg["market_ticker"],
@@ -1986,18 +2582,41 @@ class QuoteApp:
                 prefix = "reconcile"
             else:
                 prefix = "rehydrate"
-            exposure.add_position(
-                OpenPosition(
-                    position_id=f"{prefix}:{ticker}",
-                    combo_ticker=ticker,
-                    collection=h["collection"],
-                    our_side=side,
-                    contracts=CentiContracts(contracts),
-                    entry_price_cc=CentiCents(entry_price_cc),
-                    legs=legs,
-                    risk_modeled=not is_reserved,
-                )
+            position = OpenPosition(
+                position_id=f"{prefix}:{ticker}",
+                combo_ticker=ticker,
+                collection=h["collection"],
+                our_side=side,
+                contracts=CentiContracts(contracts),
+                entry_price_cc=CentiCents(entry_price_cc),
+                legs=legs,
+                risk_modeled=not is_reserved,
             )
+            exposure.add_position(position)
+            # DURABLE LEDGER IDENTITY — BOOT KEYSPACE CLOSURE (2026-07-26).
+            # We just re-minted this position's id, so any settled write for
+            # it would have to find its ledger row by the DURABLE key. Close
+            # the keyspace here: if no OPEN row exists for (leg_set_hash,
+            # combo_ticker, our_side) — the historical gap, every position
+            # filled before the ledger writer existed — write one now under
+            # the re-minted id. Stable-key gated, so a position that already
+            # has its `fill:<quote_id>` open row is a NO-OP and the open-row
+            # count never diverges from the open-position count.
+            # Best-effort by construction: the ledger is diagnostics + the
+            # p_night anchor, never the risk source of truth, so a store
+            # failure logs and startup proceeds exactly as before.
+            try:
+                if await store.ensure_open_position_row(
+                    position,
+                    subaccount="" if subaccount is None else str(subaccount),
+                ):
+                    ledger_backfilled.append(ticker)
+            except Exception as exc:  # noqa: BLE001 — never blocks startup
+                log.warning(
+                    "rehydrate_ledger_open_failed",
+                    ticker=ticker,
+                    error=repr(exc),
+                )
             if is_reserved:
                 reserved.add(ticker)
             else:
@@ -2024,7 +2643,34 @@ class QuoteApp:
                 "tagged the position for manual reconciliation",
                 tickers=sorted(mismatched),
             )
-        unmodeled = sorted(set(exch_by_ticker) - modeled - reserved)
+        if ledger_backfilled:
+            log.info(
+                "rehydrate_ledger_backfilled",
+                count=len(ledger_backfilled),
+                tickers=sorted(ledger_backfilled),
+                detail="held positions with NO open position_ledger row (filled "
+                "before the ledger writer existed) now have one under the "
+                "re-minted id — their settlements can land durably",
+            )
+        if unknown_legs:
+            log.warning(
+                "rehydrate_unknown_legs_reserved",
+                count=len(unknown_legs),
+                tickers=sorted(unknown_legs),
+                reserved_max_loss_cc=sum(
+                    exposure.positions[f"reserve:{t}"].max_loss_cc
+                    for t in unknown_legs
+                ),
+                full_notional_fallback=sorted(notional_floored),
+                detail="held exchange positions whose LEGS no durable source "
+                "(position_ledger, then the rfqs tape) could resolve — RESERVED "
+                "from exchange figures so their premium counts in the "
+                "deterministic/gross caps. Their legs are unknown, so they "
+                "cannot be attributed to a per-entity or per-family axis: treat "
+                "the entity/family caps as understated by this premium until "
+                "the ledger covers them",
+            )
+        unmodeled = sorted(set(exch_by_ticker) - modeled - reserved - set(unknown_legs))
         log.info(
             "exposure_rehydrated",
             positions=len(modeled),
@@ -2032,14 +2678,18 @@ class QuoteApp:
             games=sorted(games),
             unmodeled_open=len(unmodeled),
             reconcile_mismatches=len(mismatched),
+            ledger_backfilled=len(ledger_backfilled),
+            legs_from_ledger=len(legs_from_ledger),
+            unknown_legs_reserved=len(unknown_legs),
+            full_notional_fallback=len(notional_floored),
         )
         if unmodeled:
             log.warning(
                 "rehydrate_unmodeled_positions",
                 reason=str(ReasonCode.SKIP_RECONCILE_QUANTITY_MISMATCH),
-                detail="open exchange positions with no local fill/rfq record (a "
-                "manual/external trade) — NOT in the risk book; reconcile manually "
-                "before trusting the caps",
+                detail="open exchange positions with NO readable at-risk figure — "
+                "NOT in the risk book (a figure is never invented, hard rule 6); "
+                "reconcile manually before trusting the caps",
                 tickers=unmodeled,
             )
 
@@ -2821,9 +3471,14 @@ class QuoteApp:
             # the kill switch (cancel-all + stop via on_halt). Fail-closed inside
             # ``evaluate`` — a detector that can't run trips HALT_BREAKER_ERROR.
             try:
-                await breakers.evaluate_and_halt(
-                    self._sample_breaker_inputs(feed, lifecycle, exposure, metadata)
-                )
+                inputs = self._sample_breaker_inputs(feed, lifecycle, exposure, metadata)
+                # SCOPED metadata response, carried out BEFORE the breakers are
+                # evaluated so a market quarantined by this very sample has its
+                # resting quotes pulled milliseconds later — not a tick later.
+                # Never raises; an enforcement it could not complete escalates
+                # to the whole-bot halt on the next sample.
+                await self._enforce_market_quarantine(lifecycle)
+                await breakers.evaluate_and_halt(inputs)
             except Exception:
                 log.exception("breaker_evaluation_failed")
             # Throughput observability: joint-memo hit rate + off-loop pool
@@ -3022,110 +3677,281 @@ class QuoteApp:
     def _metadata_changes(
         self, legs: tuple[RfqLeg, ...], metadata: MetadataCache
     ) -> tuple[str, ...]:
-        """Diff each in-book market's settlement-relevant metadata against the
-        last sampled fingerprint. A market whose fingerprint changed
-        tick-over-tick (close_time / status / event / expected expiry moved under
-        us) is returned so ``detect_metadata_change`` trips — our settlement model
-        of that market is stale. First sighting SEEDS the baseline (no trip): a
+        """Diff each in-book market's metadata tick-over-tick and route the
+        change to the response that FITS it.
+
+        TWO LANES, chosen by FIELD — never by ticker, series, or elapsed time
+        (2026-07-26 rebuild, after the 14:15 ET whole-bot halt on
+        ``KXMLBTOTAL-…CLETB-6`` for ``status: active → inactive``):
+
+        - **SETTLEMENT lane ⇒ returned here ⇒ HALT_METADATA_CHANGE + the
+          needs_reconcile marker.** The market's PAYOFF FUNCTION moved: the
+          rules text, the strike/line, the parent event, the expiration
+          deadline, the payoff shape — or the graded ``result`` was RE-graded,
+          or the status entered ``disputed``/``amended`` (the grade is being
+          contested/changed), or an unrecognised status string appeared
+          (fail-closed: an enum value we do not model). Behaviour is unchanged
+          from before this rebuild.
+        - **LIFECYCLE lane ⇒ scoped market QUARANTINE, no halt.** Only the
+          exchange's trading-state bookkeeping moved: ``status`` among the
+          modelled lifecycle values, ``close_time`` (which Kalshi REWRITES
+          backdated at every single close — measured 2026-07-26 on
+          ``KXMLBRFI-…SEATEX``: ``close_time 2026-07-29T18:35:00Z →
+          2026-07-26T18:54:21Z`` bundled with the determination write, while
+          ``expiration_time`` did not move), or ``can_close_early``. Nothing
+          about what the position PAYS changed — the CLETB market that halted
+          the bot settled ``result="no"`` on an untouched rule six minutes
+          later. The proportionate response is to pull our quotes off THAT
+          market and refuse it until the exchange reports it tradable and
+          stable again.
+
+        WHY the lifecycle lane is not simply "ignore": a pause may be transient
+        or a permanent withdrawal (a VOID — refund, not 0/1), and the two are
+        indistinguishable at the instant of the change; an unpause auto-cancels
+        every resting order exchange-side (docs/api-notes/index-scan.md:150);
+        a close_time rewrite invalidates the time-to-close we priced on. All
+        three are cured by the quarantine, none by a whole-book kill.
+
+        FAIL-CLOSED PROPERTIES (each pinned by a test):
+        1. The lifecycle lane is reachable ONLY when the settlement fingerprint
+           is byte-identical across the two samples. No settlement-relevant
+           field can take it.
+        2. With no quarantine sink wired, a lifecycle change is routed to the
+           HALT lane instead — an unwired scoped response can never degrade to
+           a silent pass.
+        3. A quarantine we could not ENFORCE (a resting quote we failed to
+           pull, see ``_enforce_market_quarantine``) is promoted to the
+           whole-bot halt on the next status tick.
+
+        First sighting SEEDS the baseline (no trip, no quarantine): a
         newly-quoted market is not a change. Peek-only (no network, hot-path
-        safe); a market with no cached metadata yet is skipped (nothing to
-        fingerprint — the staleness/no-quote gates cover an unpriceable market)."""
-        changed: list[str] = []
+        safe). A market with no cached metadata, or one carrying no exchange
+        payload at all (the ``put_combo_grid`` stub injects a grid with
+        ``raw={}``), is skipped — there is nothing to fingerprint and no
+        settlement claim to make."""
+        quarantine = self._market_quarantine
+        # PROMOTION (property 3): quarantines still unenforced from a PREVIOUS
+        # tick — this tick's new ones are added below and are not in this
+        # snapshot, so a market always gets its full enforcement pass first.
+        changed: list[str] = list(quarantine.unenforced())
+        if changed:
+            log.error(
+                "market_quarantine_unenforced_escalation",
+                markets=changed,
+                detail="resting quotes not provably withdrawn — escalating to halt",
+            )
         now_wall = self._clock.now()
-        for leg in legs:
-            meta = metadata.peek(leg.market_ticker)
-            if meta is None:
+        # The union of the risk path and the quarantine: a market that LEAVES
+        # the book while quarantined must still be re-evaluated, or it could
+        # never be released.
+        tickers = sorted({leg.market_ticker for leg in legs} | set(quarantine.pending()))
+        for ticker in tickers:
+            meta = metadata.peek(ticker)
+            if meta is None or not meta.raw:
                 continue
-            fingerprint = self._settlement_fingerprint(meta)
+            settlement_fp = self._settlement_fingerprint(meta)
+            lifecycle_fp = self._lifecycle_fingerprint(meta)
+            result = str(meta.raw.get("result", "") or "")
             # SETTLEMENT HORIZON = the EARLIEST tz-aware end-of-life stamp
-            # (2026-07-25 THIRD halt of this class): props carry a
-            # far-future LISTED close (a KS market showed close_time two days
-            # out) alongside a same-day expected_expiration — taking
-            # close_time first made the horizon meaningless for exactly the
-            # prop families that resolve intraday, so their normal in-game
-            # expiry/status bookkeeping kept tripping the breaker. Earliest
-            # is the honest "this market's life is ending" signal; a genuine
-            # PREGAME reschedule (both stamps still in the future) still
-            # trips.
+            # (2026-07-25 THIRD halt of this class): props carry a far-future
+            # LISTED close alongside a same-day expected_expiration. Retained
+            # as OBSERVABILITY on the lifecycle lane (it says "this market's
+            # life is ending"); it is no longer an exemption gate, because the
+            # settlement fingerprint no longer contains any field that moves
+            # at end of life, and a change to what a position PAYS matters
+            # MOST after the game is over (this closes the hole where a
+            # post-horizon amendment was silently exempt).
             horizons = [
                 h
                 for h in (meta.close_time, meta.expected_expiration_time)
                 if h is not None and h.tzinfo is not None
             ]
             horizon = min(horizons) if horizons else None
-            # Terminal settlement statuses (doc:kalshi market lifecycle —
-            # active → closed → determined → settled/finalized). A transition
-            # INTO one of these is the market COMPLETING (props determine
-            # EARLY all the time: the 6:47p live halt was a same-day RBI
-            # resolving mid-game while its listed close sat two days out) —
-            # settlement machinery owns it, never a reschedule. Any OTHER
-            # status change (halted/paused/unknown strings) still trips
-            # (fail-toward-trip).
-            terminal = meta.status in ("closed", "determined", "settled", "finalized")
-            prior = self._metadata_fingerprints.get(leg.market_ticker)
-            if prior is not None and prior[0] != fingerprint:
-                # END-OF-LIFE EXEMPTION (2026-07-25 ~3:40p halt): a market
-                # whose PRIOR close horizon had already PASSED is simply
-                # completing its lifecycle (game over → status flips toward
-                # settled) — the settlement-resolution machinery owns it and
-                # the pregame/in-play gates already refuse to quote it. The
-                # 2026-07-25 revalidation fix un-blinded this breaker (stale
-                # entries now refresh mid-run) and its FIRST observation — the
-                # finished 1:10p KC@DET markets settling — hard-halted the
-                # bot on an expected transition. A change while the horizon
-                # is STILL IN THE FUTURE (a reschedule, a settlement-model
-                # move) trips exactly as before.
-                prior_horizon = prior[1]
-                # Benign iff the market's prior horizon already PASSED (post-
-                # game settling) OR the NEW status is TERMINAL (early
-                # determination — 2026-07-25 6:47p halt). A naive (malformed)
-                # horizon must trip, not crash: only a tz-aware horizon
-                # provably in the past earns the time-based exemption.
-                if terminal or (
-                    prior_horizon is not None
-                    and prior_horizon.tzinfo is not None
-                    and prior_horizon <= now_wall
-                ):
-                    log.info(
-                        "metadata_change_post_close_benign",
-                        ticker=leg.market_ticker,
+            prior = self._metadata_fingerprints.get(ticker)
+            if prior is not None:
+                settlement_moved = prior.settlement_fp != settlement_fp
+                # RE-GRADE (settlement lane): a graded result being REPLACED by
+                # a different graded result is the outcome changing under a
+                # booked position. The FIRST grading ("" → "yes"/"no") is the
+                # normal determination write (measured 2026-07-26 on SEATEX)
+                # and is owned by the settlement/fact machinery.
+                regraded = bool(prior.result) and bool(result) and prior.result != result
+                status_verdict = _status_change_class(prior.status, meta.status)
+                if settlement_moved or regraded or status_verdict == "settlement":
+                    log.error(
+                        "metadata_change_settlement_relevant",
+                        ticker=ticker,
+                        prior_status=prior.status,
                         new_status=meta.status,
-                        prior_horizon=(
-                            prior_horizon.isoformat()
-                            if prior_horizon is not None
-                            else None
-                        ),
+                        fingerprint_moved=settlement_moved,
+                        regraded=regraded,
+                        status_class=status_verdict,
                     )
-                else:
-                    changed.append(leg.market_ticker)
-            self._metadata_fingerprints[leg.market_ticker] = (fingerprint, horizon)
-        return tuple(changed)
+                    changed.append(ticker)
+                elif prior.lifecycle_fp != lifecycle_fp:
+                    detail = (
+                        f"lifecycle change {prior.status}->{meta.status}"
+                        f" (settlement fingerprint unchanged)"
+                    )
+                    if not quarantine.armed:
+                        # Property 2: nothing is refusing NEW quotes on this
+                        # market, so the scoped lane would be a silent pass.
+                        log.error(
+                            "market_quarantine_unarmed_failclosed",
+                            ticker=ticker,
+                            detail=detail,
+                        )
+                        changed.append(ticker)
+                    else:
+                        log.warning(
+                            "metadata_change_lifecycle_scoped",
+                            ticker=ticker,
+                            prior_status=prior.status,
+                            new_status=meta.status,
+                            horizon=horizon.isoformat() if horizon else None,
+                            horizon_passed=(
+                                horizon is not None and horizon <= now_wall
+                            ),
+                        )
+                        quarantine.quarantine(ticker, detail)
+                elif quarantine.is_quarantined(ticker) and _is_tradable_status(
+                    meta.status
+                ):
+                    # STRUCTURAL RELEASE, never a timer: the exchange reports
+                    # the market normally tradable again AND its lifecycle
+                    # fingerprint stopped moving (a full 15s tick with no
+                    # change). A permanently deactivated / voided market never
+                    # returns to "active", so it never leaves quarantine.
+                    quarantine.release(ticker)
+            self._metadata_fingerprints[ticker] = _MetaBaseline(
+                settlement_fp=settlement_fp,
+                lifecycle_fp=lifecycle_fp,
+                status=meta.status,
+                result=result,
+                horizon=horizon,
+            )
+        # Dedupe (order-preserving): a ticker can be BOTH an unenforced
+        # promotion and a fresh settlement change in the same pass — one halt,
+        # one name in the detail.
+        return tuple(dict.fromkeys(changed))
+
+    async def _enforce_market_quarantine(self, lifecycle: QuoteLifecycle) -> None:
+        """Carry out the scoped response: pull every DELETABLE resting quote off
+        each newly-quarantined market. Runs on the status loop immediately after
+        the sample that raised the quarantine, so the exposure window is the few
+        milliseconds between detection and cancel — not a tick.
+
+        Only a quarantine whose quotes were provably withdrawn is marked
+        enforced. Any delete failure (or any exception here at all) leaves the
+        whole batch unenforced, and ``_metadata_changes`` promotes it to the
+        whole-bot halt on the next tick — a scoped response we could not carry
+        out is not a scoped response. Never raises: the escalation is the
+        error path, not an exception."""
+        pending = self._market_quarantine.unenforced()
+        if not pending:
+            return
+        try:
+            deleted, failures = await lifecycle.cancel_quotes_touching(
+                set(pending), ReasonCode.DELETE_MARKET_QUARANTINED
+            )
+        except Exception:
+            log.exception("market_quarantine_enforcement_failed", markets=list(pending))
+            return
+        if failures:
+            log.error(
+                "market_quarantine_enforcement_incomplete",
+                markets=list(pending),
+                deleted=deleted,
+                failures=failures,
+            )
+            return
+        for ticker in pending:
+            self._market_quarantine.mark_enforced(ticker)
+        log.warning(
+            "market_quarantine_enforced",
+            markets=list(pending),
+            quotes_pulled=deleted,
+        )
 
     @staticmethod
     def _settlement_fingerprint(meta: MarketMeta) -> str:
-        """A stable string of the settlement-relevant metadata fields. Any change
-        here means our model of when/how the market settles moved: the exchange
-        status (e.g. active→settled/closed), the parent event, and the SCHEDULED
-        close. NOT the grid or the price — those move every tick and are not
-        settlement-relevant.
+        """The fields that can actually change WHAT AN OPEN POSITION PAYS. Any
+        move here is a hard halt + needs_reconcile.
 
-        ``expected_expiration_time`` is DELIBERATELY EXCLUDED (2026-07-25, after
-        this breaker cost FOUR halts in one day — the last one on five CLE@TB
-        markets at once as that game ended). It is Kalshi's ESTIMATE of when the
-        market will expire, and it legitimately drifts as a game runs long or
-        short: the estimate moving is in-game bookkeeping, not a change to the
-        settlement RULE (who wins, when trading closes, which event governs).
-        Every halt of that class today was estimate drift on a game already
-        underway — never a real reschedule. The estimate is still READ for the
-        end-of-life horizon (a passed horizon makes changes benign); it just no
-        longer BY ITSELF trips a hard halt. A genuine reschedule moves
-        ``close_time`` and still trips; a resolution moves ``status`` and is
-        handled by the terminal-status exemption."""
+        INCLUDED — each is a term in the payoff function itself:
+
+        - ``event_ticker``: a different parent event is a different settlement
+          source. (Ruled out as the 2026-07-26 cause: identical in the
+          18:14:49Z cache snapshot and in the live API read.)
+        - ``rules_primary``: the settlement rule verbatim — the definition of
+          what pays ("If Cleveland and Tampa Bay collectively score more 11.5
+          runs …, then the market resolves to Yes").
+        - ``rules_secondary``: carries the POSTPONEMENT policy, which decides
+          whether a delayed game still pays 0/1 or "resolves to a fair price"
+          (a refund-shaped payoff). Ambiguous fields stay IN, fail-closed.
+        - ``strike_type`` / ``floor_strike`` / ``cap_strike`` /
+          ``custom_strike``: the LINE and the entity the rule is evaluated
+          against. Total 5.5 → 6.5 is a different bet on the same game.
+        - ``expiration_time`` / ``latest_expiration_time``: the real settlement
+          DEADLINE, and the outer bound of the postponement window that decides
+          the pays-0/1 vs resolves-to-fair-price branch above. MEASURED stable
+          across a full lifecycle: untouched at 2026-07-29T16:15:00Z through
+          the CLETB market's entire life, and untouched through the SEATEX
+          determination write that backdated ``close_time`` in the same step.
+          These are the settlement stamps the pre-rebuild fingerprint was
+          missing entirely.
+        - ``market_type`` / ``notional_value_dollars``: the payoff SHAPE and
+          per-contract notional (binary $1). A scalar or re-notionalised market
+          does not pay what we priced.
+
+        EXCLUDED — each is exchange bookkeeping that cannot move the payoff,
+        with the live evidence that says so:
+
+        - ``status``: handled per-TRANSITION by ``_status_change_class``, not as
+          a flat field. Lifecycle transitions (initialized/active/inactive/
+          closed/determined/finalized) scope to a quarantine; ``disputed`` and
+          ``amended`` — the grade being contested or changed — stay hard halts;
+          an unrecognised string is a hard halt (fail-closed).
+        - ``close_time``: "when trading stopped", not what the position pays.
+          Kalshi lists it as start+3 days and REWRITES it backdated at every
+          close, bundled with the terminal status write (measured 2026-07-26,
+          13 markets in one evening). Watching it made two of the three
+          pre-rebuild fingerprint fields pure lifecycle stamps. A postponement
+          INSIDE the listed window does not change the payoff; one BEYOND it
+          moves ``expiration_time``, which is in the fingerprint.
+        - ``expected_expiration_time``: Kalshi's ESTIMATE, drifts as a game runs
+          long (the 2026-07-25 fourth-halt fix). In NEITHER lane — it moves on
+          nearly every in-play market and would quarantine the whole slate.
+        - ``result`` / ``expiration_value``: the settlement OUTCOME, owned by
+          the settlement/fact machinery. Its FIRST write is the normal
+          determination; a RE-grade is caught explicitly in
+          ``_metadata_changes``.
+        - grid, prices, volume, open interest, ``updated_time``: tick noise.
+        """
+        raw = meta.raw
+        parts = [f"event={meta.event_ticker or ''}"]
+        for field in _SETTLEMENT_PAYOUT_FIELDS:
+            # A key that DISAPPEARS is itself a change (distinct sentinel), so
+            # a rule/strike vanishing from the payload cannot read as "same".
+            value = raw.get(field, _ABSENT)
+            parts.append(f"{field}={_canonical(value)}")
+        return "|".join(parts)
+
+    @staticmethod
+    def _lifecycle_fingerprint(meta: MarketMeta) -> str:
+        """The exchange's TRADING-STATE bookkeeping: which of these moving means
+        "we may not keep quoting this market as-is", never "the payoff changed".
+        A move here scopes to a market quarantine (pull our quotes, refuse the
+        market, re-price on release), never a whole-bot halt.
+
+        ``status`` — pause/unpause/close/settle; ``close_time`` — the rewritten
+        trading-stop stamp we price time-to-close against; ``can_close_early``
+        — whether the market may close before its listed time at all."""
         return "|".join(
             (
-                meta.status,
-                meta.event_ticker or "",
-                meta.close_time.isoformat() if meta.close_time else "",
+                f"status={meta.status}",
+                f"close={meta.close_time.isoformat() if meta.close_time else ''}",
+                f"can_close_early={_canonical(meta.raw.get('can_close_early', _ABSENT))}",
             )
         )
 

@@ -201,7 +201,7 @@ def test_compute_book_risk_structural_seam_captures_hedge():
         _ADV_ENG: 2, "KXWCGOAL-26JUL15ENGARG-ENGX-1": 3,
     }
     event_by_index = {0: adv_ev, 1: goal_ev, 2: adv_ev, 3: goal_ev}
-    model = BookModel(legs, positions, corr, corr.copy(), corr.copy(),
+    model = BookModel(legs, positions, corr, corr.copy(), corr.copy(), corr.copy(),
                       leg_index, event_by_index, False)
 
     struct = compute_book_risk(model, n_samples=60_000, seed=1, structural_cfg=CFG)

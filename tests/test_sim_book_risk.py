@@ -198,7 +198,7 @@ class TestChallengerOverlay:
             marginals=lambda t: 0.5,
             within_game_rho=lambda a, b: (0.1, 0.3, 0.5),
         )
-        corr = m.corr_for_band("point")
+        corr = m.corr_tail_stress_for_band("point")
         mask = _same_game_mask(m)
         challenger = _inflate_corr(corr, 0.5, mask)
         ia, ib = m.leg_index["A"], m.leg_index["B"]
@@ -240,7 +240,7 @@ class TestChallengerOverlay:
         # p(A hit)=0.85, p(B hit)=0.15 ⇒ P(loss)=P(A miss)·P(B hit)=0.15·0.15≈2.25%.
         marg = {"A": 0.85, "B": 0.15}
         m = build_book_model([pyes, pno], marginals=lambda t: marg[t])
-        corr = m.corr_for_band("high")  # cross-game rho=0 ⇒ identity (independent)
+        corr = m.corr_tail_stress_for_band("high")  # cross-game rho=0 ⇒ identity (independent)
 
         from combomaker.sim.book_risk import _book_pnl_from_values, _es_from_pnl
         from combomaker.sim.engine import sample_leg_values
@@ -343,7 +343,7 @@ class TestGoverningRuin:
         from combomaker.sim.engine import sample_leg_values
 
         seq_prod, _, _ = np.random.SeedSequence(11).spawn(3)
-        corr = m.corr_for_band("point")
+        corr = m.corr_tail_stress_for_band("point")
         prod_vals = sample_leg_values(
             list(m.legs), corr, 120_000, np.random.default_rng(seq_prod)
         )

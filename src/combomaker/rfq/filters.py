@@ -21,6 +21,7 @@ from combomaker.rfq.models import Rfq
 from combomaker.rfq.pregame import ComboStartStatus, PregameGate
 from combomaker.rfq.schedule import ScheduleCache
 from combomaker.risk.killswitch import KillSwitch
+from combomaker.risk.quarantine import MarketQuarantine
 
 # Two-legged-tie European knockouts (Champions/Europa/Conference League): the
 # "advance" market is decided over TWO legs, so a single-match win does not imply
@@ -42,12 +43,24 @@ class RfqFilter:
         killswitch: KillSwitch,
         clock: Clock,
         schedule: ScheduleCache | None = None,
+        quarantine: MarketQuarantine | None = None,
     ) -> None:
         self._config = config
         self._feed = feed
         self._metadata = metadata
         self._killswitch = killswitch
         self._clock = clock
+        # MARKET SAFETY QUARANTINE (2026-07-26): the scoped alternative to a
+        # whole-bot halt when a market's LIFECYCLE state moves (pause/unpause/
+        # close_time rewrite). None ⇒ no quarantine wired, and the metadata
+        # breaker refuses to use the scoped lane at all (it hard-halts as
+        # before) — an unwired sink can never become a silent pass.
+        self._quarantine = quarantine
+        if quarantine is not None:
+            # Register as the quote-refusal consumer. Until this happens the
+            # metadata breaker refuses to use the scoped lane (see
+            # MarketQuarantine.armed) — no silent pass on a mis-wire.
+            quarantine.arm()
         # Phase 5: the explicit schedule feed (inactive by default) enters the
         # pregame precision ladder; the gate owns the M_q/M_c margin split.
         self._pregame = PregameGate(config, metadata, clock, schedule)
@@ -104,6 +117,18 @@ class RfqFilter:
             _is_two_legged_tie_leg(leg.market_ticker) for leg in rfq.legs
         ):
             reasons.append(ReasonCode.SKIP_UNMODELED_REGIME)
+
+        # MARKET SAFETY QUARANTINE (2026-07-26 live halt). A leg the metadata
+        # breaker put in quarantine — its lifecycle state moved (exchange
+        # trading pause, unpause, or a close_time rewrite) — is refused for
+        # NEW quotes until the exchange reports it normally tradable and
+        # stable again. Side-BLIND on purpose: an exchange-paused market can
+        # neither be entered nor hedged on, so unlike the operator blocklist
+        # there is no "no"-side exception. One dict lookup per leg.
+        if self._quarantine is not None and any(
+            self._quarantine.is_quarantined(leg.market_ticker) for leg in rfq.legs
+        ):
+            reasons.append(ReasonCode.SKIP_MARKET_QUARANTINED)
 
         reasons.extend(self._size_reasons(rfq))
 

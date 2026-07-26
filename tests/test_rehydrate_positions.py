@@ -280,7 +280,10 @@ async def test_rehydrate_populates_book_and_nets_mutex(tmp_path: Path) -> None:
 async def test_rehydrate_skips_unmodeled_and_empty(tmp_path: Path) -> None:
     store = await _seed_store(tmp_path)
     try:
-        # one modeled + one exchange position with no local record → only 1 added.
+        # One MODELED (local legs) + one exchange position with no local record.
+        # The latter is not modeled, but it is still real exchange risk: it is
+        # RESERVED at the $1.00/contract fail-closed bound because the payload
+        # carries no readable at-risk figure (2026-07-26 fail-open fix).
         rest = _StubRest({"market_positions": [
             {"ticker": "KXMVE-ARG", "position_fp": "-50.00"},
             {"ticker": "KXMVE-EXTERNAL", "position_fp": "-10.00"},
@@ -288,7 +291,9 @@ async def test_rehydrate_skips_unmodeled_and_empty(tmp_path: Path) -> None:
         exposure = ExposureBook(CONV, is_me_event=IS_ME)
         await QuoteApp._rehydrate_exposure_book(
             cast(Any, None), cast(Any, rest), store, exposure)
-        assert {p.combo_ticker for p in exposure.positions.values()} == {"KXMVE-ARG"}
+        modeled = {p.combo_ticker for p in exposure.positions.values() if p.risk_modeled}
+        assert modeled == {"KXMVE-ARG"}
+        assert exposure.positions["reserve:KXMVE-EXTERNAL"].max_loss_cc == 100_000
 
         # flat (position_fp 0) and empty payloads add nothing.
         exposure2 = ExposureBook(CONV, is_me_event=IS_ME)
@@ -426,28 +431,38 @@ async def test_reconcile_exchange_larger(tmp_path: Path) -> None:
 
 
 async def test_reconcile_missing_local_fill(tmp_path: Path) -> None:
-    """Exchange reports a ticker we have NO local fill for. No legs ⇒ can't cluster /
-    model marginals ⇒ NOT added to the book, surfaced as an unmodeled reconciliation
-    gap (never modeled from a guess)."""
+    """Exchange reports a ticker we have NO local fill for. No legs ⇒ it can't be
+    clustered or its marginals modeled — but it is REAL exchange risk, so it is
+    RESERVED, never dropped (``risk_modeled=False``). With no readable at-risk
+    figure in the payload the reserve books at the $1.00/contract fail-closed
+    upper bound (2026-07-26: dropping it was the fail-OPEN defect)."""
     store = await _seed_store(tmp_path)
     try:
         exposure = await _rehydrate(store, {"market_positions": [
             {"ticker": "KXMVE-ARG", "position_fp": "-50.00"},
             {"ticker": "KXMVE-NOFILL", "position_fp": "-20.00"}]})
-        assert {p.combo_ticker for p in exposure.positions.values()} == {"KXMVE-ARG"}
+        assert {p.combo_ticker for p in exposure.positions.values()} == {
+            "KXMVE-ARG", "KXMVE-NOFILL"}
+        nofill = exposure.positions["reserve:KXMVE-NOFILL"]
+        assert nofill.risk_modeled is False
+        assert nofill.max_loss_cc == 2000 * 10_000 // 100  # 20.00 contracts × $1
     finally:
         await store.close()
 
 
 async def test_reconcile_manual_trade(tmp_path: Path) -> None:
-    """A manual/external trade (exchange holds it, no local record at all) is the
-    same fail-closed path: excluded from the modeled book, surfaced for manual
-    reconciliation — never invented into a cap."""
+    """A manual/external trade (exchange holds it, no local record at all) takes
+    the same fail-CLOSED path: excluded from the MODELED book (no legs ⇒ never
+    decomposed against marginals) but reserved at the maximum possible loss so
+    its risk cannot vanish from the caps."""
     store = await _seed_store(tmp_path)
     try:
         exposure = await _rehydrate(store, {"market_positions": [
             {"ticker": "KXMVE-MANUAL", "position_fp": "-10.00"}]})
-        assert len(exposure.positions) == 0
+        assert list(exposure.positions) == ["reserve:KXMVE-MANUAL"]
+        p = exposure.positions["reserve:KXMVE-MANUAL"]
+        assert p.risk_modeled is False
+        assert p.max_loss_cc == 1000 * 10_000 // 100  # 10.00 contracts × $1.00
     finally:
         await store.close()
 

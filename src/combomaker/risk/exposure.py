@@ -159,6 +159,27 @@ def leg_set_hash(legs: Iterable[LegRef]) -> str:
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
+def stable_ledger_key(pos: OpenPosition) -> str | None:
+    """A position's RESTART-DURABLE identity hash, or None when it has none.
+
+    The durable position-ledger key is ``(leg_set_hash, combo_ticker,
+    our_side)`` — never ``position_id``, which is volatile: a restart's
+    ``_rehydrate_exposure_book`` re-mints every id as ``rehydrate:<ticker>``,
+    so a ledger keyed on it could never match a row written before the restart
+    (2026-07-26 defect: settled rows silently stopped landing).
+
+    ``leg_set_hash`` RAISES on a leg-less position (fail-closed: the empty set
+    has no identity). A conservatively-RESERVED holding adopted from the
+    exchange with no local fill record can carry synthetic/absent legs, and
+    that must degrade to position_id-only keying — never crash the settlement
+    money path, and never emit a placeholder hash that would collide with a
+    real combo's identity."""
+    try:
+        return leg_set_hash(pos.legs)
+    except Exception:
+        return None
+
+
 @dataclass(frozen=True, slots=True)
 class OpenPosition:
     position_id: str

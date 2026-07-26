@@ -619,6 +619,91 @@ class Store:
         )
         await self._db.commit()
 
+    async def ensure_open_position_row(
+        self,
+        position: OpenPosition,
+        *,
+        subaccount: str,
+        fees_cc: int = 0,
+    ) -> bool:
+        """DURABLE LEDGER IDENTITY — boot keyspace closure (2026-07-26).
+
+        ``record_position_open`` is written by the CONFIRM path only, so every
+        position that was filled before the ledger writer existed (or by an
+        earlier build) has NO open row — and a settled write can then never
+        land on it. On restart ``_rehydrate_exposure_book`` re-mints a NEW
+        position id for each exchange-held position; this closes the keyspace
+        by writing an OPEN row for any rehydrated position that has none.
+
+        Keyed on the DURABLE identity ``(leg_set_hash, combo_ticker,
+        our_side)``, NOT on the volatile position_id: if an open row for the
+        same real combo already exists under its original ``fill:<quote_id>``
+        id, this is a NO-OP (returns False). Otherwise it inserts the
+        re-minted row (returns True). Never duplicates a live position, so the
+        open-row count stays equal to the open-position count.
+
+        Fail-closed: a leg-less position has no durable identity —
+        ``leg_set_hash`` raises rather than writing a colliding placeholder."""
+        from combomaker.risk.exposure import leg_set_hash
+
+        lset_hash = leg_set_hash(position.legs)
+        async with self._db.execute(
+            "SELECT position_id FROM position_ledger"
+            " WHERE status='open' AND leg_set_hash=? AND combo_ticker=?"
+            " AND our_side=? LIMIT 1",
+            (lset_hash, position.combo_ticker, position.our_side.value),
+        ) as cursor:
+            existing = await cursor.fetchone()
+        if existing is not None:
+            return False
+        await self.record_position_open(
+            position, subaccount=subaccount, fees_cc=fees_cc
+        )
+        return True
+
+    async def _resolve_open_ledger_row(
+        self,
+        position_id: str,
+        *,
+        leg_set_hash: str | None,
+        combo_ticker: str | None,
+        our_side: str | None,
+        contracts_centi: int | None,
+    ) -> str | None:
+        """The ONE open ledger row a settlement belongs to, by DURABLE identity.
+
+        Match order (never more than one row consumed per settlement, so N
+        settlements retire exactly N open rows and realized P&L is never
+        double-counted into ``day_realized_pnl_cc``):
+
+          1. the exact ``position_id`` (same process — today's behaviour);
+          2. else the stable key ``(leg_set_hash, combo_ticker, our_side)``,
+             preferring an exact contract-count match, then the OLDEST row.
+
+        (2) is the restart fix: after ``_rehydrate_exposure_book`` re-mints
+        ids, the in-memory ``position_id`` of a held position no longer equals
+        the one its open row was written under, so a position_id-only UPDATE
+        could never match and EVERY settled write silently vanished."""
+        clauses = ["position_id = ?"]
+        params: list[object] = [position_id]
+        if leg_set_hash and combo_ticker and our_side:
+            clauses.append("(leg_set_hash = ? AND combo_ticker = ? AND our_side = ?)")
+            params.extend((leg_set_hash, combo_ticker, our_side))
+        order = ["(position_id = ?) DESC"]
+        order_params: list[object] = [position_id]
+        if contracts_centi is not None:
+            order.append("(contracts_centi = ?) DESC")
+            order_params.append(int(contracts_centi))
+        order.extend(("opened_at ASC", "position_id ASC"))
+        sql = (
+            "SELECT position_id FROM position_ledger WHERE status='open'"
+            f" AND ({' OR '.join(clauses)})"
+            f" ORDER BY {', '.join(order)} LIMIT 1"
+        )
+        async with self._db.execute(sql, (*params, *order_params)) as cursor:
+            row = await cursor.fetchone()
+        return None if row is None else str(row[0])
+
     async def record_position_settled(
         self,
         position_id: str,
@@ -626,12 +711,34 @@ class Store:
         settled_value: float,
         realized_pnl_cc: int,
         settlement_fee_cc: int,
-    ) -> None:
+        leg_set_hash: str | None = None,
+        combo_ticker: str | None = None,
+        our_side: str | None = None,
+        contracts_centi: int | None = None,
+    ) -> str | None:
         """P1.10. Mark a ledger position SETTLED with the exchange settlement:
         value V, realized P&L, settlement fee, and the reconciliation TIME (now).
-        Only transitions an existing OPEN row — an unknown/already-settled
-        position_id is a no-op (idempotent re-poll), matching the settlement
-        handler's own per-id dedup. Synchronous & committed (audit trail)."""
+        Only transitions an OPEN row — an unknown/already-settled position is a
+        no-op (idempotent re-poll), matching the settlement handler's own
+        per-id dedup. Synchronous & committed (audit trail).
+
+        DURABLE IDENTITY (2026-07-26 fix): the row is located by
+        ``_resolve_open_ledger_row`` — exact ``position_id`` first, else the
+        restart-stable key ``(leg_set_hash, combo_ticker, our_side)``. Keying
+        on the in-memory position_id ALONE meant that after any restart (which
+        re-mints ids as ``rehydrate:<ticker>``) no settled row could ever match
+        an open row written pre-restart, so the ledger silently stopped
+        recording settlements. Returns the position_id of the row actually
+        settled, or None when nothing matched (caller may log the miss)."""
+        target = await self._resolve_open_ledger_row(
+            position_id,
+            leg_set_hash=leg_set_hash,
+            combo_ticker=combo_ticker,
+            our_side=our_side,
+            contracts_centi=contracts_centi,
+        )
+        if target is None:
+            return None
         await self._db.execute(
             "UPDATE position_ledger SET status='settled', settled_value=?,"
             " realized_pnl_cc=?, settlement_fee_cc=?,"
@@ -643,10 +750,22 @@ class Store:
                 int(settlement_fee_cc),
                 int(settlement_fee_cc),
                 self._now(),
-                position_id,
+                target,
             ),
         )
         await self._db.commit()
+        return target
+
+    async def open_ledger_identities(self) -> list[tuple[str, str, str]]:
+        """``(leg_set_hash, combo_ticker, our_side)`` of every OPEN ledger row —
+        one batched read for the maintenance-tick DIVERGENCE INVARIANT (open
+        exposure positions vs open ledger rows). Alarm-only diagnostics; never
+        a risk input."""
+        async with self._db.execute(
+            "SELECT leg_set_hash, combo_ticker, our_side FROM position_ledger"
+            " WHERE status='open'"
+        ) as cursor:
+            return [(str(r[0]), str(r[1]), str(r[2])) async for r in cursor]
 
     async def ledger_position(self, position_id: str) -> JsonDict | None:
         """Read one ledger row by position_id (reports/tests). None if absent."""
@@ -904,15 +1023,61 @@ class Store:
             row = await cursor.fetchone()
         return int(row[0]) if row else 0
 
+    async def _ledger_legsets(
+        self, tickers: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """DURABLE leg provenance from ``position_ledger`` (BOOK COMPLETENESS,
+        2026-07-26). ``combo_ticker -> {legs_json: collection_ticker}`` keyed on
+        the ORDER-INDEPENDENT ``leg_set_hash``, so two ledger rows that spell the
+        same leg set in a different JSON order are ONE identity (not a false
+        conflict). No status filter: a combo ticker's leg definition is immutable
+        for the life of the market, so a settled row is still valid provenance for
+        a re-opened position on the same ticker.
+
+        Why this exists: ``rfqs`` is an OBSERVABILITY tape — best-effort, and
+        measurably lossy (2026-07-26: 8 held combos, $40.24 of premium at risk,
+        had ZERO rfqs rows), while ``position_ledger`` is written synchronously
+        and committed on every confirmed fill. Risk-book completeness must never
+        depend on a tape that is allowed to drop rows."""
+        placeholders = ",".join("?" * len(tickers))
+        legsets: dict[str, dict[str, Any]] = {}
+        # leg_set_hash is the durable identity; legs_json/collection are payload.
+        async with self._db.execute(
+            "SELECT combo_ticker, leg_set_hash, MAX(legs_json) AS legs_json,"
+            " MAX(collection_ticker) AS collection_ticker"
+            f" FROM position_ledger WHERE combo_ticker IN ({placeholders})"  # noqa: S608 - placeholders only
+            " GROUP BY combo_ticker, leg_set_hash",
+            tuple(tickers),
+        ) as cursor:
+            async for combo_ticker, _hash, legs_json, collection in cursor:
+                if not legs_json:
+                    continue
+                legsets.setdefault(combo_ticker, {})[legs_json] = collection
+        return legsets
+
     async def held_positions(self, combo_tickers: list[str]) -> list[JsonDict]:
         """Rehydration source for the exposure book on restart (#33). For each combo
         ticker still OPEN on the exchange, aggregate our recorded fills (summed
-        contracts + a max-loss-preserving entry price) and attach the combo's legs
-        from the rfqs tape (``fills.combo_ticker == rfqs.market_ticker``). Only
-        tickers we have BOTH a fill AND an rfq for are returned; an exchange
-        position with no local record is surfaced by the caller, never modeled from
-        a guess. Entry price is chosen so ``contracts × entry_price // 100`` equals
-        the summed per-fill max loss (the loss axis the caps bind on)."""
+        contracts + a max-loss-preserving entry price) and attach the combo's legs.
+
+        LEG PROVENANCE IS LEDGER-FIRST (BOOK COMPLETENESS, 2026-07-26). Legs come
+        from the DURABLE ``position_ledger`` (written+committed by
+        ``record_position_open`` on every confirmed fill) and fall back to the
+        ``rfqs`` OBSERVABILITY tape only for tickers the ledger cannot resolve. The
+        old tape-only lookup was fail-OPEN: a combo whose RFQ row never landed had
+        no resolvable legs, so the rehydrator dropped it AND the runtime reconcile
+        skipped it (a local fills row exists ⇒ "the recovery sweep owns it", but
+        that sweep only ever re-models THIS run's quotes) — the position counted in
+        NEITHER path and its premium vanished from ``deterministic_max_loss_cc``.
+        Each returned row carries ``legs_source`` ("position_ledger" | "rfqs_tape")
+        so the caller can log which durable source answered.
+
+        Only tickers we have BOTH a fill AND a resolvable leg set for are returned;
+        an exchange position whose legs no durable source can resolve is surfaced to
+        the caller, which reserves it from EXCHANGE figures (never modeled from a
+        guess, and never zero). Entry price is chosen so
+        ``contracts × entry_price // 100`` equals the summed per-fill max loss (the
+        loss axis the caps bind on)."""
         tickers = list(dict.fromkeys(combo_tickers))
         if not tickers:
             return []
@@ -939,37 +1104,52 @@ class Store:
         # exactly one distinct legs_json ⇒ that is the identity; two or more ⇒ the
         # provenance is ambiguous ⇒ REJECT the ticker (never rehydrated from a guess),
         # exactly as the exchange-reconcile path drops a position it cannot model.
-        legs_q = (
-            "SELECT market_ticker, legs_json,"
-            " MAX(collection_ticker) AS collection_ticker"
-            f" FROM rfqs WHERE market_ticker IN ({placeholders})"  # noqa: S608 - ints-only placeholders
-            " GROUP BY market_ticker, legs_json"
-        )
+        # (1) DURABLE source first. Whatever the ledger answers is authoritative
+        # provenance and the tape is never consulted for that ticker — which also
+        # shrinks the (large, index-scanned) rfqs lookup to the leftovers.
+        ledger_legsets = await self._ledger_legsets(tickers)
+        tape_needed = [t for t in tickers if t not in ledger_legsets]
         # market_ticker -> {legs_json: collection_ticker} across DISTINCT leg-sets.
-        legsets: dict[str, dict[str, Any]] = {}
-        async with self._db.execute(legs_q, tuple(tickers)) as cursor:
-            async for market_ticker, legs_json, collection in cursor:
-                if not legs_json:
-                    continue
-                legsets.setdefault(market_ticker, {})[legs_json] = collection
+        tape_legsets: dict[str, dict[str, Any]] = {}
+        if tape_needed:
+            tape_placeholders = ",".join("?" * len(tape_needed))
+            legs_q = (
+                "SELECT market_ticker, legs_json,"
+                " MAX(collection_ticker) AS collection_ticker"
+                f" FROM rfqs WHERE market_ticker IN ({tape_placeholders})"  # noqa: S608 - placeholders only
+                " GROUP BY market_ticker, legs_json"
+            )
+            async with self._db.execute(legs_q, tuple(tape_needed)) as cursor:
+                async for market_ticker, legs_json, collection in cursor:
+                    if not legs_json:
+                        continue
+                    tape_legsets.setdefault(market_ticker, {})[legs_json] = collection
 
         out: list[JsonDict] = []
         async with self._db.execute(fills_q, tuple(tickers)) as cursor:
             async for combo_ticker, our_side, ctr, loss_num in cursor:
                 if not ctr:
                     continue
-                distinct = legsets.get(combo_ticker)
+                # LEDGER-FIRST: the durable ledger wins over the lossy tape.
+                distinct = ledger_legsets.get(combo_ticker)
+                source = "position_ledger"
                 if not distinct:
-                    # No leg definition on the tape ⇒ cannot model ⇒ not rehydrated.
+                    distinct = tape_legsets.get(combo_ticker)
+                    source = "rfqs_tape"
+                if not distinct:
+                    # No leg definition in ANY durable source ⇒ cannot model ⇒ not
+                    # rehydrated here. The caller RESERVES it from exchange figures
+                    # (unknown legs must never mean zero exposure).
                     continue
                 if len(distinct) > 1:
                     # CONFLICTING leg definitions for the same combo ticker: the
                     # originating identity is ambiguous. Fail closed — reject rather
-                    # than guess (surfaced by the caller as an unmodeled position).
+                    # than guess (the caller then reserves it from exchange figures).
                     log.warning(
                         "held_positions.conflicting_leg_sets",
                         combo_ticker=combo_ticker,
                         distinct_leg_sets=len(distinct),
+                        source=source,
                     )
                     continue
                 legs_json, collection = next(iter(distinct.items()))
@@ -981,6 +1161,7 @@ class Store:
                         "entry_price_cc": int(loss_num) // int(ctr),
                         "collection": collection,
                         "legs": json.loads(legs_json),
+                        "legs_source": source,
                     }
                 )
         return out

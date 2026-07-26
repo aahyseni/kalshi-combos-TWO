@@ -24,8 +24,20 @@ risk view has no single marginal per pair, so this provider calls it WITHOUT
 marginals — the plain (marginal-less) entry applies, which is the pricer's own
 fallback for a marginal-less caller and carries the conservative band. That is the
 correct book-level summary: a per-combo exact orientation is the pricer's job at
-quote time; the risk MC wants one conservative constant per within-game block
-(book_model already takes the most-positive band member per block for ``high``).
+quote time; the risk MC wants the conservative marginal-less band per PAIR.
+
+WHERE THIS BAND LANDS (2026-07-26 AXIS SPLIT). ``build_book_model`` feeds this ONE
+provider into BOTH of its named joints, and they use it differently on purpose:
+  * ``corr_location_point`` — this band's POINT value is written onto each
+    within-game pair INDIVIDUALLY (one 2-index block per pair), so the assembled
+    book matrix reproduces the pricer's own per-pair ``build_sgp_correlation``
+    matrix exactly — including measured-NEGATIVE (hedging) pairs. That is the
+    joint the EV / P(book) axis marks on, because it is the joint we PRICED on.
+  * ``corr_tail_stress_{low,point,high}`` — a game's pair bands are COLLAPSED to
+    one scalar (max at ``high``) and written onto every pair in that game. Every
+    ENFORCED gate rides this one: it is a deliberate over-statement standing in
+    for the tail dependence a Gaussian copula does not have. See the construction
+    site in ``sim/book_model.py`` for the full reasoning.
 """
 
 from __future__ import annotations

@@ -71,7 +71,7 @@ def _mixed_model(corners_rho: float) -> BookModel:
     leg_index = {_ADV_ARG: 0, _ADV_ENG: 1, _CORNERS: 2}
     event_by_index = {0: _EV, 1: _EV, 2: _CORNERS_EV}
     return BookModel(
-        legs, positions, corr, corr.copy(), corr.copy(),
+        legs, positions, corr, corr.copy(), corr.copy(), corr.copy(),
         leg_index, event_by_index, False,
     )
 
@@ -89,7 +89,7 @@ def test_corner_covariance_follows_calibration():
     joints: list[float] = []
     for rho in (0.0, 0.45, 0.85):
         model = _mixed_model(rho)
-        corr = model.corr_for_band("high")
+        corr = model.corr_tail_stress_for_band("high")
         vals = sample_leg_values(
             model.legs, corr, 200_000, np.random.default_rng(7)
         )
@@ -116,7 +116,7 @@ def test_corner_covariance_lost_by_raw_structural_split():
     plans, copula = build_game_plans(tickers, events, marginals, CFG)
     # Advance pair structural; corners is copula-only.
     assert copula == [2]
-    high_corr = _mixed_model(0.85).corr_for_band("high")
+    high_corr = _mixed_model(0.85).corr_tail_stress_for_band("high")
     legs = [LegModel(p=0.55), LegModel(p=0.45), LegModel(p=0.40)]
     vals = sample_structural_values(
         plans, copula, legs, high_corr, 200_000, np.random.default_rng(7)
@@ -142,7 +142,7 @@ def test_bridge_detected_only_when_a_game_straddles_both_blocks():
     corr2 = np.eye(2)
     corr2[0, 1] = corr2[1, 0] = 0.2
     pure_struct = BookModel(
-        legs, pos, corr2, corr2.copy(), corr2.copy(),
+        legs, pos, corr2, corr2.copy(), corr2.copy(), corr2.copy(),
         {_ADV_ARG: 0, _ADV_ENG: 1}, {0: _EV, 1: _EV}, False,
     )
     assert _select_sampler(pure_struct, CFG).bridge_needed is False
@@ -156,8 +156,15 @@ def test_bridge_needed_helper_ignores_ungamed_copula_legs():
     model = _mixed_model(0.5)
     # Rebuild with the corners leg UNGAMED (event None) → not in any structural game.
     model = BookModel(
-        model.legs, model.positions, model.corr_high, model.corr_low.copy(),
-        model.corr_high.copy(), model.leg_index, {0: _EV, 1: _EV, 2: None}, False,
+        legs=model.legs,
+        positions=model.positions,
+        corr_location_point=model.corr_tail_stress_high,
+        corr_tail_stress_point=model.corr_tail_stress_high.copy(),
+        corr_tail_stress_low=model.corr_tail_stress_low.copy(),
+        corr_tail_stress_high=model.corr_tail_stress_high.copy(),
+        leg_index=model.leg_index,
+        event_by_index={0: _EV, 1: _EV, 2: None},
+        unknown=False,
     )
     tickers = [_ADV_ARG, _ADV_ENG, _CORNERS]
     events = [_EV, _EV, None]
@@ -203,7 +210,7 @@ def _two_combo_model(corners_rho: float) -> BookModel:
     leg_index = {_ADV_ARG: 0, _ADV_ENG: 1, _CORNERS: 2}
     event_by_index = {0: _EV, 1: _EV, 2: _CORNERS_EV}
     return BookModel(
-        legs, positions, corr, corr.copy(), corr.copy(),
+        legs, positions, corr, corr.copy(), corr.copy(), corr.copy(),
         leg_index, event_by_index, False,
     )
 
@@ -232,7 +239,7 @@ def test_no_bridge_leaves_governing_es_unchanged():
     corr2 = np.eye(2)
     corr2[0, 1] = corr2[1, 0] = 0.2
     model = BookModel(
-        legs, pos, corr2, corr2.copy(), corr2.copy(),
+        legs, pos, corr2, corr2.copy(), corr2.copy(), corr2.copy(),
         {_ADV_ARG: 0, _ADV_ENG: 1}, {0: _EV, 1: _EV}, False,
     )
     snap = compute_book_risk(model, n_samples=60_000, seed=1, structural_cfg=CFG)

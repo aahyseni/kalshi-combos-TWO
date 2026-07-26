@@ -24,7 +24,9 @@ any resync (feed ordering guarantees that).
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from collections.abc import Callable, Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from fractions import Fraction
@@ -70,6 +72,7 @@ from combomaker.risk.exposure import (
     LegRef,
     OpenPosition,
     OpenQuoteRisk,
+    stable_ledger_key,
 )
 from combomaker.risk.fill_velocity import FillVelocityTracker
 from combomaker.risk.inplay import InPlayDetector
@@ -474,6 +477,12 @@ class LifecycleConfig:
     # Non-positive/NaN interval ⇒ sweep disabled (belt to the config validator).
     fills_ledger_sweep_interval_s: float = 900.0
     fills_ledger_sweep_lookback_s: float = 3600.0
+    # POSITION-LEDGER DIVERGENCE INVARIANT (2026-07-26). Cadence of the
+    # maintenance-tick "open exposure positions vs open position_ledger rows"
+    # count. Alarm-only observability (one small indexed SELECT per interval,
+    # never a risk input, never on the pricing path) so a ledger that stops
+    # matching the book is SELF-REPORTING. Non-positive ⇒ disabled.
+    ledger_divergence_sweep_interval_s: float = 300.0
     # F1 MONOTONE PRE-PRICING GATE (throughput synthesis 2026-07-16, lens-3 F1).
     # When True, handle_rfq consults a CANDIDATE-FREE limits check (cached per
     # exposure generation + bankroll, ≤0.5s) BEFORE the expensive joint pricing
@@ -862,6 +871,11 @@ class QuoteLifecycle:
         # unresolved miss so a persistent miss re-alarms every interval.
         self._fills_sweep_last_mono_ns: int | None = None
         self._fills_sweep_min_ts: int | None = None
+        # POSITION-LEDGER DIVERGENCE cadence (2026-07-26): monotonic stamp of
+        # the last open-positions-vs-open-ledger-rows count. None = never run;
+        # the FIRST maintenance tick runs it (a boot-time read, right after
+        # rehydration, is the most valuable one) and then it throttles.
+        self._ledger_divergence_last_mono_ns: int | None = None
         # HEARTBEAT BEAT (2026-07-16 wedge fix): quote_app's Heartbeat.beat,
         # invoked per iteration inside the long maintenance sub-loops (reprice
         # sweep, recovery polls) so a loop that is genuinely MAKING PROGRESS
@@ -1153,6 +1167,17 @@ class QuoteLifecycle:
                 # games (which game dominates the downside = the anti-variance
                 # concentration P(book) steering will price against).
                 p_book=round(snap.p_profit, 4),
+                # AXIS SPLIT (2026-07-26): p_book/p_night/ev ride the exact
+                # per-pair PRICING joint (``location_joint`` at
+                # ``location_band``); the ES/ruin/loss-quantile gates ride the
+                # game-collapsed TAIL-DEPENDENCE STRESS joint (``tail_joint`` at
+                # the adverse ``band``). The band alone does NOT identify a joint
+                # — the two differ AT THE SAME BAND — so both the band and the
+                # joint NAME are stamped and a log line is unambiguous.
+                band=snap.band,
+                tail_joint=snap.tail_joint,
+                location_band=snap.location_band,
+                location_joint=snap.location_joint,
                 # P(NIGHT) (2026-07-25 operator KPI): realized + open book —
                 # does not reset as winners settle out; the headline number.
                 p_night=round(snap.p_night, 4),
@@ -4684,6 +4709,83 @@ class QuoteLifecycle:
         except MoneyParseError:
             return None
 
+    # -------------------------------- position-ledger divergence invariant
+
+    async def _sweep_ledger_divergence(self) -> None:
+        """POSITION-LEDGER DIVERGENCE INVARIANT (2026-07-26).
+
+        Count OPEN exposure positions vs OPEN ``position_ledger`` rows and log
+        the divergence. This exists because the "settled rows can never land"
+        defect was SILENT: ``record_settled`` keyed on the volatile in-memory
+        ``position_id``, the rehydrator re-mints ids on every restart, so no
+        settled write could match an open row written before the restart — and
+        nothing ever said so. The ledger had drifted to 6 rows / $27.35 of a
+        $731.04 book (3.74%) before a human noticed.
+
+        Matching is by the DURABLE key ``(leg_set_hash, combo_ticker,
+        our_side)`` — the same identity the settled write now resolves on — so
+        this measures exactly the property that must hold: every open position
+        we carry has an open ledger row its settlement can land on.
+
+        ALARM-ONLY and off the pricing path: one small indexed SELECT per
+        ``ledger_divergence_sweep_interval_s``, never a risk input, never a
+        writer (the boot upsert in ``_rehydrate_exposure_book`` owns backfill).
+        Non-positive interval ⇒ disabled. A leg-less/synthetic reserved
+        position (an exchange holding adopted with no local record) has no
+        durable identity and is counted separately as ``no_identity`` rather
+        than being scored as a false divergence."""
+        interval_s = self._config.ledger_divergence_sweep_interval_s
+        if not (interval_s > 0.0):
+            return
+        now = self._clock.monotonic_ns()
+        last = self._ledger_divergence_last_mono_ns
+        if last is not None and now - last < int(interval_s * 1e9):
+            return
+        self._ledger_divergence_last_mono_ns = now
+        open_rows = await self._store.open_ledger_identities()
+        # Multiset: two identical open positions on one combo need TWO rows.
+        available: Counter[tuple[str, str, str]] = Counter(open_rows)
+        positions = list(self._exposure.positions.values())
+        no_identity = 0
+        missing: list[str] = []
+        for pos in positions:
+            key = stable_ledger_key(pos)
+            if key is None:
+                no_identity += 1
+                continue
+            ident = (key, pos.combo_ticker, pos.our_side.value)
+            if available[ident] > 0:
+                available[ident] -= 1
+            else:
+                missing.append(pos.position_id)
+        self._metrics.inc("ledger_divergence.checks")
+        if missing:
+            self._metrics.inc("ledger_divergence.missing_rows", by=len(missing))
+        if no_identity:
+            self._metrics.inc("ledger_divergence.no_identity", by=no_identity)
+        orphan_rows = sum(available.values())
+        if orphan_rows:
+            self._metrics.inc("ledger_divergence.orphan_rows", by=orphan_rows)
+        fields = {
+            "open_positions": len(positions),
+            "open_ledger_rows": len(open_rows),
+            "positions_without_row": len(missing),
+            "rows_without_position": orphan_rows,
+            "positions_without_identity": no_identity,
+        }
+        if missing or orphan_rows or no_identity:
+            log.warning(
+                "position_ledger_divergence",
+                **fields,
+                position_ids=sorted(missing)[:20],
+                detail="open exposure positions and open position_ledger rows "
+                "disagree — a position with no open row cannot record its "
+                "settlement (p_night's realized anchor + settlement "
+                "calibration under-count); alarm-only, no risk effect",
+            )
+        else:
+            log.info("position_ledger_divergence_clean", **fields)
+
     # ------------------------------------ fills-ledger diff sweep (incident C)
 
     async def _sweep_fills_ledger_diff(self) -> None:
@@ -5327,6 +5429,18 @@ class QuoteLifecycle:
         # every writer-path miss. Runs even when halted (reconciliation, not
         # quoting).
         await self._sweep_fills_ledger_diff()
+        # POSITION-LEDGER DIVERGENCE INVARIANT (2026-07-26): count OPEN
+        # exposure positions vs OPEN position_ledger rows on the DURABLE
+        # identity, so "settled rows can never land after a restart" is
+        # SELF-REPORTING instead of silent. Throttled, alarm-only, and
+        # ISOLATED — a store error logs and retries next interval; it must
+        # never reach the pricing path nor abort the enforced limit check
+        # below (fix-isolation rule).
+        try:
+            await self._sweep_ledger_divergence()
+        except Exception as exc:  # noqa: BLE001 — slow loop, alarm-only
+            self._metrics.inc("ledger_divergence.errors")
+            log.warning("ledger_divergence_sweep_failed", error=repr(exc))
         if not self._killswitch.halted:
             breaches = self._partition_breaches(
                 self._limits.check(
@@ -5479,6 +5593,64 @@ class QuoteLifecycle:
                 log.warning("cancel_all_delete_failed", quote_id=quote_id, error=repr(result))
             self._drop_quote(quote_id)
         self._metrics.inc("quote.cancel_all")
+
+    async def cancel_quotes_touching(
+        self, tickers: AbstractSet[str], reason: ReasonCode | str
+    ) -> tuple[int, int]:
+        """SCOPED withdrawal: delete every DELETABLE resting quote that carries
+        a leg in ``tickers``. Returns ``(deleted, failures)``.
+
+        The market-scoped counterpart of ``cancel_all`` (2026-07-26 metadata
+        breaker rebuild): when one market's LIFECYCLE state moves (exchange
+        trading pause, unpause — which auto-cancels resting orders exchange-side
+        anyway — or a close_time rewrite that invalidates the time-to-close we
+        priced on), the proportionate response is to pull OUR quotes off THAT
+        market, not to kill the whole book.
+
+        ACCEPTED quotes are skipped exactly as ``cancel_all`` skips them: an
+        accepted quote is mid-confirm and is not ours to delete. They are not
+        counted as failures — nothing was left undone that we could do.
+
+        ``failures`` counts deletes the exchange did not acknowledge. The caller
+        (quote_app's quarantine enforcement) treats a non-zero count as an
+        UNENFORCED quarantine and escalates it to the whole-bot halt on the next
+        status tick — fail-closed: a scoped response we could not carry out is
+        not a scoped response."""
+        if not tickers:
+            return (0, 0)
+        target_ids = [
+            qid
+            for qid, state in self._open.items()
+            if not state.accepted
+            and any(leg.market_ticker in tickers for leg in state.rfq.legs)
+        ]
+        if not target_ids:
+            return (0, 0)
+        log.warning(
+            "cancel_quotes_touching",
+            reason=str(reason),
+            count=len(target_ids),
+            markets=sorted(tickers),
+        )
+        results = await asyncio.gather(
+            *(self._sender.delete_quote(qid) for qid in target_ids),
+            return_exceptions=True,
+        )
+        failures = 0
+        for quote_id, result in zip(target_ids, results, strict=True):
+            if isinstance(result, Exception):
+                failures += 1
+                log.warning(
+                    "cancel_quotes_touching_delete_failed",
+                    quote_id=quote_id,
+                    error=repr(result),
+                )
+            # Drop the mirror either way (same rule as cancel_all): a quote we
+            # asked the exchange to delete must never keep resting in OUR book.
+            # The FAILURE is what escalates, not the mirror state.
+            self._drop_quote(quote_id)
+            self._metrics.inc(f"quote.deleted.{reason}")
+        return (len(target_ids), failures)
 
     @property
     def open_quote_count(self) -> int:

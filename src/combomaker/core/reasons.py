@@ -151,6 +151,14 @@ class ReasonCode(StrEnum):
     # single-match soccer priors do not apply). Gated off until its own regime
     # is built, rather than mispriced on the wrong model.
     SKIP_UNMODELED_REGIME = "skip_unmodeled_regime"
+    # MARKET SAFETY QUARANTINE (2026-07-26): a leg whose LIFECYCLE state moved
+    # under us — an exchange trading pause (status active→inactive), an unpause
+    # (which auto-cancels every resting order), or a close_time rewrite. The
+    # payoff did not change (the settlement fingerprint is byte-identical, else
+    # this would be a halt), but the market is not one we may keep quoting
+    # until the exchange reports it normally tradable again. Measured live
+    # state, never a configured list. See risk/quarantine.py.
+    SKIP_MARKET_QUARANTINED = "skip_market_quarantined"
 
     # --- Quote lifecycle ---
     QUOTE_SENT = "quote_sent"
@@ -176,6 +184,11 @@ class ReasonCode(StrEnum):
     # < 1; a failed pull fails SAFE (quotes stay; confirm-time exactness and
     # TTL/reprice sweeps remain the backstop).
     DELETE_RISK_EVICTED_ON_FILL = "delete_risk_evicted_on_fill"
+    # Scoped withdrawal for a market entering the safety quarantine
+    # (SKIP_MARKET_QUARANTINED above): every deletable resting quote touching
+    # that market is pulled the same status tick the lifecycle move is seen.
+    # A pull we cannot complete ESCALATES to the whole-bot halt next tick.
+    DELETE_MARKET_QUARANTINED = "delete_market_quarantined"
 
     # --- Last look (confirm decision) ---
     CONFIRM_OK = "confirm_ok"

@@ -187,9 +187,18 @@ def detect_metadata_change(
 
     ``tripwire_hit`` is the ``(shape, detail)`` from ``pricing.tripwire`` (a
     pinned exchange-blocked impossible shape became constructible ⇒ the validator
-    changed). ``changed_markets`` are markets whose settlement-relevant metadata
-    (close_time / rules / settlement source) changed under us. Either trips —
-    our model of the market is stale.
+    changed). ``changed_markets`` are markets whose PAYOFF FUNCTION moved under
+    us — the rules text, the strike/line, the parent event, the expiration
+    deadline, the payoff shape, a re-graded result, or a status entering
+    dispute/amendment (``quote_app._settlement_fingerprint`` owns the exact
+    field partition and the evidence for each inclusion). Either trips — our
+    model of the market is stale.
+
+    NOT here (2026-07-26): a market's LIFECYCLE state moving — an exchange
+    trading pause/unpause or a ``close_time`` rewrite. That is a market-scoped
+    quarantine (``risk/quarantine.py``), not a whole-book kill; a quarantine
+    the bot could not ENFORCE is escalated back into ``changed_markets`` and
+    halts here.
     """
     if tripwire_hit is not None:
         shape, detail = tripwire_hit

@@ -651,13 +651,21 @@ async def test_position_reconcile_flags_unknown_exchange_position(
         assert rest.params is not None
         assert rest.params["subaccount"] == 0  # query-layer pin (P0-5)
         assert metrics.counter("position_reconcile.unmodeled") == 1
-        # Neither row ADOPTS here: FELLOUT has a local fills row (the recovery
-        # sweep owns full re-modeling) and EXTERNAL carries NO readable
-        # market_exposure figure — an at-risk amount is never guessed, so it
-        # stays alarm-only (adoption with a real figure: TestReserveAdoption).
+        # 2026-07-26 (fail-open fix): neither row carries a readable
+        # market_exposure figure, and neither has a RESOLVABLE leg set, so
+        # nobody downstream can ever model them. Leaving them out of the book —
+        # the old behaviour asserted here — is precisely the fail-OPEN defect.
+        # Both are now adopted at the PROVEN $1.00/contract upper bound and
+        # loudly alarmed (adoption with a real figure: TestReserveAdoption).
         assert {p.combo_ticker for p in exposure.positions.values()} == {
-            "KXMVE-KNOWN"
+            "KXMVE-KNOWN",
+            "KXMVE-EXTERNAL",
+            "KXMVE-FELLOUT",
         }
+        assert exposure.positions["reserve:KXMVE-EXTERNAL"].max_loss_cc == 50_000
+        assert exposure.positions["reserve:KXMVE-FELLOUT"].max_loss_cc == 215_800
+        assert metrics.counter("exchange_exposure.unreadable") == 1
+        assert metrics.counter("exchange_exposure.reserved_at_full_notional") == 2
 
         # Fully modeled book ⇒ no alarm.
         exposure.add_position(_position("KXMVE-FELLOUT"))

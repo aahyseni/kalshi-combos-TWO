@@ -61,7 +61,7 @@ def _mixed_model() -> BookModel:
     leg_index = {_ADV_ARG: 0, _ADV_ENG: 1, _CORNERS: 2}
     event_by_index = {0: _EV, 1: _EV, 2: _CORNERS_EV}
     return BookModel(
-        legs, positions, corr, corr.copy(), corr.copy(),
+        legs, positions, corr, corr.copy(), corr.copy(), corr.copy(),
         leg_index, event_by_index, False,
     )
 
@@ -79,7 +79,7 @@ def test_conditioning_injects_covariance_and_preserves_marginal():
     bundle = _select_sampler(model, CFG)
     assert bundle.conditioned is True
     assert bundle.split_sampler is not None
-    corr = model.corr_for_band("high")
+    corr = model.corr_tail_stress_for_band("high")
     n = 300_000
     cond = bundle.sampler(model.legs, corr, n, np.random.default_rng(1))
     split = bundle.split_sampler(model.legs, corr, n, np.random.default_rng(1))
@@ -125,7 +125,7 @@ def test_conditioning_off_is_byte_identical_to_split():
     bundle = _select_sampler(model, off)
     assert bundle.conditioned is False
     assert bundle.split_sampler is None
-    corr = model.corr_for_band("high")
+    corr = model.corr_tail_stress_for_band("high")
     v1 = bundle.sampler(model.legs, corr, 50_000, np.random.default_rng(4))
     # Bit-identical to a direct unconditioned split on the same seed.
     plans, cop = build_game_plans(
@@ -153,7 +153,7 @@ def _concentrated_model() -> BookModel:
     leg_index = {_ADV_ARG: 0, _ADV_ENG: 1, _CORNERS: 2}
     event_by_index = {0: _EV, 1: _EV, 2: _CORNERS_EV}
     return BookModel(
-        legs, positions, corr, corr.copy(), corr.copy(),
+        legs, positions, corr, corr.copy(), corr.copy(), corr.copy(),
         leg_index, event_by_index, False,
     )
 
@@ -171,7 +171,7 @@ def test_governing_tail_at_least_independent_split():
     assert bundle.conditioned is True
     from combomaker.sim.book_risk import _book_pnl_from_values, _es_from_pnl
 
-    corr = model.corr_for_band("high")
+    corr = model.corr_tail_stress_for_band("high")
     # The guard uses the FIFTH spawned substream; reproduce it deterministically.
     seqs = np.random.SeedSequence(5).spawn(5)
     split_vals = bundle.split_sampler(  # type: ignore[union-attr]
@@ -236,8 +236,15 @@ def test_ungamed_copula_leg_unchanged():
     model = _mixed_model()
     # Rebuild with the corners leg UNGAMED (event None).
     model = BookModel(
-        model.legs, model.positions, model.corr_high, model.corr_low.copy(),
-        model.corr_high.copy(), model.leg_index, {0: _EV, 1: _EV, 2: None}, False,
+        legs=model.legs,
+        positions=model.positions,
+        corr_location_point=model.corr_tail_stress_high,
+        corr_tail_stress_point=model.corr_tail_stress_high.copy(),
+        corr_tail_stress_low=model.corr_tail_stress_low.copy(),
+        corr_tail_stress_high=model.corr_tail_stress_high.copy(),
+        leg_index=model.leg_index,
+        event_by_index={0: _EV, 1: _EV, 2: None},
+        unknown=False,
     )
     plans, cop = build_game_plans(
         [_ADV_ARG, _ADV_ENG, _CORNERS], [_EV, _EV, None], [0.55, 0.45, 0.40], CFG

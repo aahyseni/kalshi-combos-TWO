@@ -66,7 +66,7 @@ def _structural_model(
     corr = np.eye(2)
     corr[0, 1] = corr[1, 0] = rho
     return BookModel(
-        legs, positions, corr, corr.copy(), corr.copy(),
+        legs, positions, corr, corr.copy(), corr.copy(), corr.copy(),
         {_ADV_ARG: 0, _ADV_ENG: 1}, {0: _EV, 1: _EV}, False,
     )
 
@@ -114,7 +114,7 @@ def _graded_structural_book() -> BookModel:
     n = len(legs)
     corr = np.eye(n)
     return BookModel(
-        tuple(legs), tuple(positions), corr, corr.copy(), corr.copy(),
+        tuple(legs), tuple(positions), corr, corr.copy(), corr.copy(), corr.copy(),
         leg_index, event_by_index, False,
     )
 
@@ -207,7 +207,7 @@ def test_perturbed_config_re_inverts_to_different_settlement_rate():
     prod = _select_sampler(model, CFG)
     bundle = _structural_challenger_bundle(model, CFG, bands)
     assert bundle is not None
-    corr = model.corr_for_band("high")
+    corr = model.corr_tail_stress_for_band("high")
     vals_p = prod.sampler(model.legs, corr, 200_000, np.random.default_rng(9))
     vals_c = bundle.sampler(model.legs, corr, 200_000, np.random.default_rng(9))
     # The total-over leg (index 2 of the first game) settles at a DIFFERENT rate —
@@ -266,7 +266,7 @@ def test_bundle_none_when_nothing_re_inverts():
     positions = (ComboPosition((0,), "no", 50, 8000, leg_sides=("yes",)),)
     corr = np.eye(1)
     model = BookModel(
-        legs, positions, corr, corr.copy(), corr.copy(),
+        legs, positions, corr, corr.copy(), corr.copy(), corr.copy(),
         {"KXWCCORNERS-26JUL15ENGARG-9": 0}, {0: None}, False,
     )
     bundle = _structural_challenger_bundle(

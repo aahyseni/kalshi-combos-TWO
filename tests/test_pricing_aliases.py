@@ -547,6 +547,7 @@ def test_conditioning_knockout_flag_or_folds_over_aliased_legs() -> None:
         corr,
         corr.copy(),
         corr.copy(),
+        corr.copy(),
         {corners: 0, CHAMP_ES: 1, CHAMP_AR: 2},
         {0: corners_ev, 1: CHAMP_EVENT, 2: CHAMP_EVENT},
         False,

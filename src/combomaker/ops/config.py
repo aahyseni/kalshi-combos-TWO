@@ -2822,6 +2822,14 @@ class RiskConfig(StrictModel):
     # (paper/backtests/minimal rigs).
     fills_ledger_sweep_interval_s: float = 900.0
     fills_ledger_sweep_lookback_s: float = 3600.0
+    # POSITION-LEDGER DIVERGENCE INVARIANT (2026-07-26). Cadence of the
+    # maintenance-tick count of OPEN exposure positions vs OPEN position_ledger
+    # rows. Pure observability (one small indexed SELECT per interval, off the
+    # pricing path, alarm-only) — it exists so the "settled rows can never land"
+    # drift class is SELF-REPORTING instead of silent: the ledger covered 6 rows
+    # / $27.35 of a $731.04 book before anyone noticed. Positive finite
+    # (validator below).
+    ledger_divergence_sweep_interval_s: float = 300.0
     # SETTLED-LEG MARGINAL RESOLUTION (2026-07-18 live outage: FRAENG settled
     # while cross-game combos holding FRAENG legs stayed open — the settled
     # legs' books left the feed, the book-risk model went UNKNOWN and the
@@ -3058,6 +3066,7 @@ class RiskConfig(StrictModel):
         "settled_resolution_retry_s",
         "fills_ledger_sweep_interval_s",
         "fills_ledger_sweep_lookback_s",
+        "ledger_divergence_sweep_interval_s",
     )
     @classmethod
     def _valid_verify_intervals(cls, v: float, info: ValidationInfo) -> float:

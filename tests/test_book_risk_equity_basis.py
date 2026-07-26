@@ -152,7 +152,7 @@ def test_cost_basis_plus_pnl_equals_cash_plus_payout_no_double_count() -> None:
     cost_basis = modeled_cost_basis_cc(model)
     equity_basis = available_cash_cc + cost_basis
 
-    corr = model.corr_for_band("high")
+    corr = model.corr_tail_stress_for_band("high")
     rng = np.random.default_rng(7)
     values = sample_leg_values(model.legs, corr, 5_000, rng)
     book = _book_pnl_from_values(values, model.positions)
@@ -192,7 +192,7 @@ def test_ruin_basis_is_mark_independent_but_exchange_equity_is_not() -> None:
     model = build_book_model(positions, marginals=lambda t: 0.85)
     cost_basis = modeled_cost_basis_cc(model)  # 12_000cc
 
-    corr = model.corr_for_band("high")
+    corr = model.corr_tail_stress_for_band("high")
     values = sample_leg_values(model.legs, corr, 40_000, np.random.default_rng(3))
     book = _book_pnl_from_values(values, model.positions)
 

@@ -143,7 +143,7 @@ class TestBuildBookModel:
         m = build_book_model([], marginals=lambda t: 0.5)
         assert m.legs == ()
         assert m.positions == ()
-        assert m.corr_point.shape == (0, 0)
+        assert m.corr_tail_stress_point.shape == (0, 0)
         assert not m.unknown
 
     def test_unpriceable_held_leg_reserves_not_unknown(self) -> None:
@@ -196,19 +196,19 @@ class TestBuildBookModel:
         )
         ia, ib, ic = m.leg_index["A"], m.leg_index["B"], m.leg_index["C"]
         # A,B same game G1 → high-band rho 0.8; A,C cross-game → 0.
-        assert m.corr_high[ia, ib] == pytest.approx(0.8)
-        assert m.corr_high[ia, ic] == pytest.approx(0.0)
-        assert m.corr_high[ib, ic] == pytest.approx(0.0)
+        assert m.corr_tail_stress_high[ia, ib] == pytest.approx(0.8)
+        assert m.corr_tail_stress_high[ia, ic] == pytest.approx(0.0)
+        assert m.corr_tail_stress_high[ib, ic] == pytest.approx(0.0)
         # low band uses the min rho 0.2.
-        assert m.corr_low[ia, ib] == pytest.approx(0.2)
+        assert m.corr_tail_stress_low[ia, ib] == pytest.approx(0.2)
 
     def test_flat_band_default_when_no_prior(self) -> None:
         p = _pos("p1", (_leg("A", "KXWCGAME-G1"), _leg("B", "KXWCGAME-G1")))
         m = build_book_model([p], marginals=lambda t: 0.5, within_game_rho=lambda a, b: None)
         ia, ib = m.leg_index["A"], m.leg_index["B"]
         lo, pt, hi = DEFAULT_FLAT_BAND
-        assert m.corr_low[ia, ib] == pytest.approx(lo)
-        assert m.corr_high[ia, ib] == pytest.approx(hi)
+        assert m.corr_tail_stress_low[ia, ib] == pytest.approx(lo)
+        assert m.corr_tail_stress_high[ia, ib] == pytest.approx(hi)
 
     def test_ungamed_leg_never_merges(self) -> None:
         # A leg with no event_ticker keys on itself and never correlates.
@@ -217,7 +217,7 @@ class TestBuildBookModel:
             [p], marginals=lambda t: 0.5, within_game_rho=lambda a, b: (0.2, 0.5, 0.8)
         )
         ia, ib = m.leg_index["A"], m.leg_index["B"]
-        assert m.corr_high[ia, ib] == pytest.approx(0.0)  # independent, fail-closed
+        assert m.corr_tail_stress_high[ia, ib] == pytest.approx(0.0)  # independent, fail-closed
 
     def test_no_position_uses_leg_sides(self) -> None:
         # A NO-side position's legs are marked in leg_sides so the MC flips them.
@@ -248,7 +248,7 @@ class TestBuildBookModel:
             [p_a, p_b], np.array([[1.0, rho], [rho, 1.0]])
         )
         stats = simulate(
-            m.legs, m.corr_for_band("point"), list(m.positions), n_samples=N, seed=101
+            m.legs, m.corr_tail_stress_for_band("point"), list(m.positions), n_samples=N, seed=101
         )
         # A YES combo at price 0 pays $1 * P(both hit); EV/DOLLAR = MC hit rate.
         mc_hit = stats.ev_cc / DOLLAR_CC
@@ -270,7 +270,7 @@ class TestBuildBookModel:
             [p_a, p_b], np.array([[1.0, rho], [rho, 1.0]])
         )
         stats = simulate(
-            m.legs, m.corr_for_band("point"), list(m.positions), n_samples=N, seed=202
+            m.legs, m.corr_tail_stress_for_band("point"), list(m.positions), n_samples=N, seed=202
         )
         # NO position at price 0 pays (1 - payout)*$1; EV/DOLLAR = 1 - joint.
         mc_no = stats.ev_cc / DOLLAR_CC

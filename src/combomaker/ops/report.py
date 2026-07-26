@@ -89,6 +89,14 @@ def _portfolio_mc(
         "unknown_marginals": snap.unknown,
         "usable": snap.usable,
         "band": snap.band,
+        # AXIS SPLIT (2026-07-26): the tail axes ride the game-collapsed
+        # TAIL-DEPENDENCE STRESS joint at ``band`` (adverse), the location axes
+        # (ev/p_profit/p_night/p_loss_worse_than) ride the exact per-pair PRICING
+        # joint. Publish band AND joint name on both so a reader never
+        # mis-attributes an EV (the two joints differ at the SAME band).
+        "tail_joint": snap.tail_joint,
+        "location_band": snap.location_band,
+        "location_joint": snap.location_joint,
         "ev_cc": round(snap.ev_cc, 1),
         "ev_stderr_cc": round(snap.ev_stderr_cc, 2),
         "p_profit": round(snap.p_profit, 4),

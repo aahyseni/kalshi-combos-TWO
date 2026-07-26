@@ -155,7 +155,7 @@ def test_committed_only_basis_reconciles_post_terminal_equity_exactly() -> None:
     cand_combo = position_to_combo(candidate, leg_index)
     post_combos = [*committed_combos, *reservation_combos, cand_combo]
 
-    corr = merged_model.corr_for_band("high")
+    corr = merged_model.corr_tail_stress_for_band("high")
     values = sample_leg_values(
         merged_model.legs, corr, 20_000, np.random.default_rng(11)
     )
@@ -230,7 +230,7 @@ def test_single_candidate_both_outcomes_identity_no_reservations() -> None:
     cand_combo = position_to_combo(candidate, leg_index)
     post_combos = [*committed_combos, cand_combo]
 
-    corr = merged_model.corr_for_band("high")
+    corr = merged_model.corr_tail_stress_for_band("high")
     values = sample_leg_values(
         merged_model.legs, corr, 20_000, np.random.default_rng(4)
     )
@@ -342,7 +342,7 @@ def test_p_ruin_strictly_higher_on_merged_vs_committed_basis() -> None:
 
     leg_index = merged_model.leg_index
     post_combos = [position_to_combo(p, leg_index) for p in merged_positions]
-    corr = merged_model.corr_for_band("high")
+    corr = merged_model.corr_tail_stress_for_band("high")
     values = sample_leg_values(
         merged_model.legs, corr, 40_000, np.random.default_rng(2)
     )

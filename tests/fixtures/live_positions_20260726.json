@@ -1,0 +1,236 @@
+{
+ "_source": "READ-ONLY GET /portfolio/positions?subaccount=0&count_filter=position&limit=200, prod, 2026-07-26 ~15:10 ET",
+ "_note": "Verbatim ticker/position_fp/market_exposure_dollars for all 46 open rows. Fields present on ALL 46: ticker, position_fp, market_exposure_dollars, total_traded_dollars, realized_pnl_dollars, fees_paid_dollars, last_updated_ts. The int-cents 'market_exposure' field is ABSENT from 46/46. 46/46 exposure strings carry SIX decimals; 21/46 are not a whole number of centi-cents.",
+ "market_positions": [
+  {
+   "ticker": "KXMVECROSSCATEGORY-S2026895DDF8BBAD-4AF9DA3E2EE",
+   "position_fp": "-3.19",
+   "market_exposure_dollars": "0.210540"
+  },
+  {
+   "ticker": "KXMVECROSSCATEGORY-S202617AD659C2B2-A6C0D2C6036",
+   "position_fp": "-9.00",
+   "market_exposure_dollars": "4.392000"
+  },
+  {
+   "ticker": "KXMVECROSSCATEGORY-S202630214F5E37F-92A28C6FF56",
+   "position_fp": "-67.00",
+   "market_exposure_dollars": "48.441000"
+  },
+  {
+   "ticker": "KXMVECROSSCATEGORY-S202630214F5E37F-C85EA4EC8C4",
+   "position_fp": "-13.00",
+   "market_exposure_dollars": "9.906000"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026C5F5F443089-BC7BAA9973E",
+   "position_fp": "-3.00",
+   "market_exposure_dollars": "2.046000"
+  },
+  {
+   "ticker": "KXMVECROSSCATEGORY-S20269F9F6F15289-F3F1B1C62A2",
+   "position_fp": "-1.00",
+   "market_exposure_dollars": "0.465000"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026A7EBA92B22C-CDD75DF21B8",
+   "position_fp": "-8.84",
+   "market_exposure_dollars": "3.995680"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026E2B6234550B-1C30469059B",
+   "position_fp": "-1.70",
+   "market_exposure_dollars": "0.732700"
+  },
+  {
+   "ticker": "KXMVECROSSCATEGORY-S2026A9C9669DEC1-5CF52FC8B58",
+   "position_fp": "-8.00",
+   "market_exposure_dollars": "0.992000"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026051DF1B7A44-65595AF266A",
+   "position_fp": "-5.59",
+   "market_exposure_dollars": "2.688790"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026AFD0AF85352-075FEF5643A",
+   "position_fp": "-10.93",
+   "market_exposure_dollars": "6.120800"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026AFD0AF85352-D0CC44A2483",
+   "position_fp": "-21.67",
+   "market_exposure_dollars": "11.918500"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S20260FF8C0B6E98-934871A795C",
+   "position_fp": "-11.13",
+   "market_exposure_dollars": "6.321840"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S202614545FB13D9-206487189CF",
+   "position_fp": "-5.12",
+   "market_exposure_dollars": "2.713600"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S20268D917AF0840-23B8F4D3B5E",
+   "position_fp": "-88.02",
+   "market_exposure_dollars": "56.181690"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026DF1DAB5B334-B5D586B66FE",
+   "position_fp": "-38.75",
+   "market_exposure_dollars": "29.256250"
+  },
+  {
+   "ticker": "KXMVECROSSCATEGORY-S2026D930C9037A7-CA8098CD130",
+   "position_fp": "-6.00",
+   "market_exposure_dollars": "4.350000"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026C55377C41C8-E766690AB06",
+   "position_fp": "-13.43",
+   "market_exposure_dollars": "8.648920"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S20261E2DB0583B4-52DD1F3E5F8",
+   "position_fp": "-10.27",
+   "market_exposure_dollars": "6.439290"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S20266B88D9A353F-19427F49B46",
+   "position_fp": "-128.13",
+   "market_exposure_dollars": "65.416300"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026CC2D2DE1498-5F62F47ABFC",
+   "position_fp": "-51.89",
+   "market_exposure_dollars": "30.770770"
+  },
+  {
+   "ticker": "KXMVECROSSCATEGORY-S2026305B0F451A0-D0E769C5AA7",
+   "position_fp": "-33.00",
+   "market_exposure_dollars": "17.820000"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026B6F1E006DBB-1D24863F1E3",
+   "position_fp": "-22.61",
+   "market_exposure_dollars": "13.995610"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S202641DBBEC0637-DA3F4115DBE",
+   "position_fp": "-34.08",
+   "market_exposure_dollars": "19.664160"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026AFD2EFC915C-927A0AEB097",
+   "position_fp": "-10.15",
+   "market_exposure_dollars": "4.932900"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S20261FCB8DE8947-5AA6090E028",
+   "position_fp": "-50.60",
+   "market_exposure_dollars": "14.623400"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026E8B96D1DCA5-34ABBD7CC5B",
+   "position_fp": "-2.30",
+   "market_exposure_dollars": "1.340900"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026120598D82D0-9A79A02A286",
+   "position_fp": "-12.23",
+   "market_exposure_dollars": "7.435840"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026F77BC24FA6E-264EE19B358",
+   "position_fp": "-8.41",
+   "market_exposure_dollars": "5.348760"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S20265DCE8E31042-7BF89D6F337",
+   "position_fp": "-25.81",
+   "market_exposure_dollars": "16.234490"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S20264687ED98DD0-1C422EC3FEC",
+   "position_fp": "-10.79",
+   "market_exposure_dollars": "5.977660"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026869F99BA94A-C570FC01CC3",
+   "position_fp": "-10.83",
+   "market_exposure_dollars": "6.021480"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026869F99BA94A-84AE2D59BAF",
+   "position_fp": "-327.17",
+   "market_exposure_dollars": "81.465330"
+  },
+  {
+   "ticker": "KXMVECROSSCATEGORY-S20264A07A0365FB-D46642FD839",
+   "position_fp": "-10.00",
+   "market_exposure_dollars": "7.900000"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S20269D8667FEBF6-504214CE558",
+   "position_fp": "-18.76",
+   "market_exposure_dollars": "11.818800"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026E8DD73EDB82-E32CD217D73",
+   "position_fp": "-87.00",
+   "market_exposure_dollars": "43.214000"
+  },
+  {
+   "ticker": "KXMVECROSSCATEGORY-S20266CE8CD780CD-E89092D1A2D",
+   "position_fp": "-6.00",
+   "market_exposure_dollars": "3.594000"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S20262808A939548-723D837B014",
+   "position_fp": "-19.66",
+   "market_exposure_dollars": "10.006940"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026EC9D584FCC9-EDBA3B8FE24",
+   "position_fp": "-7.28",
+   "market_exposure_dollars": "4.404400"
+  },
+  {
+   "ticker": "KXMVECROSSCATEGORY-S2026DFF45D9C405-3008C03B5FE",
+   "position_fp": "-12.00",
+   "market_exposure_dollars": "8.364000"
+  },
+  {
+   "ticker": "KXMVECROSSCATEGORY-S2026DA0C3ED737D-7393545CD5C",
+   "position_fp": "-31.00",
+   "market_exposure_dollars": "16.709000"
+  },
+  {
+   "ticker": "KXMVECROSSCATEGORY-S2026E7A551BC000-939337E7D5A",
+   "position_fp": "-16.53",
+   "market_exposure_dollars": "11.769360"
+  },
+  {
+   "ticker": "KXMVECROSSCATEGORY-S20260615D7C10AF-BCB189D67D8",
+   "position_fp": "-20.09",
+   "market_exposure_dollars": "10.346350"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S202620D5300DEAE-53CE97A47B6",
+   "position_fp": "-29.57",
+   "market_exposure_dollars": "7.983900"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S20265C036502FDD-A0AD94229DB",
+   "position_fp": "-1.00",
+   "market_exposure_dollars": "0.292000"
+  },
+  {
+   "ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026906A5F6C4F5-E2B1649B435",
+   "position_fp": "-9.49",
+   "market_exposure_dollars": "6.282380"
+  }
+ ]
+}
