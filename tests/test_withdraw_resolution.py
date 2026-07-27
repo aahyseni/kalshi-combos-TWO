@@ -250,15 +250,41 @@ def test_sender_delete_quote_has_exactly_one_call_site() -> None:
             n.lineno for n in ast.walk(batch) if hasattr(n, "lineno")
         )
     ), "the one delete_quote call must live inside _withdraw_batch"
-    # ...and the token spend must PRECEDE it in that same function.
-    spends = [
+    # ...and the token spend must PRECEDE it. The spend itself now lives in
+    # ``_spend_withdraw_tokens`` (2026-07-27 — the gate had to become FIFO-fair
+    # and wall-bounded, which is more code than belongs inline), so the
+    # invariant is checked across the extraction rather than weakened: the gate
+    # is AWAITED before the send, the ONLY ``try_spend`` in the module is inside
+    # the gate, and the gate cannot itself send.
+    gate_calls = [
         node.lineno
         for node in ast.walk(batch)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "try_spend"
+        and node.func.attr == "_spend_withdraw_tokens"
     ]
-    assert spends and min(spends) < sites[0].lineno
+    assert gate_calls and min(gate_calls) < sites[0].lineno
+    gate = fns["_spend_withdraw_tokens"]
+    assert _calls_to(gate, "try_spend") >= 1
+    assert _calls_to(gate, "delete_quote") == 0
+    # WRITE spends only — the resolver's READ bucket is a different bucket and
+    # names its own documented cost.
+    all_spends = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "try_spend"
+        and not any(
+            isinstance(arg, ast.Name) and arg.id == "DEFAULT_ENDPOINT_TOKEN_COST"
+            for arg in node.args
+        )
+    ]
+    gate_lines = {n.lineno for n in ast.walk(gate) if hasattr(n, "lineno")}
+    assert all(n.lineno in gate_lines for n in all_spends), (
+        "a token spend outside the one gate: "
+        f"{[n.lineno for n in all_spends if n.lineno not in gate_lines]}"
+    )
 
 
 def test_no_withdrawal_entry_point_can_drop_an_unproven_quote() -> None:

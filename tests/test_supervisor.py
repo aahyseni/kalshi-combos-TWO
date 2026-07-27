@@ -21,6 +21,19 @@ from combomaker.ops.supervisor import (
     supervisor_heartbeat_reachable,
 )
 from combomaker.risk.heartbeat import Heartbeat, HeartbeatReader, ReconcileMarker
+from combomaker.risk.progress import ProgressLedger, progress_path
+
+
+def _stall(tmp_path: Path, clock: FakeClock, *, timeout_s: float = 15.0) -> ProgressLedger:
+    """Publish a progress ledger with ONE registered loop, then let the caller's
+    clock advance past its derived bound. This is the supervisor's SOLE kill axis
+    since 2026-07-27 — the heartbeat axis is log-only — so every kill-drill below
+    drives the kill through a genuinely stalled LOOP."""
+    ledger = ProgressLedger(clock, progress_path(tmp_path))  # type: ignore[arg-type]
+    ledger.register("quote", interval_s=0.0, wedge_timeout_s=timeout_s)
+    ledger.mark("quote")
+    ledger.publish()
+    return ledger
 
 
 class FakeExchange:
@@ -85,23 +98,22 @@ def test_write_budget_rejects_bad_params() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Kill-drill: missed heartbeat ⇒ cancel-all + KILL + marker.
+# Kill-drill: a stalled LOOP ⇒ cancel-all + KILL + marker.
 # --------------------------------------------------------------------------- #
 
 
-async def test_kill_drill_missed_heartbeat_cancels_and_kills(tmp_path: Path) -> None:
-    # Bot beats once, then "dies". The supervisor's clock advances past the
-    # timeout ⇒ it must cancel every resting quote AND write KILL + the marker.
-    bot_clock = FakeClock()
-    Heartbeat(bot_clock, tmp_path / "heartbeat.txt").beat()
-
+async def test_kill_drill_stalled_loop_cancels_and_kills(tmp_path: Path) -> None:
+    # A registered loop stops advancing past its derived bound ⇒ the supervisor
+    # must cancel every resting quote AND write KILL + the marker.
     sup_clock = FakeClock()
+    _stall(tmp_path, sup_clock)
     exchange = FakeExchange(["q1", "q2", "q3"])
     supervisor = SafetySupervisor(_config(tmp_path), sup_clock, exchange=exchange)
 
-    assert supervisor.heartbeat_wedged() is False  # fresh at t=0
-    sup_clock.advance(16.0)  # bot went silent past the 15s timeout
-    assert supervisor.heartbeat_wedged() is True
+    assert supervisor.wedged_detail() is None  # fresh at t=0
+    sup_clock.advance(16.0)  # the loop went silent past the 15s bound
+    detail = supervisor.wedged_detail()
+    assert detail is not None and "quote" in detail  # the reason NAMES the loop
 
     result = await supervisor.check_once()
     assert result is not None
@@ -113,6 +125,90 @@ async def test_kill_drill_missed_heartbeat_cancels_and_kills(tmp_path: Path) -> 
     assert sorted(exchange.cancelled) == ["q1", "q2", "q3"]
     assert (tmp_path / "KILL").exists()
     assert ReconcileMarker(tmp_path / "needs_reconcile").is_set()
+
+
+async def test_stalled_loop_marks_needs_reconcile_even_unreachable(
+    tmp_path: Path,
+) -> None:
+    """NARROWING THE TRIGGER DID NOT NARROW THE CONSEQUENCE. The CANCEL half and
+    the ``needs_reconcile`` half both still run on the progress axis — and the
+    marker is written UNCONDITIONALLY, including when the exchange cannot be
+    reached and nothing could be cancelled."""
+    sup_clock = FakeClock()
+    _stall(tmp_path, sup_clock)
+    exchange = FakeExchange(["q1"], fail=True)  # listing raises ⇒ unreachable
+    supervisor = SafetySupervisor(_config(tmp_path), sup_clock, exchange=exchange)
+    sup_clock.advance(16.0)
+
+    result = await supervisor.check_once()
+    assert result is not None
+    assert result.exchange_reachable is False
+    assert result.cancelled == 0
+    assert result.kill_written is True
+    assert result.marker_written is True
+    assert ReconcileMarker(tmp_path / "needs_reconcile").is_set()
+
+
+async def test_stale_heartbeat_alone_no_longer_kills(tmp_path: Path) -> None:
+    """PROPORTIONALITY (2026-07-27). The liveness axis went 0-for-8: all 8
+    supervisor emergency kills had ``exchange_reachable=true``, and the 07-27
+    kill fired one tick over its bound on a bot that withdrew all 67 quotes 4.2s
+    later. A stale heartbeat with every registered loop still advancing is now a
+    LOG LINE, not a kill."""
+    sup_clock = FakeClock()
+    ledger = _stall(tmp_path, sup_clock)
+    Heartbeat(FakeClock(), tmp_path / "heartbeat.txt").beat()
+    exchange = FakeExchange(["q1", "q2"])
+    supervisor = SafetySupervisor(_config(tmp_path), sup_clock, exchange=exchange)
+
+    # 100s of a heartbeat that never beats again, while the loops keep advancing.
+    for i in range(20):
+        sup_clock.advance(5.0)
+        ledger.mark("quote")
+        ledger.publish()
+        if i >= 3:  # past the 15s liveness bound
+            assert supervisor.heartbeat_wedged() is True  # the signal still EXISTS
+        assert await supervisor.check_once() is None      # ...and decides nothing
+
+    assert supervisor.heartbeat_wedged() is True
+    assert not (tmp_path / "KILL").exists()
+    assert exchange.cancelled == []
+    assert not ReconcileMarker(tmp_path / "needs_reconcile").is_set()
+
+
+def test_stale_heartbeat_is_logged_exactly_once_per_episode(tmp_path: Path) -> None:
+    """The forensic signal SURVIVES the demotion — and is edge-triggered, so a
+    permanently dead heartbeat cannot bury the log the next incident is read
+    out of."""
+    import asyncio
+
+    sup_clock = FakeClock()
+    ledger = _stall(tmp_path, sup_clock)
+    Heartbeat(FakeClock(), tmp_path / "heartbeat.txt").beat()
+    supervisor = SafetySupervisor(_config(tmp_path), sup_clock, exchange=None)
+
+    lines: list[tuple[str, dict[str, Any]]] = []
+    supervisor_module = __import__(
+        "combomaker.ops.supervisor", fromlist=["log"]
+    )
+    real_warning = supervisor_module.log.warning
+
+    def _capture(event: str, **kw: Any) -> None:
+        lines.append((event, kw))
+        real_warning(event, **kw)
+
+    supervisor_module.log.warning = _capture  # type: ignore[assignment]
+    try:
+        for _ in range(10):  # stale the whole way through
+            sup_clock.advance(5.0)
+            ledger.mark("quote")
+            ledger.publish()
+            asyncio.run(supervisor.check_once())
+        stale = [e for e, _ in lines if e == "supervisor_heartbeat_stale"]
+        assert stale == ["supervisor_heartbeat_stale"], f"logged {len(stale)}x"
+        assert lines[0][1]["consequence"].startswith("log-only")
+    finally:
+        supervisor_module.log.warning = real_warning  # type: ignore[assignment]
 
 
 async def test_live_bot_is_not_killed(tmp_path: Path) -> None:
@@ -199,9 +295,8 @@ async def test_reserved_budget_bounds_cancels_under_429_storm(tmp_path: Path) ->
 
 
 async def test_check_once_idempotent_after_kill(tmp_path: Path) -> None:
-    bot_clock = FakeClock()
-    Heartbeat(bot_clock, tmp_path / "heartbeat.txt").beat()
     sup_clock = FakeClock()
+    _stall(tmp_path, sup_clock)
     exchange = FakeExchange(["q1", "q2"])
     supervisor = SafetySupervisor(_config(tmp_path), sup_clock, exchange=exchange)
     sup_clock.advance(20.0)
@@ -285,14 +380,15 @@ async def test_run_loop_kills_dying_bot(tmp_path: Path) -> None:
 
     class DrivenClock(FakeClock):
         """A clock the loop advances itself: every ``now()`` jumps forward so the
-        heartbeat ages out within a couple of poll cycles (deterministic without
-        real sleeps)."""
+        stalled loop ages out within a couple of poll cycles (deterministic
+        without real sleeps)."""
 
         def now(self):  # type: ignore[no-untyped-def]
             self.advance(10.0)
             return super().now()
 
-    # Bot beats once (at a fixed earlier instant) then dies.
+    # Bot publishes one progress snapshot, then its loops die.
+    _stall(tmp_path, FakeClock())
     Heartbeat(FakeClock(), tmp_path / "heartbeat.txt").beat()
     exchange = FakeExchange(["q1", "q2"])
     supervisor = SafetySupervisor(
@@ -343,11 +439,13 @@ def test_supervisor_beats_own_heartbeat_even_after_kill(tmp_path: Path) -> None:
     # proving it's alive, so it keeps beating its own heartbeat.
     Heartbeat(FakeClock(), tmp_path / "heartbeat.txt").beat()
     sup_clock = FakeClock()
+    _stall(tmp_path, sup_clock)
     supervisor = SafetySupervisor(_config(tmp_path), sup_clock, exchange=None)
     import asyncio
 
-    sup_clock.advance(20.0)  # bot went silent ⇒ first check kills
+    sup_clock.advance(20.0)  # the loop stalled ⇒ first check kills
     asyncio.run(supervisor.check_once())
+    assert (tmp_path / "KILL").exists()
     own = supervisor_heartbeat_path(tmp_path)
     # Wipe the own-heartbeat to prove the NEXT check re-beats it post-kill.
     own.unlink()

@@ -6,8 +6,12 @@ $host.UI.RawUI.WindowTitle = "MONITOR (main) - $Log"
 # Boot events included (2026-07-25: four silent windows read as "nothing is
 # going on" - the monitor must SHOW the bot coming up, then go quiet-unless-
 # eventful).
-$boot = 'supervisor_starting|supervisor_launched|supervisor_heartbeat_wedged|supervisor_emergency_kill|kill_file_present|needs_reconcile_marker|quote_app_starting|prod_preflight_green|metadata_cache_loaded|ws_connected|communications_subscribed|exposure_rehydrated|rehydrated_legs_armed|startup_reconciled|account_standing'
-$pattern = "halted|kill_switch|quote_executed_msg|fill_recovery_late|fill_recovery_quote_cancelled|fills_ledger_missing|fills_ledger_sweep_summary|hard_trip|give_back|Traceback|CRITICAL|preflight_fail|supervisor_killed|ACCUMULATED|`"phase`": `"decline`"|waiver_granted|lastlook_waiver_retry|HALT|$boot"
+$boot = 'supervisor_starting|supervisor_launched|supervisor_loop_wedged|supervisor_heartbeat_stale|shutdown_timed_out|supervisor_emergency_kill|kill_file_present|needs_reconcile_marker|quote_app_starting|prod_preflight_green|metadata_cache_loaded|ws_connected|communications_subscribed|exposure_rehydrated|rehydrated_legs_armed|startup_reconciled|account_standing|relight_supervisor_starting|relight_child_launched|relight_child_productive'
+# AUTO-RELIGHT (2026-07-27): every relight_ event is surfaced. A GRANT is
+# error-level by design - an automatic restart is never routine - and a REFUSAL
+# is terminal (the relighter exits non-zero and the BOT window stays open with
+# the reason on screen). halt_receipt_written names the class that was recorded.
+$pattern = "halted|kill_switch|quote_executed_msg|fill_recovery_late|fill_recovery_quote_cancelled|fills_ledger_missing|fills_ledger_sweep_summary|hard_trip|give_back|Traceback|CRITICAL|preflight_fail|supervisor_killed|ACCUMULATED|`"phase`": `"decline`"|waiver_granted|lastlook_waiver_retry|HALT|relight_|halt_receipt_written|$boot"
 
 Write-Host "Watching $Log" -ForegroundColor Cyan
 Write-Host "You should see BOOT lines (supervisor_starting, preflight, rehydrated...) within ~60s." -ForegroundColor Cyan
@@ -18,8 +22,8 @@ Get-Content -Path $Log -Wait -Tail 200 | Select-String -Pattern $pattern | ForEa
     $color = "Gray"
     if ($line -match 'quote_executed_msg') { $color = "Green" }
     elseif ($line -match '"phase": "decline"|ACCUMULATED') { $color = "Yellow" }
-    elseif ($line -match 'halted|kill_switch|hard_trip|HALT|CRITICAL|Traceback|supervisor_killed|supervisor_emergency_kill|supervisor_heartbeat_wedged|preflight_fail|kill_file_present') { $color = "Red" }
+    elseif ($line -match 'halted|kill_switch|hard_trip|HALT|CRITICAL|Traceback|supervisor_killed|supervisor_emergency_kill|supervisor_heartbeat_wedged|preflight_fail|kill_file_present|relight_granted|relight_refused|relight_terminal_escalation|relight_child_boot_wedged|halt_receipt_written') { $color = "Red" }
     elseif ($line -match 'waiver_granted|lastlook_waiver_retry') { $color = "Cyan" }
-    elseif ($line -match 'supervisor_starting|supervisor_launched|quote_app_starting|prod_preflight_green|metadata_cache_loaded|ws_connected|communications_subscribed|exposure_rehydrated|rehydrated_legs_armed|startup_reconciled|account_standing') { $color = "White" }
+    elseif ($line -match 'supervisor_starting|supervisor_launched|quote_app_starting|prod_preflight_green|metadata_cache_loaded|ws_connected|communications_subscribed|exposure_rehydrated|rehydrated_legs_armed|startup_reconciled|account_standing|relight_supervisor_starting|relight_child_launched|relight_child_productive|relight_child_exited|relight_session_summary') { $color = "White" }
     Write-Host $line -ForegroundColor $color
 }

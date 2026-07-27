@@ -52,9 +52,9 @@ from combomaker.exchange.rest import (
     DEFAULT_ENDPOINT_TOKEN_COST,
     DEFAULT_REQUEST_TIMEOUT_S,
     DELETE_QUOTE_TOKEN_COST,
-    HTTP_NOT_FOUND,
     HTTP_TOO_MANY_REQUESTS,
     KalshiApiError,
+    already_gone,
 )
 from combomaker.marketdata.feed import OrderbookFeed
 from combomaker.marketdata.metadata import MetadataCache
@@ -428,12 +428,38 @@ def _already_gone(exc: BaseException) -> bool:
     quarantine (which escalates to a WHOLE-BOT HALT) for markets that carried no
     exposure at all.
 
-    Duck-typed on ``status`` so any client carrying an HTTP status works, and
-    NARROW by construction: ONLY 404 is success. A 429 (``RateLimitedError``), a
-    5xx, a timeout, or a transport error is UNRESOLVED — the quote may still be
-    resting and may still fill, so it stays in our mirror, counts as
-    not-provably-withdrawn, and is retried (see ``_withdraw_batch``)."""
-    return getattr(exc, "status", None) == HTTP_NOT_FOUND
+    Delegates to ``exchange.rest.already_gone`` — ONE definition of the narrow
+    404-only rule, shared with the startup reconcile's leftover cancel, so the
+    two withdrawal paths cannot drift apart. NARROW by construction: a 429
+    (``RateLimitedError``), a 5xx, a timeout, or a transport error is UNRESOLVED
+    — the quote may still be resting and may still fill, so it stays in our
+    mirror, counts as not-provably-withdrawn, and is retried (see
+    ``_withdraw_batch``)."""
+    return already_gone(exc)
+
+
+def _withdraw_failure_kind(exc: BaseException | None) -> str:
+    """Name the FAILURE MODE behind one not-provably-withdrawn quote.
+
+    Pure observability, and the ONLY new datum the halt receipt carries that is
+    not already computed somewhere (see ``QuoteApp._write_halt_receipt``). It is
+    what makes a repeat halt distinguishable from a NEW one: the relighter's
+    novelty bound keys on the set of distinct kinds observed at THIS failure
+    site, so "the exchange 429'd us again" and "the exchange timed out this
+    time" are different root causes and "429 again" is not.
+
+    ``None`` means the quote was never asked about at all (the pass ran out of
+    wall budget) — a genuinely different mode from any exchange answer. An
+    exception carrying an HTTP ``status`` is named by that status (so 429 / 500
+    / 503 separate); anything else — a timeout, a transport error, our own
+    read-budget refusal (status 0) — is named by its exception class. Derived
+    from the exception, never chosen by a caller."""
+    if exc is None:
+        return "budget_deferred"
+    status = getattr(exc, "status", None)
+    if isinstance(status, int) and status:
+        return str(status)
+    return type(exc).__name__
 
 
 def _rate_limited(exc: BaseException) -> bool:
@@ -931,6 +957,17 @@ class QuoteLifecycle:
         # defaults, so there is no second literal anywhere and the withdrawal
         # path is paced even if a caller forgets to wire it (fail-closed).
         self._withdraw_budget = withdraw_budget or _default_write_budget(clock)
+        # FIFO ADMISSION to that bucket (2026-07-27, the 07-27 maintenance
+        # stall). One lock for the whole lifecycle — the bucket is one shared
+        # resource, so the queue for it has to be one queue. See
+        # ``_spend_withdraw_tokens`` for why a bare ``try_spend`` loop starves.
+        self._withdraw_gate = asyncio.Lock()
+        # The LAST withdrawal batch's failure modes, by kind. Written by
+        # ``_withdraw_batch`` (the one place an outcome is classified), read by
+        # quote_app's quarantine enforcement to attribute an UNENFORCED
+        # quarantine. Observability only — nothing reads it to make a
+        # withdrawal decision, so it can never change what we cancel.
+        self._last_withdraw_failure_kinds: Counter[str] = Counter()
         # WITHDRAW-PENDING RESOLVER (2026-07-26). ``quote_lister`` is the
         # account-wide open-quote enumerator (the SAME
         # ``exchange/quote_query.list_open_quotes`` helper the startup reconcile
@@ -5389,7 +5426,19 @@ class QuoteLifecycle:
             return
         state = self._open.get(quote_id)
         if state is not None and not state.accepted:
-            await self._delete_quote(quote_id, ReasonCode.DELETE_RFQ_GONE)
+            # BOUNDED (2026-07-27). This runs INLINE on the intake worker that
+            # carries our RFQ flow — an unbounded wait for write tokens here
+            # stalls the socket's consumer, and an end-of-game wave fires this
+            # handler for the whole book at once. Deferral is safe and is not
+            # abandonment: the quote stays withdraw-pending in the mirror and
+            # the 0.5s resolver re-drives it (the trigger never repeating is
+            # exactly why the resolver exists). Stated explicitly rather than
+            # inherited so the bound is visible at the risk-bearing site.
+            await self._delete_quote(
+                quote_id,
+                ReasonCode.DELETE_RFQ_GONE,
+                budget_s=_WITHDRAW_RESOLVE_BUDGET_S,
+            )
 
     def record_realized_pnl(self, delta_cc: int) -> None:
         """Settlement/fee reconciliation feeds realized P&L here (Phase 6)."""
@@ -5875,6 +5924,16 @@ class QuoteLifecycle:
                 start = 0
             items = items[start:] + items[:start]
         self._reprice_resume_after = None
+
+        def _sweep_remaining_s() -> float:
+            """What is LEFT of this sweep's wall budget, for the withdrawals it
+            drives (2026-07-27). The top-of-iteration check bounds how many
+            quotes the sweep touches; this bounds how long ONE of them may wait
+            on the write-token bucket, which is the bound that was missing when
+            the 07-27 tick blew its progress bound inside a single starved
+            delete. Derived from the sweep's own budget — no second number."""
+            return (budget_ns - (self._clock.monotonic_ns() - sweep_start_ns)) / 1e9
+
         prev_handled: str | None = None
         for quote_id, state in items:
             self._beat()
@@ -5909,7 +5968,11 @@ class QuoteLifecycle:
                 continue
             age_s = (now - state.created_mono_ns) / 1e9
             if age_s > self._config.quote_ttl_s:
-                await self._delete_quote(quote_id, ReasonCode.DELETE_TTL_EXPIRED)
+                await self._delete_quote(
+                    quote_id,
+                    ReasonCode.DELETE_TTL_EXPIRED,
+                    budget_s=_sweep_remaining_s(),
+                )
                 # Deleted — prev_handled must only ever name a SURVIVING quote:
                 # a marker pointing at a removed id fails next tick's index
                 # lookup and silently discards the rotation (verify follow-up
@@ -5922,7 +5985,11 @@ class QuoteLifecycle:
                 continue
             result = await self._price_async(state.rfq)
             if isinstance(result, NoQuote):
-                await self._delete_quote(quote_id, ReasonCode.DELETE_LEG_STALE)
+                await self._delete_quote(
+                    quote_id,
+                    ReasonCode.DELETE_LEG_STALE,
+                    budget_s=_sweep_remaining_s(),
+                )
                 if result.reason is ReasonCode.SKIP_PRICE_DEADLINE:
                     consecutive_pool_deadline += 1
                     if consecutive_pool_deadline >= _REPRICE_POOL_TRIP:
@@ -5952,9 +6019,72 @@ class QuoteLifecycle:
                 if self._by_rfq.get(state.rfq.rfq_id) == quote_id:
                     # Replacement was refused (filter/risk) — a stale quote
                     # must never stay on the wire.
-                    await self._delete_quote(quote_id, ReasonCode.DELETE_LEG_MOVED)
+                    await self._delete_quote(
+                        quote_id,
+                        ReasonCode.DELETE_LEG_MOVED,
+                        budget_s=_sweep_remaining_s(),
+                    )
             if quote_id in self._open:
                 prev_handled = quote_id
+
+    async def _spend_withdraw_tokens(
+        self,
+        budget: WriteBudget,
+        cost: int,
+        remaining_s: Callable[[], float | None],
+    ) -> bool:
+        """FIFO admission to the write-token bucket. True ⇒ ``cost`` tokens were
+        spent and the caller may send its DELETE; False ⇒ deferred (never asked).
+
+        WHY A GATE AND NOT A BARE ``try_spend`` LOOP (2026-07-27, the 07-27
+        maintenance stall). A token bucket is not a queue: whoever calls
+        ``try_spend`` at the instant tokens exist wins them. A waiter that slept
+        on ``seconds_until`` is therefore beatable — forever — by any task that
+        arrives later and spends on entry, and a starved waiter inside the
+        reprice sweep holds the whole maintenance loop (the sweep checks its wall
+        budget only at the TOP of each iteration), which is how a tick ran past
+        its 30.5 s progress bound and got the bot emergency-killed while it was
+        healthy. ``asyncio.Lock`` wakes waiters in ARRIVAL order, so admission is
+        FIFO: a later arrival queues BEHIND an existing waiter and cannot take
+        the tokens it is sleeping for.
+
+        The lock is held ACROSS the refill sleep on purpose — that is the
+        fairness — but only until tokens are spent; the DELETE itself is issued
+        outside it, so batch concurrency is unchanged. Throughput is unchanged
+        too: the holder sleeps exactly until IT can pay, and nothing else could
+        have paid earlier out of the same shared bucket.
+
+        Both waits are bounded by the caller's ``remaining_s`` when it has one:
+        the LOCK wait as well as the refill wait, because a bounded caller queued
+        behind the terminal unbounded ``cancel_all`` would otherwise inherit its
+        unbounded wait through the lock — the same stall by another door."""
+        left = remaining_s()
+        if left is not None and left <= 0.0:
+            return False
+        try:
+            if left is None:
+                await self._withdraw_gate.acquire()
+            else:
+                await asyncio.wait_for(self._withdraw_gate.acquire(), left)
+        except TimeoutError:  # asyncio.TimeoutError is this since 3.11
+            self._metrics.inc("withdraw.token_gate_deferred")
+            return False
+        try:
+            while not budget.try_spend(cost):
+                wait_s = budget.seconds_until(cost)
+                if wait_s == float("inf"):
+                    # capacity < one call's cost: no wait can ever satisfy it.
+                    return False
+                left = remaining_s()
+                if left is not None:
+                    if left <= 0.0:
+                        self._metrics.inc("withdraw.token_gate_deferred")
+                        return False
+                    wait_s = min(wait_s, left)
+                await asyncio.sleep(max(wait_s, 0.0))
+            return True
+        finally:
+            self._withdraw_gate.release()
 
     async def _withdraw_batch(
         self, quote_ids: Sequence[str], *, budget_s: float | None = None
@@ -6000,18 +6130,10 @@ class QuoteLifecycle:
             # bucket sees. Out of tokens ⇒ WAIT for the bucket's own refill
             # (never a hand-picked poll interval), because deferring costs a
             # halt on the next tick while waiting costs only wall time the
-            # caller already budgeted for.
-            while not budget.try_spend(cost):
-                wait_s = budget.seconds_until(cost)
-                if wait_s == float("inf"):
-                    # capacity < one call's cost: no wait can ever satisfy it.
-                    return (quote_id, "deferred", None)
-                remaining_s = _remaining_s()
-                if remaining_s is not None:
-                    if remaining_s <= 0.0:
-                        return (quote_id, "deferred", None)
-                    wait_s = min(wait_s, remaining_s)
-                await asyncio.sleep(max(wait_s, 0.0))
+            # caller already budgeted for. FAIR (FIFO) since 2026-07-27: see
+            # ``_spend_withdraw_tokens``.
+            if not await self._spend_withdraw_tokens(budget, cost, _remaining_s):
+                return (quote_id, "deferred", None)
             # RE-CHECK AFTER THE TOKEN GATE (2026-07-26, gate PoC R2/R3). The
             # gate above can sleep for SECONDS waiting on bucket refill, and
             # accepts land on a different task meanwhile. Every other withdrawal
@@ -6048,6 +6170,10 @@ class QuoteLifecycle:
         deferred: list[str] = []
         already_gone = 0
         rate_limited = 0
+        # Reset per batch: this names THIS pass's failure modes, never a union
+        # over history (a stale union would make every later halt look like a
+        # repeat of the first).
+        kinds: Counter[str] = Counter()
         for quote_id, outcome, exc in results:
             if outcome == "gone":
                 gone.append(quote_id)
@@ -6055,6 +6181,7 @@ class QuoteLifecycle:
                     already_gone += 1
             elif outcome == "unresolved":
                 unresolved.append(quote_id)
+                kinds[_withdraw_failure_kind(exc)] += 1
                 if exc is not None and _rate_limited(exc):
                     rate_limited += 1
                 log.warning(
@@ -6062,6 +6189,8 @@ class QuoteLifecycle:
                 )
             else:
                 deferred.append(quote_id)
+                kinds[_withdraw_failure_kind(None)] += 1
+        self._last_withdraw_failure_kinds = kinds
         if already_gone:
             # Routine at end-of-game; counted, not alarmed.
             self._metrics.inc("quote.delete_already_gone", already_gone)
@@ -6496,6 +6625,19 @@ class QuoteLifecycle:
         return await self._withdraw_and_reconcile(
             target_ids, reason, budget_s=budget_s
         )
+
+    @property
+    def last_withdraw_failure_kinds(self) -> Counter[str]:
+        """Failure modes of the LAST withdrawal batch, by kind (a COPY — the
+        caller can never mutate the live counter). Empty when the last batch
+        withdrew everything provably, or when no batch has run.
+
+        Read by ``QuoteApp._enforce_market_quarantine`` to attribute an
+        UNENFORCED quarantine in the halt receipt. Deliberately a separate
+        read-only property rather than a widened ``cancel_quotes_touching``
+        return: seven call sites destructure that ``(deleted, failures)``
+        tuple, and an observability field must not reshape a withdrawal API."""
+        return Counter(self._last_withdraw_failure_kinds)
 
     @property
     def open_quote_count(self) -> int:
@@ -7116,9 +7258,43 @@ class QuoteLifecycle:
             provider,
         )
 
-    async def _delete_quote(self, quote_id: str, reason: ReasonCode) -> None:
+    async def _delete_quote(
+        self,
+        quote_id: str,
+        reason: ReasonCode,
+        *,
+        budget_s: float | None = _WITHDRAW_RESOLVE_BUDGET_S,
+    ) -> None:
         """Withdraw ONE resting quote — a one-element call into THE withdrawal
         path. Only a PROVED withdrawal drops it.
+
+        BOUNDED BY DEFAULT (2026-07-27 — the 07-27 emergency kill). This used to
+        pass no ``budget_s`` at all, so it inherited ``_withdraw_and_reconcile``'s
+        ``None`` = UNBOUNDED wait for write tokens. Every caller here is a
+        NON-terminal, inline one — the reprice sweep's TTL / leg-stale /
+        leg-moved deletions, the RFQ-gone handler, both risk evictions — and each
+        runs on a loop that the supervisor judges for PROGRESS. A starved bucket
+        turned any one of them into an unbounded await inside a loop whose own
+        wall budget is only checked at the top of an iteration, which is how a
+        maintenance tick ran 30.9 s against a 30.5 s bound and got a healthy bot
+        killed. The default is now the EXISTING withdrawal-pass bound
+        (``_WITHDRAW_RESOLVE_BUDGET_S`` = ``_REPRICE_SWEEP_BUDGET_S``), and the
+        reprice sweep tightens it further to the budget it has actually got left.
+
+        RESIDUAL RISK, ACCEPTED AND BOUNDED: a budget-deferred delete leaves the
+        quote RESTING for up to one more 0.5 s maintenance tick, where it can
+        fill. That is the exposure the batch path (``cancel_all``,
+        ``cancel_quotes_touching``, the resolver's drain) already accepts, and it
+        is contained the same way: last look re-judges the quote at confirm, the
+        quote keeps its ``withdraw_pending_reason`` so risk keeps counting it in
+        the mirror, and ``_resolve_withdraw_pending`` re-drives it on the very
+        next tick. Weigh that against the alternative it replaces — a stalled
+        maintenance loop, which withdraws NOTHING and kills the bot.
+
+        ``budget_s=None`` (unbounded) is still available and is correct for a
+        genuinely terminal caller; today only ``cancel_all``'s two terminal
+        callers (``on_halt`` → ``_stop.set()``, and shutdown) use it, and they
+        call ``cancel_all``, not this.
 
         B3 + the 2026-07-26 gate. This used to own a SECOND, UNMETERED
         ``self._sender.delete_quote`` call plus a private copy of the
@@ -7143,7 +7319,9 @@ class QuoteLifecycle:
         drain) have never written one, and adding N store writes to the halt path
         is the maintenance-stall class we just removed."""
         state = self._open.get(quote_id)
-        gone, _failures = await self._withdraw_and_reconcile([quote_id], reason)
+        gone, _failures = await self._withdraw_and_reconcile(
+            [quote_id], reason, budget_s=budget_s
+        )
         if gone and state is not None:
             await self._store.record_decision(
                 "quote_deleted", state.rfq.rfq_id, [str(reason)], {"quote_id": quote_id}

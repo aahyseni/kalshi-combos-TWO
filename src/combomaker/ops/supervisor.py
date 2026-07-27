@@ -13,16 +13,21 @@ Design pillars (spec §1):
 
 - HEARTBEAT ("ALIVE"): the bot's DEDICATED liveness task writes ``heartbeat.txt``
   on a fixed cadence and does nothing else; the supervisor reads its age against
-  the supervisor's own clock. Age > ``heartbeat_timeout_s`` (or an unreadable
-  heartbeat — fail-closed) ⇒ the process/event loop is WEDGED.
-- LOOP PROGRESS ("WORKING"): every loop that matters publishes a last-progress
-  age to ``loop_progress.json`` (``risk/progress.py``); the supervisor escalates
-  when any loop exceeds its own DERIVED stall bound, even while the process is
-  still breathing. This is what keeps a dedicated beater from BLINDING the
-  supervisor: "alive" and "working" are now two independent signals and either
-  one going stale kills. See ``risk/progress.py`` for the 2026-07-26T20:12:54Z
-  false-kill this pair replaced (a healthy, quoting bot whose maintenance loop
-  sat in a 30s non-beating await while the event loop never stalled).
+  the supervisor's own clock. **LOG-ONLY since 2026-07-27** — a stale heartbeat
+  emits ``supervisor_heartbeat_stale`` and decides NOTHING. It went 0-for-8 as a
+  kill trigger (every one of the 8 emergency kills had ``exchange_reachable=true``
+  on a live bot; the 07-27 kill fired at age=30.9s vs a 30.5s bound, one tick
+  over, on a bot that withdrew all 67 quotes 4.2s later). The reader is kept for
+  forensics and for the bot's own preflight.
+- LOOP PROGRESS ("WORKING") — **the sole kill axis**: every loop that matters
+  publishes a last-progress age to ``loop_progress.json`` (``risk/progress.py``);
+  the supervisor escalates when any loop exceeds its own DERIVED stall bound.
+  It strictly DOMINATES the liveness axis — anything that truly stops the event
+  loop also stops every registered loop advancing — and it additionally NAMES the
+  stalled loop instead of asserting a corpse. See ``risk/progress.py`` for the
+  2026-07-26T20:12:54Z false-kill this replaced (a healthy, quoting bot whose
+  maintenance loop sat in a 30s non-beating await while the event loop never
+  stalled).
 - EMERGENCY CANCEL-ALL: on wedged (or an explicit trigger), cancel every resting
   quote via the supervisor's OWN REST client, THEN write KILL + drop the
   ``needs_reconcile`` marker. FAIL-CLOSED: if the exchange is unreachable, we
@@ -197,6 +202,10 @@ class SafetySupervisor:
         )
         self._stop = asyncio.Event()
         self._killed = False
+        # Edge-trigger latch for the DEMOTED liveness axis (2026-07-27): the
+        # heartbeat no longer kills, so it must not spam either — one line per
+        # stale episode, reset when it comes back.
+        self._heartbeat_stale_logged = False
 
     @property
     def has_kill_credential(self) -> bool:
@@ -295,32 +304,89 @@ class SafetySupervisor:
 
     def heartbeat_wedged(self) -> bool:
         """True if the bot's heartbeat is missing / stale beyond the timeout.
-        Fail-closed (an unreadable heartbeat is wedged)."""
+        Fail-closed (an unreadable heartbeat is wedged).
+
+        LOG-ONLY since 2026-07-27 — see ``wedged_detail``. Kept (with the
+        ``HeartbeatReader`` behind it) because it is still read by the bot's own
+        preflight and by the forensic line ``supervisor_heartbeat_stale``; it
+        simply no longer decides anything."""
         return self._reader.is_wedged(self._config.heartbeat_timeout_s)
 
+    def _log_heartbeat_staleness(self) -> None:
+        """Emit the demoted liveness signal EXACTLY ONCE per stale episode.
+
+        Edge-triggered on purpose: after a real death the heartbeat is stale
+        forever, and a per-poll line at ``poll_interval_s`` would bury the log
+        that the next incident has to be read out of."""
+        stale = self.heartbeat_wedged()
+        if not stale:
+            self._heartbeat_stale_logged = False
+            return
+        if self._heartbeat_stale_logged:
+            return
+        self._heartbeat_stale_logged = True
+        age = self._reader.read_age_s()
+        log.warning(
+            "supervisor_heartbeat_stale",
+            age_s=age,
+            timeout_s=self._config.heartbeat_timeout_s,
+            detail=(
+                "heartbeat missing/unreadable"
+                if age is None
+                else f"heartbeat age={age:.1f}s > "
+                f"{self._config.heartbeat_timeout_s:.1f}s"
+            ),
+            consequence="log-only — the PROGRESS axis owns the kill decision",
+        )
+
     def wedged_detail(self) -> str | None:
-        """The kill reason, or ``None`` if the bot is both ALIVE and WORKING.
+        """The kill reason, or ``None`` if the bot is WORKING.
 
-        TWO independent axes, checked in that order:
+        ONE axis decides: PROGRESS — ``loop_progress.json``. A quote/maintenance
+        loop that stops advancing past its own derived bound is a wedge, and the
+        reason NAMES the loop.
 
-        1. LIVENESS — ``heartbeat.txt``, written by the bot's dedicated beater.
-           Stale/unreadable ⇒ the process or its event loop is gone.
-        2. PROGRESS — ``loop_progress.json``. Even with a breathing event loop,
-           a quote/maintenance loop that stops advancing past its own derived
-           bound is a wedge, and the reason NAMES the loop.
+        WHY THE LIVENESS AXIS NO LONGER DECIDES (2026-07-27, proportionality
+        review). The heartbeat axis has an 0-for-8 true-positive record: all 8
+        supervisor emergency kills fired with ``exchange_reachable=true`` on a
+        bot that was alive, and the 07-27 kill fired at age=30.9s against a 30.5s
+        bound — ONE TICK over — while 4.2s later that same "wedged" bot withdrew
+        all 67 of its quotes in 218ms. The progress axis strictly DOMINATES it:
+        anything that genuinely stops the event loop also stops every registered
+        loop from advancing, and progress additionally NAMES the stalled loop.
+        A dead process therefore still gets cancelled and marked — one poll cycle
+        later, via a signal that cannot mistake a slow await for a corpse.
 
-        Splitting them is what lets a legitimately slow maintenance pass stop
-        looking like a wedge WITHOUT blinding this watchdog: axis 2 still fires
-        on a genuinely stuck loop, at the same age the old single signal did."""
-        if self.heartbeat_wedged():
-            age = self._reader.read_age_s()
-            if age is None:
-                return "heartbeat missing/unreadable"
-            return (
-                f"heartbeat wedged (age={age:.1f}s > "
-                f"{self._config.heartbeat_timeout_s:.1f}s)"
-            )
-        return self._progress.wedged_detail()
+        NOT WEAKENED: the supervisor still emergency-cancels every resting quote
+        and still writes KILL + ``needs_reconcile`` on any progress wedge, and
+        the liveness signal survives as ``supervisor_heartbeat_stale``.
+
+        THE ONE WINDOW WHERE PROGRESS DOES *NOT* DOMINATE (2026-07-27 gate B1,
+        proven by probe, not argued). ``ProgressReader`` deliberately does not
+        latch on an EMPTY ledger, and the bot publishes exactly an empty ledger
+        at preflight (quote_app.py:2125, :3554) while its loops only register
+        later (:2355, :2367). Between ``_launch_supervisor`` and registration the
+        progress axis is blind BY CONSTRUCTION — and that window SPANS THE
+        STARTUP RECONCILE, worst case ~40s, which is precisely when leftover
+        quotes are KNOWN to be resting on the exchange, and it is LONGEST against
+        a degraded exchange. Measured with the axis removed: empty ledger +
+        600s-stale heartbeat + a leftover resting quote gave wedged_detail None,
+        zero quotes cancelled, no KILL, no needs_reconcile. Pre-change that path
+        emergency-cancelled.
+
+        So the liveness axis is kept for EXACTLY that window: it decides only
+        while the progress ledger has never established. Once any loop has
+        registered, progress is the sole authority and a stale heartbeat is
+        forensic-only — which is what the 0-for-8 record was actually about."""
+        progress_verdict = self._progress.wedged_detail()
+        if progress_verdict is not None:
+            return progress_verdict
+        if not self._progress.seen and self.heartbeat_wedged():
+            # Startup window only: no loop has ever reported progress, so the
+            # dominating axis cannot speak. Fall back to liveness rather than
+            # leave the reconcile window uncovered.
+            return "liveness stale before any loop registered (startup window)"
+        return None
 
     def beat_own_heartbeat(self) -> None:
         """Record the supervisor's OWN liveness. Beaten every poll cycle (and
@@ -330,18 +396,20 @@ class SafetySupervisor:
         self._own_heartbeat.beat()
 
     async def check_once(self) -> KillResult | None:
-        """One watchdog cycle: beat our own heartbeat, then — if the BOT is
-        wedged on EITHER axis (dead process or stalled loop) and we haven't
-        already killed — emergency-cancel + KILL. Returns the ``KillResult`` on
-        a kill, else ``None``. Idempotent: once killed, further checks are
-        no-ops (the KILL file + marker persist; re-cancelling adds nothing)
-        EXCEPT we keep beating our own heartbeat."""
+        """One watchdog cycle: beat our own heartbeat, log the demoted liveness
+        signal, then — if a registered LOOP has stalled past its own derived
+        bound and we haven't already killed — emergency-cancel + KILL. Returns
+        the ``KillResult`` on a kill, else ``None``. Idempotent: once killed,
+        further checks are no-ops (the KILL file + marker persist; re-cancelling
+        adds nothing) EXCEPT we keep beating our own heartbeat."""
         self.beat_own_heartbeat()
+        # Demoted liveness axis: forensic only, never a consequence.
+        self._log_heartbeat_staleness()
         if self._killed:
             return None
         detail = self.wedged_detail()
         if detail is not None:
-            log.error("supervisor_heartbeat_wedged", detail=detail)
+            log.error("supervisor_loop_wedged", detail=detail)
             return await self.emergency_cancel_all(detail)
         return None
 

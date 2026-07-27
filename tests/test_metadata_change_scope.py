@@ -483,6 +483,15 @@ async def test_unenforceable_quarantine_escalates_to_halt(tmp_path: Path) -> Non
         ) -> tuple[int, int]:
             return (1, 1)  # one delete the exchange did not acknowledge
 
+        @property
+        def last_withdraw_failure_kinds(self) -> Any:
+            # Attribution for the halt receipt (2026-07-27 auto-relight): which
+            # failure MODE left the quarantine unenforced. Read-only, additive —
+            # the escalation below is unchanged by it.
+            from collections import Counter
+
+            return Counter({"429": 1})
+
     app = _armed_app(tmp_path)
     breakers = _breakers(app)
     _, second = _two_samples(app, _CLETB_BEFORE, _mutated(status="inactive"))

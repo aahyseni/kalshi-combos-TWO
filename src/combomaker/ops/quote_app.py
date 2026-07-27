@@ -13,10 +13,13 @@ path, best-effort cancel-all.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import itertools
 import json
+import os
 import sys
-from collections.abc import Awaitable, Callable
+import threading
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -35,15 +38,27 @@ from combomaker.core.money import (
 from combomaker.core.quantity import CentiContracts, qty_from_fp_str
 from combomaker.core.reasons import ReasonCode
 from combomaker.exchange.auth import Credentials, RequestSigner
-from combomaker.exchange.quote_query import list_open_quotes, open_quote_ids
+from combomaker.exchange.quote_query import (
+    BACKOFF_S as RECONCILE_BACKOFF_S,
+)
+from combomaker.exchange.quote_query import (
+    RETRIES as RECONCILE_RETRIES,
+)
+from combomaker.exchange.quote_query import (
+    list_open_quotes,
+    open_quote_ids,
+    open_quote_tickers,
+)
 from combomaker.exchange.rest import (
     DEFAULT_ENDPOINT_TOKEN_COST,
+    DEFAULT_REQUEST_TIMEOUT_S,
     LOWEST_TIER_LIMITS,
     ApiTierLimits,
     KalshiApiError,
     KalshiRestClient,
     RateLimitedError,
     ReadBudgetExhausted,
+    already_gone,
     observe_api_tier,
 )
 from combomaker.exchange.ws import WsManager
@@ -66,6 +81,11 @@ from combomaker.ops.preflight import (
 )
 from combomaker.ops.pricing_pool import BookRiskPool, JointPool
 from combomaker.ops.process_group import cleanup_straggler_workers
+from combomaker.ops.relight import (
+    HALT_RECEIPT_FILENAME,
+    HALT_RECEIPT_SCHEMA_VERSION,
+    RUN_ID_ENV,
+)
 from combomaker.ops.report import build_report, format_report
 from combomaker.ops.supervisor import (
     ENV_SUPERVISOR_API_KEY_ID,
@@ -89,7 +109,7 @@ from combomaker.risk.balance import BalanceTracker, StaleBalanceError
 from combomaker.risk.breakers import BreakerInputs, CircuitBreakers, RateLimitWindow
 from combomaker.risk.derived_cap_engine import DerivedCapEngine
 from combomaker.risk.exposure import ExposureBook, LegRef, OpenPosition
-from combomaker.risk.heartbeat import Heartbeat, ReconcileMarker
+from combomaker.risk.heartbeat import Heartbeat, ReconcileMarker, _atomic_write
 from combomaker.risk.inplay import InPlayDetector
 from combomaker.risk.killswitch import HaltEvent, KillSwitch
 from combomaker.risk.lastlook import LastLookPolicy
@@ -613,6 +633,22 @@ def _status_change_class(prior: str, current: str) -> str:
     if current in _LIFECYCLE_STATUSES:
         return "lifecycle"
     return "settlement"
+
+
+@dataclass(frozen=True, slots=True)
+class ShutdownStage:
+    """One post-cancel teardown stage, named so a hang can name itself.
+
+    ``run`` is a zero-arg callable returning either an awaitable or ``None``
+    (the two process-pool shutdowns are synchronous by construction).
+    ``best_effort`` mirrors the pre-existing per-stage exception policy exactly:
+    the diagnostic-sweep drain and the supervisor teardown log-and-continue;
+    every other stage propagates, as it always did.
+    """
+
+    name: str
+    run: Callable[[], Awaitable[None] | None]
+    best_effort: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1481,6 +1517,26 @@ class QuoteApp:
         # Bounded by the markets this process has actually held. See
         # risk/quarantine.py for the fail-closed properties.
         self._market_quarantine = MarketQuarantine()
+        # ── HALT RECEIPT evidence (auto-relight, 2026-07-27) ─────────────────
+        # Purely a RECORD of decisions the metadata lanes already made. Nothing
+        # here is read to make a halt/quarantine choice, so it cannot change
+        # what the breaker does; it exists so an out-of-process reader can
+        # RE-DERIVE the halt's class from its own evidence instead of trusting
+        # a label (see ``_write_halt_receipt`` and ops/relight.py gate G7).
+        #
+        # ``_lifecycle_evidence``: captured AT THE MOMENT a market is
+        # quarantined, and held, because the promotion to a whole-bot halt
+        # happens on a LATER tick by which time the fingerprints no longer
+        # differ — the evidence of the move would otherwise be gone.
+        self._lifecycle_evidence: dict[str, dict[str, Any]] = {}
+        # ``_quarantine_failure_kinds``: which withdrawal failure modes left a
+        # quarantine unenforced, per market, from the enforcement pass itself.
+        self._quarantine_failure_kinds: dict[str, dict[str, int]] = {}
+        # ``_halt_evidence`` / ``_halt_tripwire``: the CURRENT status-tick
+        # diagnosis, rebuilt every pass, serialized by ``on_halt``.
+        self._halt_evidence: dict[str, dict[str, Any]] = {}
+        self._halt_tripwire: tuple[str, str] | None = None
+        self._halt_receipt_path = config.data_dir / HALT_RECEIPT_FILENAME
         # The external SafetySupervisor subprocess (launched on startup in quote
         # mode). A SEPARATE OS process so its kill path survives the bot's own
         # host deadlocking; None until launched / when launch is skipped.
@@ -2261,6 +2317,11 @@ class QuoteApp:
             feed.on_invalidate(on_invalidate)
 
             async def on_halt(event: HaltEvent) -> None:
+                # HALT RECEIPT (2026-07-27, auto-relight). FIRST statement, so
+                # the evidence lands even if cancel-all then hangs or throws.
+                # Never blocks the cure: it is fully wrapped, and a failed
+                # receipt simply means the relighter refuses (default deny).
+                self._write_halt_receipt(event)
                 # RESTART SAFETY (Phase 6, code audit 2026-07-13 §3): on an
                 # in-process HARD-class halt, DROP the needs_reconcile marker so a
                 # bare restart is BLOCKED (HALT_NEEDS_RECONCILE) until the book is
@@ -2386,38 +2447,141 @@ class QuoteApp:
             finally:
                 for task in tasks:
                     task.cancel()
-                # Crash-path discipline: best-effort cancel-all before exit.
-                # TERMINAL (see on_halt): the loops are already cancelled, so
-                # nothing will re-drive a deferred withdrawal — no wall budget.
-                try:
-                    await lifecycle.cancel_all(ReasonCode.HALT_MANUAL, budget_s=None)
-                except Exception:
-                    log.exception("shutdown_cancel_all_failed")
-                await ws.stop()
-                await book_ws.stop()
+                # BOUNDED SHUTDOWN (2026-07-27). Ordered, NAMED stages handed to
+                # ``_shutdown``, which runs cancel-all UNBOUNDED first (the book
+                # is always fully attempted) and everything below under ONE wall
+                # bound derived from the operator wedge-tolerance anchor. See
+                # ``_shutdown`` for the incident this replaces.
+                stages: list[ShutdownStage] = [
+                    ShutdownStage("ws_stop", ws.stop),
+                    ShutdownStage("book_ws_stop", book_ws.stop),
+                ]
                 if joint_pool is not None:
-                    joint_pool.shutdown()
+                    stages.append(
+                        ShutdownStage("joint_pool_shutdown", joint_pool.shutdown)
+                    )
                 if book_risk_pool is not None:
-                    book_risk_pool.shutdown()
-                await killswitch.stop()
-                # Let any in-flight alarm-only sweep finish before the store
-                # closes under it (2026-07-26): each is wall-bounded, so this
-                # cannot hold shutdown open, and it stops a half-done
-                # divergence check from vanishing into a "Connection closed".
-                try:
-                    await lifecycle.drain_diagnostic_sweeps()
-                except Exception:
-                    log.exception("diagnostic_sweep_drain_failed")
-                # Tear down the external supervisor subprocess (best-effort).
-                try:
-                    await self._stop_supervisor()
-                except Exception:
-                    log.exception("supervisor_stop_failed")
-                await store.close()
-                log.info("quote_app_stopped", metrics=self._metrics.snapshot())
+                    stages.append(
+                        ShutdownStage(
+                            "book_risk_pool_shutdown", book_risk_pool.shutdown
+                        )
+                    )
+                stages += [
+                    ShutdownStage("killswitch_stop", killswitch.stop),
+                    # Let any in-flight alarm-only sweep finish before the store
+                    # closes under it (2026-07-26): each is wall-bounded, so this
+                    # cannot hold shutdown open, and it stops a half-done
+                    # divergence check from vanishing into a "Connection closed".
+                    ShutdownStage(
+                        "diagnostic_sweep_drain",
+                        lifecycle.drain_diagnostic_sweeps,
+                        best_effort=True,
+                    ),
+                    # Tear down the external supervisor subprocess (best-effort).
+                    ShutdownStage(
+                        "supervisor_stop", self._stop_supervisor, best_effort=True
+                    ),
+                    ShutdownStage("store_close", store.close),
+                ]
+                completed = await self._shutdown(
+                    # Crash-path discipline: best-effort cancel-all before exit.
+                    # TERMINAL (see on_halt): the loops are already cancelled, so
+                    # nothing will re-drive a deferred withdrawal — no wall budget.
+                    cancel_all=lambda: lifecycle.cancel_all(
+                        ReasonCode.HALT_MANUAL, budget_s=None
+                    ),
+                    stages=stages,
+                )
+                if completed:
+                    log.info("quote_app_stopped", metrics=self._metrics.snapshot())
 
     def request_stop(self) -> None:
         self._stop.set()
+
+    def _halt_class(self, event: HaltEvent) -> str:
+        """Name the halt's CLASS from the evidence this tick recorded.
+
+        The label is a convenience only — ``ops/relight.py`` gate G7 never
+        trusts it and re-derives the same verdict from the evidence dict in the
+        same file. So a wrong label here cannot make an unrelightable halt
+        relightable; it can only be contradicted."""
+        if str(event.reason) != str(ReasonCode.HALT_METADATA_CHANGE):
+            return str(event.reason)
+        if self._halt_tripwire is not None:
+            return "taxonomy_tripwire"
+        origins = {
+            str(e.get("origin")) for e in self._halt_evidence.values()
+        }
+        if origins == {"quarantine_unenforced"}:
+            return "lifecycle_quarantine_unenforced"
+        if "settlement" in origins:
+            return "settlement_metadata_change"
+        if "unarmed" in origins:
+            return "lifecycle_quarantine_unarmed"
+        return "metadata_change_unclassified"
+
+    def _root_cause_signature(self) -> str:
+        """The halt's ROOT CAUSE, as ``origin:<sorted distinct failure kinds>``.
+
+        Every input is measured at its own failure site: the origin by the
+        metadata lane, the kinds by the withdrawal path
+        (``lifecycle._withdraw_failure_kind``). The relighter's novelty bound
+        (B2) keys on this, so what counts as "the same failure again" is decided
+        by the exchange's behaviour, not by a threshold anyone can move."""
+        origins = sorted({str(e.get("origin")) for e in self._halt_evidence.values()})
+        kinds: set[str] = set()
+        for entry in self._halt_evidence.values():
+            raw = entry.get("withdraw_failure_kinds")
+            if isinstance(raw, dict):
+                kinds.update(str(k) for k in raw)
+        return f"{'+'.join(origins) or 'none'}:{','.join(sorted(kinds)) or 'none'}"
+
+    def _write_halt_receipt(self, event: HaltEvent) -> None:
+        """Record WHY this process halted, as EVIDENCE plus a claim the evidence
+        itself re-derives, for the out-of-process relighter (``ops/relight.py``).
+
+        Written ATOMICALLY with the same primitive the heartbeat/marker use, and
+        carrying the run nonce the relighter passed in by env: a receipt from a
+        previous run, a second stack, or a hand-written file cannot match
+        (relight gates G2/G3). No secrets, no credentials, no config — only the
+        halt's own facts.
+
+        NEVER RAISES. A receipt is diagnostics; ``cancel_all`` is the cure, and
+        nothing about the cure may depend on this succeeding. A missing receipt
+        just means the relighter refuses, which is the default anyway."""
+        try:
+            payload = {
+                "schema_version": HALT_RECEIPT_SCHEMA_VERSION,
+                "run_id": os.environ.get(RUN_ID_ENV, ""),
+                # BOTH pids, because on Windows the venv's ``python.exe`` is a
+                # LAUNCHER SHIM that re-spawns the real interpreter as a child
+                # with an identical command line (the same fact start_all.ps1's
+                # root-counting encodes: one launch = two processes). So the pid
+                # the relighter spawned is our PARENT, not us. Recording both is
+                # what lets gate G3 verify "you are the process I started"
+                # without the relighter having to walk a process tree.
+                "pid": os.getpid(),
+                "ppid": os.getppid(),
+                "written_at": self._clock.now().isoformat(),
+                "reason": str(event.reason),
+                "verdict_detail": event.detail,
+                "tripwire_hit": (
+                    None if self._halt_tripwire is None else list(self._halt_tripwire)
+                ),
+                "halt_class": self._halt_class(event),
+                "evidence": self._halt_evidence,
+                "root_cause_signature": self._root_cause_signature(),
+            }
+            _atomic_write(self._halt_receipt_path, json.dumps(payload, default=str))
+            log.error(
+                "halt_receipt_written",
+                path=str(self._halt_receipt_path),
+                halt_class=payload["halt_class"],
+                signature=payload["root_cause_signature"],
+                markets=sorted(self._halt_evidence),
+            )
+        except Exception:
+            log.exception("halt_receipt_write_failed", reason=str(event.reason))
 
     def mark_reconcile_on_hard_halt(self, event: HaltEvent) -> None:
         """RESTART SAFETY (Phase 6): drop the ``needs_reconcile`` marker on an
@@ -2506,10 +2670,34 @@ class QuoteApp:
 
     async def _startup_reconcile(self, rest: KalshiRestClient) -> bool:
         """Exchange-first startup pass: cancel leftover resting quotes + observe
-        existing positions. Returns True iff the reconcile round-trip SUCCEEDED
-        (the exchange was reachable). A failure returns False so the caller can
-        keep the ``needs_reconcile`` block in place — a bot that couldn't reach
-        the exchange has NOT proven its book and must not resume quoting."""
+        existing positions. Returns True iff the pass PROVED the book — every
+        leftover resting quote is provably off the wire AND the positions read
+        answered. Anything less returns False so the caller keeps the
+        ``needs_reconcile`` block in place.
+
+        THE FAIL-OPEN SEAM THIS CLOSES (2026-07-27). This pass is the re-proof
+        that no quote of ours is still resting on the exchange; the whole
+        block-restart-until-reconciled chain, and every consequence scope-down
+        that leans on it, is sound ONLY if "reconciled" means proven. It used to
+        swallow a per-quote ``KalshiApiError`` with a warning and STILL log
+        ``startup_reconciled`` and green the gate — so a 429 or a 503 on one
+        DELETE left a live quote resting while the bot resumed quoting on a book
+        it believed was empty. That quote can fill. Now: only an ACK or a 404
+        (``already_gone`` — the exchange has no such quote) counts as proof;
+        429 / 5xx / timeout / transport are UNRESOLVED, never proof.
+
+        FAIL-CLOSED, WITH A BOUNDED RETRY FIRST. Both halves retry a bounded
+        number of times (``RECONCILE_RETRIES``) and then STOP: an exchange that
+        is simply unreachable at boot leaves the book unproven, the marker in
+        force, ``_book_reconciled`` False, and — on prod — the preflight red,
+        which raises ``PreflightError`` and exits the process. The bot stays
+        DOWN; it never quotes against an unproven book. The retry exists only so
+        one transient 429/503 on one DELETE does not need a human, which is the
+        same proportionality the rest of this work is about. It cannot spin: the
+        attempt count is a constant, each attempt is bounded by the REST client's
+        own request timeout, the backoff is finite, and the withdrawal half is
+        additionally capped by a wall deadline (see
+        ``_withdraw_leftover_quotes``)."""
         try:
             # Enumerate leftover resting quotes via the SHARED bounded+retrying
             # helper (cursor-paginated, min_ts/max_ts windowed so it never trips
@@ -2518,24 +2706,127 @@ class QuoteApp:
             leftover = await list_open_quotes(
                 rest, int(self._clock.now().timestamp())
             )
-            for quote_id in open_quote_ids(leftover):
+        except Exception as exc:
+            # BROAD on purpose: a timeout or a transport error is exactly the
+            # "exchange unreachable" case this must fail closed on, and it is not
+            # a KalshiApiError. (CancelledError is a BaseException and still
+            # propagates, so shutdown is unaffected.)
+            log.error(
+                "startup_reconcile_failed",
+                phase="enumerate",
+                error=repr(exc),
+                detail="could not enumerate open quotes — the book is UNPROVEN; "
+                "quoting stays blocked",
+            )
+            return False
+        quote_ids = open_quote_ids(leftover)
+        unproven = await self._withdraw_leftover_quotes(rest, quote_ids)
+        if unproven:
+            tickers = open_quote_tickers(leftover)
+            self._metrics.inc("startup_reconcile.unproven_quotes", len(unproven))
+            log.error(
+                "startup_reconcile_unproven_quotes",
+                unproven=len(unproven),
+                of=len(quote_ids),
+                tickers=sorted({tickers.get(q) or q for q in unproven}),
+                quote_ids=sorted(unproven),
+                detail="these quotes could NOT be proven off the wire (only an ACK "
+                "or a 404 is proof) — they may still be RESTING and may still FILL. "
+                "The book is UNPROVEN: needs_reconcile stays in force and the bot "
+                "refuses to quote.",
+            )
+            return False
+        # P0-5: pin the positions read to our one subaccount (query-layer pin).
+        try:
+            positions = await rest.get_positions(subaccount=self._config.safety.subaccount)
+        except Exception as exc:
+            log.error(
+                "startup_reconcile_failed",
+                phase="positions",
+                error=repr(exc),
+                detail="quotes were withdrawn but the positions read failed — the "
+                "exposure book cannot be rehydrated, so the book is UNPROVEN",
+            )
+            return False
+        if positions.get("market_positions") or positions.get("positions"):
+            log.info(
+                "startup_existing_positions",
+                detail="existing positions found — the exposure book is rehydrated "
+                "from them next (_rehydrate_exposure_book, #33)",
+            )
+        log.info(
+            "startup_reconciled",
+            leftover_quotes=len(leftover),
+            withdrawn=len(quote_ids),
+        )
+        return True
+
+    async def _withdraw_leftover_quotes(
+        self, rest: KalshiRestClient, quote_ids: Sequence[str]
+    ) -> list[str]:
+        """Withdraw the leftover resting quotes a restart found, and return the
+        ones that are NOT PROVABLY off the wire.
+
+        PROOF, narrowly (mirrors ``rfq.lifecycle._withdraw_batch``, the other
+        withdrawal path, via the one shared ``already_gone``):
+
+        - an ACK  ⇒ gone;
+        - a 404   ⇒ gone (the exchange has no such quote — it cannot fill);
+        - 429 / 5xx / timeout / transport ⇒ UNRESOLVED. The request may never
+          have reached the book; the quote may still be resting. Retried, and if
+          still unresolved when the attempts run out it is RETURNED — the caller
+          fails the whole reconcile on it.
+
+        TERMINATION (three independent bounds, all constants):
+        1. at most ``RECONCILE_RETRIES`` passes — a constant range;
+        2. every DELETE is bounded by the REST client's own request timeout;
+        3. the whole withdrawal is bounded by a wall deadline of
+           ``RECONCILE_RETRIES x request_timeout`` — so N leftover quotes against
+           a hung exchange cost that deadline, not N x retries x timeout. Quotes
+           past the deadline are simply never asked about, which is
+           not-provably-gone, which fails closed.
+        Worst case wall cost is therefore ``RECONCILE_RETRIES x timeout`` plus
+        the finite backoff, independent of how many quotes were left over.
+
+        Sequential on purpose: this is the boot path, not the quote path, and one
+        DELETE in flight at a time is self-pacing against the write token bucket
+        (the exact behaviour that shipped, unchanged)."""
+        if not quote_ids:
+            return []
+        # No new number: the per-request wall bound the client already enforces,
+        # times the shared attempt anchor. Read defensively so a Protocol-shaped
+        # test double without the attribute falls back to the same constant.
+        timeout_s = float(getattr(rest, "request_timeout_s", DEFAULT_REQUEST_TIMEOUT_S))
+        deadline_ns = self._clock.monotonic_ns() + int(
+            RECONCILE_RETRIES * timeout_s * 1e9
+        )
+        pending = list(quote_ids)
+        for attempt in range(RECONCILE_RETRIES):
+            still: list[str] = []
+            for quote_id in pending:
+                if self._clock.monotonic_ns() >= deadline_ns:
+                    # Never asked ⇒ never proven. Fails closed, loudly, below.
+                    still.append(quote_id)
+                    continue
                 try:
                     await rest.delete_quote(quote_id)
-                except KalshiApiError as exc:
-                    log.warning("startup_cancel_failed", quote_id=quote_id, error=str(exc))
-            log.info("startup_reconciled", leftover_quotes=len(leftover))
-            # P0-5: pin the positions read to our one subaccount (query-layer pin).
-            positions = await rest.get_positions(subaccount=self._config.safety.subaccount)
-            if positions.get("market_positions") or positions.get("positions"):
-                log.info(
-                    "startup_existing_positions",
-                    detail="existing positions found — the exposure book is rehydrated "
-                    "from them next (_rehydrate_exposure_book, #33)",
-                )
-            return True
-        except KalshiApiError as exc:
-            log.warning("startup_reconcile_failed", error=str(exc))
-            return False
+                except Exception as exc:
+                    if already_gone(exc):
+                        continue  # 404: provably off the wire
+                    still.append(quote_id)
+                    log.warning(
+                        "startup_cancel_failed",
+                        quote_id=quote_id,
+                        attempt=attempt + 1,
+                        of=RECONCILE_RETRIES,
+                        error=repr(exc),
+                    )
+            pending = still
+            if not pending:
+                return []
+            if attempt < RECONCILE_RETRIES - 1:
+                await asyncio.sleep(RECONCILE_BACKOFF_S * (2**attempt))
+        return pending
 
     async def _rehydrate_exposure_book(
         self,
@@ -2938,10 +3229,13 @@ class QuoteApp:
         it may quote. The exchange-first reconcile is the proof; only on success
         do we clear the marker and set ``_book_reconciled`` (the preflight gate).
 
-        Fail-closed: if the reconcile round-trip FAILS (exchange unreachable), the
-        marker STAYS set and ``_book_reconciled`` STAYS false — the preflight then
-        refuses to quote. A revived bot that can't reach the exchange never
-        resumes blind. Idempotent: no marker ⇒ a normal startup reconcile."""
+        Fail-closed: if the reconcile does not PROVE the book — the exchange was
+        unreachable, or a leftover resting quote could not be provably withdrawn
+        (only an ACK or a 404 is proof) — the marker STAYS set and
+        ``_book_reconciled`` STAYS false, so the preflight refuses to quote. A
+        revived bot that can't reach the exchange, or that may still have a live
+        quote resting on it, never resumes blind. Idempotent: no marker ⇒ a
+        normal startup reconcile."""
         marker_present = self._reconcile_marker.is_set()
         if marker_present:
             log.warning(
@@ -2953,8 +3247,11 @@ class QuoteApp:
         if not ok:
             log.error(
                 "startup_reconcile_incomplete",
-                detail="exchange unreachable — book NOT reconciled; the bot will "
-                "refuse to quote (needs_reconcile stays in force)",
+                detail="book NOT proven (exchange unreachable, or a leftover quote "
+                "could not be provably withdrawn — see the preceding "
+                "startup_reconcile_failed / startup_reconcile_unproven_quotes "
+                "event); the bot will refuse to quote (needs_reconcile stays in "
+                "force)",
             )
             self._book_reconciled = False
             return
@@ -3100,6 +3397,118 @@ class QuoteApp:
             detail="supervisor did not beat within the startup window — preflight "
             "external_kill_reachable will fail closed",
         )
+
+    async def _shutdown(
+        self,
+        *,
+        cancel_all: Callable[[], Awaitable[object]],
+        stages: Sequence[ShutdownStage],
+        budget_s: float | None = None,
+        exit_fn: Callable[[int], None] | None = None,
+    ) -> bool:
+        """Flatten the book, THEN tear down under ONE wall bound.
+
+        THE INCIDENT (2026-07-27T10:17Z). The last line this process ever wrote
+        was ``joint_pool_stopped`` at 10:17:18.39; ``book_risk_pool_stopped`` and
+        ``quote_app_stopped`` appear ZERO times in that log and the next boot was
+        32.6 minutes later. Money exposure was already gone — 4.2s earlier the
+        same bot withdrew all 67 quotes in 218ms — so 32.6 of the 33.4 minutes of
+        downtime was pure teardown hang AFTER the book was flat. An unbounded
+        shutdown converts a solved problem into an outage.
+
+        TWO PROPERTIES, in this order:
+
+        1. THE BOOK FIRST, UNBOUNDED. ``cancel_all`` runs OUTSIDE the bound on
+           purpose: no deadline may ever cut short the attempt to flatten. It
+           completes in ~250ms measured, long before the bounded region starts.
+        2. EVERYTHING AFTER, BOUNDED. The stages run under a single
+           ``asyncio.wait_for`` whose T is ``supervisor.heartbeat_timeout_s`` —
+           the EXISTING operator wedge-tolerance anchor, no new number. On expiry
+           we log ``shutdown_timed_out`` naming the last COMPLETED stage and
+           ``os._exit(1)``. Each stage emits a ``shutdown_step`` line, so the
+           next hang names itself instead of vanishing.
+
+        WHY A SECOND, THREADED DEADLINE: ``asyncio.wait_for`` can only interrupt
+        an ``await``. A stage that blocks the event loop synchronously would make
+        the async bound itself unreachable — exactly the failure mode where a
+        bound matters most. A daemon timer on the SAME T (still no new number)
+        carries the guarantee in that case; whichever fires first wins, and the
+        log line is written exactly once.
+
+        RESIDUAL RISK, ACCEPTED. A hard exit can leave the SQLite WAL
+        uncheckpointed and pool workers orphaned. Both are already the steady
+        state — one session logged 390 ``store_writer_checkpoint_failed``, SQLite
+        recovers a WAL on next open by design, and ``ops/process_group.py`` reaps
+        orphaned pool workers (plus the pools' own KILL_ON_JOB_CLOSE handles).
+        Money exposure at that point is zero by property (1).
+
+        Returns True if the teardown completed within the bound. On timeout it
+        does not return at all in production (``os._exit``); ``exit_fn`` is
+        injectable so tests can observe the hard exit without dying.
+        """
+        # (1) THE BOOK, UNBOUNDED.
+        try:
+            await cancel_all()
+        except Exception:
+            log.exception("shutdown_cancel_all_failed")
+
+        # (2) EVERYTHING ELSE, BOUNDED. No new literal: the same anchor the
+        # supervisor judges a wedge by is the operator's stated tolerance for a
+        # process that has stopped making progress.
+        bound_s = (
+            budget_s
+            if budget_s is not None
+            else self._config.supervisor.heartbeat_timeout_s
+        )
+        hard_exit = exit_fn if exit_fn is not None else os._exit
+        fired = threading.Event()
+        last_completed = ["cancel_all"]
+
+        def _give_up(source: str) -> None:
+            if fired.is_set():  # pragma: no cover - both deadlines racing
+                return
+            fired.set()
+            log.error(
+                "shutdown_timed_out",
+                last_step=last_completed[0],
+                budget_s=bound_s,
+                source=source,
+            )
+            hard_exit(1)
+
+        async def _teardown() -> None:
+            for stage in stages:
+                try:
+                    result = stage.run()
+                    if inspect.isawaitable(result):
+                        await result
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    if not stage.best_effort:
+                        raise
+                    log.exception(f"{stage.name}_failed")
+                last_completed[0] = stage.name
+                log.info("shutdown_step", step=stage.name)
+
+        watchdog = threading.Timer(bound_s, _give_up, args=("watchdog",))
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            await asyncio.wait_for(_teardown(), timeout=bound_s)
+        except TimeoutError:
+            _give_up("asyncio")
+            return False
+        finally:
+            # Both deadlines sit on the SAME T (one number, by design), so they
+            # can race. The join makes the outcome deterministic: if the watchdog
+            # won, we do not return until its hard exit has actually been issued
+            # — in production it never returns, because ``os._exit`` ends the
+            # process from that thread. If it never fired, ``cancel`` wakes the
+            # timer immediately and the join is free.
+            watchdog.cancel()
+            watchdog.join()
+        return not fired.is_set()
 
     async def _stop_supervisor(self) -> None:
         """Terminate the supervisor subprocess on shutdown. Best-effort: SIGTERM
@@ -3889,6 +4298,11 @@ class QuoteApp:
         marginals, game_keys, book_legs, settled, inplay = self._book_leg_signals(
             exposure, lifecycle
         )
+        # The taxonomy tripwire shares HALT_METADATA_CHANGE with the metadata
+        # lanes and OUTRANKS them in ``detect_metadata_change``. Record it so the
+        # halt receipt can say which of the two fired — reason code alone can
+        # never attribute (relight gate G7 refuses any non-null tripwire).
+        self._halt_tripwire = self._book_tripwire(self._book_leg_refs(exposure))
         return BreakerInputs(
             rx_age_s=feed.rx_age_s,
             feed_warm=feed.warm,
@@ -3901,7 +4315,7 @@ class QuoteApp:
             game_keys=game_keys,
             settled_tickers=settled,
             inplay_tickers=inplay,
-            tripwire_hit=self._book_tripwire(self._book_leg_refs(exposure)),
+            tripwire_hit=self._halt_tripwire,
             changed_markets=self._metadata_changes(book_legs, metadata),
         )
 
@@ -4078,6 +4492,10 @@ class QuoteApp:
         ``raw={}``), is skipped — there is nothing to fingerprint and no
         settlement claim to make."""
         quarantine = self._market_quarantine
+        # HALT-RECEIPT evidence is rebuilt from scratch every pass: it must name
+        # THIS tick's diagnosis, never a union over history. Pure record-keeping
+        # — no branch below reads it.
+        self._halt_evidence = {}
         # PROMOTION (property 3): quarantines still unenforced from a PREVIOUS
         # tick — this tick's new ones are added below and are not in this
         # snapshot, so a market always gets its full enforcement pass first.
@@ -4088,6 +4506,21 @@ class QuoteApp:
                 markets=changed,
                 detail="resting quotes not provably withdrawn — escalating to halt",
             )
+            for ticker in changed:
+                # The lifecycle move itself was recorded when the quarantine was
+                # raised, on an EARLIER tick — by now the fingerprints no longer
+                # differ, so re-deriving it here would find nothing. Replay the
+                # held record and add what the enforcement pass learned.
+                held = dict(self._lifecycle_evidence.get(ticker, {}))
+                held.update(
+                    origin="quarantine_unenforced",
+                    quarantine_detail=quarantine.detail(ticker),
+                    quarantine_armed=quarantine.armed,
+                    withdraw_failure_kinds=dict(
+                        self._quarantine_failure_kinds.get(ticker, {})
+                    ),
+                )
+                self._halt_evidence[ticker] = held
         now_wall = self._clock.now()
         # The union of the risk path and the quarantine: a market that LEAVES
         # the book while quarantined must still be re-evaluated, or it could
@@ -4125,6 +4558,19 @@ class QuoteApp:
                 # and is owned by the settlement/fact machinery.
                 regraded = bool(prior.result) and bool(result) and prior.result != result
                 status_verdict = _status_change_class(prior.status, meta.status)
+                # The receipt's evidence for THIS market, from values already
+                # computed above. Recorded, never consulted.
+                observed = {
+                    "settlement_fp_prior": prior.settlement_fp,
+                    "settlement_fp_new": settlement_fp,
+                    "lifecycle_fp_prior": prior.lifecycle_fp,
+                    "lifecycle_fp_new": lifecycle_fp,
+                    "status_prior": prior.status,
+                    "status_new": meta.status,
+                    "status_class": status_verdict,
+                    "regraded": regraded,
+                    "settlement_moved": settlement_moved,
+                }
                 if settlement_moved or regraded or status_verdict == "settlement":
                     log.error(
                         "metadata_change_settlement_relevant",
@@ -4136,6 +4582,12 @@ class QuoteApp:
                         status_class=status_verdict,
                     )
                     changed.append(ticker)
+                    self._halt_evidence[ticker] = {
+                        **observed,
+                        "origin": "settlement",
+                        "quarantine_armed": quarantine.armed,
+                        "withdraw_failure_kinds": {},
+                    }
                 elif prior.lifecycle_fp != lifecycle_fp:
                     detail = (
                         f"lifecycle change {prior.status}->{meta.status}"
@@ -4150,6 +4602,13 @@ class QuoteApp:
                             detail=detail,
                         )
                         changed.append(ticker)
+                        self._halt_evidence[ticker] = {
+                            **observed,
+                            "origin": "unarmed",
+                            "quarantine_detail": detail,
+                            "quarantine_armed": False,
+                            "withdraw_failure_kinds": {},
+                        }
                     else:
                         log.warning(
                             "metadata_change_lifecycle_scoped",
@@ -4162,6 +4621,11 @@ class QuoteApp:
                             ),
                         )
                         quarantine.quarantine(ticker, detail)
+                        # HOLD the evidence of the move: if this quarantine
+                        # cannot be enforced, the promotion to a whole-bot halt
+                        # lands on a LATER tick, by which time these two
+                        # fingerprints agree again and the move is unprovable.
+                        self._lifecycle_evidence[ticker] = observed
                 elif quarantine.is_quarantined(ticker) and _is_tradable_status(
                     meta.status
                 ):
@@ -4171,6 +4635,11 @@ class QuoteApp:
                     # change). A permanently deactivated / voided market never
                     # returns to "active", so it never leaves quarantine.
                     quarantine.release(ticker)
+                    # A released market's held evidence is spent: drop it so
+                    # these dicts stay bounded by the LIVE quarantine set, the
+                    # same bound the quarantine itself carries.
+                    self._lifecycle_evidence.pop(ticker, None)
+                    self._quarantine_failure_kinds.pop(ticker, None)
             self._metadata_fingerprints[ticker] = _MetaBaseline(
                 settlement_fp=settlement_fp,
                 lifecycle_fp=lifecycle_fp,
@@ -4221,15 +4690,37 @@ class QuoteApp:
             log.exception("market_quarantine_enforcement_failed", markets=list(pending))
             return
         if failures:
+            # ATTRIBUTION for the halt receipt (2026-07-27): name the failure
+            # MODES that left this quarantine unenforced, from the withdrawal
+            # path's own classification. This is what makes "the exchange 429'd
+            # us again" distinguishable from "it timed out this time", and it is
+            # the only genuinely new datum the receipt carries. Read-only,
+            # additive, no control-flow change — the escalation below is byte
+            # for byte what it was.
+            # DEFENSIVE BY DESIGN, not by accident: this is pure attribution on
+            # the ESCALATION path of a fail-closed halt. If it could raise it
+            # would abort the enforcement pass — an observability field must
+            # never be able to break the cure it describes. Unattributable
+            # degrades to "no kinds", which the relighter reads as a distinct
+            # (and unrelightable-on-repeat) signature.
+            try:
+                kinds = dict(lifecycle.last_withdraw_failure_kinds)
+            except Exception:  # noqa: BLE001 - see above
+                log.warning("withdraw_failure_kinds_unavailable", exc_info=True)
+                kinds = {}
+            for ticker in pending:
+                self._quarantine_failure_kinds[ticker] = kinds
             log.error(
                 "market_quarantine_enforcement_incomplete",
                 markets=list(pending),
                 deleted=deleted,
                 failures=failures,
+                failure_kinds=kinds,
             )
             return
         for ticker in pending:
             self._market_quarantine.mark_enforced(ticker)
+            self._quarantine_failure_kinds.pop(ticker, None)
         log.warning(
             "market_quarantine_enforced",
             markets=list(pending),

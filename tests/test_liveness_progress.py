@@ -446,8 +446,8 @@ async def test_legitimate_startup_does_not_false_kill(tmp_path: Path) -> None:
     """The other side of B2: the real startup ORDER (publish an empty ledger →
     launch the supervisor → the supervisor polls for the whole of preflight →
     loops register → the liveness task publishes) must produce NO kill. The
-    heartbeat axis carries liveness during that window; the progress axis simply
-    is not established yet."""
+    progress axis simply is not established yet, and since 2026-07-27 it is the
+    ONLY kill axis — so an un-established ledger means no consequence at all."""
     clock = StepClock()
     ledger = _ledger(tmp_path, clock)
     heartbeat = Heartbeat(clock, tmp_path / "heartbeat.txt")  # type: ignore[arg-type]

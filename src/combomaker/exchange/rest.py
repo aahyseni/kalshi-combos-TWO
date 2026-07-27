@@ -77,8 +77,26 @@ class ReadBudgetExhausted(KalshiApiError):
 DEFAULT_REQUEST_TIMEOUT_S = 10.0
 
 # HTTP 404 on a DELETE: the exchange has no such quote. For a WITHDRAWAL that is
-# SUCCESS, not an error — see ``rfq.lifecycle._already_gone``.
+# SUCCESS, not an error — see ``already_gone`` just below.
 HTTP_NOT_FOUND = 404
+
+
+def already_gone(exc: BaseException) -> bool:
+    """True when a DELETE failed because the exchange has no such quote.
+
+    THE one definition of "provably off the wire by exception", shared by every
+    withdrawal path (the lifecycle's ``_withdraw_batch``, the startup reconcile's
+    leftover cancel). It lives here, next to ``HTTP_NOT_FOUND`` and the client
+    that raises the error, so a second path cannot grow a looser copy: a
+    withdrawal that treats 429/5xx/timeout as "gone" is a fail-OPEN seam, and the
+    startup reconcile's whole job is to be the trustworthy re-proof that nothing
+    of ours is still resting.
+
+    Duck-typed on ``status`` so any client carrying an HTTP status works, and
+    NARROW by construction: ONLY 404 is success. A 429 (``RateLimitedError``), a
+    5xx, a timeout, or a transport error is UNRESOLVED — the quote may still be
+    resting and may still fill, so it counts as not-provably-withdrawn."""
+    return getattr(exc, "status", None) == HTTP_NOT_FOUND
 
 # HTTP 429: the account's write TOKEN BUCKET was empty when the request landed.
 # The request never reached the book, so the outcome is UNKNOWN to the caller —

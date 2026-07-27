@@ -121,22 +121,22 @@ Write-Host "Starting bot stack (logs: $botLog / $proberLog)" -ForegroundColor Cy
 #    hasn't written (2026-07-25 launch failures #1 and #3; entrypoint verified
 #    against the live process list).
 #
-#    WHY A PARENT (2026-07-27 auto-relight): nothing used to outlive a halt. The
-#    supervisor is the BOT's child and is terminated in the bot's shutdown
-#    finally - measured dead 32ms after the 7/26 18:15Z metadata halt. The
-#    relighter is the bot's PARENT, so it outlives BY CONSTRUCTION, and it is the
-#    only process that can observe the child's EXIT CODE. It holds no exchange
-#    credential and opens no socket. It restarts the bot for exactly ONE halt
-#    class (a lifecycle quarantine we could not prove enforced) and escalates
-#    terminally for everything else - a KILL file on disk is an unconditional
-#    refusal, so the y/n prompt above remains the human gate it always was.
-#
-#    It deliberately does NOT carry the bot's argv on its own command line: the
-#    post-launch duplicate check below counts `combomaker\.ops\.cli run` ROOTS,
-#    and a parent carrying that argv would read as a second bot. It builds the
-#    child argv itself from these flags (ops/relight.py build_child_argv).
+#    NOT RUN UNDER THE RELIGHTER (2026-07-27 decision, reverted before it ever
+#    went live). ops/relight.py was built to be the bot's PARENT and auto-restart
+#    it after a lifecycle-class halt. Two findings killed it as a launcher:
+#      1. The class it targets has fired ZERO times since the aeed109 breaker
+#         rebuild (halt_metadata_change per run: 3 pre-rebuild, 0 in every run
+#         since). It automates a problem we no longer have.
+#      2. Adversarial gate F1: the boot-wedge branch returns without calling
+#         proc.terminate(), so it ABANDONS A LIVE CHILD - the MONITOR window
+#         says the bot is down and a human must check, while a parentless bot
+#         quotes real money. Strictly worse than having no relighter.
+#    The actual recovery need is already met, with no new process: the KILL
+#    block above auto-clears a MACHINE-written KILL. relight.py stays in the
+#    tree only for _write_halt_receipt, which quote_app imports; it is not a
+#    launcher and must not become one again without closing F1.
 #    All output -> dated log, so this window is quiet BY DESIGN.
-Start-Process cmd -ArgumentList "/k", "title BOT (quote mode, auto-relight) && echo Bot running under the RELIGHTER. This window is quiet BY DESIGN - all output goes to $botLog && echo Watch the MONITOR window for live events. Closing THIS window kills the bot. && .venv\Scripts\python.exe -m combomaker.ops.relight --env prod --mode quote --confirm-live --config config\prod-live-wc.local.yaml > $botLog 2>&1"
+Start-Process cmd -ArgumentList "/k", "title BOT (quote mode) && echo Bot running. This window is quiet BY DESIGN - all output goes to $botLog && echo Watch the MONITOR window for live events. Closing THIS window kills the bot. && .venv\Scripts\python.exe -m combomaker.ops.cli run --env prod --mode quote --confirm-live --config config\prod-live-wc.local.yaml > $botLog 2>&1"
 
 # 2) Main monitor (halts / fills / declines / waivers / errors).
 Start-Process powershell -ArgumentList "-NoExit", "-ExecutionPolicy", "Bypass", "-File", "tools\ops\watch_main.ps1", "-Log", $botLog

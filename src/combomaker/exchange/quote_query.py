@@ -38,6 +38,15 @@ WINDOW_FORWARD_S = 300           # clock-skew / just-updated buffer
 QUOTES_LIMIT = 500               # /communications/quotes documented max
 _MAX_PAGES = 1000                # belt-and-braces vs a non-terminating cursor
 
+# HOW HARD ONE RECONCILE PASS TRIES BEFORE IT DECLARES THE BOOK UNPROVEN. Named
+# here because BOTH halves of that pass use it: the enumeration below, and the
+# leftover WITHDRAWAL that consumes the enumeration (``QuoteApp.
+# _withdraw_leftover_quotes``). A read that retries 4x feeding a write that
+# retries once is a seam — one anchor, no drift. Bounded by construction: a
+# constant attempt count with a finite backoff, so every pass terminates.
+RETRIES = 4
+BACKOFF_S = 0.5
+
 
 class QuoteLister(Protocol):
     async def get_quotes(self, **params: Any) -> dict[str, Any]: ...
@@ -47,8 +56,8 @@ async def list_open_quotes(
     rest: QuoteLister,
     now_ts: int,
     *,
-    retries: int = 4,
-    backoff_s: float = 0.5,
+    retries: int = RETRIES,
+    backoff_s: float = BACKOFF_S,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> list[dict[str, Any]]:
     """Every OPEN quote the authenticated account holds, cursor-paginated to
@@ -82,15 +91,38 @@ async def list_open_quotes(
     return out
 
 
+def _quote_id(quote: dict[str, Any]) -> str:
+    """The id fields every call site already reads: ``id`` then ``quote_id``."""
+    return str(quote.get("id") or quote.get("quote_id") or "")
+
+
 def open_quote_ids(quotes: list[dict[str, Any]]) -> list[str]:
     """Extract quote ids from raw quote objects (the exact id fields both call
     sites already read: ``id`` then ``quote_id``)."""
     ids: list[str] = []
     for quote in quotes:
-        quote_id = str(quote.get("id") or quote.get("quote_id") or "")
+        quote_id = _quote_id(quote)
         if quote_id:
             ids.append(quote_id)
     return ids
+
+
+def open_quote_tickers(quotes: list[dict[str, Any]]) -> dict[str, str]:
+    """``{quote_id: market_ticker}`` over the SAME quotes ``open_quote_ids``
+    returns (same id extraction, so the two can never disagree about which quote
+    is which).
+
+    Exists so a path that must report a quote it could NOT prove off the wire can
+    name the MARKET an operator has to go look at, not an opaque quote id.
+    ``market_ticker`` is required on the Quote schema (docs/api-notes/
+    openapi-comms.md, "Quote object"); a quote somehow missing it maps to the
+    empty string and the caller falls back to the id."""
+    out: dict[str, str] = {}
+    for quote in quotes:
+        quote_id = _quote_id(quote)
+        if quote_id:
+            out[quote_id] = str(quote.get("market_ticker") or "")
+    return out
 
 
 async def _get_page_with_retry(

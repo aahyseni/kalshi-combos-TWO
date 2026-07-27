@@ -407,7 +407,13 @@ async def _quote_shapes(
     # every leg is on a game starting at/after 18:30 ET tonight.
     import re as _re
 
-    today = w.clock.now().astimezone(ET).strftime("%d%b%y").upper()  # 26JUL26
+    # The game_key stamp is YY MON DD ("26JUL27" = 2026-07-27), so the format is
+    # %y%b%d. It was written %d%b%y and matched ANYWAY on 2026-07-26 — the one
+    # day of that year where DD == YY == 26. On every other day this compared
+    # "27JUL26" against "26JUL27", selected ZERO shapes, and printed "cannot
+    # drive the path": the caps-can-quote gate silently validated NOTHING, which
+    # is the exact failure mode the standing rule exists to prevent.
+    today = w.clock.now().astimezone(ET).strftime("%y%b%d").upper()  # 26JUL27
 
     def leg_slot(t: str) -> tuple[str, int] | None:
         m = _re.search(r"-(\d{2}[A-Z]{3}\d{2})(\d{4})", t)
@@ -415,7 +421,20 @@ async def _quote_shapes(
             return None
         return m.group(1), int(m.group(2))
 
+    # The gate must grade the caps on shapes THE BOT WOULD ACTUALLY QUOTE. The
+    # live LEG-SERIES ALLOWLIST is the operator's per-sport kill switch, so it
+    # is read from the shipped config rather than restated here. Without it the
+    # harvest admits the 15-minute CRYPTO markets (KXBTC15M/KXETH15M...), which
+    # the bot filters at every pipeline stage and never subscribes an orderbook
+    # for — grading a cap on one proves nothing and crashes ``_await_books``.
+    allowed = tuple(w.cfg.filters.allowed_leg_series_prefixes)
+
+    def quotable(t: str) -> bool:
+        return any(t.startswith(p) for p in allowed)
+
     def all_tonight(r: Rfq) -> bool:
+        if not all(quotable(t) for t in r.leg_tickers):
+            return False
         slots = [leg_slot(t) for t in r.leg_tickers]
         if any(s is None for s in slots):
             return False

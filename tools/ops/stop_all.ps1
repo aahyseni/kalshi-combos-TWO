@@ -1,6 +1,13 @@
-# One-click bot shutdown: kill supervisors FIRST (they respawn the bot), then
-# bots and probers; verify; then offer a cancel-all sweep of resting quotes.
+# One-click bot shutdown: kill supervisors AND THE RELIGHTER first (they are the
+# processes that can bring the bot back), then bots and probers; verify; then
+# offer a cancel-all sweep of resting quotes.
 # Run via STOP_BOT.bat.
+#
+# WHY THE RELIGHTER GOES IN THE FIRST GROUP (2026-07-27): it is the bot's PARENT
+# and the only process that restarts it. Killed in the same pass as the bot it
+# would refuse anyway (an operator stop force-kills the child, which leaves no
+# halt receipt => default-deny => escalate), but killing it FIRST means the
+# operator never sees a spurious relight_terminal_escalation line on the way out.
 param([switch]$NoPrompt)
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
@@ -11,10 +18,10 @@ $procs = Get-CimInstance Win32_Process |
 if (-not $procs) {
     Write-Host "Nothing running (no combomaker/prober processes found)." -ForegroundColor Green
 } else {
-    $supervisors = @($procs | Where-Object { $_.CommandLine -match 'supervisor' })
-    $rest = @($procs | Where-Object { $_.CommandLine -notmatch 'supervisor' })
+    $supervisors = @($procs | Where-Object { $_.CommandLine -match 'supervisor|relight' })
+    $rest = @($procs | Where-Object { $_.CommandLine -notmatch 'supervisor|relight' })
     foreach ($p in $supervisors) {
-        Write-Host "Stopping supervisor PID $($p.ProcessId)" -ForegroundColor Yellow
+        Write-Host "Stopping supervisor/relighter PID $($p.ProcessId)" -ForegroundColor Yellow
         try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {}
     }
     Start-Sleep -Milliseconds 500
