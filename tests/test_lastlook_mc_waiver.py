@@ -1164,8 +1164,12 @@ async def test_candidate_gate_still_runs_after_granted_waiver_and_can_decline(
     gate_calls: list[tuple[str, str | None, int, int]] = []
 
     async def fake_gate(
-        quote_id: str, _state: OpenQuoteState, *, reservation_id: str | None
-    ) -> tuple[bool, str]:
+        quote_id: str,
+        _state: OpenQuoteState,
+        *,
+        reservation_id: str | None,
+        accept_ns: int | None = None,
+    ) -> tuple[bool, str, ReasonCode | None]:
         gate_calls.append(
             (
                 quote_id,
@@ -1174,7 +1178,11 @@ async def test_candidate_gate_still_runs_after_granted_waiver_and_can_decline(
                 metrics.counter("lastlook_waiver.granted"),
             )
         )
-        return False, "post-waiver gate decline (test)"
+        return (
+            False,
+            "post-waiver gate decline (test)",
+            ReasonCode.DECLINE_CANDIDATE_RISK,
+        )
 
     monkeypatch.setattr(lifecycle, "_candidate_gate_verdict", fake_gate)
 

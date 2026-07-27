@@ -99,6 +99,27 @@ class PriceGrid:
                     best = candidate
         return best
 
+    def step_at(self, price_cc: CentiCents) -> CentiCents | None:
+        """The lattice STEP in force at ``price_cc`` — the tick our bid moves on.
+
+        LEVER #5 (2026-07-27) needs this: a steer that is not a whole number of
+        ticks is silently erased by :meth:`snap_bid_down` (32.25% of live steer
+        events were annihilated exactly that way). Quantising the steer onto
+        this step makes the snap reproduce it instead of eating it.
+
+        Returns the step of the range CONTAINING the price; the WIDEST step
+        among the ranges when the price sits outside all of them (the
+        conservative read — a coarser tick can never UNDER-quantise); None when
+        the grid has no ranges at all: an unknown grid means no steer, never a
+        guessed 1-cent default (quiet-failure defense #2).
+        """
+        for r in self.ranges:
+            if r.contains(price_cc):
+                return r.step_cc
+        if not self.ranges:
+            return None
+        return CentiCents(max(int(r.step_cc) for r in self.ranges))
+
     def snap_up(self, price_cc: CentiCents) -> CentiCents | None:
         """Smallest grid price >= price_cc (for derived-ask walks, NOT our bids)."""
         best: CentiCents | None = None

@@ -47,7 +47,8 @@ def main() -> int:
         total_family_cc=tf,
         shares_by_entity={k: v / te for k, v in ent.items()},
         total_entity_cc=te,
-        budget_cc=tf * 1.5,
+        family_budget_cc=tf * 1.5,
+        entity_budget_cc=tf * 1.5,
         p_book=0.5887,
     )
     params = SkewParams(leg_axis_enabled=True, leg_axis_armed=True)

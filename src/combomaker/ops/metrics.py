@@ -78,6 +78,22 @@ class Metrics:
     def counter(self, name: str) -> int:
         return self._counters.get(name, 0)
 
+    def quantile_ms(self, name: str, q: float) -> float | None:
+        """The observed ``q``-quantile of a latency series, or **None when the
+        series has no samples**.
+
+        None means UNMEASURED and every caller must treat it as such — the
+        derived confirm-window budget (rfq/lifecycle.py) reads this and, on
+        None, reserves the WHOLE exchange window (an unknown latency is assumed
+        worst-case, so the budget collapses to zero and the confirm path
+        degrades to its deterministic fallback instead of gambling the window).
+        Never coerce a missing measurement to 0.0 — that would read as
+        "instant" and is exactly the fail-open this guards against."""
+        h = self._histograms.get(name)
+        if h is None or h.total == 0:
+            return None
+        return h.quantile(q)
+
     def histogram_max_ms(self, name: str) -> float | None:
         """The worst observed latency for a series, or None if never observed.
         This is the ALL-TIME max (never decays) — for reports/snapshots, NOT for

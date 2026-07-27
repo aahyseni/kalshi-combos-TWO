@@ -221,6 +221,19 @@ class ReasonCode(StrEnum):
     # merged marginal, an over-budget POST book, or ANY error in the off-loop eval
     # DECLINES here (fail-closed; an unmeasured/errored joint tail is never safe).
     DECLINE_CANDIDATE_RISK = "decline_candidate_risk"
+    # LATENCY, NOT RISK (2026-07-27). The candidate MC could not finish inside
+    # the DERIVED confirm-window budget, so the gate fell back to the
+    # DETERMINISTIC caps (det-max / per-combo / entity / game / slate / gross —
+    # arithmetic, microseconds) re-checked against the LIVE book — and THOSE
+    # refused. A timeout ALONE never lands here: when the deterministic caps
+    # pass, the fill CONFIRMS (we already won an auction priced +EV at
+    # reservation time; discarding it because a computation was slow is the
+    # worst possible default). This code exists so the decline report can tell a
+    # LATENCY-degraded refusal apart from DECLINE_CANDIDATE_RISK, which means
+    # the MC actually RAN and the joint-tail/ruin/EV budgets said no. Before
+    # this split, 100% of live decline_candidate_risk was a stopwatch wearing a
+    # risk reason code (70 won auctions, 254.0 contracts, over 2 days).
+    DECLINE_CANDIDATE_GATE_TIMEOUT = "decline_candidate_gate_timeout"
     DECLINE_MASS_ACCEPTANCE = "decline_mass_acceptance"
     DECLINE_KILL_SWITCH = "decline_kill_switch"
     DECLINE_EXCHANGE_INACTIVE = "decline_exchange_inactive"

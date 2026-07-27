@@ -66,12 +66,22 @@ markout-validated enable flips it live (never refit on a P&L window).
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from combomaker.core.conventions import Conventions, Side
 from combomaker.core.money import CC_PER_DOLLAR
+from combomaker.risk.concentration_steer import (
+    ConcentrationSteer,
+    CrnBookCache,
+    LossEventBook,
+    SteerCenter,
+    SteerInputs,
+    compute_concentration_steer,
+    share_alignment,
+)
 from combomaker.risk.exposure import (
     DirEntry,
     ExposureSnapshot,
@@ -163,6 +173,20 @@ class SkewParams:
     # documented two-pair range is never expanded).
     leg_axis_enabled: bool = True
     leg_axis_armed: bool = False
+    # LEVER #5 CONCENTRATION STEER (2026-07-27): the SAME shadow-first pair,
+    # for the same reason the other two have it — derive before arm.
+    # ``conc_enabled`` computes + logs the FULL decomposition (the AND-bound
+    # dollar-Herfindahl marginal, the Cov(candidate, book) price, the per-axis
+    # wall loads, the derived symmetric half-range and which bound binds it);
+    # ``conc_armed`` is the SEPARATE switch that lets it REPLACE the prior
+    # composition in ``skew_cc``. Default OFF = pure shadow: ``skew_cc`` (and
+    # therefore price) is byte-identical to the pre-Lever-#5 composition while
+    # the live magnitude distribution is measured (see
+    # ``tools/diagnostics/conc_steer_shadow_readout.py`` for the read-out the
+    # arming decision reads). ``conc_enabled=False`` is the ZERO-COST rollback:
+    # the steer is not computed at all and the quote path pays nothing for it.
+    conc_enabled: bool = True
+    conc_armed: bool = False
 
     def validate(self) -> None:
         if self.w_conc < 0.0 or self.w_off < 0.0:
@@ -235,6 +259,10 @@ class PBookProfile:
     # collect the underweight rebate (it can erode the hedge) — the
     # component reads these as neutral "hedged_protected".
     protected_games: frozenset[str] = frozenset()
+    # The tail-share HERFINDAHL, same role and same reason as
+    # ``LegAxisProfile.hhi_family`` — a book property, computed once at publish
+    # time. ``None`` ⇒ derive it from the shares here.
+    tail_hhi: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,18 +280,80 @@ class LegAxisProfile:
     (``KXMLBKS:yes``) and one arm concentrates under ONE entity key
     (``KXMLBKS:BOSSGRAY54:yes`` — every rung folds together).
 
-    ``budget_cc`` is the SAME enforced loss budget the P(book) axis divides
-    by (min(hard game $cap, game_loss_frac × bank, KILL frac × bank) —
-    published from the live bankroll, never a static dollar). ``p_book`` is
-    the cached MC P(book P&L > 0) when generation-fresh, None otherwise —
-    None fails the component to NEUTRAL (UNKNOWN never widens)."""
+    EACH AXIS DIVIDES BY ITS OWN ENFORCED WALL (2026-07-27 review finding —
+    repaired). One ``budget_cc`` used to be handed to BOTH axes: the per-GAME
+    loss budget (min(hard game $cap, game_loss_frac × bank, KILL frac × bank)).
+    But the wall the ENTITY axis is actually refused at is
+    ``threshold_cc(entity_loss_frac, bankroll)`` — on the live config
+    (game 8% vs entity 3%, before the hard-$ and KILL mins) that denominator is
+    several times too large, so the entity steer read a key at its refusal wall
+    as a fraction of it and priced ~nothing right up to the point of refusal.
+    ``family_budget_cc`` keeps the per-game budget (the family axis has no
+    separate enforced wall — the tightest bound a one-direction stack can
+    burn); ``entity_budget_cc`` is the enforced entity wall when that axis is
+    armed, and falls back to the family budget when it is not (an unarmed axis
+    has no wall of its own to divide by). ``p_book`` is the cached MC
+    P(book P&L > 0) when generation-fresh, None otherwise — None fails the
+    component to NEUTRAL (UNKNOWN never widens)."""
 
     shares_by_family: dict[str, float]
     total_family_cc: float
     shares_by_entity: dict[str, float]
     total_entity_cc: float
-    budget_cc: float
+    family_budget_cc: float
+    entity_budget_cc: float
     p_book: float | None
+    # Each axis's dollar-HERFINDAHL (``sum share**2``) — the book's own
+    # dollar-weighted average share, and the denominator-free reference the
+    # candidate's alignment is read against. It is a property of the BOOK, not
+    # of the candidate, so it is computed ONCE where the shares are (this
+    # profile is cached on the position generation) instead of re-summed over
+    # 79 entity keys on every quote. ``None`` ⇒ compute it from the shares
+    # (every pre-existing caller stays correct, just slower).
+    hhi_family: float | None = None
+    hhi_entity: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ConcentrationProfile:
+    """LEVER #5 inputs — everything the ECONOMICALLY-REAL steer reads.
+
+    Built by the lifecycle from state it already has:
+
+    * ``loss_events`` — the committed book as AND-BOUND LOSS EVENTS in premium
+      dollars (``risk/concentration_steer.LossEventBook``). Rebuilt ONLY when
+      ``ExposureBook.position_generation`` moves, so the quote path pays the
+      O(1) marginal (1.47us) and never the rebuild. This is the axis the
+      pre-existing steer got structurally wrong: a 3-leg ticket across 3
+      DIFFERENT matches is ONE loss event (as held, effective events 1.00)
+      but was scored as THREE diversification rebates (split into 3 tickets:
+      2.99).
+    * the three WALL maps — each axis's committed premium dollars per key plus
+      THAT AXIS'S OWN ENFORCED WALL in cc (the same thresholds ``risk/limits``
+      refuses on). Dollars vs a wall; never a 1/n count.
+    * ``crn`` — the already-paid-for CRN sample, for
+      ``Cov(candidate payoff, pre-existing book P&L)``. None ⇒ the steer falls
+      back to the ZERO-standard-error Herfindahl reading alone (never a guess,
+      never ``delta_p_book``: R²=0.921 vs candidate EV, 42.2% unresolvable at
+      3σ, 41.7% of EV-residual signs flip across caches — it must not reach
+      price).
+    * ``centre`` — the live measured mean score, the budget-neutrality
+      mechanism (markups are FIXED: this reallocates, it never widens).
+    * ``fill_elasticity_per_cent`` — the MEASURED CMH-stratified fill-rate
+      elasticity (~0.22 = 22% of fills lost per cent), which sets the steer's
+      validity horizon.
+    """
+
+    loss_events: LossEventBook
+    game_dollars_cc: Mapping[str, float]
+    game_wall_cc: float
+    family_dollars_cc: Mapping[str, float]
+    family_wall_cc: float
+    entity_dollars_cc: Mapping[str, float]
+    entity_wall_cc: float
+    fill_elasticity_per_cent: float
+    centre: SteerCenter
+    crn: CrnBookCache | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,6 +439,30 @@ class InventorySkew:
     family_cc: int = 0
     entity_cc: int = 0
     leg_axis_rows: tuple[tuple[str, int, float, str], ...] = ()
+    # LEVER #5 (2026-07-27). The economically-real concentration steer, in
+    # full: the AND-bound dollar-Herfindahl marginal (zero SE), the measured
+    # Cov(candidate, book) price, the per-axis wall loads, the DERIVED
+    # symmetric half-range and which of the three measured bounds is binding.
+    # None ⇒ the profile was not wired and the composition is byte-identical
+    # to the pre-Lever-#5 classifier.
+    conc: ConcentrationSteer | None = None
+    # SHADOW COUNTERFACTUAL (2026-07-27 review B3). While the steer is computed
+    # but NOT armed, this is the ``skew_cc`` the ARMED composition WOULD have
+    # produced — the exact number the arming read-out has to bucket (the
+    # component ``conc.skew_cc`` alone would miss the composed clamp and the
+    # directional term it rides on). None when armed (``skew_cc`` IS that
+    # number) or when the steer was not computed at all.
+    shadow_armed_skew_cc: int | None = None
+
+    @property
+    def shadow_armed_applied_cc(self) -> int | None:
+        """The pricer-frame value the ARMED composition would apply — the same
+        classifier→pricer sign flip as :attr:`applied_cc`, so the shadow
+        read-out compares like with like. None while there is nothing to
+        counterfactual (already armed, or the steer is off)."""
+        if self.shadow_armed_skew_cc is None:
+            return None
+        return -self.shadow_armed_skew_cc
 
     @property
     def applied_cc(self) -> int:
@@ -394,6 +508,10 @@ def compute_inventory_skew(
     pbook_profile: PBookProfile | None = None,
     pbook_book_generation: int | None = None,
     leg_axis_profile: LegAxisProfile | None = None,
+    conc_profile: ConcentrationProfile | None = None,
+    margin_cc: int = 0,
+    tick_cc: int = 0,
+    observe_centre: bool = True,
 ) -> InventorySkew:
     """Compute the inventory skew for ``candidate`` against the current book.
 
@@ -487,6 +605,18 @@ def compute_inventory_skew(
     ``peak_per_game``), so the widen-vs-decline policy can never decline on it
     — pricing only, by construction. Omitting both new arguments (every
     pre-existing caller) is byte-identical to the directional-only classifier.
+
+    LEVER #5 CONCENTRATION STEER (2026-07-27) — SHADOW-FIRST, like every other
+    steer in this function. ``conc_profile`` / ``margin_cc`` / ``tick_cc`` wire
+    the economically-real steer (``risk/concentration_steer.py``). It is
+    COMPUTED whenever ``params.conc_enabled`` and a profile is present, and it
+    REPLACES the peak/pbook/leg-axis composition in ``skew_cc`` ONLY when
+    ``params.conc_armed`` — which defaults False. Unarmed, ``InventorySkew.conc``
+    carries the full decomposition for the shadow read-out while ``skew_cc``,
+    ``applied_cc`` and every component field are byte-identical to the
+    pre-Lever-#5 classifier (``tests/test_conc_arming.py`` pins this over a
+    candidate x book grid). ``conc_enabled=False`` is the zero-cost rollback:
+    nothing is computed and the quote path pays nothing.
 
     Returns an :class:`InventorySkew` whose ``applied_cc`` is 0 while
     ``params.enabled`` is False (dark ship) and the honest ``skew_cc`` otherwise.
@@ -620,9 +750,13 @@ def compute_inventory_skew(
     # [−peak_tighten_max_cc, +peak_widen_max_cc], then ADDED — so the composed
     # classifier obeys the overall clamp documented on SkewParams by
     # construction (each addend is bounded by its own cap).
-    peak_widen_cc, peak_tighten_cc, peak_cc, peak_per_game = _peak_component(
-        candidate, params, limits, peak_profile, peak_book_generation
-    )
+    (
+        peak_widen_cc,
+        peak_tighten_cc,
+        peak_cc,
+        peak_per_game,
+        peak_score,
+    ) = _peak_component(candidate, params, peak_profile, peak_book_generation)
     # P(BOOK) STEER component, Phase B1 (2026-07-25): computed from the
     # per-game contributions the loop above already classified — SHADOW by
     # default (pbook_armed=False keeps skew_cc byte-identical while the live
@@ -634,31 +768,114 @@ def compute_inventory_skew(
     pbook_input = list(per_game) + [
         (g, 0) for g in cand_by_game if g not in seen_games
     ]
-    pbook_cc, pbook_per_game = _pbook_component(
+    pbook_cc, pbook_per_game, pbook_score = _pbook_component(
         pbook_input, params, pbook_profile, pbook_book_generation
     )
     # LEG-DIRECTION AXIS component (2026-07-25): the candidate against the
     # committed book's (family × side) / (entity × side) premium shares —
     # the cross-game direction concentration the game axes cannot see.
     # SHADOW-FIRST like pbook: computed + logged, added only when armed.
-    family_cc, entity_cc, leg_axis_rows = _leg_axis_component(
-        candidate, params, leg_axis_profile
-    )
-    skew_cc = directional_cc + peak_cc
-    if params.pbook_armed:
-        skew_cc += pbook_cc
+    (
+        family_cc,
+        entity_cc,
+        leg_axis_rows,
+        family_score,
+        entity_score,
+    ) = _leg_axis_component(candidate, params, leg_axis_profile)
+    # LEVER #5 (2026-07-27): the ECONOMICALLY-REAL concentration steer —
+    # AND-bound dollar-Herfindahl marginal (zero SE) priced by
+    # Cov(candidate payoff, book P&L) off the already-paid-for CRN cache,
+    # scaled from measured state (value dispersion ∧ fill-rate-elasticity
+    # horizon ∧ the LIVE margin), centred so the average quote cannot widen,
+    # and quantized onto the combo's own tick lattice so it cannot be
+    # annihilated by ``snap_bid_down``. Absent profile ⇒ EXACTLY the
+    # pre-existing composition, byte for byte.
+    # ONE CONCENTRATION BUDGET (operator directive 2026-07-27). Every
+    # concentration axis is now a SCALE-FREE signed intensity in [−1, +1] —
+    # a dollar SHARE read against that axis's own dollar-Herfindahl, never
+    # dollars against a wall and never a 1/n count — so they compose into a
+    # single score that is centred (budget-neutral), bounded by ONE derived
+    # symmetric half-range and quantized onto the combo's own tick lattice
+    # EXACTLY ONCE. The axes enter in the DIVERSIFIER-POSITIVE convention the
+    # steer uses, hence the negation.
+    axis_scores: list[float] = []
+    if peak_score is not None:
+        axis_scores.append(-peak_score)
+    if params.pbook_armed and pbook_score is not None:
+        axis_scores.append(-pbook_score)
     if params.leg_axis_armed:
-        skew_cc += family_cc + entity_cc
-    # COMPOSED OVERALL CLAMP (2026-07-25 review): the documented SkewParams
-    # bound [−(skew_max_tighten+peak_tighten), +(skew_max_widen+peak_widen)]
-    # stays TRUE with the pbook component armed — pbook shares the documented
-    # budget rather than expanding it (a triple-stacked rebate must never
-    # exceed what the two-pair bound already authorizes). A no-op while
-    # unarmed (directional + peak are each inside their own clamps).
-    skew_cc = max(
-        -(params.skew_max_tighten_cc + params.peak_tighten_max_cc),
-        min(params.skew_max_widen_cc + params.peak_widen_max_cc, skew_cc),
+        if family_score is not None:
+            axis_scores.append(-family_score)
+        if entity_score is not None:
+            axis_scores.append(-entity_score)
+    # SHADOW-FIRST ARMING (2026-07-27 adversarial review B3). ``conc_enabled``
+    # computes + logs; ``conc_armed`` is what lets it touch price. While
+    # unarmed the steer is still fully derived (the operator's arming read-out
+    # needs the real distribution on real flow) but the composition below falls
+    # to the PRE-LEVER-#5 branch — byte-identical, pinned by
+    # tests/test_conc_arming.py. ``conc_enabled=False`` skips the work entirely.
+    conc = (
+        _concentration_component(
+            candidate,
+            conc_profile,
+            margin_cc,
+            tick_cc,
+            observe_centre,
+            tuple(axis_scores),
+        )
+        if params.conc_enabled
+        else None
     )
+    shadow_armed_skew_cc: int | None = None
+    if conc is not None and params.conc_armed:
+        # The concentration axes are INSIDE ``conc`` (they were folded into its
+        # score before centring), so adding their cc values here would
+        # double-count them. ``conc.skew_cc`` is already bounded by the derived
+        # symmetric half-range and is already a whole number of grid ticks.
+        skew_cc = directional_cc + conc.skew_cc
+        half = conc.scale.half_cc if conc.scale is not None else 0
+        # The composed bound is the DIRECTIONAL clamp plus the derived
+        # symmetric half-range — symmetric where the steer is symmetric, so the
+        # rebate side can reach exactly as far as the widen side.
+        skew_cc = max(
+            -(params.skew_max_tighten_cc + half),
+            min(params.skew_max_widen_cc + half, skew_cc),
+        )
+    else:
+        # THE PRE-LEVER-#5 COMPOSITION. Reached when the steer is unwired
+        # (no profile), disabled, or — the normal case until the operator
+        # arms it — computed in SHADOW. ``conc`` may be non-None here; it is
+        # logged and never added, exactly like an unarmed pbook/leg-axis
+        # component.
+        skew_cc = directional_cc + peak_cc
+        if params.pbook_armed:
+            skew_cc += pbook_cc
+        if params.leg_axis_armed:
+            skew_cc += family_cc + entity_cc
+        # COMPOSED OVERALL CLAMP: the documented SkewParams bound, now
+        # SYMMETRIC on the peak pair because every concentration axis is
+        # symmetric (one weight both ways) — an asymmetric truncation here
+        # would silently re-introduce the 4:1 widen bias the axes just removed.
+        skew_cc = max(
+            -(params.skew_max_tighten_cc + params.peak_widen_max_cc),
+            min(params.skew_max_widen_cc + params.peak_widen_max_cc, skew_cc),
+        )
+        if conc is not None:
+            # SHADOW COUNTERFACTUAL: the armed branch's arithmetic run on the
+            # SAME inputs and thrown at the LOG instead of at the price. Four
+            # integer ops, so the read-out costs nothing. It DUPLICATES the
+            # armed branch above — keep the two in sync; ``test_conc_arming.py::
+            # test_the_counterfactual_equals_what_arming_actually_produces``
+            # asserts them equal to the centi-cent over a candidate grid, so a
+            # drift cannot survive the suite.
+            half = conc.scale.half_cc if conc.scale is not None else 0
+            shadow_armed_skew_cc = max(
+                -(params.skew_max_tighten_cc + half),
+                min(
+                    params.skew_max_widen_cc + half,
+                    directional_cc + conc.skew_cc,
+                ),
+            )
 
     return InventorySkew(
         skew_cc=skew_cc,
@@ -676,7 +893,113 @@ def compute_inventory_skew(
         family_cc=family_cc,
         entity_cc=entity_cc,
         leg_axis_rows=leg_axis_rows,
+        conc=conc,
+        shadow_armed_skew_cc=shadow_armed_skew_cc,
     )
+
+
+def ticket_bucket(legs: Sequence[LegRef]) -> tuple[str, ...]:
+    """The AND-BOUND LOSS-EVENT identity of one TICKET (Lever #5).
+
+    A ``requires-all`` combo forfeits its premium only if EVERY leg lands, so
+    the whole ticket is ONE loss event — not one per leg. Its identity is the
+    UNION of the axis keys it requires: the GAMES, the (family x side)
+    directions, and the (family:entity x side) entities. Two tickets are the
+    same loss event iff they need exactly the same set on all three axes.
+
+    Why the union rather than the game set alone: the game axis alone cannot
+    see the K-ladder (six short-K-over tickets across six games), and the
+    family axis alone cannot see the same-match stack. Folding all three into
+    one bucket makes the effective-event count read the shape a human would:
+      * another rung of the SAME pitcher in the SAME game -> SAME bucket
+        (concentrating; the rung segment drops out of ``leg_entity_key``);
+      * the OTHER side of that ladder -> different family key -> NEW bucket
+        (diversifying: exactly "reward the other side of the K-ladder");
+      * a brand-new match -> NEW bucket (diversifying).
+    The ABSOLUTE loading of any single key is not this object's job — that is
+    :func:`concentration_steer.wall_load`, dollars against that axis's own
+    enforced wall.
+
+    Measured live pair this reproduces: a 3-leg ticket across 3 different
+    matches held whole -> effective events 1.00; split into 3 tickets -> 2.99.
+    """
+    keys: set[str] = set()
+    for leg in legs:
+        keys.add(_game_key(leg.event_ticker or ""))
+        keys.add(leg_family_key(leg))
+        keys.add(leg_entity_key(leg))
+    return tuple(sorted(keys))
+
+
+def _concentration_component(
+    candidate: OpenPosition,
+    profile: ConcentrationProfile | None,
+    margin_cc: int,
+    tick_cc: int,
+    observe: bool,
+    axis_scores: tuple[float, ...] = (),
+) -> ConcentrationSteer | None:
+    """LEVER #5 — build the :class:`SteerInputs` and run the steer.
+
+    The AND-BOUND bucket is the GAME key set (the correlation unit the whole
+    risk engine aggregates on): a ``requires-all`` combo forfeits its premium
+    only if EVERY leg lands, so the ticket is ONE loss event keyed by the SET
+    of games it needs — never three rebates for three legs.
+
+    The candidate's premium-at-risk is ``max_loss_cc`` — the exact,
+    ground-truth-verified loss of a long-NO fill (the premium we paid), which
+    is the same dollar the caps refuse on. Concentration is priced in the money
+    that can actually be lost.
+
+    FAIL-SAFE: no profile ⇒ None (the composition is byte-identical to the
+    pre-Lever-#5 classifier); no tick ⇒ the steer says so via
+    ``reason='sub_tick_half_range'`` and contributes 0. Never raises."""
+    if profile is None:
+        return None
+    legs = candidate.legs
+    if not legs:
+        return None
+    premium_cc = float(candidate.max_loss_cc)
+    # ONE pass over the legs for all three axes AND the AND-bound bucket
+    # (2026-07-27 throughput: ``ticket_bucket`` is the union of exactly these
+    # three key sets, so recomputing them was pure waste on the quote path).
+    game_set: set[str] = set()
+    fam_set: set[str] = set()
+    ent_set: set[str] = set()
+    for leg in legs:
+        game_set.add(_game_key(leg.event_ticker or ""))
+        fam_set.add(leg_family_key(leg))
+        ent_set.add(leg_entity_key(leg))
+    game_keys = sorted(game_set)
+    fam_keys = sorted(fam_set)
+    ent_keys = sorted(ent_set)
+    bucket = tuple(sorted(game_set | fam_set | ent_set))
+    inputs = SteerInputs(
+        loss_events=profile.loss_events,
+        candidate_bucket=bucket,
+        candidate_premium_cc=premium_cc,
+        walls_by_axis={
+            "game": (profile.game_dollars_cc, game_keys, profile.game_wall_cc),
+            "family": (
+                profile.family_dollars_cc,
+                fam_keys,
+                profile.family_wall_cc,
+            ),
+            "entity": (
+                profile.entity_dollars_cc,
+                ent_keys,
+                profile.entity_wall_cc,
+            ),
+        },
+        margin_cc=margin_cc,
+        tick_cc=tick_cc,
+        fill_elasticity_per_cent=profile.fill_elasticity_per_cent,
+        crn=profile.crn,
+        candidate_legs=legs,
+        contracts=float(candidate.contracts) / 100.0,
+        axis_scores=axis_scores,
+    )
+    return compute_concentration_steer(inputs, profile.centre, observe=observe)
 
 
 def _pbook_component(
@@ -684,7 +1007,7 @@ def _pbook_component(
     params: SkewParams,
     profile: PBookProfile | None,
     book_generation: int | None,
-) -> tuple[int, tuple[tuple[str, int, float, str], ...]]:
+) -> tuple[int, tuple[tuple[str, int, float, str], ...], float | None]:
     """The P(book) steering component (operator directive 2026-07-25: P(book)
     steers the betting; more variance/diversity = higher P(book); onset off
     the CAPS, never a dollar constant, never too early).
@@ -734,22 +1057,29 @@ def _pbook_component(
     Pricing-only by construction: never feeds ``per_game``, so
     widen-vs-decline cannot decline on it."""
     if not params.pbook_enabled or profile is None:
-        return 0, ()
+        return 0, (), None
     if book_generation is None or profile.input_generation != book_generation:
-        return 0, (("*", 0, 0.0, "stale_profile"),)
+        return 0, (("*", 0, 0.0, "stale_profile"),), None
     shares = profile.tail_share_by_game
     if not shares:
-        return 0, (("*", 0, 0.0, "no_tail"),)
-    budget_cc = profile.game_budget_cc
-    if budget_cc <= 0.0 or profile.total_tail_cc <= 0.0:
-        return 0, (("*", 0, 0.0, "no_budget"),)
-    n = len(shares)
-    uniform = 1.0 / n
-    need = max(0.0, min(1.0, 1.0 - profile.p_book))
-    onset_book = min(
-        1.0, max(shares.values()) * profile.total_tail_cc / budget_cc
+        return 0, (("*", 0, 0.0, "no_tail"),), None
+    tail_hhi = (
+        profile.tail_hhi
+        if profile.tail_hhi is not None
+        else math.fsum(s * s for s in shares.values() if s > 0.0)
     )
-    total = 0.0
+    if tail_hhi <= 0.0:
+        return 0, (("*", 0, 0.0, "no_tail"),), None
+    # ``need = 1 - p_book`` IS GONE (operator directive 2026-07-27). It was
+    # BOOK-LEVEL and CANDIDATE-BLIND: it multiplied every widen and every rebate
+    # on this axis, and p_book drifts DOWN as the book grows (measured 0.5954 ->
+    # 0.5653 in one session, x1.0744 on every row), so it is a book-size proxy
+    # wearing a risk reason code — category (B) by the operator's own rule. The
+    # P(book) STEERING it was meant to carry is exactly what the SIGN of the
+    # tail-share alignment already encodes: concentrated tail share IS low
+    # P(book).
+    frac_binding = 0.0
+    seen = False
     rows: list[tuple[str, int, float, str]] = []
     for game, contrib_cc in per_game:
         share = shares.get(game)
@@ -763,146 +1093,151 @@ def _pbook_component(
             # A game with NO tail presence at all: maximally underweight —
             # flow here is pure game-level diversification.
             share = 0.0
-        if n > 1:
-            deficit = (share - uniform) / (1.0 - uniform)
+        # SCALE-FREE (operator directive 2026-07-27). ``onset_g = share x
+        # total_tail / game_budget`` put the BOOK'S OWN tail dollars in the
+        # numerator against a fixed wall, so an unchanged candidate read as more
+        # concentrating purely because the book grew. ``share_alignment`` divides
+        # that size factor out: this game's tail SHARE against the tail
+        # Herfindahl. Both ratios, both invariant to scaling the whole book, and
+        # the dollar-weighted mean alignment over the book is exactly 0 — so
+        # this axis reallocates width, it cannot raise the average.
+        align_g = share_alignment(share, tail_hhi)
+        # A fill ALWAYS adds premium-at-risk to the games it touches, so the
+        # default reading is the alignment itself; the directional loop's sign
+        # only tells us whether the candidate leans WITH the game's net
+        # direction (concentrating, keep the sign) or AGAINST it (offsetting,
+        # flip it). A delta-neutral candidate on a brand-new game is the purest
+        # variance-adder and keeps the (negative) alignment => rebate.
+        frac = -align_g if contrib_cc < 0 else align_g
+        # ONE TICKET IS ONE LOSS EVENT (the AND-binding directive): the axis
+        # reads the candidate's BINDING game — the most concentrating one —
+        # instead of SUMMING over its games. Summing was the leg-wise smear
+        # that scored a 3-match ticket as three separate effects, and on this
+        # axis it also skewed the composed score (measured on the 41,056-event
+        # replay: summing put the P(book) axis at a −163cc mean, the binding
+        # read halves it) without ever changing which candidate is worse.
+        if not seen or frac > frac_binding:
+            frac_binding = frac
+            seen = True
+        if frac > 0.0:
+            adder = int(round(params.peak_widen_max_cc * frac))
+            rows.append((game, adder, frac, "pbook_concentrating"))
+        elif frac < 0.0:
+            # THE REBATE USES THE SAME WEIGHT AS THE WIDEN. One symmetric
+            # magnitude (``peak_widen_max_cc``) both ways, so a candidate that
+            # SPREADS the tail is exactly as much tighter as a stacker is wider
+            # — the standing invariant, and the reason this axis cannot bias the
+            # average width in either direction (its dollar-weighted mean is 0).
+            adder = int(round(params.peak_widen_max_cc * frac))
+            rows.append(
+                (
+                    game,
+                    adder,
+                    frac,
+                    "pbook_offsetting" if contrib_cc < 0 else "pbook_diversifying",
+                )
+            )
         else:
-            # n == 1 (2026-07-25 review HIGH): the sole tail game is fully
-            # overweight (+1); an ABSENT game is maximally underweight (−1)
-            # — the continuous limit of the n>1 formula as the second share
-            # → 0. The old 0.0 read zeroed the new-game rebate on exactly
-            # the purest one-way (7/23) shape.
-            deficit = 1.0 if share > 0.0 else -1.0
-        deficit = max(-1.0, min(1.0, deficit))
-        onset_g = min(1.0, share * profile.total_tail_cc / budget_cc)
-        if deficit > 0.0 and contrib_cc > 0:
-            factor = deficit * need * (onset_g**params.gamma)
-            adder = int(round(params.peak_widen_max_cc * factor))
-            rows.append((game, adder, factor, "pbook_concentrating"))
-        elif deficit > 0.0 and contrib_cc < 0:
-            # REWARD IS NOT ONSET-GATED (2026-07-26). ``onset`` measures how
-            # close this game's concentrated tail sits to the ENFORCED cap —
-            # the right gate for the PENALTY (never tax a small book) and the
-            # WRONG one for the REWARD: a fill that offsets concentration is
-            # not worth less because the book is small. Multiplying it in
-            # crushed live rebates to a MEDIAN OF 0.02c against a 1-4c markup
-            # ladder (997,581 skew events) — the steer recognised diverse flow
-            # 2.39M times and priced that recognition at nothing. deficit x
-            # need still scale it (both measured); the clamp still bounds it.
-            factor = deficit * need
-            adder = -int(round(params.peak_tighten_max_cc * factor))
-            rows.append((game, adder, factor, "pbook_offsetting"))
-        elif deficit > 0.0:
-            # Overweight game, delta-neutral contribution (2026-07-25
-            # review): named so the shadow record can measure how often the
-            # shape occurs before deciding whether it deserves a widen.
-            adder = 0
-            rows.append((game, 0, 0.0, "delta_neutral_on_overweight"))
-        elif deficit < 0.0:
-            # Same asymmetry fix as pbook_offsetting: the diversification
-            # reward drops the book-level onset gate (see above). A brand-new
-            # game is the purest variance-adder whether the book is $200 or
-            # $2,000 — its value is the deficit it fills, not the book's
-            # proximity to a cap.
-            factor = abs(deficit) * need
-            adder = -int(round(params.peak_tighten_max_cc * factor))
-            rows.append((game, adder, factor, "pbook_diversifying"))
-        else:
-            adder = 0
-            rows.append((game, 0, 0.0, "balanced"))
-        total += adder
-    clamped = int(
-        max(-params.peak_tighten_max_cc, min(params.peak_widen_max_cc, total))
-    )
-    return clamped, tuple(rows)
+            # Either the candidate is delta-neutral on this game, or the game's
+            # tail share sits exactly at the book's dollar-weighted average —
+            # in both cases the candidate changes NOTHING about concentration.
+            rows.append((game, 0, 0.0, "pbook_neutral"))
+    if not seen:
+        return 0, tuple(rows), None
+    score = max(-1.0, min(1.0, frac_binding))
+    clamped = int(round(params.peak_widen_max_cc * score))
+    return clamped, tuple(rows), score
 
 
 def _leg_axis_side(
     keys: Sequence[str],
     shares: Mapping[str, float],
-    total_cc: float,
-    budget_cc: float,
-    need: float,
     params: SkewParams,
-) -> tuple[int, list[tuple[str, int, float, str]]]:
+    hhi: float | None = None,
+) -> tuple[int, list[tuple[str, int, float, str]], float | None]:
     """One axis (family OR entity) of the leg-direction component.
 
-    The same measured-only math as ``_pbook_component``, keyed by leg
-    direction instead of game:
+    The same measured-only, SCALE-FREE math as ``_pbook_component``, keyed by
+    leg direction instead of game:
 
-      deficit_k = (loss_share_k − 1/n) / (1 − 1/n) ∈ [−1, 1]  (n = book keys
-                  on this axis; n == 1 ⇒ ±1, the continuous limit)
-      onset_k   = min(1, share_k × total / budget)  — the caps-derived "when":
-                  the dollars riding this leg direction vs the tightest
-                  ENFORCED loss budget (never a hand constant)
-      need      = 1 − p_book (passed in; a healthy book barely steers)
+      align_k = share_alignment(loss_share_k, axis Herfindahl) ∈ [−1, +1]
+
+    ``share_k`` is this leg direction's fraction of the book's committed
+    premium-at-risk on this axis and the Herfindahl is that axis's own
+    dollar-weighted average share, so BOTH are pure ratios: scaling the whole
+    book by any factor leaves every reading identical (operator directive
+    2026-07-27 — the book merely being large must not widen anything). The old
+    ``onset_k = share_k x total_cc / budget_cc`` put the book's own dollars in
+    the numerator against a fixed wall, which is exactly the size term that had
+    to go; ``need = 1 - p_book`` is gone for the same reason.
 
     A candidate leg key can only ADD to its own direction (sell-only: our
-    loss rides the leg's stated side), so — unlike the game axis — there is
-    no contribution-sign split: overweight key ⇒ WIDEN (convex in onset,
-    the house asymmetry), underweight/absent key ⇒ REBATE (linear, keyed on
-    the book-level onset — the diversifying direction has ~no own dollars).
-    The OPPOSITE direction of a loaded key is a DIFFERENT key (…:no vs
-    …:yes), lands underweight/absent, and earns the rebate — that is exactly
-    "reward the other side of the K-ladder"."""
+    loss rides the leg's stated side), so — unlike the game axis — there is no
+    contribution-sign split: an ABOVE-average key ⇒ WIDEN, a BELOW-average or
+    ABSENT key ⇒ REBATE, at ONE symmetric weight. The OPPOSITE direction of a
+    loaded key is a DIFFERENT key (…:no vs …:yes), lands below average (a brand
+    new key reads exactly −Herfindahl, the biggest rebate the book's own
+    concentration can justify), and earns the rebate — that is exactly "reward
+    the other side of the K-ladder".
+
+    ONE TICKET IS ONE LOSS EVENT (the AND-binding directive), so the axis reads
+    the candidate's FULLEST key rather than summing over its legs — summing was
+    the leg-wise smear that scored a 3-match ticket as three separate effects.
+    """
     if not shares:
-        return 0, [("*", 0, 0.0, "no_book")]
-    if budget_cc <= 0.0 or total_cc <= 0.0:
-        return 0, [("*", 0, 0.0, "no_budget")]
-    n = len(shares)
-    uniform = 1.0 / n
-    onset_book = min(1.0, max(shares.values()) * total_cc / budget_cc)
-    total = 0.0
+        return 0, [("*", 0, 0.0, "no_book")], None
+    if hhi is None:
+        hhi = math.fsum(s * s for s in shares.values() if s > 0.0)
+    if hhi <= 0.0:
+        return 0, [("*", 0, 0.0, "no_book")], None
     rows: list[tuple[str, int, float, str]] = []
+    binding = 0.0
+    seen = False
     for key in keys:
-        share = shares.get(key, 0.0)
-        if n > 1:
-            deficit = (share - uniform) / (1.0 - uniform)
-        else:
-            deficit = 1.0 if share > 0.0 else -1.0
-        deficit = max(-1.0, min(1.0, deficit))
-        if deficit > 0.0:
-            onset_k = min(1.0, share * total_cc / budget_cc)
-            factor = deficit * need * (onset_k**params.gamma)
-            adder = int(round(params.peak_widen_max_cc * factor))
-            rows.append((key, adder, factor, "leg_concentrating"))
-        elif deficit < 0.0:
-            # REWARD IS NOT ONSET-GATED (2026-07-26) — see _pbook_component.
-            # The missing direction (the other side of a loaded ladder, a new
-            # family/entity) is worth its deficit regardless of how full the
-            # book is; onset stays on the WIDEN branch only.
-            factor = abs(deficit) * need
-            adder = -int(round(params.peak_tighten_max_cc * factor))
-            rows.append((key, adder, factor, "leg_diversifying"))
-        else:
-            adder = 0
-            rows.append((key, 0, 0.0, "balanced"))
-        total += adder
-    clamped = int(
-        max(-params.peak_tighten_max_cc, min(params.peak_widen_max_cc, total))
-    )
-    return clamped, rows
+        align_k = share_alignment(shares.get(key, 0.0), hhi)
+        if not seen or align_k > binding:
+            binding = align_k
+            seen = True
+        rows.append(
+            (
+                key,
+                int(round(params.peak_widen_max_cc * align_k)),
+                align_k,
+                "leg_concentrating" if align_k > 0.0 else "leg_diversifying",
+            )
+        )
+    if not seen:
+        return 0, [("*", 0, 0.0, "no_keys")], None
+    score = max(-1.0, min(1.0, binding))
+    return int(round(params.peak_widen_max_cc * score)), rows, score
 
 
 def _leg_axis_component(
     candidate: OpenPosition,
     params: SkewParams,
     profile: LegAxisProfile | None,
-) -> tuple[int, int, tuple[tuple[str, int, float, str], ...]]:
+) -> tuple[
+    int, int, tuple[tuple[str, int, float, str], ...], float | None, float | None
+]:
     """LEG-DIRECTION AXIS component (2026-07-25): ``(family_cc, entity_cc,
-    rows)`` — the candidate priced against the committed book's (family ×
-    side) and (family:entity × side) premium concentration.
+    rows, family_score, entity_score)`` — the candidate priced against the
+    committed book's (family × side) and (family:entity × side) premium
+    concentration.
 
     The profile is built at QUOTE TIME from the same exposure snapshot the
-    limits read, so there is no staleness window; ``p_book`` is None when the
-    cached MC profile was generation-stale — the component is then NEUTRAL
-    (UNKNOWN never widens). FAIL-SAFE: disabled / no profile / no p_book /
-    empty book / no budget ⇒ zeros. Pricing-only: never feeds ``per_game``,
-    so widen-vs-decline cannot decline on it."""
+    limits read, so there is no staleness window. FAIL-SAFE: disabled / no
+    profile / empty book ⇒ zeros. Pricing-only: never feeds ``per_game``,
+    so widen-vs-decline cannot decline on it.
+
+    ``p_book`` NO LONGER GATES OR SCALES THIS COMPONENT (operator directive
+    2026-07-27). It entered as ``need = 1 - p_book``, a book-level,
+    candidate-blind multiplier on every row — and p_book drifts down as the
+    book grows, so it silently raised every component as we filled: a book-size
+    term, which the operator's rule forbids. The concentration SHAPE is now read
+    directly off measured dollar shares, which is what p_book was standing in
+    for in the first place."""
     if not params.leg_axis_enabled or profile is None:
-        return 0, 0, ()
-    if profile.p_book is None:
-        return 0, 0, (("*", 0, 0.0, "no_p_book"),)
-    need = max(0.0, min(1.0, 1.0 - profile.p_book))
+        return 0, 0, (), None, None
     fam_keys: list[str] = []
     ent_keys: list[str] = []
     seen: set[str] = set()
@@ -915,32 +1250,27 @@ def _leg_axis_component(
         if ek not in seen:
             seen.add(ek)
             ent_keys.append(ek)
-    family_cc, fam_rows = _leg_axis_side(
-        fam_keys,
-        profile.shares_by_family,
-        profile.total_family_cc,
-        profile.budget_cc,
-        need,
-        params,
+    # NO WALL IN THE DENOMINATOR ANY MORE. Each axis is read against ITS OWN
+    # dollar-share distribution, which is already normalised — so the two axes
+    # need no budget at all, and the ``family_wall_cc = game_wall_cc``
+    # mis-assignment (a family key aggregates the whole book across games, a
+    # game wall does not) can no longer distort either reading. The enforced
+    # walls remain exactly where they belong: the REFUSAL layer in risk/limits.
+    family_cc, fam_rows, fam_score = _leg_axis_side(
+        fam_keys, profile.shares_by_family, params, profile.hhi_family
     )
-    entity_cc, ent_rows = _leg_axis_side(
-        ent_keys,
-        profile.shares_by_entity,
-        profile.total_entity_cc,
-        profile.budget_cc,
-        need,
-        params,
+    entity_cc, ent_rows, ent_score = _leg_axis_side(
+        ent_keys, profile.shares_by_entity, params, profile.hhi_entity
     )
-    return family_cc, entity_cc, tuple(fam_rows + ent_rows)
+    return family_cc, entity_cc, tuple(fam_rows + ent_rows), fam_score, ent_score
 
 
 def _peak_component(
     candidate: OpenPosition,
     params: SkewParams,
-    limits: SkewLimits,
     profile: PeakProfile | None,
     book_generation: int | None,
-) -> tuple[int, int, int, tuple[tuple[str, int, float, str], ...]]:
+) -> tuple[int, int, int, tuple[tuple[str, int, float, str], ...], float | None]:
     """The peak-concentration classifier component (see compute_inventory_skew).
 
     Returns ``(widen_cc, tighten_cc, clamped_component_cc, per_game_debug)``
@@ -960,25 +1290,37 @@ def _peak_component(
     FAIL-SAFE: every
     doubt branch returns a hard 0 (neutral), never raises, never refuses."""
     if not params.peak_enabled or profile is None:
-        return 0, 0, 0, ()
+        return 0, 0, 0, (), None
     if book_generation is None or profile.input_generation != book_generation:
         # Stale (or unverifiable) profile: the committed book moved since the
         # peaks were cached — NEUTRAL until the off-hot-path rebuild lands.
-        return 0, 0, 0, (("*", 0, 0.0, "stale_profile"),)
+        return 0, 0, 0, (("*", 0, 0.0, "stale_profile"),), None
     if candidate.our_side is not Side.NO:
         # Sell-only seller: the hit-loss framing below is long-NO premium-at-
         # risk. Anything else is outside the certified semantics -> neutral.
-        return 0, 0, 0, (("*", 0, 0.0, "non_no_candidate"),)
-    budget_cc = limits.max_event_worst_case_loss_dollars * 10_000.0
-    if budget_cc <= 0.0:
-        return 0, 0, 0, (("*", 0, 0.0, "no_budget"),)
-    # MAGNITUDE RECALIBRATION (operator directive 2026-07-19 evening): the old
-    # candidate-size factor min(1, candidate.max_loss_cc / budget) is GONE — a
-    # quote's per-contract price reflects WHERE its risk lands (severity x
-    # book-peak ratio), never the clip size. Size is already governed exactly
-    # by the caps / last-look / velocity brake; multiplying the ~0.015 size
-    # factor of a realistic clip against peak_ratio**gamma zeroed the steer on
-    # the live tape (a $15 rung on a ~$300 cluster priced at ~0.01c).
+        return 0, 0, 0, (("*", 0, 0.0, "non_no_candidate"),), None
+    # THE STATIC $1,000 DENOMINATOR IS GONE (operator directive 2026-07-27).
+    # ``peak_ratio`` used to be ``game top_loss / (max_event_worst_case_loss_
+    # dollars x 10_000)`` — a HAND-SET dollar in the denominator of a live
+    # pricing term (North Star violation) with the BOOK'S OWN committed loss in
+    # the numerator, so every candidate on every game paid more widen purely
+    # because the book had grown (measured: peak_cc mean 17.07 -> 21.93cc, 31%
+    # of the whole drift, while a brand-new game ADDED widen for everyone).
+    # It is replaced by the SCALE-FREE peak SHARE: this game's committed peak
+    # loss as a fraction of the book's total peak mass, read against the peak
+    # Herfindahl (``share_alignment``). Shares are ratios, so scaling the whole
+    # book leaves every reading identical; a game only reads "concentrating"
+    # when it carries MORE than the dollar-weighted average share, which is
+    # precisely "this candidate concentrates us" rather than "the book is big".
+    peak_dollars = {
+        g: float(max(0, gp.top_loss_cc)) for g, gp in profile.by_game.items()
+    }
+    total_peak_cc = math.fsum(peak_dollars.values())
+    if total_peak_cc <= 0.0:
+        # No committed peak LOSS anywhere: nothing to concentrate into and
+        # nothing to certify a miss against (tiny/flat-book branch).
+        return 0, 0, 0, (("*", 0, 0.0, "peak_not_a_loss"),), None
+    peak_shares = {g: d / total_peak_cc for g, d in peak_dollars.items()}
 
     legs_by_game: dict[str, list[LegRef]] = {}
     for leg in candidate.legs:
@@ -986,7 +1328,7 @@ def _peak_component(
             continue
         legs_by_game.setdefault(_game_key(leg.event_ticker), []).append(leg)
     if not legs_by_game:
-        return 0, 0, 0, ()
+        return 0, 0, 0, (), None
 
     # Local import: keeps this module import-light for every consumer that
     # never wires a profile (and avoids a hard risk->sim dependency at import).
@@ -994,18 +1336,19 @@ def _peak_component(
 
     widen = 0.0
     tighten = 0.0
+    frac_total = 0.0
     rows: list[tuple[str, int, float, str]] = []
     for game, legs in legs_by_game.items():
         gp = profile.by_game.get(game)
         if gp is None:
             rows.append((game, 0, 0.0, "no_peak_profile"))
             continue
-        peak_ratio = min(1.0, max(0, gp.top_loss_cc) / budget_cc)
-        if peak_ratio <= 0.0:
+        if peak_dollars.get(game, 0.0) <= 0.0:
             # The committed book's worst state for this game is not even a
             # loss — nothing to protect, nothing to rebate (tiny-book branch).
             rows.append((game, 0, 0.0, "peak_not_a_loss"))
             continue
+        peak_share = peak_shares.get(game, 0.0)
         containment = evaluate_peak_containment(profile, game, legs)
         if containment is None:
             rows.append((game, 0, 0.0, "unknown"))
@@ -1022,14 +1365,34 @@ def _peak_component(
         # stay the honest non-negative decomposition) and the per-game row
         # carries the NET adder with reason "peak_partial_offset".
         severity = containment.hit_severity
+        # SIGN AND STRENGTH COME FROM THE CANDIDATE, WEIGHT FROM THE SHAPE.
+        # ``severity`` / ``provably_misses_top`` are the candidate's OWN
+        # marginal effect on this game's peak; ``peak_share`` is this game's
+        # fraction of the BOOK'S peak mass — a pure ratio, so the identical
+        # candidate against a book scaled by any factor pays the identical
+        # amount, and a book that grows by adding OTHER games makes this game a
+        # SMALLER share and therefore steers it LESS. ONE weight
+        # (``peak_widen_max_cc``) governs both directions, so the old 4:1
+        # widen/rebate asymmetry cannot re-enter here.
         term = 0.0
-        if severity > 0.0:
-            term = params.peak_widen_max_cc * severity * (peak_ratio**params.gamma)
-            widen += term
         rebate = 0.0
+        frac = 0.0
+        if severity > 0.0:
+            frac = severity * (peak_share**params.gamma)
+            term = params.peak_widen_max_cc * frac
+            widen += term
         if containment.provably_misses_top:
-            rebate = params.peak_tighten_max_cc * peak_ratio * (1.0 - severity)
+            # The certified-miss rebate keeps its OWN pre-existing weight: this
+            # repair is about the SIZE contamination in the magnitude, not about
+            # re-rating how much a certified top-miss is worth.
+            miss = peak_share * (1.0 - severity)
+            rebate = params.peak_tighten_max_cc * miss
             tighten += rebate
+        frac_total += frac - (
+            rebate / params.peak_widen_max_cc
+            if params.peak_widen_max_cc > 0
+            else 0.0
+        )
         if severity > 0.0 and containment.provably_misses_top:
             rows.append(
                 (
@@ -1043,7 +1406,12 @@ def _peak_component(
             rows.append((game, int(round(term)), round(severity, 6), "peak_hit"))
         elif containment.provably_misses_top:
             rows.append(
-                (game, -int(round(rebate)), round(peak_ratio, 6), "peak_miss_rebate")
+                (
+                    game,
+                    -int(round(rebate)),
+                    round(peak_share, 6),
+                    "peak_miss_rebate",
+                )
             )
         else:
             # Hits only non-loss peak rows / no certificate: neither stacking
@@ -1055,15 +1423,28 @@ def _peak_component(
         -params.peak_tighten_max_cc,
         min(params.peak_widen_max_cc, widen_cc - tighten_cc),
     )
-    return widen_cc, tighten_cc, component, tuple(rows)
+    # The normalised reading the composed steer consumes: the component against
+    # its own widen weight, so every axis enters the composition on one scale.
+    score = max(-1.0, min(1.0, frac_total))
+    return widen_cc, tighten_cc, component, tuple(rows), score
+
+
+_GAME_KEY_FN: Callable[[str], str] | None = None
 
 
 def _game_key(event_ticker: str) -> str:
-    # Local import to keep the module dependency-light and mirror the exact key
-    # the exposure book aggregates on (pricing.grouping.game_key).
-    from combomaker.pricing.grouping import game_key
+    # Lazy import to keep the module dependency-light, MEMOISED into a module
+    # global (2026-07-27 throughput): the Lever-#5 bucket calls this once per
+    # leg per quote, and re-running the import machinery each time cost more
+    # than the whole steer. Same key the exposure book aggregates on
+    # (pricing.grouping.game_key) — never a reimplementation.
+    global _GAME_KEY_FN
+    fn = _GAME_KEY_FN
+    if fn is None:
+        from combomaker.pricing.grouping import game_key
 
-    return game_key(event_ticker)
+        fn = _GAME_KEY_FN = game_key
+    return fn(event_ticker)
 
 
 # ---------------------------------------------------------------------------

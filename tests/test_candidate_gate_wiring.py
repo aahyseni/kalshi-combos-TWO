@@ -98,11 +98,15 @@ class StubBookRiskPool:
         self.verdict = verdict
         self.raise_exc = raise_exc
         self.calls: list[CandidateBookRiskInputs] = []
+        # The REMAINING confirm window each call was bounded by (2026-07-27 B2:
+        # the gate hands the MC a measured deadline instead of predicting its cost).
+        self.deadlines: list[float] = []
 
     async def run_candidate(
-        self, inputs: CandidateBookRiskInputs
+        self, inputs: CandidateBookRiskInputs, *, deadline_s: float
     ) -> CandidateBookRisk:
         self.calls.append(inputs)
+        self.deadlines.append(deadline_s)
         if self.raise_exc:
             raise RuntimeError("candidate pool boom")
         assert self.verdict is not None

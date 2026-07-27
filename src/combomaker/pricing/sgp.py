@@ -15,6 +15,7 @@ joint can be re-priced across the band and the spread priced into width.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -69,8 +70,16 @@ class SgpCorrelation:
     notes: tuple[str, ...]
 
 
-def _clamp(rho: float) -> float:
-    return max(-0.95, min(0.95, rho))
+# Ordinary priors are PRIORS — a table value or a blended curve — so they are
+# held off the comonotone corners where a copula matrix conditions badly and a
+# single wrong sign becomes an arb. A pair whose coupling is an ARITHMETIC FACT
+# (see the nested-ladder block below) carries its own, tighter-to-the-corner cap
+# via ``_PairPrior.cap``; nothing else may.
+_RHO_CLAMP = 0.95
+
+
+def _clamp(rho: float, cap: float = _RHO_CLAMP) -> float:
+    return max(-cap, min(cap, rho))
 
 
 # Orientation blend zone for moneyline-involving pairs: below DOG_MAX the ML
@@ -91,6 +100,10 @@ class _PairPrior:
     rho: float
     band: float
     source: str
+    # Magnitude cap applied when this prior is written into the matrices. The
+    # default is the ordinary prior clamp; only a DERIVED-EXACT coupling (the
+    # nested-ladder resolver) may raise it, and only to the value it derived.
+    cap: float = _RHO_CLAMP
 
 
 def _lookup_pair(key: str, sport: str, params: SgpParams) -> _PairPrior | None:
@@ -520,6 +533,199 @@ _RUNG_KEYED_TYPES = _RUNG_KEYED_PROP_TYPES | {LegType.SPREAD}
 _SPREAD_RUNG_SUFFIX = re.compile(r"^[A-Za-z]+(\d+)$")
 
 
+# --- NESTED SAME-LADDER RUNGS (2026-07-27) ---------------------------------------
+# A LADDER is ONE counting variable, of ONE entity, in ONE game, listed at several
+# thresholds. Every MLB player-prop rung ticker settles YES iff the stat is >= N
+# (floor_strike N-0.5 — legtypes.LegType docstrings + the live metadata probes),
+# so for H > L the H-rung is a strict SUBSET of the L-rung: K>=5 IMPLIES K>=4.
+# The two rungs are therefore COMONOTONE — both are monotone functions of the SAME
+# underlying count — and their joint is the Frechet upper bound EXACTLY:
+#
+#     P(rung_H and rung_L) = min(p_H, p_L) = P(the higher rung)
+#
+# This is ARITHMETIC, not a measurable correlation: it needs no calibration, no
+# table entry, and no measurement pass. Before this resolver existed, a same-
+# pitcher K-ladder pair fell through every typed branch to the plain
+# 'player_ks|player_ks' entry (+0.0400) — the value MEASURED FOR TWO OPPOSING
+# STARTERS. Our single largest concentration was priced, and risk-modelled, as if
+# it were two different pitchers.
+#
+# WHICH NUMBER GOES IN THE MATRIX (measured 2026-07-27, do not "simplify" this).
+# These matrices carry GAUSSIAN-COPULA (LATENT) correlations, not Pearson
+# correlations of the indicators: pricing/copula.gaussian_copula_joint_prob and
+# sim/engine.sample_leg_values both THRESHOLD latent normals, and
+# conditionals_mlb.implied_rho solves for this same latent parameter to hit a
+# target joint. A Gaussian copula attains the Frechet upper bound only as
+# rho -> 1, so the exact latent value of a nested pair is COMONOTONE. The closed
+# form for the pair's implied PEARSON correlation,
+#
+#     rho_pearson = sqrt( p_sub (1 - p_sup) / ( p_sup (1 - p_sub) ) )
+#
+# (``nested_pearson_rho``) is the correct description of the coupling and is
+# recorded in the pair NOTE, but it is NOT the parameter this matrix takes:
+# writing it into the latent slot at the live marginals (0.9018, 0.8405) still
+# left the joint 3.17 CENTS below the exact nested joint, whereas the comonotone
+# value reproduced it to integrator precision (0.84050 vs 0.84050). So the latent
+# slot gets comonotone; the Pearson number is reported, never priced.
+#
+# WITHHELD FAMILIES (the ``relationships._NESTED_LADDER_FAMILIES`` precedent —
+# only probed conventions get an entry). SPREAD rungs (…-COL2 ⊂ …-COL1) are
+# nested too but are TEAM-suffix-shaped and already carry wired ':rN' pair
+# entries; soccer PLAYER_GOAL rungs are plausibly nested but their multi-goal
+# settlement convention has not been probed here. Both stay on their existing
+# treatment until probed — never guess a nesting.
+_NESTED_LADDER_TYPES = frozenset({
+    LegType.PLAYER_HR,
+    LegType.PLAYER_HIT,
+    LegType.PLAYER_KS,
+    LegType.PLAYER_TB,
+    LegType.PLAYER_HRR,
+    LegType.PLAYER_OUTS,
+    LegType.PLAYER_RBI,
+    LegType.PLAYER_SB,
+})
+
+# The comonotone latent rho, held a hair inside 1.0 so the block stays
+# Cholesky-factorable and PSD-repairable (sim/book_model._clamp_open_unit uses the
+# identical inset). The residual joint error at 1-1e-6 is below integrator noise.
+_NESTED_LATENT_RHO = 1.0 - 1e-6
+
+
+def nested_pearson_rho(p_a: float, p_b: float) -> float | None:
+    """Pearson correlation of two NESTED binary indicators at these marginals.
+
+    For A subset of B the exact indicator correlation is
+    ``sqrt( p_sub (1 - p_sup) / ( p_sup (1 - p_sub) ) )``, derived from
+    ``Cov = P(A) - P(A)P(B) = p_sub (1 - p_sup)``. Arguments are taken in EITHER
+    order and sorted, so the subset is always the smaller marginal — which also
+    makes a CROSSED book (a higher rung quoted above its lower rung, i.e.
+    marginals that no nesting can produce) degrade to the comonotone value for
+    the marginals as given rather than to a >1 nonsense number.
+
+    Degenerate marginals return None (fail-closed): at p in {0, 1} the indicator
+    has zero variance, so its correlation is undefined (0/0) and the caller must
+    fall back to its ordinary treatment. ``p_a == p_b`` returns exactly 1.0.
+
+    NOTE this is the PEARSON number, for reporting and for tests. The value the
+    copula matrices take is ``_NESTED_LATENT_RHO`` — see the block comment above.
+    """
+    if not (0.0 < p_a < 1.0 and 0.0 < p_b < 1.0):
+        return None
+    lo, hi = (p_a, p_b) if p_a <= p_b else (p_b, p_a)
+    return math.sqrt(lo * (1.0 - hi) / (hi * (1.0 - lo)))
+
+
+def _nested_ladder_shape(ticker: str) -> tuple[str, str, str, int] | None:
+    """``(series, raw game segment, entity, rung)`` from a rung-shaped ticker.
+
+    STRUCTURAL, never a ticker-string heuristic: exactly ``SERIES-GAME-ENTITY-LINE``
+    with a digits-only line (the identical shape guard
+    ``relationships._mlb_prop_entity`` and ``_mlb_same_player_conditional_prior``
+    use), and the RAW game segment is returned undecoded so a doubleheader
+    ``…G1`` x ``…G2`` pair can never match. None on any doubt.
+
+    Pricing aliases are deliberately NOT resolved here, matching the sibling MLB
+    parsers (``_mlb_team_blob``, ``relationships._mlb_prop_entity``): an alias may
+    only rewrite an UNKNOWN-classifying ticker, so an aliased leg's RAW shape
+    simply fails to match a ladder and the pair keeps its ordinary treatment —
+    the fail-closed direction."""
+    parts = ticker.upper().split("-")
+    if len(parts) != 4:
+        return None
+    series, game, entity, line = parts
+    if not series or not game or not entity or not line.isdigit():
+        return None
+    return series, game, entity, int(line)
+
+
+def same_nested_ladder(ticker_a: str, ticker_b: str) -> bool:
+    """TYPE-FREE structural test: do these two tickers name DIFFERENT rungs of ONE
+    ladder (same series, same raw game segment, same entity)?
+
+    Pure string work with no LegType classification and no marginal lookup, so a
+    caller on a hot O(n^2) pair loop can reject the overwhelming majority of pairs
+    before paying for either. The family REGISTRY gate (is this family a VERIFIED
+    'N or more' ladder?) lives in :func:`nested_ladder_rho`, which every pricing
+    decision goes through — this predicate alone must never be treated as
+    permission to price a pair as nested."""
+    id_a = _nested_ladder_shape(ticker_a)
+    if id_a is None:
+        return False
+    id_b = _nested_ladder_shape(ticker_b)
+    if id_b is None:
+        return False
+    return id_a[:3] == id_b[:3] and id_a[3] != id_b[3]
+
+
+def nested_ladder_rho(
+    type_a: LegType,
+    type_b: LegType,
+    ticker_a: str,
+    ticker_b: str,
+    p_a: float,
+    p_b: float,
+) -> tuple[float, float] | None:
+    """``(latent copula rho, implied Pearson rho)`` for a SAME-LADDER rung pair.
+
+    Returns None — leaving the pair on its existing treatment — unless ALL of:
+    the two legs are the SAME LegType and that type is a REGISTERED ladder family
+    (so different stat types on one player, e.g. ks x outs, are untouched and keep
+    their measured copula rho, and an unprobed family is never assumed nested);
+    the same SERIES; the same RAW game segment; the same ENTITY segment (so two
+    DIFFERENT pitchers keep the measured opposing-starter prior); DIFFERENT rungs
+    (the same rung twice is not a pair); and both marginals strictly inside
+    (0, 1). Nothing here is fitted: the value is the comonotone coupling that
+    nesting forces."""
+    if type_a is not type_b or type_a not in _NESTED_LADDER_TYPES:
+        return None
+    id_a = _nested_ladder_shape(ticker_a)
+    id_b = _nested_ladder_shape(ticker_b)
+    if id_a is None or id_b is None:
+        return None
+    if id_a[:3] != id_b[:3]:
+        return None  # different series / game / entity: not one ladder
+    if id_a[3] == id_b[3]:
+        return None  # the same rung twice — no nesting to exploit
+    pearson = nested_pearson_rho(p_a, p_b)
+    if pearson is None:
+        return None  # degenerate marginal: undefined correlation, fail-closed
+    return _NESTED_LATENT_RHO, pearson
+
+
+def _nested_ladder_prior(
+    type_a: LegType,
+    type_b: LegType,
+    ticker_a: str,
+    ticker_b: str,
+    p_a: float,
+    p_b: float,
+) -> _PairPrior | None:
+    """``nested_ladder_rho`` as a ``_PairPrior``. Band ZERO: the coupling is an
+    arithmetic identity at the given marginals, so there is no prior uncertainty
+    to widen on — the low/point/high matrices agree, exactly as they do for the
+    containment shapes the classifier prices with no rho at all."""
+    resolved = nested_ladder_rho(type_a, type_b, ticker_a, ticker_b, p_a, p_b)
+    if resolved is None:
+        return None
+    latent, pearson = resolved
+    id_a = _nested_ladder_shape(ticker_a)
+    id_b = _nested_ladder_shape(ticker_b)
+    if id_a is None or id_b is None:
+        # Unreachable — ``nested_ladder_rho`` parsed both to get here. Kept as a
+        # fail-closed branch rather than an assert so a ``-O`` run degrades to the
+        # ordinary treatment instead of raising inside the pricing loop.
+        return None
+    return _PairPrior(
+        rho=latent,
+        band=0.0,
+        source=(
+            f"nested ladder {type_a} {id_a[2]} r{id_a[3]}xr{id_b[3]} "
+            f"comonotone (implied pearson {pearson:+.3f})"
+        ),
+        cap=latent,
+    )
+
+
 def _leg_rung(leg_type: LegType, ticker: str) -> int | None:
     """The Kalshi line integer of a RUNG-KEYED leg (the ':rN' grammar), or
     None. Batter props: 4-segment ticker with an all-digit last segment
@@ -868,13 +1074,31 @@ def build_sgp_correlation(
             key = pair_key(types[i], types[j])
             sport = str(classify_sport(legs[i].market_ticker))
             prior: _PairPrior | None = None
+            cap = _RHO_CLAMP
             if types[i] is LegType.UNKNOWN or types[j] is LegType.UNKNOWN:
                 rho, band = params.default_rho, fallback_band
                 untyped += 1
                 notes.append(f"untyped pair {key}: flat prior {rho}")
             else:
                 pair_types = {types[i], types[j]}
-                if pair_types == {LegType.FIRST_HALF_MONEYLINE, LegType.MONEYLINE}:
+                # NESTED SAME-LADDER RUNGS FIRST (2026-07-27). Two rungs of ONE
+                # entity's ONE counting variable are COMONOTONE by arithmetic
+                # (over-H ⊂ over-L), so their coupling is DERIVED from the two
+                # marginals the pricer already holds — it can never be a table
+                # lookup and must never fall through to a measured
+                # DIFFERENT-entity prior (a same-pitcher K-ladder was pricing at
+                # the +0.04 measured for two OPPOSING starters). Cheap gate: the
+                # resolver's first test is `type_a is type_b`, false for almost
+                # every pair, so the hot path pays one identity compare.
+                if marginals is not None:
+                    prior = _nested_ladder_prior(
+                        types[i], types[j],
+                        legs[i].market_ticker, legs[j].market_ticker,
+                        marginals[i], marginals[j],
+                    )
+                if prior is not None:
+                    pass  # exact nesting wins over every typed/table branch
+                elif pair_types == {LegType.FIRST_HALF_MONEYLINE, LegType.MONEYLINE}:
                     # 1H-winner × FT-winner: sign flips on same-vs-opposite
                     # team; draw shapes resolve :tiexwin/:teamxtie/:tiextie
                     # (suffix order = pair_key leg order, 1H leg first).
@@ -1234,7 +1458,7 @@ def build_sgp_correlation(
                     )
                     prior = _lookup_pair_runged(key, sport, params, rung)
                 if prior is not None:
-                    rho, band = prior.rho, prior.band
+                    rho, band, cap = prior.rho, prior.band, prior.cap
                     typed += 1
                     if prior.source != key:  # plain global hits stay silent
                         notes.append(f"pair {prior.source}={rho:+.3f}")
@@ -1242,9 +1466,9 @@ def build_sgp_correlation(
                     rho, band = params.default_rho, fallback_band
                     untyped += 1
                     notes.append(f"no prior for pair {key}: flat prior {rho}")
-            point[i, j] = point[j, i] = _clamp(rho)
-            low[i, j] = low[j, i] = _clamp(rho - band)
-            high[i, j] = high[j, i] = _clamp(rho + band)
+            point[i, j] = point[j, i] = _clamp(rho, cap)
+            low[i, j] = low[j, i] = _clamp(rho - band, cap)
+            high[i, j] = high[j, i] = _clamp(rho + band, cap)
 
     def repaired(m: NDArray[np.float64]) -> NDArray[np.float64]:
         return m if is_psd(m) else nearest_psd(m)

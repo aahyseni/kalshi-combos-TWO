@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 from combomaker.core.conventions import Side
 from combomaker.core.money import CentiCents
@@ -109,21 +110,37 @@ class ScriptedPool:
         *,
         on_call: Callable[[int, CandidateBookRiskInputs], Awaitable[None]] | None = None,
         raise_exc: bool = False,
+        mc_ms: float = 0.0,
+        clock: Any = None,
     ) -> None:
         self._verdicts = verdicts
         self._on_call = on_call
         self.raise_exc = raise_exc
         self.calls: list[CandidateBookRiskInputs] = []
+        # The REMAINING confirm window each call was bounded by (2026-07-27 B2).
+        self.deadlines: list[float] = []
+        # Optional MC WALL COST, in ms, burnt on the injected fake clock. Mirrors
+        # ``BookRiskPool.run_candidate``'s real ``asyncio.wait_for`` semantics: a
+        # run that exceeds its deadline raises TimeoutError and the caller
+        # resolves it as LATENCY, never as a risk verdict.
+        self._mc_ms = mc_ms
+        self._clock = clock
 
     async def run_candidate(
-        self, inputs: CandidateBookRiskInputs
+        self, inputs: CandidateBookRiskInputs, *, deadline_s: float
     ) -> CandidateBookRisk:
         idx = len(self.calls)
         self.calls.append(inputs)
+        self.deadlines.append(deadline_s)
         if self._on_call is not None:
             await self._on_call(idx, inputs)
         if self.raise_exc:
             raise RuntimeError("candidate pool boom")
+        if self._mc_ms:
+            if self._clock is not None:
+                self._clock.advance(min(self._mc_ms, deadline_s * 1000.0) / 1000.0)
+            if self._mc_ms / 1000.0 > deadline_s:
+                raise TimeoutError("candidate MC exceeded its deadline")
         v = self._verdicts[min(idx, len(self._verdicts) - 1)]
         return v(inputs) if callable(v) else v
 
@@ -479,10 +496,14 @@ async def test_provisional_released_on_mc_error(tmp_path: Path) -> None:
     ) == 1
 
 
-async def test_provisional_released_on_unstable_book_deadline(tmp_path: Path) -> None:
-    # The book moves under EVERY MC attempt (a reservation is added on each call), so
-    # no verdict ever prices the live book: the retry budget is exhausted and the gate
-    # FAILS CLOSED (declines) — and the provisional reservation is released.
+async def test_unstable_book_resolves_on_the_deterministic_caps(tmp_path: Path) -> None:
+    # 2026-07-27 CONFIRM-WINDOW REBUILD. The book moves under EVERY MC attempt (a
+    # reservation is added on each call), so no verdict ever prices the live book
+    # and the retry budget is exhausted. That is a STABILITY/LATENCY outcome, not
+    # a risk verdict — the MC never got to judge anything — so it now resolves on
+    # the ENFORCED DETERMINISTIC caps re-checked against the book as it stands.
+    # Here they ADMIT, so the already-won auction CONFIRMS instead of being
+    # thrown away, and the provisional reservation is COMMITTED (not released).
     n = 0
 
     async def on_call(idx: int, inputs: CandidateBookRiskInputs) -> None:
@@ -501,30 +522,37 @@ async def test_provisional_released_on_unstable_book_deadline(tmp_path: Path) ->
     lifecycle, sender, exposure, reservation = await _make(tmp_path, pool=pool)
     await lifecycle.handle_rfq(rfq())
     await lifecycle.on_quote_accepted(accepted_msg("q1", "yes"))
-    assert sender.confirmed == []
-    # The candidate's provisional reservation is gone (released); only the churn
-    # reservations added by the hook remain — the fill's headroom did not linger.
-    assert not reservation.is_outstanding("fill:q1")
-    assert lifecycle._metrics.counter(  # noqa: SLF001
-        f"confirm.declined.{ReasonCode.DECLINE_CANDIDATE_RISK}"
-    ) == 1
+    assert sender.confirmed == ["q1"]
     assert lifecycle._metrics.counter(  # noqa: SLF001
         "candidate_gate.retries_exhausted"
     ) == 1
+    assert lifecycle._metrics.counter(  # noqa: SLF001
+        "candidate_gate.timeout_fallback_confirm"
+    ) == 1
+    # A latency/stability outcome is NEVER recorded as a risk decline.
+    assert lifecycle._metrics.counter(  # noqa: SLF001
+        f"confirm.declined.{ReasonCode.DECLINE_CANDIDATE_RISK}"
+    ) == 0
 
 
-async def test_gate_fails_closed_when_confirm_deadline_would_be_exceeded(
+async def test_an_overrunning_mc_is_cut_off_by_the_window_not_by_a_prediction(
     tmp_path: Path,
 ) -> None:
-    # The audit LIVE CANDIDATE-GATE LATENCY requirement: risk computation must NOT
-    # silently consume the whole confirm window. The first MC "takes" nearly the whole
-    # deadline (the hook advances the clock) AND moves the book (forcing a retry). On
-    # the retry the deadline guard sees that another MC's worth of time no longer fits
-    # in the remaining window, so it FAILS CLOSED (declines) rather than starting an MC
-    # that would overrun — and releases the provisional reservation.
+    # The audit LIVE CANDIDATE-GATE LATENCY requirement is UNCHANGED: risk
+    # computation must NOT silently consume the whole confirm window. The first MC
+    # "takes" ~1.8s of the derived budget (the hook advances the clock) AND moves
+    # the book, forcing a retry. The retry's MC then OVERRUNS what is left.
+    #
+    # What CHANGED (2026-07-27, B2): the retry is STARTED, bounded by the window
+    # that is actually left, instead of being skipped on a PREDICTED cost. The
+    # cut-off is the clock, not a rate estimator — which is what makes it
+    # impossible for measurement history to switch the risk gate off permanently
+    # (test_confirm_window_budget section 6). The RESOLUTION is unchanged: a
+    # latency cut-off resolves on the ENFORCED deterministic caps — which admit
+    # here — and the already-won auction CONFIRMS.
     async def on_call(idx: int, inputs: CandidateBookRiskInputs) -> None:
         if idx == 0:
-            # Burn ~90% of the 2.0s deadline DURING the first MC …
+            # Burn ~1.8s of the derived budget DURING the first MC …
             lifecycle._clock.advance(1.8)  # noqa: SLF001
             # … and move the book so the verdict is discarded and a retry is needed.
             reservation.try_reserve(
@@ -533,19 +561,29 @@ async def test_gate_fails_closed_when_confirm_deadline_would_be_exceeded(
                 marginals=lifecycle._marginals,  # noqa: SLF001
                 daily_pnl=lifecycle.daily_pnl,
             )
+        else:
+            # The retry's MC does not land inside the remaining window: the
+            # bounded await gives up exactly as asyncio.wait_for does.
+            raise TimeoutError("candidate MC exceeded its deadline")
 
     pool = ScriptedPool([_verdict(confirm=True)], on_call=on_call)
     lifecycle, sender, exposure, reservation = await _make(tmp_path, pool=pool)
     await lifecycle.handle_rfq(rfq())
     await lifecycle.on_quote_accepted(accepted_msg("q1", "yes"))
-    # Exactly ONE MC ran (the first); the retry was refused by the deadline guard
-    # BEFORE starting a second MC — the confirm window was not consumed by risk math.
-    assert len(pool.calls) == 1
-    assert sender.confirmed == []
-    assert not reservation.is_outstanding("fill:q1")  # provisional released
+    # BOTH MCs were STARTED — the second one bounded by the window that remained,
+    # and the deadline that bounded it was strictly positive and strictly smaller
+    # than the first (the budget is spent, not predicted).
+    assert len(pool.calls) == 2
+    assert 0.0 < pool.deadlines[1] < pool.deadlines[0]
+    assert lifecycle._metrics.counter("candidate_gate.mc_timeout") == 1  # noqa: SLF001
     assert lifecycle._metrics.counter(  # noqa: SLF001
         "candidate_gate.deadline_exceeded"
     ) == 1
+    # …and the auction was WON, not thrown away.
+    assert sender.confirmed == ["q1"]
+    assert lifecycle._metrics.counter(  # noqa: SLF001
+        "candidate_gate.timeout_fallback_confirm"
+    ) == 1
     assert lifecycle._metrics.counter(  # noqa: SLF001
         f"confirm.declined.{ReasonCode.DECLINE_CANDIDATE_RISK}"
-    ) == 1
+    ) == 0

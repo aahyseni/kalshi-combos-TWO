@@ -1,0 +1,334 @@
+{
+  "boots": [
+    {
+      "launch_to_first_beat_s": 3.19,
+      "log": "live_20260722_relight.log"
+    },
+    {
+      "launch_to_first_beat_s": 3.42,
+      "log": "live_20260722_relight2.log"
+    },
+    {
+      "launch_to_first_beat_s": 4.45,
+      "log": "live_20260723_bookriskfix.log"
+    },
+    {
+      "launch_to_first_beat_s": 3.26,
+      "log": "live_20260723_shadow.log"
+    },
+    {
+      "launch_to_first_beat_s": 5.14,
+      "log": "live_20260723_shadow2.log"
+    },
+    {
+      "launch_to_first_beat_s": 8.11,
+      "log": "live_20260723_v3.log"
+    },
+    {
+      "launch_to_first_beat_s": 7.14,
+      "log": "live_20260723_v4.log"
+    },
+    {
+      "launch_to_first_beat_s": 6.76,
+      "log": "live_20260723_v5.log"
+    },
+    {
+      "launch_to_first_beat_s": 37.83,
+      "log": "live_20260725_1509.log"
+    },
+    {
+      "launch_to_first_beat_s": 38.65,
+      "log": "live_20260725_1521.log"
+    },
+    {
+      "launch_to_first_beat_s": 40.66,
+      "log": "live_20260725_1525.log"
+    },
+    {
+      "launch_to_first_beat_s": 39.87,
+      "log": "live_20260725_1534.log"
+    },
+    {
+      "launch_to_first_beat_s": 36.3,
+      "log": "live_20260725_1559.log"
+    },
+    {
+      "launch_to_first_beat_s": 41.63,
+      "log": "live_20260725_1803.log"
+    },
+    {
+      "launch_to_first_beat_s": 39.75,
+      "log": "live_20260725_1823.log"
+    },
+    {
+      "launch_to_first_beat_s": 41.6,
+      "log": "live_20260725_1841.log"
+    },
+    {
+      "launch_to_first_beat_s": 40.03,
+      "log": "live_20260725_1850.log"
+    },
+    {
+      "launch_to_first_beat_s": 42.24,
+      "log": "live_20260725_2006.log"
+    },
+    {
+      "launch_to_first_beat_s": 33.61,
+      "log": "live_20260725_2357.log"
+    },
+    {
+      "launch_to_first_beat_s": 35.24,
+      "log": "live_20260725_pbook_shadow.log"
+    },
+    {
+      "launch_to_first_beat_s": 33.97,
+      "log": "live_20260725_pbook_shadow2.log"
+    },
+    {
+      "launch_to_first_beat_s": 34.45,
+      "log": "live_20260725_pbook_shadow3.log"
+    },
+    {
+      "launch_to_first_beat_s": 34.35,
+      "log": "live_20260725_pbook_shadow4.log"
+    },
+    {
+      "launch_to_first_beat_s": 34.61,
+      "log": "live_20260725_v5_floor6.log"
+    },
+    {
+      "launch_to_first_beat_s": 37.41,
+      "log": "live_20260725_v6_w0.log"
+    },
+    {
+      "launch_to_first_beat_s": 34.87,
+      "log": "live_20260726_0030.log"
+    },
+    {
+      "launch_to_first_beat_s": 35.0,
+      "log": "live_20260726_0436.log"
+    },
+    {
+      "launch_to_first_beat_s": 45.51,
+      "log": "live_20260726_0909.log"
+    },
+    {
+      "launch_to_first_beat_s": 44.07,
+      "log": "live_20260726_0929.log"
+    },
+    {
+      "launch_to_first_beat_s": 42.9,
+      "log": "live_20260726_0931.log"
+    },
+    {
+      "launch_to_first_beat_s": 44.16,
+      "log": "live_20260726_0943.log"
+    },
+    {
+      "launch_to_first_beat_s": 43.68,
+      "log": "live_20260726_1606.log"
+    },
+    {
+      "launch_to_first_beat_s": 34.49,
+      "log": "live_20260727_0532.log"
+    },
+    {
+      "launch_to_first_beat_s": 39.46,
+      "log": "live_20260727_0649.log"
+    },
+    {
+      "launch_to_first_beat_s": 48.33,
+      "log": "live_20260727_1023.log"
+    }
+  ],
+  "candidate_gate_attempts_max": 2,
+  "candidate_gate_confirm_events": 267,
+  "candidate_gate_deadline_events": 70,
+  "live_n_positions_last": 46,
+  "live_n_positions_max": 71,
+  "max_same_tick_quarantine": 11,
+  "max_same_tick_quarantine_where": "live_20260726_1606.log|2026-07-26T20:12:25",
+  "observed_tier": {
+    "event": "api_tier_observed",
+    "level": "info",
+    "metadata_reads_per_s_ceiling": 30.0,
+    "read_capacity": 600,
+    "read_refill_per_s": 300,
+    "ts": "2026-07-27T14:23:44.264399Z",
+    "usage_tier": "advanced",
+    "write_capacity": 600,
+    "write_refill_per_s": 300
+  },
+  "observed_tier_at": "2026-07-27T14:23:44.264399Z",
+  "provenance": {
+    "manifest": {
+      "live_20260722_relight.log": [
+        30773314,
+        1784778554.835
+      ],
+      "live_20260722_relight2.log": [
+        20975625,
+        1784779031.204
+      ],
+      "live_20260723_bookriskfix.log": [
+        113470436,
+        1784834095.398
+      ],
+      "live_20260723_shadow.log": [
+        35546524,
+        1784780652.623
+      ],
+      "live_20260723_shadow2.log": [
+        150640700,
+        1784829990.939
+      ],
+      "live_20260723_v3.log": [
+        151696616,
+        1784838164.787
+      ],
+      "live_20260723_v4.log": [
+        74381270,
+        1784840187.141
+      ],
+      "live_20260723_v5.log": [
+        37683762,
+        1784842594.5
+      ],
+      "live_20260725_1452.log": [
+        1005,
+        1785005563.771
+      ],
+      "live_20260725_1453.log": [
+        1005,
+        1785005626.863
+      ],
+      "live_20260725_1500.log": [
+        985,
+        1785006058.228
+      ],
+      "live_20260725_1509.log": [
+        19423503,
+        1785007027.529
+      ],
+      "live_20260725_1518.log": [
+        1948,
+        1785007143.169
+      ],
+      "live_20260725_1521.log": [
+        7551067,
+        1785007488.269
+      ],
+      "live_20260725_1525.log": [
+        30524514,
+        1785008049.1
+      ],
+      "live_20260725_1534.log": [
+        14250668,
+        1785008414.273
+      ],
+      "live_20260725_1559.log": [
+        387549033,
+        1785017021.36
+      ],
+      "live_20260725_1803.log": [
+        111676118,
+        1785018223.961
+      ],
+      "live_20260725_1823.log": [
+        96838507,
+        1785019265.556
+      ],
+      "live_20260725_1841.log": [
+        33242699,
+        1785019632.638
+      ],
+      "live_20260725_1850.log": [
+        105766919,
+        1785022361.61
+      ],
+      "live_20260725_1959.log": [
+        1797,
+        1785023980.757
+      ],
+      "live_20260725_2006.log": [
+        48621030,
+        1785026252.054
+      ],
+      "live_20260725_2357.log": [
+        85600247,
+        1785039194.504
+      ],
+      "live_20260725_pbook_shadow.log": [
+        98795015,
+        1784992288.352
+      ],
+      "live_20260725_pbook_shadow2.log": [
+        223563865,
+        1784995010.477
+      ],
+      "live_20260725_pbook_shadow3.log": [
+        14179461,
+        1784995192.819
+      ],
+      "live_20260725_pbook_shadow4.log": [
+        128615403,
+        1784996773.491
+      ],
+      "live_20260725_v5_floor6.log": [
+        193918964,
+        1785000831.094
+      ],
+      "live_20260725_v6_w0.log": [
+        52980137,
+        1785002259.622
+      ],
+      "live_20260725_v7.log": [
+        1003,
+        1785002929.014
+      ],
+      "live_20260726_0030.log": [
+        54500416,
+        1785040623.213
+      ],
+      "live_20260726_0436.log": [
+        1975654625,
+        1785071347.71
+      ],
+      "live_20260726_0909.log": [
+        221569962,
+        1785072538.686
+      ],
+      "live_20260726_0929.log": [
+        14634616,
+        1785072654.404
+      ],
+      "live_20260726_0931.log": [
+        135666060,
+        1785073374.219
+      ],
+      "live_20260726_0943.log": [
+        2623337933,
+        1785089779.325
+      ],
+      "live_20260726_1606.log": [
+        8928852,
+        1785096809.897
+      ],
+      "live_20260727_0532.log": [
+        317412433,
+        1785147438.393
+      ],
+      "live_20260727_0649.log": [
+        1265807875,
+        1785162136.166
+      ],
+      "live_20260727_1023.log": [
+        1156185252,
+        1785171980.203
+      ]
+    },
+    "scanned_bytes": 10041971164,
+    "scanned_logs": 41,
+    "source": "fresh scan"
+  }
+}

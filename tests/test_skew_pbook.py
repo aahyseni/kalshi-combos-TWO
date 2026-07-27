@@ -16,17 +16,22 @@ derive-before-arm measurement. Semantics pinned:
 
 from __future__ import annotations
 
+import dataclasses
+import random
 from collections.abc import Callable
 
 from combomaker.core.conventions import Conventions, Side
 from combomaker.core.money import CentiCents
 from combomaker.core.quantity import CentiContracts
+from combomaker.risk.concentration_steer import SteerCenter, build_loss_event_book
 from combomaker.risk.exposure import ExposureBook, LegRef, OpenPosition
 from combomaker.risk.skew import (
+    ConcentrationProfile,
     PBookProfile,
     SkewLimits,
     SkewParams,
     compute_inventory_skew,
+    ticket_bucket,
 )
 
 CONVENTIONS = Conventions(
@@ -104,7 +109,46 @@ def _profile(
     )
 
 
-def _skew(candidate, book, marginals, profile, *, params=PARAMS, gen=GEN):
+def _warm_centre(sd: float = 0.12) -> SteerCenter:
+    """A centre warmed on real-shaped flow, as the live one always is."""
+    c = SteerCenter(half_life=128.0)
+    rng = random.Random(19)
+    for _ in range(600):
+        c.observe(rng.gauss(0.0, sd))
+    return c
+
+
+def _conc(book: ExposureBook, *, centre: SteerCenter | None = None,
+          wall_cc: float = 1.0e9) -> ConcentrationProfile:
+    """LEVER #5 profile from the committed book, ticket-atomic (2026-07-27).
+
+    The DIVERSIFICATION rebate that used to be priced by the 1/n_keys COUNT
+    deficit lives here now, on the AND-BOUND dollar-Herfindahl."""
+    events = [
+        (ticket_bucket(p.legs), float(p.max_loss_cc))
+        for p in book.positions.values()
+    ]
+    return ConcentrationProfile(
+        loss_events=build_loss_event_book(events),
+        game_dollars_cc={},
+        game_wall_cc=wall_cc,
+        family_dollars_cc={},
+        family_wall_cc=wall_cc,
+        entity_dollars_cc={},
+        entity_wall_cc=wall_cc,
+        fill_elasticity_per_cent=0.22,
+        centre=centre if centre is not None else _warm_centre(),
+    )
+
+
+def _skew(candidate, book, marginals, profile, *, params=PARAMS, gen=GEN,
+          conc_profile=None, margin_cc=200, tick_cc=10):
+    # LEVER #5 ARMING (2026-07-27 review B3): the steer ships SHADOW, so a test
+    # that wires a ``conc_profile`` AND asserts on the composed ``applied_cc``
+    # has to arm it explicitly. Byte-identity of the UNARMED composition is
+    # pinned in tests/test_conc_arming.py, not here.
+    if conc_profile is not None and not params.conc_armed:
+        params = dataclasses.replace(params, conc_armed=True)
     snap = book.snapshot(provider(marginals), mass_acceptance=False)
     return compute_inventory_skew(
         candidate,
@@ -115,6 +159,10 @@ def _skew(candidate, book, marginals, profile, *, params=PARAMS, gen=GEN):
         params,
         pbook_profile=profile,
         pbook_book_generation=gen,
+        conc_profile=conc_profile,
+        margin_cc=margin_cc,
+        tick_cc=tick_cc,
+        observe_centre=False,
     )
 
 
@@ -167,64 +215,117 @@ class TestSteeringSemantics:
         even though the directional component is neutral there."""
         book, marginals = _one_way_book()
         cand = no_position("cand", (leg("C", "KX-G3"),))
-        skew = _skew(cand, book, marginals, _profile())
+        skew = _skew(cand, book, marginals, _profile(),
+                     conc_profile=_conc(book))
         assert skew.concentration_cc == 0 and skew.offset_cc == 0  # dir-neutral
+        # SIZE-INVARIANCE REPAIR (2026-07-27): a game the book's tail does not
+        # touch reads share 0 against a positive Herfindahl, i.e. alignment
+        # −H — a strict REBATE, and one that cannot decay as we diversify
+        # (there is no key COUNT and no wall anywhere in it).
         assert skew.pbook_cc < 0
-        assert any(r[3] == "pbook_diversifying" for r in skew.pbook_per_game)
+        assert any(
+            r[3] == "pbook_diversifying" for r in skew.pbook_per_game
+        )
+        assert skew.conc is not None
+        assert skew.conc.hhi.score > 0.0      # it DOES lower concentration
+        assert skew.conc.applied_cc > 0       # ...and it is quoted tighter
+        assert skew.applied_cc > 0
 
-    def test_magnitude_scales_with_p_book_deficit(self) -> None:
-        """A healthy book (p_book 0.9) steers far less than the one-way 0.40
-        book — the need factor is measured, never a target."""
+    def test_magnitude_is_independent_of_p_book(self) -> None:
+        """SUPERSEDES ``test_magnitude_scales_with_p_book_deficit``
+        (operator directive 2026-07-27).
+
+        ``need = 1 − p_book`` was a BOOK-LEVEL, CANDIDATE-BLIND multiplier on
+        every row of this axis, and p_book drifts DOWN as the book grows
+        (measured 0.5954 → 0.5653 in one session, ×1.0744 on every widen and
+        every rebate). That is a book-size term wearing a risk reason code —
+        category (B) — so it is gone. The same candidate against the same
+        SHAPE now prices identically whatever p_book says."""
         book, marginals = _one_way_book()
         cand = no_position("cand", (leg("A", "KX-G1"),))
         needy = _skew(cand, book, marginals, _profile(p_book=0.40))
         healthy = _skew(cand, book, marginals, _profile(p_book=0.90))
-        assert needy.pbook_cc > healthy.pbook_cc > 0
+        assert needy.pbook_cc == healthy.pbook_cc > 0
 
-    def test_balanced_book_is_neutral(self) -> None:
-        """A perfectly diversified profile (uniform shares) steers nothing."""
+    def test_widen_reads_share_against_the_herfindahl_not_the_game_count(
+        self,
+    ) -> None:
+        """SUPERSEDES the wall-onset test (operator directive 2026-07-27).
+
+        The question is neither "is this game an average FRACTION of the book"
+        (a COUNT, which decayed as we diversified) nor "how much of the game's
+        WALL is spent" (a book-size term). It is "does this game carry MORE
+        than the book's dollar-weighted average share" — ``share − Σ share²``,
+        a pure ratio. A uniform two-game split is exactly average ⇒ NEUTRAL;
+        a 0.9/0.1 split is above average ⇒ WIDEN — and neither reading moves
+        when the tail dollars are scaled by 100x."""
         book, marginals = _one_way_book()
         cand = no_position("cand", (leg("A", "KX-G1"),))
-        skew = _skew(
+        uniform = _skew(
             cand, book, marginals,
-            _profile(shares={"G1": 0.5, "G2": 0.5}, p_book=0.40),
+            _profile(shares={"G1": 0.5, "G2": 0.5}, total_tail_cc=1.0e9),
         )
-        assert skew.pbook_cc == 0
+        assert uniform.pbook_cc == 0
 
-
-class TestCapsDerivedOnset:
-    """The operator's 'at what point is it too much' (2026-07-25): the onset
-    DERIVES from the caps — concentration pays only as the concentrated tail
-    approaches the game-loss budget, convex (a small book is nearly free;
-    never a $100/$200 constant, never an early over-markup)."""
-
-    def test_tiny_book_is_nearly_free(self) -> None:
-        """A $100-scale concentrated tail against the test budget steers
-        ~nothing — the 'does it start at $100' answer is NO."""
-        book, marginals = _one_way_book()
-        cand = no_position("cand", (leg("A", "KX-G1"),))
-        skew = _skew(
-            cand, book, marginals, _profile(total_tail_cc=1_000_000.0)  # ~$100
+        skewed_big = _skew(
+            cand, book, marginals,
+            _profile(shares={"G1": 0.9, "G2": 0.1}, total_tail_cc=1.0e9),
         )
-        assert skew.pbook_cc == 0
+        skewed_small = _skew(
+            cand, book, marginals,
+            _profile(shares={"G1": 0.9, "G2": 0.1}, total_tail_cc=1.0e7),
+        )
+        assert skewed_big.pbook_cc > 0
+        assert skewed_big.pbook_cc == skewed_small.pbook_cc
 
-    def test_widen_grows_with_hole_depth(self) -> None:
+
+class TestScaleInvariance:
+    """THE OPERATOR'S RULE (2026-07-27): "we shouldn't be widening all of our
+    bets just because we hit a $ amount of positions, we only widen on bets
+    that concentrate current directions". The P(book) axis reads SHAPE, so
+    scaling the whole book changes nothing it says."""
+
+    def test_identical_candidate_1x_vs_3x_book_gets_the_same_component(
+        self,
+    ) -> None:
         book, marginals = _one_way_book()
         cand = no_position("cand", (leg("A", "KX-G1"),))
-        shallow = _skew(cand, book, marginals, _profile(total_tail_cc=2.5e8))
-        deep = _skew(cand, book, marginals, _profile(total_tail_cc=1.0e9))
-        assert 0 <= shallow.pbook_cc < deep.pbook_cc
+        base = _skew(
+            cand, book, marginals,
+            _profile(total_tail_cc=1.0e8, game_budget_cc=1.0e9),
+        )
+        triple = _skew(
+            cand, book, marginals,
+            _profile(total_tail_cc=3.0e8, game_budget_cc=1.0e9),
+        )
+        assert base.pbook_cc == triple.pbook_cc
 
-    def test_widen_onset_is_convex(self) -> None:
-        """Half the hole pays much less than half the widen (gamma=2): the
-        steer stays out of the way early and bites late."""
+    def test_no_discontinuity_as_the_book_sweeps(self) -> None:
+        """Sweeping the book's tail dollars across three orders of magnitude
+        produces EXACTLY one value — no cliff, no step, nothing to cross."""
         book, marginals = _one_way_book()
         cand = no_position("cand", (leg("A", "KX-G1"),))
-        # onset_g = share x total / budget: 0.9 at full, 0.45 at half.
-        full = _skew(cand, book, marginals, _profile(total_tail_cc=1.0e9))
-        half = _skew(cand, book, marginals, _profile(total_tail_cc=0.5e9))
-        assert full.pbook_cc > 0
-        assert half.pbook_cc < full.pbook_cc / 2
+        seen = {
+            _skew(
+                cand, book, marginals,
+                _profile(total_tail_cc=1.0e6 * (1.35**i)),
+            ).pbook_cc
+            for i in range(40)
+        }
+        assert len(seen) == 1
+
+    def test_concentrator_widens_and_diversifier_is_strictly_tighter(
+        self,
+    ) -> None:
+        book, marginals = _one_way_book()
+        prof = _profile(shares={"G1": 0.9, "G2": 0.1})
+        conc = _skew(
+            no_position("c", (leg("A", "KX-G1"),)), book, marginals, prof
+        )
+        div = _skew(
+            no_position("d", (leg("C", "KX-G3"),)), book, marginals, prof
+        )
+        assert conc.pbook_cc > 0 > div.pbook_cc
 
     def test_rebate_is_book_size_invariant(self) -> None:
         """SUPERSEDES ``test_rebate_reads_the_book_level_hole`` (2026-07-26).
@@ -242,14 +343,24 @@ class TestCapsDerivedOnset:
         (1 - p_book). The "deeper hole pays more" intuition survives in the
         honest place: a concentrating book has a LOWER p_book, so ``need``
         rises and the rebate rises with it. Onset stays on the WIDEN branch
-        (never tax a small book), pinned by test_widen_onset_is_convex."""
+        (never tax a small book), pinned by test_widen_onset_is_convex.
+
+        LEVER #5 (2026-07-27): the doctrine is unchanged, the MECHANISM moved.
+        The reward is now the AND-BOUND dollar-Herfindahl marginal, which is
+        a RATIO of effective loss-event counts and therefore book-size
+        invariant by construction — not by a rule we have to remember."""
         book, marginals = _one_way_book()
         cand = no_position("cand", (leg("C", "KX-G3"),))
-        shallow = _skew(cand, book, marginals, _profile(total_tail_cc=2.5e8))
-        deep = _skew(cand, book, marginals, _profile(total_tail_cc=1.0e9))
-        assert deep.pbook_cc == shallow.pbook_cc < 0
-        # And it is a number a taker can actually see.
-        assert abs(deep.pbook_cc) >= 25
+        centre = _warm_centre()
+        shallow = _skew(cand, book, marginals, _profile(total_tail_cc=2.5e8),
+                        conc_profile=_conc(book, centre=centre))
+        deep = _skew(cand, book, marginals, _profile(total_tail_cc=1.0e9),
+                     conc_profile=_conc(book, centre=centre))
+        assert shallow.conc is not None and deep.conc is not None
+        assert deep.conc.applied_cc == shallow.conc.applied_cc > 0
+        # And it is a number a taker can actually see: the measured OLD
+        # median |applied_cc| was 20cc against a 200cc margin.
+        assert deep.conc.applied_cc >= 25
 
 
 class TestReviewRegressions:
@@ -258,19 +369,28 @@ class TestReviewRegressions:
     def test_single_game_book_still_rebates_new_game_flow(self) -> None:
         """Review HIGH (n=1 discontinuity): the PUREST one-way shape — tail
         on exactly ONE game — must reward a new-game diversifier, matching
-        the epsilon-split book's rebate (the old code paid 0)."""
+        the epsilon-split book's rebate (the old code paid 0).
+
+        LEVER #5 (2026-07-27): the n==1 discontinuity cannot recur, because
+        there is no ``n`` anywhere any more — the rebate is priced by the
+        AND-bound dollar-Herfindahl, which never divides by a key count."""
         book, marginals = _one_way_book()
         cand = no_position("cand", (leg("C", "KX-G3"),))
+        centre = _warm_centre()
         single = _skew(
-            cand, book, marginals, _profile(shares={"G1": 1.0})
+            cand, book, marginals, _profile(shares={"G1": 1.0}),
+            conc_profile=_conc(book, centre=centre),
         )
         epsilon = _skew(
-            cand, book, marginals, _profile(shares={"G1": 0.999, "G2": 0.001})
+            cand, book, marginals, _profile(shares={"G1": 0.999, "G2": 0.001}),
+            conc_profile=_conc(book, centre=centre),
         )
-        assert single.pbook_cc < 0
-        assert any(r[3] == "pbook_diversifying" for r in single.pbook_per_game)
-        # Continuous: the single-game rebate ~= the epsilon-split rebate.
-        assert abs(single.pbook_cc - epsilon.pbook_cc) <= 2
+        assert single.conc is not None and epsilon.conc is not None
+        assert single.conc.applied_cc > 0
+        assert single.applied_cc > 0
+        # Continuous: the single-game rebate == the epsilon-split rebate
+        # EXACTLY (the profile's share split is not an input to it at all).
+        assert single.conc.applied_cc == epsilon.conc.applied_cc
 
     def test_hedged_protected_game_earns_no_rebate(self) -> None:
         """Review LOW (hedge erosion): a game whose tail attribution is
@@ -285,13 +405,15 @@ class TestReviewRegressions:
         assert skew.pbook_cc == 0
         assert any(r[3] == "hedged_protected" for r in skew.pbook_per_game)
 
-    def test_armed_composed_skew_obeys_documented_two_pair_bound(self) -> None:
-        """Review MEDIUM (stale clamp doc): arming pbook must NOT expand the
-        documented overall clamp — the composed skew_cc is re-clamped to
-        [−(skew_tighten+peak_tighten), +(skew_widen+peak_widen)]."""
+    def test_armed_composed_skew_obeys_documented_bound(self) -> None:
+        """Review MEDIUM (stale clamp doc), RE-RULED 2026-07-27: arming pbook
+        must not expand the documented overall clamp — but that clamp is now
+        SYMMETRIC on the concentration pair, because every concentration axis
+        carries ONE weight in both directions. An asymmetric truncation here
+        would silently re-impose the 4:1 widen bias the axes just removed."""
         book, marginals = _one_way_book()
         armed = SkewParams(enabled=True, pbook_armed=True)
-        lo = -(armed.skew_max_tighten_cc + armed.peak_tighten_max_cc)
+        lo = -(armed.skew_max_tighten_cc + armed.peak_widen_max_cc)
         hi = armed.skew_max_widen_cc + armed.peak_widen_max_cc
         for cand, profile in (
             (  # maximal widen stack: same-way into a full one-way hole
@@ -306,20 +428,22 @@ class TestReviewRegressions:
             skew = _skew(cand, book, marginals, profile, params=armed)
             assert lo <= skew.skew_cc <= hi
 
-    def test_delta_neutral_on_overweight_is_named(self) -> None:
-        """Review LOW: an overweight game reached with a delta-neutral
-        contribution is measurable in the shadow record under its own
-        reason, not silently 'balanced'."""
+    def test_delta_neutral_on_overweight_still_adds_tail_mass(self) -> None:
+        """Review LOW, RE-RULED 2026-07-27: a delta-neutral contribution on an
+        OVERWEIGHT game is not neutral — the fill still puts premium at risk on
+        the game that already dominates the tail, so it concentrates. The
+        directional sign only decides whether the alignment is kept or flipped;
+        it never zeroes the reading."""
         from combomaker.risk.skew import _pbook_component
 
-        pbook_cc, rows = _pbook_component(
+        pbook_cc, rows, score = _pbook_component(
             [("G1", 0)],
             PARAMS,
             _profile(shares={"G1": 0.9, "G2": 0.1}),
             GEN,
         )
-        assert pbook_cc == 0
-        assert rows[0][3] == "delta_neutral_on_overweight"
+        assert pbook_cc > 0 and score is not None and score > 0.0
+        assert rows[0][3] == "pbook_concentrating"
 
     def test_profile_builder_normalizes_by_positive_mass(self) -> None:
         """Review HIGH (shares don't sum to 1): negative attribution entries

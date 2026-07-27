@@ -24,6 +24,7 @@ any resync (feed ordering guarantees that).
 from __future__ import annotations
 
 import asyncio
+import math
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
@@ -79,6 +80,18 @@ from combomaker.pricing.quote import ConstructedQuote, NoQuote
 from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.models import Rfq
 from combomaker.risk.balance import BalanceTracker
+from combomaker.risk.concentration_steer import (
+    CrnBookCache,
+    LossEventBook,
+    SteerCenter,
+    build_loss_event_book,
+)
+from combomaker.risk.deploy_scale import FAILSAFE as DEPLOY_SCALE_FAILSAFE
+from combomaker.risk.deploy_scale import (
+    DeployScaleResult,
+    scale_grid,
+    solve_deployment_scale,
+)
 from combomaker.risk.exposure import (
     ExposureBook,
     ExposureSnapshot,
@@ -98,6 +111,7 @@ from combomaker.risk.lastlook import (
 from combomaker.risk.limits import (
     _SLATE_TZ,
     Breach,
+    ConcentrationCertificate,
     DailyPnl,
     HaltInputs,
     LimitChecker,
@@ -110,6 +124,7 @@ from combomaker.risk.limits import (
 from combomaker.risk.markouts import MarkoutSubject, MarkoutTracker
 from combomaker.risk.reservation import ReserveResult, RiskReservationService
 from combomaker.risk.skew import (
+    ConcentrationProfile,
     GameSkewCache,
     LegAxisProfile,
     PBookProfile,
@@ -118,11 +133,13 @@ from combomaker.risk.skew import (
     WidenPolicyParams,
     compute_inventory_skew,
     decide_widen_or_decline,
+    ticket_bucket,
 )
 from combomaker.sim.book_model import (
     BookModel,
     WithinGameRhoProvider,
     build_book_model,
+    within_game_pair_tickers,
 )
 from combomaker.sim.book_risk import (
     BookRiskSnapshot,
@@ -171,19 +188,23 @@ def _pbook_profile_from_snapshot(
     positive_tail = sum(
         tc.loss_cc for tc in snap.per_game_tail_cc if tc.loss_cc > 0.0
     )
+    shares = (
+        {
+            tc.key: tc.loss_cc / positive_tail
+            for tc in snap.per_game_tail_cc
+            if tc.loss_cc > 0.0
+        }
+        if positive_tail > 0.0
+        else {}
+    )
     return PBookProfile(
         input_generation=snap.input_generation,
         p_book=snap.p_profit,
-        tail_share_by_game=(
-            {
-                tc.key: tc.loss_cc / positive_tail
-                for tc in snap.per_game_tail_cc
-                if tc.loss_cc > 0.0
-            }
-            if positive_tail > 0.0
-            else {}
-        ),
+        tail_share_by_game=shares,
         total_tail_cc=positive_tail,
+        # The tail-share Herfindahl: a BOOK property, so it is computed here
+        # (once per publish, off the hot path) and read O(1) on the quote path.
+        tail_hhi=math.fsum(s * s for s in shares.values()),
         game_budget_cc=game_budget_cc,
         protected_games=frozenset(
             tc.key for tc in snap.per_game_tail_cc if tc.loss_cc <= 0.0
@@ -547,11 +568,74 @@ _INPLAY_ONLY_SKIPS = frozenset(
 # eviction can only ever cost a duplicate row, never a wrong number).
 _INPLAY_SHADOW_DEDUPE_CAP = 4096
 
+# === EXCHANGE CONFIRM WINDOW (protocol fact, not a tunable) ==================
+# Combo RFQs are HVM: the exchange gives the maker 3.0s to confirm an accepted
+# quote and 1s to execute (docs/api-notes/communications-ws.md:261; the same 3.0
+# the RiskConfig budget validators already encode). This is a property of the
+# venue, in the same class as a tick size — it is READ here, never tuned. Every
+# confirm-path budget in this module is DERIVED from it minus MEASURED costs.
+EXCHANGE_CONFIRM_WINDOW_S: float = 3.0
+EXCHANGE_CONFIRM_WINDOW_NS: int = int(EXCHANGE_CONFIRM_WINDOW_S * 1e9)
+
+# NO COST PREDICTOR (2026-07-27, B2). This module used to carry a
+# ``_MeasuredRate`` ms/unit estimator and skip the candidate gate's build/MC
+# when the PREDICTED cost did not fit the confirm window. It is gone. Two
+# defects made it unfixable-in-place rather than merely mistuned:
+#
+#   * it was fed the WHOLE build time as if every millisecond scaled with the
+#     PAIR count, while the build's dominant term on a small book is FIXED
+#     (``_gate_pricing_edge`` — a full engine call, 160-450 ms measured), so a
+#     small book yielded ~1000x the true marginal rate; and
+#   * ``predict_ms`` took max() over the retained samples, and samples only
+#     arrived when a build actually RAN. One pessimistic sample skipped the
+#     build; a skipped build produced no new sample; the max never decayed. The
+#     joint-tail / P(ruin) / delta-P(book) gate went DARK PERMANENTLY, with only
+#     a counter to show for it.
+#
+# The replacement is not a better predictor, it is no predictor: the input build
+# is INTERRUPTIBLE against the derived deadline and the MC is BOUNDED by the
+# remaining window (the same deadline_s the last-look waiver's off-loop
+# enumeration already uses). Both stages are therefore attempted on EVERY
+# accept, both are bounded by the clock rather than by history, and there is no
+# state a bad sample can poison — the MC cannot be turned off by anything except
+# the window itself running out.
+
+
+class _GateBudgetExceeded(Exception):
+    """Raised out of the candidate-gate INPUT BUILD when it crosses its deadline.
+
+    The build (not the MC) was the live killer: 23 of 24 lost auctions in one
+    session never reached a single Monte Carlo sample — they were still
+    resolving O(T^2) rho pairs when the budget ran out. A synchronous loop that
+    cannot be abandoned is a loop that spends the whole confirm window, so the
+    build is now interruptible and its abandonment is a TIMEOUT (deterministic
+    fallback), never a risk decline."""
+
+    def __init__(self, stage: str, elapsed_ms: float) -> None:
+        super().__init__(f"candidate gate build exceeded its budget in {stage}")
+        self.stage = stage
+        self.elapsed_ms = elapsed_ms
+
 
 @dataclass(frozen=True, slots=True)
 class LifecycleConfig:
     quote_ttl_s: float = 30.0
     reprice_threshold_cc: int = 100
+    # LEVER #5 (2026-07-27) — the MEASURED, CMH-stratified fill-rate
+    # elasticity: the fraction of fills lost per CENT of extra width. This is
+    # a MEASUREMENT, not a knob: the concentration steer's validity horizon is
+    # ``1/(2e)`` cents (the half-range at which the linear elasticity's own
+    # extrapolation has burned half the flow), so a re-measurement moves the
+    # steer automatically and nothing has to be hand-tuned. 0 ⇒ that bound
+    # simply abstains and the LIVE MARGIN binds instead.
+    fill_elasticity_per_cent: float = 0.22
+    # LEVER #5 CRN cache: rows drawn on the PRICING joint for the
+    # Cov(candidate, book) price. A COMPUTE bound (the standing 4096 precedent
+    # in peak_profile / the waiver), never a risk number — the RESOLVABILITY
+    # decision is made from the drawn sample's own measured SNR against the
+    # ratified z anchor below, and an unresolvable draw simply abstains.
+    crn_cache_samples: int = 4096
+    crn_min_snr_z: float = 3.0
     exchange_active: bool = True  # updated by the exchange-status poller
     # Portfolio-CVaR book-risk MC (armed off the slow loop; never inside check()).
     # ``book_risk_mc_samples`` is smaller than the report's 100k because this runs
@@ -573,6 +657,36 @@ class LifecycleConfig:
     # 1.645 for a one-sided 95% level to decline a fill whose ruin p̂ only just
     # clears the budget by luck of the draw.
     ruin_prob_ci_z: float = 0.0
+    # --- DEPLOYMENT SCALE (risk/deploy_scale.py; operator LEVER #1) ----------
+    # Default OFF ⇒ the scale is never solved, never consumed, and every
+    # ``check`` call passes 1.0 (byte-identical to before this existed). When
+    # armed, the scale is SOLVED off the maintenance tick — same off-loop
+    # discipline as the book-risk MC, never on the quote path — as the largest
+    # uniform book scaling that STILL clears every enforced cap including the
+    # ratified ``portfolio_kill_tail_prob``. It then breathes only the
+    # DEPLOY-side budgets (per-combo / entity / game / slate / directional);
+    # the envelope it was solved against is untouchable by construction.
+    deploy_scale_enabled: bool = False
+    # Search ceiling for the bisection. NOT a target and NOT a cap: if the
+    # envelope is still clean at this bound the solve reports it and stops
+    # looking (a bound, so one pathological snapshot cannot ask for 100x).
+    deploy_scale_s_max: float = 3.0
+    # Probe ladder resolution: at most this many full-book MCs per solve, and
+    # the scale is quantized to (s_max - 1) / points. Bounded by construction —
+    # the operator can read the MC budget straight off the number.
+    deploy_scale_grid_points: int = 16
+    # Solve cadence. Deliberately MUCH slower than the book-risk refresh: the
+    # solve shares the SAME single-worker pool the gating snapshot uses, and a
+    # starved gating snapshot fails the CVaR cap CLOSED (declines everything).
+    # At 16 probes x deploy_scale_mc_samples this is a ~1% duty cycle on that
+    # worker. The generation guard, not this interval, is what keeps the number
+    # honest between solves (a fill invalidates it instantly).
+    deploy_scale_refresh_s: float = 300.0
+    # MC budget PER bisection probe. Smaller than the gating snapshot's because
+    # this solve never gates anything — it only decides how much of the already-
+    # enforced envelope the deploy budgets may use, and every candidate still
+    # faces the full-fidelity gating snapshot afterwards.
+    deploy_scale_mc_samples: int = 20_000
     # P0-1 candidate-aware portfolio-risk gate at CONFIRM. When True (default), a
     # confirm the existing analytic/gross/burst gates already ADMIT runs an ADDITIONAL
     # candidate-aware ~20k-sample portfolio MC (off the loop via the BookRiskPool):
@@ -604,6 +718,43 @@ class LifecycleConfig:
     # / a pathological churn storm). Both are conservative: exceeding either DECLINES.
     candidate_gate_deadline_s: float = 2.0
     candidate_gate_max_retries: int = 3
+    # === CONFIRM-WINDOW REBUILD (2026-07-27) ==================================
+    # THE DEFECT THIS REPLACES: ``candidate_gate_deadline_s`` is a TYPED constant
+    # and its expiry resolved to DECLINE. Live, that discarded 70 already-WON
+    # auctions in two days (254.0 contracts) — 23 of 24 losses in one session
+    # never ran a single MC sample: the O(T^2) INPUT BUILD alone blew the budget,
+    # and the loss was recorded as ``decline_candidate_risk``, a stopwatch
+    # wearing a risk reason code. Worse, it was self-stalling: each fill grew the
+    # book, which grew the build, which timed out the next fill.
+    #
+    # THE REPLACEMENT, per the operator's "no manual number updates; the bot
+    # should know how to react smoothly":
+    #   * the budget is DERIVED per accept from the exchange's own confirm window
+    #     minus the time already burnt since the accept minus a MEASURED reserve
+    #     (confirm RTT high quantile + its observed dispersion + the measured cost
+    #     of the deterministic fallback itself) — never a typed constant;
+    #   * the gate predicts build+MC cost from MEASURED per-unit rates and simply
+    #     DOES NOT START work that cannot fit, so growth degrades continuously
+    #     instead of falling off a cliff;
+    #   * expiry no longer means decline: it means fall back to the DETERMINISTIC
+    #     caps, re-checked against the live book.
+    # False restores the pre-2026-07-27 typed budget (rollback switch only).
+    candidate_gate_derived_deadline: bool = True
+    # A candidate-gate TIMEOUT resolves to the DETERMINISTIC fallback (the held
+    # reservation's enforced caps — det-max / per-combo / entity / game / slate /
+    # gross — re-checked against the CURRENT book, arithmetic, microseconds)
+    # instead of an automatic decline. We have already WON an auction that passed
+    # those caps at reservation time and was priced +EV; throwing it away because
+    # a Monte Carlo was slow is the worst available default. The MC gate becomes a
+    # best-effort REFINEMENT: it can still DECLINE when it finishes, and it can
+    # never be the reason we miss the window. False restores the old
+    # decline-on-timeout (rollback switch only).
+    candidate_gate_timeout_fallback: bool = True
+    # Granularity (in ticker PAIRS) at which the O(T^2) rho resolution inside the
+    # gate's input build checks its deadline. Pure LOOP-CHECK granularity, not a
+    # risk number: smaller = tighter deadline honouring, larger = fewer clock
+    # reads. At the measured ~0.126 ms/pair, 256 pairs is ~32 ms of overshoot.
+    candidate_gate_build_check_pairs: int = 256
     # P1 EV VISIBILITY (audit "+EV IS PRODUCTION-MODEL EV, NOT ROBUST EV"). The
     # candidate gate LOGS the production candidate EV AND the challenger / bridge /
     # split candidate EV (and the worst-credible EV) so a candidate that is +EV under
@@ -1049,6 +1200,18 @@ class QuoteLifecycle:
         # guard: a new recompute is not launched while the previous one is still
         # running (its result publishes when it finishes).
         self._book_risk_task: asyncio.Task[None] | None = None
+        # DEPLOYMENT SCALE (risk/deploy_scale.py) — the SOLVED multiple of the
+        # current book the live envelope still permits. Refreshed on the SAME
+        # off-loop cadence as the book-risk snapshot (never on the quote path:
+        # the hot path only READS this float). 1.0 until a solve succeeds, and
+        # 1.0 forever while ``deploy_scale_enabled`` is off ⇒ byte-identical.
+        self._deploy_scale: DeployScaleResult = DEPLOY_SCALE_FAILSAFE
+        self._deploy_scale_refresh_mono_ns: int | None = None
+        self._deploy_scale_task: asyncio.Task[None] | None = None
+        # Committed premium-at-risk, cached on the position generation — the
+        # denominator of the deployment scale's book-growth decay. Recomputed
+        # only when the position set changes, never per quote.
+        self._committed_premium_cache: tuple[int, int] | None = None
         # Fill-velocity governor: a rolling committed-notional + count window over
         # our OWN acceptances, built from the SAME RiskLimits the caps use. A
         # burst over the soft frac / max fills DECLINEs further confirms +
@@ -1091,6 +1254,37 @@ class QuoteLifecycle:
         # snapshot (same generation-stamp discipline as the snapshot itself).
         # Absent/stale ⇒ the skew's pbook component is a hard ZERO (neutral).
         self._pbook_profile: PBookProfile | None = None
+        # LEVER #5 (2026-07-27) — the ECONOMICALLY-REAL concentration steer.
+        # ``_loss_event_book`` is the committed book as AND-BOUND LOSS EVENTS
+        # in premium dollars, rebuilt ONLY when the position generation moves
+        # (a fill or a settlement), so the quote path pays the O(1) Herfindahl
+        # marginal (1.47us) and never the O(n_positions) rebuild.
+        # ``_steer_centre`` is the live measured mean+dispersion of the steer
+        # score: the BUDGET-NEUTRALITY mechanism (markups are FIXED, so the
+        # steer reallocates and must never widen the average quote) and the
+        # standardiser that makes the swing economically real.
+        self._loss_event_book: LossEventBook = build_loss_event_book(())
+        self._loss_event_generation: int = -1
+        self._steer_centre = SteerCenter()
+        # LEG-AXIS PROFILE CACHE (2026-07-27 throughput). The (family x side) /
+        # (entity x side) shares read ONLY ``ExposureBook.positions`` — the
+        # COMMITTED book (``exposure.snapshot`` fills
+        # ``committed_loss_by_*_cc`` from ``self.positions`` alone, resting
+        # candidates go to the separate enforced map) — so the whole profile is
+        # a pure function of ``position_generation`` and rebuilding its two
+        # share dicts on EVERY quote was waste. Keyed exactly like the
+        # loss-event book and the peak/P(book) caches.
+        self._leg_axis_profile: LegAxisProfile | None = None
+        self._leg_axis_profile_key: tuple[int, float | None] = (-1, None)
+        # The already-paid-for CRN sample (PRICING joint) behind
+        # ``Cov(candidate payoff, pre-existing book P&L)`` — the measured,
+        # EV-orthogonal price of concentration (SE 0.0161 c/contract against a
+        # 1.1333 c/contract spread => SNR 70.4). Generation-stamped: stale =>
+        # the steer falls back to the ZERO-standard-error Herfindahl reading.
+        self._crn_cache: CrnBookCache | None = None
+        # The frozen BookModel the CRN cache samples from (stamped with the
+        # generation it was read at, so a superseded model can never publish).
+        self._last_book_inputs: Any | None = None
         # Fee model for the REAL fill fee booked at execution (defense #3): our
         # combo maker quadratic fills compute $0 (pricing/fees.py + ground truth),
         # correct for any nonzero-fee series. None ⇒ book fee UNKNOWN (None) — the
@@ -1328,7 +1522,7 @@ class QuoteLifecycle:
             marginals=self._marginals,
             within_game_rho=self._within_game_rho,
         )
-        return BookRiskInputs(
+        inputs = BookRiskInputs(
             model=model,
             n_samples=self._config.book_risk_mc_samples,
             seed=self._config.book_risk_seed,
@@ -1355,6 +1549,11 @@ class QuoteLifecycle:
             # + fees; process-scoped until the day-anchored ledger lands).
             realized_pnl_cc=self._realized_pnl_cc,
         )
+        # LEVER #5: keep the frozen model + its generation so the CRN cache can
+        # be drawn from EXACTLY the book the MC priced, on the same slow loop
+        # (never the quote path). Superseded generations can never publish.
+        self._last_book_inputs = inputs
+        return inputs
 
     def _ruin_equity_basis_cc(self, model: BookModel) -> int | None:
         """COST-basis equity for the P(ruin) check (P1-3): live available cash
@@ -1412,6 +1611,7 @@ class QuoteLifecycle:
                 snap, game_budget_cc=self._enforced_game_budget_cc()
             )
             self._log_leg_axis_exposure()
+            self._publish_crn_cache(snap.input_generation)
         if snap.usable:
             log.info(
                 "book_risk_snapshot",
@@ -1484,30 +1684,254 @@ class QuoteLifecycle:
         Shares normalize the committed (family × side) / (entity × side) loss
         attributions; ``p_book`` rides the cached MC profile ONLY when it is
         generation-fresh (stale ⇒ None ⇒ the component is neutral: UNKNOWN
-        never widens). The budget is the same enforced denominator the
-        P(book) axis divides by."""
+        never widens).
+
+        THE BUDGETS ARE TELEMETRY NOW (operator directive 2026-07-27). They no
+        longer enter the component's magnitude at all: a wall in the
+        denominator with the BOOK'S OWN dollars in the numerator is exactly the
+        book-size term the operator ruled out, and it is why the
+        ``family_wall_cc = game_wall_cc`` mis-assignment mattered. The axis
+        reads SHARE against its own dollar-Herfindahl instead — both pure
+        ratios — and the enforced walls stay where they belong: the REFUSAL
+        layer in ``risk/limits``. They are still published here so the operator
+        readout can show how loaded each axis is."""
+        p_book: float | None = None
+        profile = self._pbook_profile
+        gen = self._exposure.position_generation
+        if profile is not None and profile.input_generation == gen:
+            p_book = profile.p_book
+        # CACHED ON THE POSITION GENERATION (2026-07-27 throughput): the shares
+        # below read the COMMITTED book only, so they cannot move between two
+        # quotes at the same generation. ``p_book`` is part of the key so a
+        # refreshed MC read still lands immediately.
+        key = (gen, p_book)
+        cached = self._leg_axis_profile
+        if cached is not None and self._leg_axis_profile_key == key:
+            return cached
         fam = snap.committed_loss_by_family_cc
         ent = snap.committed_loss_by_entity_cc
         total_fam = float(sum(fam.values()))
         total_ent = float(sum(ent.values()))
-        p_book: float | None = None
-        profile = self._pbook_profile
-        if (
-            profile is not None
-            and profile.input_generation == self._exposure.position_generation
-        ):
-            p_book = profile.p_book
-        return LegAxisProfile(
-            shares_by_family=(
-                {k: v / total_fam for k, v in fam.items()} if total_fam > 0 else {}
-            ),
+        fam_shares = (
+            {k: v / total_fam for k, v in fam.items()} if total_fam > 0 else {}
+        )
+        ent_shares = (
+            {k: v / total_ent for k, v in ent.items()} if total_ent > 0 else {}
+        )
+        built = LegAxisProfile(
+            shares_by_family=fam_shares,
             total_family_cc=total_fam,
-            shares_by_entity=(
-                {k: v / total_ent for k, v in ent.items()} if total_ent > 0 else {}
-            ),
+            shares_by_entity=ent_shares,
             total_entity_cc=total_ent,
-            budget_cc=self._enforced_game_budget_cc(),
+            # Each axis's dollar-Herfindahl, computed HERE with the shares (once
+            # per position generation) rather than re-summed over 79 entity keys
+            # on the quote path.
+            hhi_family=math.fsum(s * s for s in fam_shares.values()),
+            hhi_entity=math.fsum(s * s for s in ent_shares.values()),
+            family_budget_cc=self._enforced_game_budget_cc(),
+            entity_budget_cc=self._enforced_entity_budget_cc(),
             p_book=p_book,
+        )
+        self._leg_axis_profile = built
+        self._leg_axis_profile_key = key
+        return built
+
+    def _log_net_effect(self, cert: ConcentrationCertificate) -> None:
+        """LEVER #3 telemetry: one structured line per entity-axis net-effect
+        certificate, so admissions and refusals are both countable on the tape
+        in DOLLARS (the operator's measure) instead of inferred from a decline
+        tally. Fires only when a key has actually breached AND the admission is
+        armed, so it is bounded by the breach rate, not the RFQ rate.
+        Fix-isolation: a logging failure can never reach the pricing path or
+        change a risk decision — it is swallowed here."""
+        try:
+            log.info(
+                "entity_net_effect",
+                key=cert.key,
+                admitted=bool(cert.certified),
+                verdict=cert.verdict,
+                pre_eff_n=round(cert.pre_eff_n, 3),
+                post_eff_n=round(cert.post_eff_n, 3),
+                pre_key_cc=cert.pre_key_cc,
+                post_key_cc=cert.post_key_cc,
+                pre_total_cc=cert.pre_total_cc,
+                post_total_cc=cert.post_total_cc,
+                n_keys_post=cert.n_keys_post,
+            )
+        except Exception:  # pragma: no cover - telemetry must never propagate
+            pass
+
+    def _enforced_entity_budget_cc(self) -> float:
+        """The ENFORCED accumulated-entity wall in cc — ``threshold_cc(
+        entity_loss_frac, bankroll)``, the exact number the entity cap refuses
+        on. Unarmed axis or unusable bankroll ⇒ the per-game budget (an unarmed
+        axis has no wall of its own; falling back to the tightest enforced game
+        bound is what both leg-axis steers did before the split)."""
+        limits = self._limits.limits
+        bankroll_cc = self._risk_bankroll_cc()
+        if (
+            limits.entity_loss_frac is not None
+            and bankroll_cc is not None
+            and bankroll_cc > 0
+        ):
+            return float(threshold_cc(limits.entity_loss_frac, bankroll_cc))
+        return self._enforced_game_budget_cc()
+
+    def _publish_crn_cache(self, generation: int) -> None:
+        """LEVER #5 — publish the CRN sample behind ``Cov(candidate, book)``.
+
+        WHY THIS IS THE SIGNAL. ``delta_p_book`` must NOT reach price: R² =
+        0.921 against candidate EV (92% redundant with what the pricer already
+        has), 42.2% of candidates unresolvable at 3σ at n=20k, and 41.7% of
+        EV-residual signs flip across caches. ``Cov(candidate payoff,
+        pre-existing book P&L)`` is a MEAN OF A PRODUCT — every draw
+        contributes — and it is EV-ORTHOGONAL BY CONSTRUCTION. Measured: SE
+        $0.378 = 0.0161 c/contract against an EV-controlled spread of 1.1333
+        c/contract ⇒ SNR 70.4, matched-pair t = 8.4.
+
+        THE JOINT IS DELIBERATE. This is a LOCATION-axis object (it prices a
+        quote), so it samples ``corr_location_point`` — the PRICING joint the
+        fills were actually quoted on — never the tail-dependence stress joint
+        every ENFORCED gate rides (2026-07-26 axis split). A pricing steer off
+        the collapsed stress joint would mark every fill adverse by
+        construction.
+
+        BLAST RADIUS. Slow loop only: this rides the off-hot-path book-risk
+        publish and runs at most once per position generation. The quote path
+        reads the cached arrays and never samples. Any failure logs and leaves
+        the cache None — the steer then runs on the ZERO-standard-error
+        Herfindahl reading alone, which is a complete steer by itself.
+
+        DERIVE BEFORE USE. The cache publishes only if the drawn sample's own
+        measured SNR clears the ratified z = 3 anchor; below that the estimate
+        is not resolvable and the covariance term abstains rather than
+        contributing noise to a price."""
+        inputs = self._last_book_inputs
+        if inputs is None or inputs.input_generation != generation:
+            return
+        bankroll_cc = self._risk_bankroll_cc()
+        if bankroll_cc is None or bankroll_cc <= 0:
+            self._crn_cache = None
+            return
+        try:
+            import numpy as np
+
+            from combomaker.sim.engine import book_pnl, sample_leg_values
+
+            model = inputs.model
+            if model.unknown or not model.legs or not model.positions:
+                self._crn_cache = None
+                return
+            n = int(self._config.crn_cache_samples)
+            rng = np.random.default_rng(inputs.seed ^ 0x5E31)
+            values = sample_leg_values(
+                model.legs, model.corr_location_point, n, rng
+            )
+            pnl = book_pnl(values, model.positions)
+            # The value signal's own measured dispersion over the book's OWN
+            # tickets — the steer's derived half-range candidate, and the
+            # denominator of the resolvability check. Nothing hand-set.
+            cache = CrnBookCache(
+                input_generation=generation,
+                col_by_ticker=dict(model.leg_index),
+                leg_values=values,
+                book_pnl=pnl,
+                bankroll_cc=float(bankroll_cc),
+            )
+            vals: list[float] = []
+            for pos in self._exposure.positions.values():
+                v = cache.value_cc_per_contract(pos.legs)
+                if v is not None:
+                    vals.append(v)
+            if len(vals) < 2:
+                self._crn_cache = None
+                return
+            sd = float(np.std(vals, ddof=1))
+            # SE of a covariance mean over n draws, in the same cc/contract
+            # units — the resolvability denominator.
+            se = float(np.std(pnl, ddof=1)) * 0.5 * CC_PER_DOLLAR / (
+                float(bankroll_cc) * math.sqrt(max(1, pnl.size))
+            )
+            snr = sd / se if se > 0 else 0.0
+            if snr < self._config.crn_min_snr_z:
+                log.info(
+                    "crn_cache_unresolvable",
+                    generation=generation,
+                    snr=round(snr, 2),
+                    required_z=self._config.crn_min_snr_z,
+                )
+                self._crn_cache = None
+                return
+            self._crn_cache = CrnBookCache(
+                input_generation=generation,
+                col_by_ticker=cache.col_by_ticker,
+                leg_values=values,
+                book_pnl=pnl,
+                bankroll_cc=float(bankroll_cc),
+                value_sd_cc=sd,
+            )
+            log.info(
+                "crn_cache_published",
+                generation=generation,
+                n_samples=int(pnl.size),
+                n_legs=len(model.legs),
+                value_sd_cc=round(sd, 3),
+                snr=round(snr, 2),
+            )
+        except Exception:
+            log.exception("crn_cache_publish_failed")
+            self._crn_cache = None
+
+    def _concentration_profile(self, snap: ExposureSnapshot) -> ConcentrationProfile:
+        """LEVER #5 (2026-07-27) — the steer's inputs, all measured state.
+
+        THE LOSS-EVENT BOOK is rebuilt only when the position generation moves
+        (a fill / settlement / rehydrate), never per quote: the AND-bound
+        dollar-Herfindahl marginal is O(1) against the cached running sums,
+        which is the whole reason it costs 1.47us against the 7.16us heuristic
+        it replaces. Correctness is exact, not approximate — the generation
+        counter is the same one every other cache in this class keys on.
+
+        THE WALLS are each axis's OWN ENFORCED threshold, taken from the LIVE
+        limit checker: the per-game loss budget the P(book) axis already
+        divides by, and the accumulated-entity wall (``entity_loss_frac`` x
+        bankroll) the entity cap refuses on. The family axis has no separate
+        enforced wall, so it reads the game budget — the tightest bound a
+        one-direction stack can burn. NOTHING here is a count.
+        """
+        gen = self._exposure.position_generation
+        if gen != self._loss_event_generation:
+            self._loss_event_book = build_loss_event_book(
+                (ticket_bucket(p.legs), float(p.max_loss_cc))
+                for p in self._exposure.positions.values()
+            )
+            self._loss_event_generation = gen
+        game_wall_cc = self._enforced_game_budget_cc()
+        # ONE owner for the entity denominator (2026-07-27): the same helper the
+        # leg-axis profile uses, so the two steers can never drift apart.
+        entity_wall_cc = self._enforced_entity_budget_cc()
+        return ConcentrationProfile(
+            loss_events=self._loss_event_book,
+            game_dollars_cc={
+                k: float(v) for k, v in snap.worst_case_loss_by_game_cc.items()
+            },
+            game_wall_cc=game_wall_cc,
+            family_dollars_cc={
+                k: float(v) for k, v in snap.committed_loss_by_family_cc.items()
+            },
+            family_wall_cc=game_wall_cc,
+            entity_dollars_cc={
+                k: float(v) for k, v in snap.loss_by_entity_cc.items()
+            },
+            entity_wall_cc=entity_wall_cc,
+            fill_elasticity_per_cent=self._config.fill_elasticity_per_cent,
+            centre=self._steer_centre,
+            crn=(
+                self._crn_cache
+                if self._crn_cache is not None
+                and self._crn_cache.input_generation == gen
+                else None
+            ),
         )
 
     def _log_leg_axis_exposure(self) -> None:
@@ -1603,6 +2027,310 @@ class QuoteLifecycle:
             self._publish_book_risk(snap)
         except Exception:
             log.exception("book_risk_recompute_offloop_failed")
+
+    # ------------------------------------------------------ deployment scale
+
+    def deploy_scale_for_check(self) -> float:
+        """The scale the caps' DEPLOY-side budgets breathe at, for one check.
+
+        HOT-PATH COST: an attribute read, a comparison and (only when the book
+        changed since the solve) one cached sum over committed positions. The
+        SOLVE never runs here — it runs on the maintenance tick, off-loop.
+
+        BOOK-GROWTH DECAY (2026-07-27, found by the live ship gate). The first
+        cut invalidated the scale on any position-generation change. That is
+        correct in spirit and useless in practice: a RESERVATION bumps the
+        position generation, so on live flow the scale collapsed to 1.0 within
+        one accept and never re-armed between solves — the feature measured
+        headroom it could never spend.
+
+        The honest replacement charges every dollar of book growth against the
+        measured headroom instead of throwing the measurement away. The solve
+        said "this book could be S times bigger". If committed premium-at-risk
+        has since grown by g = live / solved, the room that is left is S / g:
+
+            effective = clamp(S x solved_premium / live_premium, 1.0, S)
+
+        Monotone and fail-safe SMALLER by construction — the scale can only
+        ever walk DOWN as fills land, reaching exactly 1.0 when the book has
+        grown into the whole solved envelope, with no cliff and no dead zone.
+        It is a MECHANISM (measured book growth), not a tolerance number.
+
+        Every remaining uncertainty still returns 1.0 outright:
+          - feature disarmed (byte-identical to before this existed);
+          - the solve never succeeded / raised (``FAILSAFE``);
+          - the solved or the live premium is unreadable / non-positive.
+
+        This decay is a BETWEEN-SOLVES bridge, never the safety argument: the
+        portfolio ENVELOPE (det-max / tail-prob / ruin / CVaR) is enforced at
+        100% and UNSCALED against the fresh gating snapshot on every candidate,
+        so a scale that is briefly generous can still only loosen SHAPE caps
+        inside a wall that has not moved.
+        """
+        if not self._config.deploy_scale_enabled:
+            return 1.0
+        res = self._deploy_scale
+        if not res.solved or res.scale <= 1.0:
+            return 1.0
+        solved_premium = res.solved_premium_cc
+        if solved_premium <= 0:
+            return 1.0
+        if res.book_generation == self._exposure.position_generation:
+            return res.scale
+        live_premium = self._committed_premium_cc()
+        if live_premium <= 0:
+            return 1.0
+        if live_premium <= solved_premium:
+            return res.scale                    # book did not grow — full room
+        decayed = res.scale * solved_premium / live_premium
+        return max(1.0, min(res.scale, decayed))
+
+    def _committed_premium_cc(self) -> int:
+        """Total committed premium-at-risk, CACHED on the position generation.
+
+        One O(positions) sum per position change (a fill / settlement /
+        reservation), not per quote — the hot path re-reads the cache."""
+        gen = self._exposure.position_generation
+        cached = self._committed_premium_cache
+        if cached is not None and cached[0] == gen:
+            return cached[1]
+        total = sum(p.max_loss_cc for p in self._exposure.positions.values())
+        self._committed_premium_cache = (gen, total)
+        return total
+
+    async def solve_deploy_scale_offloop(self) -> None:
+        """OFF-LOOP solve: every MC probe runs in the ``book_risk_pool`` worker.
+
+        The cheap parts (build the scaled ``BookModel``, run ``check``) stay on
+        the loop — the same on-loop work one book-risk refresh and one
+        quote-time check already do — and the expensive per-probe MC is
+        ``await``ed in the worker process, yielding control so the maintenance
+        loop keeps beating the supervisor heartbeat throughout. Falls back to
+        the inline solve when no pool is wired (paper/backtests/tests).
+
+        The ladder is walked DESCENDING and STOPS at the first feasible scale,
+        so the common case costs far fewer than ``deploy_scale_grid_points``
+        MCs. Never raises on the loop."""
+        if not self._config.deploy_scale_enabled:
+            return
+        if self._book_risk_pool is None:
+            self.solve_deploy_scale()
+            return
+        pool = self._book_risk_pool
+        t0 = self._clock.monotonic_ns()
+        try:
+            gen = self._exposure.position_generation
+            positions = list(self._exposure.positions.values())
+            bankroll = self._risk_bankroll_cc()
+            if not positions or bankroll is None or bankroll <= 0:
+                self._deploy_scale = DEPLOY_SCALE_FAILSAFE
+                return
+            graded: dict[float, tuple[bool, tuple[str, ...]]] = {}
+
+            async def grade(s: float) -> bool:
+                inputs = self._deploy_scale_mc_inputs(s, positions, bankroll, gen)
+                if inputs is None:
+                    graded[s] = (False, ("empty_scaled_book",))
+                    return False
+                snap = await pool.run(inputs)
+                verdict = self._deploy_scale_check(s, positions, bankroll, snap)
+                graded[s] = verdict
+                return verdict[0]
+
+            await grade(1.0)
+            for s in scale_grid(
+                self._config.deploy_scale_s_max,
+                self._config.deploy_scale_grid_points,
+            ):
+                if self._exposure.position_generation != gen:
+                    # The book moved under the solve — the answer would describe
+                    # a portfolio we no longer hold. Abandon; the next tick
+                    # re-solves. (``deploy_scale_for_check`` would reject it on
+                    # the generation stamp anyway; stopping saves the rest of
+                    # the MC budget.)
+                    log.info("deploy_scale_solve_abandoned_stale", generation=gen)
+                    return
+                if await grade(s):
+                    break                      # monotone => this is the answer
+            result = solve_deployment_scale(
+                graded,
+                s_max=self._config.deploy_scale_s_max,
+                points=self._config.deploy_scale_grid_points,
+                solve_ms=(self._clock.monotonic_ns() - t0) / 1e6,
+            )
+            self._deploy_scale = replace(
+                result,
+                book_generation=gen,
+                solved_premium_cc=sum(p.max_loss_cc for p in positions),
+            )
+            self._log_deploy_scale(result, gen, len(positions), offloop=True)
+        except Exception:
+            log.exception("deploy_scale_solve_offloop_failed")
+            self._deploy_scale = DEPLOY_SCALE_FAILSAFE
+
+    def solve_deploy_scale(self) -> None:
+        """INLINE solve (paper / backtests / tests / no pool wired).
+
+        Byte-identical POLICY to the off-loop path — they share the probe
+        ladder, the per-probe grading and ``solve_deployment_scale`` — the MC
+        simply runs on the calling thread. Never raises."""
+        if not self._config.deploy_scale_enabled:
+            return
+        t0 = self._clock.monotonic_ns()
+        try:
+            gen = self._exposure.position_generation
+            positions = list(self._exposure.positions.values())
+            bankroll = self._risk_bankroll_cc()
+            if not positions or bankroll is None or bankroll <= 0:
+                self._deploy_scale = DEPLOY_SCALE_FAILSAFE
+                return
+            graded: dict[float, tuple[bool, tuple[str, ...]]] = {}
+
+            def grade(s: float) -> bool:
+                graded[s] = self._deploy_scale_feasible(s, positions, bankroll, gen)
+                return graded[s][0]
+
+            grade(1.0)
+            for s in scale_grid(
+                self._config.deploy_scale_s_max,
+                self._config.deploy_scale_grid_points,
+            ):
+                if grade(s):
+                    break
+            result = solve_deployment_scale(
+                graded,
+                s_max=self._config.deploy_scale_s_max,
+                points=self._config.deploy_scale_grid_points,
+                solve_ms=(self._clock.monotonic_ns() - t0) / 1e6,
+            )
+            self._deploy_scale = replace(
+                result,
+                book_generation=gen,
+                solved_premium_cc=sum(p.max_loss_cc for p in positions),
+            )
+            self._log_deploy_scale(result, gen, len(positions), offloop=False)
+        except Exception:
+            log.exception("deploy_scale_solve_failed")
+            self._deploy_scale = DEPLOY_SCALE_FAILSAFE
+
+    def _log_deploy_scale(
+        self, result: DeployScaleResult, gen: int, n_positions: int, *, offloop: bool
+    ) -> None:
+        log.info(
+            "deploy_scale_solved",
+            scale=round(result.scale, 4),
+            solved=result.solved,
+            binding=list(result.binding),
+            reason=result.reason,
+            evaluations=result.evaluations,
+            solve_ms=round(result.solve_ms, 1),
+            generation=gen,
+            n_positions=n_positions,
+            offloop=offloop,
+        )
+
+    def _scaled_positions(
+        self, s: float, positions: list[OpenPosition]
+    ) -> list[OpenPosition]:
+        """The book UNIFORMLY scaled by ``s``.
+
+        Contracts are integer centi-contracts, so the scaling rounds; a position
+        that rounds to zero is dropped. That can only make the scaled book
+        SMALLER (a sub-centi-contract amount), i.e. the solve marginally more
+        permissive at the 1e-2-contract level — while a scaled book that comes
+        out entirely EMPTY is graded INFEASIBLE, never a free pass."""
+        out: list[OpenPosition] = []
+        for p in positions:
+            c = int(round(int(p.contracts) * s))
+            if c > 0:
+                out.append(replace(p, contracts=CentiContracts(c)))
+        return out
+
+    def _deploy_scale_mc_inputs(
+        self, s: float, positions: list[OpenPosition], bankroll_cc: int, gen: int
+    ) -> BookRiskInputs | None:
+        """The immutable inputs for ONE probe's MC (picklable => pool-safe)."""
+        scaled = self._scaled_positions(s, positions)
+        if not scaled:
+            return None
+        model = build_book_model(
+            scaled, marginals=self._marginals, within_game_rho=self._within_game_rho
+        )
+        return BookRiskInputs(
+            model=model,
+            n_samples=self._config.deploy_scale_mc_samples,
+            seed=self._config.book_risk_seed,
+            band="high",
+            bankroll_cc=bankroll_cc,
+            structural_cfg=self._structural_cfg,
+            current_equity_cc=self._ruin_equity_basis_cc(model),
+            ruin_floor_frac=self._config.ruin_floor_frac,
+            ruin_prob_ci_z=self._config.ruin_prob_ci_z,
+            input_generation=gen,
+            realized_pnl_cc=self._realized_pnl_cc,
+        )
+
+    def _deploy_scale_check(
+        self,
+        s: float,
+        positions: list[OpenPosition],
+        bankroll_cc: int,
+        snap: BookRiskSnapshot,
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Is the book scaled by ``s`` clean under EVERY enforced cap?
+
+        The caps are evaluated at their UNSCALED thresholds — s is bounded by
+        the deploy-side budgets as well as by the portfolio envelope, which is
+        the strictest reading of the operator's "bounded above by every
+        already-enforced cap". An UNUSABLE snapshot is INFEASIBLE (fail-closed:
+        an unmeasured tail is never headroom)."""
+        if not snap.usable:
+            return False, ("book_risk_unusable",)
+        scaled = self._scaled_positions(s, positions)
+        if not scaled:
+            return False, ("empty_scaled_book",)
+        probe = ExposureBook(self._conventions, is_me_event=self._exposure.is_me_event)
+        for p in scaled:
+            probe.add_position(p)
+        breaches = self._limits.check(
+            probe,
+            self._marginals,
+            self.daily_pnl,
+            risk_bankroll_cc=bankroll_cc,
+            bankroll_source_configured=self._bankroll_source_configured(),
+            start_time_provider=self._start_time_provider,
+            halt_inputs=self._halt_inputs(),
+            book_risk=snap,
+        )
+        enforced = self.partition_breaches(list(breaches))
+        return (not enforced), tuple(sorted({str(b.reason) for b in enforced}))
+
+    def _deploy_scale_feasible(
+        self,
+        s: float,
+        positions: list[OpenPosition],
+        bankroll_cc: int,
+        gen: int,
+    ) -> tuple[bool, tuple[str, ...]]:
+        """One INLINE probe: live MC on the scaled book, then the live checker."""
+        inputs = self._deploy_scale_mc_inputs(s, positions, bankroll_cc, gen)
+        if inputs is None:
+            return False, ("empty_scaled_book",)
+        snap = compute_book_risk(
+            inputs.model,
+            n_samples=inputs.n_samples,
+            seed=inputs.seed,
+            band=inputs.band,
+            bankroll_cc=inputs.bankroll_cc,
+            structural_cfg=inputs.structural_cfg,
+            current_equity_cc=inputs.current_equity_cc,
+            ruin_floor_frac=inputs.ruin_floor_frac,
+            ruin_prob_ci_z=inputs.ruin_prob_ci_z,
+            input_generation=inputs.input_generation,
+            realized_pnl_cc=inputs.realized_pnl_cc,
+        )
+        return self._deploy_scale_check(s, positions, bankroll_cc, snap)
+
 
     def _book_risk_for_check(self) -> PortfolioRisk | None:
         """The book-risk snapshot to feed ``check()``'s portfolio-CVaR cap.
@@ -1974,16 +2702,254 @@ class QuoteLifecycle:
         return enforced
 
     async def _run_candidate_mc(
-        self, inputs: CandidateBookRiskInputs
+        self, inputs: CandidateBookRiskInputs, *, deadline_s: float
     ) -> CandidateBookRisk:
         """Run ONE candidate-MC eval, off the loop via ``BookRiskPool.run_candidate``
         when a pool is wired (the CPU-bound MC never blocks the heartbeat), else
         INLINE via the pool's OWN worker fn (paper / backtests / tests — fast there,
-        and byte-identical to the off-loop path). Raises on any pool/worker error;
-        the caller turns that into a fail-closed decline."""
+        and byte-identical to the off-loop path).
+
+        BOUNDED by ``deadline_s`` — the confirm window that is actually LEFT,
+        measured off the clock by the caller. This is what replaced the deleted
+        cost predictor (B2): the MC is always STARTED while any window remains,
+        and a run that will not land in time raises ``TimeoutError`` (the worker
+        finishes and frees itself, exactly as ``run_state_worst_case`` documents)
+        which the caller resolves as a LATENCY event through the deterministic
+        fallback — never as a risk verdict. Any other pool/worker error raises and
+        the caller turns it into a fail-closed decline.
+
+        The INLINE path (no pool) is synchronous and cannot be interrupted, so it
+        is not wrapped: it is the paper/backtest/test path, where the MC is fast
+        and there is no exchange window to miss."""
         if self._book_risk_pool is not None:
-            return await self._book_risk_pool.run_candidate(inputs)
+            return await self._book_risk_pool.run_candidate(
+                inputs, deadline_s=deadline_s
+            )
         return _worker_candidate_book_risk(inputs)
+
+    # ---------------------------------------- derived confirm-window budgeting
+
+    def _confirm_window_reserve_ns(self) -> int:
+        """The time that MUST still be on the clock when the candidate gate gives
+        up, so the confirm can actually land. Fully MEASURED — no typed number.
+
+        Three MEASURED terms:
+          * ``confirm.rtt_ms`` p99 — the observed round trip of the confirm call
+            we still have to make;
+          * its observed DISPERSION (p99 − p50) — the safety margin taken FROM
+            the latency distribution itself, so a link that becomes erratic
+            widens its own margin without anyone touching a config;
+          * ``candidate_gate.fallback_ms`` p99 — the measured cost of the
+            deterministic fallback that runs when the budget expires (it is
+            microseconds of arithmetic, but it is measured rather than assumed).
+
+        Neither term needs a prior CONFIRM to be measured, so the very first
+        accept of a process already budgets honestly:
+          * confirms are rare (tens/day), so until ``confirm.rtt_ms`` has samples
+            the round trip is read from ``quote.create_rtt_ms`` — the same REST
+            verb to the same venue over the same link, sampled thousands of times
+            an hour. A measured proxy, never a typed guess;
+          * the deterministic check is timed on EVERY accept by the reservation
+            itself (``confirm.deterministic_check_ms``), which runs the identical
+            ``LimitChecker.check`` machinery moments before the gate.
+
+        UNMEASURED ⇒ WORST CASE. With no samples at all the reserve is the WHOLE
+        exchange window, driving the gate budget to zero: that accept resolves on
+        the deterministic caps. Under the new semantics a zero budget costs a
+        refinement, never an auction — and it self-warms immediately."""
+        rtt_hi = self._first_measured_quantile_ms(
+            ("confirm.rtt_ms", "quote.create_rtt_ms"), 0.99
+        )
+        rtt_mid = self._first_measured_quantile_ms(
+            ("confirm.rtt_ms", "quote.create_rtt_ms"), 0.50
+        )
+        fallback_hi = self._first_measured_quantile_ms(
+            ("confirm.deterministic_check_ms", "confirm.decision_ms"), 0.99
+        )
+        if rtt_hi is None or rtt_mid is None or fallback_hi is None:
+            return EXCHANGE_CONFIRM_WINDOW_NS
+        dispersion_ms = max(0.0, rtt_hi - rtt_mid)
+        reserve_ms = rtt_hi + dispersion_ms + fallback_hi
+        return min(EXCHANGE_CONFIRM_WINDOW_NS, int(reserve_ms * 1e6))
+
+    def _first_measured_quantile_ms(
+        self, series: Sequence[str], q: float
+    ) -> float | None:
+        """The ``q``-quantile of the FIRST series in ``series`` that has samples,
+        or None if none do.
+
+        The order is a MEASURED-PROXY CHAIN, most-direct first: the real thing,
+        then the closest thing we actually measure often enough to be warm. It
+        exists so "unmeasured ⇒ worst case" never fires for a quantity we can in
+        fact observe — e.g. the confirm round trip is the direct measurement but
+        confirms are rare, while the quote POST is the same REST verb to the same
+        venue and is sampled thousands of times an hour."""
+        for name in series:
+            value = self._metrics.quantile_ms(name, q)
+            if value is not None:
+                return value
+        return None
+
+    def _candidate_gate_budget_ns(self, accept_ns: int | None) -> int:
+        """The wall budget this accept's candidate gate may consume, DERIVED:
+
+            exchange confirm window
+              − time already burnt since the accept landed (last look, fill
+                velocity, the reservation, and the last-look MC waiver when it
+                ran — all of it accounted automatically, because the anchor is
+                the accept itself)
+              − the MEASURED reserve the confirm round trip needs (above)
+
+        Clamped at zero. With ``candidate_gate_derived_deadline`` off, or with no
+        accept anchor (paper / tests calling the gate directly), the pre-
+        2026-07-27 typed ``candidate_gate_deadline_s`` applies unchanged."""
+        if not self._config.candidate_gate_derived_deadline or accept_ns is None:
+            return int(self._config.candidate_gate_deadline_s * 1e9)
+        elapsed_ns = self._clock.monotonic_ns() - accept_ns
+        return max(
+            0, EXCHANGE_CONFIRM_WINDOW_NS - elapsed_ns - self._confirm_window_reserve_ns()
+        )
+
+    async def _candidate_gate_fallback(
+        self,
+        quote_id: str,
+        state: OpenQuoteState,
+        *,
+        reservation_id: str | None,
+        cause: str,
+        detail: str,
+    ) -> tuple[bool, str, ReasonCode | None]:
+        """THE TIMEOUT IS NOT A DECLINE (2026-07-27, operator directive).
+
+        Reached when the MC refinement could not be completed inside the DERIVED
+        budget (the build or the MC would not fit, the build was abandoned
+        mid-flight, or the book moved under every retry). We have ALREADY WON an
+        auction that (a) the analytic/gross/burst gates admitted, (b) a real
+        reservation granted headroom for, and (c) was priced +EV. Discarding it
+        because a computation was slow is the worst available default — it cost
+        70 won auctions in two days.
+
+        What we do instead is decide from state we ALREADY HAVE, deterministically:
+        re-run the ENFORCED caps (det-max, per-combo, entity/game, slate, gross,
+        halt inputs) over the SAME entity set the reservation used, against the
+        CURRENT live book. This is arithmetic — no Monte Carlo, microseconds —
+        and it preserves the reason last look exists: the book can move between
+        the reservation and now, and a fill that no longer fits the caps STILL
+        DECLINES. Only the MC REFINEMENT is skipped.
+
+        Returns ``(True, "", None)`` to confirm, or ``(False, detail,
+        DECLINE_CANDIDATE_GATE_TIMEOUT)`` — a reason code that is deliberately
+        DISTINCT from ``DECLINE_CANDIDATE_RISK`` so the decline report can tell a
+        latency-degraded refusal from a risk model refusal."""
+        if not self._config.candidate_gate_timeout_fallback:
+            # Rollback switch: the pre-2026-07-27 behaviour, byte-identical.
+            return False, detail, ReasonCode.DECLINE_CANDIDATE_RISK
+        t0 = self._clock.monotonic_ns()
+        try:
+            breaches = self._deterministic_confirm_breaches(
+                quote_id, state, reservation_id=reservation_id
+            )
+        except Exception as exc:  # noqa: BLE001 — a broken fallback fails closed
+            log.error(
+                "candidate_gate_fallback_errored",
+                quote_id=quote_id,
+                cause=cause,
+                error=repr(exc),
+            )
+            return (
+                False,
+                f"{detail}; deterministic fallback errored: {exc!r}",
+                ReasonCode.DECLINE_CANDIDATE_GATE_TIMEOUT,
+            )
+        fallback_ms = (self._clock.monotonic_ns() - t0) / 1e6
+        # Feeds _confirm_window_reserve_ns: the budget reserves the measured cost
+        # of this very check, so the fallback can never be the thing that runs out
+        # of window. SHARED series with the reservation (identical machinery), so
+        # the estimate is warm from the first accept of a process.
+        self._metrics.observe_ms("confirm.deterministic_check_ms", fallback_ms)
+        self._metrics.observe_ms("candidate_gate.fallback_ms", fallback_ms)
+        if breaches:
+            self._metrics.inc("candidate_gate.timeout_fallback_decline")
+            reasons = ",".join(sorted({str(b.reason) for b in breaches}))
+            log.warning(
+                "candidate_gate_timeout_fallback_decline",
+                quote_id=quote_id,
+                cause=cause,
+                fallback_ms=round(fallback_ms, 3),
+                breaches=reasons,
+                detail="MC refinement did not fit the derived confirm budget AND "
+                "the deterministic caps refuse this fill against the live book",
+            )
+            return (
+                False,
+                (
+                    f"{detail}; deterministic fallback DECLINED "
+                    f"(enforced breaches: {reasons})"
+                ),
+                ReasonCode.DECLINE_CANDIDATE_GATE_TIMEOUT,
+            )
+        self._metrics.inc("candidate_gate.timeout_fallback_confirm")
+        log.warning(
+            "candidate_gate_timeout_fallback_confirm",
+            quote_id=quote_id,
+            cause=cause,
+            fallback_ms=round(fallback_ms, 3),
+            n_positions=len(self._exposure.positions),
+            detail="MC refinement did not fit the derived confirm budget; the "
+            "enforced deterministic caps re-checked against the live book ADMIT "
+            "this already-won auction — confirming (latency is not a risk verdict)",
+        )
+        return True, "", None
+
+    def _deterministic_confirm_breaches(
+        self,
+        quote_id: str,
+        state: OpenQuoteState,
+        *,
+        reservation_id: str | None,
+    ) -> list[Breach]:
+        """The CHEAP DETERMINISTIC re-check of the ENFORCED caps at confirm — the
+        mandatory safety floor under the timeout fallback. Returns the enforced
+        breaches ([] = admissible).
+
+        With a reservation service the candidate is already HELD, so
+        ``RiskReservationService.revalidate`` re-runs ``LimitChecker.check`` over
+        exactly the entity set ``try_reserve`` used (outstanding reservations,
+        which include this candidate) — no double count, no state mutation.
+
+        Without one (paper / backtests / tests) there is nothing held, so the
+        candidate is passed explicitly to the SAME checker with the SAME
+        arguments the reservation path uses. Either way this is the identical
+        machinery the enforced caps always run through — never a reimplementation
+        of a cap (hard rule 8)."""
+        if self._reservation is not None and reservation_id is not None:
+            return self._reservation.revalidate(
+                reservation_id,
+                marginals=self._marginals,
+                daily_pnl=self.daily_pnl,
+                risk_bankroll_cc=self._risk_bankroll_cc(),
+                bankroll_source_configured=self._bankroll_source_configured(),
+                start_time_provider=self._start_time_provider,
+                halt_inputs=self._halt_inputs(),
+                book_risk=self._book_risk_for_check(),
+                apply_resting_haircut=self._config.resting_haircut_at_confirm,
+                deploy_scale=self.deploy_scale_for_check(),
+            )
+        candidate = self._fill_position(quote_id, state)
+        raw = self._limits.check(
+            self._exposure,
+            self._marginals,
+            self.daily_pnl,
+            candidate_positions=[candidate],
+            risk_bankroll_cc=self._risk_bankroll_cc(),
+            bankroll_source_configured=self._bankroll_source_configured(),
+            start_time_provider=self._start_time_provider,
+            halt_inputs=self._halt_inputs(),
+            book_risk=self._book_risk_for_check(),
+            apply_resting_haircut=self._config.resting_haircut_at_confirm,
+            deploy_scale=self.deploy_scale_for_check(),
+        )
+        return self._partition_breaches(raw)
 
     async def _candidate_gate_verdict(
         self,
@@ -1991,15 +2957,28 @@ class QuoteLifecycle:
         state: OpenQuoteState,
         *,
         reservation_id: str | None,
-    ) -> tuple[bool, str]:
+        accept_ns: int | None = None,
+    ) -> tuple[bool, str, ReasonCode | None]:
         """P0-1/P0-2 candidate-aware portfolio-risk gate for ONE contemplated fill,
         ATOMIC with the reservation book.
 
-        Returns ``(True, "")`` to PROCEED to the confirm round-trip (the provisional
-        reservation, if any, stays held for the caller to commit), or
-        ``(False, detail)`` to DECLINE with ``DECLINE_CANDIDATE_RISK``. STRICTLY
-        ADDITIVE — reachable only after the existing gates ADMIT the fill, and it can
-        only DECLINE, never admit.
+        Returns ``(True, "", None)`` to PROCEED to the confirm round-trip (the
+        provisional reservation, if any, stays held for the caller to commit), or
+        ``(False, detail, reason)`` to DECLINE — where ``reason`` is
+        ``DECLINE_CANDIDATE_RISK`` when the RISK MODEL refused and
+        ``DECLINE_CANDIDATE_GATE_TIMEOUT`` when the MC could not be completed in
+        the derived window AND the deterministic fallback also refused. STRICTLY
+        ADDITIVE — reachable only after the existing gates ADMIT the fill, and it
+        can only DECLINE, never admit.
+
+        2026-07-27 CONFIRM-WINDOW REBUILD. The gate is now a best-effort
+        REFINEMENT on a DERIVED budget (``_candidate_gate_budget_ns``): before
+        starting any piece of work it predicts that work's cost from MEASURED
+        per-unit rates (ms/pair for the O(T^2) input build, ms/position for the
+        MC) and simply does not start what cannot fit; the build is itself
+        interruptible; and every way of running out of time resolves through
+        ``_candidate_gate_fallback`` — the deterministic enforced caps re-checked
+        against the live book — instead of an automatic decline.
 
         P0-2 (candidate MC atomic with reservations). Before this gate runs the caller
         has ALREADY created a PROVISIONAL reservation for this candidate under the
@@ -2017,15 +2996,14 @@ class QuoteLifecycle:
              during the await — the verdict priced a book that no longer exists, so it
              is DISCARDED and the inputs are REBUILT + retried.
 
-        The retry loop is BOUNDED by BOTH the remaining confirm deadline
-        (``candidate_gate_deadline_s`` wall budget) and ``candidate_gate_max_retries``.
-        If a rebuild is needed but too little deadline remains for one more MC, or the
-        retry budget is exhausted, the gate FAILS CLOSED (declines) rather than
-        silently consuming the whole confirm window (audit LIVE CANDIDATE-GATE
-        LATENCY). FAIL-CLOSED throughout: an UNKNOWN merged marginal, an over-budget
-        POST book, ANY exception in the eval, or an unstable book that never settles
-        within the deadline all DECLINE — an unmeasured, errored, or stale joint tail
-        is never safe. The CALLER releases the provisional reservation on any decline.
+        The retry loop is BOUNDED by BOTH the DERIVED confirm budget and
+        ``candidate_gate_max_retries``. Running out of either is a LATENCY event,
+        not a risk verdict, and resolves through the deterministic fallback.
+        Still FAIL-CLOSED where it must be: an UNKNOWN merged marginal, an
+        over-budget POST book, or ANY exception in the eval DECLINE outright with
+        ``DECLINE_CANDIDATE_RISK`` — an unmeasured or errored joint tail is never
+        safe, and an exception is a correctness failure, not a slow clock. The
+        CALLER releases the provisional reservation on any decline.
 
         With no reservation service (paper / backtests / tests) ``reservation_id`` is
         None: there is no provisional reservation and the single-loop confirm cannot
@@ -2033,28 +3011,21 @@ class QuoteLifecycle:
         reservation version is -1 too) and the gate runs exactly one MC attempt — the
         prior behaviour, preserved."""
         start_ns = self._clock.monotonic_ns()
-        deadline_ns = int(self._config.candidate_gate_deadline_s * 1e9)
-        last_mc_ns = 0  # duration of the most recent MC attempt (for deadline budget)
+        budget_ns = self._candidate_gate_budget_ns(accept_ns)
+        # Absolute wall the interruptible build honours (same clock as start_ns).
+        hard_deadline_ns = start_ns + budget_ns
         for attempt in range(self._config.candidate_gate_max_retries + 1):
-            # Build inputs (stamps the generation + reservation version at this read).
-            try:
-                inputs = self._build_candidate_gate_inputs(
-                    quote_id, state, exclude_reservation_id=reservation_id
-                )
-            except Exception as exc:  # noqa: BLE001 — any build error declines
-                log.error(
-                    "candidate_gate_errored", quote_id=quote_id, error=repr(exc)
-                )
-                return False, f"candidate gate errored: {exc!r}"
-            # Deadline guard BEFORE the MC: if less time remains than the previous
-            # attempt took, do not start an MC that would overrun the confirm window.
-            # (First attempt: last_mc_ns is 0, so this never blocks the first run.)
+            # ---- BUDGET EXHAUSTED? (measured, never predicted) ----------------
+            # The ONLY pre-work check: is there any window left at all? There is
+            # no cost PREDICTION here by design — see the block comment on
+            # _run_candidate_mc's deadline. A predictor that is only ever
+            # validated by doing the work can lock itself out of the work, and
+            # this one provably did: one poisoned ms/pair sample skipped the
+            # build, a skipped build produced no new sample, and the joint-tail /
+            # P(ruin) / delta-P(book) gate went dark permanently.
             elapsed_ns = self._clock.monotonic_ns() - start_ns
-            if elapsed_ns + last_mc_ns > deadline_ns:
-                # LIVE CANDIDATE-GATE LATENCY: the confirm window expired (too little
-                # deadline remains for another MC) BEFORE a stable verdict — an accept
-                # LOST because the exchange window ran out. Count both the deadline
-                # trip and the window-expired-before-confirm axis the audit enumerates.
+            remaining_ns = budget_ns - elapsed_ns
+            if remaining_ns <= 0:
                 self._metrics.inc("candidate_gate.deadline_exceeded")
                 self._metrics.inc("candidate_gate.window_expired_before_confirm")
                 self._metrics.observe_ms(
@@ -2066,25 +3037,165 @@ class QuoteLifecycle:
                     quote_id=quote_id,
                     attempt=attempt,
                     elapsed_ms=round(elapsed_ns / 1e6, 1),
-                    detail="insufficient confirm deadline remains for another MC",
+                    budget_ms=round(budget_ns / 1e6, 1),
+                    remaining_ms=round(remaining_ns / 1e6, 1),
+                    detail="no confirm budget remains — resolving on the "
+                    "deterministic caps",
                 )
-                return False, (
-                    "candidate gate deadline exhausted before a stable verdict"
+                return await self._candidate_gate_fallback(
+                    quote_id,
+                    state,
+                    reservation_id=reservation_id,
+                    cause="budget_exhausted",
+                    detail=(
+                        "candidate gate: MC refinement did not fit the derived "
+                        "confirm budget"
+                    ),
+                )
+            # ---- INTERRUPTIBLE build -----------------------------------------
+            build0_ns = self._clock.monotonic_ns()
+            try:
+                inputs = self._build_candidate_gate_inputs(
+                    quote_id,
+                    state,
+                    exclude_reservation_id=reservation_id,
+                    deadline_ns=hard_deadline_ns,
+                )
+            except _GateBudgetExceeded as exc:
+                # The build itself ran out of window. It abandoned its own work at
+                # the deadline (``exc.stage`` carries how far it got, e.g.
+                # ``rho_pairs[440/880]``) — nothing is learned or remembered, so
+                # the NEXT accept starts the build again from a clean clock.
+                self._metrics.inc("candidate_gate.deadline_exceeded")
+                self._metrics.inc("candidate_gate.window_expired_before_confirm")
+                self._metrics.inc("candidate_gate.build_aborted")
+                self._metrics.observe_ms(
+                    "candidate_gate.runtime_ms",
+                    (self._clock.monotonic_ns() - start_ns) / 1e6,
+                )
+                self._metrics.observe_ms("candidate_gate.remaining_window_ms", 0.0)
+                log.warning(
+                    "candidate_gate_deadline",
+                    quote_id=quote_id,
+                    attempt=attempt,
+                    elapsed_ms=round(exc.elapsed_ms, 1),
+                    budget_ms=round(budget_ns / 1e6, 1),
+                    stage=exc.stage,
+                    detail="candidate-gate input build abandoned at its deadline "
+                    "— resolving on the deterministic caps",
+                )
+                return await self._candidate_gate_fallback(
+                    quote_id,
+                    state,
+                    reservation_id=reservation_id,
+                    cause=f"build_aborted:{exc.stage}",
+                    detail=(
+                        "candidate gate: input build exceeded the derived confirm "
+                        f"budget in {exc.stage}"
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 — any build error declines
+                log.error(
+                    "candidate_gate_errored", quote_id=quote_id, error=repr(exc)
+                )
+                return (
+                    False,
+                    f"candidate gate errored: {exc!r}",
+                    ReasonCode.DECLINE_CANDIDATE_RISK,
+                )
+            build_ms = (self._clock.monotonic_ns() - build0_ns) / 1e6
+            self._metrics.observe_ms("candidate_gate.build_ms", build_ms)
+            # ---- The MC, BOUNDED by what is actually left of the window -------
+            # No prediction: the remaining budget is MEASURED off the clock and
+            # handed to the MC as its deadline, exactly as the last-look waiver
+            # already bounds its off-loop enumeration
+            # (BookRiskPool.run_state_worst_case). The MC therefore ALWAYS RUNS
+            # while any window remains, and a run that cannot finish inside the
+            # window resolves as a TIMEOUT through the deterministic fallback —
+            # the same money outcome a "predicted over budget" skip aimed for,
+            # reached by measurement instead of prophecy, and with no path-
+            # dependent state that could make the next accept skip too.
+            elapsed_ns = self._clock.monotonic_ns() - start_ns
+            remaining_ns = budget_ns - elapsed_ns
+            if remaining_ns <= 0:
+                self._metrics.inc("candidate_gate.deadline_exceeded")
+                self._metrics.inc("candidate_gate.window_expired_before_confirm")
+                self._metrics.observe_ms(
+                    "candidate_gate.runtime_ms", elapsed_ns / 1e6
+                )
+                self._metrics.observe_ms("candidate_gate.remaining_window_ms", 0.0)
+                log.warning(
+                    "candidate_gate_deadline",
+                    quote_id=quote_id,
+                    attempt=attempt,
+                    elapsed_ms=round(elapsed_ns / 1e6, 1),
+                    budget_ms=round(budget_ns / 1e6, 1),
+                    remaining_ms=round(remaining_ns / 1e6, 1),
+                    detail="the input build consumed the confirm budget — no "
+                    "window remains for the MC",
+                )
+                return await self._candidate_gate_fallback(
+                    quote_id,
+                    state,
+                    reservation_id=reservation_id,
+                    cause="mc_no_budget",
+                    detail=(
+                        "candidate gate: MC refinement did not fit the derived "
+                        "confirm budget"
+                    ),
                 )
             mc0_ns = self._clock.monotonic_ns()
             try:
-                result = await self._run_candidate_mc(inputs)
+                result = await self._run_candidate_mc(
+                    inputs, deadline_s=remaining_ns / 1e9
+                )
+            except TimeoutError:
+                # LATENCY, NOT A RISK VERDICT: the MC did not land inside the
+                # window. The worker finishes and frees itself; we resolve on the
+                # deterministic caps re-checked against the live book.
+                self._metrics.inc("candidate_gate.deadline_exceeded")
+                self._metrics.inc("candidate_gate.window_expired_before_confirm")
+                self._metrics.inc("candidate_gate.mc_timeout")
+                mc_ms = (self._clock.monotonic_ns() - mc0_ns) / 1e6
+                self._metrics.observe_ms(
+                    "candidate_gate.runtime_ms",
+                    (self._clock.monotonic_ns() - start_ns) / 1e6,
+                )
+                self._metrics.observe_ms("candidate_gate.remaining_window_ms", 0.0)
+                log.warning(
+                    "candidate_gate_deadline",
+                    quote_id=quote_id,
+                    attempt=attempt,
+                    mc_ms=round(mc_ms, 1),
+                    budget_ms=round(budget_ns / 1e6, 1),
+                    detail="the candidate MC exceeded the remaining confirm "
+                    "budget — resolving on the deterministic caps",
+                )
+                return await self._candidate_gate_fallback(
+                    quote_id,
+                    state,
+                    reservation_id=reservation_id,
+                    cause="mc_timeout",
+                    detail=(
+                        "candidate gate: MC refinement did not fit the derived "
+                        "confirm budget"
+                    ),
+                )
             except Exception as exc:  # noqa: BLE001 — any error declines (fail-closed)
                 log.error(
                     "candidate_gate_errored", quote_id=quote_id, error=repr(exc)
                 )
-                return False, f"candidate gate errored: {exc!r}"
-            last_mc_ns = self._clock.monotonic_ns() - mc0_ns
+                return (
+                    False,
+                    f"candidate gate errored: {exc!r}",
+                    ReasonCode.DECLINE_CANDIDATE_RISK,
+                )
+            mc_ns = self._clock.monotonic_ns() - mc0_ns
             # LIVE CANDIDATE-GATE LATENCY: one observation per MC attempt feeds the
             # candidate-gate p50/p90/p99 runtime histogram; the MC worker queue dwell
             # (submit→worker-start, decomposed by the pool from total await − in-worker
             # compute) is recorded when a pool ran it (inline runs have no queue).
-            self._metrics.observe_ms("candidate_gate.mc_ms", last_mc_ns / 1e6)
+            self._metrics.observe_ms("candidate_gate.mc_ms", mc_ns / 1e6)
             if self._book_risk_pool is not None:
                 # ``getattr`` so a pool double without the dwell field (test stubs)
                 # simply records no queue-dwell sample rather than raising.
@@ -2122,7 +3233,7 @@ class QuoteLifecycle:
             # Stable verdict: the book the MC priced is still the live book. Record
             # the LIVE CANDIDATE-GATE LATENCY completion metrics (total gate runtime +
             # remaining confirm-window time at completion) whatever the verdict.
-            self._record_gate_completion_latency(start_ns)
+            self._record_gate_completion_latency(start_ns, budget_ns)
             # P1 EV VISIBILITY: log the production candidate EV DISTINCTLY from the
             # challenger / bridge / split candidate EVs (and the worst-credible EV), so
             # a candidate that is +EV under production yet −EV under a challenger is
@@ -2130,9 +3241,14 @@ class QuoteLifecycle:
             # production-model-EV based).
             self._log_candidate_gate_ev(quote_id, attempt, result)
             if result.unknown:
-                return False, f"candidate gate UNKNOWN: {result.decline_reason}"
+                return (
+                    False,
+                    f"candidate gate UNKNOWN: {result.decline_reason}",
+                    ReasonCode.DECLINE_CANDIDATE_RISK,
+                )
             if not result.confirm:
-                return False, (
+                return (
+                    False,
                     f"candidate gate declined: {result.decline_reason} "
                     f"(admission_ev_cc={result.admission_ev_cc:.1f} "
                     f"[{result.admission_ev_source}], "
@@ -2143,7 +3259,8 @@ class QuoteLifecycle:
                     f"post_det_cc={result.post.deterministic_max_loss_cc:.0f}, "
                     f"post_mutex_det_cc="
                     f"{_fmt_opt_cc(result.post.mutex_aware_det_max_cc)}, "
-                    f"post_p_ruin={result.post.p_ruin:.4f})"
+                    f"post_p_ruin={result.post.p_ruin:.4f})",
+                    ReasonCode.DECLINE_CANDIDATE_RISK,
                 )
             log.info(
                 "candidate_gate_confirm",
@@ -2165,30 +3282,46 @@ class QuoteLifecycle:
                 delta_p_book=round(result.candidate_delta_p_book, 4),
                 n_pre=result.n_pre_positions,
             )
-            return True, ""
-        # Retry budget exhausted without a stable verdict: the book kept moving under
-        # every attempt. FAIL CLOSED (a never-settling book is never safe to confirm).
+            return True, "", None
+        # Retry budget exhausted without a stable verdict: the book kept moving
+        # under every attempt. This is a STABILITY/LATENCY outcome, not a risk
+        # verdict — the MC never got to price the live book — so it resolves the
+        # same way a timeout does: the ENFORCED deterministic caps, re-checked
+        # against the book as it stands RIGHT NOW (which is precisely the book
+        # whose churn defeated the MC). Still declines when those caps refuse.
         self._metrics.inc("candidate_gate.retries_exhausted")
-        self._record_gate_completion_latency(start_ns)
+        self._record_gate_completion_latency(start_ns, budget_ns)
         log.warning(
             "candidate_gate_unstable",
             quote_id=quote_id,
             retries=self._config.candidate_gate_max_retries,
-            detail="book moved under every candidate-MC attempt — declining",
+            detail="book moved under every candidate-MC attempt — resolving on "
+            "the deterministic caps against the current book",
         )
-        return False, "candidate gate unstable: reservation/book moved every retry"
+        return await self._candidate_gate_fallback(
+            quote_id,
+            state,
+            reservation_id=reservation_id,
+            cause="retries_exhausted",
+            detail="candidate gate unstable: reservation/book moved every retry",
+        )
 
-    def _record_gate_completion_latency(self, start_ns: int) -> None:
+    def _record_gate_completion_latency(
+        self, start_ns: int, budget_ns: int | None = None
+    ) -> None:
         """LIVE CANDIDATE-GATE LATENCY: at a terminal gate outcome record the total
         gate runtime (all attempts) and the remaining confirm-window time — the
-        deadline budget left when the verdict landed. A negative remainder (the gate
-        overran the wall budget) is clamped to 0 (no time left)."""
+        budget left when the verdict landed. A negative remainder (the gate
+        overran the budget) is clamped to 0 (no time left). ``budget_ns`` is the
+        DERIVED budget this gate actually ran under; None falls back to the static
+        config value (callers that predate the derived budget)."""
         elapsed_ns = self._clock.monotonic_ns() - start_ns
-        deadline_ns = int(self._config.candidate_gate_deadline_s * 1e9)
+        if budget_ns is None:
+            budget_ns = int(self._config.candidate_gate_deadline_s * 1e9)
         self._metrics.observe_ms("candidate_gate.runtime_ms", elapsed_ns / 1e6)
         self._metrics.observe_ms(
             "candidate_gate.remaining_window_ms",
-            max(0.0, (deadline_ns - elapsed_ns) / 1e6),
+            max(0.0, (budget_ns - elapsed_ns) / 1e6),
         )
 
     def _log_candidate_gate_ev(
@@ -2239,14 +3372,37 @@ class QuoteLifecycle:
             admission_ev_source=result.admission_ev_source,
         )
 
+    def _gate_build_deadline_check(self, deadline_ns: int | None, stage: str) -> None:
+        """Abandon the candidate-gate input build if the absolute wall has passed.
+        Called between the build's heavy stages so no single stage can spend the
+        whole confirm window."""
+        if deadline_ns is None:
+            return
+        now_ns = self._clock.monotonic_ns()
+        if now_ns > deadline_ns:
+            raise _GateBudgetExceeded(stage, (now_ns - deadline_ns) / 1e6)
+
     def _build_candidate_gate_inputs(
         self,
         quote_id: str,
         state: OpenQuoteState,
         *,
         exclude_reservation_id: str | None = None,
+        deadline_ns: int | None = None,
     ) -> CandidateBookRiskInputs:
         """Build the IMMUTABLE, picklable inputs for one off-loop candidate MC.
+
+        INTERRUPTIBLE (2026-07-27). ``deadline_ns`` is an ABSOLUTE monotonic wall.
+        The O(T^2) rho resolution and the two other heavy stages (the fresh
+        re-price, the committed-book model) check it and raise
+        ``_GateBudgetExceeded`` rather than run past the exchange's confirm
+        window. This was the live killer: the build alone is what blew the budget
+        on 23 of 24 lost auctions, and a synchronous loop that cannot be
+        abandoned is a loop that spends the WHOLE window before anyone can react.
+        Partial work is still MEASURED (a ms/pair rate is recorded for the pairs
+        that completed), so the very next accept predicts the cost correctly and
+        declines to start. None = no deadline (the pre-2026-07-27 behaviour, used
+        by every non-confirm caller and by the rollback path).
 
         On-loop work only: build the candidate position (shared builder), read the
         committed positions + outstanding reservations, resolve every candidate-
@@ -2285,9 +3441,14 @@ class QuoteLifecycle:
         else:
             reservation_version = -1
             reservations = ()
+        # The merged book, in the EXACT order the worker's
+        # ``evaluate_candidate_book_risk`` assembles it (committed, reservations,
+        # then the candidate). Both the leg universe and the same-game grouping
+        # are first-occurrence ordered, so this order is load-bearing.
+        merged: tuple[OpenPosition, ...] = (*committed, *reservations, candidate)
         # Universe of distinct leg tickers across the merged book.
         tickers: set[str] = set()
-        for pos in (*committed, *reservations, candidate):
+        for pos in merged:
             for leg in pos.legs:
                 tickers.add(leg.market_ticker)
         # Resolve marginals ON-LOOP; a missing marginal is OMITTED (⇒ None in the
@@ -2297,19 +3458,50 @@ class QuoteLifecycle:
             p = self._marginals(ticker)
             if p is not None:
                 marginals[ticker] = float(p)
-        # Resolve within-game pair rho ON-LOOP for every distinct unordered pair
-        # (build_book_model queries only same-game pairs; resolving all is a
-        # harmless superset). Only the pairs with a band are stored; a pair the
-        # provider maps to None is omitted (the worker provider then returns None
-        # for it, exactly as the live provider would).
+        # Resolve within-game pair rho ON-LOOP for EXACTLY the pairs
+        # ``build_book_model`` will ask for — no more, no fewer.
+        #
+        #   NO MORE: the pre-2026-07-27 build resolved every unordered ticker
+        #   pair on the theory that a superset is harmless. It is not. On the
+        #   live 100-position book that is 22,155 pairs against 879 same-game
+        #   ones — 96.03% of the work computed and thrown away, and it is what
+        #   burnt the 3.0 s exchange confirm window (measured COLD: 4,507 ms vs
+        #   197 ms; at 3x the book, 35,505 ms vs 521 ms).
+        #
+        #   NO FEWER: a same-game pair MISSING from this dict makes the worker's
+        #   ``_DictWithinGameRho`` return None, ``build_book_model`` substitute
+        #   ``flat_band``, and the joint tail come out at LESS correlation than
+        #   the pricer measured — a silent UNDERSTATEMENT of risk. So the pair
+        #   set is not re-derived here: ``within_game_pair_tickers`` is the SAME
+        #   grouping code ``build_book_model`` itself runs (shared primitives in
+        #   sim/book_model.py), fed the SAME ordered positions and the SAME
+        #   priced-predicate the worker's ``_DictMarginals`` implements
+        #   (present in ``marginals`` ⇔ priceable). Equality is by construction.
+        #
+        # Only pairs WITH a band are stored; a pair the provider maps to None is
+        # omitted (the worker provider then returns None for it, exactly as the
+        # live provider would).
         rho_pairs: dict[frozenset[str], tuple[float, float, float]] = {}
         if self._within_game_rho is not None:
-            ordered = sorted(tickers)
-            for i in range(len(ordered)):
-                for j in range(i + 1, len(ordered)):
-                    band = self._within_game_rho(ordered[i], ordered[j])
-                    if band is not None:
-                        rho_pairs[frozenset((ordered[i], ordered[j]))] = band
+            same_game_pairs = within_game_pair_tickers(
+                merged, lambda ticker: ticker in marginals
+            )
+            total_pairs = len(same_game_pairs)
+            check_every = max(1, int(self._config.candidate_gate_build_check_pairs))
+            rho0_ns = self._clock.monotonic_ns()
+            done = 0
+            for ticker_a, ticker_b in same_game_pairs:
+                band = self._within_game_rho(ticker_a, ticker_b)
+                if band is not None:
+                    rho_pairs[frozenset((ticker_a, ticker_b))] = band
+                done += 1
+                if deadline_ns is not None and done % check_every == 0:
+                    now_ns = self._clock.monotonic_ns()
+                    if now_ns > deadline_ns:
+                        raise _GateBudgetExceeded(
+                            f"rho_pairs[{done}/{total_pairs}]",
+                            (now_ns - rho0_ns) / 1e6,
+                        )
         limits = self._limits.limits
         bankroll_cc = self._risk_bankroll_cc()
         # P0-1 (candidate P(ruin) equity basis must NOT be overstated). The ruin
@@ -2326,12 +3518,18 @@ class QuoteLifecycle:
         # (payout − price) carry its own cost, yielding the correct
         #   cash + terminal_value(committed) + Σ_resv(payout − price)
         #     + cand_payout − cand_price.
+        self._gate_build_deadline_check(deadline_ns, "build_book_model")
         committed_only_model = build_book_model(
             list(committed),
             marginals=self._marginals,
             within_game_rho=self._within_game_rho,
         )
         current_equity_cc = self._ruin_equity_basis_cc(committed_only_model)
+        # The fresh re-price is a full engine call (measured 160-450 ms live) —
+        # the last heavy stage, and the last place worth abandoning before the
+        # window is gone.
+        self._gate_build_deadline_check(deadline_ns, "pricing_edge")
+        pricing_edge_cc = self._gate_pricing_edge(state)
         return CandidateBookRiskInputs(
             committed=committed,
             candidate=candidate,
@@ -2378,7 +3576,7 @@ class QuoteLifecycle:
             gate_ev_from_pricing_fair=self._config.gate_ev_from_pricing_fair,
             # Fresh re-price only when armed (one engine call per confirm
             # attempt); OFF ⇒ None ⇒ the gate keeps its MC EV, byte-identical.
-            pricing_edge_cc=self._gate_pricing_edge(state),
+            pricing_edge_cc=pricing_edge_cc,
             # P(BOOK) NON-DECREASE doctrine gate (2026-07-25). Default OFF.
             require_p_book_non_decreasing=(
                 self._config.require_p_book_non_decreasing
@@ -2440,7 +3638,13 @@ class QuoteLifecycle:
         if self._reservation is None:
             return None
         candidate = self._fill_position(quote_id, state)
-        return self._reservation.try_reserve(
+        # MEASURE the deterministic cap check (2026-07-27). This is the SAME
+        # LimitChecker.check the candidate gate's timeout fallback runs, so timing
+        # it here — on every accept, before the gate — keeps the derived confirm
+        # budget's fallback reserve warm from the first accept of a process
+        # instead of waiting for a timeout to happen first.
+        check0_ns = self._clock.monotonic_ns()
+        result = self._reservation.try_reserve(
             reservation_id,
             candidate,
             marginals=self._marginals,
@@ -2455,7 +3659,17 @@ class QuoteLifecycle:
             # reservations + candidate stay at 100%; only the resting fold
             # weights. Default False = today; armed in the local YAML.
             apply_resting_haircut=self._config.resting_haircut_at_confirm,
+            # DEPLOYMENT SCALE: the AUTHORITATIVE confirm-path check breathes at
+            # the SAME solved scale quote-time admission used — size-layer
+            # coherence (quote-time never looser than confirm) is exactly what
+            # keeps this out of the renege zone. 1.0 while disarmed.
+            deploy_scale=self.deploy_scale_for_check(),
         )
+        self._metrics.observe_ms(
+            "confirm.deterministic_check_ms",
+            (self._clock.monotonic_ns() - check0_ns) / 1e6,
+        )
+        return result
 
     # ------------------------------------------- last-look MC waiver (Problem A)
 
@@ -2916,7 +4130,8 @@ class QuoteLifecycle:
         touching the BREACHED games — or, with ``waiver_game_scoped_stability``
         (2026-07-25), the breached games' position/reservation CONTENT in
         place of the global counters (same-game changes still invalidate;
-        unrelated-game fills no longer do — see the scoped branch below). A quote landing/expiring on an UNRELATED
+        unrelated-game fills no longer do — see the scoped branch below). A
+        quote landing/expiring on an UNRELATED
         game cannot change the breached games' certified worst case, so it no
         longer invalidates the run — at 400+ quotes/min the old FULL-generation
         stamp made the waiver un-runnable ("book moved during every
@@ -3104,6 +4319,10 @@ class QuoteLifecycle:
             halt_inputs=self._halt_inputs(),
             book_risk=self._book_risk_for_check(),
             apply_resting_haircut=True,
+            # DEPLOYMENT SCALE: quote-time and confirm-time breathe at the SAME
+            # solved scale (never diverge — a looser quote-time cap than confirm
+            # is the renege zone). 1.0 while disarmed ⇒ byte-identical.
+            deploy_scale=self.deploy_scale_for_check(),
         )
 
     def _note_watchdog(self, *, risk_declined: bool) -> None:
@@ -3193,6 +4412,10 @@ class QuoteLifecycle:
             # quotes identically (re-verified armed in
             # tools/proto_resting_haircut.py part D2). No-op at weight 1.
             apply_resting_haircut=True,
+            # DEPLOYMENT SCALE: quote-time and confirm-time breathe at the SAME
+            # solved scale (never diverge — a looser quote-time cap than confirm
+            # is the renege zone). 1.0 while disarmed ⇒ byte-identical.
+            deploy_scale=self.deploy_scale_for_check(),
         )
         # Shadow-split FIRST (the one shadow-enforcement seam), then the
         # monotone filter (which also drops shadow, belt-and-suspenders).
@@ -3305,6 +4528,14 @@ class QuoteLifecycle:
             # (this RFQ's hypothetical fill) is never haircut. No-op at the
             # default weight 1.
             apply_resting_haircut=True,
+            # DEPLOYMENT SCALE: quote-time and confirm-time breathe at the SAME
+            # solved scale (never diverge — a looser quote-time cap than confirm
+            # is the renege zone). 1.0 while disarmed ⇒ byte-identical.
+            deploy_scale=self.deploy_scale_for_check(),
+            # LEVER #3 visibility: one line per entity-axis net-effect verdict
+            # (admitted AND refused). Observational only — ``check`` never
+            # branches on it — and never called while the admission is disarmed.
+            net_effect_observer=self._log_net_effect,
         )
         # EV-BASED SLOT EVICTION (2026-07-25 big-fill audit: the slot cap was
         # arrival-order-blind — $3.2M/day of flow died while low-EV leftovers
@@ -3339,11 +4570,25 @@ class QuoteLifecycle:
         if self._rfq_gone(rfq):
             await self._skip_dead_rfq(rfq, "pre_post")
             return
+        # SAME-LINK LATENCY WARM-UP (2026-07-27). The confirm-window budget is
+        # derived from the MEASURED confirm round trip — but confirms are rare
+        # (tens/day) and the FIRST one of a process has no history, so an
+        # unmeasured link would force the gate to skip its MC refinement exactly
+        # when the book is least understood. The quote POST is the same REST verb
+        # to the same venue over the same link and happens thousands of times an
+        # hour, so it is the honest MEASURED proxy until real confirm samples
+        # exist. Two clock reads + one histogram insert; benchmarked on the quote
+        # path (see the 2026-07-27 confirm-window report).
+        create_rtt0_ns = self._clock.monotonic_ns()
         try:
             response = await self._sender.create_quote(
                 rfq.rfq_id,
                 yes_bid_cc=result.yes_bid_cc,
                 no_bid_cc=result.no_bid_cc,
+            )
+            self._metrics.observe_ms(
+                "quote.create_rtt_ms",
+                (self._clock.monotonic_ns() - create_rtt0_ns) / 1e6,
             )
         except KalshiApiError as exc:
             # rfq_closed / 409: the RFQ's ~1s window closed before our POST landed
@@ -3642,11 +4887,18 @@ class QuoteLifecycle:
             # linger for a fill we are not making). Disabled by config ⇒ skipped (kill
             # switch + prior behaviour), and the reservation stays as before.
             if self._config.candidate_gate_enabled:
-                gate_ok, gate_detail = await self._candidate_gate_verdict(
+                gate_ok, gate_detail, gate_reason = await self._candidate_gate_verdict(
                     quote_id, state,
                     reservation_id=(
                         reservation_id if self._reservation is not None else None
                     ),
+                    # The DERIVED confirm budget is anchored on the ACCEPT, not on
+                    # the gate's own start: everything the accept path already spent
+                    # (last look, fill velocity, the reservation, and the last-look
+                    # MC waiver when it ran) is then automatically deducted from the
+                    # exchange's window — no static split between the two budgets to
+                    # keep in sync by hand.
+                    accept_ns=t0,
                 )
                 if not gate_ok:
                     # Release the provisional reservation: this fill is declined, so
@@ -3654,13 +4906,16 @@ class QuoteLifecycle:
                     # confirm, never leave headroom consumed for a non-fill).
                     if self._reservation is not None:
                         self._reservation.release(reservation_id)
-                    self._metrics.inc(
-                        f"confirm.declined.{ReasonCode.DECLINE_CANDIDATE_RISK}"
-                    )
+                    # LATENCY vs RISK are DIFFERENT EVENTS (2026-07-27). The gate
+                    # names which one this was; before the split, 100% of live
+                    # confirm.declined.decline_candidate_risk was a stopwatch, which
+                    # is exactly why no decline analysis ever surfaced it.
+                    decline_reason = gate_reason or ReasonCode.DECLINE_CANDIDATE_RISK
+                    self._metrics.inc(f"confirm.declined.{decline_reason}")
                     self._track_markout(f"declined:{quote_id}", state)
                     await self._record_confirm_decision(
                         state, confirm=False,
-                        reason=ReasonCode.DECLINE_CANDIDATE_RISK,
+                        reason=decline_reason,
                         detail=gate_detail, decision_ms=decision_ms,
                     )
                     self._executed_states.pop(quote_id, None)
@@ -3863,6 +5118,7 @@ class QuoteLifecycle:
                     halt_inputs=self._halt_inputs(),
                     book_risk=self._book_risk_for_check(),
                     apply_resting_haircut=True,
+                    deploy_scale=self.deploy_scale_for_check(),
                 )
                 breached_games = {
                     b.game
@@ -5634,6 +6890,39 @@ class QuoteLifecycle:
         # the worker finishes; the maintenance tick returns now and keeps beating.
         self._book_risk_task = asyncio.ensure_future(self.recompute_book_risk_offloop())
 
+    def _maybe_solve_deploy_scale(self) -> None:
+        """Refresh the SOLVED deployment scale off the maintenance tick.
+
+        OFF THE QUOTE HOT PATH, always. The solve is ``O(iterations)`` full-book
+        MCs; it runs here on the same throttle the book-risk snapshot uses and
+        NEVER inside ``check``. On the live async loop it is launched as a
+        BACKGROUND TASK (single-flight) so the maintenance tick returns
+        immediately and keeps beating the supervisor heartbeat, exactly like
+        ``_maybe_recompute_book_risk``; without an event loop (paper/tests) it
+        runs inline.
+
+        Disarmed ⇒ returns immediately, never even reads the clock, so the
+        throttle state and the tick's timing are byte-identical to before this
+        existed."""
+        if not self._config.deploy_scale_enabled:
+            return
+        now = self._clock.monotonic_ns()
+        interval_ns = int(self._config.deploy_scale_refresh_s * 1e9)
+        last = self._deploy_scale_refresh_mono_ns
+        if last is not None and now - last < interval_ns:
+            return
+        if self._deploy_scale_task is not None and not self._deploy_scale_task.done():
+            return
+        self._deploy_scale_refresh_mono_ns = now
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self.solve_deploy_scale()
+            return
+        self._deploy_scale_task = asyncio.ensure_future(
+            self.solve_deploy_scale_offloop()
+        )
+
     def _maybe_recompute_peak_profile(self) -> None:
         """Refresh the PEAK-CONCENTRATION profile (sim/peak_profile.py) off the
         maintenance tick — ONLY when the committed position set changed
@@ -5806,6 +7095,12 @@ class QuoteLifecycle:
         # LAUNCHES the MC in a worker and returns immediately (never blocks the tick
         # / heartbeat); without one it runs inline (fast in paper/tests).
         self._maybe_recompute_book_risk()
+        # DEPLOYMENT SCALE (operator LEVER #1): re-SOLVE how much of the already-
+        # enforced envelope is still unused, on its own (slower) throttle and in
+        # the SAME worker pool — never on the quote path, which only reads the
+        # resulting float. Disarmed by default ⇒ an immediate return, so the
+        # tick's timing is unchanged until the operator arms it.
+        self._maybe_solve_deploy_scale()
         # PEAK-CONCENTRATION profile (2026-07-18): rebuild the cached committed-
         # book peak scorelines when a fill/settlement changed the position set —
         # a pure PRICING input to the skew seam (stale/absent = neutral adder).
@@ -6824,6 +8119,26 @@ class QuoteLifecycle:
             # snapshot (no staleness window); p_book only when the cached MC
             # profile is generation-fresh (None ⇒ the component is neutral).
             leg_axis_profile=self._leg_axis_profile_from(snap),
+            # LEVER #5 (operator directive 2026-07-27): the AND-BOUND
+            # dollar-Herfindahl marginal (zero SE) priced by
+            # Cov(candidate payoff, book P&L) off the already-paid-for CRN
+            # cache, on a SYMMETRIC half-range derived from measured state,
+            # centred so the average quote cannot widen (markups are FIXED),
+            # and quantized onto the combo's OWN grid step so it can never be
+            # annihilated by ``snap_bid_down``.
+            # SHADOW-FIRST (2026-07-27 review B3): ``conc_armed`` defaults
+            # False, so the steer is computed + logged here and CANNOT reach
+            # price until the operator arms it off the shadow read-out.
+            # ``conc_enabled: false`` is the zero-cost rollback — the profile
+            # itself (three dict copies + the loss-event cache read) is not
+            # even built.
+            conc_profile=(
+                self._concentration_profile(snap)
+                if self._skew_params.conc_enabled
+                else None
+            ),
+            margin_cc=constructed.total_width_cc,
+            tick_cc=self._combo_tick_cc(rfq, constructed),
         )
         log.info(
             "inventory_skew_shadow",
@@ -6854,6 +8169,69 @@ class QuoteLifecycle:
                 (key, adder, round(factor, 4), reason)
                 for key, adder, factor, reason in skew.leg_axis_rows
             ],
+            # LEVER #5 (2026-07-27): everything the ARMING/AUDIT decision
+            # reads — the AND-bound effective loss-event count before and
+            # after, the zero-SE Herfindahl marginal, the measured
+            # Cov(candidate, book) price in cc/contract, the per-axis wall
+            # loads (DOLLARS vs each axis's own enforced wall — never a
+            # count), the DERIVED symmetric half-range and WHICH measured
+            # bound is binding it.
+            conc_cc=(skew.conc.skew_cc if skew.conc else 0),
+            conc_applied_cc=(skew.conc.applied_cc if skew.conc else 0),
+            conc_n_events_pre=(
+                round(skew.conc.hhi.n_pre, 4) if skew.conc else None
+            ),
+            conc_n_events_post=(
+                round(skew.conc.hhi.n_post, 4) if skew.conc else None
+            ),
+            conc_hhi_marginal=(
+                round(skew.conc.hhi.relative, 6) if skew.conc else None
+            ),
+            # THE SCALE-FREE READING (2026-07-27) — the number that actually
+            # prices. ``conc_hhi_marginal`` above carries the 2p/T book-size
+            # factor and is kept only for continuity of the readout;
+            # ``conc_intensity`` is bucket dollar SHARE minus the book's
+            # dollar-Herfindahl, which is invariant when the whole book scales.
+            conc_intensity=(
+                round(skew.conc.hhi.intensity, 6) if skew.conc else None
+            ),
+            conc_value_cc_per_contract=(
+                None
+                if skew.conc is None or skew.conc.value_cc_per_contract is None
+                else round(skew.conc.value_cc_per_contract, 3)
+            ),
+            conc_score_raw=(round(skew.conc.score_raw, 4) if skew.conc else None),
+            conc_score_centred=(
+                round(skew.conc.score_centred, 4) if skew.conc else None
+            ),
+            conc_wall_loads={
+                k: round(v, 4)
+                for k, v in (skew.conc.wall_load_by_axis if skew.conc else {}).items()
+            },
+            conc_half_cc=(
+                skew.conc.scale.half_cc
+                if skew.conc and skew.conc.scale
+                else None
+            ),
+            conc_scale_binding=(
+                skew.conc.scale.binding if skew.conc and skew.conc.scale else None
+            ),
+            conc_reason=(skew.conc.reason if skew.conc else None),
+            # THE ARMING SEAM (2026-07-27 review B3). ``conc_armed`` says
+            # whether the steer touched THIS quote's price;
+            # ``conc_shadow_applied_cc`` is the pricer-frame number the armed
+            # composition WOULD have produced on exactly these inputs (None
+            # once armed — then ``applied_cc`` is that number). Together they
+            # are the whole arming read-out: pair them per bucket and the
+            # operator sees the counterfactual against what actually shipped.
+            conc_armed=self._skew_params.conc_armed,
+            conc_shadow_applied_cc=skew.shadow_armed_applied_cc,
+            # Budget neutrality (markups are FIXED): the live measured centre
+            # of the score distribution. A mean far from 0 means the steer is
+            # drifting into a markup change and the centring is not keeping up.
+            steer_centre_mean=round(self._steer_centre.mean, 5),
+            steer_centre_sd=round(self._steer_centre.sd, 5),
+            steer_centre_n=self._steer_centre.n,
         )
         if skew.pbook_per_game:
             log.debug(
@@ -6906,6 +8284,20 @@ class QuoteLifecycle:
                 )
             widen_declines = widen.applied
         return skew.applied_cc, widen_declines
+
+    def _combo_tick_cc(self, rfq: Rfq, constructed: ConstructedQuote) -> int:
+        """The combo's OWN grid step at the quoted bid (LEVER #5).
+
+        The steer is quantized onto this so ``snap_bid_down`` reproduces it
+        exactly instead of erasing it — 32.25% of live steer events fell below
+        one tick and were silently annihilated. Unknown grid ⇒ 0, which makes
+        the steer a hard 0: an unknown lattice is never a guessed default."""
+        meta = self._metadata.peek(rfq.market_ticker)
+        grid = meta.grid if meta is not None else None
+        if grid is None:
+            return 0
+        step = grid.step_at(constructed.no_bid_cc)
+        return 0 if step is None else int(step)
 
     def _min_time_to_close_s(self, rfq: Rfq) -> float | None:
         times: list[float] = []
@@ -7170,6 +8562,7 @@ class QuoteLifecycle:
                 # the standing resting book and short-circuited BEFORE the
                 # deferral could ever hand the denial to the waiver).
                 apply_resting_haircut=self._config.resting_haircut_at_confirm,
+                deploy_scale=self.deploy_scale_for_check(),
             )
         )
         # LAST-LOOK MC WAIVER deferral (handoff Problem A). This advisory check

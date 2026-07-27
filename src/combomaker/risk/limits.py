@@ -39,9 +39,10 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from dataclasses import replace as dataclasses_replace
 from datetime import datetime
 from fractions import Fraction
-from typing import Protocol
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from combomaker.core.reasons import ReasonCode
@@ -51,6 +52,7 @@ from combomaker.risk.exposure import (
     OpenPosition,
     leg_entity_key,
 )
+from combomaker.risk.net_effect import certify_net_effect, pre_state_from_post
 
 # Slate bucketing timezone. A "slate" = all unresolved games whose start falls on
 # the SAME US/Eastern CALENDAR DAY (deterministic; groups an evening's slate and
@@ -191,6 +193,16 @@ class RiskLimits:
     # concentration; this is the hard wall that REFUSES it. None (default) ⇒
     # the axis is not evaluated (byte-identical to before).
     entity_loss_frac: Fraction | None = None
+    # NET-EFFECT ADMISSION on the entity axis (LEVER #3, operator 2026-07-27:
+    # "stop refusing the flow that diversifies us"). False (default) ⇒ the
+    # entity wall refuses on the WORST single key, byte-identical to before.
+    # True ⇒ a candidate that pushes a key past ``entity_loss_frac`` is still
+    # admitted when an EXHAUSTIVE enumeration of the book's per-key premium
+    # state certifies the fill DILUTES dollar concentration (risk/net_effect.py:
+    # key share not up, peak share not up, dollar-weighted effective N strictly
+    # up) AND the key still fits the LIVE per-COMBO wall. A POLICY switch, not a
+    # number: it arms a measured mechanism and adds no threshold of its own.
+    entity_net_effect_admission: bool = False
     # One-directional / theme: net directional exposure to one leg outcome across
     # games (LOSS-equivalent; see the check site for the interpretation). 10%.
     directional_frac: Fraction = Fraction(10, 100)
@@ -280,6 +292,58 @@ class RiskLimits:
     # risk/exposure.py's composition note + tools/proto_resting_haircut.py.
     resting_quote_weight: Fraction = Fraction(1)
     resting_floor_count: int = 3
+
+
+# --- DEPLOYMENT SCALE (see risk/deploy_scale.py for the solver + rationale) ---
+# The DEPLOY-SIDE budgets — the shape caps that say how much of the book may ride
+# ONE combo / entity / game / slate / direction. These are the ONLY fields a
+# solved deployment scale may breathe. Everything not named here (the portfolio
+# envelope the scale is SOLVED AGAINST — CVaR / det-max / ruin budget /
+# tail-prob anchor — the halts, and every absolute backstop) is invariant under
+# ``scale_deploy_budgets`` BY CONSTRUCTION: a field must be listed to move, so
+# the scale can never raise its own ceiling. Lives here (not in deploy_scale)
+# because it operates on RiskLimits and ``check`` must reach it without the
+# import cycle; ``risk.deploy_scale`` re-exports both names.
+DEPLOY_BUDGET_FIELDS: tuple[str, ...] = (
+    "per_combo_loss_frac",
+    "entity_loss_frac",
+    "game_loss_frac",
+    "slate_loss_frac",
+    "directional_frac",
+)
+
+_DEPLOY_SCALE_Q = 1_000_000
+
+
+def as_exact(scale: float) -> Fraction:
+    """Quantize a SOLVED float scale to an exact ``Fraction`` (6 dp), truncated
+    toward zero so the quantization can only ever make the scale SMALLER — the
+    same convention ``cap_family.CapFractions.as_fractions`` uses when a solved
+    float becomes a live threshold (floats are never live thresholds)."""
+    return Fraction(int(scale * _DEPLOY_SCALE_Q), _DEPLOY_SCALE_Q)
+
+
+def scale_deploy_budgets(limits: RiskLimits, scale: float) -> RiskLimits:
+    """``limits`` with ONLY :data:`DEPLOY_BUDGET_FIELDS` multiplied by ``scale``.
+
+    ``scale <= 1`` returns the SAME OBJECT (byte-identical default — the whole
+    feature is inert until a caller passes a solved scale > 1). An unarmed
+    (None) axis stays unarmed: a scale never INVENTS a cap that was off. Exact
+    ``Fraction`` arithmetic throughout."""
+    if scale <= 1.0:
+        return limits
+    q = as_exact(scale)
+    if q <= 1:
+        return limits
+    updates: dict[str, Any] = {}
+    for name in DEPLOY_BUDGET_FIELDS:
+        cur = getattr(limits, name, None)
+        if cur is None:
+            continue
+        updates[name] = cur * q
+    if not updates:
+        return limits
+    return dataclasses_replace(limits, **updates)
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,6 +460,77 @@ def _waiver_covers(
         return False
     cert = waived_games.get(game)
     return cert is not None and cert.certified and cert.worst_case_cc <= game_thr_cc
+
+
+class ConcentrationCertificate(Protocol):
+    """NET-EFFECT admission certificate for ONE (family:entity x direction) key
+    — the WaiverCertificate doctrine extended from risk-REDUCING fills to
+    risk-DIVERSIFYING ones (LEVER #3, operator 2026-07-27).
+
+    Structurally ``risk.net_effect.NetEffectCertificate``; a Protocol for the
+    same reason ``WaiverCertificate`` is one — the check site types the
+    contract, not the producer. ``certified`` True means an EXHAUSTIVE
+    enumeration of the book's complete per-key premium state, before and after
+    the candidate, proved all three dollar tests: the breaching key's dollar
+    share does not rise, the book's peak dollar share does not rise, and the
+    DOLLAR-WEIGHTED effective N strictly rises. It is a state enumeration, never
+    a leg-sign test, and it is a SHAPE waiver only — ``post_key_cc`` is
+    re-validated at the check site against a LIVE enforced wall, and every
+    portfolio SCALE protection (det-max, ruin, CVaR/KILL-tail, slate, per-game,
+    the halts) is untouched by it."""
+
+    @property
+    def key(self) -> str: ...
+
+    @property
+    def certified(self) -> bool: ...
+
+    @property
+    def post_key_cc(self) -> int: ...
+
+    @property
+    def verdict(self) -> str: ...
+
+
+NetEffectObserver = Callable[[ConcentrationCertificate], None]
+"""Optional telemetry sink for every net-effect certificate ``check`` builds
+(admitted AND refused). Purely observational: ``check`` ignores whatever it
+returns and never branches on it, so a logging callback can never change a
+risk decision. None (default) ⇒ not called at all — zero hot-path cost."""
+
+
+def _net_effect_admits(
+    cert: ConcentrationCertificate | None,
+    key: str,
+    live_key_loss_cc: int,
+    ceiling_cc: int,
+) -> bool:
+    """Whether a net-effect certificate may waive the entity wall for ``key``.
+
+    Re-validated HERE, at the point of enforcement, exactly as ``_waiver_covers``
+    re-validates the last-look certificate — four independent conditions, ALL
+    fail-closed:
+
+    * the certificate exists and is CERTIFIED (the enumeration passed);
+    * it describes THIS key (a certificate for another key never travels);
+    * ``post_key_cc`` equals the LIVE accumulated loss the cap just read, so a
+      certificate built against a book that has since moved is rejected rather
+      than honoured against stale state;
+    * the live accumulated loss still fits ``ceiling_cc`` — the ABSOLUTE
+      ceiling, which the caller derives from the LIVE per-COMBO wall. That is
+      the entity cap's own stated design rationale read forwards ("one player
+      should never carry more than one structure is allowed to"), so the waiver
+      introduces NO new number and can never uncap a key: a certificate built
+      against a larger bankroll can only ever be REJECTED by a tighter live
+      wall, never honoured against a looser one.
+    """
+    return (
+        cert is not None
+        and cert.certified
+        and cert.key == key
+        and int(cert.post_key_cc) == int(live_key_loss_cc)
+        and int(live_key_loss_cc) <= int(ceiling_cc)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -552,6 +687,8 @@ class LimitChecker:
         book_risk: PortfolioRisk | None = None,
         waived_games: Mapping[str, WaiverCertificate] | None = None,
         apply_resting_haircut: bool = False,
+        deploy_scale: float = 1.0,
+        net_effect_observer: NetEffectObserver | None = None,
     ) -> list[Breach]:
         """All current breaches, mass-acceptance included.
 
@@ -610,7 +747,22 @@ class LimitChecker:
         simply not evaluated (no snapshot yet); a present-but-unusable snapshot
         fails closed (a breach), matching UNKNOWN-is-never-safe.
         """
-        limits = self._limits
+        # DEPLOYMENT SCALE (risk/deploy_scale.py). ``deploy_scale`` is SOLVED off
+        # the hot path from the live envelope — the largest uniform book scaling
+        # that still clears EVERY enforced cap, including the ratified
+        # ``portfolio_kill_tail_prob`` anchor. It breathes ONLY the deploy-side
+        # budgets (per-combo / entity / game / slate / directional); the
+        # ENVELOPE this very number was bounded by (portfolio CVaR, det-max,
+        # ruin budget), the HALTS and every absolute backstop are invariant by
+        # construction (``DEPLOY_BUDGET_FIELDS`` is the exhaustive list), so the
+        # scale can never move its own ceiling. Default 1.0 ⇒ byte-identical
+        # (``scale_deploy_budgets`` returns the SAME object) and the whole
+        # feature is inert unless the caller passes a solved scale.
+        limits = (
+            self._limits
+            if deploy_scale <= 1.0
+            else scale_deploy_budgets(self._limits, deploy_scale)
+        )
         breaches: list[Breach] = []
         candidates = candidate_positions or []
 
@@ -943,16 +1095,68 @@ class LimitChecker:
             for position in candidates:
                 for leg in position.legs:
                     candidate_keys.add(leg_entity_key(leg))
+            # NET-EFFECT ADMISSION (LEVER #3, operator 2026-07-27: "stop
+            # refusing the flow that diversifies us"). The wall above judges a
+            # combo by its WORST key; a cross-sport ticket that adds one unit
+            # to an over-wall arm plus four units of genuinely fresh exposure
+            # IMPROVES our dollar concentration and was refused outright (the
+            # 7/26-27 esports tape). When armed, such a candidate is admitted
+            # ONLY on a certificate produced by EXHAUSTIVE enumeration of the
+            # book's complete per-key premium state before and after the fill
+            # (risk/net_effect.py) — the WaiverCertificate doctrine, extended
+            # from risk-REDUCING to risk-DIVERSIFYING flow, and measured in
+            # DOLLARS, never key counts. The certificate is built LAZILY, only
+            # once a key has actually breached, so a clean quote pays nothing.
+            # SCOPE: a SHAPE waiver only. ``combo_thr`` — the LIVE per-COMBO
+            # wall — remains the absolute ceiling ("one entity may carry at
+            # most what one structure is allowed to"), and every portfolio
+            # SCALE protection (det-max, ruin, CVaR/KILL-tail, slate, per-game,
+            # the halts) is untouched.
+            pre_by_key: dict[str, int] | None = None
             for key in sorted(candidate_keys):
                 loss_cc = snapshot.loss_by_entity_cc.get(key, 0)
                 if loss_cc <= entity_thr:
                     continue
+                cert: ConcentrationCertificate | None = None
+                if limits.entity_net_effect_admission:
+                    if pre_by_key is None:
+                        pre_by_key = pre_state_from_post(
+                            snapshot.loss_by_entity_cc,
+                            (
+                                (
+                                    frozenset(
+                                        leg_entity_key(leg) for leg in p.legs
+                                    ),
+                                    int(p.max_loss_cc),
+                                )
+                                for p in candidates
+                            ),
+                        )
+                    cert = certify_net_effect(
+                        key=key,
+                        pre_by_key=pre_by_key,
+                        post_by_key=snapshot.loss_by_entity_cc,
+                    )
+                    if net_effect_observer is not None:
+                        net_effect_observer(cert)
+                    if _net_effect_admits(cert, key, loss_cc, combo_thr):
+                        continue
+                net_note = (
+                    ""
+                    if cert is None
+                    else (
+                        f"; net-effect {cert.verdict} "
+                        f"(N_eff {cert.pre_eff_n:.2f}->{cert.post_eff_n:.2f}, "
+                        f"ceiling {combo_thr}cc)"
+                    )
+                )
                 out.append(
                     Breach(
                         ReasonCode.SKIP_ENTITY_LOSS_CAP,
                         f"entity {key} ACCUMULATED loss {loss_cc}cc "
                         f"(committed+reserved+candidate) > "
-                        f"{limits.entity_loss_frac} bankroll = {entity_thr}cc",
+                        f"{limits.entity_loss_frac} bankroll = {entity_thr}cc"
+                        f"{net_note}",
                         shadow=shadow,
                     )
                 )

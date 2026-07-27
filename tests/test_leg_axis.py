@@ -19,11 +19,14 @@ combos, invisible until hand-decomposed). Pinned here:
 
 from __future__ import annotations
 
+import dataclasses
+import random
 from collections.abc import Callable
 
 from combomaker.core.conventions import Conventions, Side
 from combomaker.core.money import CentiCents
 from combomaker.core.quantity import CentiContracts
+from combomaker.risk.concentration_steer import SteerCenter, build_loss_event_book
 from combomaker.risk.exposure import (
     ExposureBook,
     LegRef,
@@ -32,10 +35,12 @@ from combomaker.risk.exposure import (
     leg_family_key,
 )
 from combomaker.risk.skew import (
+    ConcentrationProfile,
     LegAxisProfile,
     SkewLimits,
     SkewParams,
     compute_inventory_skew,
+    ticket_bucket,
 )
 
 CONVENTIONS = Conventions(
@@ -181,12 +186,46 @@ def _k_heavy_profile(
             "KXMLBTOTAL:7.5:no": 0.1,
         },
         total_entity_cc=total_cc,
-        budget_cc=budget_cc,
+        family_budget_cc=budget_cc,
+        entity_budget_cc=budget_cc,
         p_book=p_book,
     )
 
 
-def _skew(candidate, profile, *, params=PARAMS):
+def _warm_centre(sd: float = 0.12) -> SteerCenter:
+    c = SteerCenter(half_life=128.0)
+    rng = random.Random(19)
+    for _ in range(600):
+        c.observe(rng.gauss(0.0, sd))
+    return c
+
+
+def _conc(held: tuple[OpenPosition, ...] = (), *, centre=None):
+    """LEVER #5 profile (2026-07-27) — the AND-BOUND dollar-Herfindahl that
+    now prices every DIVERSIFICATION rebate the 1/n_keys COUNT deficit used
+    to price (and decay: 42% in one session, purely because we succeeded)."""
+    return ConcentrationProfile(
+        loss_events=build_loss_event_book(
+            [(ticket_bucket(p.legs), float(p.max_loss_cc)) for p in held]
+        ),
+        game_dollars_cc={},
+        game_wall_cc=1.0e9,
+        family_dollars_cc={},
+        family_wall_cc=1.0e9,
+        entity_dollars_cc={},
+        entity_wall_cc=1.0e9,
+        fill_elasticity_per_cent=0.22,
+        centre=centre if centre is not None else _warm_centre(),
+    )
+
+
+def _skew(candidate, profile, *, params=PARAMS, conc_profile=None):
+    # LEVER #5 ARMING (2026-07-27 review B3): the steer ships SHADOW, so a test
+    # that wires a ``conc_profile`` AND asserts on the composed ``applied_cc``
+    # has to arm it explicitly. Byte-identity of the UNARMED composition is
+    # pinned in tests/test_conc_arming.py, not here.
+    if conc_profile is not None and not params.conc_armed:
+        params = dataclasses.replace(params, conc_armed=True)
     book = ExposureBook(CONVENTIONS)
     snap = book.snapshot(provider({}), mass_acceptance=False)
     return compute_inventory_skew(
@@ -197,6 +236,10 @@ def _skew(candidate, profile, *, params=PARAMS):
         LIMITS,
         params,
         leg_axis_profile=profile,
+        conc_profile=conc_profile,
+        margin_cc=200,
+        tick_cc=10,
+        observe_centre=False,
     )
 
 
@@ -211,42 +254,78 @@ class TestLegAxisComponent:
         assert "leg_concentrating" in reasons
 
     def test_other_side_of_the_ladder_rebates(self) -> None:
+        """The missing direction is a DIFFERENT family key carrying zero share,
+        so its scale-free alignment is ``−H`` — a strict rebate on this axis
+        AND a new AND-bound loss event on the Herfindahl."""
+        held = (no_position("h", (leg(KS_SKENES_5, "KX-G9"),)),)
         cand = no_position("c", (leg(KS_SKENES_5, "KX-G9", side="no"),))
-        skew = _skew(cand, _k_heavy_profile())
-        assert skew.family_cc < 0  # KXMLBKS:no is the missing direction
+        skew = _skew(cand, _k_heavy_profile(), conc_profile=_conc(held))
+        assert skew.family_cc < 0
+        assert all(
+            r[3] == "leg_diversifying"
+            for r in skew.leg_axis_rows
+            if r[0].startswith("KXMLBKS") and ":no" in r[0]
+        )
+        assert skew.conc is not None
+        # KXMLBKS:no is a DIFFERENT family key from the loaded KXMLBKS:yes, so
+        # the ticket lands on a NEW AND-bound loss event: it lowers
+        # dollar-weighted concentration and is quoted strictly tighter.
+        assert skew.conc.hhi.score > 0.0
+        assert skew.conc.applied_cc > 0
 
     def test_same_entity_widens_more_than_new_entity(self) -> None:
+        centre = _warm_centre()
+        held = (no_position("h", (leg(KS_CEASE_5, "KX-G1"),)),)
         same = _skew(
-            no_position("c1", (leg(KS_CEASE_6, "KX-G1"),)), _k_heavy_profile()
+            no_position("c1", (leg(KS_CEASE_6, "KX-G1"),)), _k_heavy_profile(),
+            conc_profile=_conc(held, centre=centre),
         )
         new = _skew(
             no_position("c2", (leg(HR_SCHWARBER, "KX-G3"),)),
             _k_heavy_profile(),
+            conc_profile=_conc(held, centre=centre),
         )
         assert same.entity_cc > 0  # another Cease rung: the $127-arm shape
-        assert new.entity_cc < 0  # brand-new entity: diversification rebate
-        assert new.family_cc < 0  # brand-new family direction too
+        # Another rung of the SAME arm in the SAME game is the SAME AND-bound
+        # loss event (the rung segment drops out of leg_entity_key), so it
+        # CONCENTRATES; a brand-new entity in a new game is a NEW event.
+        assert same.conc is not None and new.conc is not None
+        assert same.conc.hhi.relative <= 0.0 < new.conc.hhi.relative
+        assert new.conc.applied_cc > same.conc.applied_cc
+        assert new.applied_cc > same.applied_cc
 
-    def test_onset_scales_with_the_enforced_budget(self) -> None:
+    def test_the_axis_is_book_size_invariant(self) -> None:
+        """SUPERSEDES ``test_onset_scales_with_the_enforced_budget`` (operator
+        directive 2026-07-27). The budget/wall denominator IS the book-size
+        term: it made the identical candidate read as more concentrating purely
+        because the book grew. The axis now reads SHARE against the axis's own
+        Herfindahl, so a 1x and a 100x book of the same composition price the
+        same — and a full sweep of book sizes produces no cliff at all."""
         cand = no_position("c", (leg(KS_SKENES_5, "KX-G9"),))
-        near_cap = _skew(
-            cand, _k_heavy_profile(total_cc=1.0e6, budget_cc=1.0e6)
-        )
-        tiny_book = _skew(
-            cand, _k_heavy_profile(total_cc=1.0e4, budget_cc=1.0e6)
-        )
-        assert near_cap.family_cc > tiny_book.family_cc >= 0
+        values = {
+            _skew(
+                cand, _k_heavy_profile(total_cc=1.0e4 * (2.0**i),
+                                       budget_cc=1.0e6)
+            ).family_cc
+            for i in range(12)
+        }
+        assert len(values) == 1
+        assert values.pop() > 0  # ...and it still widens the concentrator
 
     def test_unknown_p_book_and_empty_book_are_neutral(self) -> None:
         cand = no_position("c", (leg(KS_SKENES_5, "KX-G9"),))
+        # p_book NO LONGER GATES THIS AXIS (2026-07-27): ``need = 1 − p_book``
+        # was a candidate-blind book-size proxy and is gone, so an unknown
+        # p_book leaves the SHAPE reading untouched.
         no_pb = _skew(cand, _k_heavy_profile(p_book=None))
-        assert no_pb.family_cc == 0 and no_pb.entity_cc == 0
+        assert no_pb.family_cc == _skew(cand, _k_heavy_profile()).family_cc
         empty = LegAxisProfile(
             shares_by_family={},
             total_family_cc=0.0,
             shares_by_entity={},
             total_entity_cc=0.0,
-            budget_cc=1.0e6,
+            family_budget_cc=1.0e6,
+            entity_budget_cc=1.0e6,
             p_book=0.45,
         )
         sk = _skew(cand, empty)

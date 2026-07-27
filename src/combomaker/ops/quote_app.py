@@ -356,6 +356,13 @@ def build_lifecycle_config(
         quote_ttl_s=QUOTE_TTL_S,
         candidate_gate_enabled=risk_cfg.candidate_gate_enabled,
         candidate_gate_deadline_s=risk_cfg.candidate_gate_deadline_s,
+        # CONFIRM-WINDOW REBUILD (2026-07-27). Both default ON — they ARE the
+        # fix for the 70 won auctions discarded on our own stopwatch — and are
+        # exposed here only so the operator has a real rollback lever without an
+        # edit. ``candidate_gate_deadline_s`` above is now only the fallback
+        # budget used when the derived deadline is switched OFF.
+        candidate_gate_derived_deadline=risk_cfg.candidate_gate_derived_deadline,
+        candidate_gate_timeout_fallback=risk_cfg.candidate_gate_timeout_fallback,
         worst_challenger_ev_tolerance_cc=risk_cfg.worst_challenger_ev_tolerance_cc,
         lastlook_mc_waiver_enabled=risk_cfg.lastlook_mc_waiver_enabled,
         lastlook_mc_waiver_deadline_s=risk_cfg.lastlook_mc_waiver_deadline_s,
@@ -388,6 +395,14 @@ def build_lifecycle_config(
         release_accepted_quote_exposure=risk_cfg.release_accepted_quote_exposure,
         require_p_book_non_decreasing=risk_cfg.require_p_book_non_decreasing,
         open_quote_ev_eviction=risk_cfg.open_quote_ev_eviction,
+        # DEPLOYMENT SCALE (operator LEVER #1): solved off the maintenance tick
+        # from the live envelope; consumed by the deploy-side budgets only.
+        # Default OFF ⇒ never solved, never consumed (byte-identical).
+        deploy_scale_enabled=risk_cfg.deploy_scale_enabled,
+        deploy_scale_s_max=risk_cfg.deploy_scale_s_max,
+        deploy_scale_grid_points=risk_cfg.deploy_scale_grid_points,
+        deploy_scale_refresh_s=risk_cfg.deploy_scale_refresh_s,
+        deploy_scale_mc_samples=risk_cfg.deploy_scale_mc_samples,
         # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): poll REST for a confirmed
         # fill whose quote_executed WS message never arrived.
         fill_record_recovery_after_s=risk_cfg.fill_record_recovery_after_s,
@@ -1766,6 +1781,12 @@ class QuoteApp:
                 # flip that adds it into pricing (after its shadow slate).
                 leg_axis_enabled=skew_cfg.leg_axis_enabled,
                 leg_axis_armed=skew_cfg.leg_axis_armed,
+                # LEVER #5 CONCENTRATION STEER (2026-07-27): shadow-computed by
+                # default; ``pricing.skew.conc_armed: true`` is the ONE flip
+                # that lets it price (after the shadow read-out).
+                # ``conc_enabled: false`` stops it being computed at all.
+                conc_enabled=skew_cfg.conc_enabled,
+                conc_armed=skew_cfg.conc_armed,
             )
             skew_limits = SkewLimits(
                 max_event_delta_contracts=risk_cfg.max_event_delta_contracts,
@@ -2001,6 +2022,17 @@ class QuoteApp:
                 # SETTLED-LEG MARGINAL RESOLUTION (2026-07-18): see above.
                 settled_marginals=settled_marginals,
             )
+            # NESTED-LADDER RESOLUTION for the risk view (2026-07-27). The rho
+            # provider is built ABOVE (it is a lifecycle constructor argument),
+            # but the ONE marginal source it needs — the lifecycle's feed/settled
+            # resolver — only exists now. Binding it here means the SAME provider
+            # object held by the lifecycle's portfolio MC, the candidate gate's
+            # shipped rho_pairs, and the report MC resolves same-ladder rung pairs
+            # (a starter's K-ladder) to their EXACT comonotone coupling instead of
+            # the +0.04 MEASURED FOR TWO OPPOSING STARTERS. Nothing else in the
+            # provider changes: every non-nested pair keeps the marginal-less band
+            # (see sim/within_game_rho.py).
+            within_game_rho.bind_marginals(lifecycle._marginals)  # noqa: SLF001 (wiring seam)
             # R3 Phase 3: single-writer risk-reservation service. Wired AFTER the
             # lifecycle (it reuses the lifecycle's shadow splitter, so a %-cap
             # breach in Phase-2 SHADOW mode never denies a reservation — only

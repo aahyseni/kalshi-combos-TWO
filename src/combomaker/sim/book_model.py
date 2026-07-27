@@ -203,6 +203,126 @@ def _position_to_combo(
     )
 
 
+# === THE SAME-GAME PAIR SET — ONE DEFINITION, TWO CONSUMERS ================
+#
+# ``build_book_model`` resolves a within-game rho for EXACTLY the unordered leg
+# pairs that share a game. Any caller that has to PRE-RESOLVE those rhos (the
+# RFQ candidate gate ships them to a worker process as a plain dict, because the
+# live SgpParams closure does not pickle) must produce the IDENTICAL set:
+#
+#   * a pair the caller resolves that the model never asks for is pure waste —
+#     measured on the live 100-position book, 22,155 all-pairs vs 879 same-game
+#     = 96.03% of the work discarded, and the discarded 96% is what blew the
+#     3.0 s exchange confirm window;
+#   * a pair the caller MISSES is a CORRECTNESS defect, and a silent one: the
+#     dict-backed provider returns None for it, ``build_book_model`` substitutes
+#     ``flat_band``, and the book is modelled at LESS correlation than the
+#     pricer measured — it UNDERSTATES the joint tail and therefore UNDERSTATES
+#     RISK, with nothing in the output to say so.
+#
+# So the grouping is NOT re-implemented at the call site. The three primitives
+# below are the ONLY definition; ``build_book_model`` and
+# ``within_game_pair_tickers`` both call them, so the two sets are equal BY
+# CONSTRUCTION and an edit to either one moves both together.
+
+
+def select_modeled_positions(
+    positions: Sequence[OpenPosition],
+    priced: Callable[[str], bool],
+) -> tuple[list[OpenPosition], float]:
+    """Split the book into SAMPLED and RESERVED, the one way (P0-4 + 2026-07-23).
+
+    A position is SAMPLED only if it is ``risk_modeled`` AND every one of its
+    legs is priceable; otherwise its EXACT max loss folds into the deterministic
+    reserve. Returns ``(modeled_positions, reserved_loss_cc)`` preserving input
+    order — the order everything downstream (leg universe, combo list) keys on.
+    """
+    modeled: list[OpenPosition] = []
+    reserved_loss_cc = 0.0
+    for position in positions:
+        if position.risk_modeled and all(
+            priced(leg.market_ticker) for leg in position.legs
+        ):
+            modeled.append(position)
+        else:
+            reserved_loss_cc += float(position.max_loss_cc)
+    return modeled, reserved_loss_cc
+
+
+def build_leg_universe(
+    modeled_positions: Sequence[OpenPosition],
+) -> tuple[list[str], dict[int, str | None], dict[int, str | None]]:
+    """The global leg universe: one entry per DISTINCT ``market_ticker``, in
+    first-occurrence order over ``modeled_positions``.
+
+    Returns ``(ticker_by_index, event_by_index, game_of_index)``. The game key is
+    the pricer's own :func:`~combomaker.pricing.grouping.game_key` on the leg's
+    ``event_ticker``; a leg with NO event ticker gets ``None`` and therefore
+    never joins a game block (fail-closed — an ungamed leg never correlates).
+    First occurrence wins, so a ticker seen under two event tickers is placed by
+    the FIRST position that carries it: identical for every consumer that walks
+    the same ordered position list.
+    """
+    seen: dict[str, int] = {}
+    ticker_by_index: list[str] = []
+    event_by_index: dict[int, str | None] = {}
+    game_of_index: dict[int, str | None] = {}
+    for position in modeled_positions:
+        for leg in position.legs:
+            if leg.market_ticker in seen:
+                continue
+            idx = len(ticker_by_index)
+            seen[leg.market_ticker] = idx
+            ticker_by_index.append(leg.market_ticker)
+            event_by_index[idx] = leg.event_ticker
+            game_of_index[idx] = (
+                game_key(leg.event_ticker) if leg.event_ticker else None
+            )
+    return ticker_by_index, event_by_index, game_of_index
+
+
+def within_game_index_members(
+    game_of_index: dict[int, str | None], n: int
+) -> dict[str, list[int]]:
+    """Leg indices grouped by game code, in index order. An ungamed leg
+    (``game is None``) is dropped — it never correlates with another leg."""
+    members_by_game: dict[str, list[int]] = {}
+    for idx in range(n):
+        game = game_of_index.get(idx)
+        if game is None:
+            continue  # an ungamed leg never correlates with another (fail-closed)
+        members_by_game.setdefault(game, []).append(idx)
+    return members_by_game
+
+
+def within_game_pair_tickers(
+    positions: Sequence[OpenPosition],
+    priced: Callable[[str], bool],
+) -> list[tuple[str, str]]:
+    """EXACTLY the unordered leg-ticker pairs ``build_book_model`` will resolve a
+    within-game rho for, given the SAME ordered ``positions`` and the SAME
+    ``priced`` predicate — no more (the 96% cross-game waste) and no fewer (a
+    missing pair silently understates correlation).
+
+    Emitted in ``build_book_model``'s own order: game groups in first-appearance
+    order, and within a group the nested ``(i, j)`` index order.
+    """
+    modeled, _reserved = select_modeled_positions(positions, priced)
+    ticker_by_index, _event_by_index, game_of_index = build_leg_universe(modeled)
+    members_by_game = within_game_index_members(
+        game_of_index, len(ticker_by_index)
+    )
+    pairs: list[tuple[str, str]] = []
+    for members in members_by_game.values():
+        if len(members) < 2:
+            continue
+        for a_pos in range(len(members)):
+            i = members[a_pos]
+            for b_pos in range(a_pos + 1, len(members)):
+                pairs.append((ticker_by_index[i], ticker_by_index[members[b_pos]]))
+    return pairs
+
+
 def build_book_model(
     positions: Iterable[OpenPosition],
     *,
@@ -257,40 +377,32 @@ def build_book_model(
     # EVERY quote while one held combo's game was in progress (live 2026-07-23: a $5
     # combo with an in-play, empty-book leg blocked the entire book). Fail-closed
     # paired with the known-max-loss fact (the standing "full state awareness" rule).
-    modeled_positions: list[OpenPosition] = []
-    reserved_loss_cc = 0.0
-    for position in positions:
-        if position.risk_modeled and all(
-            _priced(leg.market_ticker) is not None for leg in position.legs
-        ):
-            modeled_positions.append(position)
-        else:
-            reserved_loss_cc += float(position.max_loss_cc)
+    # THE SHARED DEFINITION (see the block above ``select_modeled_positions``):
+    # the modeled/reserved split, the leg universe and the same-game grouping are
+    # the SAME three primitives ``within_game_pair_tickers`` uses, so the pair set
+    # a caller pre-resolves is equal to the set queried below BY CONSTRUCTION.
+    modeled_positions, reserved_loss_cc = select_modeled_positions(
+        positions, lambda ticker: _priced(ticker) is not None
+    )
 
     # --- global leg universe: one LegModel per distinct ticker, YES marginal ---
-    leg_index: dict[str, int] = {}
+    ticker_by_index, event_by_index, game_of_index = build_leg_universe(
+        modeled_positions
+    )
+    leg_index: dict[str, int] = {
+        ticker: idx for idx, ticker in enumerate(ticker_by_index)
+    }
     legs: list[LegModel] = []
-    event_by_index: dict[int, str | None] = {}
-    game_of_index: dict[int, str | None] = {}
     unknown = False
-    for position in modeled_positions:
-        for leg in position.legs:
-            if leg.market_ticker in leg_index:
-                continue
-            p = _priced(leg.market_ticker)
-            if p is None:
-                # Unreachable: modeled_positions are all-priced by construction.
-                # Kept as belt-and-braces fail-closed if a provider ever returns
-                # non-deterministically within one build.
-                unknown = True
-                p = 0.5  # placeholder ONLY; `unknown` forbids using the stats
-            idx = len(legs)
-            leg_index[leg.market_ticker] = idx
-            legs.append(LegModel(p=p))
-            event_by_index[idx] = leg.event_ticker
-            game_of_index[idx] = (
-                game_key(leg.event_ticker) if leg.event_ticker else None
-            )
+    for ticker in ticker_by_index:
+        p = _priced(ticker)
+        if p is None:
+            # Unreachable: modeled_positions are all-priced by construction.
+            # Kept as belt-and-braces fail-closed if a provider ever returns
+            # non-deterministically within one build.
+            unknown = True
+            p = 0.5  # placeholder ONLY; `unknown` forbids using the stats
+        legs.append(LegModel(p=p))
 
     n = len(legs)
 
@@ -315,12 +427,7 @@ def build_book_model(
         )
 
     # --- within-game blocks: index sets keyed on the game code ---------------
-    game_members: dict[str, list[int]] = {}
-    for idx in range(n):
-        game = game_of_index.get(idx)
-        if game is None:
-            continue  # an ungamed leg never correlates with another (fail-closed)
-        game_members.setdefault(game, []).append(idx)
+    game_members = within_game_index_members(game_of_index, n)
 
     # === THE TWO JOINTS (2026-07-26 AXIS SPLIT) ==============================
     #
@@ -384,12 +491,8 @@ def build_book_model(
     # corr entries, and the structural/copula split is decided downstream from the
     # leg universe, which this does not touch.
 
-    # Ticker by latent index, resolved ONCE. (The pre-split path did an O(n)
-    # reverse scan of ``leg_index`` per leg per pair per band — O(n^3) — inside
-    # the pair loop.)
-    ticker_by_index: list[str] = [""] * n
-    for _ticker, _i in leg_index.items():
-        ticker_by_index[_i] = _ticker
+    # ``ticker_by_index`` comes straight from ``build_leg_universe`` above — the
+    # SAME list ``within_game_pair_tickers`` names its pairs from.
 
     # Resolve each unordered within-game PAIR's (low, point, high) band ONCE — the
     # pre-split code re-queried the provider for every pair on EVERY band (3x the

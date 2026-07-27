@@ -79,6 +79,39 @@ vs realized P&L — never on single outcomes.
    duplicate any live logic (e.g. the harness copies the engine's ~15-line model
    dispatch because `engine.price()` needs order books a backtest lacks), keep a
    "keep in sync with <live location>" comment and cover it with the parity check.
+9. **VITAL-SIGNS GATE before any commit that touches pricing, risk, or the
+   quote/confirm path (operator directive 2026-07-27).** Run
+
+   ```
+   .venv/Scripts/python.exe -m tools.vitals.gate          # fast tier, ~14s
+   ```
+
+   and it must be **8/8 GREEN** before the commit. Applies to any change under
+   `src/combomaker/{pricing,risk,rfq,sim}/**`, `ops/{quote_app,supervisor,
+   relight,write_budget}.py`, or the caps/config that feed them. Before ARMING a
+   change live (or before any change to `compute_book_risk` / the candidate gate
+   / `build_book_model`), also run the pre-ship tier:
+
+   ```
+   .venv/Scripts/python.exe -m tools.vitals.gate --tier pre-ship   # ~35s
+   ```
+
+   **WHY IT EXISTS, and why the unit suite is not a substitute.** Eight changes
+   in 48 h produced SEVEN regressions with 3,081 unit tests GREEN throughout;
+   reintroducing all seven trips 17 test instances and every one of those 17 was
+   written by the commit that FIXED that same regression — zero pre-existing
+   detectors, and two of the seven are invisible to the suite even today. The
+   suite asserts the mechanism the author had in mind and never varies the
+   discriminating variable. The gate does exactly that: every check runs against
+   DEGRADED state (a book already over a wall, an exchange 429ing forever, a
+   realistic fan-out wave taken from the tape, an accept landing inside an await,
+   the book at 1x/3x/5x), and every threshold is measured, observed, or a
+   protocol fact — **there is no tuned constant in `tools/vitals/`**. Rule 8
+   applies: the gate imports and drives the real modules and never edits one.
+   `tools/vitals/prove.py` reintroduces six historical defects in scratch copies
+   and proves the gate goes red on each; run it after changing the gate itself.
+   Full rationale, per-check incident mapping and the measured table:
+   `docs/reports/2026-07-27-vital-signs-gate.md`.
 
 ## Quiet-failure defenses (operator directive 2026-07-05 — standing rules)
 

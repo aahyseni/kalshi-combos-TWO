@@ -686,25 +686,35 @@ class BookRiskPool:
         return result
 
     async def run_candidate(
-        self, inputs: CandidateBookRiskInputs
+        self, inputs: CandidateBookRiskInputs, *, deadline_s: float
     ) -> CandidateBookRisk:
         """Run the P0-1 CANDIDATE book-risk MC in a worker and return its verdict.
 
         Awaiting the future yields the loop so the heartbeat keeps beating during the
-        ~20k-sample MC. Confirms are rare and the confirm window is 3s, so awaiting
-        off-loop here is fine — what matters is that the CPU-bound MC never runs
-        INLINE on the loop. NO deadline (unlike a one-shot RFQ price): the confirm
-        path awaits the verdict, and any exception propagates to the caller, which
-        DECLINES the confirm (fail-closed — an errored gate never confirms)."""
+        ~20k-sample MC. What matters is that the CPU-bound MC never runs INLINE on
+        the loop.
+
+        BOUNDED by ``deadline_s`` since 2026-07-27 (B2), with the SAME semantics
+        ``run_state_worst_case`` already ships: this is a confirm-window decision,
+        so on timeout the loop stops waiting (``TimeoutError`` propagates) while
+        the worker finishes and frees itself. The candidate gate treats that
+        timeout as a LATENCY event and resolves on the deterministic caps — it is
+        never a risk verdict. Any OTHER exception propagates to the caller, which
+        DECLINES the confirm (fail-closed — an errored gate never confirms).
+
+        The bound is what let the gate DELETE its cost predictor: the MC is
+        started on every accept that has any window left, so no measurement
+        history can ever switch it off."""
         if self._executor is None:
             raise RuntimeError("BookRiskPool.run_candidate before start()")
         self.calls += 1
         loop = asyncio.get_running_loop()
         submit_ns = time.monotonic_ns()
+        fut = loop.run_in_executor(
+            self._executor, _timed_worker_candidate_book_risk, inputs
+        )
         try:
-            result, compute_ms = await loop.run_in_executor(
-                self._executor, _timed_worker_candidate_book_risk, inputs
-            )
+            result, compute_ms = await asyncio.wait_for(fut, timeout=deadline_s)
         except Exception:
             self.errors += 1
             raise

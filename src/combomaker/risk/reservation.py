@@ -59,6 +59,7 @@ from typing import Any
 
 from combomaker.core.conventions import Side
 from combomaker.core.quantity import qty_from_fp_str
+from combomaker.core.reasons import ReasonCode
 from combomaker.ops.logging import get_logger
 from combomaker.risk.exposure import ExposureBook, MarginalProvider, OpenPosition
 from combomaker.risk.limits import (
@@ -287,6 +288,7 @@ class RiskReservationService:
         book_risk: PortfolioRisk | None = None,
         waived_games: Mapping[str, WaiverCertificate] | None = None,
         apply_resting_haircut: bool = False,
+        deploy_scale: float = 1.0,
     ) -> ReserveResult:
         """Atomically reserve headroom for ``candidate`` if the limits allow it.
 
@@ -352,6 +354,13 @@ class RiskReservationService:
             book_risk=book_risk,
             waived_games=waived_games,
             apply_resting_haircut=apply_resting_haircut,
+            # DEPLOYMENT SCALE (risk/deploy_scale.py). The CONFIRM path must
+            # breathe at the SAME solved scale the quote-time admission used, or
+            # we re-open the renege zone the 2026-07-25 big-fill audit closed
+            # (win the auction on a looser quote-time cap, decline it here).
+            # The caller passes the SAME ``deploy_scale_for_check()`` value; the
+            # default 1.0 is byte-identical to before this existed.
+            deploy_scale=deploy_scale,
         )
         enforced = self._split(raw)
         if enforced:
@@ -374,6 +383,70 @@ class RiskReservationService:
                 version=self._version,
             )
         )
+
+    def revalidate(
+        self,
+        reservation_id: str,
+        *,
+        marginals: MarginalProvider,
+        daily_pnl: DailyPnl,
+        risk_bankroll_cc: int | None = None,
+        bankroll_source_configured: bool = True,
+        start_time_provider: StartTimeProvider | None = None,
+        halt_inputs: HaltInputs | None = None,
+        book_risk: PortfolioRisk | None = None,
+        apply_resting_haircut: bool = False,
+        deploy_scale: float = 1.0,
+    ) -> list[Breach]:
+        """RE-CHECK the ENFORCED deterministic caps for an ALREADY-HELD
+        reservation against the **current** book. Returns the enforced breaches
+        ([] = still admissible). READ-ONLY: nothing is recorded, released, or
+        version-bumped, so it is safe to call at any point between reserve and
+        commit.
+
+        This is the CONFIRM-PATH SAFETY FLOOR the 2026-07-27 candidate-gate
+        timeout fallback stands on. Last look exists because the book can move
+        between quote and accept — and it can move again between the reservation
+        and the moment the (slow) candidate MC gives up. Skipping the MC
+        REFINEMENT is allowed; skipping the enforced caps is not. So the fallback
+        calls this and re-runs the SAME ``LimitChecker.check`` over the SAME
+        entity set ``try_reserve`` used — deterministic arithmetic, microseconds,
+        no Monte Carlo — and only confirms on an empty list.
+
+        Entity-set equality with ``try_reserve`` is exact and load-bearing: there
+        the candidate is not yet held, so the checker sees
+        ``[*outstanding, candidate]``; here the candidate IS held, so
+        ``outstanding_positions()`` already contains it and is that same set.
+        Passing the candidate again would double-count it.
+
+        FAIL-CLOSED on an unknown id: a reservation that is not outstanding has
+        no held headroom to validate (it was released, committed, or never
+        granted), so a synthetic enforced breach is returned rather than a
+        deceptively empty "all clear"."""
+        if reservation_id not in self._held:
+            return [
+                Breach(
+                    reason=ReasonCode.DECLINE_RISK_LIMIT,
+                    detail=(
+                        f"revalidate: reservation {reservation_id!r} is not "
+                        "outstanding — no held headroom to re-check (fail-closed)"
+                    ),
+                )
+            ]
+        raw = self._limits.check(
+            self._exposure,
+            marginals,
+            daily_pnl,
+            candidate_positions=self.outstanding_positions(),
+            risk_bankroll_cc=risk_bankroll_cc,
+            bankroll_source_configured=bankroll_source_configured,
+            start_time_provider=start_time_provider,
+            halt_inputs=halt_inputs,
+            book_risk=book_risk,
+            apply_resting_haircut=apply_resting_haircut,
+            deploy_scale=deploy_scale,
+        )
+        return self._split(raw)
 
     def commit(self, reservation_id: str) -> bool:
         """The fill is real (confirm landed): promote the held reservation into a

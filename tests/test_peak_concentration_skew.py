@@ -172,6 +172,24 @@ def profile_for(
     )
 
 
+def with_peak_share(profile: PeakProfile, share: float) -> PeakProfile:
+    """The SAME game profile, re-weighted to carry ``share`` of the BOOK'S peak
+    mass by parking the remainder on a phantom game the candidate never touches.
+
+    This is the axis the 2026-07-27 repair put the peak component on: the weight
+    is a pure RATIO, so it moves only when the book's SHAPE moves - never when
+    the whole book is scaled."""
+    import dataclasses
+
+    gp = profile.by_game[GAME]
+    top = float(max(0, gp.top_loss_cc))
+    other = top * (1.0 - share) / share if share > 0 else 0.0
+    phantom = dataclasses.replace(gp, game="PHANTOM", top_loss_cc=int(round(other)))
+    return dataclasses.replace(
+        profile, by_game={**profile.by_game, "PHANTOM": phantom}
+    )
+
+
 def limits_with_budget(budget_dollars: float) -> SkewLimits:
     """Delta/notional axes kept loose so the peak/loss budget is the driver."""
     return SkewLimits(
@@ -235,38 +253,60 @@ class TestPeakStacking:
         assert [row[3] for row in peaked.peak_per_game] == ["peak_hit"]
 
     def test_exact_formula_values(self) -> None:
-        # MAGNITUDE RECALIBRATION (operator directive 2026-07-19 evening): the
-        # candidate-size factor is GONE — the per-contract price reflects
-        # WHERE the risk lands, never the clip size (size is the caps'/
-        # velocity brake's job). Book premium $30 -> peak 300_000cc; budget
-        # $50 -> peak_ratio 0.6; severity 1.0 (hits the worst state).
-        # widen = 600 x 1.0 x 0.6**2 = 216cc (~2.2c; was 13cc pre-recal).
+        # SIZE-INVARIANCE REPAIR (operator directive 2026-07-27): the STATIC
+        # $1,000-style budget denominator is GONE. The weight is now this
+        # game's SHARE of the BOOK'S peak mass — a pure ratio — so a one-game
+        # book reads share 1.0 and a full-severity stacker pays the full
+        # widen: 600 x 1.0 x 1.0**2 = 600cc. The candidate-size factor stays
+        # gone (2026-07-19): the per-contract price reflects WHERE the risk
+        # lands, never the clip size.
         book = committed_book()
         profile = profile_for(book)
         candidate = no_position("cand", STACK_LEGS, contracts=1_000)
         peaked = skew_for(candidate, book, profile=profile)
-        assert peaked.peak_cc == 216
-        assert peaked.peak_per_game == ((GAME, 216, 1.0, "peak_hit"),)
+        assert peaked.peak_cc == 600
+        assert peaked.peak_per_game == ((GAME, 600, 1.0, "peak_hit"),)
         # Size-independence pin: a 10x clip pays the SAME per-contract price.
         big = no_position("cand", STACK_LEGS, contracts=10_000)
-        assert skew_for(big, book, profile=profile).peak_cc == 216
+        assert skew_for(big, book, profile=profile).peak_cc == 600
 
-    def test_widen_scales_up_as_peak_approaches_budget(self) -> None:
-        # Same candidate, same $50 budget; the BOOK grows -> the game's peak
-        # loss approaches (then hits) the budget -> the widen ramps convexly.
+    def test_widen_scales_with_this_games_share_of_the_book_peak_mass(
+        self,
+    ) -> None:
+        """SUPERSEDES ``test_widen_scales_up_as_peak_approaches_budget``
+        (operator directive 2026-07-27).
+
+        The old ramp was the BOOK'S OWN committed loss over a STATIC $1,000-
+        style budget: the identical candidate paid more widen purely because
+        the book had grown, and a brand-new game ADDED widen for everyone. The
+        ramp is now this game's SHARE of the book's peak mass - a pure ratio,
+        convex (gamma 2). It rises only when the game becomes a LARGER FRACTION
+        of the book, i.e. only when we are genuinely concentrating."""
         candidate = no_position("cand", STACK_LEGS, contracts=1_000)
-        last = -1
-        adders: list[int] = []
+        book = committed_book()
+        base = profile_for(book)
+        adders = [
+            skew_for(
+                candidate, book, profile=with_peak_share(base, share)
+            ).peak_cc
+            for share in (0.15, 0.3, 0.6, 0.9, 1.0)
+        ]
+        assert adders == sorted(adders) and adders[0] < adders[-1]
+        # 600 x severity 1.0 x share**2.
+        assert adders == [14, 54, 216, 486, 600]
+
+    def test_widen_is_invariant_to_scaling_the_whole_book(self) -> None:
+        """THE OPERATOR'S RULE. Same composition, book scaled across an order
+        of magnitude: the identical candidate pays the IDENTICAL widen, with no
+        discontinuity anywhere in the sweep."""
+        candidate = no_position("cand", STACK_LEGS, contracts=1_000)
+        seen = set()
         for held in (2_500, 5_000, 10_000, 15_000, 25_000):
             book = committed_book(held_contracts=held)
-            profile = profile_for(book)
-            peaked = skew_for(candidate, book, profile=profile)
-            assert peaked.peak_cc >= last
-            last = peaked.peak_cc
-            adders.append(peaked.peak_cc)
-        assert adders[0] < adders[-1]  # strictly larger by the top
-        # ratios 0.15/0.3/0.6/0.9/1.0, severity 1.0, gamma 2: 600 x ratio**2.
-        assert adders == [14, 54, 216, 486, 600]
+            seen.add(
+                skew_for(candidate, book, profile=profile_for(book)).peak_cc
+            )
+        assert seen == {600}
 
     def test_severity_scales_by_which_peak_tier_is_hit(self) -> None:
         # Severity < 1 needs the cached top-K to span DIFFERENT loss tiers, so
@@ -332,9 +372,9 @@ class TestAntiPeak:
         assert peaked.peak_cc < 0
         assert peaked.peak_tighten_cc > 0 and peaked.peak_widen_cc == 0
         assert peaked.skew_cc == base.skew_cc + peaked.peak_cc
-        # Recalibrated rebate = 150 x peak_ratio 0.6 = 90cc (~0.9c tighter —
-        # win the flattening auction; was 5cc pre-recal). Row factor = ratio.
-        assert peaked.peak_per_game == ((GAME, -90, 0.6, "peak_miss_rebate"),)
+        # Rebate = 150 x peak_share 1.0 x (1 - severity 0) = 150cc (~1.5c
+        # tighter — win the flattening auction). Row factor = the SHARE.
+        assert peaked.peak_per_game == ((GAME, -150, 1.0, "peak_miss_rebate"),)
 
     def test_advance_mutex_opposite_side_rebates(self) -> None:
         # Advance is exactly-mutex per enumerated state (shootout branches
@@ -667,14 +707,26 @@ class TestNeutralUnknown:
         peaked = skew_for(candidate, book, profile=profile, params=off)
         assert peaked.peak_cc == 0 and peaked.peak_per_game == ()
 
-    def test_zero_budget_is_neutral(self) -> None:
+    def test_no_committed_peak_loss_is_neutral(self) -> None:
+        """SUPERSEDES ``test_zero_budget_is_neutral`` (2026-07-27): there is no
+        budget any more - the STATIC dollar denominator was the defect. The
+        fail-safe is now structural: a book whose cached peaks carry no LOSS at
+        all has no peak mass to share out, so the component is exactly 0."""
+        import dataclasses
+
         book = committed_book()
         profile = profile_for(book)
+        flat = dataclasses.replace(
+            profile,
+            by_game={
+                g: dataclasses.replace(gp, top_loss_cc=0)
+                for g, gp in profile.by_game.items()
+            },
+        )
         candidate = no_position("cand", STACK_LEGS, contracts=1_000)
-        no_budget = limits_with_budget(0.0)
-        peaked = skew_for(candidate, book, profile=profile, limits=no_budget)
+        peaked = skew_for(candidate, book, profile=flat)
         assert peaked.peak_cc == 0
-        assert peaked.peak_per_game == (("*", 0, 0.0, "no_budget"),)
+        assert peaked.peak_per_game == (("*", 0, 0.0, "peak_not_a_loss"),)
 
 
 # ---------------------------------------------------------------------------
@@ -819,17 +871,19 @@ class TestEmptyTinyBook:
         candidate = no_position("cand", STACK_LEGS, contracts=1_000)
         peaked = skew_for(candidate, [], profile=profile)
         assert peaked.peak_cc == 0
-        assert peaked.peak_per_game == ((GAME, 0, 0.0, "no_peak_profile"),)
+        # No cached game carries any peak LOSS => no peak mass to share out.
+        assert peaked.peak_per_game == (("*", 0, 0.0, "peak_not_a_loss"),)
 
-    def test_tiny_book_rounds_to_zero(self) -> None:
-        # Book premium $0.30 vs a $100 budget: ratio 0.003, gamma 2 -> the
-        # widen term rounds to 0 (small book => ~no effect, by construction).
+    def test_tiny_share_rounds_to_zero(self) -> None:
+        """SUPERSEDES ``test_tiny_book_rounds_to_zero`` (2026-07-27). A TINY
+        BOOK is no longer the thing that zeroes the steer - that was the
+        book-size term. What zeroes it is a tiny SHARE: a game carrying 0.3% of
+        the book's peak mass is not where our concentration is, at ANY book
+        size."""
         book = committed_book(held_contracts=100)
-        profile = profile_for(book)
+        profile = with_peak_share(profile_for(book), 0.003)
         candidate = no_position("cand", STACK_LEGS, contracts=1_000)
-        peaked = skew_for(
-            candidate, book, profile=profile, limits=limits_with_budget(100.0)
-        )
+        peaked = skew_for(candidate, book, profile=profile)
         assert peaked.peak_cc == 0
         assert peaked.peak_per_game[0][3] == "peak_hit"  # evaluated, just ~0
 
@@ -1201,11 +1255,11 @@ class TestMultiClusterLiveShape:
         b_st = no_position("cb", B_LEGS, contracts=1_000, entry_price=7_600)
         s_a = skew_for(a_st, book, profile=profile, limits=LIMITS_95)
         s_b = skew_for(b_st, book, profile=profile, limits=LIMITS_95)
-        assert s_a.peak_cc == 384
-        assert s_a.peak_per_game == ((GAME, 384, 1.0, "peak_hit"),)
-        assert s_b.peak_widen_cc == 232 and s_b.peak_tighten_cc == 47
-        assert s_b.peak_cc == 185
-        assert s_b.peak_per_game == ((GAME, 185, 0.605263, "peak_partial_offset"),)
+        assert s_a.peak_cc == 600
+        assert s_a.peak_per_game == ((GAME, 600, 1.0, "peak_hit"),)
+        assert s_b.peak_widen_cc == 363 and s_b.peak_tighten_cc == 59
+        assert s_b.peak_cc == 304
+        assert s_b.peak_per_game == ((GAME, 304, 0.605263, "peak_partial_offset"),)
         # Additive composition with the directional classifier is untouched.
         base_b = skew_for(b_st, book, profile=None, limits=LIMITS_95)
         assert s_b.skew_cc == base_b.skew_cc + s_b.peak_cc
@@ -1231,7 +1285,7 @@ class TestMultiClusterLiveShape:
                 entry_price=7_600,
             )
             s = skew_for(b_prop, book, profile=profile, limits=LIMITS_95)
-            assert s.peak_cc == 185  # same NET as the pure B-stacker
+            assert s.peak_cc == 304  # same NET as the pure B-stacker
 
     def test_prefix_n1_b_stacker_rode_free_and_collected_rebate(self) -> None:
         # THE REGRESSION PIN (peak_n_clusters=1 == the single-plateau cluster
@@ -1245,8 +1299,8 @@ class TestMultiClusterLiveShape:
         assert legacy.by_game[GAME].lower_clusters == ()
         b_st = no_position("cb", B_LEGS, contracts=1_000, entry_price=7_600)
         s_b = skew_for(b_st, book, profile=legacy, limits=LIMITS_95)
-        assert s_b.peak_cc == -120
-        assert s_b.peak_per_game == ((GAME, -120, 0.8, "peak_miss_rebate"),)
+        assert s_b.peak_cc == -150
+        assert s_b.peak_per_game == ((GAME, -150, 1.0, "peak_miss_rebate"),)
 
     def test_three_cluster_severity_ladder(self) -> None:
         # Three clusters price at their exact loss ratios (budget $80 ->
@@ -1262,9 +1316,9 @@ class TestMultiClusterLiveShape:
         assert gp.top_loss_cc == 640_000
         assert [c.loss_cc for c in gp.lower_clusters] == [340_000, 240_000]
         expected = {
-            "A": (STACK_LEGS, 384, "peak_hit"),
-            "B": (B_LEGS, 148, "peak_partial_offset"),
-            "C": (UNDER_LEGS, 69, "peak_partial_offset"),
+            "A": (STACK_LEGS, 600, "peak_hit"),
+            "B": (B_LEGS, 249, "peak_partial_offset"),
+            "C": (UNDER_LEGS, 131, "peak_partial_offset"),
         }
         for _name, (legs, cc, reason) in expected.items():
             cand = no_position("c", legs, contracts=2_000, entry_price=6_400)
@@ -1290,16 +1344,16 @@ class TestMultiClusterRebate:
         # Asymmetry hotfix: the certified top-miss earns the discounted
         # rebate half (47cc) but the B hit's widen half (232cc) dominates —
         # NET widen, never a net rebate for cluster-stacking flow.
-        assert s.peak_tighten_cc == 47
-        assert s.peak_widen_cc == 232
-        assert s.peak_cc == 185 > 0
+        assert s.peak_tighten_cc == 59
+        assert s.peak_widen_cc == 363
+        assert s.peak_cc == 304 > 0
         c = evaluate_peak_containment(profile, GAME, list(B_LEGS))
         assert c is not None and c.provably_misses_top
         # Pre-fix pin: n_clusters=1 granted the FULL rebate to the same
         # candidate (recalibrated magnitude: 150 x 0.8 = 120cc).
         legacy = profile_for(book, n_clusters=1)
         s1 = skew_for(b_st, book, profile=legacy, limits=LIMITS_95)
-        assert s1.peak_tighten_cc > 0 and s1.peak_cc == -120
+        assert s1.peak_tighten_cc > 0 and s1.peak_cc == -150
 
     def test_miss_a_and_b_full_rebate(self) -> None:
         # {FRA & under 2.5} provably misses EVERY A state (all over) and hits
@@ -1310,8 +1364,8 @@ class TestMultiClusterRebate:
         profile = profile_for(book)
         flat = no_position("cf", UNDER_LEGS, contracts=1_000, entry_price=7_600)
         s = skew_for(flat, book, profile=profile, limits=LIMITS_95)
-        assert s.peak_cc == -120
-        assert s.peak_per_game == ((GAME, -120, 0.8, "peak_miss_rebate"),)
+        assert s.peak_cc == -150
+        assert s.peak_per_game == ((GAME, -150, 1.0, "peak_miss_rebate"),)
         c = evaluate_peak_containment(profile, GAME, list(UNDER_LEGS))
         assert c is not None and c.provably_misses_top and c.hit_severity == 0.0
 
@@ -1372,16 +1426,16 @@ class TestSingleClusterByteIdentity:
         legacy = profile_for(book, n_clusters=1)
         stack = no_position("cand", STACK_LEGS, contracts=1_000)
         s = skew_for(stack, book, profile=legacy)
-        assert s.peak_cc == 216
-        assert s.peak_per_game == ((GAME, 216, 1.0, "peak_hit"),)
+        assert s.peak_cc == 600
+        assert s.peak_per_game == ((GAME, 600, 1.0, "peak_hit"),)
         anti = no_position("cand", ANTI_LEGS, contracts=1_000)
         a = skew_for(anti, book, profile=legacy)
-        assert a.peak_per_game == ((GAME, -90, 0.6, "peak_miss_rebate"),)
-        adders = []
-        for held in (2_500, 5_000, 10_000, 15_000, 25_000):
-            b = committed_book(held_contracts=held)
-            p = profile_for(b, n_clusters=1)
-            adders.append(skew_for(stack, b, profile=p).peak_cc)
+        assert a.peak_per_game == ((GAME, -150, 1.0, "peak_miss_rebate"),)
+        base = profile_for(book, n_clusters=1)
+        adders = [
+            skew_for(stack, book, profile=with_peak_share(base, share)).peak_cc
+            for share in (0.15, 0.3, 0.6, 0.9, 1.0)
+        ]
         assert adders == [14, 54, 216, 486, 600]
 
     def test_n1_equals_n3_on_single_cluster_book_shapes(self) -> None:
@@ -1435,12 +1489,12 @@ class TestClusterStateCapOverflow:
         # from the dropped C. Recalibrated rebate = 150 x ratio 0.8 = 120cc.
         c_st = no_position("cc", UNDER_LEGS, contracts=2_000, entry_price=6_400)
         s = skew_for(c_st, book, profile=profile, limits=LIMITS_80)
-        assert s.peak_cc == -120  # same as n_clusters=1 (uncached = neutral C)
+        assert s.peak_cc == -150  # same as n_clusters=1 (uncached = neutral C)
         assert [row[3] for row in s.peak_per_game] == ["peak_miss_rebate"]
         # B (the higher cluster) kept its widen (600 x 0.53125 x 0.64 = 204)
         # net of the certified top-miss discount (120 x (1-0.53125) = 56).
         b_st = no_position("cb", B_LEGS, contracts=2_000, entry_price=6_400)
-        assert skew_for(b_st, book, profile=profile, limits=LIMITS_80).peak_cc == 148
+        assert skew_for(b_st, book, profile=profile, limits=LIMITS_80).peak_cc == 249
 
     def test_overflow_cascades_lowest_first_never_skips(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1472,7 +1526,7 @@ class TestClusterStateCapOverflow:
         s_b = skew_for(b_st, book, profile=profile, limits=LIMITS_80)
         assert s_b.peak_cc == 0
         a_st = no_position("ca", STACK_LEGS, contracts=2_000, entry_price=6_400)
-        assert skew_for(a_st, book, profile=profile, limits=LIMITS_80).peak_cc == 384
+        assert skew_for(a_st, book, profile=profile, limits=LIMITS_80).peak_cc == 600
 
 
 # ---------------------------------------------------------------------------

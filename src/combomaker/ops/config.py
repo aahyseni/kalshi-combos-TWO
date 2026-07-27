@@ -2213,6 +2213,22 @@ class SkewConfig(StrictModel):
     # distribution, THEN arm (the derive-before-arm rule).
     leg_axis_enabled: bool = True
     leg_axis_armed: bool = False
+    # LEVER #5 CONCENTRATION STEER (operator directive 2026-07-27), on the SAME
+    # derive-before-arm seam as the two steers above — the 2026-07-27
+    # adversarial review's B3 finding was that it shipped with neither.
+    # ``conc_enabled`` computes + logs the full decomposition on every quote
+    # (risk/concentration_steer.py: the AND-bound dollar-Herfindahl marginal,
+    # the Cov(candidate, book) price off the CRN cache, the per-axis wall
+    # loads, the derived symmetric half-range). ``conc_armed`` is the SEPARATE
+    # switch that lets it REPLACE the peak/pbook/leg-axis composition in
+    # ``skew_cc`` — default OFF, because the measured magnitude is ~10x the
+    # composition it replaces (median |applied_cc| 14 -> 140cc) and a step that
+    # size gets a shadow slate and an operator read-out first
+    # (tools/diagnostics/conc_steer_shadow_readout.py).
+    # ``conc_enabled: false`` is the ZERO-COST rollback: the profile is never
+    # built, the steer is never computed, the quote path pays nothing.
+    conc_enabled: bool = True
+    conc_armed: bool = False
 
     @field_validator("w_conc", "w_off")
     @classmethod
@@ -2657,6 +2673,30 @@ class RiskConfig(StrictModel):
     # is enabled the SUM of both budgets must fit the 3s window (model
     # validator below).
     candidate_gate_deadline_s: float = 2.0
+    # CONFIRM-WINDOW REBUILD (2026-07-27) — the fix for "we win auctions and
+    # throw them away on a stopwatch". Live evidence: 70 already-WON auctions
+    # discarded in two days (254.0 contracts) because a TYPED 1.0s gate budget
+    # expired and expiry meant DECLINE; 23 of 24 losses in one session never ran
+    # a single MC sample (the O(T^2) input build alone blew the budget), and
+    # every one was recorded as decline_candidate_risk — a stopwatch wearing a
+    # risk reason code. Self-stalling: each fill grew the book, which grew the
+    # build, which timed out the next fill, until the loss rate hit 100%.
+    #
+    # derived_deadline: the gate's wall budget is DERIVED per accept from the
+    # exchange's own 3s confirm window minus the time already burnt since the
+    # accept minus a MEASURED reserve (confirm RTT high quantile + its observed
+    # dispersion + the measured deterministic-check cost). No typed number, and
+    # it moves continuously as measured latency moves. OFF ⇒ the old typed
+    # ``candidate_gate_deadline_s`` above.
+    # timeout_fallback: expiry resolves on the ENFORCED DETERMINISTIC caps
+    # (det-max / per-combo / entity / game / slate / gross — arithmetic,
+    # microseconds) re-checked against the LIVE book: CONFIRM when they allow,
+    # DECLINE (with the distinct DECLINE_CANDIDATE_GATE_TIMEOUT reason code)
+    # when they do not. The MC becomes a best-effort REFINEMENT that can never
+    # be the reason we miss the window. OFF ⇒ the old decline-on-timeout.
+    # Both default ON; they exist as rollback levers, not as tuning knobs.
+    candidate_gate_derived_deadline: bool = True
+    candidate_gate_timeout_fallback: bool = True
     # P1 EV VISIBILITY (audit "+EV IS PRODUCTION-MODEL EV, NOT ROBUST EV"). The
     # candidate gate always LOGS the production candidate EV alongside the
     # challenger / bridge / split candidate EVs. This OPTIONAL tolerance (float cc)
@@ -2779,6 +2819,25 @@ class RiskConfig(StrictModel):
     # enforced wall stands untouched. The cap ITSELF remains hand-set
     # tech-debt (dissolution into measured capacity is the follow-up build).
     open_quote_ev_eviction: bool = False
+    # DEPLOYMENT SCALE (operator LEVER #1, risk/deploy_scale.py). Default OFF =
+    # byte-identical: the scale is never solved, never consumed, and every
+    # ``LimitChecker.check`` receives 1.0. When armed, the bot SOLVES — off the
+    # maintenance tick, in the book-risk worker pool, never on the quote path —
+    # the largest uniform book scaling that STILL clears every enforced cap
+    # (including the ratified ``portfolio_kill_tail_prob``), and lets ONLY the
+    # deploy-side budgets (per-combo / entity / game / slate / directional)
+    # breathe at it. The envelope the solve is bounded by (portfolio CVaR /
+    # det-max / ruin budget / tail-prob anchor), the halts and every absolute
+    # backstop are invariant by construction. No multiplier is ever configured:
+    # ``deploy_scale_s_max`` is only the SEARCH ceiling (a bound on how far the
+    # solver may look, so one pathological snapshot cannot ask for 100x), and
+    # ``deploy_scale_grid_points`` is the ladder resolution AND the exact MC
+    # budget per solve.
+    deploy_scale_enabled: bool = False
+    deploy_scale_s_max: float = 3.0
+    deploy_scale_grid_points: int = 16
+    deploy_scale_refresh_s: float = 300.0
+    deploy_scale_mc_samples: int = 20_000
     # (5) P(BOOK) NON-DECREASE (operator doctrine 2026-07-25: "anything we
     # take in should push it up, or neutral"): the candidate gate declines a
     # fill whose measured ΔP(book) is negative beyond the CRN noise floor
@@ -2907,6 +2966,14 @@ class RiskConfig(StrictModel):
     # ONE (family:entity x direction) key — every combo riding one player/team
     # one way, across all games. Empty string = axis OFF (byte-identical).
     entity_loss_frac: str = ""     # single position max_loss
+    # NET-EFFECT ADMISSION on the entity axis (LEVER #3, operator 2026-07-27:
+    # "stop refusing the flow that diversifies us"). False = today's
+    # worst-single-leg refusal, byte-identical. True = a candidate over the
+    # entity wall is still admitted when an exhaustive enumeration of the
+    # book's per-key premium state certifies it DILUTES dollar concentration
+    # (risk/net_effect.py), capped by the LIVE per-combo wall. A policy
+    # switch, not a number.
+    entity_net_effect_admission: bool = False
     directional_frac: str = "0.10"        # net one-directional / theme
     slate_loss_frac: str = "0.08"         # Σ game loss over one slate
     daily_loss_frac: str = "0.06"         # soft daily-loss halt
@@ -3179,6 +3246,7 @@ class RiskConfig(StrictModel):
                 if self.entity_loss_frac
                 else None
             ),
+            entity_net_effect_admission=self.entity_net_effect_admission,
             directional_frac=Fraction(Decimal(self.directional_frac)),
             slate_loss_frac=Fraction(Decimal(self.slate_loss_frac)),
             daily_loss_frac=Fraction(Decimal(self.daily_loss_frac)),

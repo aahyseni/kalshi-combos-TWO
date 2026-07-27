@@ -240,18 +240,26 @@ async def test_latency_metrics_recorded_on_a_gate_run(tmp_path: Path) -> None:
     assert latencies["candidate_gate.remaining_window_ms"]["count"] == 1
 
 
-async def test_gate_deadline_records_window_expired_and_fails_closed(
+async def test_gate_deadline_records_window_expired_and_falls_back(
     tmp_path: Path,
 ) -> None:
-    # The first MC burns ~90% of the deadline AND moves the book (forces a retry). On
-    # the retry the deadline guard sees another MC would overrun the confirm window, so
-    # it FAILS CLOSED — recording the accept-lost (window-expired) axis and a 0
-    # remaining-window observation — rather than starting an MC that would overrun.
+    # The first MC moves the book (forces a retry) and then the WHOLE derived
+    # budget is burnt, so the retry has no window left at all — recording the
+    # accept-lost (window-expired) axis and a 0 remaining-window observation.
+    #
+    # 2026-07-27: the LATENCY ACCOUNTING is unchanged; the RESOLUTION is. The
+    # deterministic caps are re-checked against the live book and they admit, so
+    # the already-won auction CONFIRMS. The window-expired counter now measures
+    # "the MC refinement was skipped", NOT "an auction was thrown away".
+    #
+    # B2: what expires here is the CLOCK, not a predicted cost. The gate carries
+    # no cost estimator any more — the only thing that can stop an MC is the
+    # window itself.
     from tests.test_candidate_gate_atomic import _held
 
     async def on_call(idx, inputs):
         if idx == 0:
-            lifecycle._clock.advance(1.8)  # noqa: SLF001 — burn ~90% of the 2.0s budget
+            lifecycle._clock.advance(4.0)  # noqa: SLF001 — burn the WHOLE window
             reservation.try_reserve(
                 "concurrent",
                 _held("concurrent"),
@@ -263,10 +271,8 @@ async def test_gate_deadline_records_window_expired_and_fails_closed(
     lifecycle, sender, exposure, reservation = await _make(tmp_path, pool=pool)
     await lifecycle.handle_rfq(rfq())
     await lifecycle.on_quote_accepted(accepted_msg("q1", "yes"))
-    # Exactly ONE MC ran; the retry was refused by the deadline guard (fail-closed).
+    # Exactly ONE MC ran; the retry found no window left.
     assert len(pool.calls) == 1
-    assert sender.confirmed == []
-    assert not reservation.is_outstanding("fill:q1")  # provisional released
     # The audit's accept-lost axis is recorded, alongside the existing deadline trip.
     assert lifecycle._metrics.counter(  # noqa: SLF001
         "candidate_gate.window_expired_before_confirm"
@@ -274,9 +280,14 @@ async def test_gate_deadline_records_window_expired_and_fails_closed(
     assert lifecycle._metrics.counter(  # noqa: SLF001
         "candidate_gate.deadline_exceeded"
     ) == 1
+    # The auction was WON, not discarded, and no risk decline was recorded.
+    assert sender.confirmed == ["q1"]
+    assert lifecycle._metrics.counter(  # noqa: SLF001
+        "candidate_gate.timeout_fallback_confirm"
+    ) == 1
     assert lifecycle._metrics.counter(  # noqa: SLF001
         f"confirm.declined.{ReasonCode.DECLINE_CANDIDATE_RISK}"
-    ) == 1
+    ) == 0
     # A 0-remaining-window observation was recorded at the deadline outcome.
     snap = lifecycle._metrics.snapshot()  # noqa: SLF001
     assert (
