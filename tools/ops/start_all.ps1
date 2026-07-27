@@ -39,10 +39,15 @@ if ($shells) {
 # Nothing is running (guard above), so liveness files are stale leftovers:
 # a stale heartbeat makes the supervisor declare "wedged" instantly and
 # emergency-KILL before the bot even starts. Delete them.
-# 2026-07-26: loop_progress.json joins the list — it is the second liveness
+# 2026-07-26: loop_progress.json joins the list - it is the second liveness
 # signal (per-loop "working" ages, risk/progress.py) and a stale one reads as
 # an instantly-stalled loop exactly the same way. The bot also rewrites it
 # before launching the supervisor, so this is belt-and-braces.
+# Captured BEFORE the purge: a heartbeat on disk proves the PREVIOUS run
+# actually reached liveness at least once. That is the flap discriminator used
+# by the KILL block below - no timer, no retry count, just "did the last
+# relight produce a working bot".
+$prevRunReachedLiveness = Test-Path "data\heartbeat.txt"
 foreach ($hb in @("data\heartbeat.txt", "data\supervisor_heartbeat.txt", "data\loop_progress.json")) {
     if (Test-Path $hb) {
         Remove-Item -Force $hb
@@ -53,7 +58,43 @@ foreach ($hb in @("data\heartbeat.txt", "data\supervisor_heartbeat.txt", "data\l
 # Never silently delete it - show it and ask. The needs_reconcile marker is
 # left alone: the bot reconciles against the exchange at boot and clears it
 # itself.
+#
+# 2026-07-27 (machinery proportionality review): a MACHINE-written KILL no
+# longer requires a human. Measured over the retained corpus: 8 supervisor
+# emergency kills, ALL 8 with exchange_reachable=true, ALL 8 human-gated. The
+# 07-27 kill fired at maintenance age=30.9s against a 30.5s bound - ONE tick
+# over - and that same "unable to manage risk" bot then withdrew all 67 quotes
+# in 218ms. The detector was right; the HUMAN LATCH is what turned a 0.5s
+# overrun into 33 minutes of downtime.
+#
+# This is safe ONLY because needs_reconcile is untouched and is written
+# unconditionally by the supervisor: an auto-relit bot still CANNOT quote until
+# _startup_reconcile has enumerated and cancelled every leftover quote on the
+# exchange and preflight gate 5 is green. Worst case per wasted cycle is the
+# cancel-all it already performs.
+#
+# Flap guard with no invented number: we auto-clear only if the PREVIOUS run
+# actually reached liveness (wrote a heartbeat). A run that died before ever
+# beating means relighting is not producing a working bot - that is when a
+# human should look.
+$killIsMachineWritten = $false
 if (Test-Path "KILL") {
+    $killBody = (Get-Content "KILL" -Raw)
+    # the only string supervisor._write_kill_file emits (supervisor.py:214)
+    $killIsMachineWritten = $killBody.TrimStart().StartsWith("supervisor kill:")
+}
+if ((Test-Path "KILL") -and $killIsMachineWritten -and $prevRunReachedLiveness) {
+    $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $archive = "data\KILL_$stamp.txt"
+    Move-Item -Force "KILL" $archive
+    Write-Host "Machine-written KILL auto-cleared (archived to $archive):" -ForegroundColor Yellow
+    Get-Content $archive | ForEach-Object { Write-Host "   $_" -ForegroundColor Yellow }
+    Write-Host "needs_reconcile remains - the bot re-proves the book against the exchange before quoting." -ForegroundColor Yellow
+}
+elseif (Test-Path "KILL") {
+    if ($killIsMachineWritten -and -not $prevRunReachedLiveness) {
+        Write-Host "FLAP GUARD: the previous run never reached liveness, so this KILL is NOT auto-cleared." -ForegroundColor Red
+    }
     Write-Host "A KILL file is present - the bot refuses to start with it:" -ForegroundColor Red
     Get-Content "KILL" | ForEach-Object { Write-Host "   $_" -ForegroundColor Red }
     $ans = Read-Host "Reviewed and ready to relight? Delete the KILL file and start? (y/n)"
@@ -73,13 +114,29 @@ Set-Content -Path "data\CURRENT_LOG.txt" -Value "$botLog`r`n$proberLog" -Encodin
 
 Write-Host "Starting bot stack (logs: $botLog / $proberLog)" -ForegroundColor Cyan
 
-# 1) THE BOT (cli run, quote mode). It spawns the safety supervisor as its
-#    OWN subprocess (quote_app.supervisor_launch_cmd) - launching
-#    `-m combomaker.ops.supervisor` standalone insta-kills on the missing
-#    heartbeat the not-yet-started bot hasn't written (2026-07-25 launch
-#    failures #1 and #3; entrypoint verified against the live process list).
+# 1) THE RELIGHTER, which spawns THE BOT (cli run, quote mode) as its CHILD.
+#    The bot in turn spawns the safety supervisor as its OWN subprocess
+#    (quote_app.supervisor_launch_cmd) - launching `-m combomaker.ops.supervisor`
+#    standalone insta-kills on the missing heartbeat the not-yet-started bot
+#    hasn't written (2026-07-25 launch failures #1 and #3; entrypoint verified
+#    against the live process list).
+#
+#    WHY A PARENT (2026-07-27 auto-relight): nothing used to outlive a halt. The
+#    supervisor is the BOT's child and is terminated in the bot's shutdown
+#    finally - measured dead 32ms after the 7/26 18:15Z metadata halt. The
+#    relighter is the bot's PARENT, so it outlives BY CONSTRUCTION, and it is the
+#    only process that can observe the child's EXIT CODE. It holds no exchange
+#    credential and opens no socket. It restarts the bot for exactly ONE halt
+#    class (a lifecycle quarantine we could not prove enforced) and escalates
+#    terminally for everything else - a KILL file on disk is an unconditional
+#    refusal, so the y/n prompt above remains the human gate it always was.
+#
+#    It deliberately does NOT carry the bot's argv on its own command line: the
+#    post-launch duplicate check below counts `combomaker\.ops\.cli run` ROOTS,
+#    and a parent carrying that argv would read as a second bot. It builds the
+#    child argv itself from these flags (ops/relight.py build_child_argv).
 #    All output -> dated log, so this window is quiet BY DESIGN.
-Start-Process cmd -ArgumentList "/k", "title BOT (quote mode) && echo Bot running. This window is quiet BY DESIGN - all output goes to $botLog && echo Watch the MONITOR window for live events. Closing THIS window kills the bot. && .venv\Scripts\python.exe -m combomaker.ops.cli run --env prod --mode quote --confirm-live --config config\prod-live-wc.local.yaml > $botLog 2>&1"
+Start-Process cmd -ArgumentList "/k", "title BOT (quote mode, auto-relight) && echo Bot running under the RELIGHTER. This window is quiet BY DESIGN - all output goes to $botLog && echo Watch the MONITOR window for live events. Closing THIS window kills the bot. && .venv\Scripts\python.exe -m combomaker.ops.relight --env prod --mode quote --confirm-live --config config\prod-live-wc.local.yaml > $botLog 2>&1"
 
 # 2) Main monitor (halts / fills / declines / waivers / errors).
 Start-Process powershell -ArgumentList "-NoExit", "-ExecutionPolicy", "Bypass", "-File", "tools\ops\watch_main.ps1", "-Log", $botLog
