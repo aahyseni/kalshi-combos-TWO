@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -43,13 +43,25 @@ from combomaker.core.money import (
 )
 from combomaker.core.quantity import CentiContracts, qty_from_fp_str
 from combomaker.core.reasons import ReasonCode
-from combomaker.exchange.rest import KalshiApiError
+from combomaker.exchange.quote_query import (
+    QuoteLister,
+    list_open_quotes,
+    open_quote_ids,
+)
+from combomaker.exchange.rest import (
+    DEFAULT_ENDPOINT_TOKEN_COST,
+    DEFAULT_REQUEST_TIMEOUT_S,
+    DELETE_QUOTE_TOKEN_COST,
+    HTTP_NOT_FOUND,
+    HTTP_TOO_MANY_REQUESTS,
+    KalshiApiError,
+)
 from combomaker.marketdata.feed import OrderbookFeed
 from combomaker.marketdata.metadata import MetadataCache
 from combomaker.marketdata.settled import SettledMarginalResolver
 from combomaker.ops.logging import get_logger
 from combomaker.ops.metrics import Metrics
-from combomaker.ops.persistence import Store
+from combomaker.ops.persistence import STORE_OP_TIMEOUT_S, Store
 from combomaker.ops.pricing_pool import (
     BookRiskInputs,
     BookRiskPool,
@@ -59,6 +71,7 @@ from combomaker.ops.pricing_pool import (
     _worker_candidate_book_risk,
     _worker_state_worst_case,
 )
+from combomaker.ops.write_budget import TokenBudget, WriteBudget
 from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.fees import FeeModel, FeeType, FeeUnknownError
 from combomaker.pricing.grouping import game_key
@@ -275,6 +288,162 @@ class FillsGetter(Protocol):
 # found the 2026-07-16 proven case) rather than polling forever.
 _FILL_RECOVERY_MAX_POLLS_PER_TICK = 3
 _FILL_RECOVERY_MAX_ATTEMPTS = 10
+# Per-REST-poll wall bound on the maintenance tick. Tighter than the REST
+# client's own 10s total (``DEFAULT_REQUEST_TIMEOUT_S``) because these polls run
+# SERIALLY inside one tick: 3 × 10s turned a black-holed connection into a ~30s
+# tick (2026-07-16 review). Named 2026-07-26 so the off-loop sweep bounds below
+# can be DERIVED from it instead of repeating the literal.
+_MAINTENANCE_POLL_TIMEOUT_S = 2.5
+# Pages the fills-ledger diff walks per sweep.
+_FILLS_SWEEP_MAX_PAGES = 3
+
+# ── OFF-LOOP ALARM-ONLY SWEEPS (2026-07-26, the 20:12:24Z maintenance stall) ──
+# The maintenance loop owns TTL expiry, the enforced limit/halt check and the
+# reprice sweep — and, until the 2026-07-26 liveness split, the supervisor
+# heartbeat itself. Two ALARM-ONLY diagnostics were awaited INLINE on that loop:
+# the position-ledger divergence invariant (one SELECT) and the fills-ledger
+# diff. On 2026-07-26 the divergence SELECT came due at 20:12:24.43Z — exactly
+# 300.000 s after the run's only completed check at 20:07:24.43Z — on a store
+# whose single aiosqlite connection thread was saturated by the tape writer
+# (46 ``store_writer_checkpoint_failed``, WAL 57,765 frames). It never returned:
+# ``ledger_divergence.checks`` finished the run at 1. The maintenance loop went
+# silent from that instant and the supervisor killed a healthy, quoting bot 30.1 s
+# later.
+#
+# The rule that follows: an ALARM-ONLY diagnostic never runs inline on a loop
+# that owns safety work. These are launched as SINGLE-FLIGHT background tasks
+# (the ``_maybe_resolve_settled_marginals`` pattern), each under its own wall
+# bound, and a slow store degrades to a logged, retried skip. The tick returns
+# in the time its own work takes, whatever the store is doing.
+#
+# Bounds are DERIVED from what each sweep does, out of primitives that already
+# exist — never a fresh literal:
+#   * divergence  = one store read            ⇒ STORE_OP_TIMEOUT_S
+#   * fills diff  = 2 store reads + N pages   ⇒ 2·STORE_OP_TIMEOUT_S
+#                                               + N·_MAINTENANCE_POLL_TIMEOUT_S
+_LEDGER_DIVERGENCE_SWEEP_TIMEOUT_S = STORE_OP_TIMEOUT_S
+_FILLS_LEDGER_SWEEP_TIMEOUT_S = (
+    2 * STORE_OP_TIMEOUT_S + _FILLS_SWEEP_MAX_PAGES * _MAINTENANCE_POLL_TIMEOUT_S
+)
+
+# ── BOUNDED QUOTE WITHDRAWAL (2026-07-26, the 20:12:54Z false kill) ──────────
+# A lifecycle wave at the END OF EVERY GAME quarantines many markets in the same
+# tick (11 across TORBOS+CHCPIT at 20:12:25Z) and the withdrawal underneath is a
+# burst of DELETEs — 63 of them over 27s in the incident, one at a time, most
+# answered HTTP 404 because the exchange had already dropped the quotes with
+# their finished markets. Three bounds, so the burst is a normal event and not
+# an outage:
+#
+#   1. CONCURRENT, but paced by the WRITE-TOKEN BUDGET (``ops/write_budget.py``,
+#      the same bucket + the same config source the supervisor's own emergency
+#      cancel-all is paced by). NOT by a concurrency literal: the first cut of
+#      this fix used a fan-out of 8, and a fan-out is not a rate — 8 in flight
+#      at the exchange's measured 5-40 ms DELETE latency is 200-1,600 req/s =
+#      400-3,200 WRITE TOKENS/s (DeleteQuote costs 2 —
+#      ``exchange.rest.DELETE_QUOTE_TOKEN_COST``) against a 300 tokens/s
+#      Advanced-tier ceiling. A 200-quote wave (the live ``max_open_quotes``)
+#      would therefore 429 its own tail, and every 429 here lands on the three
+#      worst places at once: the burst breaker (HALT_RATE_LIMIT_BURST at 10 per
+#      10s), the quarantine's unenforced escalation (HALT_METADATA_CHANGE), and
+#      — before this fix — ``_drop_quote``, which would have made the mirror
+#      FORGET quotes that were still resting and could still fill. Pacing in
+#      tokens is latency-independent by construction; a fan-out is not.
+#   2. A PER-CALL wall bound, reusing the REST client's own request timeout, so
+#      one hung socket cannot pin the pass forever. (The real client already
+#      enforces it; the bound here also covers the ``QuoteSender`` PROTOCOL,
+#      through which no aiohttp timeout is visible.)
+#   3. An optional WHOLE-PASS budget from the caller, sized to the caller's own
+#      tick. Work that does not fit is DEFERRED, never abandoned: its markets
+#      stay unenforced and are retried next tick (and escalate to the halt if
+#      they are still unenforced then — the fail-closed contract is unchanged).
+#      Because a deferral costs a halt on the NEXT tick, a pass that is merely
+#      out of tokens WAITS for the bucket to refill (the wait itself is bounded
+#      by the caller's budget) instead of deferring on the spot.
+#
+# ── ONE WRITE PATH, ONE PROVER, AND THE PROVER IS A READ (2026-07-26) ────────
+# The bounds above make a withdrawal wave *safe*; they do not make an UNKNOWN
+# withdrawal *terminate*. The first cut left two holes the adversarial gate
+# proved with PoCs:
+#
+#   * a SECOND, unmetered DELETE path (``_delete_quote`` owned its own
+#     ``self._sender.delete_quote`` call), so the busiest way to withdraw a
+#     quote — TTL / leg-stale / leg-moved / RFQ-gone / eviction, 1,137 calls in
+#     the incident — spent no tokens at all; and
+#   * the reprice sweep re-DRIVING every pending withdrawal every 0.5 s tick,
+#     which is O(pending) WRITES per tick on the exact bucket that is already
+#     429ing. At the live ``max_open_quotes`` = 200 that is 400 write tokens
+#     per tick against a 300 tok/s ceiling: the storm sustains its own 429s and
+#     never establishes truth, so the pending set never drains and quoting
+#     bricks at capacity.
+#
+# Both are now structural, not cadence-tuned:
+#
+#   A. ``self._sender.delete_quote`` is referenced EXACTLY ONCE in this module —
+#      inside ``_withdraw_batch._one``, immediately after the token gate. An
+#      unmetered write is unwritable, not merely discouraged. Every caller goes
+#      through ``_withdraw_and_reconcile``, which is also the ONLY caller of
+#      ``_drop_quote`` for a withdrawal, so no path can drop an id the exchange
+#      never proved gone. (Both invariants are grep-checked by
+#      tests/test_architecture.py.)
+#   B. The UNKNOWN is resolved by a READ, not a retried write:
+#      ``_resolve_withdraw_pending`` asks ``GET /communications/quotes?
+#      user_filter=self&status=open`` ONCE per tick — 10 READ tokens, O(1) in
+#      the pending count, on the bucket the write storm is not touching (Kalshi
+#      meters reads on a separate bucket; observed advanced 600 cap / 300
+#      refill on EACH). Absent from the open set ⇒ PROVEN off the wire ⇒
+#      dropped. Present ⇒ PROVEN still resting ⇒ re-deleted through the metered
+#      write path. A failed read resolves NOTHING.
+#
+# The resolver's whole pass reuses the sweep's existing wall budget rather than
+# introducing a number: the READ is bounded by the tick's existing per-REST-poll
+# bound and whatever is left of the pass budget is what the metered re-DELETE
+# drain may spend. Work that does not fit stays pending and is retried next tick.
+_CANCEL_TIMEOUT_S = DEFAULT_REQUEST_TIMEOUT_S
+
+
+def _default_write_budget(clock: Clock) -> WriteBudget:
+    """The withdrawal bucket for a lifecycle nobody injected one into.
+
+    Sized from the SAME config object the live bot's supervisor budget is sized
+    from (``ops.config.SupervisorConfig`` defaults: 200 tokens / 10.0 s), so
+    there is exactly one place an operator changes the write budget and no
+    second literal to drift. Imported inside the function to keep the pydantic
+    config module off this hot module's import graph."""
+    from combomaker.ops.config import SupervisorConfig  # noqa: PLC0415
+
+    defaults = SupervisorConfig()
+    return WriteBudget.create(
+        clock,
+        capacity=defaults.write_budget_capacity,
+        refill_s=defaults.write_budget_refill_s,
+    )
+
+
+def _already_gone(exc: BaseException) -> bool:
+    """True when a DELETE failed because the exchange has no such quote.
+
+    A 404 on a withdrawal is SUCCESS for our purposes: the thing we wanted off
+    the wire is off the wire, and it cannot fill. Treating it as an error is
+    what turned a routine end-of-game wave into 63 warnings and an unenforceable
+    quarantine (which escalates to a WHOLE-BOT HALT) for markets that carried no
+    exposure at all.
+
+    Duck-typed on ``status`` so any client carrying an HTTP status works, and
+    NARROW by construction: ONLY 404 is success. A 429 (``RateLimitedError``), a
+    5xx, a timeout, or a transport error is UNRESOLVED — the quote may still be
+    resting and may still fill, so it stays in our mirror, counts as
+    not-provably-withdrawn, and is retried (see ``_withdraw_batch``)."""
+    return getattr(exc, "status", None) == HTTP_NOT_FOUND
+
+
+def _rate_limited(exc: BaseException) -> bool:
+    """True when a DELETE was refused by the exchange's TOKEN BUCKET (429).
+
+    Split out from the other unresolved outcomes for observability only — the
+    handling is identical (the quote is UNKNOWN, never dropped) — because a 429
+    on THIS path means our pacing is wrong, which is a different repair from a
+    5xx or a hung socket."""
+    return getattr(exc, "status", None) == HTTP_TOO_MANY_REQUESTS
 
 # CANCEL-REPORT VERIFICATION bounds (2026-07-18 review). A verification ROUND
 # whose EVERY /portfolio/fills read failed proves nothing about absence — the
@@ -319,6 +488,13 @@ def _parse_epoch_s(raw: object) -> int | None:
 # circuit breaker, and the sweep's total wall budget per tick.
 _REPRICE_POOL_TRIP = 2
 _REPRICE_SWEEP_BUDGET_S = 2.5
+# WITHDRAW-RESOLUTION pass budget (2026-07-26). The resolver runs at the top of
+# the same maintenance tick, immediately ahead of the reprice sweep, and gets the
+# SAME whole-pass wall bound the sweep already has — an EXISTING primitive, not a
+# new number. Inside it the list READ is bounded by the tick's existing
+# per-REST-poll bound (_MAINTENANCE_POLL_TIMEOUT_S) and the remainder is the
+# metered re-DELETE drain's budget.
+_WITHDRAW_RESOLVE_BUDGET_S = _REPRICE_SWEEP_BUDGET_S
 
 # F1 PRE-PRICING GATE cache age bound (seconds). The generation/bankroll keys
 # do the real invalidation; this bound only covers slow drift (metadata ME
@@ -647,6 +823,24 @@ class OpenQuoteState:
     fill_recorded: bool = False
     # REST polls spent recovering this quote (bounded; exhausted ⇒ loud metric).
     fill_recovery_attempts: int = 0
+    # UNRESOLVED WITHDRAWAL (B3, 2026-07-26). Set when a DELETE neither acked
+    # nor 404'd (429 / 5xx / timeout), or was deferred by a wall budget before
+    # it was even asked: the quote may still be RESTING and FILLABLE, so it
+    # stays in the mirror. The reason it was being withdrawn for is kept so the
+    # withdraw-pending RESOLVER can re-drive the SAME withdrawal — including for
+    # the event-driven reasons (RFQ gone, risk eviction) whose trigger never
+    # fires twice. This is the UNKNOWN marker risk, reprice and eviction read.
+    # None ⇒ not being withdrawn.
+    withdraw_pending_reason: ReasonCode | str | None = None
+    # Monotonic ns at which the most recent withdrawal REQUEST for this quote
+    # finished without proving anything (2026-07-26, replacing the write-only
+    # ``withdraw_attempts`` counter). This is the HAPPENS-BEFORE key of the read
+    # resolver: only a quote whose ask STRICTLY PRE-DATES the open-quote list
+    # request may be resolved by its absence from that list. A quote deleted
+    # after the list was issued could legitimately still appear in it (or have
+    # been dropped between the two), so it is never judged by that read — the
+    # read-after-write hazard is killed by construction, not by a delay.
+    withdraw_asked_mono_ns: int = 0
     # CANCEL-REPORT VERIFICATION (2026-07-18 incidents A+B). Set (monotonic ns)
     # when REST reported this CONFIRMED quote as CANCELLED — the point
     # verify-before-discard starts. While set, the position stays booked
@@ -723,9 +917,39 @@ class QuoteLifecycle:
         beat: Callable[[], None] | None = None,
         rfq_alive: Callable[[str], bool] | None = None,
         settled_marginals: SettledMarginalResolver | None = None,
+        withdraw_budget: WriteBudget | None = None,
+        quote_lister: QuoteLister | None = None,
+        read_budget: TokenBudget | None = None,
     ) -> None:
         self._clock = clock
         self._sender = sender
+        # WRITE-TOKEN BUDGET for the quote-withdrawal burst (see the BOUNDED
+        # QUOTE WITHDRAWAL block). Injected by quote_app from the operator's
+        # SINGLE budget knob (``supervisor.write_budget_capacity`` /
+        # ``write_budget_refill_s``); when nothing is injected (backtests, paper,
+        # tests) we build the SAME bucket from the SAME config object's
+        # defaults, so there is no second literal anywhere and the withdrawal
+        # path is paced even if a caller forgets to wire it (fail-closed).
+        self._withdraw_budget = withdraw_budget or _default_write_budget(clock)
+        # WITHDRAW-PENDING RESOLVER (2026-07-26). ``quote_lister`` is the
+        # account-wide open-quote enumerator (the SAME
+        # ``exchange/quote_query.list_open_quotes`` helper the startup reconcile
+        # and the supervisor's kill path use, min_ts/max_ts windowed so it never
+        # trips the exchange circuit-breaker); ``read_budget`` is quote_app's ONE
+        # read bucket, so the resolver's GET charges the same place every other
+        # read charges. Unwired (paper / backtests / minimal rigs) ⇒ no read ⇒
+        # the resolver degrades to the METERED write drain, which still
+        # terminates (a re-DELETE of a gone quote 404s = provably gone) — it just
+        # cannot observe an accept/execute transition. Fail-closed either way:
+        # nothing is ever dropped without proof.
+        self._quote_lister = quote_lister
+        self._read_budget = read_budget
+        # Monotonic ns of the last SUCCESSFUL open-quote read. Feeds the
+        # all-pending-at-capacity terminal predicate: a book that is full, wholly
+        # UNKNOWN, and has not been read since the oldest ask cannot be proven at
+        # all, and an unprovable book is HALT_NEEDS_RECONCILE (the same doctrine
+        # ``cancel_quotes_touching`` and ``_startup_reconcile`` already state).
+        self._withdraw_read_ok_mono_ns: int | None = None
         self._engine = engine
         # Off-loop pricing (Phase 1): when set, the async hot path runs the
         # expensive joint step in a worker process with a deadline so a cold combo
@@ -876,6 +1100,11 @@ class QuoteLifecycle:
         # the FIRST maintenance tick runs it (a boot-time read, right after
         # rehydration, is the most valuable one) and then it throttles.
         self._ledger_divergence_last_mono_ns: int | None = None
+        # OFF-LOOP DIAGNOSTIC SWEEPS (2026-07-26): the single-flight task handle
+        # per alarm-only sweep. A sweep still running when its next launch comes
+        # due is SKIPPED (never stacked) and the skip is counted, so a store that
+        # is permanently too slow is loud instead of silently piling up tasks.
+        self._diag_tasks: dict[str, asyncio.Task[None]] = {}
         # HEARTBEAT BEAT (2026-07-16 wedge fix): quote_app's Heartbeat.beat,
         # invoked per iteration inside the long maintenance sub-loops (reprice
         # sweep, recovery polls) so a loop that is genuinely MAKING PROGRESS
@@ -3137,6 +3366,45 @@ class QuoteLifecycle:
     # ------------------------------------------------------- accept → confirm
 
     async def on_quote_accepted(self, msg: JsonDict) -> None:
+        """ACCEPT → last look → confirm/lapse, plus the TERMINATION GUARANTEE the
+        withdraw-resolver's mid-confirm deferral rests on (2026-07-26 gate, B1).
+
+        ``_resolve_withdraw_pending`` refuses to resolve an ACCEPTED quote, so
+        something must guarantee that an accepted quote always leaves ``_open``.
+        Every branch of ``_on_quote_accepted`` already ends in ``_drop_quote``
+        ("Accepted quotes are no longer open either way"); the one path that did
+        not was an EXCEPTION escaping mid-confirm, which quote_app's
+        ``quote_event_worker`` logs and moves past — leaving the state
+        accepted + withdraw-pending in the mirror forever, i.e. the deferral
+        turned into a strand. Dropping here is the SAME thing the normal branches
+        do and is safe for the same reason: once accepted, the resting quote is
+        economically dead in every outcome (confirm ⇒ the fill position replaces
+        it; lapse/decline ⇒ the exchange voids it — there is no post-accept
+        withdrawal). The position/reservation state is NOT touched: it lives in
+        ``_executed_states`` and the reservation book, which the confirm-timeout
+        reconcile and the executed-replay own. The exception is re-raised so the
+        worker's own logging and any halt accounting are unchanged.
+
+        ``BaseException`` (task cancellation at shutdown) is deliberately NOT
+        caught: that path is the process stopping, where the startup reconcile
+        rebuilds the book from the exchange."""
+        quote_id = str(msg.get("quote_id", ""))
+        try:
+            await self._on_quote_accepted(msg)
+        except Exception as exc:
+            self._metrics.inc("confirm.errored")
+            log.error(
+                "quote_accepted_errored",
+                quote_id=quote_id,
+                error=repr(exc),
+                detail="accept handling raised — the accepted quote is dropped "
+                "from the mirror (as every normal branch does) so a deferred "
+                "withdraw-pending state can never strand",
+            )
+            self._drop_quote(quote_id)
+            raise
+
+    async def _on_quote_accepted(self, msg: JsonDict) -> None:
         t0 = self._clock.monotonic_ns()
         quote_id = str(msg.get("quote_id", ""))
         state = self._open.get(quote_id)
@@ -3597,6 +3865,11 @@ class QuoteLifecycle:
             state = self._open.get(quote_id)
             if state is None or state.accepted:
                 continue  # unknown to us or mid-confirm — never yank
+            if state.withdraw_pending_reason is not None:
+                # Already being withdrawn, outcome UNKNOWN (B3). Re-picking it
+                # would spend the whole eviction budget re-deleting one quote
+                # instead of releasing a different game's exposure.
+                continue
             qgames = {
                 game_key(leg.event_ticker)
                 for leg in quote.legs
@@ -3977,7 +4250,8 @@ class QuoteLifecycle:
                 # and limit-halt checks all waited behind it. A timed-out poll
                 # is just a failed attempt (bounded-retry, loud exhaustion).
                 payload = await asyncio.wait_for(
-                    self._quote_getter.get_quote(quote_id), timeout=2.5
+                    self._quote_getter.get_quote(quote_id),
+                    timeout=_MAINTENANCE_POLL_TIMEOUT_S,
                 )
             except Exception as exc:  # noqa: BLE001 — any poll error retries next tick
                 self._metrics.inc("fill_recovery.errors")
@@ -4220,7 +4494,7 @@ class QuoteLifecycle:
                     min_ts=min_ts,
                     order_id=state.cancel_expected_order_id,
                 ),
-                timeout=2.5,
+                timeout=_MAINTENANCE_POLL_TIMEOUT_S,
             )
         except Exception as exc:  # noqa: BLE001 — any poll error retries on cadence
             self._metrics.inc("fill_recovery.verify_errors")
@@ -4709,6 +4983,86 @@ class QuoteLifecycle:
         except MoneyParseError:
             return None
 
+    # ---------------------------------- off-loop alarm-only diagnostic sweeps
+
+    def _launch_diagnostic_sweeps(self) -> None:
+        """Launch every ALARM-ONLY sweep as a single-flight background task.
+
+        SYNC and non-blocking by construction — the maintenance tick calls this
+        and moves straight on to the enforced limit check. Each sweep keeps its
+        OWN cadence guard internally (so this is cheap on the ticks where
+        nothing is due) and runs under its own derived wall bound.
+
+        A sweep that is still running when the next launch comes due is skipped
+        with a counter, never stacked: piling up tasks against a saturated store
+        is how a diagnostic becomes an outage. Nothing here can raise into the
+        tick; the wrapper swallows every outcome into a log + metric.
+
+        FIX ISOLATION: no pricing, risk, or quoting state is read or written
+        here, and no caller awaits the result."""
+        self._launch_diagnostic_sweep(
+            "ledger_divergence",
+            self._sweep_ledger_divergence,
+            _LEDGER_DIVERGENCE_SWEEP_TIMEOUT_S,
+        )
+        self._launch_diagnostic_sweep(
+            "fills_ledger_sweep",
+            self._sweep_fills_ledger_diff,
+            _FILLS_LEDGER_SWEEP_TIMEOUT_S,
+        )
+
+    def _launch_diagnostic_sweep(
+        self,
+        name: str,
+        sweep: Callable[[], Awaitable[None]],
+        timeout_s: float,
+    ) -> None:
+        running = self._diag_tasks.get(name)
+        if running is not None and not running.done():
+            # Still going from a previous launch. The sweep's own cadence guard
+            # already stamped, so this is not a missed interval — it is a store
+            # (or exchange) slower than the sweep's whole wall bound, which is
+            # exactly what the 2026-07-26 incident looked like from inside.
+            self._metrics.inc(f"{name}.skipped_in_flight")
+            return
+
+        async def _run() -> None:
+            try:
+                await asyncio.wait_for(sweep(), timeout_s)
+            except asyncio.CancelledError:
+                raise
+            except TimeoutError:
+                # THE incident, now bounded: a store read that does not return.
+                # Loud, counted, retried on the next cadence — never a stall.
+                self._metrics.inc(f"{name}.timeout")
+                log.warning(
+                    f"{name}_sweep_timeout",
+                    timeout_s=timeout_s,
+                    detail="alarm-only sweep exceeded its wall bound (a "
+                    "saturated store or exchange) — skipped and retried on "
+                    "the next interval; the maintenance loop was never held",
+                )
+            except Exception as exc:  # noqa: BLE001 — alarm-only, never fatal
+                self._metrics.inc(f"{name}.errors")
+                log.warning(f"{name}_sweep_failed", error=repr(exc))
+
+        self._diag_tasks[name] = asyncio.ensure_future(_run())
+
+    async def drain_diagnostic_sweeps(self) -> None:
+        """Wait for every in-flight alarm-only sweep to finish (or time out).
+
+        SHUTDOWN uses this: a sweep still holding a store cursor when the store
+        closes logs a spurious ``Connection closed`` error and, worse, an
+        orphaned task means the process exits with the divergence check half
+        done and no record of it. Each sweep is already wall-bounded, so this
+        can never hold shutdown open longer than the slowest bound.
+
+        Never raises: the wrapper inside ``_launch_diagnostic_sweep`` has
+        already swallowed every outcome into a log + metric."""
+        tasks = [t for t in self._diag_tasks.values() if not t.done()]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     # -------------------------------- position-ledger divergence invariant
 
     async def _sweep_ledger_divergence(self) -> None:
@@ -4860,7 +5214,7 @@ class QuoteLifecycle:
         rows: list[JsonDict] = []
         cursor = ""
         truncated = False
-        for _ in range(3):
+        for _ in range(_FILLS_SWEEP_MAX_PAGES):
             params: dict[str, str | int] = {"limit": 1000, "min_ts": min_ts}
             if self._fills_subaccount is not None:
                 params["subaccount"] = self._fills_subaccount
@@ -4868,7 +5222,8 @@ class QuoteLifecycle:
                 params["cursor"] = cursor
             self._beat()
             payload = await asyncio.wait_for(
-                self._fills_getter.get_fills(**params), timeout=2.5
+                self._fills_getter.get_fills(**params),
+                timeout=_MAINTENANCE_POLL_TIMEOUT_S,
             )
             page = payload.get("fills") or []
             if isinstance(page, list):
@@ -5424,23 +5779,17 @@ class QuoteLifecycle:
         # recovered position counts against the caps this same tick. Runs even
         # when halted — recording exchange truth is reconciliation, not quoting.
         await self._sweep_unrecorded_fills()
-        # FILLS-LEDGER SWEEP (2026-07-24 incident C): slow-cadence account-wide
-        # /portfolio/fills vs local-ledger diff — the alarm-only backstop under
-        # every writer-path miss. Runs even when halted (reconciliation, not
-        # quoting).
-        await self._sweep_fills_ledger_diff()
-        # POSITION-LEDGER DIVERGENCE INVARIANT (2026-07-26): count OPEN
-        # exposure positions vs OPEN position_ledger rows on the DURABLE
-        # identity, so "settled rows can never land after a restart" is
-        # SELF-REPORTING instead of silent. Throttled, alarm-only, and
-        # ISOLATED — a store error logs and retries next interval; it must
-        # never reach the pricing path nor abort the enforced limit check
-        # below (fix-isolation rule).
-        try:
-            await self._sweep_ledger_divergence()
-        except Exception as exc:  # noqa: BLE001 — slow loop, alarm-only
-            self._metrics.inc("ledger_divergence.errors")
-            log.warning("ledger_divergence_sweep_failed", error=repr(exc))
+        # ALARM-ONLY SWEEPS — LAUNCHED, NEVER AWAITED (2026-07-26, the
+        # 20:12:24Z stall). The fills-ledger diff (incident C's account-wide
+        # backstop) and the position-ledger divergence invariant are pure
+        # diagnostics: they hold no safety decision and nothing below reads
+        # their result this tick. Awaiting them put an UNBOUNDED store read in
+        # front of TTL expiry, the enforced limit/halt check and the reprice
+        # sweep — and, before the liveness split, in front of the heartbeat.
+        # They now run as single-flight background tasks under their own wall
+        # bounds; a saturated store degrades to a logged, retried skip. See the
+        # OFF-LOOP ALARM-ONLY SWEEPS block at the top of this module.
+        self._launch_diagnostic_sweeps()
         if not self._killswitch.halted:
             breaches = self._partition_breaches(
                 self._limits.check(
@@ -5499,6 +5848,14 @@ class QuoteLifecycle:
         #       still get today's fail-safe deletion;
         #   (3) a wall budget for the whole sweep (_REPRICE_SWEEP_BUDGET_S) as
         #       belt-and-suspenders against many slow-but-not-timeout awaits.
+        #
+        # WITHDRAW-PENDING RESOLUTION runs FIRST (2026-07-26): a quote whose
+        # withdrawal is UNKNOWN is not a reprice candidate — it is a quote we are
+        # trying to remove — and resolving it by READ before the sweep both frees
+        # capacity this same tick and keeps the sweep out of the write-driver
+        # business it used to be in. Returns instantly when nothing is pending
+        # (the steady state), so the tick's cost is unchanged.
+        await self._resolve_withdraw_pending()
         now = self._clock.monotonic_ns()
         sweep_start_ns = now
         budget_ns = int(_REPRICE_SWEEP_BUDGET_S * 1e9)
@@ -5521,18 +5878,12 @@ class QuoteLifecycle:
         prev_handled: str | None = None
         for quote_id, state in items:
             self._beat()
-            if state.accepted:
-                prev_handled = quote_id
-                continue
-            age_s = (now - state.created_mono_ns) / 1e9
-            if age_s > self._config.quote_ttl_s:
-                await self._delete_quote(quote_id, ReasonCode.DELETE_TTL_EXPIRED)
-                # Deleted — prev_handled must only ever name a SURVIVING quote:
-                # a marker pointing at a removed id fails next tick's index
-                # lookup and silently discards the rotation (verify follow-up
-                # 2026-07-16). Deleted quotes aren't in next tick's items, so
-                # resuming after the last survivor skips nothing.
-                continue
+            # WALL BUDGET FIRST (2026-07-26): every branch below can now do
+            # TOKEN-PACED work — the TTL delete goes through the same metered
+            # write path as everything else — so the budget has to bound the
+            # loop BEFORE the branch, not only before the reprice. Checked here
+            # it also matches its own comment: the current quote was not
+            # handled, so the rotation resumes AT it next tick.
             if self._clock.monotonic_ns() - sweep_start_ns > budget_ns:
                 self._metrics.inc("reprice.sweep_budget_deferred")
                 log.warning(
@@ -5543,6 +5894,32 @@ class QuoteLifecycle:
                 # Current quote was NOT handled — resume AT it next tick.
                 self._reprice_resume_after = prev_handled
                 break
+            if state.accepted:
+                prev_handled = quote_id
+                continue
+            if state.withdraw_pending_reason is not None:
+                # UNKNOWN withdrawal (B3). NOT re-driven here: the sweep is not a
+                # write driver any more. ``_resolve_withdraw_pending`` (top of
+                # this tick) owns it — one READ proves gone-or-resting for the
+                # WHOLE pending set, and only the proven-resting ids pay a
+                # metered write. Re-asking per quote per tick is what made the
+                # 429 storm self-sustaining. Never repriced while pending: it is
+                # a quote we are trying to remove, not one we want to improve.
+                prev_handled = quote_id
+                continue
+            age_s = (now - state.created_mono_ns) / 1e9
+            if age_s > self._config.quote_ttl_s:
+                await self._delete_quote(quote_id, ReasonCode.DELETE_TTL_EXPIRED)
+                # Deleted — prev_handled must only ever name a SURVIVING quote:
+                # a marker pointing at a removed id fails next tick's index
+                # lookup and silently discards the rotation (verify follow-up
+                # 2026-07-16). Deleted quotes aren't in next tick's items, so
+                # resuming after the last survivor skips nothing. An UNRESOLVED
+                # TTL delete leaves the quote in ``_open`` (pending) — it is a
+                # survivor and a valid marker, so mark it as one.
+                if quote_id in self._open:
+                    prev_handled = quote_id
+                continue
             result = await self._price_async(state.rfq)
             if isinstance(result, NoQuote):
                 await self._delete_quote(quote_id, ReasonCode.DELETE_LEG_STALE)
@@ -5579,23 +5956,488 @@ class QuoteLifecycle:
             if quote_id in self._open:
                 prev_handled = quote_id
 
-    async def cancel_all(self, reason: ReasonCode | str) -> None:
-        """Best-effort delete of every open quote. Idempotent, race-safe."""
+    async def _withdraw_batch(
+        self, quote_ids: Sequence[str], *, budget_s: float | None = None
+    ) -> tuple[list[str], list[str], list[str]]:
+        """Withdraw a BATCH of resting quotes from the exchange, concurrently,
+        PACED BY THE WRITE-TOKEN BUDGET, under a per-call wall bound and an
+        optional whole-pass budget. Returns ``(gone, unresolved, deferred)``.
+
+        - ``gone``: PROVABLY off the wire — the exchange acknowledged the
+          delete, or answered 404 (it has no such quote — ``_already_gone``).
+          Only these leave our mirror.
+        - ``unresolved``: we asked and do NOT know the outcome (429 / 5xx /
+          timeout / transport). The quote may still be RESTING and may still
+          FILL, so it is UNKNOWN, not gone: it stays in the mirror, counts as
+          not-provably-withdrawn, and is retried on the next pass. A 429 in
+          particular is not a failed delete at all — the request never reached
+          the book — and treating it as a confirmed failure is how a rate-limit
+          storm would make the mirror forget live quotes.
+        - ``deferred``: never asked, because the pass ran out of WALL budget.
+          Still resting and still ours; the caller retries next tick.
+
+        Concurrency is whatever the token bucket pays for and no more: at most
+        ``capacity / DELETE_QUOTE_TOKEN_COST`` deletes can be in flight before
+        the bucket is empty, and from then on the pass admits calls at the
+        bucket's refill rate. Never raises. See the BOUNDED QUOTE WITHDRAWAL
+        block for why each bound exists."""
+        if not quote_ids:
+            return ([], [], [])
+        budget = self._withdraw_budget
+        cost = DELETE_QUOTE_TOKEN_COST
+        deadline_ns: int | None = None
+        if budget_s is not None:
+            deadline_ns = self._clock.monotonic_ns() + int(budget_s * 1e9)
+
+        def _remaining_s() -> float | None:
+            if deadline_ns is None:
+                return None
+            return (deadline_ns - self._clock.monotonic_ns()) / 1e9
+
+        async def _one(quote_id: str) -> tuple[str, str, BaseException | None]:
+            # ── token gate ──────────────────────────────────────────────────
+            # Spend BEFORE the request, so what we emit is what the exchange's
+            # bucket sees. Out of tokens ⇒ WAIT for the bucket's own refill
+            # (never a hand-picked poll interval), because deferring costs a
+            # halt on the next tick while waiting costs only wall time the
+            # caller already budgeted for.
+            while not budget.try_spend(cost):
+                wait_s = budget.seconds_until(cost)
+                if wait_s == float("inf"):
+                    # capacity < one call's cost: no wait can ever satisfy it.
+                    return (quote_id, "deferred", None)
+                remaining_s = _remaining_s()
+                if remaining_s is not None:
+                    if remaining_s <= 0.0:
+                        return (quote_id, "deferred", None)
+                    wait_s = min(wait_s, remaining_s)
+                await asyncio.sleep(max(wait_s, 0.0))
+            # RE-CHECK AFTER THE TOKEN GATE (2026-07-26, gate PoC R2/R3). The
+            # gate above can sleep for SECONDS waiting on bucket refill, and
+            # accepts land on a different task meanwhile. Every other withdrawal
+            # chooser refuses to touch a mid-confirm quote; without this the
+            # drain fires a fresh DELETE at a quote we have already reserved
+            # risk for and are about to confirm. Checked as late as possible —
+            # once the request is in flight the window is closed and benign.
+            live = self._open.get(quote_id)
+            if live is not None and live.accepted:
+                self._metrics.inc("withdraw_resolve.accepted_deferred")
+                return (quote_id, "deferred", None)
+            timeout_s = _CANCEL_TIMEOUT_S
+            remaining_s = _remaining_s()
+            if remaining_s is not None:
+                if remaining_s <= 0.0:
+                    return (quote_id, "deferred", None)
+                # The budget is a HARD wall, not just an admission gate: a call
+                # admitted with 0.2s left may not run for the full per-call
+                # timeout, or a hung exchange would still hold the caller for
+                # one timeout (measured: 2 waves = 20s against a 0.2s budget).
+                # Whichever bound is tighter wins.
+                timeout_s = min(timeout_s, remaining_s)
+            try:
+                await asyncio.wait_for(self._sender.delete_quote(quote_id), timeout_s)
+                return (quote_id, "gone", None)
+            except Exception as exc:
+                if _already_gone(exc):
+                    return (quote_id, "gone", exc)
+                return (quote_id, "unresolved", exc)
+
+        results = await asyncio.gather(*(_one(qid) for qid in quote_ids))
+        gone: list[str] = []
+        unresolved: list[str] = []
+        deferred: list[str] = []
+        already_gone = 0
+        rate_limited = 0
+        for quote_id, outcome, exc in results:
+            if outcome == "gone":
+                gone.append(quote_id)
+                if exc is not None:
+                    already_gone += 1
+            elif outcome == "unresolved":
+                unresolved.append(quote_id)
+                if exc is not None and _rate_limited(exc):
+                    rate_limited += 1
+                log.warning(
+                    "delete_quote_unresolved", quote_id=quote_id, error=repr(exc)
+                )
+            else:
+                deferred.append(quote_id)
+        if already_gone:
+            # Routine at end-of-game; counted, not alarmed.
+            self._metrics.inc("quote.delete_already_gone", already_gone)
+            log.info("delete_quote_already_gone", count=already_gone)
+        if unresolved:
+            self._metrics.inc("quote.delete_unresolved", len(unresolved))
+        if rate_limited:
+            # Our pacing is wrong if this is ever non-zero — the whole point of
+            # the token budget is that the withdrawal wave never 429s.
+            self._metrics.inc("quote.delete_rate_limited", rate_limited)
+            log.error(
+                "quote_withdrawal_rate_limited",
+                count=rate_limited,
+                detail="429 on a token-paced withdrawal — quotes are UNKNOWN "
+                "(kept in the mirror) and retried; pacing needs review",
+            )
+        if deferred:
+            self._metrics.inc("quote.delete_deferred", len(deferred))
+            log.warning(
+                "quote_withdrawal_budget_deferred",
+                deferred=len(deferred),
+                detail="withdrawal pass exceeded its wall budget — remaining "
+                "quotes stay resting and are retried next tick",
+            )
+        return (gone, unresolved, deferred)
+
+    async def _withdraw_and_reconcile(
+        self,
+        quote_ids: Sequence[str],
+        reason: ReasonCode | str,
+        *,
+        budget_s: float | None = None,
+    ) -> tuple[int, int]:
+        """THE withdrawal path. Every caller — single quote, scoped market
+        quarantine, whole-book cancel-all, the resolver's re-delete — comes
+        through here, so the drop rule is written ONCE. Returns
+        ``(gone, unresolved_or_deferred)``.
+
+        The rule, verbatim from ``_withdraw_batch``'s contract:
+
+        * ``gone`` — the exchange ACKED the delete or answered 404
+          (``_already_gone``: it has no such quote). PROVABLY off the wire,
+          cannot fill ⇒ dropped from the mirror and from exposure.
+        * everything else — 429 / 5xx / timeout / transport, or never asked
+          because the pass ran out of wall budget — is UNKNOWN. The quote may
+          still be RESTING and may still FILL, so it STAYS in the mirror (risk
+          keeps counting it, it keeps consuming ``max_open_quotes``) and is
+          marked withdraw-pending for the read resolver.
+
+        ``_drop_quote`` is called for withdrawals ONLY from here, and only from
+        the ``gone`` list, so no caller's docstring premise can make the mirror
+        forget a quote the exchange never proved gone (defect 1: ``cancel_all``
+        used to drop unresolved ids on a "terminal path, no next tick" premise
+        that is false for 5 of its 7 callers)."""
+        if not quote_ids:
+            return (0, 0)
+        gone, unresolved, deferred = await self._withdraw_batch(
+            quote_ids, budget_s=budget_s
+        )
+        for quote_id in gone:
+            self._drop_quote(quote_id)
+            self._metrics.inc(f"quote.deleted.{reason}")
+        # Stamp AFTER the batch returns, never before: the happens-before guard
+        # is only sound if the recorded ask time is >= the instant the request
+        # actually went out. A later stamp can only make the resolver MORE
+        # conservative (it declines to judge the quote on this round's read).
+        asked_ns = self._clock.monotonic_ns()
+        for quote_id in (*unresolved, *deferred):
+            state = self._open.get(quote_id)
+            if state is None:
+                continue
+            state.withdraw_pending_reason = reason
+            state.withdraw_asked_mono_ns = asked_ns
+        return (len(gone), len(unresolved) + len(deferred))
+
+    async def _resolve_withdraw_pending(self) -> None:
+        """Resolve every UNKNOWN withdrawal with ONE READ, not a retried write.
+
+        ``GET /communications/quotes?user_filter=self&status=open`` is the same
+        account-wide enumerator the startup reconcile and the supervisor kill
+        path already use (``exchange/quote_query.list_open_quotes`` — cursor
+        paginated, min_ts/max_ts windowed so it never triggers the full-history
+        scan that trips the exchange circuit-breaker). It costs 10 READ tokens —
+        the default endpoint cost; GetQuotes is not one of the 13 live-verified
+        overrides — and Kalshi meters reads on a bucket SEPARATE from writes, so
+        this is O(1) in the pending count on the bucket a write storm is not
+        touching. At ``max_open_quotes`` = 200 that is 10 read tokens per tick
+        against the deleted retry driver's 400 WRITE tokens per tick.
+
+        Three outcomes, no fourth:
+          * ABSENT from the open set (and asked strictly before the read) ⇒
+            PROVEN off the wire ⇒ dropped, counted as a completed deletion.
+          * PRESENT ⇒ PROVEN still resting ⇒ re-deleted through the metered
+            write path, grouped by the reason it was being withdrawn for.
+          * the read FAILED, or the quote's ask does not pre-date the read ⇒
+            NOTHING is resolved. UNKNOWN never silently becomes "gone".
+
+        No lister wired (paper / backtests / minimal rigs) ⇒ the pending set is
+        drained by the metered write alone. That still terminates — a re-DELETE
+        of a gone quote answers 404, which is proof — it simply cannot observe an
+        accept/execute transition, and it is bounded by the write bucket rather
+        than by the read.
+
+        AN ACCEPTED QUOTE IS NEVER RESOLVED HERE (2026-07-26 gate, B1). This was
+        the ONLY withdrawal chooser without the guard the other three carry
+        (``cancel_all``, ``cancel_quotes_touching``, ``_pick_eviction_victim`` —
+        "not mid-confirm, never yank"), and it is the one chooser that both REAPS
+        and RE-DELETEs. One step reaches it: a TTL / RFQ-gone DELETE 429s ⇒ the
+        quote is UNKNOWN and STILL RESTING ⇒ the taker ACCEPTS it ⇒
+        ``on_quote_accepted`` sets ``accepted`` and then awaits (store write +
+        reservation + confirm REST) across several 0.5 s ticks. Inside that window
+        the unguarded resolver did two unrecoverable things: absent from the open
+        list (an ACCEPTED quote is no longer OPEN) it booked a quote that FILLED as
+        a proven withdrawal, and present it fired a fresh DELETE at a quote whose
+        risk we have already reserved and are about to confirm.
+
+        The guard DEFERS, it does not strand: the accepted quote keeps its pending
+        reason and keeps counting for risk, and ``on_quote_accepted`` drops it from
+        the mirror in EVERY branch — confirm, decline, lapse, unreadable side,
+        unknown size, and (via the wrapper's ``_drop_quote``) an escaping
+        exception. So the deferral terminates in exactly one confirm window, with
+        or without the network."""
+        pending: list[tuple[str, OpenQuoteState]] = []
+        accepted_deferred = 0
+        for qid, state in self._open.items():
+            if state.withdraw_pending_reason is None:
+                continue
+            if state.accepted:
+                # MID-CONFIRM: not ours to reap and not ours to re-delete. The
+                # accept path owns this quote and drops it when it finishes.
+                accepted_deferred += 1
+                continue
+            pending.append((qid, state))
+        if accepted_deferred:
+            self._metrics.inc(
+                "withdraw_resolve.accepted_deferred", accepted_deferred
+            )
+        if not pending:
+            return  # the steady state — zero cost on the maintenance tick
+        deadline_ns = self._clock.monotonic_ns() + int(
+            _WITHDRAW_RESOLVE_BUDGET_S * 1e9
+        )
+        read = await self._read_open_quote_ids(len(pending))
+        still_resting: dict[ReasonCode | str, list[str]] = {}
+        reaped: list[str] = []
+        if read is not None:
+            issued, open_ids = read
+            for quote_id, state in pending:
+                reason = state.withdraw_pending_reason
+                if reason is None:  # pragma: no cover — pending by construction
+                    continue
+                if state.withdraw_asked_mono_ns >= issued:
+                    # The ask does not strictly pre-date the read; this read
+                    # cannot speak about it. Next tick's read can.
+                    self._metrics.inc("withdraw_resolve.not_yet_readable")
+                    continue
+                # RE-CHECK AFTER THE AWAIT (2026-07-26, gate PoC R1/R2). The
+                # `state.accepted` test that built `pending` is a SNAPSHOT taken
+                # BEFORE `_read_open_quote_ids`, and accepts arrive on a
+                # DIFFERENT task (quote_app.quote_event_worker ->
+                # on_quote_accepted). An accept landing inside that await is
+                # invisible to the snapshot — and because an ACCEPTED quote is
+                # not OPEN, "absent from the open list" is the EXPECTED answer
+                # for it, so reaping would be the DEFAULT outcome, not a rare
+                # interleaving. Measured without this re-check: proven_gone=2 on
+                # a quote that then logged confirm_ok and booked a fill. Always
+                # read the LIVE state here, never the snapshot.
+                live = self._open.get(quote_id)
+                if live is None or live.accepted:
+                    # Already dropped by the accept path, or now mid-confirm:
+                    # not ours to reap and not ours to re-delete.
+                    self._metrics.inc("withdraw_resolve.accepted_deferred")
+                    continue
+                if quote_id in open_ids:
+                    still_resting.setdefault(reason, []).append(quote_id)
+                else:
+                    self._drop_quote(quote_id)
+                    self._metrics.inc(f"quote.deleted.{reason}")
+                    self._metrics.inc("withdraw_resolve.proven_gone")
+                    reaped.append(quote_id)
+            if reaped:
+                # ONE aggregated line, not one per quote: an end-of-game wave
+                # reaps the whole book at once and this runs on the maintenance
+                # loop.
+                log.info(
+                    "withdraw_resolved_gone",
+                    count=len(reaped),
+                    quote_ids=reaped[:20],
+                    detail="absent from the exchange's open-quote list — PROVEN "
+                    "off the wire; the mirror can forget them",
+                )
+        else:
+            # No read (unwired or failed): nothing is PROVEN, so nothing is
+            # dropped. The metered write is the only drain available.
+            for quote_id, state in pending:
+                reason = state.withdraw_pending_reason
+                if reason is None:  # pragma: no cover
+                    continue
+                still_resting.setdefault(reason, []).append(quote_id)
+        for reason, ids in still_resting.items():
+            remaining_s = (deadline_ns - self._clock.monotonic_ns()) / 1e9
+            if remaining_s <= 0.0:
+                self._metrics.inc("withdraw_resolve.drain_budget_deferred")
+                break
+            gone, _failed = await self._withdraw_and_reconcile(
+                ids, reason, budget_s=remaining_s
+            )
+            if gone:
+                self._metrics.inc("withdraw_resolve.drained", gone)
+        await self._halt_if_book_is_wholly_unprovable()
+
+    async def _read_open_quote_ids(
+        self, pending_count: int
+    ) -> tuple[int, set[str]] | None:
+        """The prover: ``(issued_mono_ns, our account's OPEN quote ids)``, or
+        ``None`` when we could not establish them (no lister wired, no read
+        tokens, or the read failed / timed out). ``None`` resolves NOTHING — it
+        never means "empty". ``issued`` is the instant the request went OUT,
+        which is the happens-before key: only a withdrawal asked strictly before
+        it may be judged by this answer."""
+        if self._quote_lister is None:
+            return None
+        budget = self._read_budget
+        if budget is not None and not budget.try_spend(DEFAULT_ENDPOINT_TOKEN_COST):
+            # Refused, never queued: the 0.5s maintenance tick IS the retry.
+            self._metrics.inc("withdraw_resolve.read_budget_deferred")
+            return None
+        issued = self._clock.monotonic_ns()
+        try:
+            quotes = await asyncio.wait_for(
+                # retries=1: the helper's default 4x0.5s backoff (3.5s) exceeds
+                # this tick's own poll bound, and the maintenance tick is the
+                # retry loop.
+                list_open_quotes(
+                    self._quote_lister,
+                    int(self._clock.now().timestamp()),
+                    retries=1,
+                ),
+                _MAINTENANCE_POLL_TIMEOUT_S,
+            )
+        except Exception as exc:
+            self._metrics.inc("withdraw_resolve.read_failed")
+            log.warning(
+                "withdraw_resolve_read_failed",
+                pending=pending_count,
+                error=repr(exc),
+                detail="open-quote read failed — NOTHING resolved; the pending "
+                "quotes stay UNKNOWN (risk keeps counting them) and the next "
+                "maintenance tick re-reads",
+            )
+            return None
+        self._withdraw_read_ok_mono_ns = issued
+        self._metrics.inc("withdraw_resolve.reads")
+        return (issued, set(open_quote_ids(quotes)))
+
+    async def _halt_if_book_is_wholly_unprovable(self) -> None:
+        """THE BOUNDED EXIT. Pending quotes keep counting against
+        ``max_open_quotes`` — a quote that may be resting is real risk AND real
+        capacity, and excluding it would uncap the resting worst-case loss the
+        mass-acceptance fold carries. So the terminal state is a predicate over
+        EXISTING state and an EXISTING limit, with no new number:
+
+            the book is AT capacity, AND every open quote is withdraw-pending,
+            AND no successful open-quote read has landed since the oldest of
+            those asks ⇒ the book cannot be proven at all ⇒
+            HALT_NEEDS_RECONCILE.
+
+        That is the doctrine ``cancel_quotes_touching`` already states ("a scoped
+        response we could not carry out is not a scoped response") and exactly
+        what ``_startup_reconcile`` does when it returns False: the restart
+        rebuilds the book from the exchange over this same endpoint. Every branch
+        of the withdrawal now terminates — resolve-by-read, else metered write
+        drain, else halt → restart reconcile — and none of them converts UNKNOWN
+        into "gone"."""
+        if self._killswitch.halted:
+            return
+        states = list(self._open.values())
+        if not states:
+            return
+        if len(states) < self._limits.limits.max_open_quotes:
+            return
+        if any(s.withdraw_pending_reason is None for s in states):
+            return
+        oldest_ask_ns = min(s.withdraw_asked_mono_ns for s in states)
+        read_ok = self._withdraw_read_ok_mono_ns
+        if read_ok is not None and read_ok >= oldest_ask_ns:
+            return
+        self._metrics.inc("withdraw_resolve.unprovable_halt")
+        await self._killswitch.halt(
+            ReasonCode.HALT_NEEDS_RECONCILE,
+            f"{len(states)} open quotes at cap "
+            f"{self._limits.limits.max_open_quotes}, every one withdraw-PENDING "
+            "and unread since its withdrawal was asked — the book cannot be "
+            "proven; the restart exchange-reconcile owns it",
+        )
+
+    async def cancel_all(
+        self,
+        reason: ReasonCode | str,
+        *,
+        budget_s: float | None = _WITHDRAW_RESOLVE_BUDGET_S,
+    ) -> None:
+        """Best-effort delete of every open quote. Idempotent, race-safe.
+
+        Token-paced + per-call timeout (2026-07-26): a whole-book cancel on a
+        big book must not out-run the exchange's write budget, and one hung
+        DELETE must not hold the halt path open forever.
+
+        WHOLE-PASS WALL BUDGET (2026-07-26 gate, B2 — THROUGHPUT NEVER
+        REGRESSES). Token pacing alone made this call BLOCK its caller for the
+        bucket's refill time: at the live bucket (200 tok / 20 tok/s) and the
+        live ``max_open_quotes`` = 200 the cliff sits at 100 quotes (the burst
+        the full bucket pays for) and the measured hold is 10.0 s full-bucket /
+        20.0 s empty-bucket. Five of the seven callers are NOT terminal and run
+        INLINE on paths that must not stall: the feed's invalidate (fired from
+        ``_handle_disconnect`` AND from a gap BEFORE the resync is sent),
+        ``on_channel_lost`` (which force-reconnects the socket carrying our RFQ
+        flow immediately after), the exchange-status halt, and both
+        DECLINE_FILL_VELOCITY sites. Holding those for tens of seconds is a
+        pricing/quoting throughput regression — the exact thing the standing rule
+        forbids — and the pre-token-pacing implementation was ~1 RTT.
+
+        The bound is the EXISTING withdrawal-pass budget
+        (``_WITHDRAW_RESOLVE_BUDGET_S``, itself ``_REPRICE_SWEEP_BUDGET_S``), not
+        a new number: it is the whole-pass wall bound the read-resolver's own
+        pass already gets on every maintenance tick, and the resolver is exactly
+        who inherits this pass's leftovers. Nothing is abandoned — quotes the
+        budget defers are never asked, so they stay in the mirror marked
+        withdraw-pending (risk keeps counting them) and the 0.5 s resolver
+        re-drives them, proving each one gone by READ or re-DELETEing it. This is
+        the same "deferred, never abandoned" contract ``cancel_quotes_touching``
+        carries.
+
+        ``budget_s=None`` restores the unbounded pass and is passed by the TWO
+        genuinely terminal callers only (``on_halt`` → ``_stop.set()`` and
+        shutdown), where waiting for the bucket is right: there is no next tick
+        to inherit the leftovers, so the pass must attempt every quote, and a
+        halting bot has nothing left to hold up.
+
+        SAME DROP RULE AS EVERY OTHER WITHDRAWAL (2026-07-26 gate, defect 1).
+        This used to drop the mirror for EVERY id, unresolved ones included, on
+        the premise "terminal path, there is no next tick". That premise is FALSE
+        for 5 of the 7 callers — ``on_invalidate`` (feed resync), the
+        force-reconnecting ``on_channel_lost``, ``HALT_EXCHANGE_STATUS``, and
+        both ``DECLINE_FILL_VELOCITY`` sites all keep the process running — so a
+        429 storm on any of them made the book forget quotes that were still
+        resting and could still fill. The premise is deleted rather than
+        defended: only PROVEN-gone ids leave the mirror, here as everywhere. For
+        the 2 genuinely terminal callers (``on_halt`` → ``_stop.set()``, and
+        shutdown) keeping the mirror costs nothing — the process is stopping and
+        ``_startup_reconcile`` rebuilds truth from the exchange. One rule, no
+        flag, no branch."""
         open_ids = [qid for qid, s in self._open.items() if not s.accepted]
         if not open_ids:
             return
         log.warning("cancel_all", reason=str(reason), count=len(open_ids))
-        results = await asyncio.gather(
-            *(self._sender.delete_quote(qid) for qid in open_ids), return_exceptions=True
+        _gone, failures = await self._withdraw_and_reconcile(
+            open_ids, reason, budget_s=budget_s
         )
-        for quote_id, result in zip(open_ids, results, strict=True):
-            if isinstance(result, Exception):
-                log.warning("cancel_all_delete_failed", quote_id=quote_id, error=repr(result))
-            self._drop_quote(quote_id)
+        if failures:
+            log.warning(
+                "cancel_all_unresolved",
+                reason=str(reason),
+                unresolved=failures,
+                detail="withdrawal outcome UNKNOWN — those quotes stay in the "
+                "mirror (risk keeps counting them) and are resolved by the "
+                "open-quote read; a restart reconciles them off the exchange",
+            )
         self._metrics.inc("quote.cancel_all")
 
     async def cancel_quotes_touching(
-        self, tickers: AbstractSet[str], reason: ReasonCode | str
+        self,
+        tickers: AbstractSet[str],
+        reason: ReasonCode | str,
+        *,
+        budget_s: float | None = None,
     ) -> tuple[int, int]:
         """SCOPED withdrawal: delete every DELETABLE resting quote that carries
         a leg in ``tickers``. Returns ``(deleted, failures)``.
@@ -5611,11 +6453,24 @@ class QuoteLifecycle:
         accepted quote is mid-confirm and is not ours to delete. They are not
         counted as failures — nothing was left undone that we could do.
 
-        ``failures`` counts deletes the exchange did not acknowledge. The caller
-        (quote_app's quarantine enforcement) treats a non-zero count as an
-        UNENFORCED quarantine and escalates it to the whole-bot halt on the next
-        status tick — fail-closed: a scoped response we could not carry out is
-        not a scoped response."""
+        BURST-BOUNDED (2026-07-26): concurrent, paced by the WRITE-TOKEN BUDGET,
+        with a per-call wall bound and — when the caller passes ``budget_s`` — a
+        whole-pass budget sized to the caller's own tick. An end-of-game
+        lifecycle wave quarantining a dozen markets at once is NORMAL and must
+        neither occupy the calling loop for tens of seconds nor breach the
+        account's write-token bucket (a 429 storm here would trip the
+        rate-limit-burst halt AND leave the quarantine unenforced).
+
+        ``failures`` counts quotes we could not provably get off the wire:
+        deletes whose outcome is UNKNOWN (429/5xx/timeout/transport) PLUS any
+        deferred by the budget. The caller (quote_app's quarantine enforcement)
+        treats a non-zero count as an UNENFORCED quarantine and escalates it to
+        the whole-bot halt on the next status tick — fail-closed: a scoped
+        response we could not carry out is not a scoped response.
+
+        A 404 is NOT a failure: the exchange has already dropped that quote, so
+        it is provably off the wire and can never fill (``_already_gone``).
+        ``deleted`` is the count of quotes provably gone."""
         if not tickers:
             return (0, 0)
         target_ids = [
@@ -5632,25 +6487,15 @@ class QuoteLifecycle:
             count=len(target_ids),
             markets=sorted(tickers),
         )
-        results = await asyncio.gather(
-            *(self._sender.delete_quote(qid) for qid in target_ids),
-            return_exceptions=True,
+        # Drop the mirror ONLY for quotes PROVABLY off the wire (acked, or 404 =
+        # the exchange has no such quote). An UNRESOLVED delete — 429, 5xx,
+        # timeout, transport — is not a confirmed anything: that quote may still
+        # be resting and may still FILL, so it stays in the mirror, keeps
+        # counting as not-provably-withdrawn, and is resolved by the read.
+        # DEFERRED quotes were never asked about at all — same rule.
+        return await self._withdraw_and_reconcile(
+            target_ids, reason, budget_s=budget_s
         )
-        failures = 0
-        for quote_id, result in zip(target_ids, results, strict=True):
-            if isinstance(result, Exception):
-                failures += 1
-                log.warning(
-                    "cancel_quotes_touching_delete_failed",
-                    quote_id=quote_id,
-                    error=repr(result),
-                )
-            # Drop the mirror either way (same rule as cancel_all): a quote we
-            # asked the exchange to delete must never keep resting in OUR book.
-            # The FAILURE is what escalates, not the mirror state.
-            self._drop_quote(quote_id)
-            self._metrics.inc(f"quote.deleted.{reason}")
-        return (len(target_ids), failures)
 
     @property
     def open_quote_count(self) -> int:
@@ -6272,14 +7117,34 @@ class QuoteLifecycle:
         )
 
     async def _delete_quote(self, quote_id: str, reason: ReasonCode) -> None:
-        try:
-            await self._sender.delete_quote(quote_id)
-        except Exception as exc:
-            log.warning("delete_quote_failed", quote_id=quote_id, error=repr(exc))
+        """Withdraw ONE resting quote — a one-element call into THE withdrawal
+        path. Only a PROVED withdrawal drops it.
+
+        B3 + the 2026-07-26 gate. This used to own a SECOND, UNMETERED
+        ``self._sender.delete_quote`` call plus a private copy of the
+        already-gone / unresolved handling. That copy was the busiest way to
+        withdraw a quote (1,137 calls in the incident: 438 TTL + 1,104 RFQ-gone,
+        on a run whose write path was 429ing) and it spent no write tokens at
+        all, so the exchange's bucket never saw what we were emitting. It is
+        gone: ``_withdraw_and_reconcile`` → ``_withdraw_batch._one`` is the only
+        code in this module that may call the sender's delete, and it spends
+        ``DELETE_QUOTE_TOKEN_COST`` BEFORE the request.
+
+        The rule is therefore the batch rule, unconditionally:
+          * ACK or 404 (``_already_gone``) ⇒ provably off the wire ⇒ dropped;
+          * anything else ⇒ UNKNOWN ⇒ stays in the mirror (still counted by
+            risk, still able to fill), marked withdraw-pending, and resolved by
+            the next maintenance tick's open-quote READ — including for the
+            event-driven reasons (RFQ-gone, eviction) whose triggers never
+            repeat.
+
+        The decision record stays HERE, on the single-quote path only, exactly
+        as before: batch withdrawals (cancel-all, quarantine, the resolver's
+        drain) have never written one, and adding N store writes to the halt path
+        is the maintenance-stall class we just removed."""
         state = self._open.get(quote_id)
-        self._drop_quote(quote_id)
-        self._metrics.inc(f"quote.deleted.{reason}")
-        if state is not None:
+        gone, _failures = await self._withdraw_and_reconcile([quote_id], reason)
+        if gone and state is not None:
             await self._store.record_decision(
                 "quote_deleted", state.rfq.rfq_id, [str(reason)], {"quote_id": quote_id}
             )

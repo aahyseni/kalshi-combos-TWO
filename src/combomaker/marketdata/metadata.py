@@ -21,8 +21,13 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from combomaker.core.clock import Clock
+from combomaker.exchange.rest import (
+    DEFAULT_ENDPOINT_TOKEN_COST,
+    ReadBudgetExhausted,
+)
 from combomaker.marketdata.grid import GridError, PriceGrid
 from combomaker.ops.logging import get_logger
+from combomaker.ops.write_budget import TokenBudget
 
 log = get_logger(__name__)
 
@@ -104,10 +109,39 @@ class EventMeta:
 
 
 class MetadataCache:
-    def __init__(self, rest: RestLike, clock: Clock, *, ttl_s: float = 300.0) -> None:
+    """
+    READ-BUDGET PACING (2026-07-26). Every network fetch below spends from a
+    READ token bucket before it is emitted, exactly as the withdrawal wave
+    spends from the write bucket. WHY here and not at the call sites: the
+    metadata fetch is reached from the RFQ hot path (``_ensure_watched``), the
+    status loop's metadata-change sampler, and the startup leg-arming pass, and
+    a bucket that only some of them respect is not a bucket. A refusal RAISES
+    ``ReadBudgetExhausted`` (a ``KalshiApiError``) rather than blocking: the
+    caller's existing "this read failed, keep the cached value and retry on the
+    next RFQ" path is already the correct behaviour, and it costs no wall time
+    on the hot path — a local refusal is strictly cheaper than the 429 it
+    replaces.
+
+    ``read_budget=None`` (tests, backtests, paper) ⇒ unpaced, exactly as before.
+    """
+
+    def __init__(
+        self,
+        rest: RestLike,
+        clock: Clock,
+        *,
+        ttl_s: float = 300.0,
+        read_budget: TokenBudget | None = None,
+        read_token_cost: int = DEFAULT_ENDPOINT_TOKEN_COST,
+    ) -> None:
         self._rest = rest
         self._clock = clock
         self._ttl_s = ttl_s
+        self._read_budget = read_budget
+        self._read_token_cost = read_token_cost
+        # Reads REFUSED locally (never emitted). The mirror image of a 429 —
+        # and the number that should replace the incident's 5,726 of them.
+        self.read_budget_refusals = 0
         self._markets: dict[str, MarketMeta] = {}
         self._events: dict[str, EventMeta] = {}
         # PERSISTENCE dirty flag (2026-07-25): set by every network-backed
@@ -348,7 +382,17 @@ class MetadataCache:
             return cached
         return await self.refresh(ticker)
 
+    def _spend_read_budget(self, endpoint: str) -> None:
+        """Pay for one GET out of the READ bucket, or refuse it locally."""
+        budget = self._read_budget
+        if budget is None:
+            return
+        if not budget.try_spend(self._read_token_cost):
+            self.read_budget_refusals += 1
+            raise ReadBudgetExhausted(endpoint, self._read_token_cost)
+
     async def refresh(self, ticker: str) -> MarketMeta:
+        self._spend_read_budget(f"GET /markets/{ticker}")
         payload = await self._rest.get_market(ticker)
         market = payload.get("market", payload)  # endpoint wraps in {"market": {...}}
         grid: PriceGrid | None
@@ -391,6 +435,7 @@ class MetadataCache:
             age_s = (self._clock.monotonic_ns() - cached.fetched_mono_ns) / 1e9
             if age_s <= budget:
                 return cached
+        self._spend_read_budget(f"GET /events/{event_ticker}")
         payload = await self._rest.get_event(event_ticker)
         event = payload.get("event", payload)
         flag = event.get("mutually_exclusive")

@@ -157,6 +157,7 @@ async def _cancel_reported(rig: RecoveryRig, getter: FakeQuoteGetter) -> str:
     )
     rig.h.clock.advance(RECOVERY_AFTER_S + 0.5)
     await rig.lifecycle.maintenance_tick()  # GET quote → cancelled → verifying
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert rig.metrics.counter("fill_recovery.cancel_verify_started") == 1
     return quote_id
 
@@ -182,12 +183,14 @@ async def test_cancel_report_then_late_execution_keeps_position_and_records(
     # Verify attempt 1 (due immediately on the next tick): tape empty — the
     # position STAYS while attempts remain.
     await rig.lifecycle.maintenance_tick()
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert len(fills.calls) == 1
     assert f"fill:{quote_id}" in rig.exposure.positions
     assert await rig.store.count("fills") == 0
 
     # Not due yet: no extra poll before the configured delay elapses.
     await rig.lifecycle.maintenance_tick()
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert len(fills.calls) == 1
 
     # The exchange executes LATE (incident A: minutes after the cancel
@@ -195,6 +198,7 @@ async def test_cancel_report_then_late_execution_keeps_position_and_records(
     fills.script(COMBO_TICKER, {"fills": [taker_fill()]})
     rig.h.clock.advance(VERIFY_DELAY_S + 0.5)
     await rig.lifecycle.maintenance_tick()  # attempt 2 → match → replay
+    await rig.lifecycle.drain_diagnostic_sweeps()
 
     assert rig.metrics.counter("fill_recovery.late_execution") == 1
     assert f"fill:{quote_id}" in rig.exposure.positions  # kept, never removed
@@ -212,6 +216,7 @@ async def test_cancel_report_then_late_execution_keeps_position_and_records(
     # Terminal: nothing further polled or written.
     rig.h.clock.advance(VERIFY_DELAY_S + 0.5)
     await rig.lifecycle.maintenance_tick()
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert len(fills.calls) == 2
     assert await rig.store.count("fills") == 1
     assert rig.metrics.counter("fill_recovery.cancelled") == 0  # never discarded
@@ -229,6 +234,7 @@ async def test_cancel_report_with_fill_already_on_tape_recovers_first_poll(
     quote_id = await _cancel_reported(rig, getter)
 
     await rig.lifecycle.maintenance_tick()  # attempt 1 → immediate match
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert rig.metrics.counter("fill_recovery.late_execution") == 1
     assert f"fill:{quote_id}" in rig.exposure.positions
     assert await rig.store.count("fills") == 1
@@ -256,6 +262,7 @@ async def test_wrong_side_or_count_never_matches(tmp_path: Path) -> None:
     )
     quote_id = await _cancel_reported(rig, getter)
     await rig.lifecycle.maintenance_tick()  # attempt 1 (final) → no match
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert await rig.store.count("fills") == 0
     assert f"fill:{quote_id}" not in rig.exposure.positions  # verified absent
     assert rig.metrics.counter("fill_recovery.cancelled") == 1
@@ -279,6 +286,7 @@ async def test_query_time_scoped_by_min_ts(tmp_path: Path) -> None:
     state = rig.lifecycle._executed_states[quote_id]  # noqa: SLF001
     assert state.fill_confirmed_wall_ts is not None
     await rig.lifecycle.maintenance_tick()  # verification attempt 1
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert fills.calls[0]["ticker"] == COMBO_TICKER
     assert fills.calls[0]["min_ts"] == state.fill_confirmed_wall_ts - 60
     assert fills.calls[0]["limit"] == 100
@@ -307,7 +315,9 @@ async def test_historical_fill_in_ledger_never_adopted(tmp_path: Path) -> None:
     fills.script(COMBO_TICKER, {"fills": [taker_fill(order_id="ord-hist")]})
     rig.h.clock.advance(RECOVERY_AFTER_S + 0.5)
     await rig.lifecycle.maintenance_tick()  # cancel discovered → verifying
+    await rig.lifecycle.drain_diagnostic_sweeps()
     await rig.lifecycle.maintenance_tick()  # attempt 1 (final): guard refuses
+    await rig.lifecycle.drain_diagnostic_sweeps()
 
     assert (
         rig.metrics.counter("fill_recovery.verify_match_rejected.already_in_ledger")
@@ -352,11 +362,13 @@ async def test_two_concurrent_verifications_one_exchange_fill(
 
     rig.h.clock.advance(RECOVERY_AFTER_S + 0.5)
     await rig.lifecycle.maintenance_tick()  # both cancel reports discovered
+    await rig.lifecycle.drain_diagnostic_sweeps()
 
     # One tick, both verifications: q1 adopts (claims ord-shared) but its
     # write fails — NO ledger row exists when q2 verifies; only the CLAIM
     # blocks q2 from adopting the same exchange fill.
     await rig.lifecycle.maintenance_tick()
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert rig.metrics.counter("fill_recovery.late_execution") == 1
     assert (
         rig.metrics.counter("fill_recovery.verify_match_rejected.already_claimed")
@@ -369,6 +381,7 @@ async def test_two_concurrent_verifications_one_exchange_fill(
 
     # Next tick: q1's replay retries and lands EXACTLY ONE row.
     await rig.lifecycle.maintenance_tick()
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert await rig.store.count("fills") == 1
     (row,) = await _fill_rows(rig.store)
     assert row[0] == f"fill:{q1}"
@@ -393,6 +406,7 @@ async def test_ws_execution_during_verification_single_row(tmp_path: Path) -> No
     for _ in range(3):
         rig.h.clock.advance(VERIFY_DELAY_S + 0.5)
         await rig.lifecycle.maintenance_tick()
+        await rig.lifecycle.drain_diagnostic_sweeps()
     assert fills.calls == []  # verification never polled after the WS row
     assert await rig.store.count("fills") == 1  # single row
     assert rig.metrics.counter("fill.count") == 1
@@ -415,9 +429,11 @@ async def test_truly_cancelled_removes_phantom_after_verification(
 
     # Attempts 1 and 2: position stays while the budget remains.
     await rig.lifecycle.maintenance_tick()
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert f"fill:{quote_id}" in rig.exposure.positions
     rig.h.clock.advance(VERIFY_DELAY_S + 0.5)
     await rig.lifecycle.maintenance_tick()
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert f"fill:{quote_id}" in rig.exposure.positions
     assert len(fills.calls) == 2
 
@@ -425,6 +441,7 @@ async def test_truly_cancelled_removes_phantom_after_verification(
     # the old path did, no fills row ever written.
     rig.h.clock.advance(VERIFY_DELAY_S + 0.5)
     await rig.lifecycle.maintenance_tick()
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert len(fills.calls) == 3
     assert f"fill:{quote_id}" not in rig.exposure.positions
     assert await rig.store.count("fills") == 0
@@ -434,6 +451,7 @@ async def test_truly_cancelled_removes_phantom_after_verification(
     # Terminal: nothing polls again.
     rig.h.clock.advance(VERIFY_DELAY_S + 0.5)
     await rig.lifecycle.maintenance_tick()
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert len(fills.calls) == 3
 
 
@@ -454,8 +472,10 @@ async def test_all_reads_errored_retries_rounds_then_keeps_position(
 
     for _ in range(9):  # 3 rounds x 3 attempts, all errors
         await rig.lifecycle.maintenance_tick()
+        await rig.lifecycle.drain_diagnostic_sweeps()
         rig.h.clock.advance(VERIFY_DELAY_S + 0.5)
     await rig.lifecycle.maintenance_tick()  # nothing left — state popped
+    await rig.lifecycle.drain_diagnostic_sweeps()
 
     assert rig.metrics.counter("fill_recovery.verify_errors") == 9
     assert rig.metrics.counter("fill_recovery.verify_round_failed") == 2
@@ -480,12 +500,14 @@ async def test_transient_error_round_then_recovery_next_round(
     quote_id = await _cancel_reported(rig, getter)
 
     await rig.lifecycle.maintenance_tick()  # round 1, attempt 1: error → retry round
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert rig.metrics.counter("fill_recovery.verify_round_failed") == 1
     assert f"fill:{quote_id}" in rig.exposure.positions
 
     fills.script(COMBO_TICKER, {"fills": [taker_fill()]})  # exchange back up
     rig.h.clock.advance(VERIFY_DELAY_S + 0.5)
     await rig.lifecycle.maintenance_tick()  # round 2, attempt 1: match
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert rig.metrics.counter("fill_recovery.late_execution") == 1
     assert await rig.store.count("fills") == 1
     assert f"fill:{quote_id}" in rig.exposure.positions
@@ -524,6 +546,7 @@ async def test_committed_writer_miss_is_loud_and_retried(tmp_path: Path) -> None
     getter.script_status(quote_id, "executed", creator_order_id="o1")
     rig.h.clock.advance(RECOVERY_AFTER_S + 0.5)
     await rig.lifecycle.maintenance_tick()
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert await rig.store.count("fills") == 1
     assert rig.metrics.counter("fill.count") == 1
     assert rig.metrics.counter("fill_ledger.write_failed") == 1  # once, not two
@@ -551,12 +574,14 @@ async def test_verified_fill_write_failure_retries_next_tick(tmp_path: Path) -> 
 
     quote_id = await _cancel_reported(rig, getter)
     await rig.lifecycle.maintenance_tick()  # attempt 1 → match → write FAILS
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert rig.metrics.counter("fill_recovery.late_execution") == 1
     assert rig.metrics.counter("fill_ledger.write_failed") == 1
     assert await rig.store.count("fills") == 0
     assert f"fill:{quote_id}" in rig.exposure.positions  # still kept
 
     await rig.lifecycle.maintenance_tick()  # replay retry (no new REST poll)
+    await rig.lifecycle.drain_diagnostic_sweeps()
     assert len(fills.calls) == 1
     assert await rig.store.count("fills") == 1
     assert f"fill:{quote_id}" in rig.exposure.positions
@@ -580,6 +605,7 @@ async def test_verification_disabled_falls_back_to_immediate_discard(
     )
     rig.h.clock.advance(RECOVERY_AFTER_S + 0.5)
     await rig.lifecycle.maintenance_tick()
+    await rig.lifecycle.drain_diagnostic_sweeps()
     # attempts=0 ⇒ verification explicitly disabled: prior behaviour.
     assert f"fill:{quote_id}" not in rig.exposure.positions
     assert rig.metrics.counter("fill_recovery.cancelled") == 1
@@ -1006,6 +1032,7 @@ class TestIncidentCPartialExecution:
         )
         quote_id = await _cancel_reported(rig, getter)
         await rig.lifecycle.maintenance_tick()  # attempt 1 → partial match
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert rig.metrics.counter("fill_recovery.late_execution") == 1
         assert rig.metrics.counter("fill_recovery.partial_execution_resize") == 1
         assert rig.metrics.counter("fill_recovery.cancelled") == 0  # never discarded
@@ -1033,6 +1060,7 @@ class TestIncidentCPartialExecution:
         )
         quote_id = await _cancel_reported(rig, getter)
         await rig.lifecycle.maintenance_tick()
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert rig.metrics.counter("fill_recovery.late_execution") == 1
         assert rig.metrics.counter("fill_recovery.partial_execution_resize") == 0
         (row,) = await _fill_rows(rig.store)
@@ -1058,6 +1086,7 @@ class TestIncidentCPartialExecution:
         )
         quote_id = await _cancel_reported(rig, getter)
         await rig.lifecycle.maintenance_tick()  # attempt 1 (final) → no match
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert rig.metrics.counter("fill_recovery.verify_structural_skips") == 1
         assert rig.metrics.counter("fill_recovery.late_execution") == 0
         assert await rig.store.count("fills") == 0
@@ -1091,11 +1120,13 @@ class TestIncidentCPartialExecution:
 
         quote_id = await _cancel_reported(rig, getter)
         await rig.lifecycle.maintenance_tick()  # adopt+resize → write FAILS
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert rig.metrics.counter("fill_recovery.partial_execution_resize") == 1
         assert await rig.store.count("fills") == 0
         assert int(rig.exposure.positions[f"fill:{quote_id}"].contracts) == 380
 
         await rig.lifecycle.maintenance_tick()  # replay retry → row lands
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert await rig.store.count("fills") == 1
         (row,) = await _fill_rows(rig.store)
         assert row[4] == 380
@@ -1131,10 +1162,12 @@ class TestFillsLedgerSweep:
         )
 
         await rig.lifecycle.maintenance_tick()  # first tick: stamps cadence only
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert all("ticker" in c for c in fills.calls)  # no account-wide fetch
 
         rig.h.clock.advance(900.5)
         await rig.lifecycle.maintenance_tick()  # sweep fires
+        await rig.lifecycle.drain_diagnostic_sweeps()
         account_calls = [c for c in fills.calls if "ticker" not in c]
         assert len(account_calls) == 1
         assert account_calls[0]["limit"] == 1000
@@ -1157,6 +1190,7 @@ class TestFillsLedgerSweep:
 
         rig.h.clock.advance(900.5)
         await rig.lifecycle.maintenance_tick()
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert rig.metrics.counter("fills_ledger_sweep.ran") == 1
         assert rig.metrics.counter("fills_ledger_sweep.missing") == 0
 
@@ -1171,22 +1205,27 @@ class TestFillsLedgerSweep:
         fills.script("", RuntimeError("rest down"))
 
         await rig.lifecycle.maintenance_tick()  # stamp
+        await rig.lifecycle.drain_diagnostic_sweeps()
         rig.h.clock.advance(900.5)
         await rig.lifecycle.maintenance_tick()  # sweep → error → swallowed
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert rig.metrics.counter("fills_ledger_sweep.errors") == 1
         assert rig.metrics.counter("fills_ledger_sweep.ran") == 0
 
         fills.script("", {"fills": []})
         rig.h.clock.advance(900.5)
         await rig.lifecycle.maintenance_tick()  # next interval retries
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert rig.metrics.counter("fills_ledger_sweep.ran") == 1
 
     async def test_no_fills_getter_disables_sweep(self, tmp_path: Path) -> None:
         getter = FakeQuoteGetter()
         rig = await _make_rig(tmp_path, getter=getter)  # fills_getter=None
         await rig.lifecycle.maintenance_tick()
+        await rig.lifecycle.drain_diagnostic_sweeps()
         rig.h.clock.advance(900.5)
         await rig.lifecycle.maintenance_tick()  # guard returns — nothing to call
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert rig.metrics.counter("fills_ledger_sweep.ran") == 0
 
 
@@ -1221,7 +1260,9 @@ class TestReviewHardening:
         getter.script_status(q_b, "cancelled", cancellation_reason="execution failed")
         rig.h.clock.advance(RECOVERY_AFTER_S + 0.5)
         await rig.lifecycle.maintenance_tick()  # cancel discovered → verifying
+        await rig.lifecycle.drain_diagnostic_sweeps()
         await rig.lifecycle.maintenance_tick()  # attempt 1 (final): ambiguous
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert rig.metrics.counter("fill_recovery.late_execution") == 0
         assert rig.metrics.counter("fill_recovery.partial_execution_resize") == 0
         assert rig.metrics.counter("fill_recovery.cancelled") == 0  # NOT discarded
@@ -1257,7 +1298,9 @@ class TestReviewHardening:
         )
         rig.h.clock.advance(RECOVERY_AFTER_S + 0.5)
         await rig.lifecycle.maintenance_tick()  # verifying (captures the key)
+        await rig.lifecycle.drain_diagnostic_sweeps()
         await rig.lifecycle.maintenance_tick()  # attempt 1 → adopt ord-mine
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert rig.metrics.counter("fill_recovery.late_execution") == 1
         (row,) = await _fill_rows(rig.store)
         assert row[1] == "ord-mine"
@@ -1286,6 +1329,7 @@ class TestReviewHardening:
         )
         quote_id = await _cancel_reported(rig, getter)
         await rig.lifecycle.maintenance_tick()  # attempt 1 → aggregate adopt
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert rig.metrics.counter("fill_recovery.late_execution") == 1
         (row,) = await _fill_rows(rig.store)
         assert row[1] == "ord-multi"
@@ -1322,6 +1366,7 @@ class TestReviewHardening:
         quote_id = await _cancel_reported(rig, getter)
         fills.race = (rig.lifecycle, quote_id)
         await rig.lifecycle.maintenance_tick()  # final attempt + the race
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert await rig.store.count("fills") == 1  # the WS row
         assert f"fill:{quote_id}" in rig.exposure.positions  # NEVER discarded
         assert rig.metrics.counter("fill_recovery.cancelled") == 0
@@ -1375,8 +1420,10 @@ class TestReviewHardening:
 
         rig.h.clock.advance(RECOVERY_AFTER_S + 0.5)
         await rig.lifecycle.maintenance_tick()  # A recovers (claims, write fails);
+        await rig.lifecycle.drain_diagnostic_sweeps()
         # B's cancel discovered → verifying
         await rig.lifecycle.maintenance_tick()  # A retry fails; B: already_claimed
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert (
             rig.metrics.counter("fill_recovery.verify_match_rejected.already_claimed")
             == 1
@@ -1384,6 +1431,7 @@ class TestReviewHardening:
         assert rig.metrics.counter("fill_recovery.late_execution") == 0
         # A's next retry lands its own row with its own order id.
         await rig.lifecycle.maintenance_tick()
+        await rig.lifecycle.drain_diagnostic_sweeps()
         rows = await _fill_rows(rig.store)
         assert [r[0] for r in rows] == [f"fill:{q_a}"]
         assert rows[0][1] == "ord-shared"
@@ -1401,8 +1449,10 @@ class TestReviewHardening:
         fills = EndlessFills()
         rig = await _verify_rig(tmp_path, getter=getter, fills=fills)
         await rig.lifecycle.maintenance_tick()  # stamp
+        await rig.lifecycle.drain_diagnostic_sweeps()
         rig.h.clock.advance(900.5)
         await rig.lifecycle.maintenance_tick()  # sweep: 3 pages, cursor remains
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert len(fills.calls) == 3  # bounded
         assert rig.metrics.counter("fills_ledger_sweep.truncated") == 1
         assert rig.metrics.counter("fills_ledger_sweep.ran") == 1
@@ -1421,8 +1471,10 @@ class TestReviewHardening:
         state.fill_recovery_attempts = 10  # exhausted — parked forever
         fills.script("", {"fills": [taker_fill(order_id="ord-lost")]})
         await rig.lifecycle.maintenance_tick()  # stamp
+        await rig.lifecycle.drain_diagnostic_sweeps()
         rig.h.clock.advance(900.5)
         await rig.lifecycle.maintenance_tick()  # sweep fires
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert rig.metrics.counter("fills_ledger_sweep.missing") == 1
 
     async def test_sweep_store_error_is_contained(self, tmp_path: Path) -> None:
@@ -1438,8 +1490,10 @@ class TestReviewHardening:
 
         rig.store.fill_order_ids = broken  # type: ignore[method-assign]
         await rig.lifecycle.maintenance_tick()  # stamp
+        await rig.lifecycle.drain_diagnostic_sweeps()
         rig.h.clock.advance(900.5)
         await rig.lifecycle.maintenance_tick()  # sweep → store error → contained
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert rig.metrics.counter("fills_ledger_sweep.errors") == 1
         assert rig.metrics.counter("fills_ledger_sweep.ran") == 0
 
@@ -1458,7 +1512,9 @@ class TestReviewHardening:
         assert await rig.store.count("fills") == 1
         fills.script("", {"fills": [taker_fill(order_id="ord-unkeyed")]})
         await rig.lifecycle.maintenance_tick()  # stamp
+        await rig.lifecycle.drain_diagnostic_sweeps()
         rig.h.clock.advance(900.5)
         await rig.lifecycle.maintenance_tick()
+        await rig.lifecycle.drain_diagnostic_sweeps()
         assert rig.metrics.counter("fills_ledger_sweep.matched_null_order_id") == 1
         assert rig.metrics.counter("fills_ledger_sweep.missing") == 0

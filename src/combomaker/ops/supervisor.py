@@ -11,9 +11,18 @@ survive the host that hosts it deadlocking.
 
 Design pillars (spec §1):
 
-- HEARTBEAT: the bot writes ``heartbeat.txt`` every tick; the supervisor reads
-  its age against the supervisor's own clock. Age > ``heartbeat_timeout_s`` (or
-  an unreadable heartbeat — fail-closed) ⇒ WEDGED.
+- HEARTBEAT ("ALIVE"): the bot's DEDICATED liveness task writes ``heartbeat.txt``
+  on a fixed cadence and does nothing else; the supervisor reads its age against
+  the supervisor's own clock. Age > ``heartbeat_timeout_s`` (or an unreadable
+  heartbeat — fail-closed) ⇒ the process/event loop is WEDGED.
+- LOOP PROGRESS ("WORKING"): every loop that matters publishes a last-progress
+  age to ``loop_progress.json`` (``risk/progress.py``); the supervisor escalates
+  when any loop exceeds its own DERIVED stall bound, even while the process is
+  still breathing. This is what keeps a dedicated beater from BLINDING the
+  supervisor: "alive" and "working" are now two independent signals and either
+  one going stale kills. See ``risk/progress.py`` for the 2026-07-26T20:12:54Z
+  false-kill this pair replaced (a healthy, quoting bot whose maintenance loop
+  sat in a 30s non-beating await while the event loop never stalled).
 - EMERGENCY CANCEL-ALL: on wedged (or an explicit trigger), cancel every resting
   quote via the supervisor's OWN REST client, THEN write KILL + drop the
   ``needs_reconcile`` marker. FAIL-CLOSED: if the exchange is unreachable, we
@@ -47,7 +56,15 @@ from typing import Protocol
 
 from combomaker.core.clock import Clock
 from combomaker.ops.logging import get_logger
+
+# THE one write-token budget (ops/write_budget.py). It used to be defined here;
+# it moved when the lifecycle's end-of-game withdrawal wave had to pace on the
+# SAME bucket concept, so there is one token budget in the codebase and one
+# config source for it. Re-exported by this import — importing it from here
+# still works.
+from combomaker.ops.write_budget import WriteBudget
 from combomaker.risk.heartbeat import Heartbeat, HeartbeatReader, ReconcileMarker
+from combomaker.risk.progress import ProgressReader, progress_path
 
 log = get_logger(__name__)
 
@@ -85,67 +102,6 @@ class SupervisorExchange(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class WriteBudget:
-    """A reserved token bucket for the supervisor's OWN writes.
-
-    Refills ``capacity`` tokens per ``refill_s`` window. ``try_spend`` consumes a
-    token if available. The point: the supervisor's writes are throttled to a
-    RESERVED budget so, even when the shared/bot budget is exhausted under a 429
-    storm, the supervisor always has tokens to cancel-all — it never draws from
-    (or exhausts) the bot's pool. Deterministic under a fake clock.
-
-    Frozen: the mutable state (tokens, last-refill) lives in a tiny inner box so
-    the public handle stays hashable/immutable while the bucket refills.
-    """
-
-    clock: Clock
-    capacity: int
-    refill_s: float
-    _state: _BudgetState
-
-    @classmethod
-    def create(cls, clock: Clock, *, capacity: int, refill_s: float) -> WriteBudget:
-        if capacity < 1:
-            raise ValueError("write budget capacity must be >= 1")
-        if refill_s <= 0:
-            raise ValueError("write budget refill_s must be > 0")
-        return cls(
-            clock=clock,
-            capacity=capacity,
-            refill_s=refill_s,
-            _state=_BudgetState(tokens=capacity, last_refill=clock.now().timestamp()),
-        )
-
-    def _refill(self) -> None:
-        now = self.clock.now().timestamp()
-        elapsed = now - self._state.last_refill
-        if elapsed >= self.refill_s:
-            # Full refill each window boundary (a reserved emergency budget is
-            # bursty, not rate-smoothed: it must be FULL when a kill fires).
-            self._state.tokens = self.capacity
-            self._state.last_refill = now
-
-    def try_spend(self) -> bool:
-        """Consume one token; True if one was available. Refills first."""
-        self._refill()
-        if self._state.tokens > 0:
-            self._state.tokens -= 1
-            return True
-        return False
-
-    @property
-    def tokens(self) -> int:
-        self._refill()
-        return self._state.tokens
-
-
-@dataclass(slots=True)
-class _BudgetState:
-    tokens: int
-    last_refill: float
-
-
-@dataclass(frozen=True, slots=True)
 class KillResult:
     """Outcome of an emergency kill. ``kill_written`` is the load-bearing
     invariant — it is True on EVERY path that completes (reachable or not),
@@ -174,6 +130,7 @@ class SupervisorConfig:
         write_budget_capacity: int = 200,
         write_budget_refill_s: float = 10.0,
         own_heartbeat_path: Path | None = None,
+        progress_path_: Path | None = None,
     ) -> None:
         self.heartbeat_path = heartbeat_path
         self.kill_file = kill_file
@@ -189,6 +146,14 @@ class SupervisorConfig:
             own_heartbeat_path
             if own_heartbeat_path is not None
             else heartbeat_path.parent / SUPERVISOR_HEARTBEAT_FILENAME
+        )
+        # The bot's per-loop PROGRESS ledger ("working"), read alongside the
+        # heartbeat ("alive"). Defaults next to the heartbeat so a caller that
+        # only knows the data_dir gets the right path for free.
+        self.progress_path = (
+            progress_path_
+            if progress_path_ is not None
+            else progress_path(heartbeat_path.parent)
         )
 
 
@@ -213,6 +178,12 @@ class SafetySupervisor:
         self._clock = clock
         self._exchange = exchange
         self._reader = HeartbeatReader(clock, config.heartbeat_path)
+        # The second, INDEPENDENT axis: per-loop progress. The heartbeat alone
+        # can only say the event loop schedules; this says the loops that
+        # matter are still advancing. Latching (see ProgressReader) so a bot
+        # that has never published one is not killed on sight, while a bot that
+        # HAS published one can never make the ledger vanish to hide a stall.
+        self._progress = ProgressReader(clock, config.progress_path)
         self._marker = ReconcileMarker(config.reconcile_marker_path)
         # The supervisor's OWN heartbeat: it beats this every poll cycle so the
         # bot's preflight can verify a RUNNING, RECENTLY-BEATING watcher (not just
@@ -327,6 +298,30 @@ class SafetySupervisor:
         Fail-closed (an unreadable heartbeat is wedged)."""
         return self._reader.is_wedged(self._config.heartbeat_timeout_s)
 
+    def wedged_detail(self) -> str | None:
+        """The kill reason, or ``None`` if the bot is both ALIVE and WORKING.
+
+        TWO independent axes, checked in that order:
+
+        1. LIVENESS — ``heartbeat.txt``, written by the bot's dedicated beater.
+           Stale/unreadable ⇒ the process or its event loop is gone.
+        2. PROGRESS — ``loop_progress.json``. Even with a breathing event loop,
+           a quote/maintenance loop that stops advancing past its own derived
+           bound is a wedge, and the reason NAMES the loop.
+
+        Splitting them is what lets a legitimately slow maintenance pass stop
+        looking like a wedge WITHOUT blinding this watchdog: axis 2 still fires
+        on a genuinely stuck loop, at the same age the old single signal did."""
+        if self.heartbeat_wedged():
+            age = self._reader.read_age_s()
+            if age is None:
+                return "heartbeat missing/unreadable"
+            return (
+                f"heartbeat wedged (age={age:.1f}s > "
+                f"{self._config.heartbeat_timeout_s:.1f}s)"
+            )
+        return self._progress.wedged_detail()
+
     def beat_own_heartbeat(self) -> None:
         """Record the supervisor's OWN liveness. Beaten every poll cycle (and
         after a kill — the supervisor stays up as the latch, and a live latch
@@ -335,21 +330,17 @@ class SafetySupervisor:
         self._own_heartbeat.beat()
 
     async def check_once(self) -> KillResult | None:
-        """One watchdog cycle: beat our own heartbeat, then — if the BOT's
-        heartbeat is wedged and we haven't already killed — emergency-cancel +
-        KILL. Returns the ``KillResult`` on a kill, else ``None``. Idempotent:
-        once killed, further checks are no-ops (the KILL file + marker persist;
-        re-cancelling adds nothing) EXCEPT we keep beating our own heartbeat."""
+        """One watchdog cycle: beat our own heartbeat, then — if the BOT is
+        wedged on EITHER axis (dead process or stalled loop) and we haven't
+        already killed — emergency-cancel + KILL. Returns the ``KillResult`` on
+        a kill, else ``None``. Idempotent: once killed, further checks are
+        no-ops (the KILL file + marker persist; re-cancelling adds nothing)
+        EXCEPT we keep beating our own heartbeat."""
         self.beat_own_heartbeat()
         if self._killed:
             return None
-        if self.heartbeat_wedged():
-            age = self._reader.read_age_s()
-            detail = (
-                f"heartbeat wedged (age={age:.1f}s > {self._config.heartbeat_timeout_s:.1f}s)"
-                if age is not None
-                else "heartbeat missing/unreadable"
-            )
+        detail = self.wedged_detail()
+        if detail is not None:
             log.error("supervisor_heartbeat_wedged", detail=detail)
             return await self.emergency_cancel_all(detail)
         return None
@@ -365,6 +356,7 @@ class SafetySupervisor:
             "supervisor_starting",
             heartbeat_path=str(self._config.heartbeat_path),
             own_heartbeat_path=str(self._config.own_heartbeat_path),
+            progress_path=str(self._config.progress_path),
             timeout_s=self._config.heartbeat_timeout_s,
             has_credential=self.has_kill_credential,
         )
@@ -472,6 +464,7 @@ async def _run_supervisor_cli(env: str, config_path: Path | None) -> int:
         write_budget_capacity=app_config.supervisor.write_budget_capacity,
         write_budget_refill_s=app_config.supervisor.write_budget_refill_s,
         own_heartbeat_path=supervisor_heartbeat_path(app_config.data_dir),
+        progress_path_=progress_path(app_config.data_dir),
     )
     clock = SystemClock()
 

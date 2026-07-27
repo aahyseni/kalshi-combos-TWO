@@ -36,7 +36,16 @@ from combomaker.core.quantity import CentiContracts, qty_from_fp_str
 from combomaker.core.reasons import ReasonCode
 from combomaker.exchange.auth import Credentials, RequestSigner
 from combomaker.exchange.quote_query import list_open_quotes, open_quote_ids
-from combomaker.exchange.rest import KalshiApiError, KalshiRestClient, RateLimitedError
+from combomaker.exchange.rest import (
+    DEFAULT_ENDPOINT_TOKEN_COST,
+    LOWEST_TIER_LIMITS,
+    ApiTierLimits,
+    KalshiApiError,
+    KalshiRestClient,
+    RateLimitedError,
+    ReadBudgetExhausted,
+    observe_api_tier,
+)
 from combomaker.exchange.ws import WsManager
 from combomaker.marketdata.feed import OrderbookFeed
 from combomaker.marketdata.grid import PriceGrid
@@ -66,6 +75,7 @@ from combomaker.ops.supervisor import (
     supervisor_heartbeat_path,
     supervisor_heartbeat_reachable,
 )
+from combomaker.ops.write_budget import TokenBudget, WriteBudget
 from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
 from combomaker.pricing.grouping import game_key
@@ -84,6 +94,7 @@ from combomaker.risk.inplay import InPlayDetector
 from combomaker.risk.killswitch import HaltEvent, KillSwitch
 from combomaker.risk.lastlook import LastLookPolicy
 from combomaker.risk.limits import LimitChecker, StarvationWatchdog
+from combomaker.risk.progress import ProgressLedger, progress_path
 from combomaker.risk.quarantine import MarketQuarantine
 from combomaker.risk.reservation import (
     RiskReservationService,
@@ -233,6 +244,28 @@ def _int_or_none(value: CentiCents | int | None) -> int | None:
 # outstanding.
 RESERVATION_RECONCILE_INTERVAL_S = 15.0
 
+# ── LIVENESS vs PROGRESS (2026-07-26 false-kill rebuild) ────────────────────
+# The two loops the external supervisor judges, and their OWN cadences. The
+# stall bound for each is DERIVED (``supervisor.heartbeat_timeout_s`` + the
+# cadence below) inside ProgressLedger.register — nothing here is a threshold,
+# only the cadence each loop already runs at.
+MAINTENANCE_TICK_INTERVAL_S = 0.5
+STATUS_TICK_INTERVAL_S = 15.0
+LOOP_MAINTENANCE = "maintenance"
+LOOP_QUOTE = "quote"
+LOOP_STATUS = "status"
+
+# Concurrent RFQ workers (see the block at the async-worker launch in run() for
+# the measured reasoning). Module-level because the read-budget wait bound below
+# is derived from it.
+RFQ_WORKERS = 8
+# How many times a WAITING (slow-path) metadata read re-waits for the read
+# bucket before giving the leg up for this pass. Not a duration — the wait
+# itself is the bucket's own ``seconds_until`` — just a bound on losing the
+# token race to a concurrent reader, so it is exactly the number of concurrent
+# readers that could take the token from us.
+_READ_BUDGET_WAIT_ATTEMPTS = RFQ_WORKERS
+
 # Off-loop joint pricing (Phase 1 — the wedge guarantee). Cold combo pricing runs
 # in worker PROCESSES (escaping the GIL) with a hard per-call deadline so a
 # multi-second cold combo can never stall the event loop / heartbeat / WS pongs
@@ -374,6 +407,27 @@ def build_lifecycle_config(
         peak_n_clusters=peak_n_clusters,
         peak_cluster_min_frac=peak_cluster_min_frac,
     )
+
+
+class _PacedMarketSource:
+    """A ``MarketSource`` that WAITS for read tokens before each GET.
+
+    The settled-marginal resolver is the second-largest read source in the bot
+    (123 of the 2026-07-26 incident's 429s were ``settled_fetch_failed`` HTTP
+    429). It runs off-loop, bounded to a few fetches per pass, and its result
+    must eventually land — so it pays the bucket's own refill wait instead of
+    being refused. Sharing ONE bucket with the metadata cache is the point: two
+    independent budgets against one exchange bucket is not a budget."""
+
+    def __init__(
+        self, inner: MarketSource, reserve: Callable[[], Awaitable[None]]
+    ) -> None:
+        self._inner = inner
+        self._reserve = reserve
+
+    async def get_market(self, ticker: str) -> dict[str, Any]:
+        await self._reserve()  # waits AND spends
+        return await self._inner.get_market(ticker)
 
 
 def build_settled_resolver(
@@ -664,6 +718,17 @@ class RateLimitRecordingSender:
         the recovery polls feeds the burst breaker too."""
         try:
             return await self._inner.get_quote(quote_id)  # type: ignore[attr-defined,no-any-return]
+        except RateLimitedError:
+            self._window.record()
+            raise
+
+    async def get_quotes(self, **params: Any) -> JsonDict:
+        """``QuoteLister`` slice for the WITHDRAW-PENDING RESOLVER (2026-07-26):
+        the account-wide open-quote list that PROVES whether an UNKNOWN
+        withdrawal is off the wire. Same pass-through + 429 tap, so a rate-limit
+        storm on the prover feeds the burst breaker like every other endpoint."""
+        try:
+            return await self._inner.get_quotes(**params)  # type: ignore[attr-defined,no-any-return]
         except RateLimitedError:
             self._window.record()
             raise
@@ -1376,11 +1441,25 @@ class QuoteApp:
         self._metadata_cache_path = str(config.data_dir / "metadata_cache.json")
         self._metadata_persist_ticks = 0
         self._stop = asyncio.Event()
+        # OBSERVED rate-limit tier + the READ bucket derived from it (2026-07-26).
+        # Both start at the fail-safe FLOOR so any code path that reads them
+        # before ``run()`` asks the exchange paces itself as the smallest tier.
+        self._api_tier: ApiTierLimits = LOWEST_TIER_LIMITS
+        self._read_budget: TokenBudget | None = None
         # Phase 6 out-of-process safety plumbing. The heartbeat file is what the
         # external supervisor reads; the reconcile marker enforces
         # block-restart-until-reconciled (both live under data_dir so the
         # standalone supervisor process finds them at the same paths).
         self._heartbeat = Heartbeat(self._clock, config.data_dir / "heartbeat.txt")
+        # LIVENESS ("alive") vs PROGRESS ("working") — split 2026-07-26 after the
+        # 20:12:54Z false kill. The heartbeat above is now beaten ONLY by the
+        # dedicated ``_liveness_loop`` (its whole job is to prove the event loop
+        # schedules); every loop that matters publishes a last-progress age
+        # here, and the supervisor escalates on EITHER signal. Splitting them is
+        # what stops a legitimately slow maintenance pass from reading as a
+        # wedge without blinding the supervisor to a real one — see
+        # risk/progress.py.
+        self._progress = ProgressLedger(self._clock, progress_path(config.data_dir))
         self._reconcile_marker = ReconcileMarker(config.data_dir / "needs_reconcile")
         # 429-burst window for the rate-limit circuit breaker (recorded from the
         # REST error paths in the polling loops).
@@ -1463,7 +1542,28 @@ class QuoteApp:
 
         external = self._build_external_odds()
         async with KalshiRestClient(config.endpoints.rest_base_url, signer) as rest:
-            metadata = MetadataCache(rest, self._clock)
+            # ── OBSERVED RATE-LIMIT TIER (2026-07-26) ────────────────────────
+            # Both token buckets come from the exchange, not from a constant.
+            # ``WRITE_TOKENS_PER_S = 300`` used to be hard-coded with the
+            # comment "we are on Advanced" while the only recorded in-repo
+            # observation said BASIC (100 write tok/s) — i.e. the paced wave
+            # was either correct or a 2.2x breach and nothing in the process
+            # could tell which. Now it asks; an unreadable answer falls back to
+            # the LOWEST documented tier, never the highest.
+            tier = await observe_api_tier(rest)
+            self._api_tier = tier
+            # READ bucket: one shared budget for every metadata GET. Sized
+            # VERBATIM from the observed bucket — capacity is the exchange's own
+            # burst allowance and the refill window is that capacity at the
+            # exchange's own refill rate, so there is no number here a human
+            # picked.
+            read_budget = TokenBudget.create(
+                self._clock,
+                capacity=tier.read_capacity,
+                refill_s=tier.read_refill_s,
+            )
+            self._read_budget = read_budget
+            metadata = MetadataCache(rest, self._clock, read_budget=read_budget)
             # PERSISTENT METADATA CACHE (2026-07-25): warm boot from the last
             # run's still-live markets — kills the boot 429 burst (2,319
             # failed fetches in 36s at the 7/25 v6 boot) that left low-flow
@@ -1725,8 +1825,15 @@ class QuoteApp:
             # cached — so a cross-game book stays risk-modelable after one of
             # its games settles. Knob: risk.settled_marginal_resolution
             # (False ⇒ None ⇒ the pre-fix fail-closed behaviour).
+            # ...through the SAME read bucket the metadata cache spends from
+            # (2026-07-26). This is the second-biggest read source on the tape
+            # (123 of the incident's 429s) and it is a SLOW, off-loop, bounded
+            # pass, so it WAITS for tokens rather than refusing — a graded fact
+            # must eventually land. One bucket, or it is not a budget.
             settled_marginals = build_settled_resolver(
-                risk_cfg, rest, self._clock
+                risk_cfg,
+                _PacedMarketSource(rest, self._reserve_read_token),
+                self._clock,
             )
             lifecycle = QuoteLifecycle(
                 clock=self._clock,
@@ -1793,11 +1900,34 @@ class QuoteApp:
                 # the query layer (P0-5). None in paper mode.
                 fills_getter=quote_getter,
                 fills_subaccount=config.safety.subaccount,
-                # WEDGE FIX (2026-07-16, the 18:13Z kill): the lifecycle beats
-                # this heartbeat per iteration inside its long maintenance
-                # sub-loops (reprice sweep / recovery polls) — progress is not a
-                # wedge; a true event-loop wedge still cannot beat.
-                beat=self._heartbeat.beat,
+                # WRITE-TOKEN PACING for the end-of-game withdrawal wave
+                # (2026-07-26 adversarial gate B1): the SAME bucket and the SAME
+                # operator knob the supervisor's emergency cancel-all is paced
+                # by, so the two write bursts cannot be sized apart and there is
+                # one number to move. A concurrency literal cannot bound a token
+                # RATE — see rfq/lifecycle.py's BOUNDED QUOTE WITHDRAWAL block.
+                withdraw_budget=self._tier_clamped_write_budget(),
+                # WITHDRAW-PENDING RESOLVER (2026-07-26 gate): the PROVER for an
+                # UNKNOWN withdrawal is a READ, not a retried write. Same wrapped
+                # sender (its 429s feed the burst breaker) exposing
+                # GET /communications/quotes, and the SAME single read bucket
+                # every other read charges — 10 read tokens per maintenance tick
+                # that has anything pending, O(1) in the pending count, on the
+                # bucket a write storm is not touching. None in paper mode ⇒ the
+                # resolver falls back to the metered write drain (fail-closed:
+                # nothing is ever dropped without proof either way).
+                quote_lister=quote_getter,
+                read_budget=self._read_budget,
+                # WEDGE FIX (2026-07-16, the 18:13Z kill; re-pointed 2026-07-26
+                # at the PROGRESS ledger): the lifecycle marks progress per
+                # iteration inside its long maintenance sub-loops (reprice
+                # sweep / recovery polls) — a loop grinding through a big book
+                # is working, not wedged. It no longer writes the liveness
+                # heartbeat (the dedicated ``_liveness_loop`` owns that), so a
+                # slow sub-loop can never masquerade as a dead process, and a
+                # sub-loop that stops iterating still ages this mark and still
+                # escalates.
+                beat=self._progress.marker(LOOP_MAINTENANCE),
                 # F2 MID-PIPELINE LIVENESS (throughput synthesis 2026-07-16):
                 # the intake's liveness view over its open-RFQ registry
                 # (populated on rfq_created, popped on rfq_deleted). The
@@ -1929,6 +2059,14 @@ class QuoteApp:
                 # reachable is graded. The bot beats its heartbeat first so the
                 # supervisor has a file to watch from t=0.
                 self._heartbeat.beat()
+                # …and publish a FRESH progress ledger for the same reason,
+                # which additionally OVERWRITES any leftover from a previous
+                # run. A stale ledger on disk would latch the new supervisor's
+                # reader and read as an instantly-stalled loop — the same
+                # stale-liveness-file trap the launcher already clears for the
+                # heartbeat (tools/ops/start_all.ps1). No loops are registered
+                # yet, so this is an empty, un-stallable snapshot.
+                self._progress.publish()
                 await self._launch_supervisor()
                 await self._await_supervisor_heartbeat()
                 # PROD PREFLIGHT: every go-live condition must be green before the
@@ -1961,7 +2099,8 @@ class QuoteApp:
             # skip_price_deadline steady): the queue backed up and RFQs closed / hit
             # the deadline before we posted. WATCH the heartbeat on the first run —
             # if it wedges, the offload assumption is wrong; drop back to 4.
-            RFQ_WORKERS = 8
+            # (RFQ_WORKERS is module-level — the read-budget wait bound is
+            # derived from it, see _READ_BUDGET_WAIT_ATTEMPTS.)
             # WIN-THE-TAKER FRESHNESS (2026-07-14 P1). A combo RFQ has a ~1s window;
             # an RFQ that sat in our queue too long can only rfq_closed AFTER wasting
             # pool budget on it — starving the fresh RFQs we could still win. Now the
@@ -2019,6 +2158,13 @@ class QuoteApp:
             async def rfq_worker() -> None:
                 while True:
                     rfq, recv_mono = await rfq_work.get()
+                    # PROGRESS (2026-07-26): the quote path advanced. Marked on
+                    # DEQUEUE so a worker that goes into a long price/POST and
+                    # never comes back ages the mark. Idleness is handled by the
+                    # registered probe (an empty work queue is not a wedge), so
+                    # a quiet market never looks stalled and a deadlocked worker
+                    # pool with work queued always does.
+                    self._progress.mark(LOOP_QUOTE)
                     try:
                         dwell_s = (self._clock.monotonic_ns() - recv_mono) / 1e9
                         if dwell_s > RFQ_MAX_QUEUE_DWELL_S:
@@ -2120,7 +2266,13 @@ class QuoteApp:
                 # bare restart is BLOCKED (HALT_NEEDS_RECONCILE) until the book is
                 # reconciled against the exchange. Soft/manual halts do NOT need it.
                 self.mark_reconcile_on_hard_halt(event)
-                await lifecycle.cancel_all(event.reason)
+                # TERMINAL caller (2026-07-26 gate, B2): `_stop.set()` below ends
+                # the process, so there is no next maintenance tick for the
+                # withdraw-resolver to inherit leftovers from — this pass must
+                # attempt EVERY quote, waiting for the write bucket if need be.
+                # `budget_s=None` keeps exactly the pre-bound behaviour; the wall
+                # budget exists for the NON-terminal callers, which keep running.
+                await lifecycle.cancel_all(event.reason, budget_s=None)
                 self._stop.set()
 
             killswitch.on_halt(on_halt)
@@ -2134,7 +2286,40 @@ class QuoteApp:
 
             ws.start()
             book_ws.start()  # dedicated order-book socket (see construction note)
+            # Register the loops the external supervisor judges. Each declares
+            # only its OWN cadence; the stall bound is DERIVED from the single
+            # operator wedge-tolerance anchor (supervisor.heartbeat_timeout_s).
+            # Nothing here is a hand-set threshold.
+            wedge_timeout_s = self._config.supervisor.heartbeat_timeout_s
+            self._progress.register(
+                LOOP_MAINTENANCE,
+                interval_s=MAINTENANCE_TICK_INTERVAL_S,
+                wedge_timeout_s=wedge_timeout_s,
+            )
+            # NOTE — the 15s status loop is deliberately NOT a kill signal. It
+            # already tolerates a 10s exchange GET plus a 15s enforcement budget
+            # inside one tick, so any bound loose enough to be safe for it is
+            # too loose to mean anything, and a tight one is a NEW false-kill
+            # surface on the exact end-of-game path this rebuild exists to stop
+            # false-killing. It publishes progress for OBSERVABILITY only (its
+            # mark is a no-op while unregistered).
+            self._progress.register(
+                LOOP_QUOTE,
+                # The quote path is event-driven: its "cadence" is the longest a
+                # single RFQ may legitimately occupy a worker (the pool deadline
+                # plus the dwell budget that bounds how stale an RFQ may be when
+                # it starts). Both are existing quote-path numbers, not new ones.
+                interval_s=POOL_DEADLINE_S + RFQ_MAX_QUEUE_DWELL_S,
+                wedge_timeout_s=wedge_timeout_s,
+                # IDLE IS NOT A STALL: with nothing queued, workers block on an
+                # empty queue by design. Only a BACKED-UP queue that stops
+                # draining is a wedge.
+                idle=rfq_work.empty,
+            )
             tasks = [
+                # DEDICATED LIVENESS first: nothing this task does can be
+                # delayed by the bot's work, which is the whole point.
+                asyncio.create_task(self._liveness_loop(), name="liveness"),
                 asyncio.create_task(retry_pending(), name="rfq-retry"),
                 asyncio.create_task(quote_event_worker(), name="quote-event-worker"),
                 *[
@@ -2202,8 +2387,10 @@ class QuoteApp:
                 for task in tasks:
                     task.cancel()
                 # Crash-path discipline: best-effort cancel-all before exit.
+                # TERMINAL (see on_halt): the loops are already cancelled, so
+                # nothing will re-drive a deferred withdrawal — no wall budget.
                 try:
-                    await lifecycle.cancel_all(ReasonCode.HALT_MANUAL)
+                    await lifecycle.cancel_all(ReasonCode.HALT_MANUAL, budget_s=None)
                 except Exception:
                     log.exception("shutdown_cancel_all_failed")
                 await ws.stop()
@@ -2213,6 +2400,14 @@ class QuoteApp:
                 if book_risk_pool is not None:
                     book_risk_pool.shutdown()
                 await killswitch.stop()
+                # Let any in-flight alarm-only sweep finish before the store
+                # closes under it (2026-07-26): each is wall-bounded, so this
+                # cannot hold shutdown open, and it stops a half-done
+                # divergence check from vanishing into a "Connection closed".
+                try:
+                    await lifecycle.drain_diagnostic_sweeps()
+                except Exception:
+                    log.exception("diagnostic_sweep_drain_failed")
                 # Tear down the external supervisor subprocess (best-effort).
                 try:
                     await self._stop_supervisor()
@@ -2944,8 +3139,10 @@ class QuoteApp:
         if config.env is not Env.PROD:
             return
         # The bot writes its first heartbeat here so the supervisor has a file to
-        # watch from t=0 (rather than a gap until the first maintenance tick).
+        # watch from t=0 (rather than a gap until the first maintenance tick),
+        # and refreshes the progress ledger alongside it for the same reason.
         self._heartbeat.beat()
+        self._progress.publish()
         heartbeat_established = self._heartbeat.path.exists()
         # external_kill_reachable requires a LIVE, recently-beating supervisor
         # (not just a configured credential) — verified against the supervisor's
@@ -3020,6 +3217,15 @@ class QuoteApp:
                 meta = await metadata.market(ticker)
                 if meta.event_ticker:
                     await metadata.event(meta.event_ticker)
+            except ReadBudgetExhausted:
+                # LOCAL refusal, not an exchange error: the read bucket is spent
+                # for this instant. The leg stays uncached, so the very next RFQ
+                # naming it retries once the bucket refills — the same
+                # retry-until-cached behaviour, minus the 429 and minus the
+                # round trip. Counted, never logged per-RFQ (a per-refusal log
+                # would just be the 5,726-line storm in a different colour).
+                self._metrics.inc("metadata.read_budget_deferred")
+                break
             except KalshiApiError as exc:
                 log.warning("metadata_fetch_failed", ticker=ticker, error=str(exc))
         # COMBO market grid: the combo ticker is UNIQUE per RFQ, so fetching it per
@@ -3039,34 +3245,163 @@ class QuoteApp:
                     meta = await metadata.market(combo)
                     if meta.grid is not None and collection:
                         self._collection_grid[collection] = meta.grid
+                except ReadBudgetExhausted:
+                    self._metrics.inc("metadata.read_budget_deferred")
                 except KalshiApiError as exc:
                     log.warning("metadata_fetch_failed", ticker=combo, error=str(exc))
 
-    async def _maintenance_loop(self, lifecycle: QuoteLifecycle) -> None:
+    async def _sleep_for_read_budget(self) -> None:
+        """Sleep until the READ bucket could pay for one metadata GET.
+
+        WAIT ONLY — it does not spend; the caller's own fetch does that. The
+        sleep is the bucket's OWN ``seconds_until``, never a poll interval
+        somebody picked. No budget wired (paper/backtests) ⇒ returns at once."""
+        budget = self._read_budget
+        if budget is None:
+            return
+        wait_s = budget.seconds_until(DEFAULT_ENDPOINT_TOKEN_COST)
+        if wait_s <= 0.0 or wait_s == float("inf"):
+            return
+        await asyncio.sleep(wait_s)
+
+    async def _reserve_read_token(self) -> None:
+        """Wait for AND SPEND one metadata GET's worth of read tokens.
+
+        For callers that reach the exchange directly (not through
+        ``MetadataCache``, which spends for itself): they must charge the same
+        bucket or the pacing is fiction.
+
+        BOUNDED: the bucket is not FIFO, so a hot path continuously draining it
+        could in principle starve a waiter forever. The wait is therefore capped
+        at ONE FULL REFILL of the bucket (``budget.refill_s`` — the bucket's own
+        property, not a picked number); past that we raise the same
+        ``ReadBudgetExhausted`` the cache raises, and the caller's existing
+        fetch-failed backoff owns the retry. In practice contention is
+        self-correcting: pacing lets the metadata cache actually FILL, which is
+        what collapses the miss rate that caused the contention."""
+        budget = self._read_budget
+        if budget is None:
+            return
+        cost = DEFAULT_ENDPOINT_TOKEN_COST
+        deadline = self._clock.monotonic_ns() + int(budget.refill_s * 1e9)
+        while not budget.try_spend(cost):
+            wait_s = budget.seconds_until(cost)
+            if wait_s == float("inf") or self._clock.monotonic_ns() >= deadline:
+                self._metrics.inc("metadata.read_budget_deferred")
+                raise ReadBudgetExhausted("GET /markets", cost)
+            await asyncio.sleep(max(wait_s, 0.0))
+
+    def _tier_clamped_write_budget(self) -> WriteBudget:
+        """The withdrawal write bucket, CLAMPED to the observed tier ceiling.
+
+        The operator knob (``supervisor.write_budget_capacity`` /
+        ``write_budget_refill_s``, 200 tokens / 10 s = 20 tok/s) is a
+        deliberately conservative sub-allocation of the account's write bucket,
+        and it stays the number the operator moves. But it is a number a human
+        set, so it can be set ABOVE what the account can actually spend — and a
+        budget that admits more than the exchange does is not a budget. Both the
+        sustained rate AND the burst capacity are clamped to the OBSERVED bucket
+        (``ApiTierLimits.clamp_write_budget``) and any clamp is alarmed. This is
+        the "derive from measured state, never a hand-set number" rule applied
+        to the ceiling: a tier downgrade under a running bot re-paces the wave
+        automatically, and an UNREADABLE tier paces it as the smallest bucket."""
+        sup = self._config.supervisor
+        tier = self._api_tier
+        capacity, refill_s = tier.clamp_write_budget(
+            sup.write_budget_capacity, sup.write_budget_refill_s
+        )
+        if (capacity, refill_s) != (
+            sup.write_budget_capacity,
+            sup.write_budget_refill_s,
+        ):
+            log.error(
+                "write_budget_clamped_to_tier",
+                usage_tier=tier.usage_tier,
+                tier_observed=tier.observed,
+                configured_capacity=sup.write_budget_capacity,
+                configured_tokens_per_s=(
+                    sup.write_budget_capacity / sup.write_budget_refill_s
+                ),
+                tier_capacity=tier.write_capacity,
+                tier_tokens_per_s=tier.write_refill_per_s,
+                clamped_capacity=capacity,
+                clamped_refill_s=refill_s,
+                detail="configured write budget exceeds the account's OBSERVED "
+                "write bucket — clamped to the tier (a budget that admits more "
+                "than the exchange does is not a budget)",
+            )
+        else:
+            log.info(
+                "write_budget_within_tier",
+                usage_tier=tier.usage_tier,
+                tier_observed=tier.observed,
+                capacity=capacity,
+                tokens_per_s=capacity / refill_s,
+                tier_capacity=tier.write_capacity,
+                tier_tokens_per_s=tier.write_refill_per_s,
+            )
+        return WriteBudget.create(
+            self._clock, capacity=capacity, refill_s=refill_s
+        )
+
+    async def _liveness_loop(self) -> None:
+        """DEDICATED LIVENESS (2026-07-26 rebuild). This task's ONLY job is to
+        prove the process and its event loop are still scheduling: sleep, beat,
+        publish, repeat. It does no exchange I/O, holds no lock, and touches no
+        risk state, so it cannot be slowed by anything the bot is doing — which
+        is precisely the point. A slow maintenance pass is no longer
+        indistinguishable from a dead process.
+
+        It also publishes the PROGRESS ledger, i.e. how long each real loop has
+        gone without completing an iteration. That is the signal that keeps this
+        from BLINDING the supervisor: if the event loop breathes while the quote
+        or maintenance loop is genuinely stuck, the ledger ages and the
+        supervisor still kills — now naming the stalled loop.
+
+        Cadence = the supervisor's own poll interval (beating faster than the
+        watcher reads buys nothing), capped at a QUARTER of the wedge tolerance
+        so three consecutive failed writes still cannot age the file past it.
+        Both inputs are existing supervisor config; no new number, and a
+        misconfigured poll interval can never starve the beat below the
+        tolerance it is judged against.
+
+        NEVER let a write failure end this task (2026-07-26 morning: two live
+        runs died when a Windows ``os.replace`` PermissionError escaped the
+        beat and ENDED the loop that owned it — after which no beat ever landed
+        again and the supervisor killed a healthy bot 30s later). Swallow +
+        log + metric: a genuinely stuck disk still ages the file on disk and
+        still trips the (correct) wedged kill, so fail-closed is preserved."""
+        sup = self._config.supervisor
+        interval_s = max(
+            min(sup.poll_interval_s, sup.heartbeat_timeout_s / 4.0), 0.05
+        )
         while True:
-            await asyncio.sleep(0.5)
-            # Beat the heartbeat FIRST, every tick — the external supervisor
-            # presumes the bot wedged if this file goes stale. A slow/failed
-            # maintenance_tick still leaves the last beat aging, which is exactly
-            # the wedged signal the supervisor watches for (fail-closed).
-            #
-            # NEVER let a beat FAILURE kill this loop (2026-07-26: two live
-            # runs died 15 and 7 minutes in — supervisor emergency kill on
-            # "heartbeat wedged (age=30.3s)" with NO log gap and every other
-            # loop still logging, i.e. the beats stopped while the process
-            # was healthy). ``Heartbeat.beat`` write-temp-then-renames, and
-            # on Windows that rename raises PermissionError whenever the
-            # supervisor holds the target open; the retries can still lose
-            # the race, and an escaping exception ENDS the maintenance task
-            # — after which no beat ever lands again and the supervisor
-            # kills a perfectly healthy bot 30s later. Swallow + log: a
-            # genuinely stuck disk still ages the beat and still trips the
-            # (correct) wedged kill, so fail-closed is preserved.
             try:
                 self._heartbeat.beat()
             except Exception:
                 self._metrics.inc("heartbeat.beat_failed")
                 log.exception("heartbeat_beat_failed")
+            try:
+                self._progress.publish()
+            except Exception:
+                self._metrics.inc("progress.publish_failed")
+                log.exception("progress_publish_failed")
+            await asyncio.sleep(interval_s)
+
+    async def _maintenance_loop(self, lifecycle: QuoteLifecycle) -> None:
+        while True:
+            await asyncio.sleep(MAINTENANCE_TICK_INTERVAL_S)
+            # PROGRESS, not liveness (2026-07-26). This loop used to beat the
+            # heartbeat itself, which made "the maintenance pass is slow"
+            # indistinguishable from "the process is dead" — the exact
+            # confusion that emergency-killed a healthy, quoting bot at
+            # 20:12:54Z when an end-of-game lifecycle wave put the tick in a
+            # ~30s non-beating await. Liveness is now the dedicated
+            # ``_liveness_loop``'s job; this loop only reports that it is
+            # ADVANCING. A tick that stops advancing past its derived bound
+            # (supervisor.heartbeat_timeout_s + this loop's cadence — the same
+            # age the old signal died at) still escalates, by name.
+            self._progress.mark(LOOP_MAINTENANCE)
             try:
                 await lifecycle.maintenance_tick()
             except Exception:
@@ -3292,16 +3627,28 @@ class QuoteApp:
                 ticker
             ):
                 continue
-            try:
-                meta = await metadata.market(ticker)
-                if meta.event_ticker:
-                    await metadata.event(meta.event_ticker)
-            except KalshiApiError as exc:
-                log.warning(
-                    "rehydrated_leg_metadata_fetch_failed",
-                    ticker=ticker,
-                    error=str(exc),
-                )
+            # SLOW PATH ⇒ WAIT for read tokens, never refuse (2026-07-26). This
+            # startup pass must eventually succeed — a committed leg without
+            # metadata loses its pregame start resolution — and it is not
+            # latency-critical, so it pays the bucket's own refill wait instead
+            # of storming it. (The RFQ hot path does the opposite: refuse
+            # instantly, retry on the next RFQ.) That is also what turns a boot
+            # burst into a paced trickle rather than the 2,319-failure storm.
+            for _ in range(_READ_BUDGET_WAIT_ATTEMPTS):
+                try:
+                    meta = await metadata.market(ticker)
+                    if meta.event_ticker:
+                        await metadata.event(meta.event_ticker)
+                except ReadBudgetExhausted:
+                    await self._sleep_for_read_budget()
+                    continue  # bucket was empty (or lost the race) — re-ask
+                except KalshiApiError as exc:
+                    log.warning(
+                        "rehydrated_leg_metadata_fetch_failed",
+                        ticker=ticker,
+                        error=str(exc),
+                    )
+                break
         log.info(
             "rehydrated_legs_armed",
             legs=len(tickers),
@@ -3452,6 +3799,7 @@ class QuoteApp:
         metadata: MetadataCache,
     ) -> None:
         while True:
+            self._progress.mark(LOOP_STATUS)
             try:
                 status = await rest.get_exchange_status()
                 active = bool(status.get("exchange_active")) and bool(
@@ -3487,7 +3835,7 @@ class QuoteApp:
                 log.info("pricing_stats", **lifecycle.pricing_stats())
             except Exception:
                 log.exception("pricing_stats_log_failed")
-            await asyncio.sleep(15.0)
+            await asyncio.sleep(STATUS_TICK_INTERVAL_S)
 
     def _sample_breaker_inputs(
         self,
@@ -3841,6 +4189,15 @@ class QuoteApp:
         the sample that raised the quarantine, so the exposure window is the few
         milliseconds between detection and cancel — not a tick.
 
+        BURST-BOUNDED (2026-07-26). A lifecycle wave at the END OF EVERY GAME
+        quarantines many markets in one tick — 11 at 20:12:25Z across TORBOS +
+        CHCPIT as their markets walked active→inactive→determined→finalized.
+        That is NORMAL, not exceptional, and MLB nights end 15 games. So the
+        withdrawal underneath runs CONCURRENTLY with a bounded fan-out, per-call
+        timeouts, and a wall budget sized to this loop's own tick — never a
+        sequential walk that can grow with the slate and never an unbounded one
+        that can storm the exchange. See ``cancel_quotes_touching``.
+
         Only a quarantine whose quotes were provably withdrawn is marked
         enforced. Any delete failure (or any exception here at all) leaves the
         whole batch unenforced, and ``_metadata_changes`` promotes it to the
@@ -3852,7 +4209,13 @@ class QuoteApp:
             return
         try:
             deleted, failures = await lifecycle.cancel_quotes_touching(
-                set(pending), ReasonCode.DELETE_MARKET_QUARANTINED
+                set(pending),
+                ReasonCode.DELETE_MARKET_QUARANTINED,
+                # The pass may not outlive the loop that owns it: whatever it
+                # cannot finish inside one tick stays UNENFORCED and is retried
+                # next tick (and escalates to the halt if it is still unenforced
+                # then — the existing fail-closed contract, unchanged).
+                budget_s=STATUS_TICK_INTERVAL_S,
             )
         except Exception:
             log.exception("market_quarantine_enforcement_failed", markets=list(pending))

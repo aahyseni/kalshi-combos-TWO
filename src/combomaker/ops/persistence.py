@@ -199,6 +199,22 @@ CREATE INDEX IF NOT EXISTS idx_position_ledger_status ON position_ledger (status
 CREATE INDEX IF NOT EXISTS idx_position_ledger_leghash ON position_ledger (leg_set_hash);
 """
 
+# SQLite's own lock-wait tolerance for this connection (``PRAGMA busy_timeout``).
+# It is the store's EXISTING statement of "how long an operation here may
+# legitimately block before something is wrong", so a caller that must bound a
+# store await derives its wall bound from this rather than inventing a second
+# number. Named 2026-07-26 for exactly that reason: the maintenance tick's
+# ledger-divergence SELECT had NO bound at all and sat on a saturated aiosqlite
+# connection for >65 s, silencing the loop that owned the liveness heartbeat.
+#
+# IMPORTANT: busy_timeout only bounds SQLite's own LOCK waits. It does NOT bound
+# the time a statement spends QUEUED behind other work on the single aiosqlite
+# connection thread (the background tape writer's 1000-statement batches and its
+# WAL TRUNCATE/PASSIVE checkpoints all run there). That queueing is the actual
+# 2026-07-26 stall, and only an asyncio-level ``wait_for`` can bound it.
+BUSY_TIMEOUT_MS = 5000
+STORE_OP_TIMEOUT_S = BUSY_TIMEOUT_MS / 1000.0
+
 
 class Store:
     # Manual WAL checkpoint cadence (writes between attempts) and the
@@ -244,7 +260,7 @@ class Store:
         # busy_timeout absorbs the brief checkpoint lock on the large DB.
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=NORMAL")
-        await db.execute("PRAGMA busy_timeout=5000")
+        await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         # autocheckpoint OFF (2026-07-14): with it ON, a 2000-page checkpoint
         # fired INLINE on every writer commit that crossed the threshold — on the
         # ~2GB DB that ran near-continuously during bursts, so the background

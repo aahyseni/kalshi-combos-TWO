@@ -39,7 +39,11 @@ if ($shells) {
 # Nothing is running (guard above), so liveness files are stale leftovers:
 # a stale heartbeat makes the supervisor declare "wedged" instantly and
 # emergency-KILL before the bot even starts. Delete them.
-foreach ($hb in @("data\heartbeat.txt", "data\supervisor_heartbeat.txt")) {
+# 2026-07-26: loop_progress.json joins the list — it is the second liveness
+# signal (per-loop "working" ages, risk/progress.py) and a stale one reads as
+# an instantly-stalled loop exactly the same way. The bot also rewrites it
+# before launching the supervisor, so this is belt-and-braces.
+foreach ($hb in @("data\heartbeat.txt", "data\supervisor_heartbeat.txt", "data\loop_progress.json")) {
     if (Test-Path $hb) {
         Remove-Item -Force $hb
         Write-Host "Removed stale $hb (nothing was running)" -ForegroundColor Yellow

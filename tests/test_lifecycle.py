@@ -853,7 +853,13 @@ async def test_reprice_sweep_budget_marker_skips_deleted_quotes(rig: Rig) -> Non
     """A TTL-deleted quote never becomes the resume marker (verify follow-up
     2026-07-16): the budget break after a deletion resumes from the last
     SURVIVING handled quote, not the removed id (which would discard the
-    rotation and re-walk the front)."""
+    rotation and re-walk the front).
+
+    2026-07-26: the sweep's wall budget is now checked at the TOP of the loop
+    body, because every branch below it — the TTL delete included — goes through
+    the TOKEN-PACED write path and can therefore WAIT for the bucket. So the
+    budget is blown here by the DELETE itself, which is exactly the newly
+    realistic case, and the marker must still name the surviving q1."""
     await _open_n_quotes(rig, 4)
     states = list(rig.lifecycle._open.values())
     order = [s.rfq.rfq_id for s in states]
@@ -863,13 +869,20 @@ async def test_reprice_sweep_budget_marker_skips_deleted_quotes(rig: Rig) -> Non
 
     async def slow_but_fine(rfq_, **_: object):  # noqa: ANN202
         priced.append(rfq_.rfq_id)
-        rig.h.clock.advance(3.0)  # one pricing blows the whole 2.5s budget
+        rig.h.clock.advance(1.0)  # inside the 2.5s budget
         state = next(iter(rig.lifecycle._open.values()))
         return state.constructed  # unchanged fair — no reprice action
 
+    inner_delete = rig.sender.delete_quote
+
+    async def paced_delete(quote_id: str):  # noqa: ANN202
+        rig.h.clock.advance(2.0)  # the token-paced DELETE blows the budget
+        return await inner_delete(quote_id)
+
+    rig.sender.delete_quote = paced_delete  # type: ignore[assignment]
     rig.lifecycle._price_async = slow_but_fine  # type: ignore[method-assign]
     await rig.lifecycle.maintenance_tick()
-    # q1 priced (3.0s), q2 TTL-deleted, q3 hits the budget break.
+    # q1 priced (1.0s), q2 TTL-deleted (+2.0s), q3 hits the budget break.
     assert priced == [order[0]]
     assert rig.lifecycle.open_quote_count == 3
     # Marker = q1, the last SURVIVOR — not the deleted q2.

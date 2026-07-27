@@ -455,7 +455,7 @@ async def test_enforcement_pulls_resting_quotes_then_marks_enforced(
             self._failures = failures
 
         async def cancel_quotes_touching(
-            self, tickers: set[str], reason: Any
+            self, tickers: set[str], reason: Any, **_: object
         ) -> tuple[int, int]:
             self.calls.append((set(tickers), reason))
             return (2, self._failures)
@@ -479,7 +479,7 @@ async def test_unenforceable_quarantine_escalates_to_halt(tmp_path: Path) -> Non
 
     class _FailingLifecycle:
         async def cancel_quotes_touching(
-            self, tickers: set[str], reason: Any
+            self, tickers: set[str], reason: Any, **_: object
         ) -> tuple[int, int]:
             return (1, 1)  # one delete the exchange did not acknowledge
 
@@ -510,7 +510,7 @@ async def test_enforcement_exception_leaves_quarantine_unenforced(
 
     class _RaisingLifecycle:
         async def cancel_quotes_touching(
-            self, tickers: set[str], reason: Any
+            self, tickers: set[str], reason: Any, **_: object
         ) -> tuple[int, int]:
             raise RuntimeError("sender down")
 
