@@ -3064,6 +3064,32 @@ class RiskConfig(StrictModel):
     # marginal walks the live FEED first, so a market pinned at 0/100 would
     # otherwise masquerade as settled).
     det_max_settlement_aware: bool = False
+    # PORTFOLIO HAIRCUT in the risk-capital denominator (2026-07-28, operator).
+    #
+    #     risk_bankroll = min(start_of_day_equity, cash + haircut * portfolio_value)
+    #
+    # ``risk/balance.py`` shipped this hard-coded at 0.5 carrying its own note
+    # "FLAGGED for operator to set per risk tolerance" — and it was never set.
+    # Measured cost of leaving it, live 2026-07-28: cash $1,901.13 plus 0.5 x
+    # $763.93 of position mark gave a $2,283.10 denominator against $2,665.06
+    # of real equity, so the 0.36 det-max wall read $821.91 instead of $959.02
+    # while det-max sat at $821.14 — $0.77 of headroom.
+    #
+    # AND IT IS A FEEDBACK LOOP: deploying $100 moves cash -$100 and position
+    # mark +$100, but the mark counts half, so the denominator falls $50 and
+    # the ceiling falls $18. Every dollar deployed shrank the ceiling it was
+    # measured against, and the book converged on the fixed point near $800 —
+    # the plateau the operator kept hitting and could not explain.
+    #
+    # OPERATOR DIRECTIVE 2026-07-28: "Haircut should be 1.0. We always use full
+    # equity." At 1.0 a dollar of cash and a dollar of position count the same
+    # and the loop disappears. This is a POLICY ANCHOR (North Star layer 2 —
+    # risk appetite stated once), not a tuned knob. The DEFAULT stays 0.5 so
+    # the committed prod.yaml is byte-unchanged; the live config sets 1.0.
+    # Accepted consequence: at 1.0 the denominator now moves with mark-to-
+    # market, so a marking-down book lowers its own ceiling. That is correct —
+    # equity is equity — but it is a real behaviour change from a flat floor.
+    portfolio_haircut: Fraction = Fraction(1, 2)
     # FIX 5 STALE-SNAPSHOT DECAY (2026-07-28) — ARMING FLAG, DEFAULT SHADOW.
     # ``_book_risk_for_check`` discards the book-risk snapshot on ANY position-
     # generation mismatch, and a RESERVATION bumps that counter on every accept —

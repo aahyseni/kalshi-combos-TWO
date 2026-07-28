@@ -1811,7 +1811,15 @@ class QuoteApp:
             # Live bankroll denominator for the %-caps (fail-closed on stale) +
             # the starvation watchdog. The tracker is polled in _balance_loop.
             balance_tracker = BalanceTracker(
-                conventions, self._clock, stale_after_s=BALANCE_STALE_AFTER_S
+                conventions,
+                self._clock,
+                stale_after_s=BALANCE_STALE_AFTER_S,
+                # 2026-07-28: previously left at balance.py's module default of
+                # 0.5, so every dollar deployed shrank the ceiling it was being
+                # measured against ($100 deployed -> denominator -$50 ->
+                # ceiling -$18). Now an explicit operator anchor; see
+                # RiskConfig.portfolio_haircut for the measurement.
+                portfolio_haircut=risk_cfg.portfolio_haircut,
             )
             watchdog = StarvationWatchdog(threshold=risk_cfg.starvation_threshold)
             # Pregame precision tier a2: an operator-set explicit schedule table
