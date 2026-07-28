@@ -69,7 +69,11 @@ from combomaker.marketdata.metadata import (
     MetadataCache,
     write_persist_payload,
 )
-from combomaker.marketdata.settled import MarketSource, SettledMarginalResolver
+from combomaker.marketdata.settled import (
+    FETCH_BUDGET_PER_PASS,
+    MarketSource,
+    SettledMarginalResolver,
+)
 from combomaker.ops.config import AppConfig, Env, Mode, RiskConfig
 from combomaker.ops.logging import configure_logging, get_logger
 from combomaker.ops.metrics import Metrics
@@ -395,6 +399,9 @@ def build_lifecycle_config(
         release_accepted_quote_exposure=risk_cfg.release_accepted_quote_exposure,
         require_p_book_non_decreasing=risk_cfg.require_p_book_non_decreasing,
         open_quote_ev_eviction=risk_cfg.open_quote_ev_eviction,
+        # FIX 4 (2026-07-28): value-ranked allocation of the fixed det-max
+        # budget, riding the SAME eviction mechanism. Default shadow.
+        det_budget_value_ranking=risk_cfg.det_budget_value_ranking,
         # DEPLOYMENT SCALE (operator LEVER #1): solved off the maintenance tick
         # from the live envelope; consumed by the deploy-side budgets only.
         # Default OFF ⇒ never solved, never consumed (byte-identical).
@@ -429,6 +436,9 @@ def build_lifecycle_config(
         # CONFIRM-TIME resting haircut (2026-07-17): the reservation check
         # weights ONLY the resting fold; the serial commit chain stays 100%.
         resting_haircut_at_confirm=risk_cfg.resting_haircut_at_confirm,
+        # FIX 5 (2026-07-28): arm the book-growth DECAY of a generation-stale
+        # book-risk snapshot rather than discarding it. Default SHADOW.
+        book_risk_stale_decay=risk_cfg.book_risk_stale_decay,
         # PEAK-CONCENTRATION steer (2026-07-18): K cached worst scorelines per
         # game for the off-hot-path committed-book peak profile (a PRICING
         # input to the skew seam — sim/peak_profile.py). Sourced from
@@ -466,7 +476,10 @@ class _PacedMarketSource:
 
 
 def build_settled_resolver(
-    risk_cfg: RiskConfig, source: MarketSource, clock: Clock
+    risk_cfg: RiskConfig,
+    source: MarketSource,
+    clock: Clock,
+    metrics: Metrics | None = None,
 ) -> SettledMarginalResolver | None:
     """SETTLED-LEG MARGINAL RESOLUTION wiring (2026-07-18 live outage) — the
     ONE place the YAML knob decides whether a resolver exists, extracted pure
@@ -477,7 +490,10 @@ def build_settled_resolver(
     if not risk_cfg.settled_marginal_resolution:
         return None
     return SettledMarginalResolver(
-        source, clock, retry_after_s=risk_cfg.settled_resolution_retry_s
+        source,
+        clock,
+        retry_after_s=risk_cfg.settled_resolution_retry_s,
+        metrics=metrics,
     )
 
 
@@ -971,6 +987,37 @@ async def _exchange_position_confirmed_flat(
     return False
 
 
+async def get_positions_paged(
+    rest: PositionsGetter, *, subaccount: int | None
+) -> dict[str, Any]:
+    """The OPEN-positions listing, PAGED TO EXHAUSTION, merged into one payload.
+
+    2026-07-21 review F3: a single unpaginated GET truncates past the endpoint's
+    default page size (~100 rows — MLB volume crosses that within days) and a
+    truncated read must NEVER be able to read as "flat"/absent. That fix landed
+    on the 5-minute reconcile path only; the BOOT rehydrate kept a bare
+    ``get_positions(...)`` (2026-07-27 diagnosis), so a restart past ~100 open
+    combos would boot an exposure book missing the tail and under-reserve real
+    risk for a whole reconcile interval. One helper now, both callers.
+
+    ``count_filter=position`` keeps the listing to genuinely open rows;
+    ``subaccount=None`` uses the exchange default (P0-5 pins it when given)."""
+    rows: list[dict[str, Any]] = []
+    cursor = ""
+    for _ in range(25):
+        params: dict[str, str | int] = {"limit": 200, "count_filter": "position"}
+        if subaccount is not None:
+            params["subaccount"] = subaccount
+        if cursor:
+            params["cursor"] = cursor
+        payload = await rest.get_positions(**params)
+        rows.extend(payload.get("market_positions") or payload.get("positions") or [])
+        cursor = str(payload.get("cursor") or "")
+        if not cursor:
+            break
+    return {"market_positions": rows}
+
+
 async def position_reconcile_unmodeled_once(
     rest: PositionsGetter,
     exposure: ExposureBook,
@@ -1012,23 +1059,7 @@ async def position_reconcile_unmodeled_once(
     # Page the OPEN-positions listing to exhaustion (2026-07-21 review F3: a
     # single unpaginated GET truncates past ~100 rows — MLB volume crosses
     # that within days — and truncation must never read as "flat").
-    # count_filter=position keeps the listing to genuinely open rows.
-    rows: list[dict[str, Any]] = []
-    cursor = ""
-    for _ in range(25):
-        params: dict[str, str | int] = {
-            "subaccount": subaccount,
-            "limit": 200,
-            "count_filter": "position",
-        }
-        if cursor:
-            params["cursor"] = cursor
-        payload = await rest.get_positions(**params)
-        rows.extend(payload.get("market_positions") or payload.get("positions") or [])
-        cursor = str(payload.get("cursor") or "")
-        if not cursor:
-            break
-    merged: dict[str, Any] = {"market_positions": rows}
+    merged: dict[str, Any] = await get_positions_paged(rest, subaccount=subaccount)
     exch_by_ticker = open_combo_positions_from_positions(merged)
     exposure_cc_by_ticker, unreadable_exposure = _exchange_exposure_cc_by_ticker(merged)
     if unreadable_exposure:
@@ -1463,6 +1494,45 @@ class _StoreSettlementLedger:
             )
 
 
+class _StoreOrphanLedger:
+    """Adapter: the settlement handler's ORPHAN-ROW reconciliation onto the
+    Store's ``position_ledger`` (2026-07-27).
+
+    AWAITED, not fire-and-forget (unlike ``_StoreSettlementLedger``): the
+    handler must see whether the row actually closed before it counts it, and
+    this path runs in the 30 s settlement loop where a disk round-trip costs
+    nothing. It never writes anything but the settled transition of a row that
+    is currently ``open``, so a re-polled settlement is a no-op."""
+
+    def __init__(self, store: Store) -> None:
+        self._store = store
+
+    async def open_ledger_tickers(self) -> set[str]:
+        return await self._store.open_ledger_tickers()
+
+    async def open_ledger_rows_for_ticker(
+        self, combo_ticker: str
+    ) -> list[dict[str, Any]]:
+        return await self._store.open_ledger_rows_for_ticker(combo_ticker)
+
+    async def close_ledger_row_settled(
+        self,
+        position_id: str,
+        *,
+        settled_value: float,
+        realized_pnl_cc: int,
+        settlement_fee_cc: int,
+        reconciled_at: str,
+    ) -> str | None:
+        return await self._store.record_position_settled(
+            position_id,
+            settled_value=settled_value,
+            realized_pnl_cc=realized_pnl_cc,
+            settlement_fee_cc=settlement_fee_cc,
+            reconciled_at=reconciled_at,
+        )
+
+
 class QuoteApp:
     def __init__(self, config: AppConfig) -> None:
         if config.mode not in (Mode.PAPER, Mode.QUOTE):
@@ -1628,10 +1698,37 @@ class QuoteApp:
             # burst allowance and the refill window is that capacity at the
             # exchange's own refill rate, so there is no number here a human
             # picked.
+            #
+            # CRITICAL RESERVE (2026-07-27). One bucket shared by the
+            # CONTINUOUS metadata refresh and the LOW-VOLUME settled-leg
+            # resolver is a PRIORITY INVERSION: metadata wins every race for
+            # the last token, so what starves is the correctness-critical read
+            # (live run: 27 settled_fetch_failed, every one a 429). The reserve
+            # is exactly ONE settled-resolution pass — the resolver's own
+            # bounded per-pass claim × the live-verified per-endpoint token
+            # cost (GET /account/endpoint_costs default_cost=10). Both factors
+            # are measured/observed state, and the reserve moves automatically
+            # if either does. It costs the metadata tier 50 of 600 tokens
+            # (8.3%) and it is what guarantees a settlement resolution can
+            # always be served while metadata yields.
+            critical_read_reserve = FETCH_BUDGET_PER_PASS * DEFAULT_ENDPOINT_TOKEN_COST
             read_budget = TokenBudget.create(
                 self._clock,
                 capacity=tier.read_capacity,
                 refill_s=tier.read_refill_s,
+                reserve=critical_read_reserve,
+            )
+            log.info(
+                "read_budget_armed",
+                capacity=tier.read_capacity,
+                refill_s=tier.read_refill_s,
+                sustained_tokens_per_s=tier.read_refill_per_s,
+                per_call_token_cost=DEFAULT_ENDPOINT_TOKEN_COST,
+                critical_reserve_tokens=critical_read_reserve,
+                critical_reserve_calls=FETCH_BUDGET_PER_PASS,
+                routine_capacity=tier.read_capacity - critical_read_reserve,
+                detail="settlement resolution spends CRITICAL (may draw the "
+                "reserve); routine metadata refresh yields at the floor",
             )
             self._read_budget = read_budget
             metadata = MetadataCache(rest, self._clock, read_budget=read_budget)
@@ -1911,6 +2008,7 @@ class QuoteApp:
                 risk_cfg,
                 _PacedMarketSource(rest, self._reserve_read_token),
                 self._clock,
+                self._metrics,
             )
             lifecycle = QuoteLifecycle(
                 clock=self._clock,
@@ -2059,6 +2157,13 @@ class QuoteApp:
                 # no live writer, so p_night's day-anchored seed was a silent
                 # no-op and settlement calibration was unanswerable locally.
                 ledger=_StoreSettlementLedger(store),
+                # LEDGER RECONCILIATION (2026-07-27): close open ledger rows for
+                # combos that settled while they were NOT in the exposure book
+                # (they settled during a process gap, or boot dropped them as
+                # already-finalized). Ledger-only, fail-closed, no cash/risk
+                # effect — the repair for the 56-row / $775.85 divergence that
+                # was alarm-only all day.
+                orphan_ledger=_StoreOrphanLedger(store),
             )
             settlement_poller = SettlementPoller(
                 source=rest,
@@ -2915,11 +3020,11 @@ class QuoteApp:
             # P0-5: pin the positions read to ONE subaccount at the QUERY LAYER.
             # subaccount=None ⇒ the exchange default (0/primary); an int pins that
             # subaccount and the endpoint returns ONLY its positions.
-            payload = (
-                await rest.get_positions(subaccount=subaccount)
-                if subaccount is not None
-                else await rest.get_positions()
-            )
+            # PAGED (2026-07-27): this read was the last unpaginated
+            # get_positions in the tree — at boot, past the endpoint's default
+            # page size, the exposure book would silently come up missing its
+            # tail and under-reserve real risk until the 5-minute reconcile.
+            payload = await get_positions_paged(rest, subaccount=subaccount)
         except KalshiApiError as exc:
             log.warning("rehydrate_positions_failed", error=str(exc))
             return
@@ -3706,11 +3811,19 @@ class QuoteApp:
         await asyncio.sleep(wait_s)
 
     async def _reserve_read_token(self) -> None:
-        """Wait for AND SPEND one metadata GET's worth of read tokens.
+        """Wait for AND SPEND one metadata GET's worth of read tokens, at the
+        CRITICAL priority tier.
 
         For callers that reach the exchange directly (not through
         ``MetadataCache``, which spends for itself): they must charge the same
         bucket or the pacing is fiction.
+
+        CRITICAL (2026-07-27): this is the settled-marginal resolver's path —
+        low volume, correctness-critical, and the loser of every race against
+        the continuous metadata refresh (live: 27 settled_fetch_failed, all
+        429). It spends with ``critical=True`` so it may draw the bucket's
+        reserve, which the routine metadata tier can never touch. Settlement
+        resolution therefore cannot be starved by refresh volume.
 
         BOUNDED: the bucket is not FIFO, so a hot path continuously draining it
         could in principle starve a waiter forever. The wait is therefore capped
@@ -3725,8 +3838,8 @@ class QuoteApp:
             return
         cost = DEFAULT_ENDPOINT_TOKEN_COST
         deadline = self._clock.monotonic_ns() + int(budget.refill_s * 1e9)
-        while not budget.try_spend(cost):
-            wait_s = budget.seconds_until(cost)
+        while not budget.try_spend(cost, critical=True):
+            wait_s = budget.seconds_until(cost, critical=True)
             if wait_s == float("inf") or self._clock.monotonic_ns() >= deadline:
                 self._metrics.inc("metadata.read_budget_deferred")
                 raise ReadBudgetExhausted("GET /markets", cost)

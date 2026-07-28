@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from combomaker.core.conventions import Side
@@ -44,9 +45,15 @@ from combomaker.core.money import (
     MoneyParseError,
     fee_cc_from_dollars_str,
 )
+from combomaker.core.quantity import CentiContracts
 from combomaker.core.reasons import ReasonCode
 from combomaker.ops.logging import get_logger
-from combomaker.risk.balance import BalanceTracker, Settlement
+from combomaker.risk.balance import (
+    BalanceTracker,
+    Settlement,
+    settlement_payout_per_contract_cc,
+    settlement_realized_cc,
+)
 from combomaker.risk.exposure import ExposureBook, OpenPosition, stable_ledger_key
 from combomaker.risk.killswitch import KillSwitch
 
@@ -229,6 +236,56 @@ class SettlementLedger(Protocol):
     ) -> None: ...
 
 
+class OrphanLedgerReconciler(Protocol):
+    """The ledger surface the ORPHAN-ROW reconciliation needs (2026-07-27).
+
+    Separate from ``SettlementLedger`` on purpose: it is additive and optional
+    (None ⇒ the pre-fix behaviour exactly), so no existing wiring or stub has
+    to grow methods it never calls."""
+
+    async def open_ledger_tickers(self) -> set[str]: ...
+
+    async def open_ledger_rows_for_ticker(
+        self, combo_ticker: str
+    ) -> list[JsonDict]: ...
+
+    async def close_ledger_row_settled(
+        self,
+        position_id: str,
+        *,
+        settled_value: float,
+        realized_pnl_cc: int,
+        settlement_fee_cc: int,
+        reconciled_at: str,
+    ) -> str | None: ...
+
+
+def _settled_at_iso(row: JsonDict) -> str | None:
+    """The exchange's own ``settled_time`` normalised to the ledger's stamp
+    format (tz-aware UTC isoformat), or None when it cannot be read.
+
+    Attribution matters: ``day_realized_pnl_cc`` buckets on ``reconciled_at``,
+    so a row closed today for a combo that settled last night must carry LAST
+    NIGHT's stamp. Unreadable ⇒ None ⇒ the caller REFUSES to close the row
+    (fail-closed: a wrong day is a corrupted anchor, and the row keeps its
+    exposure meaning until we can attribute it)."""
+    raw = row.get("settled_time")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat()
+
+
 class SettlementHandler:
     """Books + reconciles settled positions we HOLD. Owns no loop — the poller
     drives it, and tests call ``handle_settlements`` directly against fakes.
@@ -248,6 +305,7 @@ class SettlementHandler:
         lifecycle: RecordsRealizedPnl,
         killswitch: KillSwitch,
         ledger: SettlementLedger | None = None,
+        orphan_ledger: OrphanLedgerReconciler | None = None,
     ) -> None:
         self._exposure = exposure
         self._balance = balance_tracker
@@ -262,10 +320,30 @@ class SettlementHandler:
         # combos hit at the rate we price?") unanswerable from local data.
         # None ⇒ ledger writes are skipped (tests/backtests), never an error.
         self._ledger = ledger
+        # ORPHAN-ROW RECONCILIATION (2026-07-27). None ⇒ exactly the pre-fix
+        # behaviour (a settlement for a ticker the exposure book does not hold
+        # is dropped and its open ledger row lives forever).
+        self._orphan_ledger = orphan_ledger
         # Position ids we have already booked+reconciled (idempotency backstop on
         # top of the ledger's own dedup — a re-polled settlement never double-books
         # NOR re-runs the reconcile HALT check).
         self._reconciled: set[str] = set()
+        # Tickers whose orphan rows this process has already reconciled (or
+        # refused as ambiguous) — the poller re-pages the SAME settlement rows
+        # every 30 s and neither the DB write nor the alarm should repeat.
+        self._orphans_seen: set[str] = set()
+        # Tickers that currently HAVE an open ledger row, refreshed ONCE per
+        # settlement batch (one indexed read) instead of once per settlement
+        # row. The poller pages the account's WHOLE settlement history every
+        # 30 s — thousands of rows, ~130 of which can possibly have an open row
+        # — so without this pre-filter the reconciliation would issue one DB
+        # round-trip per historical settlement on the first pass of every
+        # process. None ⇒ the batch read failed ⇒ fall back to the per-ticker
+        # read (fail-OPEN toward doing the work, never toward skipping it).
+        self._open_ledger_tickers: set[str] | None = None
+        # OBSERVABLE counters (the divergence sweep is the other half).
+        self.orphan_rows_closed = 0
+        self.orphan_rows_ambiguous = 0
 
     async def handle_settlements(self, rows: list[JsonDict]) -> list[ReconcileResult]:
         """Process a batch of exchange settlement rows. Returns the results for
@@ -283,6 +361,8 @@ class SettlementHandler:
         # #2/#3), never a log. A metadata-read error must fail closed like the
         # farmed tripwire, so this runs before we touch the ledger.
         await self._audit_mutex_metadata(rows)
+        # ONE indexed read for the whole batch (see ``_open_ledger_tickers``).
+        await self._refresh_open_ledger_tickers()
         results: list[ReconcileResult] = []
         for row in rows:
             if self._killswitch.halted:
@@ -340,12 +420,238 @@ class SettlementHandler:
             if pos.combo_ticker == parsed.ticker
         ]
         if not positions:
+            # Not in the exposure book — no live risk to book. But the DURABLE
+            # ledger may still carry an OPEN row for it (the combo settled while
+            # this process was down, or the boot rehydrate dropped it as
+            # already-finalized), and that row can never close by itself.
+            # Reconcile it from exchange truth; never a risk/cash side effect.
+            await self._reconcile_orphan_ledger_rows(row, parsed)
             return None  # a settlement for a market we don't hold — not ours
 
         # A combo market yields ONE settlement row; we may hold >1 position on it
         # (e.g. re-quoted). Reconcile the ledger figures against the SUM of our
         # positions on this ticker (revenue/fee are per-market aggregates).
         return await self._reconcile_positions(parsed, positions)
+
+    async def _refresh_open_ledger_tickers(self) -> None:
+        """Re-read the set of tickers that currently have an OPEN ledger row —
+        one indexed query per settlement batch.
+
+        The orphan reconciliation is a needle-in-a-haystack search: the poller
+        pages the account's ENTIRE settlement history every 30 s, and at most a
+        few hundred of those tickers can possibly still carry an open row. This
+        turns "one DB round-trip per historical settlement row" into "one per
+        batch". FAIL-OPEN: any error leaves the set None, which makes the
+        pre-filter a no-op and every row take the per-ticker read — the work
+        still happens, it is just slower."""
+        if self._orphan_ledger is None:
+            return
+        try:
+            self._open_ledger_tickers = await self._orphan_ledger.open_ledger_tickers()
+        except Exception:
+            log.exception("orphan_ledger_ticker_scan_failed")
+            self._open_ledger_tickers = None
+
+    async def _reconcile_orphan_ledger_rows(
+        self, row: JsonDict, parsed: ParsedSettlement
+    ) -> None:
+        """Close OPEN ledger rows for a settled combo the exposure book does
+        not hold — the ledger-divergence repair (2026-07-27).
+
+        WHY the rows exist: a combo that settled while the process was down is
+        absent from ``get_positions`` at the next boot, so the exposure book
+        never holds it, so ``_handle_one`` dropped its settlement as "not ours"
+        and the open row survived forever. Measured on the live store: the
+        divergence was CONSTANT within a run and stepped ONLY at restarts —
+        exactly this. Same class: a boot rehydrate that drops an
+        already-``finalized`` position.
+
+        WHAT IT DOES AND DOES NOT DO. Ledger-only: it writes the settled row
+        (status, V, realized, fee, and the EXCHANGE's settled_time as the
+        reconciliation stamp) so p_night's realized anchor and the settlement
+        calibration curve stop under-counting. It NEVER touches cash, the
+        realized accumulators, the exposure book or the caps — that money moved
+        on the exchange in a previous process and re-booking it into today's
+        in-memory realized half would corrupt the ENFORCED daily-loss ladder.
+
+        FAIL-CLOSED ON AMBIGUITY (never silently deletes a row that may be real
+        exposure): the row is only closed when the rows' gross payout
+        reconstructs the exchange's own ``revenue`` to within a cent — the same
+        to-the-cent identity the live path HALTs on — and when the exchange's
+        settled_time and the row's own side/quantity are readable. Anything
+        else leaves the row OPEN and raises a loud alarm. Unlike the live path
+        this ALARMS rather than HALTs: we hold no position, so there is no live
+        risk to stop trading over, and halting the bot on a bookkeeping
+        ambiguity would be the cure being worse than the disease."""
+        if self._orphan_ledger is None or parsed.ticker in self._orphans_seen:
+            return
+        known = self._open_ledger_tickers
+        if known is not None and parsed.ticker not in known:
+            # Batch pre-filter: this ticker had no open ledger row when the
+            # batch started. Deliberately NOT memoised in ``_orphans_seen`` —
+            # the set is re-read at the top of every batch, so a row opened
+            # later is picked up on the next poll instead of being suppressed
+            # for the life of the process.
+            return
+        try:
+            rows = await self._orphan_ledger.open_ledger_rows_for_ticker(parsed.ticker)
+        except Exception:
+            log.exception("orphan_ledger_read_failed", combo_ticker=parsed.ticker)
+            return
+        if not rows:
+            return
+
+        settled_at = _settled_at_iso(row)
+        if settled_at is None:
+            self.orphan_rows_ambiguous += len(rows)
+            self._orphans_seen.add(parsed.ticker)
+            log.warning(
+                "settlement_orphan_row_unattributable",
+                combo_ticker=parsed.ticker,
+                open_rows=len(rows),
+                raw_settled_time=repr(row.get("settled_time")),
+                detail="the exchange settlement carries no readable "
+                "settled_time — the realized P&L could only be attributed to "
+                "the WRONG day, so the open ledger row is LEFT OPEN "
+                "(fail-closed; never deleted)",
+            )
+            return
+
+        # Rebuild each row as the Settlement it was, under the ONE payout
+        # formula (risk.balance) — no second copy of the convention.
+        parcels: list[tuple[str, Settlement]] = []
+        total_ct = 0
+        try:
+            for r in rows:
+                side = Side(str(r["our_side"]))
+                contracts = int(r["contracts_centi"])
+                if contracts <= 0:
+                    raise ValueError(f"non-positive contracts {contracts}")
+                total_ct += contracts
+                parcels.append(
+                    (
+                        str(r["position_id"]),
+                        Settlement(
+                            position_id=str(r["position_id"]),
+                            our_side=side,
+                            contracts=CentiContracts(contracts),
+                            entry_price_cc=CentiCents(int(r["entry_price_cc"])),
+                            settled_value=parsed.settled_value,
+                            fee_cc=ZERO,  # replaced by the exact share below
+                        ),
+                    )
+                )
+        except (KeyError, TypeError, ValueError) as exc:
+            self.orphan_rows_ambiguous += len(rows)
+            self._orphans_seen.add(parsed.ticker)
+            log.warning(
+                "settlement_orphan_row_unreadable",
+                combo_ticker=parsed.ticker,
+                open_rows=len(rows),
+                error=repr(exc),
+                detail="an open ledger row's side/quantity/price could not be "
+                "read — refusing to close it (fail-closed; never deleted)",
+            )
+            return
+
+        # TO-THE-CENT identity: Σ gross payout over these rows must reconstruct
+        # the exchange's `revenue`. If it does not, these rows are NOT this
+        # settlement's counterpart (partial coverage, a re-quote we already
+        # booked, a convention drift) — leave them open and alarm.
+        try:
+            gross_cc = sum(
+                int(s.contracts)
+                * settlement_payout_per_contract_cc(
+                    s.our_side,
+                    parsed.settled_value,
+                    no_pays_complement=self._balance.combo_no_pays_complement,
+                )
+                // 100
+                for _, s in parcels
+            )
+        except Exception as exc:  # noqa: BLE001 — unverified convention ⇒ refuse
+            self.orphan_rows_ambiguous += len(rows)
+            self._orphans_seen.add(parsed.ticker)
+            log.warning(
+                "settlement_orphan_row_convention_refused",
+                combo_ticker=parsed.ticker,
+                error=repr(exc),
+                detail="payout convention not verified — open ledger rows left "
+                "OPEN (fail-closed)",
+            )
+            return
+        residual_cc = abs(gross_cc - int(parsed.revenue_cc))
+        if residual_cc >= CC_PER_CENT:
+            self.orphan_rows_ambiguous += len(rows)
+            self._orphans_seen.add(parsed.ticker)
+            log.warning(
+                "settlement_orphan_row_ambiguous",
+                combo_ticker=parsed.ticker,
+                open_rows=len(rows),
+                predicted_gross_cc=gross_cc,
+                exchange_revenue_cc=int(parsed.revenue_cc),
+                residual_cc=residual_cc,
+                settled_value=parsed.settled_value,
+                detail="open ledger rows for this settled combo do not "
+                "reconstruct the exchange's revenue to the cent — they may not "
+                "be this settlement's counterpart, so they are LEFT OPEN "
+                "(fail-closed; a row that may represent real exposure is never "
+                "deleted or closed on a guess)",
+            )
+            return
+
+        closed = 0
+        for position_id, parcel in parcels:
+            fee_share = (
+                CentiCents(int(parsed.fee_cc) * int(parcel.contracts) // total_ct)
+                if int(parsed.fee_cc) and total_ct > 0
+                else ZERO
+            )
+            settlement = Settlement(
+                position_id=parcel.position_id,
+                our_side=parcel.our_side,
+                contracts=parcel.contracts,
+                entry_price_cc=parcel.entry_price_cc,
+                settled_value=parsed.settled_value,
+                fee_cc=fee_share,
+            )
+            realized_cc = settlement_realized_cc(
+                settlement,
+                no_pays_complement=self._balance.combo_no_pays_complement,
+            )
+            try:
+                landed = await self._orphan_ledger.close_ledger_row_settled(
+                    position_id,
+                    settled_value=float(parsed.settled_value),
+                    realized_pnl_cc=int(realized_cc),
+                    settlement_fee_cc=int(fee_share),
+                    reconciled_at=settled_at,
+                )
+            except Exception:
+                log.exception(
+                    "settlement_orphan_row_write_failed",
+                    combo_ticker=parsed.ticker,
+                    position_id=position_id,
+                )
+                return  # retry on the next poll; the row stays OPEN
+            if landed is None:
+                continue  # raced/already closed — idempotent
+            closed += 1
+            self.orphan_rows_closed += 1
+            log.info(
+                "settlement_orphan_row_closed",
+                combo_ticker=parsed.ticker,
+                position_id=position_id,
+                settled_value=parsed.settled_value,
+                realized_cc=int(realized_cc),
+                settlement_fee_cc=int(fee_share),
+                reconciled_at=settled_at,
+                detail="ledger row for a combo that settled while it was not "
+                "in the exposure book (settled during a process gap) closed "
+                "from exchange truth — ledger-only, no cash/risk effect",
+            )
+        if closed:
+            self._orphans_seen.add(parsed.ticker)
 
     async def _reconcile_positions(
         self, parsed: ParsedSettlement, positions: list[OpenPosition]

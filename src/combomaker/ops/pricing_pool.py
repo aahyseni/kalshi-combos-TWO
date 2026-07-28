@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import time
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from combomaker.core.conventions import Conventions
@@ -301,6 +301,13 @@ class BookRiskInputs:
     # — the snapshot's p_night = P(realized + open book > 0). None ⇒ p_night
     # == p_profit.
     realized_pnl_cc: int | None = None
+    # FIX 2 (2026-07-28): arm the SETTLED-LEG resolution of the deterministic
+    # max-loss axis. The exchange determinations themselves ride on the frozen
+    # ``model`` (``BookModel.settled_leg_values``, resolved ON-LOOP from the
+    # graded-fact cache — the worker has no resolver); this is only the policy
+    # bit deciding whether the resulting credit is SUBTRACTED or merely
+    # measured. False (default) ⇒ byte-identical to before this existed.
+    det_max_settlement_aware: bool = False
 
 
 def _worker_book_risk(inputs: BookRiskInputs) -> BookRiskSnapshot:
@@ -319,6 +326,7 @@ def _worker_book_risk(inputs: BookRiskInputs) -> BookRiskSnapshot:
         ruin_prob_ci_z=inputs.ruin_prob_ci_z,
         input_generation=inputs.input_generation,
         realized_pnl_cc=inputs.realized_pnl_cc,
+        det_max_settlement_aware=inputs.det_max_settlement_aware,
     )
 
 
@@ -437,6 +445,20 @@ class CandidateBookRiskInputs:
     # quote-time cap does. Defaults True = the config default (and the sound
     # smaller bound), so an unstamped legacy caller is unchanged.
     det_max_mutex_aware: bool = True
+    # FIX 3 (2026-07-28): arming flag for the offsetting-position det-max credit
+    # (RiskLimits.det_max_hedge_credit), threaded to the worker gate so the
+    # quote-time cap and the candidate gate arm/disarm together. Default False
+    # = SHADOW: the credit is measured onto the verdict axes but never gates.
+    det_max_hedge_credit: bool = False
+    # FIX 2 (2026-07-28): the EXCHANGE-DETERMINED leg outcomes (ticker → 0.0/1.0),
+    # resolved ON THE LOOP from the graded-fact cache because the worker has no
+    # resolver and the live one is not picklable — the same dict-snapshot
+    # discipline the marginals and pair rhos already use. A ticker ABSENT from
+    # the dict is UNKNOWN in the worker exactly as it is on the loop, so the
+    # position it belongs to is charged in full (fail-closed). Empty + the
+    # arming flag False ⇒ byte-identical to before this existed.
+    settled_facts: dict[str, float] = field(default_factory=dict)
+    det_max_settlement_aware: bool = False
     # P0-2 (candidate MC atomic with reservations). The ExposureBook POSITION
     # generation and the RiskReservationService VERSION captured on the loop at the
     # instant these inputs were read. They are NOT consumed by the worker (the MC
@@ -555,6 +577,9 @@ def _worker_candidate_book_risk(
         require_p_book_non_decreasing=inputs.require_p_book_non_decreasing,
         worst_challenger_ev_tolerance=inputs.worst_challenger_ev_tolerance,
         det_max_mutex_aware=inputs.det_max_mutex_aware,
+        det_max_hedge_credit=inputs.det_max_hedge_credit,
+        settled_facts=inputs.settled_facts.get,
+        det_max_settlement_aware=inputs.det_max_settlement_aware,
     )
 
 

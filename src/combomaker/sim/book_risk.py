@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -53,6 +53,7 @@ from combomaker.risk.exposure import (
 )
 from combomaker.sim.book_model import (
     BookModel,
+    SettledFactProvider,
     WithinGameRhoProvider,
     build_book_model,
     position_to_combo,
@@ -255,6 +256,39 @@ class BookRiskSnapshot:
     # (an UNKNOWN/empty snapshot, or a pre-fix snapshot) ⇒ consumers fall back
     # to the comonotone number (fail-closed: the LARGER bound).
     mutex_aware_det_max_cc: float | None = None
+    # FIX 3 HEDGE ACCOUNTING (2026-07-28) — the det-max credit released by
+    # positions that PROVABLY CANNOT BOTH LOSE (a complement/sub-parlay of a
+    # combo we already hold), measured over units the fold charges at FULL
+    # comonotone loss. ALWAYS computed (shadow visibility); SUBTRACTED from the
+    # gated number only when ``RiskLimits.det_max_hedge_credit`` is ARMED, so
+    # the default build is byte-identical. This is the RISK ACCOUNTING axis and
+    # is distinct from the 2026-07-27 skew work, which changed the PRICE on
+    # offsetting flow — see the FIX 3 block above ``_loss_literals``.
+    det_max_hedge_credit_cc: float = 0.0
+    # FIX 2 SETTLED-LEG RESOLUTION (2026-07-28) — the forward det-max the
+    # EXCHANGE HAS ALREADY RETIRED: the summed premium of every held combo whose
+    # graded legs prove it can no longer lose (a NO parlay with one leg settled
+    # against the parlay is WON — our NO pays). ALWAYS measured, so an unarmed
+    # bot still reports the headroom it is throwing away; only REMOVED from
+    # ``deterministic_max_loss_cc`` / ``mutex_aware_det_max_cc`` when
+    # ``det_max_settlement_aware`` is armed. Distinct from the hedge credit
+    # above: that one nets two positions that cannot BOTH lose, this one retires
+    # a position that can no longer lose AT ALL, on the exchange's own
+    # determination rather than any model.
+    det_max_settled_credit_cc: float = 0.0
+    # FIX 5 (2026-07-28) — the BOOK LOSS at which this settlement wave reaches
+    # the ruin floor: ``current_equity_cc − ruin_floor_cc``. ``p_ruin`` is
+    # exactly P(loss > this), so carrying it lets a consumer that must charge the
+    # snapshot for unmeasured book growth (``lifecycle._decay_book_risk``)
+    # re-read the ruin probability at the SHIFTED threshold off the loss-quantile
+    # envelope instead of having to GUESS where the threshold sits. Guessing is
+    # not a small error: when p_ruin is 0 the envelope proves only that the
+    # threshold lies somewhere ABOVE the largest sampled loss, so the tightest
+    # admissible guess (== that largest loss) manufactured a 34.7% ruin
+    # probability on a book that was nowhere near ruin. None ⇒ equity/bankroll
+    # were unavailable, the ruin cap does not evaluate, and there is nothing to
+    # shift.
+    ruin_loss_threshold_cc: float | None = None
 
     # Tail attribution (§4.4).
     per_game_tail_cc: tuple[TailContribution, ...] = ()
@@ -278,7 +312,126 @@ class BookRiskSnapshot:
         return self.n_positions > 0 or self.deterministic_max_loss_cc > 0.0
 
 
-def _deterministic_all_hit_loss_cc(model: BookModel) -> float:
+def position_settled_cannot_lose(
+    pos: ComboPosition, settled: Mapping[int, float]
+) -> bool:
+    """FIX 2 (2026-07-28). True iff the EXCHANGE'S OWN determinations already
+    prove this position CANNOT lose another cent — so its deterministic
+    max-loss contribution is exactly 0.
+
+    ``settled`` maps a latent leg index to that leg's graded value (0.0 or 1.0),
+    and carries an entry ONLY for a leg the exchange has actually determined
+    (``BookModel.settled_leg_values``; never the feed marginal — see
+    ``book_model.SettledFactProvider``). An index that is ABSENT is UNKNOWN.
+
+    The combo's payout is ``V = Π over legs of (value if leg_side=='yes' else
+    1 − value)``; each factor is the leg's SELECTED-SIDE value. For the sell-only
+    book every position is a long NO, which pays ``1 − V``:
+
+      * LONG NO — we lose our premium only if the parlay HITS (``V = 1``), which
+        requires EVERY leg's selected-side value to be 1. So a SINGLE leg the
+        exchange has graded to selected-side 0 forces ``V = 0`` permanently: the
+        parlay has MISSED, our NO is WON, and no further loss is possible. This
+        is the operator's stated common case — a combo carrying legs from
+        yesterday's slate plus one or two live legs today — and it resolves on
+        the settled legs ALONE, with the live legs left completely unconstrained.
+      * LONG YES — we lose if the parlay MISSES (``V = 0``), so we are safe only
+        when EVERY leg is graded to selected-side 1. One unknown leg is enough to
+        keep the full charge.
+
+    FAIL CLOSED, both directions: an UNKNOWN leg can never make a NO position
+    safe (we only ever act on a leg PROVEN to have gone against the parlay), and
+    it always keeps a YES position charged. Nothing is inferred — a leg is
+    resolved only when the exchange determination for it is in hand. Returning
+    False is always the conservative answer, and it is what every unrecognised
+    shape falls through to.
+
+    Both live shapes (the MC's index-keyed ``ComboPosition`` and the candidate
+    gate's ticker-keyed ``OpenPosition``) resolve through ``_settled_cannot_lose``
+    below, so the two paths cannot drift apart."""
+    sides = pos.leg_sides or ("yes",) * len(pos.leg_indices)
+    return _settled_cannot_lose(
+        pos.side == "no",
+        (
+            settled.get(idx)
+            for idx in pos.leg_indices
+        ),
+        sides,
+    )
+
+
+def _settled_cannot_lose(
+    our_side_is_no: bool,
+    leg_values: Iterable[float | None],
+    leg_sides: Iterable[str],
+) -> bool:
+    """THE ONE settlement-resolution rule (see ``position_settled_cannot_lose``
+    for the full derivation). ``leg_values`` are the exchange-graded YES values
+    aligned with ``leg_sides``; None means UNKNOWN.
+
+    LONG NO  ⇒ won as soon as ONE leg is PROVEN to have broken the parlay.
+    LONG YES ⇒ safe only when EVERY leg is proven to have gone the parlay's way.
+    Both directions fail closed on an UNKNOWN leg."""
+    if our_side_is_no:
+        for value, leg_side in zip(leg_values, leg_sides, strict=False):
+            if value is None:
+                continue  # UNKNOWN — proves nothing either way
+            selected = value if leg_side == "yes" else 1.0 - value
+            if selected == 0.0:
+                return True
+        return False
+    for value, leg_side in zip(leg_values, leg_sides, strict=False):
+        if value is None:
+            return False  # UNKNOWN ⇒ charged in full
+        selected = value if leg_side == "yes" else 1.0 - value
+        if selected != 1.0:
+            return False
+    return True
+
+
+def open_position_settled_cannot_lose(
+    position: OpenPosition, settled_facts: SettledFactProvider
+) -> bool:
+    """FIX 2, the CANDIDATE-GATE shape. Same rule as
+    ``position_settled_cannot_lose``, resolved from leg TICKERS through the
+    exchange-determination provider instead of the model's latent indices — the
+    gate merges raw ``OpenPosition``s and never builds the index map.
+
+    A value that is not exactly 0.0/1.0 is treated as UNKNOWN (a settlement fact
+    is binary; anything else is not one), so it charges in full."""
+    values: list[float | None] = []
+    for leg in position.legs:
+        fact = settled_facts(leg.market_ticker)
+        values.append(float(fact) if fact == 0.0 or fact == 1.0 else None)
+    return _settled_cannot_lose(
+        position.our_side is Side.NO,
+        values,
+        (leg.side for leg in position.legs),
+    )
+
+
+def settled_det_max_credit_cc(model: BookModel) -> float:
+    """FIX 2. The deterministic max-loss the EXCHANGE has already retired on this
+    book: the summed premium (+ fee) of every position ``position_settled_cannot_
+    lose`` proves is won, in float cc.
+
+    This is the headroom the forward max-loss axis was charging for outcomes that
+    are no longer possible. Always computable and always reported (the shadow
+    number); whether it is SUBTRACTED from the enforced axis is the caller's
+    arming decision. 0.0 on a model with no settled facts."""
+    settled = model.settled_leg_values
+    if not settled:
+        return 0.0
+    total = 0.0
+    for pos in model.positions:
+        if position_settled_cannot_lose(pos, settled):
+            total += float(pos.price_cc) * pos.contracts + float(pos.fee_cc)
+    return total
+
+
+def _deterministic_all_hit_loss_cc(
+    model: BookModel, *, settlement_aware: bool = False
+) -> float:
     """The EXACT worst case: every position's combo resolves against us at once.
 
     For a long NO position the worst outcome is the parlay HITS (payout $1/ct) →
@@ -292,9 +445,23 @@ def _deterministic_all_hit_loss_cc(model: BookModel) -> float:
     (``worst_case_loss_by_game_cc``), here rolled up over the whole book as an
     unconditional upper bound the sampled ES can never exceed.
 
+    FIX 2 (2026-07-28) — ``settlement_aware``. "Unconditional" was the defect:
+    the sum above charges a full forward max-loss for a combo the EXCHANGE HAS
+    ALREADY DETERMINED cannot lose (measured on the live book 2026-07-28: 14 of
+    77 open positions, all legs on games that finished the previous day, still
+    carrying $80.20 of forward max-loss against $3.34–$4.60 of binding
+    headroom). When True, a position ``position_settled_cannot_lose`` PROVES is
+    won contributes 0; everything else — including every position with even one
+    UNKNOWN or ungraded leg — is charged in full exactly as before. This is not
+    a model estimate: it is the exchange's own determination, so the axis stays
+    a hard upper bound. False (the default) reproduces the old sum bit for bit.
+
     Returned as a POSITIVE loss magnitude in float cc."""
+    settled = model.settled_leg_values if settlement_aware else {}
     total = 0.0
     for pos in model.positions:
+        if settled and position_settled_cannot_lose(pos, settled):
+            continue  # exchange-DETERMINED win — no forward loss remains
         total += float(pos.price_cc) * pos.contracts + float(pos.fee_cc)
     return total
 
@@ -1049,6 +1216,7 @@ def compute_book_risk(
     ruin_prob_ci_z: float = 0.0,
     input_generation: int = -1,
     realized_pnl_cc: int | None = None,
+    det_max_settlement_aware: bool = False,
 ) -> BookRiskSnapshot:
     """Run the full book-risk MC and build the halt-feeding snapshot.
 
@@ -1348,7 +1516,18 @@ def compute_book_risk(
     # the risk-modeled sub-book; the reserved holdings (unavailable marginals, not
     # sampled) add their full premium to the all-hit worst case, so their
     # whole-account risk is never hidden from the operative tail number.
-    deterministic_max = _deterministic_all_hit_loss_cc(model) + reserve
+    # FIX 2 (2026-07-28): the SETTLED-LEG credit — the forward max-loss the
+    # exchange has already retired. ALWAYS measured (so the shadow readout is
+    # honest on an unarmed bot); only SUBTRACTED from the enforced axes when
+    # ``det_max_settlement_aware`` is armed. Unarmed ⇒ every number below is
+    # byte-identical to before this existed.
+    settled_credit = settled_det_max_credit_cc(model)
+    deterministic_max = (
+        _deterministic_all_hit_loss_cc(
+            model, settlement_aware=det_max_settlement_aware
+        )
+        + reserve
+    )
 
     # Mutex/scenario-aware deterministic bound (2026-07-18): same counted
     # losses, co-aggregated soundly — within-game exclusive branches max, across
@@ -1357,19 +1536,24 @@ def compute_book_risk(
     # armed. Computed here (off the hot path) so the snapshot is the quote-time
     # cache — recomputed only on a book change via the generation stamp. Any
     # failure falls back to the comonotone number (fail closed, never open).
+    hedge_credit = 0.0
     try:
         marg_map = {t: model.legs[i].p for t, i in model.leg_index.items()}
-        mutex_det = min(
-            deterministic_max,
-            mutex_aware_det_max_from_units(
-                _det_units_from_model(model),
-                reserved_loss_cc=reserve,
-                marginals=marg_map.get,
-                structural_cfg=structural_cfg,
+        mutex_raw, hedge_credit = mutex_aware_det_max_and_credit(
+            _det_units_from_model(
+                model, settlement_aware=det_max_settlement_aware
             ),
+            reserved_loss_cc=reserve,
+            marginals=marg_map.get,
+            structural_cfg=structural_cfg,
         )
+        mutex_det = min(deterministic_max, mutex_raw)
+        # The credit is measured only over FULL-charged units, so it stays
+        # subtractable after the comonotone clamp; clamp it defensively anyway.
+        hedge_credit = max(0.0, min(hedge_credit, mutex_det))
     except Exception:
         mutex_det = deterministic_max
+        hedge_credit = 0.0
 
     # P0-3: the governing MODEL tail is the worst SAMPLED CVaR across scenarios —
     # NOT maxed with the deterministic maximum. The deterministic maximum is a
@@ -1444,6 +1628,16 @@ def compute_book_risk(
         governing_model_es_99_cc=governing_model_es,
         deterministic_max_loss_cc=deterministic_max,
         mutex_aware_det_max_cc=mutex_det,
+        det_max_hedge_credit_cc=hedge_credit,
+        det_max_settled_credit_cc=settled_credit,
+        # FIX 5: the loss level at which this wave hits the ruin floor, so a
+        # growth-charged consumer can shift it exactly (None when the ruin cap
+        # does not evaluate for want of an equity/bankroll reading).
+        ruin_loss_threshold_cc=(
+            None
+            if current_equity_cc is None or ruin_floor_cc is None
+            else float(current_equity_cc) - float(ruin_floor_cc)
+        ),
         per_game_tail_cc=per_game_tail,
         per_leg_tail_cc=per_leg_tail,
     )
@@ -1529,6 +1723,11 @@ class _TailAxes:
     # <= ``deterministic_max_loss_cc`` when present. Both ride the verdict so
     # live monitoring can compare the two bounds per decision.
     mutex_aware_det_max_cc: float | None = None
+    # FIX 3 HEDGE ACCOUNTING (2026-07-28): the det-max credit released by
+    # provably-cannot-both-lose positions on THIS book. Always measured, never
+    # pre-subtracted — the candidate gate subtracts it only when
+    # ``det_max_hedge_credit`` is armed (shadow default ⇒ byte-identical).
+    det_max_hedge_credit_cc: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1621,6 +1820,7 @@ def _tail_axes_from_pnl(
     split_pnl: NDArray[np.float64] | None = None,
     ruin_prob_ci_z: float = 0.0,
     mutex_aware_det_max_cc: float | None = None,
+    det_max_hedge_credit_cc: float = 0.0,
 ) -> _TailAxes:
     """Roll a per-scenario book P&L vector (and its correlation-inflated
     challenger re-sample, plus the optional P0-7 full-copula bridge re-sample and
@@ -1729,6 +1929,7 @@ def _tail_axes_from_pnl(
         split_ev_cc=split_ev,
         governing_model_tail_loss_cc=governing_tail_loss,
         mutex_aware_det_max_cc=mutex_aware_det_max_cc,
+        det_max_hedge_credit_cc=det_max_hedge_credit_cc,
     )
 
 
@@ -1739,15 +1940,25 @@ def _reserved_loss_of(positions: Sequence[OpenPosition]) -> float:
 
 
 def _det_and_gross(
-    positions: Sequence[OpenPosition], combos: Sequence[ComboPosition]
+    positions: Sequence[OpenPosition],
+    combos: Sequence[ComboPosition],
+    settled: Mapping[int, float] | None = None,
 ) -> tuple[float, float]:
     """(deterministic all-hit max loss, gross settlement notional) for a subset,
     in float cc. Deterministic max = Σ (premium + fee) over sampled combos
     + reserved-holding premium (the exact comonotone all-hit worst case, P0-3/P0-4).
     Gross = Σ contracts×$1 over EVERY position (modeled AND reserved) — the
-    utilization axis is size-based, so reserved holdings count too."""
+    utilization axis is size-based, so reserved holdings count too.
+
+    FIX 2 (2026-07-28): ``settled`` (the merged model's ``settled_leg_values``)
+    retires a combo the exchange has already DETERMINED cannot lose. None/empty
+    ⇒ every combo charged in full, byte-identical. The GROSS axis is deliberately
+    untouched — utilization is about capital tied up, and a determined-but-unswept
+    position still ties its collateral up until the exchange actually pays."""
     det = 0.0
     for combo in combos:
+        if settled and position_settled_cannot_lose(combo, settled):
+            continue  # exchange-DETERMINED win — no forward loss remains
         det += float(combo.price_cc) * combo.contracts + float(combo.fee_cc)
     det += _reserved_loss_of(positions)
     gross = float(sum(p.gross_settlement_notional_cc for p in positions))
@@ -1784,14 +1995,29 @@ class DetMaxUnit:
 
 def _det_units_from_positions(
     positions: Sequence[OpenPosition],
+    settled_facts: SettledFactProvider | None = None,
 ) -> tuple[list[DetMaxUnit], float]:
     """(risk-modeled units, reserved premium) for a position set, with per-unit
     ``loss_cc`` computed by the EXACT arithmetic ``_det_and_gross`` uses for the
     comonotone number (``float(price) * (centi/100)``, fee 0 — build_book_model
-    sets every sampled combo's fee to 0), so no-netting parity is exact."""
+    sets every sampled combo's fee to 0), so no-netting parity is exact.
+
+    FIX 2 (2026-07-28): with ``settled_facts``, a position the exchange has
+    already determined cannot lose is OMITTED — the same drop-don't-zero rule as
+    ``_det_units_from_model`` (the fold recharges INT premium from
+    ``contracts_centi × entry_price_cc``, so a zero-``loss_cc`` unit would still
+    be charged in every enumerated scenario). RESERVED holdings are never
+    resolved: their legs are unpriceable by definition, so they stay charged in
+    full (fail-closed)."""
     units: list[DetMaxUnit] = []
     reserved = 0.0
     for p in positions:
+        if (
+            settled_facts is not None
+            and p.risk_modeled
+            and open_position_settled_cannot_lose(p, settled_facts)
+        ):
+            continue  # exchange-DETERMINED win — in no realizable loss scenario
         if p.risk_modeled:
             units.append(
                 DetMaxUnit(
@@ -1808,17 +2034,32 @@ def _det_units_from_positions(
     return units, reserved
 
 
-def _det_units_from_model(model: BookModel) -> list[DetMaxUnit]:
+def _det_units_from_model(
+    model: BookModel, *, settlement_aware: bool = False
+) -> list[DetMaxUnit]:
     """Units for the async snapshot path, reconstructed from the frozen
     ``BookModel`` (the workers never see the live ``ExposureBook``): per combo,
     legs are rebuilt from the shared leg universe (ticker + event + selected
     side) and ``loss_cc`` uses the EXACT ``_deterministic_all_hit_loss_cc``
     arithmetic (``float(price)·contracts + fee``). A combo whose legs cannot be
     reconstructed gets an EMPTY leg tuple ⇒ the fold routes it comonotone
-    (fail-closed)."""
+    (fail-closed).
+
+    FIX 2 (2026-07-28): with ``settlement_aware``, a position the exchange has
+    already determined cannot lose is OMITTED ENTIRELY rather than emitted with
+    ``loss_cc = 0``. Dropping it is the only correct move — the mutex fold's
+    state enumeration charges each unit its INT premium recomputed from
+    ``contracts_centi × entry_price_cc``, NOT from ``loss_cc``, so a zero-loss
+    unit left in the list would still be charged its full premium in every
+    enumerated scenario and the credit would silently vanish on exactly the
+    axis the det-max caps actually gate on. A won position participates in no
+    scenario, so removing it changes no other unit's bound."""
+    settled = model.settled_leg_values if settlement_aware else {}
     ticker_of = {i: t for t, i in model.leg_index.items()}
     units: list[DetMaxUnit] = []
     for k, pos in enumerate(model.positions):
+        if settled and position_settled_cannot_lose(pos, settled):
+            continue  # exchange-DETERMINED win — in no realizable loss scenario
         sides = pos.leg_sides or tuple("yes" for _ in pos.leg_indices)
         legs: list[LegRef] = []
         for i, s in zip(pos.leg_indices, sides, strict=True):
@@ -1926,9 +2167,38 @@ def mutex_aware_det_max_from_units(
     from real tickers/marginals) or explicit ME metadata — never leg-sign
     heuristics. Pure and deterministic; the caller caches it (the async
     snapshot is the quote-time cache, generation-stamped)."""
+    bound, _credit = mutex_aware_det_max_and_credit(
+        units,
+        reserved_loss_cc=reserved_loss_cc,
+        marginals=marginals,
+        structural_cfg=structural_cfg,
+        is_me_event=is_me_event,
+    )
+    return bound
+
+
+def mutex_aware_det_max_and_credit(
+    units: Sequence[DetMaxUnit],
+    *,
+    reserved_loss_cc: float = 0.0,
+    marginals: MarginalProvider | None = None,
+    structural_cfg: StructuralConfigView | None = None,
+    is_me_event: Callable[[str], bool | None] | None = None,
+) -> tuple[float, float]:
+    """``(mutex_aware_bound_cc, hedge_offset_credit_cc)`` — the bound above PLUS
+    the separately-reported OFFSETTING-POSITION credit (FIX 3, 2026-07-28).
+
+    The credit is the amount by which the bound may be reduced once positions
+    that PROVABLY CANNOT BOTH LOSE stop being charged twice; it is returned
+    alongside (never pre-subtracted) so the caller decides — SHADOW reports it,
+    ARMED subtracts it. ``bound − credit`` is a sound upper bound on the book's
+    realizable deterministic worst case (proof in ``_hedge_offset_credit_cc``);
+    because ``credit`` is measured only over units the fold charges at FULL
+    comonotone loss, it is equally subtractable from ``min(bound, comonotone)``.
+    Any failure returns ``(comonotone, 0.0)`` — fail closed on BOTH axes."""
     comonotone = float(sum(u.loss_cc for u in units)) + max(0.0, reserved_loss_cc)
     try:
-        bound = _mutex_aware_det_fold(
+        bound, credit = _mutex_aware_det_fold(
             units,
             reserved_loss_cc=max(0.0, reserved_loss_cc),
             marginals=marginals,
@@ -1936,8 +2206,11 @@ def mutex_aware_det_max_from_units(
             is_me_event=is_me_event,
         )
     except Exception:
-        return comonotone  # fail closed: the larger, comonotone bound
-    return min(bound, comonotone)
+        return comonotone, 0.0  # fail closed: larger bound, zero credit
+    gated = min(bound, comonotone)
+    # Never credit more than the bound itself (defensive; the matching
+    # construction already guarantees credit <= bound − max single unit loss).
+    return gated, max(0.0, min(credit, gated))
 
 
 def _mutex_aware_det_fold(
@@ -1947,10 +2220,17 @@ def _mutex_aware_det_fold(
     marginals: MarginalProvider | None,
     structural_cfg: StructuralConfigView | None,
     is_me_event: Callable[[str], bool | None] | None,
-) -> float:
-    """The aggregation body (see ``mutex_aware_det_max_from_units``)."""
+) -> tuple[float, float]:
+    """The aggregation body (see ``mutex_aware_det_max_from_units``).
+
+    Returns ``(total, hedge_offset_credit)``. The credit is computed but NEVER
+    subtracted here — see ``mutex_aware_det_max_and_credit``."""
     residual = reserved_loss_cc
     buckets: dict[str, list[DetMaxUnit]] = {}
+    # FIX 3 bookkeeping: units this fold charges at FULL comonotone loss. Only
+    # these are eligible for the offsetting-position credit, so the credit can
+    # never double-count a netting the state/ME folds already granted.
+    residual_units: list[DetMaxUnit] = []
     for u in units:
         game: str | None = None
         if (
@@ -1962,6 +2242,7 @@ def _mutex_aware_det_fold(
             game = _single_game_of(u)
         if game is None:
             residual += u.loss_cc
+            residual_units.append(u)
         else:
             buckets.setdefault(game, []).append(u)
 
@@ -2007,6 +2288,7 @@ def _mutex_aware_det_fold(
         )
 
     total = residual
+    full_charged: list[DetMaxUnit] = list(residual_units)
     for game, bucket in buckets.items():
         como_g = float(sum(u.loss_cc for u in bucket))
         bound_g = como_g
@@ -2030,6 +2312,191 @@ def _mutex_aware_det_fold(
                 # >= largest single entry by the fold's own contract.
                 bound_g = min(bound_g, mutex_scenario_bound(entries, is_me_event))
         total += bound_g
+        # A bucket that earned NO netting credit contributes exactly the sum of
+        # its units' full losses, so those units are individually full-charged
+        # and may take the offsetting credit. A bucket that DID net is skipped
+        # entirely (we cannot attribute its bound per unit) — conservative.
+        if bound_g >= como_g:
+            full_charged.extend(bucket)
+    return total, _hedge_offset_credit_cc(full_charged)
+
+
+# ---------------------------------------------------------------------------
+# FIX 3 — HEDGE ACCOUNTING (2026-07-28).
+#
+# WHAT THIS IS, AND WHAT IT IS NOT. The operator asked whether the 2026-07-27
+# skew/widening work already covered this. IT DID NOT, and the distinction is
+# recorded here on purpose:
+#
+#   * The SKEW work changed the PRICE we quote on offsetting flow (pricing/
+#     skew.py — peak-concentration widening, anti-peak rebate). It decides what
+#     a hedge COSTS the taker.
+#   * THIS is the RISK ACCOUNTING. It decides what a hedge CONSUMES of our
+#     deterministic max-loss budget. Before it, ``_mutex_aware_det_fold``
+#     bucketed only long-NO units into game folds, so a COMPLEMENT position (the
+#     opposite side of a combo we already hold) fell into the comonotone
+#     residual and was charged its FULL premium ON TOP of the position it
+#     offsets — two positions that cannot both lose, both charged. The measured
+#     mutex credit on the live book was $30.77 = 3.79% of an $812.66 book.
+#
+# CERTIFICATION IS STATE ENUMERATION, NEVER A LEG-SIGN HEURISTIC. Each unit's
+# LOSS CONDITION is a proposition over leg outcomes, read from the settlement
+# rule alone (no correlation model, no game structure, no marginals):
+#
+#     long NO  on legs L  loses  <=>  every leg of L resolves to its selected
+#                                     side   (the parlay HITS; NO pays nothing)
+#     long YES on legs L  loses  <=>  some leg of L resolves against its
+#                                     selected side   (the parlay MISSES)
+#
+# Two units are CERTIFIED EXCLUSIVE iff their loss conditions are jointly
+# UNSATISFIABLE over the free assignment of every distinct market to {yes, no}.
+# Treating distinct exchange markets as unconstrained free variables is the
+# ADVERSARIAL direction: a real joint distribution can only ever be a SUBSET of
+# those assignments, so an unsatisfiable pair here is unsatisfiable in reality.
+# The enumeration is exact and closed-form for these two shapes:
+#
+#     NO / NO   exclusive iff some shared market is required on OPPOSITE sides
+#     NO / YES  exclusive iff the YES unit's literals are a SUBSET of the NO
+#               unit's literals (the NO unit's loss forces every one of them
+#               true, so the YES unit cannot miss) — this is the same-combo
+#               complement, and any sub-parlay of it
+#     YES / YES never certified (two parlays can both miss)
+#
+# AGGREGATION IS A MATCHING, NOT A CLIQUE. Pairwise exclusivity does not imply
+# joint exclusivity for three or more units, so we never take a max over a
+# group. We take a set of DISJOINT certified pairs (each unit in at most one)
+# and charge each pair ``max(loss_a, loss_b)`` instead of ``loss_a + loss_b``.
+# SOUNDNESS: fix any realizable outcome; the set S of units that lose in it
+# contains at most one member of each certified pair, so the realized loss is
+# <= sum over pairs of max + sum of unpaired full losses = (full sum − credit).
+# FAIL TOWARD THE LARGER WORST CASE: anything not certified — unknown leg side,
+# a reserved holding, a self-contradictory leg set, an unrecognised side, an
+# exception — is simply not paired and stays charged in full.
+# ---------------------------------------------------------------------------
+
+
+def _loss_literals(unit: DetMaxUnit) -> dict[str, str] | None:
+    """The unit's loss condition as ``market_ticker -> required side``, or None
+    when the unit is NOT certifiable (⇒ never paired, always charged in full).
+
+    Rejects: reserved/unmodeled holdings, empty leg sets, any leg side outside
+    ``{yes, no}``, and a leg set that names one market on BOTH sides (a
+    self-contradictory combo — charging it in full is conservative and we
+    refuse to reason about it)."""
+    if not unit.risk_modeled or not unit.legs:
+        return None
+    if unit.our_side not in (Side.NO, Side.YES):
+        return None
+    lits: dict[str, str] = {}
+    for leg in unit.legs:
+        if leg.side not in ("yes", "no"):
+            return None
+        prev = lits.get(leg.market_ticker)
+        if prev is not None and prev != leg.side:
+            return None
+        lits[leg.market_ticker] = leg.side
+    return lits
+
+
+def _certified_cannot_both_lose(
+    side_a: Side,
+    lits_a: dict[str, str],
+    side_b: Side,
+    lits_b: dict[str, str],
+) -> bool:
+    """True iff the two loss conditions are provably jointly unsatisfiable —
+    the exact three-case enumeration documented in the FIX 3 block above."""
+    if side_a is Side.NO and side_b is Side.NO:
+        # Both need every literal true; impossible iff they disagree anywhere.
+        return any(lits_b.get(m, s) != s for m, s in lits_a.items())
+    if side_a is Side.NO and side_b is Side.YES:
+        # b needs SOME literal false; a forces all of ITS literals true.
+        return all(lits_a.get(m) == s for m, s in lits_b.items())
+    if side_a is Side.YES and side_b is Side.NO:
+        return all(lits_b.get(m) == s for m, s in lits_a.items())
+    return False  # YES/YES: two parlays can both miss — never certified.
+
+
+# Hard ceiling on candidate pairs EXAMINED by the offsetting-credit scan. Sized
+# from the measured shape: the live 77-unit book examines a handful of pairs and
+# a 308-unit stress (4x the book, every leg shared) stays under 3ms. Exhausting
+# the budget only means FEWER pairs found ⇒ LESS credit ⇒ a larger charged
+# number, so this can never become a soundness hole — it is a latency bound.
+_HEDGE_PAIR_BUDGET = 200_000
+
+
+def _hedge_offset_credit_cc(units: Sequence[DetMaxUnit]) -> float:
+    """The det-max credit from disjoint CERTIFIED-EXCLUSIVE pairs among units
+    that are all charged at FULL loss (float cc, >= 0).
+
+    Greedy maximal matching over pairs ranked by the credit they release
+    (``min(loss_a, loss_b)`` descending, unit_id-tie-broken for determinism).
+    Greedy is not the optimal matching, but EVERY matching is sound — the
+    credit is only ever an under-claim of the true offset, never an over-claim.
+
+    Candidate pairs are drawn from an inverted market->unit index: certification
+    in all three cases requires a SHARED market ticker, so units that share no
+    market can never certify and are never compared (keeps the scan near-linear
+    on a real book instead of O(n^2) over ~200 entities). A hard
+    ``_HEDGE_PAIR_BUDGET`` on pairs EXAMINED bounds the worst case (a leg shared
+    by very many units); exhausting it stops the scan, which can only find FEWER
+    pairs and therefore claim LESS credit — conservative by construction, never
+    a soundness hole."""
+    lits_by_id: dict[str, dict[str, str]] = {}
+    unit_by_id: dict[str, DetMaxUnit] = {}
+    by_market: dict[str, list[str]] = {}
+    for u in units:
+        lits = _loss_literals(u)
+        if lits is None:
+            continue
+        # Duplicate unit_ids would corrupt the matching's disjointness; a
+        # collision means the caller built ambiguous units ⇒ refuse to pair.
+        if u.unit_id in unit_by_id:
+            return 0.0
+        lits_by_id[u.unit_id] = lits
+        unit_by_id[u.unit_id] = u
+        for market in lits:
+            by_market.setdefault(market, []).append(u.unit_id)
+
+    seen: set[tuple[str, str]] = set()
+    pairs: list[tuple[float, str, str]] = []
+    budget = _HEDGE_PAIR_BUDGET
+    # Smallest market buckets first: a leg shared by very many units is the only
+    # way to blow the budget, and spending it there would starve every cheap,
+    # high-signal bucket. Ordering changes only WHICH pairs a truncated scan
+    # sees, never soundness (any matching is sound).
+    for ids in sorted(by_market.values(), key=len):
+        for i, a_id in enumerate(ids):
+            for b_id in ids[i + 1 :]:
+                key = (a_id, b_id) if a_id < b_id else (b_id, a_id)
+                if key in seen:
+                    continue
+                if budget <= 0:
+                    break
+                seen.add(key)
+                budget -= 1
+                a, b = unit_by_id[key[0]], unit_by_id[key[1]]
+                if not _certified_cannot_both_lose(
+                    a.our_side, lits_by_id[key[0]], b.our_side, lits_by_id[key[1]]
+                ):
+                    continue
+                credit = min(a.loss_cc, b.loss_cc)
+                if credit > 0.0:
+                    pairs.append((credit, key[0], key[1]))
+            if budget <= 0:
+                break
+        if budget <= 0:
+            break
+
+    pairs.sort(key=lambda p: (-p[0], p[1], p[2]))
+    used: set[str] = set()
+    total = 0.0
+    for credit, a_id, b_id in pairs:
+        if a_id in used or b_id in used:
+            continue
+        used.add(a_id)
+        used.add(b_id)
+        total += credit
     return total
 
 
@@ -2064,6 +2531,13 @@ def evaluate_candidate_book_risk(
     require_p_book_non_decreasing: bool = False,
     worst_challenger_ev_tolerance: float = float("-inf"),
     det_max_mutex_aware: bool = True,
+    # FIX 2 (2026-07-28): the EXCHANGE-DETERMINATION provider + its arming bit.
+    # Threaded so the CONFIRM-time gate resolves settled legs exactly as the
+    # quote-time cap does; without it the gate would recharge $80.20 of already-
+    # decided outcomes at the one moment the headroom is actually spent.
+    settled_facts: SettledFactProvider | None = None,
+    det_max_settlement_aware: bool = False,
+    det_max_hedge_credit: bool = False,
 ) -> CandidateBookRisk:
     """Candidate- and reservation-aware portfolio risk on COMMON sampled states.
 
@@ -2120,6 +2594,9 @@ def evaluate_candidate_book_risk(
         all_positions,
         marginals=marginals,
         within_game_rho=within_game_rho,
+        # FIX 2: only when ARMED — unarmed the merged model carries no settled
+        # map at all, so every det-max path below is byte-identical.
+        settled_facts=settled_facts if det_max_settlement_aware else None,
     )
 
     empty = _TailAxes(
@@ -2258,8 +2735,9 @@ def evaluate_candidate_book_risk(
         empty_pnl = np.zeros(0, dtype=np.float64)
         pre_pnl = post_pnl = pre_pnl_c = post_pnl_c = empty_pnl
 
-    pre_det, pre_gross = _det_and_gross(pre_positions, pre_combos)
-    post_det, post_gross = _det_and_gross(all_positions, post_combos)
+    settled_map = model.settled_leg_values
+    pre_det, pre_gross = _det_and_gross(pre_positions, pre_combos, settled_map)
+    post_det, post_gross = _det_and_gross(all_positions, post_combos, settled_map)
 
     # MUTEX/SCENARIO-AWARE deterministic bound (2026-07-18): the SAME counted
     # premium-at-risk (committed + reservations + simultaneous accepts [+ the
@@ -2275,6 +2753,12 @@ def evaluate_candidate_book_risk(
     # None (fail closed to comonotone, never open).
     pre_mutex: float | None = None
     post_mutex: float | None = None
+    # FIX 3 (2026-07-28): the offsetting-position credit on each book, measured
+    # alongside the bound and NEVER pre-subtracted. Shadow (the default) reports
+    # it on the verdict's axes; ARMED, ``_candidate_gate`` subtracts the POST
+    # credit before the det budget check. See the FIX 3 block in this module.
+    pre_hedge_credit = 0.0
+    post_hedge_credit = 0.0
     if (
         det_max_mutex_aware
         and portfolio_det_max_frac is not None
@@ -2282,29 +2766,34 @@ def evaluate_candidate_book_risk(
         and bankroll_cc > 0
     ):
         try:
-            pre_units, pre_reserved = _det_units_from_positions(pre_positions)
-            post_units, post_reserved = _det_units_from_positions(all_positions)
-            pre_mutex = min(
-                pre_det,
-                mutex_aware_det_max_from_units(
-                    pre_units,
-                    reserved_loss_cc=pre_reserved,
-                    marginals=marginals,
-                    structural_cfg=structural_cfg,
-                ),
+            gate_facts = settled_facts if det_max_settlement_aware else None
+            pre_units, pre_reserved = _det_units_from_positions(
+                pre_positions, gate_facts
             )
-            post_mutex = min(
-                post_det,
-                mutex_aware_det_max_from_units(
-                    post_units,
-                    reserved_loss_cc=post_reserved,
-                    marginals=marginals,
-                    structural_cfg=structural_cfg,
-                ),
+            post_units, post_reserved = _det_units_from_positions(
+                all_positions, gate_facts
             )
+            pre_raw, pre_hedge_credit = mutex_aware_det_max_and_credit(
+                pre_units,
+                reserved_loss_cc=pre_reserved,
+                marginals=marginals,
+                structural_cfg=structural_cfg,
+            )
+            post_raw, post_hedge_credit = mutex_aware_det_max_and_credit(
+                post_units,
+                reserved_loss_cc=post_reserved,
+                marginals=marginals,
+                structural_cfg=structural_cfg,
+            )
+            pre_mutex = min(pre_det, pre_raw)
+            post_mutex = min(post_det, post_raw)
+            pre_hedge_credit = max(0.0, min(pre_hedge_credit, pre_mutex))
+            post_hedge_credit = max(0.0, min(post_hedge_credit, post_mutex))
         except Exception:
             pre_mutex = None
             post_mutex = None
+            pre_hedge_credit = 0.0
+            post_hedge_credit = 0.0
 
     pre_axes = _tail_axes_from_pnl(
         pre_pnl,
@@ -2317,6 +2806,7 @@ def evaluate_candidate_book_risk(
         split_pnl=pre_split_pnl,
         ruin_prob_ci_z=ruin_prob_ci_z,
         mutex_aware_det_max_cc=pre_mutex,
+        det_max_hedge_credit_cc=pre_hedge_credit,
     )
     post_axes = _tail_axes_from_pnl(
         post_pnl,
@@ -2329,6 +2819,7 @@ def evaluate_candidate_book_risk(
         split_pnl=post_split_pnl,
         ruin_prob_ci_z=ruin_prob_ci_z,
         mutex_aware_det_max_cc=post_mutex,
+        det_max_hedge_credit_cc=post_hedge_credit,
     )
     # PRODUCTION-model candidate EV — the number the admission policy gates on.
     candidate_ev = post_axes.ev_cc - pre_axes.ev_cc
@@ -2405,6 +2896,7 @@ def evaluate_candidate_book_risk(
         bankroll_cc=bankroll_cc,
         portfolio_cvar_frac=portfolio_cvar_frac,
         portfolio_det_max_frac=portfolio_det_max_frac,
+        det_max_hedge_credit=det_max_hedge_credit,
         portfolio_ruin_prob_budget=portfolio_ruin_prob_budget,
         absolute_notional_multiple=absolute_notional_multiple,
         hedge_cost_budget_cc=hedge_cost_budget_cc,
@@ -2459,6 +2951,7 @@ def _candidate_gate(
     absolute_notional_multiple: int | None,
     hedge_cost_budget_cc: int,
     allow_negative_ev_hedge: bool,
+    det_max_hedge_credit: bool = False,
     hedge_budget_tail_derived: bool = False,
     tail_prob_gate: bool = False,
     kill_tail_prob: float = 0.02,
@@ -2628,6 +3121,15 @@ def _candidate_gate(
         post_det_gate = post.deterministic_max_loss_cc
         if post.mutex_aware_det_max_cc is not None:
             post_det_gate = min(post_det_gate, post.mutex_aware_det_max_cc)
+            # FIX 3 HEDGE ACCOUNTING (2026-07-28, arming flag defaults SHADOW).
+            # Two positions that provably CANNOT BOTH LOSE must not both be
+            # charged. Applied ONLY on top of the mutex-aware bound the credit
+            # was measured against (never on the raw comonotone fallback, whose
+            # None case means the fold never ran). Disarmed ⇒ byte-identical.
+            if det_max_hedge_credit:
+                post_det_gate = max(
+                    0.0, post_det_gate - post.det_max_hedge_credit_cc
+                )
         if post_det_gate > det_thr:
             return False, "post_deterministic_max_over_budget"
 

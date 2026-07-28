@@ -319,6 +319,31 @@ class RiskLimits:
     # SKIP_PORTFOLIO_DET_MAX reason are unchanged; both bounds are logged in
     # the breach detail so monitoring can compare.
     portfolio_det_max_mutex_aware: bool = True
+    # FIX 3 HEDGE ACCOUNTING (2026-07-28) — the RISK-LEDGER axis, deliberately
+    # distinct from the 2026-07-27 skew work (which changed the PRICE we quote
+    # on offsetting flow, not what it CONSUMES). The mutex fold buckets only
+    # long-NO units per game, so a COMPLEMENT position — the opposite side of a
+    # combo we already hold, which cannot lose when that one does — fell into
+    # the comonotone residual and was charged its FULL premium ON TOP of the
+    # position it offsets. True: the det-max cap subtracts the snapshot's
+    # ``det_max_hedge_credit_cc`` (disjoint certified-exclusive pairs, charged
+    # ONCE instead of twice) from the mutex-aware bound. False (default,
+    # SHADOW): the credit is measured and logged in the breach detail but never
+    # gates — byte-identical. Certification is state enumeration over leg-outcome
+    # literals (sim/book_risk._certified_cannot_both_lose), never a leg-sign
+    # heuristic; anything ambiguous stays charged in full.
+    det_max_hedge_credit: bool = False
+    # FIX 2 SETTLED-LEG DET-MAX (2026-07-28). The deterministic max-loss axis is
+    # a FORWARD bound, but it was computed unconditionally — a combo whose games
+    # are over and whose outcome the exchange has already DETERMINED still
+    # carried its full premium (live 2026-07-28: 14 of 77 positions, $80.20,
+    # against $3.34–$4.60 of binding headroom). True: a position the exchange's
+    # graded legs prove is WON contributes 0 to both det-max axes. False
+    # (default, SHADOW): measured into the snapshot's
+    # ``det_max_settled_credit_cc`` and logged, never gates — byte-identical.
+    # The flag rides here so the quote-time cap, the candidate gate and the
+    # book-risk MC all read ONE value and cannot diverge.
+    det_max_settlement_aware: bool = False
     # A2: max acceptable P(this settlement wave drops equity below the ruin floor).
     # Read off the structural-MC snapshot's ``p_ruin`` (floor set on the MC side,
     # -30% ⇒ equity < 0.70·bankroll). A probability budget, not a $ cap.
@@ -747,6 +772,13 @@ class PortfolioRisk(Protocol):
     # this field degrades to the comonotone number (fail closed, never looser).
     @property
     def mutex_aware_det_max_cc(self) -> float | None: ...
+
+    # FIX 3 (2026-07-28): the offsetting-position det-max credit measured on
+    # this snapshot (>= 0; 0.0 when uncomputed). Read via ``getattr`` with a
+    # 0.0 fallback in ``check`` so a snapshot/fake predating this field simply
+    # takes no credit (fail closed, never looser).
+    @property
+    def det_max_hedge_credit_cc(self) -> float: ...
 
 
 class LimitChecker:
@@ -1575,9 +1607,20 @@ class LimitChecker:
                 # logged in the breach detail for live monitoring comparison.
                 det_comono_cc = book_risk.deterministic_max_loss_cc
                 det_mutex_cc = getattr(book_risk, "mutex_aware_det_max_cc", None)
+                # FIX 3 (2026-07-28): the offsetting-position credit measured on
+                # this snapshot. ALWAYS read for the breach detail (shadow
+                # visibility); SUBTRACTED only when armed, and only on top of
+                # the mutex-aware bound it was measured against.
+                hedge_credit_cc = float(
+                    getattr(book_risk, "det_max_hedge_credit_cc", 0.0) or 0.0
+                )
                 det_gate_cc = det_comono_cc
+                applied_credit_cc = 0.0
                 if limits.portfolio_det_max_mutex_aware and det_mutex_cc is not None:
                     det_gate_cc = min(det_comono_cc, float(det_mutex_cc))
+                    if limits.det_max_hedge_credit:
+                        applied_credit_cc = max(0.0, min(hedge_credit_cc, det_gate_cc))
+                        det_gate_cc = det_gate_cc - applied_credit_cc
                 if det_gate_cc > det_max_thr:
                     mutex_note = (
                         f"{int(det_mutex_cc)}cc"
@@ -1591,7 +1634,10 @@ class LimitChecker:
                             f"{int(det_gate_cc)}cc (comonotone "
                             f"{int(det_comono_cc)}cc, mutex-aware {mutex_note}, "
                             f"mutex gating "
-                            f"{'on' if limits.portfolio_det_max_mutex_aware else 'off'}) > "
+                            f"{'on' if limits.portfolio_det_max_mutex_aware else 'off'}, "
+                            f"hedge credit {int(hedge_credit_cc)}cc "
+                            f"{'applied' if limits.det_max_hedge_credit else 'shadow'}"
+                            f") > "
                             f"{limits.portfolio_det_max_frac} bankroll = "
                             f"{det_max_thr}cc",
                             shadow=shadow,

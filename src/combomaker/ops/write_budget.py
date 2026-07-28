@@ -70,18 +70,34 @@ class WriteBudget:
     capacity: int
     refill_s: float
     _state: _BudgetState
+    # PRIORITY FLOOR (2026-07-27). Tokens ROUTINE spenders may not touch, so a
+    # continuous high-volume consumer can never take the whole bucket away from
+    # a low-volume, CORRECTNESS-CRITICAL one. 0 ⇒ the historical single-tier
+    # behaviour (every caller equal), which is what every write caller keeps.
+    reserve: int = 0
 
     @classmethod
-    def create(cls, clock: Clock, *, capacity: int, refill_s: float) -> WriteBudget:
+    def create(
+        cls, clock: Clock, *, capacity: int, refill_s: float, reserve: int = 0
+    ) -> WriteBudget:
         if capacity < 1:
             raise ValueError("write budget capacity must be >= 1")
         if refill_s <= 0:
             raise ValueError("write budget refill_s must be > 0")
+        if reserve < 0:
+            raise ValueError("budget reserve must be >= 0")
+        if reserve >= capacity:
+            # A reserve that swallows the bucket would starve the ROUTINE tier
+            # forever — the mirror of the defect the reserve exists to fix.
+            raise ValueError(
+                f"budget reserve {reserve} must be < capacity {capacity}"
+            )
         return cls(
             clock=clock,
             capacity=capacity,
             refill_s=refill_s,
             _state=_BudgetState(tokens=capacity, last_refill=clock.now().timestamp()),
+            reserve=reserve,
         )
 
     @property
@@ -106,34 +122,52 @@ class WriteBudget:
             # accumulate instead of being rounded away on every call.
             self._state.last_refill += gained * self.refill_s / self.capacity
 
-    def try_spend(self, cost: int = 1) -> bool:
+    def _floor(self, critical: bool) -> int:
+        """Tokens this tier may NOT spend below. CRITICAL callers see 0 (the
+        whole bucket); ROUTINE callers see ``reserve``."""
+        return 0 if critical else self.reserve
+
+    def try_spend(self, cost: int = 1, *, critical: bool = False) -> bool:
         """Consume ``cost`` tokens; True if they were available. Refills first.
 
         ``cost`` defaults to 1 — the historical, request-counting behaviour the
         supervisor's reserved cancel allowance is sized in. Callers pacing
         against the exchange's real bucket pass the endpoint's DOCUMENTED cost
-        (``exchange.rest.DELETE_QUOTE_TOKEN_COST``)."""
+        (``exchange.rest.DELETE_QUOTE_TOKEN_COST``).
+
+        ``critical=True`` may draw the ``reserve``; the default ROUTINE tier
+        may not (it yields at the floor). With ``reserve=0`` both tiers are
+        identical, which is every existing caller."""
         if cost < 1:
             raise ValueError(f"cost must be >= 1, got {cost}")
         self._refill()
-        if self._state.tokens >= cost:
-            self._state.tokens -= cost
+        state = self._state
+        # Floor INLINED, not ``self._floor(critical)``: this is the write/cancel
+        # and metadata-pacing hot path, and a Python method call here measured
+        # +8.8% per call against HEAD where the subtraction measures +0.5%
+        # (bench in the report). "Throughput never regresses" applies to the
+        # primitive too.
+        available = state.tokens if critical else state.tokens - self.reserve
+        if available >= cost:
+            state.tokens -= cost
             return True
         return False
 
-    def seconds_until(self, cost: int = 1) -> float:
-        """Wall seconds until ``cost`` tokens are available (0.0 when they are
-        now, ``inf`` when ``cost`` exceeds the whole capacity and no amount of
-        waiting can ever satisfy it).
+    def seconds_until(self, cost: int = 1, *, critical: bool = False) -> float:
+        """Wall seconds until ``cost`` tokens are available to this TIER (0.0
+        when they are now, ``inf`` when ``cost`` exceeds what the tier could
+        ever hold and no amount of waiting can satisfy it).
 
         A caller that must WAIT for budget derives its sleep from the bucket's
         own rate here instead of inventing a poll interval."""
-        if cost > self.capacity:
+        floor = self._floor(critical)
+        if cost > self.capacity - floor:
             return float("inf")
         self._refill()
-        if self._state.tokens >= cost:
+        available = self._state.tokens - floor
+        if available >= cost:
             return 0.0
-        needed = cost - self._state.tokens
+        needed = cost - available
         return needed * self.refill_s / self.capacity
 
     @property
@@ -149,4 +183,13 @@ class WriteBudget:
 # clone this, the read side takes the same primitive under a name that does not
 # lie about which bucket it guards; ``WriteBudget`` stays as the historical name
 # for the withdrawal/kill paths.
+#
+# PRIORITY (2026-07-27): one bucket shared by a CONTINUOUS high-volume consumer
+# (metadata refresh) and a LOW-VOLUME correctness-critical one (settled-leg
+# resolution) is a priority inversion — the high-volume consumer wins every race
+# for the last token and settlement resolution is what starves. ``reserve`` is
+# the repair: a floor of tokens the ROUTINE tier may not touch, so the CRITICAL
+# tier always has its own bounded pass available. The caller DERIVES the reserve
+# from the critical consumer's own bounded per-pass claim × the live-verified
+# per-call token cost — never a number picked by hand.
 TokenBudget = WriteBudget

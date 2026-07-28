@@ -55,6 +55,22 @@ class _StubRest:
         return self._payload
 
 
+class _PagedStubRest:
+    """A positions endpoint that PAGES: the caller must follow the cursor or it
+    sees only the first page (the truncation defect this pins)."""
+
+    def __init__(self, pages: list[dict[str, Any]]) -> None:
+        self._pages = pages
+        self.get_positions_calls: list[dict[str, Any]] = []
+
+    async def get_positions(self, **params: Any) -> dict[str, Any]:
+        self.get_positions_calls.append(dict(params))
+        idx = int(params.get("cursor") or 0)
+        rows = self._pages[idx] if idx < len(self._pages) else {}
+        cursor = str(idx + 1) if idx + 1 < len(self._pages) else ""
+        return {"market_positions": rows.get("market_positions", []), "cursor": cursor}
+
+
 async def _seed_store(tmp_path: Path) -> Store:
     store = await Store.open(tmp_path / "t.sqlite3", FakeClock())
     await store.record_rfq(_rfq("KXMVE-ARG", "ARG"), source="ws")
@@ -506,7 +522,14 @@ async def test_reconcile_subaccount_pinned_at_query_layer(tmp_path: Path) -> Non
 
     Here the stub endpoint (as the real one does) returns only subaccount 0's
     positions when queried with subaccount=0. The test asserts the pin was threaded
-    to the query, and that every returned row is folded (no fictional row filter)."""
+    to the query, and that every returned row is folded (no fictional row filter).
+
+    PAGED (2026-07-27): the boot read now goes through ``get_positions_paged``,
+    the same helper the 5-minute reconcile uses — an unpaginated boot read
+    truncates past the endpoint's default page size and a truncated read must
+    never be able to boot an under-reserved book. So the query also carries
+    ``limit``/``count_filter``; the PIN is what this test is about and it is
+    still threaded exactly as before (and still absent when None)."""
     store = await _seed_store(tmp_path)
     try:
         rest = _StubRest({"market_positions": [
@@ -515,8 +538,10 @@ async def test_reconcile_subaccount_pinned_at_query_layer(tmp_path: Path) -> Non
         exposure = ExposureBook(CONV, is_me_event=IS_ME)
         await QuoteApp._rehydrate_exposure_book(
             cast(Any, None), cast(Any, rest), store, exposure, subaccount=0)
-        # the pin reached the endpoint (the REAL filter mechanism):
-        assert rest.get_positions_calls == [{"subaccount": 0}]
+        # the pin reached the endpoint (the REAL filter mechanism), on a PAGED
+        # query bounded to genuinely open rows:
+        assert rest.get_positions_calls == [
+            {"limit": 200, "count_filter": "position", "subaccount": 0}]
         # both rows the pinned endpoint returned are folded (no row-level filter):
         assert {p.combo_ticker for p in exposure.positions.values()} == {
             "KXMVE-ARG", "KXMVE-ENG"}
@@ -527,16 +552,49 @@ async def test_reconcile_subaccount_pinned_at_query_layer(tmp_path: Path) -> Non
         await QuoteApp._rehydrate_exposure_book(
             cast(Any, None), cast(Any, rest3), store,
             ExposureBook(CONV, is_me_event=IS_ME), subaccount=3)
-        assert rest3.get_positions_calls == [{"subaccount": 3}]
+        assert rest3.get_positions_calls == [
+            {"limit": 200, "count_filter": "position", "subaccount": 3}]
 
-        # subaccount=None ⇒ NO param (the exchange default / all-subaccount posture,
-        # unchanged from the pre-P0-5 call): the helper never invents a pin.
+        # subaccount=None ⇒ NO pin param (the exchange default / all-subaccount
+        # posture, unchanged from the pre-P0-5 call): never an invented pin.
         rest2 = _StubRest({"market_positions": [
             {"ticker": "KXMVE-ARG", "position_fp": "-50.00"}]})
         await QuoteApp._rehydrate_exposure_book(
             cast(Any, None), cast(Any, rest2), store,
             ExposureBook(CONV, is_me_event=IS_ME))
-        assert rest2.get_positions_calls == [{}]
+        assert rest2.get_positions_calls == [
+            {"limit": 200, "count_filter": "position"}]
+        assert "subaccount" not in rest2.get_positions_calls[0]
+    finally:
+        await store.close()
+
+
+async def test_boot_rehydrate_pages_the_positions_listing(tmp_path: Path) -> None:
+    """TRUNCATION AT BOOT (2026-07-27 diagnosis). The boot read was the last
+    unpaginated ``get_positions`` in the tree — the 5-minute reconcile path was
+    paged by the 2026-07-21 F3 review and this one was missed. Past the
+    endpoint's default page size the exposure book would come up MISSING its
+    tail: real exposure not reserved, for up to a full reconcile interval.
+
+    Both combos here live on page 2 of the stub's listing, so a caller that
+    ignores the cursor books nothing at all."""
+    store = await _seed_store(tmp_path)
+    try:
+        rest = _PagedStubRest([
+            {"market_positions": [{"ticker": "KXMVE-OTHER", "position_fp": "0.00"}]},
+            {"market_positions": [
+                {"ticker": "KXMVE-ARG", "position_fp": "-50.00"},
+                {"ticker": "KXMVE-ENG", "position_fp": "-40.00"}]},
+        ])
+        exposure = ExposureBook(CONV, is_me_event=IS_ME)
+        await QuoteApp._rehydrate_exposure_book(
+            cast(Any, None), cast(Any, rest), store, exposure, subaccount=0)
+        assert {p.combo_ticker for p in exposure.positions.values()} == {
+            "KXMVE-ARG", "KXMVE-ENG"}
+        # The cursor was followed, and the pin rode every page.
+        assert len(rest.get_positions_calls) == 2
+        assert rest.get_positions_calls[1]["cursor"] == "1"
+        assert all(c["subaccount"] == 0 for c in rest.get_positions_calls)
     finally:
         await store.close()
 

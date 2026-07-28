@@ -2819,6 +2819,21 @@ class RiskConfig(StrictModel):
     # enforced wall stands untouched. The cap ITSELF remains hand-set
     # tech-debt (dissolution into measured capacity is the follow-up build).
     open_quote_ev_eviction: bool = False
+    # FIX 4 VALUE-RANKED ALLOCATION OF A FIXED DET-MAX BUDGET (2026-07-28) —
+    # ARMING FLAG, DEFAULT SHADOW. det-max is correlation-INDEPENDENT, so
+    # deciding WHICH candidates consume a fixed budget is a deterministic
+    # knapsack, not a model call. Measured on the 2026-07-27 won-auction set:
+    # the 17 auctions we DECLINED were 24% DENSER in EV per unit of consumed
+    # det-max than the 21 we confirmed (0.0491 vs 0.0395). This EXTENDS the
+    # existing ``open_quote_ev_eviction`` mechanism onto the det-max axis
+    # (ranking by DENSITY = EV / det-max consumed) rather than adding a second
+    # eviction path. It NEVER admits anything the caps refuse — after an
+    # eviction the SAME ``LimitChecker.check`` re-runs and any surviving breach
+    # declines exactly as before. Modes: "shadow" (DEFAULT — the reallocation
+    # is computed and LOGGED as ``open_quote_eviction_shadow``, nothing is
+    # deleted, the decision path is byte-identical), "on" (armed), "off" (the
+    # mechanism never runs at all on this axis).
+    det_budget_value_ranking: str = "shadow"
     # DEPLOYMENT SCALE (operator LEVER #1, risk/deploy_scale.py). Default OFF =
     # byte-identical: the scale is never solved, never consumed, and every
     # ``LimitChecker.check`` receives 1.0. When armed, the bot SOLVES — off the
@@ -3019,6 +3034,55 @@ class RiskConfig(StrictModel):
     # (threaded in QuoteLifecycle._build_candidate_gate_inputs).
     # Reason codes and budgets are unchanged.
     portfolio_det_max_mutex_aware: bool = True
+    # FIX 3 HEDGE ACCOUNTING (2026-07-28) — ARMING FLAG, DEFAULT SHADOW.
+    # The 2026-07-27 skew work changed the PRICE we quote on offsetting flow.
+    # This is the RISK ACCOUNTING: two positions that provably CANNOT BOTH LOSE
+    # (a combo complement, or any sub-parlay of a combo we hold NO on) must not
+    # both be charged into det-max. The mutex fold buckets only long-NO units
+    # per game, so a complement hedge was charged its FULL premium ON TOP of the
+    # position it offsets. False (default): the credit is MEASURED and logged
+    # (snapshot ``det_max_hedge_credit_cc`` + the SKIP_PORTFOLIO_DET_MAX breach
+    # detail) but never gates — byte-identical. True: the quote-time det-max cap
+    # AND the candidate gate subtract it from the mutex-aware bound. Never
+    # loosens any other axis: certification is exact state enumeration over leg
+    # literals and anything ambiguous stays charged in full.
+    det_max_hedge_credit: bool = False
+    # FIX 2 SETTLED-LEG DET-MAX (2026-07-28) — ARMING FLAG, DEFAULT SHADOW.
+    # ``_deterministic_all_hit_loss_cc`` charges a full FORWARD max-loss on every
+    # held combo unconditionally, including combos whose games are OVER and whose
+    # outcome the exchange has already determined. Measured on the live book
+    # 2026-07-28: 14 of 77 open positions had every leg on games that finished
+    # the previous day and were still charged $80.20 — against $3.34–$4.60 of
+    # actual binding headroom, i.e. 17–24x the entire headroom, recurring every
+    # night. False (default): the settled credit is MEASURED and logged
+    # (snapshot ``det_max_settled_credit_cc``) but the enforced axis is
+    # byte-identical. True: a combo the exchange's own determinations prove is
+    # WON contributes 0 to both det-max axes. This is MODEL-IMMUNE — it consumes
+    # exchange determinations, never a correlation estimate — and it FAILS
+    # CLOSED: any leg whose settlement is unknown, ungraded or unread is charged
+    # in full, and a settlement is never inferred from a leg's marginal (the
+    # marginal walks the live FEED first, so a market pinned at 0/100 would
+    # otherwise masquerade as settled).
+    det_max_settlement_aware: bool = False
+    # FIX 5 STALE-SNAPSHOT DECAY (2026-07-28) — ARMING FLAG, DEFAULT SHADOW.
+    # ``_book_risk_for_check`` discards the book-risk snapshot on ANY position-
+    # generation mismatch, and a RESERVATION bumps that counter on every accept —
+    # so under fan-out the cap fails closed on freshness, not on risk. Measured
+    # 2026-07-28: 407 of 407 ``skip_portfolio_cvar`` declines carried
+    # ``book_risk_generation_stale`` and NOTHING else; at the 10:24Z peak that was
+    # 289 declines against 62 quotes in ONE minute, with the generation gap equal
+    # to exactly 1 in every single case (p50 = p90 = max = 1) — one reservation.
+    # THE REPO ALREADY SOLVED THIS ONCE and wrote the lesson at
+    # ``risk/deploy_scale.py``: "a reservation bumps this counter on every accept,
+    # so a hard cliff here made the whole feature inert" — the fix was to DECAY by
+    # measured book growth, not to discard. True: a generation-stale snapshot is
+    # CHARGED for every dollar of premium added since it was measured and then
+    # used; False (default): the decay is computed and LOGGED
+    # (``book_risk_stale_decay_shadow``) while the discard still happens —
+    # byte-identical. This NEVER loosens the posture: the decayed snapshot is
+    # strictly MORE conservative than the measurement it came from, and a book
+    # that has more than doubled since the measurement abstains outright.
+    book_risk_stale_decay: bool = False
     portfolio_ruin_prob_budget: str = "0.05"  # A2: max P(equity < ruin floor this wave)
     absolute_notional_multiple: int = 3   # utilization backstop (× bankroll)
     fill_velocity_window_s: float = 2.0
@@ -3105,6 +3169,17 @@ class RiskConfig(StrictModel):
     # 0 is a MEANINGFUL value for these two (trim disabled / zero hedge budget
     # = today's behaviour), so they get their own >= 0 validator rather than
     # joining the >= 1 knob set above.
+    # FIX 4 arming mode — a tri-state, not a bool, so "measure it live without
+    # changing a decision" is a first-class state rather than a code edit.
+    @field_validator("det_budget_value_ranking")
+    @classmethod
+    def _eviction_mode(cls, v: str) -> str:
+        if v not in ("off", "shadow", "on"):
+            raise ValueError(
+                f"must be one of 'off' / 'shadow' / 'on', got {v!r}"
+            )
+        return v
+
     @field_validator("lastlook_waiver_topk_resting", "hedge_cost_budget_cc")
     @classmethod
     def _nonnegative_int_knob(cls, v: int) -> int:
@@ -3279,6 +3354,8 @@ class RiskConfig(StrictModel):
             portfolio_cvar_frac=Fraction(Decimal(self.portfolio_cvar_frac)),
             portfolio_det_max_frac=Fraction(Decimal(self.portfolio_det_max_frac)),
             portfolio_det_max_mutex_aware=self.portfolio_det_max_mutex_aware,
+            det_max_hedge_credit=self.det_max_hedge_credit,
+            det_max_settlement_aware=self.det_max_settlement_aware,
             portfolio_tail_prob_gate=self.portfolio_tail_prob_gate,
             portfolio_kill_tail_prob=float(
                 Fraction(Decimal(self.portfolio_kill_tail_prob))

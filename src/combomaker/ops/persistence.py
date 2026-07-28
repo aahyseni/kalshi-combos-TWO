@@ -731,6 +731,7 @@ class Store:
         combo_ticker: str | None = None,
         our_side: str | None = None,
         contracts_centi: int | None = None,
+        reconciled_at: str | None = None,
     ) -> str | None:
         """P1.10. Mark a ledger position SETTLED with the exchange settlement:
         value V, realized P&L, settlement fee, and the reconciliation TIME (now).
@@ -745,7 +746,14 @@ class Store:
         re-mints ids as ``rehydrate:<ticker>``) no settled row could ever match
         an open row written pre-restart, so the ledger silently stopped
         recording settlements. Returns the position_id of the row actually
-        settled, or None when nothing matched (caller may log the miss)."""
+        settled, or None when nothing matched (caller may log the miss).
+
+        ``reconciled_at`` overrides the stamp with the EXCHANGE's own
+        ``settled_time`` (2026-07-27). ``day_realized_pnl_cc`` — p_night's
+        cross-restart realized anchor — buckets on this column, so a row closed
+        today for a combo that settled last night must carry LAST NIGHT's
+        stamp or the seed mis-attributes the whole backlog to today. Default
+        (None) keeps the live path's behaviour: reconciled now, settled now."""
         target = await self._resolve_open_ledger_row(
             position_id,
             leg_set_hash=leg_set_hash,
@@ -765,12 +773,58 @@ class Store:
                 int(realized_pnl_cc),
                 int(settlement_fee_cc),
                 int(settlement_fee_cc),
-                self._now(),
+                reconciled_at or self._now(),
                 target,
             ),
         )
         await self._db.commit()
         return target
+
+    async def open_ledger_rows_for_ticker(self, combo_ticker: str) -> list[JsonDict]:
+        """Every OPEN ``position_ledger`` row on one combo ticker, oldest first.
+        (``open_ledger_tickers`` below is the batched pre-filter for it.)
+
+        LEDGER RECONCILIATION (2026-07-27). A combo that settled while the
+        process was DOWN is absent from ``get_positions`` at the next boot, so
+        the exposure book never holds it, so the settlement handler dropped its
+        row as "not ours" and the ledger row stayed ``open`` forever (measured:
+        56 orphan rows, $775.85 of cost basis, +1..+4 per restart, under-counting
+        p_night's realized anchor and the settlement-calibration curve). The
+        handler now closes those rows from EXCHANGE TRUTH, and this is the read
+        it does it with: everything needed to recompute the position's realized
+        P&L under the one payout formula, and nothing else."""
+        async with self._db.execute(
+            "SELECT position_id, combo_ticker, our_side, contracts_centi,"
+            " entry_price_cc, opened_at FROM position_ledger"
+            " WHERE status='open' AND combo_ticker=?"
+            " ORDER BY opened_at ASC, position_id ASC",
+            (combo_ticker,),
+        ) as cursor:
+            return [
+                {
+                    "position_id": str(r[0]),
+                    "combo_ticker": str(r[1]),
+                    "our_side": str(r[2]),
+                    "contracts_centi": int(r[3]),
+                    "entry_price_cc": int(r[4]),
+                    "opened_at": str(r[5]),
+                }
+                async for r in cursor
+            ]
+
+    async def open_ledger_tickers(self) -> set[str]:
+        """Every DISTINCT combo ticker carrying an OPEN ``position_ledger``
+        row — ONE indexed read (2026-07-27).
+
+        The orphan reconciliation is a needle-in-a-haystack search: the
+        settlement poller re-pages the account's WHOLE settlement history every
+        30 s, and only the few hundred tickers in this set can possibly still
+        have an open row. Without this the reconciliation would issue one DB
+        round-trip per historical settlement, per process."""
+        async with self._db.execute(
+            "SELECT DISTINCT combo_ticker FROM position_ledger WHERE status='open'"
+        ) as cursor:
+            return {str(r[0]) async for r in cursor}
 
     async def open_ledger_identities(self) -> list[tuple[str, str, str]]:
         """``(leg_set_hash, combo_ticker, our_side)`` of every OPEN ledger row —

@@ -223,6 +223,48 @@ class Settlement:
         return self.settled_value >= 1.0
 
 
+def settlement_payout_per_contract_cc(
+    our_side: Side, settled_value: float, *, no_pays_complement: bool
+) -> int:
+    """GROSS payout per contract in cc for the side we hold: LONG NO pays
+    $1 − V (scalar-aware, DNP "rounded down"), LONG YES pays V.
+
+    A NO credit requires the verified complement convention
+    (``combo_no_pays_complement``, verified True since 2026-07-10); unverified
+    ⇒ ``StaleBalanceError`` (fail-closed, never a convenient 0)."""
+    if our_side is Side.NO:
+        if not no_pays_complement:
+            raise StaleBalanceError(
+                "NO settlement credit requires combo_no_pays_complement "
+                "verified True (Conventions) — refusing to book an unverified "
+                "settlement"
+            )
+        return _no_payout_per_contract_cc(settled_value)
+    return round(settled_value * CC_PER_DOLLAR)
+
+
+def settlement_realized_cc(
+    settlement: Settlement, *, no_pays_complement: bool
+) -> int:
+    """The realized cc of one settled position — payout − premium − fee.
+
+    THE one place the economics live (extracted from
+    ``BalanceTracker.apply_settlement`` 2026-07-27): the ledger-reconciliation
+    path must compute the identical figure for a settlement that landed while
+    the position was not in the book (a combo that settled while the process
+    was down), and a second copy of a money formula is exactly the quiet-failure
+    species defense #1 exists for. Pure: no accumulator is touched."""
+    contracts = int(settlement.contracts)
+    premium_paid_cc = contracts * int(settlement.entry_price_cc) // 100
+    payout_per_ct_cc = settlement_payout_per_contract_cc(
+        settlement.our_side,
+        settlement.settled_value,
+        no_pays_complement=no_pays_complement,
+    )
+    payout_cc = contracts * payout_per_ct_cc // 100
+    return payout_cc - premium_paid_cc - int(settlement.fee_cc)
+
+
 class BalanceTracker:
     """Live bankroll (fail-closed on stale) + realized-P&L ledger.
 
@@ -786,31 +828,20 @@ class BalanceTracker:
         if settlement.position_id in self._settled_ids:
             return 0
 
-        contracts = int(settlement.contracts)
-        premium_paid_cc = contracts * int(settlement.entry_price_cc) // 100
         fee_cc = int(settlement.fee_cc)
-
-        if settlement.our_side is Side.NO:
-            # A NO credit requires the verified complement convention.
-            if not self._conventions.combo_no_pays_complement:
-                raise StaleBalanceError(
-                    "NO settlement credit requires combo_no_pays_complement "
-                    "verified True (Conventions) — refusing to book an unverified "
-                    "settlement"
-                )
-            # NO pays $1 − V per contract (scalar-aware, "rounded down").
-            payout_per_ct_cc = _no_payout_per_contract_cc(settlement.settled_value)
-        else:
-            # LONG YES pays V per contract (the mirror; defensive path).
-            payout_per_ct_cc = round(settlement.settled_value * CC_PER_DOLLAR)
+        # ONE formula (extracted 2026-07-27 so the ledger-reconciliation path can
+        # compute the SAME realized figure for a settlement that arrived while we
+        # held no position, without a second copy of the payout convention).
+        # Raises before anything mutates, preserving the guard order below.
+        realized_cc = settlement_realized_cc(
+            settlement, no_pays_complement=self.combo_no_pays_complement
+        )
 
         # Mark settled ONLY after every raising guard above, so a settlement that
         # raised (e.g. convention not yet verified) can be replayed and booked
         # once the guard clears — idempotency without a poison-pill drop.
         self._settled_ids.add(settlement.position_id)
-        payout_cc = contracts * payout_per_ct_cc // 100
 
-        realized_cc = payout_cc - premium_paid_cc - fee_cc
         self._realized_pnl_cc += realized_cc
         self._accrued_fees_cc += fee_cc
         if realized_cc < 0:
@@ -826,6 +857,13 @@ class BalanceTracker:
             realized_pnl_cc=self._realized_pnl_cc,
         )
         return realized_cc
+
+    @property
+    def combo_no_pays_complement(self) -> bool:
+        """The verified NO-payout convention this tracker books under — read by
+        the ledger-reconciliation path so it applies the SAME gate (and the same
+        fail-closed refusal) without importing the conventions fixture twice."""
+        return bool(self._conventions.combo_no_pays_complement)
 
     @property
     def realized_pnl_cc(self) -> int:

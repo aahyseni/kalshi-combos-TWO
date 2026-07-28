@@ -139,27 +139,47 @@
     {
       "launch_to_first_beat_s": 48.33,
       "log": "live_20260727_1023.log"
+    },
+    {
+      "launch_to_first_beat_s": 44.58,
+      "log": "live_20260727_1715.log"
+    },
+    {
+      "launch_to_first_beat_s": 46.33,
+      "log": "live_20260727_1810.log"
+    },
+    {
+      "launch_to_first_beat_s": 46.55,
+      "log": "live_20260727_1839.log"
+    },
+    {
+      "launch_to_first_beat_s": 47.83,
+      "log": "live_20260728_0445.log"
+    },
+    {
+      "launch_to_first_beat_s": 47.14,
+      "log": "live_20260728_1501.log"
     }
   ],
   "candidate_gate_attempts_max": 2,
-  "candidate_gate_confirm_events": 267,
+  "candidate_gate_confirm_events": 371,
   "candidate_gate_deadline_events": 70,
-  "live_n_positions_last": 46,
+  "live_n_positions_last": 55,
   "live_n_positions_max": 71,
-  "max_same_tick_quarantine": 11,
-  "max_same_tick_quarantine_where": "live_20260726_1606.log|2026-07-26T20:12:25",
+  "max_same_tick_quarantine": 15,
+  "max_same_tick_quarantine_where": "live_20260727_1839.log|2026-07-28T01:45:17",
   "observed_tier": {
     "event": "api_tier_observed",
     "level": "info",
     "metadata_reads_per_s_ceiling": 30.0,
     "read_capacity": 600,
     "read_refill_per_s": 300,
-    "ts": "2026-07-27T14:23:44.264399Z",
+    "ts": "2026-07-28T19:01:52.652782Z",
     "usage_tier": "advanced",
     "write_capacity": 600,
     "write_refill_per_s": 300
   },
-  "observed_tier_at": "2026-07-27T14:23:44.264399Z",
+  "observed_tier_at": "2026-07-28T19:01:52.652782Z",
   "provenance": {
     "manifest": {
       "live_20260722_relight.log": [
@@ -325,10 +345,30 @@
       "live_20260727_1023.log": [
         1156185252,
         1785171980.203
+      ],
+      "live_20260727_1715.log": [
+        373764563,
+        1785190158.469
+      ],
+      "live_20260727_1810.log": [
+        239461945,
+        1785191873.813
+      ],
+      "live_20260727_1839.log": [
+        2535892501,
+        1785222711.676
+      ],
+      "live_20260728_0445.log": [
+        560081798,
+        1785234326.103
+      ],
+      "live_20260728_1501.log": [
+        1967383161,
+        1785271666.384
       ]
     },
-    "scanned_bytes": 10041971164,
-    "scanned_logs": 41,
+    "scanned_bytes": 15718554921,
+    "scanned_logs": 46,
     "source": "fresh scan"
   }
 }

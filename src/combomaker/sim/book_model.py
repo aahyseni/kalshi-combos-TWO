@@ -56,7 +56,7 @@ space (floats OK, hard rule 5). This module builds ONLY the inputs to
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from numpy.typing import NDArray
@@ -91,6 +91,17 @@ DEFAULT_CROSS_EVENT_RHO = 0.0
 # mild positive (same-game legs lean together); low reaches ≤0 (could be
 # uncorrelated or negative), high is a conservative same-game ceiling.
 DEFAULT_FLAT_BAND: tuple[float, float, float] = (-0.20, 0.10, 0.40)
+
+# FIX 2 (2026-07-28). A leg ticker → the EXCHANGE'S OWN graded settlement value
+# (exactly 0.0 or 1.0), or None when the exchange has not determined it. The one
+# live implementation is ``SettledMarginalResolver.resolved`` — a permanent cache
+# of ``/markets/{ticker}`` determinations, filled off the hot path. It is passed
+# SEPARATELY from the marginal provider on purpose: ``QuoteLifecycle._marginals``
+# returns the FEED microprice first and only falls back to the graded fact, so a
+# marginal of exactly 0.0/1.0 does NOT prove settlement (a live market pinned at
+# 0 or 100 produces one). Resolving det-max off the marginal would therefore be an
+# INFERENCE; this provider is the exchange determination itself.
+SettledFactProvider = Callable[[str], float | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +150,19 @@ class BookModel:
     forces the whole model UNKNOWN), but their premium is carried here as a
     DETERMINISTIC reserve the risk MC adds OUTSIDE model ES — so their
     whole-account risk never vanishes from the tail number while never being
-    scored against a fabricated p=0.5."""
+    scored against a fabricated p=0.5.
+
+    ``settled_leg_values`` (FIX 2, 2026-07-28) maps a latent leg index to the
+    EXCHANGE-DETERMINED settlement value of that leg — exactly 0.0 or 1.0, and
+    ONLY ever sourced from the graded-fact cache (``SettledMarginalResolver``,
+    i.e. the exchange's own determination on ``/markets/{ticker}``). It is
+    deliberately a SEPARATE field from ``legs[i].p`` even though a graded leg's
+    marginal already equals its 0/1 fact: the marginal provider walks the FEED
+    FIRST, so a live market pinned at 0 or 100 would present ``p ∈ {0,1}``
+    without having settled at all. Treating that as a determination would be an
+    INFERENCE, and the det-max axis must never resolve a settlement it has not
+    read from the exchange. Absent (the default, an empty dict) ⇒ every position
+    is charged its FULL premium exactly as before (fail-closed)."""
 
     legs: tuple[LegModel, ...]
     positions: tuple[ComboPosition, ...]
@@ -153,6 +176,9 @@ class BookModel:
     event_by_index: dict[int, str | None]
     unknown: bool
     reserved_loss_cc: float = 0.0
+    # FIX 2: latent leg index → EXCHANGE-DETERMINED 0.0/1.0 (see the class
+    # docstring). Empty ⇒ no leg is resolved ⇒ byte-identical det-max.
+    settled_leg_values: dict[int, float] = field(default_factory=dict)
 
     def corr_tail_stress_for_band(self, band: str) -> NDArray[np.float64]:
         """The TAIL-DEPENDENCE STRESS matrix for a band ("point"|"low"|"high").
@@ -330,6 +356,7 @@ def build_book_model(
     within_game_rho: WithinGameRhoProvider | None = None,
     cross_event_rho: float = DEFAULT_CROSS_EVENT_RHO,
     flat_band: tuple[float, float, float] = DEFAULT_FLAT_BAND,
+    settled_facts: SettledFactProvider | None = None,
 ) -> BookModel:
     """Assemble the MC engine triple for the live book, the pricer's way.
 
@@ -355,6 +382,15 @@ def build_book_model(
     into ``reserved_loss_cc`` — a deterministic reserve the risk MC adds OUTSIDE
     the model ES. Its whole-account risk therefore stays in global capital
     accounting without ever being scored against a fabricated ``p=0.5``.
+
+    FIX 2 (2026-07-28) — ``settled_facts``: the optional EXCHANGE-DETERMINATION
+    provider. When supplied, each leg ticker is asked for its graded 0/1 outcome
+    and the resulting (index → value) map is carried on the model as
+    ``settled_leg_values`` for the deterministic max-loss axis to resolve
+    against. It is read ONLY here and ONLY from that provider — never from the
+    leg's marginal, which walks the live feed FIRST and so can present exactly
+    0.0/1.0 on a market that has not settled at all. None (the default) ⇒ an
+    empty map ⇒ det-max charges every position in full, exactly as before.
     """
     positions = list(positions)
     # Resolve each distinct leg's marginal ONCE (the provider walks feed → settled
@@ -404,6 +440,18 @@ def build_book_model(
             p = 0.5  # placeholder ONLY; `unknown` forbids using the stats
         legs.append(LegModel(p=p))
 
+    # FIX 2: the EXCHANGE-DETERMINED 0/1 facts for this leg universe, read from
+    # the graded-fact provider ONLY (never from ``p`` — see ``SettledFactProvider``).
+    # A value that is not EXACTLY 0.0 or 1.0 is discarded rather than rounded: a
+    # settlement fact is binary by construction, so anything else is not one, and
+    # the position it belongs to stays charged in full (fail-closed).
+    settled_leg_values: dict[int, float] = {}
+    if settled_facts is not None:
+        for idx, ticker in enumerate(ticker_by_index):
+            fact = settled_facts(ticker)
+            if fact == 0.0 or fact == 1.0:
+                settled_leg_values[idx] = float(fact)
+
     n = len(legs)
 
     # --- positions → engine ComboPositions (RISK-MODELED only; P0-4) ----------
@@ -424,6 +472,7 @@ def build_book_model(
             event_by_index=event_by_index,
             unknown=unknown,
             reserved_loss_cc=reserved_loss_cc,
+            settled_leg_values=settled_leg_values,
         )
 
     # --- within-game blocks: index sets keyed on the game code ---------------
@@ -572,6 +621,7 @@ def build_book_model(
         event_by_index=event_by_index,
         unknown=unknown,
         reserved_loss_cc=reserved_loss_cc,
+        settled_leg_values=settled_leg_values,
     )
 
 

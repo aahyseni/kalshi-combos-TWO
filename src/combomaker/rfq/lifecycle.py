@@ -139,6 +139,7 @@ from combomaker.sim.book_model import (
     BookModel,
     WithinGameRhoProvider,
     build_book_model,
+    select_modeled_positions,
     within_game_pair_tickers,
 )
 from combomaker.sim.book_risk import (
@@ -647,6 +648,12 @@ class LifecycleConfig:
     book_risk_mc_samples: int = 20_000
     book_risk_stale_after_s: float = 30.0
     book_risk_seed: int = 7
+    # FIX 5 (2026-07-28): arm the BOOK-GROWTH DECAY of a generation-stale
+    # snapshot instead of discarding it (see ``_book_risk_for_check``). False
+    # (default) = SHADOW: the decayed verdict is computed and logged, the
+    # discard still happens, behaviour byte-identical. The TIME-staleness guard
+    # (``book_risk_stale_after_s``) is NOT decayed and keeps failing closed.
+    book_risk_stale_decay: bool = False
     # A2 ruin floor: equity below this fraction of bankroll is "ruin". Operator
     # directive 2026-07-15: −30% ⇒ 0.70. Feeds compute_book_risk's p_ruin, which
     # the P(ruin) cap gates against ``portfolio_ruin_prob_budget``.
@@ -933,6 +940,12 @@ class LifecycleConfig:
     # slot cap, evict the weakest-EV resting quote for a strictly-higher-EV
     # candidate instead of blind-declining by arrival order. Default OFF.
     open_quote_ev_eviction: bool = False
+    # FIX 4 VALUE-RANKED DET-MAX ALLOCATION (2026-07-28): at the det-max budget
+    # wall, evict the weakest EV-per-consumed-det-max resting quote for a
+    # materially denser candidate instead of blind-declining by arrival order.
+    # Same mechanism as the slot axis above (one eviction path, not two).
+    # Default OFF = SHADOW: the would-be eviction is logged, nothing deleted.
+    det_budget_value_ranking: str = "shadow"
     # PEAK-CONCENTRATION pricing steer (operator directive 2026-07-18 evening).
     # K cached worst scorelines per game for the committed-book peak profile
     # (sim/peak_profile.build_peak_profile) — rebuilt OFF the hot path on the
@@ -968,8 +981,163 @@ class _StaleBookRisk:
     governing_model_es_99_cc: float = 0.0
     deterministic_max_loss_cc: float = 0.0
     mutex_aware_det_max_cc: float | None = None
+    # FIX 3: a stale/absent snapshot takes NO hedge credit (fail closed).
+    det_max_hedge_credit_cc: float = 0.0
     p_ruin: float = 0.0
     p_ruin_upper: float = 0.0  # P1-2 (never read on the unusable path)
+
+
+@dataclass(frozen=True, slots=True)
+class _DecayedBookRisk:
+    """FIX 5 (2026-07-28). A generation-stale book-risk snapshot CHARGED for the
+    book growth it has not seen, instead of thrown away.
+
+    THE DOCTRINE THIS COPIES is already written down in ``risk/deploy_scale.py``:
+    "a reservation bumps this counter on every accept, so a hard cliff here made
+    the whole feature inert". The book-risk snapshot had exactly that cliff —
+    ``_book_risk_for_check`` discarded on ANY generation mismatch — and it
+    produced exactly that outcome: measured 2026-07-28, ALL 407 of the session's
+    ``skip_portfolio_cvar`` declines were ``book_risk_generation_stale`` and
+    nothing else, 289 of them inside one minute against 62 quotes, with the
+    live-vs-snapshot generation gap equal to 1 in every single instance. One
+    reservation was darkening the whole tail axis.
+
+    THE CHARGE, and why it is sound. ``added_premium_cc`` is the EXACT summed
+    ``max_loss_cc`` of the positions present in the live book that were NOT in
+    the book the MC priced — computed from the position-ID sets, not from a
+    scalar difference, so a simultaneous add-and-remove cannot net out and
+    undercharge. Every loss axis is then shifted UP by that amount:
+
+        loss(live book) <= loss(snapshot book) + Σ premium(added positions)
+
+    which holds for ANY joint outcome, because a position's loss can never
+    exceed the premium paid for it (``OpenPosition.max_loss_cc``, verified
+    ground truth) and REMOVED positions can only ever reduce the loss. The
+    charge is comonotone — it assumes every new position loses in full, at the
+    same time as the old book's worst case — so it is strictly MORE conservative
+    than a fresh measurement of the same live book, never less. Note this is a
+    tighter-than-ratio argument: ``deploy_scale`` decays a PERMISSION by the
+    premium RATIO, whereas a risk measure admits the exact ADDITIVE bound, and
+    additive is the more conservative of the two here (the old ES is at most the
+    old premium, so ``es·Δ/premium <= Δ``).
+
+    ABSTAIN BAND. The decay is a BETWEEN-SNAPSHOTS BRIDGE, not a substitute for
+    measuring. When the added premium exceeds the premium the snapshot was built
+    on — the book has more than DOUBLED since it was measured — the measurement
+    no longer describes the book in any useful sense and the caller abstains
+    back to the fail-closed sentinel. That bound is the measured book itself,
+    not a tolerance number. The TIME-staleness guard is untouched and still
+    fails closed on its own.
+
+    WHAT IS NOT DECAYED. Every CREDIT is dropped to zero rather than carried:
+    a credit is a loosening, and a loosening certified against a book that no
+    longer exists is exactly what must not survive staleness. ``p_ruin`` is
+    re-derived from the shifted loss-quantile envelope and then floored at the
+    snapshot's own value, so it can only rise. A snapshot with NO envelope
+    cannot have its ruin axis charged at all, so the caller refuses to decay it.
+
+    Built ONCE per (snapshot generation, live generation) and cached — the
+    quantile shift is O(1001) and must never run per quote."""
+
+    usable: bool
+    governing_model_es_99_cc: float
+    deterministic_max_loss_cc: float
+    mutex_aware_det_max_cc: float | None
+    p_ruin: float
+    p_ruin_upper: float
+    loss_quantiles_cc: tuple[float, ...]
+    n_samples: int
+    # A stale snapshot's certified offsets are NOT carried (see above).
+    det_max_hedge_credit_cc: float = 0.0
+    # Provenance for the readout — never a control input.
+    added_premium_cc: int = 0
+    unsampled_premium_cc: int = 0
+
+
+def _decay_book_risk(
+    snap: BookRiskSnapshot,
+    added_premium_cc: int,
+    unsampled_premium_cc: int | None = None,
+) -> _DecayedBookRisk | None:
+    """FIX 5. Charge ``snap`` for the book growth it never saw, returning the
+    more-conservative view — or None when the snapshot cannot be charged soundly
+    (the caller then keeps today's fail-closed discard).
+
+    TWO CHARGES, because the two axes are exposed to different things:
+
+      * ``added_premium_cc`` — premium of live positions the snapshot did not
+        HOLD at all. Charged to the DETERMINISTIC axis, where it is exact:
+        det-max is literally a sum of premiums, so adding the new positions'
+        premium reproduces the new det-max to the cent.
+      * ``unsampled_premium_cc`` — premium of live positions the snapshot did not
+        SAMPLE, which is a SUPERSET: it also includes positions the snapshot held
+        only as a flat RESERVE (an unpriceable leg) and which have since become
+        modeled. Those contribute nothing to the snapshot's sampled model ES, so
+        when their leg book comes online the ES rises with NO change in total
+        premium — measured live 2026-07-28 08:46:45 → 08:47:00, governing ES
+        +$16.44 against det-max flat at $777.66. Charging the ES/tail axes only
+        for absent positions would have walked straight past that, so those axes
+        take the larger charge. Defaults to ``added_premium_cc`` when the caller
+        cannot distinguish the two (never smaller — fail toward the larger).
+
+    Returns None when: the snapshot is unusable (an UNKNOWN book is not made
+    knowable by charging it more), or it carries no loss-quantile envelope (the
+    ruin axis then has no sound charge available, and shipping an uncharged ruin
+    probability alongside charged loss axes would be a silent free pass on the
+    one axis that was not decayed).
+
+    Pure; cost is O(len(loss_quantiles)) — call once per generation pair."""
+    if not snap.usable:
+        return None
+    quantiles = snap.loss_quantiles_cc
+    if not quantiles:
+        return None
+    delta = float(max(0, added_premium_cc))
+    tail_delta = delta if unsampled_premium_cc is None else float(
+        max(0, unsampled_premium_cc)
+    )
+    tail_delta = max(tail_delta, delta)  # never charge the tail axes less
+    # Every LOSS quantile rises by at most the unsampled premium (comonotone
+    # worst case for every position the model did not price); shifting the whole
+    # envelope keeps it sorted, so the tail-probability cap reads a strictly more
+    # adverse distribution than it did before.
+    shifted = tuple(q + tail_delta for q in quantiles)
+    # P(ruin) is exactly P(book loss > the ruin loss threshold), so with the
+    # threshold carried on the snapshot the charged probability is a direct
+    # re-read of the SHIFTED envelope — no guessing where the threshold sits.
+    # (Inferring it from p_ruin alone is not viable: a book with p_ruin = 0 only
+    # proves the threshold is somewhere ABOVE the largest sampled loss, and
+    # assuming it sits exactly there invented a 34.7% ruin probability on a book
+    # nowhere near ruin, which would have made the whole decay unusable.)
+    # Floored at the snapshot's own values so the charge can only ever RAISE ruin.
+    denom = max(1, len(quantiles) - 1)
+    threshold = snap.ruin_loss_threshold_cc
+    if threshold is None:
+        # No equity/bankroll reading ⇒ the ruin cap does not evaluate on this
+        # snapshot and there is nothing to shift; carry its value through.
+        decayed_ruin = snap.p_ruin
+    else:
+        decayed_ruin = sum(1 for q in shifted if q > threshold) / denom
+    p_ruin = min(1.0, max(snap.p_ruin, decayed_ruin))
+    p_ruin_upper = min(
+        1.0, max(getattr(snap, "p_ruin_upper", snap.p_ruin), decayed_ruin)
+    )
+    mutex = snap.mutex_aware_det_max_cc
+    return _DecayedBookRisk(
+        usable=True,
+        # SAMPLED tail axes take the (larger) unsampled charge; the DETERMINISTIC
+        # axes take the exact absent-position charge — a position the snapshot
+        # already held as a reserve is already inside its det-max.
+        governing_model_es_99_cc=snap.governing_model_es_99_cc + tail_delta,
+        deterministic_max_loss_cc=snap.deterministic_max_loss_cc + delta,
+        mutex_aware_det_max_cc=None if mutex is None else mutex + delta,
+        p_ruin=p_ruin,
+        p_ruin_upper=p_ruin_upper,
+        loss_quantiles_cc=shifted,
+        n_samples=snap.n_samples,
+        added_premium_cc=int(added_premium_cc),
+        unsampled_premium_cc=int(tail_delta),
+    )
 
 
 @dataclass
@@ -1189,6 +1357,22 @@ class QuoteLifecycle:
         # non-empty book with a stale/absent snapshot fails the CVaR cap CLOSED.
         self._book_risk: BookRiskSnapshot | None = None
         self._book_risk_mono_ns: int | None = None
+        # FIX 5 (book-growth decay of a generation-stale snapshot). The position
+        # id → max_loss_cc map the LATEST snapshot was built on, captured at
+        # publish; the growth charge is the summed premium of live positions
+        # absent from it. None ⇒ nothing published yet ⇒ no decay is possible.
+        self._book_risk_positions: dict[str, int] | None = None
+        # (generation, position ids the model at that generation actually
+        # SAMPLED). A position HELD but only RESERVED sits outside the sampled
+        # model ES, so the tail axes must be charged for it even though it is
+        # already inside the snapshot's det-max — see ``_decay_book_risk``.
+        self._book_risk_sampled: tuple[int, set[str]] | None = None
+        # The decayed view, memoised on (snapshot generation, live generation) —
+        # the quantile shift is O(1001) and must never run per quote. The third
+        # slot is None when this generation pair is NOT decayable (abstained).
+        self._decayed_book_risk: (
+            tuple[int, int, _DecayedBookRisk | None] | None
+        ) = None
         # Throttle the MC recompute to comfortably inside the freshness window
         # (half of it) so the snapshot stays fresh without running a full MC every
         # 0.5s maintenance tick. None ⇒ never refreshed yet.
@@ -1397,6 +1581,11 @@ class QuoteLifecycle:
         # the maintenance-tick granularity. A falsely-CACHED verdict can only
         # DECLINE (never admit), and retry_pending re-checks within 1s anyway.
         self._pre_gate_cache: tuple[int, int | None, int, list[Breach]] | None = None
+        # FIX 4 ANTI-THRASH LEDGER (2026-07-28): combo_ticker -> the EV/det
+        # density of the candidate that displaced a quote on it. Insertion-
+        # ordered dict used as a bounded FIFO (``_EVICTION_LEDGER_MAX``). See
+        # ``_thrash_blocked`` for the invariant it enforces.
+        self._evicted_density: dict[str, float] = {}
         # EVENT-DRIVEN POST-FILL RISK PULL (resting-quote haircut, 2026-07-17):
         # single-flight task + the games of recently committed fills (eviction
         # priority: same-game resting quotes first). Armed only while
@@ -1521,6 +1710,11 @@ class QuoteLifecycle:
             positions,
             marginals=self._marginals,
             within_game_rho=self._within_game_rho,
+            # FIX 2: the EXCHANGE'S OWN determinations, so the deterministic
+            # max-loss axis can retire a combo whose outcome is already decided.
+            # Deliberately NOT ``self._marginals`` — that walks the live feed
+            # first and would let a market pinned at 0/100 masquerade as settled.
+            settled_facts=self._settled_fact,
         )
         inputs = BookRiskInputs(
             model=model,
@@ -1544,6 +1738,10 @@ class QuoteLifecycle:
             current_equity_cc=self._ruin_equity_basis_cc(model),
             ruin_floor_frac=self._config.ruin_floor_frac,
             ruin_prob_ci_z=self._config.ruin_prob_ci_z,
+            # FIX 2 arming (shadow default). The settled credit is MEASURED
+            # either way; this decides only whether it is SUBTRACTED from the
+            # enforced det-max axes.
+            det_max_settlement_aware=self._det_max_settlement_aware(),
             input_generation=gen,
             # P(NIGHT) (2026-07-25 operator KPI): realized-so-far (settlements
             # + fees; process-scoped until the day-anchored ledger lands).
@@ -1553,6 +1751,31 @@ class QuoteLifecycle:
         # be drawn from EXACTLY the book the MC priced, on the same slow loop
         # (never the quote path). Superseded generations can never publish.
         self._last_book_inputs = inputs
+        # FIX 5: record WHICH positions this model actually SAMPLED, at BUILD
+        # time (not publish — the priceability of a leg can move in between, and
+        # the charge basis must describe the book the MC really priced).
+        #
+        # WHY A SECOND SET, and not just "was it in the book". A position that is
+        # RESERVED (an unpriceable leg) sits OUTSIDE the sampled model ES and
+        # inside the flat deterministic reserve. When its leg book comes online
+        # it becomes SAMPLED, and the model ES rises even though total premium —
+        # and therefore det-max — has not moved by a cent. Measured live on
+        # 2026-07-28 08:46:45 → 08:47:00: governing ES +$16.44 with det-max
+        # unchanged at $777.66. Charging the ES axis only for positions that were
+        # ABSENT would have missed that entirely, so the ES axis is charged for
+        # every live position the snapshot did not SAMPLE, while the det-max axis
+        # is charged only for positions it did not HOLD (a reserved position's
+        # premium is already inside its reserve — charging it twice would be
+        # sound but so tight the bridge would never help).
+        self._book_risk_sampled = (
+            gen,
+            {
+                p.position_id
+                for p in select_modeled_positions(
+                    positions, lambda t: self._marginals(t) is not None
+                )[0]
+            },
+        )
         return inputs
 
     def _ruin_equity_basis_cc(self, model: BookModel) -> int | None:
@@ -1596,6 +1819,16 @@ class QuoteLifecycle:
             return
         self._book_risk = snap
         self._book_risk_mono_ns = self._clock.monotonic_ns()
+        # FIX 5: remember WHICH positions (and at what premium) this snapshot
+        # priced. On a later generation mismatch the growth charge is computed
+        # from the position-ID SETS, not from a scalar total, so a simultaneous
+        # add-and-remove between generations cannot net out and undercharge.
+        # Cheap: one dict of ~book-size ints, rebuilt only when a snapshot
+        # publishes (the slow loop), never on the quote path.
+        self._book_risk_positions = {
+            pid: p.max_loss_cc for pid, p in self._exposure.positions.items()
+        }
+        self._decayed_book_risk = None
         # P(BOOK) STEER profile (2026-07-25): publish the measured P(book) +
         # per-game tail shares alongside the snapshot — the skew's pbook
         # component reads this cached profile at quote time (generation-
@@ -2027,6 +2260,10 @@ class QuoteLifecycle:
                 ruin_prob_ci_z=inputs.ruin_prob_ci_z,
                 input_generation=inputs.input_generation,
                 realized_pnl_cc=inputs.realized_pnl_cc,
+                # FIX 2 arming — MUST be forwarded here too, or the INLINE path
+                # (paper mode, backtests, any embedding without a worker pool)
+                # silently ignores the flag while the off-loop path honours it.
+                det_max_settlement_aware=inputs.det_max_settlement_aware,
             )
             # Inline path builds the model and runs the MC without yielding, so the
             # generation cannot move between build and store; the publish gate is a
@@ -2285,7 +2522,13 @@ class QuoteLifecycle:
         if not scaled:
             return None
         model = build_book_model(
-            scaled, marginals=self._marginals, within_game_rho=self._within_game_rho
+            scaled,
+            marginals=self._marginals,
+            within_game_rho=self._within_game_rho,
+            # FIX 2: the deploy-scale solve must measure the SAME det-max the
+            # caps enforce, or it would solve against a book carrying forward
+            # loss the exchange has already retired and under-report headroom.
+            settled_facts=self._settled_fact,
         )
         return BookRiskInputs(
             model=model,
@@ -2297,6 +2540,7 @@ class QuoteLifecycle:
             current_equity_cc=self._ruin_equity_basis_cc(model),
             ruin_floor_frac=self._config.ruin_floor_frac,
             ruin_prob_ci_z=self._config.ruin_prob_ci_z,
+            det_max_settlement_aware=self._det_max_settlement_aware(),
             input_generation=gen,
             realized_pnl_cc=self._realized_pnl_cc,
         )
@@ -2359,6 +2603,9 @@ class QuoteLifecycle:
             ruin_prob_ci_z=inputs.ruin_prob_ci_z,
             input_generation=inputs.input_generation,
             realized_pnl_cc=inputs.realized_pnl_cc,
+            # FIX 2: the deploy-scale probe must measure the SAME det-max the
+            # caps enforce (see ``_deploy_scale_mc_inputs``).
+            det_max_settlement_aware=inputs.det_max_settlement_aware,
         )
         return self._deploy_scale_check(s, positions, bankroll_cc, snap)
 
@@ -2384,7 +2631,23 @@ class QuoteLifecycle:
         somehow missed, and a wall-clock-stale snapshot on a quiet book). A snapshot
         can be time-fresh yet generation-stale (fills changed the portfolio within
         the freshness window) — the generation check invalidates it immediately.
-        Cheap: reads stored state + one clock read; never runs MC."""
+        Cheap: reads stored state + one clock read; never runs MC.
+
+        FIX 5 (2026-07-28) — the GENERATION branch DECAYS instead of discarding.
+        A hard cliff on the generation counter is a mistake this repo has already
+        made once and already written the lesson for (``risk/deploy_scale.py``:
+        "a reservation bumps this counter on every accept, so a hard cliff here
+        made the whole feature inert"). It had the same effect here: every one of
+        the session's 407 ``skip_portfolio_cvar`` declines on 2026-07-28 was this
+        branch and nothing else, 289 of them in the 10:24Z minute alone against
+        62 quotes, at a generation gap of exactly 1 — a single reservation.
+        Armed, the snapshot is instead CHARGED for the premium added since it was
+        measured (``_decay_book_risk``) and used; the result is strictly more
+        adverse than the measurement, so a book that genuinely breaches still
+        breaches. Unarmed (the default) the decayed verdict is computed for the
+        log and the discard happens exactly as before. The TIME guard below is
+        NOT decayed: an old measurement of an UNCHANGED book is a different
+        failure (nothing to charge for) and keeps failing closed."""
         if not self._exposure.positions:
             return None
         snap = self._book_risk
@@ -2394,13 +2657,79 @@ class QuoteLifecycle:
         if snap.input_generation != self._exposure.position_generation:
             # The PORTFOLIO was mutated (fill / settlement / rehydration /
             # reconciliation / reservation) since this snapshot's MC read the
-            # positions. Even if it is still time-fresh, it no longer describes the
-            # current portfolio, so the positions-only book-risk MC is inconsistent.
+            # positions. Charge the growth and keep the measurement rather than
+            # throwing away the only tail number we have (FIX 5).
+            decayed = self._book_risk_decayed()
+            if decayed is not None and self._config.book_risk_stale_decay:
+                # The TIME guard still applies to a decayed snapshot: growth is
+                # charged, but an ancient measurement is still refused.
+                if (
+                    self._clock.monotonic_ns() - stamp
+                ) / 1e9 > self._config.book_risk_stale_after_s:
+                    return _StaleBookRisk()
+                return decayed
             return _StaleBookRisk()  # position generation superseded ⇒ fail closed
         age_s = (self._clock.monotonic_ns() - stamp) / 1e9
         if age_s > self._config.book_risk_stale_after_s:
             return _StaleBookRisk()  # snapshot too old ⇒ fail closed (secondary)
         return snap
+
+    def _book_risk_decayed(self) -> _DecayedBookRisk | None:
+        """FIX 5. The book-growth-charged view of the current (generation-stale)
+        snapshot, or None when this book cannot be charged soundly.
+
+        MEMOISED on (snapshot generation, live generation): the growth charge is
+        O(live positions) and the quantile shift O(1001), so both run once per
+        book change rather than once per quote — the hot path pays a tuple
+        compare. This mirrors ``_committed_premium_cc``'s generation cache.
+
+        Returns None (⇒ the caller keeps the fail-closed discard) when:
+          - no snapshot / no captured position map;
+          - the snapshot is unusable or carries no loss-quantile envelope
+            (``_decay_book_risk``'s own refusals); or
+          - the ABSTAIN BAND trips: the premium ADDED since the measurement
+            exceeds the premium the measurement was built on, i.e. the book has
+            more than doubled and the snapshot no longer describes it. That
+            bound is the measured book itself, not a tolerance knob."""
+        snap = self._book_risk
+        priced = self._book_risk_positions
+        if snap is None or priced is None:
+            return None
+        snap_gen = snap.input_generation
+        live_gen = self._exposure.position_generation
+        cached = self._decayed_book_risk
+        if cached is not None and cached[0] == snap_gen and cached[1] == live_gen:
+            return cached[2]
+        # EXACT growth charges from the position-ID sets: only positions the
+        # snapshot never saw (resp. never SAMPLED) are charged, and REMOVED
+        # positions are ignored (dropping a position can only lower the loss). A
+        # scalar premium difference would let a simultaneous add+remove net out
+        # and undercharge, which is exactly what must not happen here.
+        sampled_stamp = self._book_risk_sampled
+        sampled = (
+            sampled_stamp[1]
+            if sampled_stamp is not None and sampled_stamp[0] == snap_gen
+            else None
+        )
+        added = 0
+        unsampled = 0
+        for pid, p in self._exposure.positions.items():
+            if pid not in priced:
+                added += p.max_loss_cc
+                unsampled += p.max_loss_cc
+            elif sampled is not None and pid not in sampled:
+                # HELD by the snapshot but only as a flat RESERVE — inside its
+                # det-max already, outside its sampled model ES. Charge the tail
+                # axes for it (its leg book may have come online since).
+                unsampled += p.max_loss_cc
+        result: _DecayedBookRisk | None
+        measured = sum(priced.values())
+        if measured > 0 and added > measured:
+            result = None  # abstain: the book more than doubled since measuring
+        else:
+            result = _decay_book_risk(snap, added, unsampled)
+        self._decayed_book_risk = (snap_gen, live_gen, result)
+        return result
 
     # ------------------------------------------------------------- risk audit
 
@@ -2499,7 +2828,27 @@ class QuoteLifecycle:
                 fallback_reason = "book_risk_aged_out"
             else:
                 fallback_reason = "book_risk_unusable"
+        # FIX 5 SHADOW OBSERVABILITY (2026-07-28). On the generation-stale
+        # branch — the one that produced 100% of the session's portfolio-CVaR
+        # declines — report what the book-growth decay MEASURED, whether or not
+        # it is armed. Unarmed this is the whole shadow readout: how much premium
+        # the snapshot had not seen, and the charged tail the cap WOULD have read
+        # instead of failing closed. Cached per generation pair, so this costs a
+        # tuple compare on the hot path.
+        decay_added_cc: int | None = None
+        decay_es_99_cc: int | None = None
+        decay_det_max_cc: int | None = None
+        if fallback_reason == "book_risk_generation_stale":
+            decayed = self._book_risk_decayed()
+            if decayed is not None:
+                decay_added_cc = decayed.added_premium_cc
+                decay_es_99_cc = int(decayed.governing_model_es_99_cc)
+                decay_det_max_cc = int(decayed.deterministic_max_loss_cc)
         return {
+            "stale_decay_added_premium_cc": decay_added_cc,
+            "stale_decay_es_99_cc": decay_es_99_cc,
+            "stale_decay_det_max_cc": decay_det_max_cc,
+            "stale_decay_armed": bool(self._config.book_risk_stale_decay),
             "snapshot_generation": snap_generation,
             "live_generation": live_generation,
             "snapshot_age_s": snap_age_s,
@@ -3489,6 +3838,19 @@ class QuoteLifecycle:
             p = self._marginals(ticker)
             if p is not None:
                 marginals[ticker] = float(p)
+        # FIX 2: resolve the EXCHANGE'S OWN determinations ON-LOOP too (the
+        # worker has no resolver, and the live one is not picklable). Only exact
+        # 0.0/1.0 facts are shipped; a ticker the exchange has not determined is
+        # OMITTED, so the worker reads it as UNKNOWN and charges its position in
+        # full — the same fail-closed contract the marginals dict already has.
+        # Populated only when ARMED, so the shadow build ships an empty dict and
+        # the gate is byte-identical.
+        settled_facts: dict[str, float] = {}
+        if self._det_max_settlement_aware():
+            for ticker in tickers:
+                fact = self._settled_fact(ticker)
+                if fact == 0.0 or fact == 1.0:
+                    settled_facts[ticker] = float(fact)
         # Resolve within-game pair rho ON-LOOP for EXACTLY the pairs
         # ``build_book_model`` will ask for — no more, no fewer.
         #
@@ -3621,6 +3983,16 @@ class QuoteLifecycle:
             # quote-time cap honors, threaded to the worker gate so knob=False
             # restores comonotone gating at BOTH sites (verify finding 2026-07-18).
             det_max_mutex_aware=bool(limits.portfolio_det_max_mutex_aware),
+            # FIX 3 HEDGE ACCOUNTING arming (2026-07-28): the SAME RiskLimits
+            # knob the quote-time det-max cap honors, so both sites arm together
+            # and shadow together (a looser gate than cap is the renege zone).
+            det_max_hedge_credit=bool(limits.det_max_hedge_credit),
+            # FIX 2 SETTLED-LEG DET-MAX arming (2026-07-28) + the determinations
+            # themselves, so the confirm-time gate retires the same already-
+            # decided combos the quote-time cap does. Arming together is the
+            # point: a gate STRICTER than the cap is the renege zone.
+            settled_facts=settled_facts,
+            det_max_settlement_aware=self._det_max_settlement_aware(),
             # P0-2 staleness stamps (see _build_candidate_gate_inputs docstring).
             input_generation=input_generation,
             reservation_version=reservation_version,
@@ -4291,6 +4663,56 @@ class QuoteLifecycle:
             )
         return _worker_state_worst_case(inputs)
 
+    # FIX 4 anti-thrash ledger cap (combo_ticker -> density that displaced it).
+    _EVICTION_LEDGER_MAX = 512
+
+    @staticmethod
+    def _quote_det_consumed_cc(quote: OpenQuoteRisk) -> int:
+        """The det-max budget a RESTING quote consumes: the worse quotable
+        side's premium at risk, ``contracts x bid // 100`` — the EXACT
+        arithmetic ``sim.book_risk._det_and_gross`` charges the hypothetical
+        fill (both quotable sides fold in as hypotheticals and the det axis
+        takes the worse). Correlation-INDEPENDENT by construction, which is
+        what makes ranking on it MODEL-FREE (FIX 4, 2026-07-28)."""
+        return max(
+            int(quote.contracts) * int(bid) // 100
+            for bid in (int(quote.yes_bid_cc), int(quote.no_bid_cc), 0)
+        )
+
+    @staticmethod
+    def _value_density(ev_cc: int, det_cc: int) -> float | None:
+        """EV per unit of consumed det-max. None when the denominator is not
+        positive — a zero-consumption quote has no density, is never ranked,
+        and is never chosen as the loser (UNKNOWN is never a convenient
+        loser, quiet-failure defense 2)."""
+        if det_cc <= 0:
+            return None
+        return float(ev_cc) / float(det_cc)
+
+    def _note_eviction(self, combo_ticker: str, winner_density: float) -> None:
+        """Record that ``combo_ticker`` was evicted by a candidate of density
+        ``winner_density`` (bounded FIFO ledger)."""
+        ledger = self._evicted_density
+        prior = ledger.pop(combo_ticker, None)
+        ledger[combo_ticker] = (
+            winner_density if prior is None else max(prior, winner_density)
+        )
+        while len(ledger) > self._EVICTION_LEDGER_MAX:
+            ledger.pop(next(iter(ledger)))
+
+    def _thrash_blocked(self, combo_ticker: str, density: float) -> bool:
+        """ANTI-THRASH INVARIANT (FIX 4): a combo evicted at density ``d`` may
+        not itself evict anything until its OWN density strictly exceeds ``d``.
+
+        A evicting B requires density(A) > density(B); B could only evict its
+        way back in with density(B) > density(A), which this refuses. So an
+        evicted quote can never immediately re-enter by displacing its evictor.
+        It CAN still be admitted normally when the budget genuinely frees up —
+        that is correct reallocation, not thrash — and a genuine reprice to a
+        higher density clears the block."""
+        prior = self._evicted_density.get(combo_ticker)
+        return prior is not None and density <= prior
+
     async def _try_slot_eviction(
         self,
         rfq: Rfq,
@@ -4299,44 +4721,137 @@ class QuoteLifecycle:
         quote_risk: OpenQuoteRisk,
         raw_breaches: list[Breach],
     ) -> list[Breach]:
-        """EV-BASED SLOT EVICTION (2026-07-25 big-fill audit). Fires ONLY when
-        every ENFORCED breach is the slot-count cap (any other enforced wall
-        stands untouched — this must never loosen a risk cap). Compares the
-        candidate's quote-time EV against the weakest STORED quote-time EV in
-        the resting book (apples to apples — both computed by the same
-        ``_quote_candidate_ev_cc`` at issue/reprice time; a quote with
-        UNKNOWN stored EV is never chosen as the loser). Strict ``>`` plus
-        one attempt per RFQ bounds churn; the reprice cadence refreshes
-        stored EVs. On eviction the SAME check re-runs once against the
-        freed book — any surviving breach declines exactly as before."""
+        """VALUE-RANKED ALLOCATION OF A FIXED BUDGET — ONE eviction mechanism,
+        two axes (2026-07-25 slot axis; 2026-07-28 FIX 4 det-max axis).
+
+        Fires ONLY when EVERY ENFORCED breach is the SINGLE axis being
+        reallocated (any other enforced wall stands untouched — this must never
+        loosen a risk cap), and after any eviction the SAME
+        ``LimitChecker.check`` re-runs so a surviving breach declines exactly as
+        before. It decides WHICH candidates get a fixed budget, NEVER whether
+        the budget exists.
+
+          * SLOT axis (``open_quote_ev_eviction``, SKIP_MAX_OPEN_QUOTES) —
+            ranks on raw quote-time EV. Every resting quote consumes exactly
+            one slot, so EV and EV-per-slot rank identically. UNCHANGED from
+            2026-07-25.
+          * DET-MAX axis (``det_budget_value_ranking``, SKIP_PORTFOLIO_DET_MAX)
+            — ranks on DENSITY = EV / consumed det-max, because quotes consume
+            the det budget in wildly different amounts. Measured on the
+            2026-07-27 won-auction set: the 17 auctions we DECLINED were 24%
+            DENSER than the 21 we confirmed (0.0491 vs 0.0395 EV per unit of
+            det). Arrival order was actively selecting the worse half of the
+            flow. det-max is correlation-INDEPENDENT, so the reordering is
+            MODEL-FREE — a deterministic knapsack, not a model call.
+
+        Both axes compare STORED quote-time EVs (all produced by the same
+        ``_quote_candidate_ev_cc`` at issue/reprice, apples to apples); a quote
+        with UNKNOWN stored EV is never chosen as the loser. Strict ``>`` on the
+        ranking key, one attempt per RFQ, and the anti-thrash ledger bound
+        churn. Mode ``"shadow"`` (the det axis default) LOGS the reallocation it
+        would have made and deletes nothing — the decision path is byte-
+        identical to today."""
         enforced = [b for b in raw_breaches if not b.shadow]
-        if not enforced or any(
-            b.reason is not ReasonCode.SKIP_MAX_OPEN_QUOTES for b in enforced
-        ):
+        if not enforced:
             return raw_breaches
+        reasons = {b.reason for b in enforced}
+        if reasons == {ReasonCode.SKIP_MAX_OPEN_QUOTES}:
+            if not self._config.open_quote_ev_eviction:
+                return raw_breaches
+            return await self._try_axis_eviction(
+                rfq, result, risk_qty, quote_risk, raw_breaches,
+                axis="slot", mode="on",
+            )
+        if reasons == {ReasonCode.SKIP_PORTFOLIO_DET_MAX}:
+            mode = str(self._config.det_budget_value_ranking)
+            if mode == "off":
+                return raw_breaches
+            return await self._try_axis_eviction(
+                rfq, result, risk_qty, quote_risk, raw_breaches,
+                axis="det_max", mode=mode,
+            )
+        return raw_breaches
+
+    async def _try_axis_eviction(
+        self,
+        rfq: Rfq,
+        result: ConstructedQuote,
+        risk_qty: CentiContracts,
+        quote_risk: OpenQuoteRisk,
+        raw_breaches: list[Breach],
+        *,
+        axis: str,
+        mode: str,
+    ) -> list[Breach]:
+        """One axis of the value-ranked reallocation above. ``axis`` selects the
+        ranking key ("slot" = raw EV, "det_max" = EV per consumed det-max);
+        ``mode`` is "on" (evict) or "shadow" (log the would-be eviction and
+        return the breaches untouched)."""
         cand_ev = self._quote_candidate_ev_cc(result, risk_qty)
         if cand_ev is None:
             return raw_breaches
+        cand_det = 0
+        if axis == "det_max":
+            cand_det = self._quote_det_consumed_cc(quote_risk)
+            cand_key_opt = self._value_density(cand_ev, cand_det)
+            if cand_key_opt is None:
+                return raw_breaches
+            cand_key = cand_key_opt
+            if self._thrash_blocked(quote_risk.combo_ticker, cand_key):
+                self._metrics.inc("quote.eviction_thrash_blocked")
+                return raw_breaches
+        else:
+            cand_key = float(cand_ev)
         loser: OpenQuoteRisk | None = None
+        loser_key: float | None = None
         for q in self._exposure.open_quotes.values():
             if q.expected_edge_cc is None:
                 continue
-            if loser is None or q.expected_edge_cc < (
-                loser.expected_edge_cc or 0
-            ):
-                loser = q
-        if loser is None or loser.expected_edge_cc is None:
+            if axis == "det_max":
+                key_opt = self._value_density(
+                    q.expected_edge_cc, self._quote_det_consumed_cc(q)
+                )
+                if key_opt is None:
+                    continue
+                key = key_opt
+            else:
+                key = float(q.expected_edge_cc)
+            if loser_key is None or key < loser_key:
+                loser, loser_key = q, key
+        if loser is None or loser_key is None or loser.expected_edge_cc is None:
             return raw_breaches
-        if cand_ev <= loser.expected_edge_cc:
+        if cand_key <= loser_key:
+            return raw_breaches
+        if mode != "on":
+            # SHADOW: report the reallocation the operator arms from and change
+            # NOTHING. Bounded by the breach rate, not the RFQ rate.
+            self._metrics.inc("quote.eviction_shadow." + axis)
+            log.info(
+                "open_quote_eviction_shadow",
+                axis=axis,
+                would_evict_quote_id=loser.quote_id,
+                evicted_ev_cc=loser.expected_edge_cc,
+                evicted_key=loser_key,
+                candidate_rfq_id=rfq.rfq_id,
+                candidate_ev_cc=cand_ev,
+                candidate_det_cc=cand_det,
+                candidate_key=cand_key,
+            )
             return raw_breaches
         self._metrics.inc("quote.slot_evictions")
+        self._metrics.inc("quote.evictions." + axis)
         log.info(
             "open_quote_evicted",
+            axis=axis,
             evicted_quote_id=loser.quote_id,
             evicted_ev_cc=loser.expected_edge_cc,
+            evicted_key=loser_key,
             candidate_rfq_id=rfq.rfq_id,
             candidate_ev_cc=cand_ev,
+            candidate_key=cand_key,
         )
+        if axis == "det_max":
+            self._note_eviction(loser.combo_ticker, cand_key)
         await self._delete_quote(loser.quote_id, ReasonCode.DELETE_EVICTED_LOWER_EV)
         return self._limits.check(
             self._exposure,
@@ -4578,7 +5093,14 @@ class QuoteLifecycle:
         # held slots): when the ONLY enforced blocker is SKIP_MAX_OPEN_QUOTES
         # and this candidate's quote-time EV beats the weakest resting
         # quote's stored EV, evict the loser and re-check once.
-        if self._config.open_quote_ev_eviction and raw_breaches:
+        # FIX 4 (2026-07-28): the SAME mechanism now also reallocates the
+        # DET-MAX budget by value. The dispatcher below is a no-op unless the
+        # enforced breach set is exactly one reallocatable axis whose mode is
+        # not "off"; the det axis defaults to "shadow" (log, never delete).
+        if raw_breaches and (
+            self._config.open_quote_ev_eviction
+            or str(self._config.det_budget_value_ranking) != "off"
+        ):
             raw_breaches = await self._try_slot_eviction(
                 rfq, result, risk_qty, quote_risk, raw_breaches
             )
@@ -8397,6 +8919,32 @@ class QuoteLifecycle:
         if market_ticker in self._committed_leg_tickers():
             self._settled.note_missing(market_ticker)
         return None
+
+    def _settled_fact(self, market_ticker: str) -> float | None:
+        """FIX 2 (2026-07-28). The EXCHANGE'S OWN graded outcome for this leg
+        (exactly 0.0 or 1.0), or None when it has not determined one.
+
+        THIS IS NOT ``_marginals``, and the difference is the whole point. The
+        marginal provider walks the live FEED FIRST and only falls back to the
+        graded fact, so it can legitimately return 0.0 or 1.0 for a market that
+        is trading, pinned, and entirely unsettled. Resolving deterministic
+        max-loss off that number would be INFERRING a settlement we never read —
+        exactly what the det-max axis must never do. This reads the graded cache
+        and nothing else.
+
+        Pure in-memory (hot-path safe); the fetching happens on the maintenance
+        tick. No resolver ⇒ None for every leg ⇒ nothing is ever resolved and
+        det-max charges the whole book in full (fail-closed)."""
+        if self._settled is None:
+            return None
+        return self._settled.resolved(market_ticker)
+
+    def _det_max_settlement_aware(self) -> bool:
+        """FIX 2 arming, read from the LIVE ``RiskLimits`` (which the nightly
+        adaptive-cap swap may replace) so the book-risk MC, the candidate gate
+        and the quote-time cap can never disagree about whether the settled
+        credit is enforced. False ⇒ SHADOW: still measured, never subtracted."""
+        return bool(self._limits.limits.det_max_settlement_aware)
 
     def _committed_leg_tickers(self) -> frozenset[str]:
         """Distinct leg tickers of the COMMITTED positions, cached per position

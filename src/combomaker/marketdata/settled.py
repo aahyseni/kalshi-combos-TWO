@@ -55,11 +55,19 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 
 from combomaker.core.clock import Clock
+from combomaker.exchange.rest import ReadBudgetExhausted
 from combomaker.ops.logging import get_logger
 
 log = get_logger(__name__)
 
 JsonDict = dict[str, Any]
+
+# The resolver's own bounded per-pass fetch claim. Exported because the READ
+# bucket's CRITICAL reserve is derived from it (``ops.quote_app``): reserve =
+# this × the live-verified per-endpoint token cost, i.e. exactly one pass of
+# this resolver and not a token more. Changing the pass budget therefore moves
+# the reserve with it — there is no second number to keep in sync.
+FETCH_BUDGET_PER_PASS = 5
 
 # Statuses under which the exchange's `result` is a graded, immutable FACT.
 GRADED_STATUSES: frozenset[str] = frozenset({"determined", "finalized"})
@@ -88,6 +96,13 @@ class MarketSource(Protocol):
     async def get_market(self, ticker: str) -> JsonDict: ...
 
 
+class Counters(Protocol):
+    """The one metrics method this module uses (``ops.metrics.Metrics``
+    satisfies it; None disables counting)."""
+
+    def inc(self, name: str, by: int = 1) -> None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class SettledResult:
     """One permanently-cached graded outcome. ``marginal`` is the leg's exact
@@ -114,11 +129,14 @@ class SettledMarginalResolver:
         clock: Clock,
         *,
         retry_after_s: float = 30.0,
-        fetch_budget_per_pass: int = 5,
+        fetch_budget_per_pass: int = FETCH_BUDGET_PER_PASS,
         max_pending: int = 512,
+        metrics: Counters | None = None,
     ) -> None:
         self._source = source
         self._clock = clock
+        self._metrics = metrics
+        self._retry_after_s = retry_after_s
         self._retry_after_ns = int(retry_after_s * 1e9)
         self._fetch_budget_per_pass = fetch_budget_per_pass
         self._max_pending = max_pending
@@ -153,6 +171,37 @@ class SettledMarginalResolver:
         # ungraded/active tickers are cycling on the backoff (relight2
         # 2026-07-19: graded FRAENG facts sat unfetched for 25 minutes).
         self._attempts: dict[str, int] = {}
+        # STARVATION OBSERVABILITY (2026-07-27). Counted and logged LOUD,
+        # because the failure it precedes is SILENT: overnight we simply never
+        # learn what settled. TWO signatures, both measured against the
+        # resolver's own retry cycle so neither invents a number:
+        #
+        #   OVERDUE   — a pending entry's due time passed more than one cycle
+        #               ago, i.e. the fetch PASS itself stopped running (a
+        #               stalled maintenance tick, a pass budget swamped by
+        #               backlog). Ordinary backoff is NOT this.
+        #   UNSERVED  — a ticker whose reads have been FAILING for longer than
+        #               one cycle (local budget refusal or exchange error). A
+        #               failure re-arms the backoff, so such a ticker looks
+        #               perfectly on-schedule forever: without this second
+        #               signature the read-budget inversion this work exists
+        #               to kill would raise no alarm at all.
+        #
+        # ``read_budget_deferrals`` counts LOCAL budget refusals separately
+        # from exchange failures (``fetch_failures``) — the two have different
+        # owners and only the first says the reserve stopped working.
+        self.read_budget_deferrals = 0
+        self.fetch_failures = 0
+        self.starved_passes = 0
+        # ticker → monotonic ns of the first FAILED attempt with no successful
+        # read since (cleared by any successful GET and by ``_drop_pending``).
+        self._unserved_since: dict[str, int] = {}
+        # Last starvation alarm (monotonic ns). The alarm is THROTTLED to one
+        # per retry cycle — the resolver's own backoff, so no new number: a
+        # pass runs every few hundred ms, and an unthrottled WARNING would
+        # emit thousands of identical lines per hour and bury the signal it
+        # exists to raise.
+        self._last_starve_alarm_ns: int | None = None
 
     # ------------------------------------------------------------- hot path
 
@@ -198,11 +247,23 @@ class SettledMarginalResolver:
                 max_pending=self._max_pending,
             )
             return
-        # Due immediately, unless a recent fetch proved the market LIVE (then
-        # deferred to the recheck floor — flicker-refetch protection).
-        self._pending[market_ticker] = self._live_floor.get(market_ticker, 0)
+        # Due NOW, unless a recent fetch proved the market LIVE (then deferred
+        # to the recheck floor — flicker-refetch protection). The stamp is the
+        # registration instant rather than 0 so "overdue" is measurable
+        # (``_alarm_if_starved``): a 0 would read as overdue by the whole
+        # monotonic clock the moment it was registered.
+        now = self._clock.monotonic_ns()
+        floor = self._live_floor.get(market_ticker, 0)
+        self._pending[market_ticker] = floor if floor > now else now
 
     # ------------------------------------------------------ maintenance tick
+
+    @property
+    def pending_count(self) -> int:
+        """How many tickers are awaiting resolution (the BACKLOG — the log's
+        ``n_pending``). Read by the maintenance/report paths and by the tests
+        that bound backlog clearance; never a risk input."""
+        return len(self._pending)
 
     @property
     def has_due_pending(self) -> bool:
@@ -225,7 +286,10 @@ class SettledMarginalResolver:
         OBSERVABILITY (requirement from the same outage — the operator was
         blind to what the resolver knew): once per pass with a non-empty
         pending set, an INFO ``settled_resolution_pending`` line reports the
-        pending/never-fetched counts and a ticker sample."""
+        pending/never-fetched counts and a ticker sample, and
+        ``_alarm_if_starved`` raises a WARNING + counter if any resolution has
+        been DUE for longer than one retry cycle (2026-07-27 — starvation must
+        never again be inferable only from a 429 count in a log)."""
         now = self._clock.monotonic_ns()
         if self._pending:
             never_fetched = sum(
@@ -237,6 +301,7 @@ class SettledMarginalResolver:
                 n_never_fetched=never_fetched,
                 sample=sorted(self._pending)[:8],
             )
+            self._alarm_if_starved(now)
         due = [t for t, due_ns in self._pending.items() if due_ns <= now]
         due.sort(key=lambda t: self._attempts.get(t, 0) > 0)  # new first; stable
         resolved = 0
@@ -244,15 +309,106 @@ class SettledMarginalResolver:
             self._attempts[ticker] = self._attempts.get(ticker, 0) + 1
             try:
                 payload = await self._source.get_market(ticker)
+            except ReadBudgetExhausted as exc:
+                # OUR OWN bucket refused this GET — nothing reached the
+                # exchange. Distinguished from an exchange failure because it
+                # is the starvation signature this priority work exists to
+                # kill: with the CRITICAL reserve wired it must be ~0, so any
+                # occurrence is the alarm that the reserve stopped working.
+                self.read_budget_deferrals += 1
+                self._bump("settled.read_budget_deferred")
+                log.warning(
+                    "settled_read_budget_deferred",
+                    ticker=ticker,
+                    error=repr(exc),
+                    detail="the LOCAL read budget refused a settlement "
+                    "resolution GET — correctness-critical reads are supposed "
+                    "to hold a reserve the routine metadata tier cannot spend; "
+                    "resolution retries on the backoff",
+                )
+                self._mark_unserved(ticker)
+                self._pending[ticker] = self._clock.monotonic_ns() + self._retry_after_ns
+                continue
             except Exception as exc:
+                self.fetch_failures += 1
+                self._bump("settled.fetch_failed")
                 log.warning(
                     "settled_fetch_failed", ticker=ticker, error=repr(exc)
                 )
+                self._mark_unserved(ticker)
                 self._pending[ticker] = self._clock.monotonic_ns() + self._retry_after_ns
                 continue
+            # A payload came back: this ticker IS being served (whether or not
+            # it is graded yet), so its unserved clock stops.
+            self._unserved_since.pop(ticker, None)
             if self._ingest(ticker, payload):
                 resolved += 1
         return resolved
+
+    def _bump(self, name: str, by: int = 1) -> None:
+        if self._metrics is not None:
+            self._metrics.inc(name, by)
+
+    def _mark_unserved(self, ticker: str) -> None:
+        """Start (never restart) this ticker's unserved clock on a failed read."""
+        self._unserved_since.setdefault(ticker, self._clock.monotonic_ns())
+
+    def _alarm_if_starved(self, now_ns: int) -> None:
+        """LOUD line + counter when settled-leg resolution has stopped making
+        progress for longer than ONE retry cycle (the resolver's own backoff —
+        no new number). See ``_unserved_since`` for the two signatures.
+
+        Ordinary backoff is never reported: a ticker deferred to its
+        backoff/live floor is waiting BY DESIGN, and an alarm that cried wolf
+        on it would train the operator to ignore the one line that matters.
+        THROTTLED to one line per retry cycle (a pass runs every few hundred
+        ms), and re-armed the instant progress resumes so a fresh onset is
+        still news."""
+        overdue = [
+            t
+            for t, due_ns in self._pending.items()
+            if now_ns - due_ns > self._retry_after_ns
+        ]
+        # A failing read RE-ARMS the backoff, so a ticker whose GETs are all
+        # being refused looks permanently on-schedule. This is the signature
+        # that actually catches the read-budget priority inversion.
+        unserved = [
+            t
+            for t, since_ns in self._unserved_since.items()
+            if t in self._pending and now_ns - since_ns > self._retry_after_ns
+        ]
+        starved = sorted(set(overdue) | set(unserved))
+        if not starved:
+            self._last_starve_alarm_ns = None  # re-arm: the next onset is news
+            return
+        last = self._last_starve_alarm_ns
+        if last is not None and now_ns - last < self._retry_after_ns:
+            return  # already alarmed this cycle — count once, not per pass
+        self._last_starve_alarm_ns = now_ns
+        self.starved_passes += 1
+        self._bump("settled.resolution_starved", len(starved))
+        log.warning(
+            "settled_resolution_starved",
+            n_starved=len(starved),
+            n_overdue=len(overdue),
+            n_unserved=len(unserved),
+            n_pending=len(self._pending),
+            overdue_by_s_max=max(
+                ((now_ns - self._pending[t]) / 1e9 for t in overdue), default=0.0
+            ),
+            unserved_for_s_max=max(
+                ((now_ns - self._unserved_since[t]) / 1e9 for t in unserved),
+                default=0.0,
+            ),
+            retry_after_s=self._retry_after_s,
+            read_budget_deferrals=self.read_budget_deferrals,
+            fetch_failures=self.fetch_failures,
+            sample=starved[:8],
+            detail="settled-leg resolutions have made no progress for more "
+            "than one retry cycle — the bot is not learning what settled "
+            "(p_night realized anchor, settlement calibration and position "
+            "cleanup all drift from exchange truth)",
+        )
 
     def _ingest(self, ticker: str, payload: JsonDict) -> bool:
         """Classify one GetMarket payload; True iff the ticker RESOLVED."""
@@ -325,6 +481,7 @@ class SettledMarginalResolver:
         history)."""
         self._pending.pop(ticker, None)
         self._attempts.pop(ticker, None)
+        self._unserved_since.pop(ticker, None)
 
     @staticmethod
     def _settlement_value_consistent(
