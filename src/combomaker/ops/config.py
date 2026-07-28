@@ -2966,16 +2966,37 @@ class RiskConfig(StrictModel):
     # ONE (family:entity x direction) key — every combo riding one player/team
     # one way, across all games. Empty string = axis OFF (byte-identical).
     entity_loss_frac: str = ""     # single position max_loss
-    # NET-EFFECT ADMISSION on the entity axis (LEVER #3, operator 2026-07-27:
-    # "stop refusing the flow that diversifies us"). False = today's
-    # worst-single-leg refusal, byte-identical. True = a candidate over the
-    # entity wall is still admitted when an exhaustive enumeration of the
-    # book's per-key premium state certifies it DILUTES dollar concentration
-    # (risk/net_effect.py), capped by the LIVE per-combo wall. A policy
-    # switch, not a number.
-    entity_net_effect_admission: bool = False
+    # TIERED ENTITY LOAD (operator 2026-07-28: "Risk engine = protection not
+    # limitation"). Entity load as a % of bankroll: <1% no action | 1-2% tier 1 |
+    # 2-3% tier 2 | >3% DECLINE (the decline line IS ``entity_loss_frac``).
+    # False (default) = SHADOW: today's worst-single-key refusal, byte-identical;
+    # the certificate is only logged (``entity_tier_admission`` events). True =
+    # ARMED: a candidate over the entity wall is admitted only when the key was
+    # COOL before it (a SIZE event, not accumulation across structures), the
+    # combo is net DIVERSIFYING in dollars across ALL its legs, and the key still
+    # fits the LIVE per-COMBO wall (risk/entity_admission.py). Only the 1%/2%
+    # tier anchors are new; the accumulation wall stays 3% and the per-combo cap
+    # stays byte-identical.
+    entity_admission_armed: bool = False
+    # DERIVE-BEFORE-ARM companion (the pbook_enabled / pbook_armed pattern):
+    # True = build the certificate and LOG it (``entity_tier_admission``
+    # events carry would_admit) while the cap still refuses exactly as today.
+    entity_admission_enabled: bool = False
     directional_frac: str = "0.10"        # net one-directional / theme
     slate_loss_frac: str = "0.08"         # Σ game loss over one slate
+    # FIX 2 — SLATE AGGREGATION BY PARTITION (operator 2026-07-27: "stop summing
+    # losses that cannot all occur"). False (default) = SHADOW: the naive
+    # Σ-per-game roll-up enforces exactly as today, and the corrected number is
+    # only logged (``slate_partition_shadow`` events, emitted only on a slate the
+    # naive number would refuse). True = ARMED: the slate binds on the ENUMERATED
+    # JOINT WORST CASE with every loss event counted ONCE. THE THRESHOLD DOES NOT
+    # MOVE — this is an arithmetic repair of the measure.
+    slate_partition_armed: bool = False
+    # DERIVE-BEFORE-ARM companion. True = compute + LOG the corrected number
+    # (``slate_partition_shadow`` events) on every slate the naive sum would
+    # refuse, while the naive sum still enforces. It is the only consumer of the
+    # snapshot's once-counted loss events, so OFF means zero hot-path cost.
+    slate_partition_enabled: bool = False
     daily_loss_frac: str = "0.06"         # soft daily-loss halt
     drawdown_frac: str = "0.10"           # peak-drawdown halt
     hard_trip_frac: str = "0.12"          # hard-trip KILL
@@ -3246,7 +3267,10 @@ class RiskConfig(StrictModel):
                 if self.entity_loss_frac
                 else None
             ),
-            entity_net_effect_admission=self.entity_net_effect_admission,
+            entity_admission_armed=self.entity_admission_armed,
+            entity_admission_enabled=self.entity_admission_enabled,
+            slate_partition_armed=self.slate_partition_armed,
+            slate_partition_enabled=self.slate_partition_enabled,
             directional_frac=Fraction(Decimal(self.directional_frac)),
             slate_loss_frac=Fraction(Decimal(self.slate_loss_frac)),
             daily_loss_frac=Fraction(Decimal(self.daily_loss_frac)),

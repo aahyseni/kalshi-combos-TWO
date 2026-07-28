@@ -1736,27 +1736,58 @@ class QuoteLifecycle:
         self._leg_axis_profile_key = key
         return built
 
-    def _log_net_effect(self, cert: ConcentrationCertificate) -> None:
-        """LEVER #3 telemetry: one structured line per entity-axis net-effect
-        certificate, so admissions and refusals are both countable on the tape
-        in DOLLARS (the operator's measure) instead of inferred from a decline
-        tally. Fires only when a key has actually breached AND the admission is
-        armed, so it is bounded by the breach rate, not the RFQ rate.
-        Fix-isolation: a logging failure can never reach the pricing path or
-        change a risk decision — it is swallowed here."""
+    def _log_entity_admission(
+        self, cert: ConcentrationCertificate, ceiling_cc: int, would_admit: bool
+    ) -> None:
+        """TIERED-ENTITY SHADOW READ-OUT: one structured line per entity-axis
+        certificate, so admissions and refusals are countable on the tape in
+        DOLLARS and TIERS (the operator's measure) instead of inferred from a
+        decline tally. ``would_admit`` is the decision the ARMED cap would take —
+        the number the operator arms from while the cap still refuses. The row
+        carries the breaching key's own PRIOR vs ADDED dollars and its tier on
+        both sides, so an ACCUMULATION refusal and a SIZE admission are
+        distinguishable on the tape without re-deriving anything. Fires only when
+        a key has actually breached, so it is bounded by the breach rate, not the
+        RFQ rate. Fix-isolation: a logging failure can never reach the pricing
+        path or change a risk decision — it is swallowed here."""
         try:
             log.info(
-                "entity_net_effect",
+                "entity_tier_admission",
                 key=cert.key,
-                admitted=bool(cert.certified),
+                would_admit=bool(would_admit),
+                certified=bool(cert.certified),
                 verdict=cert.verdict,
-                pre_eff_n=round(cert.pre_eff_n, 3),
-                post_eff_n=round(cert.post_eff_n, 3),
-                pre_key_cc=cert.pre_key_cc,
-                post_key_cc=cert.post_key_cc,
-                pre_total_cc=cert.pre_total_cc,
-                post_total_cc=cert.post_total_cc,
-                n_keys_post=cert.n_keys_post,
+                key_loss_cc=cert.key_loss_cc,
+                prior_cc=cert.prior_cc,
+                add_cc=cert.add_cc,
+                prior_tier=cert.prior_tier,
+                post_tier=cert.post_tier,
+                diversifying_cc=cert.diversifying_cc,
+                concentrating_cc=cert.concentrating_cc,
+                candidate_total_cc=cert.candidate_total_cc,
+                widen_pct=round(cert.widen_weight_pct, 2),
+                cool_keys=cert.n_cool_keys,
+                loaded_keys=cert.n_loaded_keys,
+                ceiling_cc=int(ceiling_cc),
+            )
+        except Exception:  # pragma: no cover - telemetry must never propagate
+            pass
+
+    def _log_slate_partition(
+        self, slate: str, naive_cc: int, partitioned_cc: int, threshold_cc: int
+    ) -> None:
+        """FIX 2 SHADOW READ-OUT: for every slate the NAIVE Σ-per-game roll-up
+        would refuse, the once-counted ENUMERATED JOINT WORST CASE beside it and
+        whether that corrected number still breaches. Fires only on a would-be
+        refusal. Telemetry only; swallowed on failure."""
+        try:
+            log.info(
+                "slate_partition_shadow",
+                slate=slate,
+                naive_cc=int(naive_cc),
+                partitioned_cc=int(partitioned_cc),
+                threshold_cc=int(threshold_cc),
+                would_admit=bool(partitioned_cc <= threshold_cc),
             )
         except Exception:  # pragma: no cover - telemetry must never propagate
             pass
@@ -4532,10 +4563,15 @@ class QuoteLifecycle:
             # solved scale (never diverge — a looser quote-time cap than confirm
             # is the renege zone). 1.0 while disarmed ⇒ byte-identical.
             deploy_scale=self.deploy_scale_for_check(),
-            # LEVER #3 visibility: one line per entity-axis net-effect verdict
-            # (admitted AND refused). Observational only — ``check`` never
-            # branches on it — and never called while the admission is disarmed.
-            net_effect_observer=self._log_net_effect,
+            # FIX 1 / FIX 2 SHADOW READ-OUTS (2026-07-27). One line per
+            # entity-axis ticket-admission verdict (admitted AND refused) and one
+            # per would-be slate refusal, carrying the naive sum next to the
+            # once-counted joint worst case — the numbers the operator arms from.
+            # Observational only: ``check`` never branches on either, both fire
+            # ONLY on a would-be refusal (bounded by the breach rate, not the RFQ
+            # rate), and a logging failure is swallowed inside.
+            entity_admission_observer=self._log_entity_admission,
+            slate_partition_observer=self._log_slate_partition,
         )
         # EV-BASED SLOT EVICTION (2026-07-25 big-fill audit: the slot cap was
         # arrival-order-blind — $3.2M/day of flow died while low-EV leftovers

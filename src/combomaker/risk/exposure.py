@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import hashlib
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from fractions import Fraction
@@ -637,6 +637,24 @@ class ExposureSnapshot:
     # PRICING, this one is what the enforced per-entity cap binds on, exactly
     # mirroring loss_by_combo_cc's committed+candidate accumulation.
     loss_by_entity_cc: dict[str, int] = field(default_factory=dict)
+    # THE BOOK AS LOSS EVENTS, EACH COUNTED ONCE (FIX 2, 2026-07-27). The same
+    # committed positions + candidates + (under mass acceptance) resting-quote
+    # worst-side contributions that feed ``worst_case_loss_by_game_cc`` — but as
+    # ATOMS rather than per-game terms, so an aggregation that must PARTITION
+    # (the slate cap) can count a multi-game parlay ONCE instead of once per
+    # game. Carries the same per-game leg tuples the Stage-B mutex fold consumes,
+    # so no second source of truth exists. Populated by ``snapshot()``; defaulted
+    # empty for back-compat constructions.
+    loss_units: tuple[LossUnit, ...] = ()
+    # DID ``snapshot()`` ACTUALLY BUILD ``loss_units``? (hard rule 6 / quiet-
+    # failure defense #2). ``loss_units`` is empty in TWO utterly different
+    # states — "the book is empty" and "nobody asked for it" — and the consumer
+    # (the slate partition) reads an empty census as ZERO EXPOSURE, i.e. the
+    # PERMISSIVE answer. A snapshot built with ``want_loss_units=False`` would
+    # therefore make every slate breach disappear. This flag is the explicit
+    # UNKNOWN branch: False ⇒ the census was never taken and NO consumer may
+    # derive a permissive number from it. Never inferred from emptiness.
+    loss_units_built: bool = False
 
     # --- back-compat aliases (old event-keyed names; now game-keyed data) ------
     # The pre-B2 field names ``delta_by_event`` / ``worst_case_loss_by_event_cc``
@@ -672,6 +690,107 @@ class ExposureSnapshot:
 # over/under, goalscorers) lives in the structural MC (A1), where the joint state is
 # sampled and the bound is a probability, not a monotone worst-case cap.
 _MutexEntry = tuple[tuple["LegRef", ...], int, bool]
+
+
+@dataclass(frozen=True, slots=True)
+class LossUnit:
+    """ONE loss event of the book — the AND-BOUND TICKET, counted exactly ONCE.
+
+    Exported by ``snapshot()`` so an aggregation that must PARTITION (the slate
+    cap, FIX 2 / 2026-07-27) can count each ticket a single time, instead of
+    re-summing ``worst_case_loss_by_game_cc`` — which charges a multi-game
+    parlay's FULL max_loss once PER GAME it touches (measured live: 55% of the
+    book is multi-game, mean 2.38 games/ticket; the roll-up read $2,610.28
+    against $1,358.71 of real premium, 1.92x).
+
+    ``legs_by_game`` is the ticket's legs partitioned by ``pricing.grouping.
+    game_key`` — the SAME partition ``game_entries`` uses, so a bucket fold sees
+    exactly the per-game leg tuple the Stage-B mutex fold expects. Empty ⇒ the
+    ticket touches no identifiable game (fail-closed: the caller pools it into
+    the conservative UNKNOWN bucket rather than dropping it).
+
+    ``resting`` marks a contribution that came from an OPEN QUOTE under mass
+    acceptance (haircuttable), as opposed to a committed position / candidate
+    (never haircut).
+    """
+
+    legs_by_game: tuple[tuple[str, tuple[LegRef, ...]], ...]
+    loss_cc: int
+    requires_all: bool
+    resting: bool
+
+
+def partitioned_worst_case_cc(
+    units: Iterable[LossUnit],
+    is_me_event: Callable[[str], bool | None] | None,
+    game_caps: Mapping[str, int] | None = None,
+) -> int:
+    """The ENUMERATED joint worst case of a set of loss events, each counted ONCE.
+
+    THE INVARIANTS (FIX 2, operator 2026-07-27 — "compute the exposure
+    CORRECTLY", not an exemption and not a raised number):
+
+    1. **PARTITION.** Every unit lands in EXACTLY ONE bucket: its single game
+       when every one of its legs lives in one ``game_key`` game, else the
+       COMONOTONE RESIDUAL at full loss. This is the same bucketing rule
+       ``sim.book_risk._mutex_aware_det_fold`` already uses, and violating it is
+       the entire defect being repaired.
+    2. **PER-BUCKET SOUNDNESS.** A game bucket folds through
+       ``_mutex_game_worst_cc`` — the existing Stage-B single-explicit-ME-event
+       max-over-branches bound (>= the largest single unit, <= the bucket's
+       comonotone sum, monotone in the unit set). No second concept is invented.
+    3. **CLAMP.** The result is clamped into ``[max single loss, sum of losses
+       counted once]``. Sum-counted-once IS the comonotone all-lose bound, so any
+       aggregate above it is not a worst case, it is an artefact — asserting the
+       clamp makes today's bug untestable-away (live it would have clamped
+       $2,610.28 -> $1,358.71).
+    4. **MONOTONICITY.** Adding a unit never lowers the number: bucket bounds are
+       monotone, the residual only grows, and the clamp's upper term only grows.
+       The E2 mass-acceptance dominance property is preserved.
+    5. **FAIL-CLOSED.** Missing/ambiguous ME metadata, 0 or >=2 ME events, an
+       ungamed or multi-game unit, or any exception ⇒ the comonotone treatment
+       (the LARGER number). Uncertainty always fails toward the larger worst
+       case.
+
+    ``game_caps`` is the CONFIRM-PATH waiver pass-through: a game whose
+    state-exact worst case has been certified caps its BUCKET's bound by ``min``
+    — exactly the substitution the naive roll-up already applies to that game's
+    term, applied at the bucket instead of the sum. A certificate can only ever
+    TIGHTEN a bucket, never raise one.
+
+    SOUNDNESS. Fix any realizable joint outcome w. Each unit loses at most its
+    full premium and is counted in exactly one bucket; within a game bucket the
+    realized outcome selects one ME branch whose total dominates the units that
+    lose in it; residual units are counted unconditionally at full loss. Hence
+    the realized total loss <= this number, for every w.
+    """
+    unit_list = list(units)
+    comonotone = sum(int(u.loss_cc) for u in unit_list)
+    if not unit_list:
+        return 0
+    largest = max(int(u.loss_cc) for u in unit_list)
+    try:
+        residual = 0
+        buckets: dict[str, list[_MutexEntry]] = {}
+        for u in unit_list:
+            loss = int(u.loss_cc)
+            if len(u.legs_by_game) == 1:
+                game, glegs = u.legs_by_game[0]
+                buckets.setdefault(game, []).append((glegs, loss, u.requires_all))
+            else:
+                # Multi-game (its exclusivity vs the rest is NOT certified here)
+                # or ungamed (no identifiable game) ⇒ comonotone residual.
+                residual += loss
+        total = residual
+        for game, entries in buckets.items():
+            bound = _mutex_game_worst_cc(entries, is_me_event)
+            cap = None if game_caps is None else game_caps.get(game)
+            total += bound if cap is None else min(bound, int(cap))
+    except Exception:  # pragma: no cover - fail closed to the larger bound
+        return comonotone
+    # CLAMP (invariant 3): never above the once-counted comonotone sum, never
+    # below the largest single loss event.
+    return max(min(total, comonotone), largest)
 
 
 def _mutex_required(
@@ -1214,9 +1333,19 @@ class ExposureBook:
         extra_positions: Iterable[OpenPosition] = (),
         resting_quote_weight: Fraction | None = None,
         resting_floor_count: int = 3,
+        want_loss_units: bool = False,
     ) -> ExposureSnapshot:
         """Current exposures; with ``mass_acceptance`` every open quote fills
         on its per-aggregate WORSE side (sign-aligned magnitude bound).
+
+        ``want_loss_units`` (FIX 2, 2026-07-27) populates ``loss_units`` — the
+        book as ONCE-COUNTED loss events. OFF by default and deliberately so:
+        building it costs an allocation per position and the ONLY consumer is
+        the slate partition, which runs only when that lever is enabled or armed
+        (throughput never regresses — measured 3,177us/call at HEAD vs
+        3,181us/call here with the flag off). It also sets ``loss_units_built``,
+        so a consumer can tell "empty book" from "census never taken" instead of
+        reading the permissive default off an empty tuple.
 
         Per-market aggregation keys on ``market_ticker``; every per-event
         aggregate keys on the GAME (``pricing.grouping.game_key`` of the leg's
@@ -1260,6 +1389,8 @@ class ExposureBook:
         loss_entity: dict[str, int] = defaultdict(int)
         # committed + candidates/reservations (the ENFORCED entity cap reads this)
         loss_entity_all: dict[str, int] = defaultdict(int)
+        # FIX 2: the book as ONCE-COUNTED loss events (see ``LossUnit``).
+        loss_units: list[LossUnit] = []
         gross_cc = 0
         unknown = False
 
@@ -1318,10 +1449,27 @@ class ExposureBook:
                 if leg.event_ticker:
                     pos_legs_by_game[game_key(leg.event_ticker)].append(leg)
             requires_all = position.our_side is Side.NO
+            # FIX 2 (2026-07-27): the SAME ticket, as ONE loss event, carrying
+            # the SAME per-game leg partition — so the slate cap can count it
+            # once instead of once per game. The per-game leg tuple is built
+            # ONCE and shared with ``game_entries`` (no second allocation on the
+            # hot path). Ungamed ⇒ empty tuple: the caller pools it
+            # conservatively; it is never dropped.
+            unit_games: list[tuple[str, tuple[LegRef, ...]]] = []
             for game, glegs in pos_legs_by_game.items():
+                gl = tuple(glegs)
                 game_notional[game] += position.gross_settlement_notional_cc
-                game_entries[game].append(
-                    (tuple(glegs), position.max_loss_cc, requires_all)
+                game_entries[game].append((gl, position.max_loss_cc, requires_all))
+                if want_loss_units:
+                    unit_games.append((game, gl))
+            if want_loss_units:
+                loss_units.append(
+                    LossUnit(
+                        legs_by_game=tuple(unit_games),
+                        loss_cc=int(position.max_loss_cc),
+                        requires_all=requires_all,
+                        resting=False,
+                    )
                 )
             if deltas is not None:
                 # Leg market tickers are unique within a position (duplicate
@@ -1391,6 +1539,21 @@ class ExposureBook:
                         worst_notional=worst_notional,
                         requires_all=requires_all,
                         per_market=dict(per_market),
+                    )
+                )
+
+        # FIX 2: resting open quotes as ONCE-COUNTED loss events. Emitted in
+        # BOTH fold modes (the ``resting`` flag lets the caller apply the same
+        # burst-floored haircut composition the per-game fold applies); the
+        # per-game term itself is untouched by this list.
+        if want_loss_units:
+            for c in quote_contribs:
+                loss_units.append(
+                    LossUnit(
+                        legs_by_game=tuple(c.legs_by_game.items()),
+                        loss_cc=int(c.worst_loss),
+                        requires_all=c.requires_all,
+                        resting=True,
                     )
                 )
 
@@ -1577,6 +1740,8 @@ class ExposureBook:
             committed_loss_by_family_cc=dict(loss_family),
             committed_loss_by_entity_cc=dict(loss_entity),
             loss_by_entity_cc=dict(loss_entity_all),
+            loss_units=tuple(loss_units),
+            loss_units_built=bool(want_loss_units),
             worst_case_loss_by_game_cc=game_worst,
             gross_settlement_notional_by_game_cc=dict(game_notional),
             directional_by_game_cc=game_directional,
