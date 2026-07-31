@@ -40,6 +40,7 @@ class RfqIntake:
         metrics: Metrics | None = None,
         *,
         series_prefixes: tuple[str, ...] | None = None,
+        hold_probe: Callable[[], bool] | None = None,
     ) -> None:
         """``series_prefixes``: PRE-PARSE firehose gate (quote mode only). The
         communications channel is the WHOLE exchange's RFQ stream — measured
@@ -50,10 +51,24 @@ class RfqIntake:
         ~35s). An RFQ whose raw legs aren't ALL on these prefixes is dropped on
         a cheap string check BEFORE any parsing (metric only) — those would
         decline SKIP_SERIES_NOT_ALLOWED anyway. None (observe mode / default)
-        keeps the record-everything behavior."""
+        keeps the record-everything behavior.
+
+        ``hold_probe``: CONFIRM-PRIORITY intake hold (2026-07-31 double halt).
+        While it answers True — an accepted quote's confirm is in flight, see
+        quote_app's AcceptPriorityGate — NEW ``rfq_created`` messages are
+        DROPPED pre-parse (metric ``rfq.dropped_accept_priority``) so their
+        parse+fan-out cost (the dominant per-frame cost, ~500 frames/s
+        measured) cannot compete with the confirm for the event loop.
+        ``rfq_deleted`` and quote events still process (cheap, and mirror
+        consistency matters more than a saved dict pop). Cost of a drop: an
+        RFQ we never quote — during a window we would decline to quote anyway
+        (a banked win outranks any reprice, operator priority 2026-07-31). The
+        probe is self-bounding: it can only answer True inside the exchange's
+        confirm window (the gate's derivation)."""
         self._ws = ws
         self._metrics = metrics or Metrics()
         self._series_prefixes = series_prefixes
+        self._hold_probe = hold_probe
         self._on_rfq: list[RfqHandler] = []
         self._on_rfq_deleted: list[RfqDeletedHandler] = []
         self._on_quote_event: list[QuoteEventHandler] = []
@@ -123,6 +138,11 @@ class RfqIntake:
         log.info("communications_subscribed", sid=sid)
 
     async def _handle_rfq_created(self, envelope: JsonDict) -> None:
+        if self._hold_probe is not None and self._hold_probe():
+            # Confirm in flight: quoting yields to banking the win (see
+            # __init__ docstring — bounded by the exchange confirm window).
+            self._metrics.inc("rfq.dropped_accept_priority")
+            return
         msg = envelope.get("msg", {})
         if self._series_prefixes is not None:
             # Firehose gate: raw string check BEFORE Rfq.from_ws (see __init__).
@@ -166,6 +186,17 @@ class RfqIntake:
     ) -> Callable[[JsonDict], Awaitable[None]]:
         async def handle(envelope: JsonDict) -> None:
             msg = envelope.get("msg", {})
+            # WIRE-RECEIVE STAMP pass-through (2026-07-31 confirm priority
+            # inversion): the WS read loop stamps priority frames with the
+            # monotonic instant they left the socket. Quote events are keyed
+            # payloads (the lifecycle only ever sees ``msg``), so the stamp is
+            # copied down for the accept handler's deadline anchor — the
+            # exchange's 3.0s confirm window opened before this frame reached
+            # us, and anchoring at handler start silently granted the confirm
+            # path time the exchange had already spent (2026-07-31 double halt).
+            recv_ns = envelope.get("_recv_mono_ns")
+            if isinstance(recv_ns, int) and isinstance(msg, dict):
+                msg.setdefault("_ws_recv_mono_ns", recv_ns)
             self._metrics.inc(f"quote_event.{quote_type}")
             for handler in self._on_quote_event:
                 try:

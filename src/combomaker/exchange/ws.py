@@ -39,6 +39,12 @@ _WS_HANDSHAKE_PATH = "/trade-api/ws/v2"
 
 SubscribedHandler = Callable[[int], Awaitable[None]]  # receives the new sid
 
+# PRIORITY-LANE WAKE SENTINEL (2026-07-31 confirm priority inversion). Enqueued
+# into the NORMAL queue when a priority frame arrives so an idle dispatcher
+# wakes immediately; carries no payload and is never dispatched. Identity
+# (``is``) checked, so no real message can collide with it.
+_PRIORITY_WAKE: JsonDict = {"type": "_priority_wake"}
+
 
 @dataclass
 class _Subscription:
@@ -106,12 +112,40 @@ class WsManager:
         # rather than silently falling behind.
         self._msg_queue: asyncio.Queue[JsonDict] = asyncio.Queue(maxsize=self._QUEUE_MAX)
         self._dispatch_task: asyncio.Task[None] | None = None
+        # PRIORITY LANE (2026-07-31, the double confirm-expiry halt). The
+        # dispatcher is FIFO over the whole channel, so a rare-but-deadlined
+        # frame (quote_accepted: the exchange gives 3.0s to confirm, a protocol
+        # fact — rfq/lifecycle.py EXCHANGE_CONFIRM_WINDOW_S) can sit behind
+        # thousands of firehose frames. Measured 2026-07-31 (report of the same
+        # date): on all 12 expired confirms ever, the in-handler time was
+        # <= 1.14s of the 3.0s window — >= 1.86s died UPSTREAM, in this queue's
+        # backlog, while the comms channel carried ~500 frames/s sustained.
+        # Frames whose type is marked priority route to their own queue, which
+        # the dispatcher fully drains BEFORE dispatching each normal frame, so
+        # a priority frame waits for AT MOST ONE normal dispatch (~ms), never
+        # the backlog. FIFO is preserved within each lane; the marked types
+        # (quote lifecycle events keyed by quote_id) carry no seq dependency on
+        # the rfq stream. Bound: inherited from the dispatcher bound above
+        # (_QUEUE_MAX) with the same fail-closed overflow semantics — no new
+        # number.
+        self._priority_types: frozenset[str] = frozenset()
+        self._priority_queue: asyncio.Queue[JsonDict] = asyncio.Queue(
+            maxsize=self._QUEUE_MAX
+        )
 
     # --- registration (all before start) ---
 
     def on_message(self, msg_type: str, handler: MessageHandler) -> None:
         """Register a handler for a message ``type`` ('*' = every message)."""
         self._handlers.setdefault(msg_type, []).append(handler)
+
+    def mark_priority(self, *msg_types: str) -> None:
+        """Route frames of these types around the FIFO dispatch backlog.
+
+        For rare frames with an EXCHANGE deadline (accept→confirm). Register
+        before ``start()``; handlers are unchanged — only queueing order moves.
+        """
+        self._priority_types = self._priority_types | frozenset(msg_types)
 
     def on_disconnect(self, handler: LifecycleHandler) -> None:
         self._on_disconnect.append(handler)
@@ -205,10 +239,11 @@ class WsManager:
         if self._dispatch_task is not None:
             # Drain what's already queued (handlers may hold cleanup state),
             # then cancel. join() would hang if a handler stalls — bound it.
-            try:
-                await asyncio.wait_for(self._msg_queue.join(), timeout=0.1)
-            except (TimeoutError, asyncio.TimeoutError):
-                pass
+            for q in (self._priority_queue, self._msg_queue):
+                try:
+                    await asyncio.wait_for(q.join(), timeout=0.1)
+                except TimeoutError:
+                    pass
             self._dispatch_task.cancel()
             try:
                 await self._dispatch_task
@@ -302,6 +337,32 @@ class WsManager:
                 except ValueError:
                     log.warning("ws_bad_json", name=self._name, data=frame.data[:200])
                     continue
+                if str(message.get("type", "")) in self._priority_types:
+                    # Deadlined frame: its own lane + a wake sentinel so an
+                    # idle dispatcher (empty normal queue) wakes immediately.
+                    # Overflow on EITHER queue is the same genuine-runaway
+                    # signal as below — fail closed by reconnecting.
+                    #
+                    # WIRE-RECEIVE STAMP: the exchange's deadline (the 3.0s
+                    # confirm window) opens BEFORE this frame reaches us, so
+                    # every deadline computation downstream must anchor at the
+                    # earliest instant this process can observe — right here,
+                    # off the socket — not at handler start. The stamp rides
+                    # the envelope (server fields never start with "_") and the
+                    # intake copies it through, so any residual in-process
+                    # delay (dispatch, the quote-event queue, loop contention)
+                    # automatically deducts from the derived confirm budget.
+                    message["_recv_mono_ns"] = self._last_rx_mono_ns
+                    self._metrics.inc(f"{self._name}.priority_frame")
+                    try:
+                        self._priority_queue.put_nowait(message)
+                        self._msg_queue.put_nowait(_PRIORITY_WAKE)
+                        continue
+                    except asyncio.QueueFull:
+                        self._metrics.inc(f"{self._name}.dispatch_queue_overflow")
+                        log.error("ws_dispatch_queue_overflow", name=self._name)
+                        await ws.close()
+                        return
                 try:
                     self._msg_queue.put_nowait(message)
                 except asyncio.QueueFull:
@@ -319,13 +380,14 @@ class WsManager:
     def _discard_queued(self) -> None:
         """Drop every queued-but-unprocessed message (dead-connection backlog)."""
         dropped = 0
-        while True:
-            try:
-                self._msg_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            self._msg_queue.task_done()
-            dropped += 1
+        for q in (self._priority_queue, self._msg_queue):
+            while True:
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                q.task_done()
+                dropped += 1
         if dropped:
             self._metrics.inc(f"{self._name}.queue_discarded", dropped)
             log.info("ws_queue_discarded", name=self._name, dropped=dropped)
@@ -334,15 +396,44 @@ class WsManager:
         """Single long-lived consumer: handlers run here, IN ORDER (FIFO keeps
         per-sid seq continuity), off the read loop. Messages from a dead
         connection self-drop downstream (sid no longer registered), so the queue
-        safely spans reconnects. Cancelled only by stop()."""
+        safely spans reconnects. Cancelled only by stop().
+
+        PRIORITY frames (``mark_priority``) are fully drained before EVERY
+        normal dispatch, so a deadlined frame waits for at most one normal
+        handler run instead of the whole backlog (derivation at the queue's
+        construction). The wake sentinel exists only for the idle case; by the
+        time the dispatcher works through a backlog to a sentinel its frame has
+        long been drained ahead of an earlier normal dispatch — a no-op then.
+        """
         while True:
             message = await self._msg_queue.get()
+            try:
+                # empty() guard, not try/except: the drain's QueueEmpty raise
+                # measured -41% on the no-op drain benchmark when paid per
+                # frame; the O(1) emptiness check keeps the no-priority path at
+                # its pre-lane cost (2026-07-31 bench in the same-day report).
+                if not self._priority_queue.empty():
+                    await self._drain_priority()
+                if message is not _PRIORITY_WAKE:
+                    await self._dispatch(message)
+            except Exception:  # a handler bug must not kill the dispatcher
+                log.exception("ws_dispatch_failed", name=self._name)
+            finally:
+                self._msg_queue.task_done()
+
+    async def _drain_priority(self) -> None:
+        """Dispatch every queued priority frame NOW (FIFO within the lane)."""
+        while True:
+            try:
+                message = self._priority_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
             try:
                 await self._dispatch(message)
             except Exception:  # a handler bug must not kill the dispatcher
                 log.exception("ws_dispatch_failed", name=self._name)
             finally:
-                self._msg_queue.task_done()
+                self._priority_queue.task_done()
 
     async def _dispatch(self, message: JsonDict) -> None:
         msg_type = str(message.get("type", ""))
