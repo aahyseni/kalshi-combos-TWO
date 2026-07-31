@@ -298,6 +298,88 @@ class RiskLimits:
     portfolio_tail_prob_gate: bool = False
     portfolio_kill_tail_prob: float = 0.02
     portfolio_tail_prob_ci_z: float = 0.0
+    # ── KILL-ANCHORED BOOK GATE (2026-07-29) — THE ONE ARMING FLAG ──────────
+    # THE DEFECT it repairs. The operator ratified P(KILL-night) <= 2% at the
+    # 12%-of-bankroll KILL line, and ``portfolio_tail_prob_gate`` has been ARMED
+    # live since 2026-07-25 — but the armed form thresholds the probability on
+    # ``portfolio_cvar_frac x bankroll`` (0.35 live), NOT on the KILL line
+    # ``hard_trip_frac x bankroll`` (0.12). With ``portfolio_det_max_frac``
+    # 0.36 the ratio is 0.35/0.36 = 0.9722, so 2% of scenarios would have to
+    # reach 97.22% of the COMONOTONE MAXIMUM loss before the gate could fire.
+    # It never has: measured on the 2026-07-28 tape the breach string
+    # "P(book loss >= " occurs 0 times in 104,803 ``risk_audit`` rows and
+    # "deterministic max loss" 0 times — BOTH portfolio envelope axes refused
+    # ZERO fills, and every one of the 1,579 ``skip_portfolio_cvar`` declines
+    # was fail-closed STALENESS. The dollar cap did all the governing and the
+    # operator's actual risk anchor was decorative.
+    #
+    # WHY THE DOLLAR CAP CANNOT DO THIS JOB. det-max IS the premium sum
+    # (``exposure.max_loss_cc``; live comonotone $408.84 == premium $408.84,
+    # ratio 1.000001), so it is BLIND TO SHAPE: five books each holding
+    # EXACTLY $693.89 span ES99 $345.96 -> $238.94 and P(KILL-night)
+    # 0.00900 -> 0.00100 (9x) with det-max IDENTICAL TO THE CENT. The
+    # $1,058.50 wall ADMITS a 2-ticket book at P(KILL-night) 4.9% (2.45x the
+    # ratified budget) and REFUSES a 64-ticket book at 0.6% — wrong in both
+    # directions.
+    #
+    # WHAT ARMING DOES — EXACTLY ONE THING, off RATIFIED anchors only:
+    #   the tail-PROBABILITY form thresholds on the KILL line
+    #   ``hard_trip_frac x bankroll`` with budget ``portfolio_kill_tail_prob``
+    #   — the two anchors the operator actually ratified — instead of
+    #   ``portfolio_cvar_frac x bankroll``.
+    # det-max is DELIBERATELY NOT MOVED. See the WITHDRAWN section below.
+    #
+    # WITHDRAWN 2026-07-31 — the second half of the original design (demote
+    # det-max to a "model-failure backstop" at ``ruin_floor_frac`` = 0.70 x
+    # bankroll, 1.94x today's 0.36) WAS MEASURED AND IS A RISK REGRESSION. It
+    # is not shipped. Three independent reasons, all checked:
+    #
+    #  1. THE DERIVATION WAS SELF-CANCELLING. It read "ruin floor 30%" as a
+    #     surviving-equity fraction of 0.70 and then applied the complement
+    #     twice — ``(1 - (1 - 0.70)) = 0.70`` — so the "derived" ceiling was
+    #     just the input restated. In THIS codebase ruin is a 30% DRAWDOWN
+    #     (``cap_family.RUIN_FLOOR_FRAC = 0.30`` is the distance;
+    #     ``book_risk`` uses 0.70 as the surviving-equity floor, the
+    #     complement). A ceiling at 0.70 x bankroll therefore permits a
+    #     comonotone collapse of 2.33x the ratified ruin DISTANCE and 5.83x
+    #     the KILL line. No ratified anchor yields 0.70.
+    #
+    #  2. IT ADMITTED EXACTLY THE BOOK det-max EXISTS TO REFUSE. The 64-ticket
+    #     "spread" book the demotion was designed to let through carries
+    #     $1,983.64 of premium = 67.5% of bankroll. It scores P(KILL-night)
+    #     0.57% ONLY under the ratified cross-game independence assumption
+    #     (rho = 0) that the governing MC itself uses. Re-measured under
+    #     correlated model error (one-factor copula on the loss indicator,
+    #     400k paths):
+    #         rho 0.00 -> P(KILL) 0.57%   P(ruin) 0.00%
+    #         rho 0.10 -> P(KILL) 12.09%  P(ruin) 0.97%
+    #         rho 0.25 -> P(KILL) 20.82%  P(ruin) 6.21%
+    #         rho 1.00 -> P(KILL) 29.47%  P(ruin) 29.47%
+    #     rho = 0.25 is not hypothetical — it is the sensitivity already on
+    #     record for this book (ES99 $221.64 -> $280.65, modeled EV +$10.84 ->
+    #     -$4.25). At that rho the admitted book breaches the ratified 2%
+    #     budget by 10.4x. Today's 0.36 wall is what refuses it.
+    #
+    #  3. IT REMOVED THE ONLY CORRELATION-ROBUST BOUND AT THE MOMENT IT
+    #     MATTERS. The tail-probability gate (a) is computed FROM the joint
+    #     model, so it inherits whatever correlation error the model has.
+    #     det-max does not: ``Loss(omega) <= D`` for EVERY outcome under ANY
+    #     copula. Loosening the copula-free bound 1.94x while making a
+    #     copula-dependent gate the governing constraint concentrates all
+    #     protection on the one assumption most likely to be wrong.
+    #
+    # So det-max keeps binding on ``portfolio_det_max_frac`` exactly as today,
+    # armed or not. Raising it is an OPERATOR RATIFICATION (a new layer-2
+    # anchor above the 30% ruin distance), not an agent derivation.
+    #
+    # The ES_0.99 fallback form is UNCHANGED and still binds on
+    # ``portfolio_cvar_frac`` — an ES is an average-of-the-worst-1% magnitude,
+    # not a KILL-distance probability, so re-anchoring IT to 0.12 would brick
+    # quoting. Staleness/unusable snapshots fail closed exactly as today.
+    # Default False = SHADOW = byte-identical (proven over 20,000 replayed
+    # limit cases + 2,000 candidate-gate cases,
+    # tools/diagnostics/kill_anchor_shadow_golden.py).
+    kill_anchored_book_gate: bool = False
     # Portfolio DETERMINISTIC maximum-loss cap (P0-3): the exact all-hit
     # premium-at-risk (+ reserved holdings) as a %-of-bankroll ceiling. Gated
     # INDEPENDENTLY of the sampled-ES cap so the deterministic maximum is its own
@@ -1534,6 +1616,34 @@ class LimitChecker:
         if book_risk is not None:
             cvar_thr = threshold_cc(limits.portfolio_cvar_frac, bankroll)
             det_max_thr = threshold_cc(limits.portfolio_det_max_frac, bankroll)
+            # KILL-ANCHORED RE-ANCHOR (2026-07-29, ARMING FLAG — default SHADOW
+            # ⇒ the line below is skipped and every threshold is exactly the
+            # one enforced today). See ``RiskLimits.kill_anchored_book_gate``.
+            #
+            # THE GOVERNING CONSTRAINT moves onto the two anchors the operator
+            # actually ratified: the KILL line ``hard_trip_frac`` (0.12 of
+            # bankroll) and the budget ``portfolio_kill_tail_prob`` (0.02).
+            # Nothing is derived — both are read straight from config.
+            #
+            # ``det_max_thr`` is INTENTIONALLY untouched by the arming flag. The
+            # original design also demoted it to ``ruin_floor_frac`` (0.70 x
+            # bankroll); that half was measured to be a risk REGRESSION and was
+            # withdrawn — the full measurement is in
+            # ``RiskLimits.kill_anchored_book_gate``. det-max is the only bound
+            # that survives a wrong correlation model, and the gate above is
+            # computed FROM the correlation model, so the copula-free wall must
+            # not move when the copula-dependent gate takes over.
+            # The tail-probability threshold. Separate name from ``cvar_thr``
+            # because the ES_0.99 FALLBACK form below deliberately keeps
+            # binding on ``portfolio_cvar_frac``: an ES is an
+            # average-of-the-worst-1% MAGNITUDE, not a KILL-distance
+            # PROBABILITY, and re-anchoring it to 0.12 would refuse essentially
+            # every book (it is the fail-closed path, never a free pass).
+            tail_thr = (
+                threshold_cc(limits.hard_trip_frac, bankroll)
+                if limits.kill_anchored_book_gate
+                else cvar_thr
+            )
             if not book_risk.usable:
                 # Fail closed on BOTH tail axes — an unmeasured joint tail AND an
                 # unmeasured deterministic maximum are each never safe.
@@ -1570,19 +1680,25 @@ class LimitChecker:
                     # Each grid point carries 1/(len-1) probability mass;
                     # counting POINTS ≥ thr rounds the mass UP (conservative).
                     n_grid = len(quantiles)
-                    k_ge = sum(1 for q in quantiles if q >= cvar_thr)
+                    k_ge = sum(1 for q in quantiles if q >= tail_thr)
                     p_hat = k_ge / max(1, n_grid - 1)
                     p_upper = _wilson_upper(
                         min(1.0, p_hat), n_mc, limits.portfolio_tail_prob_ci_z
                     )
                     if p_upper > limits.portfolio_kill_tail_prob:
+                        anchor_note = (
+                            f" (KILL line {limits.hard_trip_frac} bankroll)"
+                            if limits.kill_anchored_book_gate
+                            else ""
+                        )
                         out.append(
                             Breach(
                                 ReasonCode.SKIP_PORTFOLIO_CVAR,
-                                f"P(book loss >= {cvar_thr}cc) = "
+                                f"P(book loss >= {tail_thr}cc) = "
                                 f"{p_upper:.4f} (upper) > kill tail budget "
                                 f"{limits.portfolio_kill_tail_prob:.4f} "
-                                f"(tail-probability form)",
+                                f"(tail-probability form)"
+                                f"{anchor_note}",
                                 shadow=shadow,
                             )
                         )
