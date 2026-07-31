@@ -118,12 +118,17 @@ async def _skip_reasons(store: Store) -> dict[str, int]:
 
 
 async def test_without_snapshot_first_rfq_fails_closed(tmp_path: Path) -> None:
-    """The exact warmup behaviour the fix kills — proves the fixture bites."""
+    """The exact warmup behaviour the fix kills — proves the fixture bites.
+
+    2026-07-31 boot-warmup quote gate: the fail-closed skip is now the
+    DEDICATED warmup hold (pre-pricing, SKIP_WARMUP_BOOK_RISK) instead of a
+    post-pricing skip_portfolio_cvar decline — same no-quote outcome, no
+    pricing spent, and the boot window is named in the tape."""
     rig = await _make_rig(tmp_path, db="warmup.sqlite3")
     await rig.lifecycle.handle_rfq(combo(CROSS_EVENT_LEGS))
     assert rig.sender.created == []
     reasons = await _skip_reasons(rig.store)
-    assert reasons.get(str(ReasonCode.SKIP_PORTFOLIO_CVAR), 0) >= 1
+    assert reasons.get(str(ReasonCode.SKIP_WARMUP_BOOK_RISK), 0) >= 1
 
 
 async def test_startup_snapshot_kills_warmup_declines(tmp_path: Path) -> None:
@@ -165,11 +170,12 @@ async def test_snapshot_error_proceeds_as_today(tmp_path: Path) -> None:
     # Never raises out of startup…
     await QuoteApp._startup_book_risk_snapshot(cast(Any, None), rig.lifecycle)
     # …and behaviour is exactly today's: the unmeasured book keeps failing
-    # closed until the maintenance loop publishes a snapshot.
+    # closed until the maintenance loop publishes a snapshot (2026-07-31: the
+    # fail-closed skip is the dedicated boot-warmup hold, pre-pricing).
     await rig.lifecycle.handle_rfq(combo(CROSS_EVENT_LEGS))
     assert rig.sender.created == []
     reasons = await _skip_reasons(rig.store)
-    assert reasons.get(str(ReasonCode.SKIP_PORTFOLIO_CVAR), 0) >= 1
+    assert reasons.get(str(ReasonCode.SKIP_WARMUP_BOOK_RISK), 0) >= 1
 
 
 async def test_snapshot_timeout_is_bounded_and_proceeds(tmp_path: Path) -> None:

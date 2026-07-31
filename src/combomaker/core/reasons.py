@@ -94,6 +94,15 @@ class ReasonCode(StrEnum):
     # a P&L window. Distinct from the enforced delta/loss caps: this fires BELOW
     # the hard cap, in the low-headroom band where a quote would have to be wide.
     SKIP_WIDEN_AVOIDED = "skip_widen_avoided"
+    # BOOT-WARMUP QUOTE GATE (2026-07-31): quote SENDING is held at startup
+    # until the first moment the confirm path's book-risk usability predicate
+    # (_book_risk_for_check: empty book, or a usable generation-matched fresh
+    # snapshot) could let a confirm pass. Quoting before then manufactures
+    # guaranteed reneges (the confirm gate fails closed on the unmeasured
+    # tail) and burns exchange goodwill. One-way latch: once quoting opens it
+    # never re-holds — mid-run staleness keeps its existing behaviour
+    # (SKIP_PORTFOLIO_CVAR / _DET_MAX fail closed per check).
+    SKIP_WARMUP_BOOK_RISK = "skip_warmup_book_risk"
     SKIP_HALTED = "skip_halted"
     SKIP_PRICING_FAILED = "skip_pricing_failed"
     # The off-loop joint pricing exceeded its latency DEADLINE — we DELIBERATELY

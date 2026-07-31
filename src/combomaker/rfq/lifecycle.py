@@ -1377,6 +1377,21 @@ class QuoteLifecycle:
         # (half of it) so the snapshot stays fresh without running a full MC every
         # 0.5s maintenance tick. None ⇒ never refreshed yet.
         self._book_risk_refresh_mono_ns: int | None = None
+        # BOOT-WARMUP QUOTE GATE (2026-07-31, the 10:11:12Z boot reneges).
+        # Quote SENDING is held at startup until the FIRST moment the confirm
+        # path's own usability predicate (``_book_risk_for_check``: empty book
+        # ⇒ None ⇒ nothing to measure, else a usable generation-matched fresh
+        # snapshot) reads open — the SAME predicate, never a duplicate, so the
+        # gate can never be looser or stricter than the confirm that would
+        # renege the fill. ONE-WAY latch: once open it stays open for the
+        # process lifetime, so mid-run staleness behaviour is UNCHANGED (only
+        # the boot window is new). ``_warmup_last_warn_mono_ns`` throttles the
+        # loud still-holding warning to once per snapshot-freshness window
+        # (``book_risk_stale_after_s`` — the system's own staleness horizon,
+        # not a new knob).
+        self._quote_warmup_open: bool = False
+        self._quote_warmup_start_mono_ns: int = clock.monotonic_ns()
+        self._warmup_last_warn_mono_ns: int | None = None
         # P2-2: the in-flight OFF-LOOP recompute task, if any. The maintenance tick
         # LAUNCHES the off-loop MC as a background task and returns IMMEDIATELY (it
         # never awaits the MC), so the maintenance loop keeps beating the heartbeat
@@ -2673,6 +2688,93 @@ class QuoteLifecycle:
         if age_s > self._config.book_risk_stale_after_s:
             return _StaleBookRisk()  # snapshot too old ⇒ fail closed (secondary)
         return snap
+
+    def quote_warmup_open(self) -> bool:
+        """BOOT-WARMUP QUOTE GATE (2026-07-31). True once quote SENDING is open.
+
+        Holds quote sending at startup until the FIRST evaluation on which the
+        confirm gate's book-risk usability predicate could pass — REUSING
+        ``_book_risk_for_check`` (None ⇒ empty book, nothing to measure — an
+        empty book must still quote; else the snapshot's own ``usable``). A
+        quote sent before that moment is a quote whose acceptance the confirm
+        path is GUARANTEED to renege (fail-closed on the unmeasured tail), so
+        sending it only burns exchange goodwill (the 2026-07-31 10:11:12Z
+        boot: two won auctions reneged "book-risk snapshot unusable").
+
+        ONE-WAY LATCH: opens once, never re-holds — mid-run staleness keeps
+        today's behaviour exactly (per-check fail-closed via the portfolio
+        caps). Emits ONE loud line with the measured warmup duration when
+        quoting opens; while holding, emits a loud warning throttled to once
+        per snapshot-freshness window (a NEVER-usable book stays silent
+        forever, loudly). Cheap: latched-open path is one bool read; the
+        holding path is ``_book_risk_for_check`` (state + clock reads)."""
+        if self._quote_warmup_open:
+            return True
+        risk = self._book_risk_for_check()
+        now_ns = self._clock.monotonic_ns()
+        # ENFORCEMENT PARITY — the gate may hold ONLY where the confirm path
+        # would actually renege, never wider (no-double-risk-layers; a gate
+        # stricter than confirm is a pure throughput loss):
+        #   * SHADOW caps: the fail-closed portfolio breaches carry
+        #     ``shadow=caps_shadow_mode`` (risk/limits.py) and the confirm
+        #     path DROPS shadow breaches (``_partition_breaches``) — a confirm
+        #     cannot renege, so the gate stands down. Read live off the
+        #     checker, so an operator cap-mode change needs no second switch.
+        #   * NO BANKROLL LAYER: with no bankroll source configured and no
+        #     reading, the whole %-cap layer (incl. the book-risk fail-closed)
+        #     is INACTIVE (limits.py "do-not-brick path" — demo/paper rigs) —
+        #     same two inputs check() receives, so the gate mirrors it exactly.
+        caps_shadow = self._limits.limits.caps_shadow_mode
+        bankroll_layer_active = (
+            self._risk_bankroll_cc() is not None
+            or self._bankroll_source_configured()
+        )
+        if risk is None or risk.usable or caps_shadow or not bankroll_layer_active:
+            self._quote_warmup_open = True
+            warmup_s = (now_ns - self._quote_warmup_start_mono_ns) / 1e9
+            if risk is None or risk.usable:
+                detail = (
+                    "first USABLE book-risk verdict — quote sending opens "
+                    "(boot-warmup gate released; it will not re-hold this "
+                    "process)"
+                )
+            elif caps_shadow:
+                detail = (
+                    "portfolio caps in SHADOW mode — a confirm cannot renege, "
+                    "so the boot-warmup gate stands down (opens un-held)"
+                )
+            else:
+                detail = (
+                    "no bankroll layer configured — the %-cap fail-closed is "
+                    "inactive (limits.py do-not-brick path), so the "
+                    "boot-warmup gate stands down (opens un-held)"
+                )
+            log.info(
+                "quote_warmup_open",
+                warmup_s=round(warmup_s, 3),
+                book_positions=len(self._exposure.positions),
+                caps_shadow_mode=caps_shadow,
+                bankroll_layer_active=bankroll_layer_active,
+                detail=detail,
+            )
+            return True
+        elapsed_s = (now_ns - self._quote_warmup_start_mono_ns) / 1e9
+        last = self._warmup_last_warn_mono_ns
+        if (
+            last is None
+            or (now_ns - last) / 1e9 >= self._config.book_risk_stale_after_s
+        ):
+            self._warmup_last_warn_mono_ns = now_ns
+            log.warning(
+                "quote_warmup_holding",
+                elapsed_s=round(elapsed_s, 1),
+                book_positions=len(self._exposure.positions),
+                detail="boot warmup: non-empty book with NO usable book-risk "
+                "snapshot yet — quote sending held (fail-closed; a confirm "
+                "could only renege). Feeds/metadata/settlement continue; "
+                "quoting opens automatically on the first usable snapshot",
+            )
+        return False
 
     def _book_risk_decayed(self) -> _DecayedBookRisk | None:
         """FIX 5. The book-growth-charged view of the current (generation-stale)
@@ -4977,6 +5079,23 @@ class QuoteLifecycle:
         # been deleted while queued; nothing purges the rfq_work queue itself).
         if self._rfq_gone(rfq):
             await self._skip_dead_rfq(rfq, "pre_price")
+            return
+        # BOOT-WARMUP QUOTE GATE (2026-07-31): hold quote SENDING until the
+        # first usable book-risk verdict (the confirm gate's own predicate,
+        # reused). BEFORE filter/pricing — no work is spent on a quote that
+        # could only be reneged. Leg watching/metadata warm-up happens in
+        # quote_app._ensure_watched BEFORE this method, so books keep warming
+        # during the hold; the skip is durably recorded per RFQ (hedge-watch).
+        if not self.quote_warmup_open():
+            self._metrics.inc("quote.warmup_held")
+            await self._record_skip(
+                rfq,
+                [ReasonCode.SKIP_WARMUP_BOOK_RISK],
+                {
+                    "detail": "boot warmup: no usable book-risk snapshot yet — "
+                    "quote sending held (fail-closed)"
+                },
+            )
             return
         reasons = self._filter.evaluate(rfq)
         if reasons:
@@ -7653,6 +7772,12 @@ class QuoteLifecycle:
         # LAUNCHES the MC in a worker and returns immediately (never blocks the tick
         # / heartbeat); without one it runs inline (fast in paper/tests).
         self._maybe_recompute_book_risk()
+        # BOOT-WARMUP QUOTE GATE: evaluate/latch off the tick too, so quoting
+        # opens the moment the first usable snapshot publishes even with zero
+        # RFQ flow — and the loud still-holding warning fires on a quiet boot
+        # (self-throttled to once per freshness window). One bool read once
+        # open; never re-holds.
+        self.quote_warmup_open()
         # DEPLOYMENT SCALE (operator LEVER #1): re-SOLVE how much of the already-
         # enforced envelope is still unused, on its own (slower) throttle and in
         # the SAME worker pool — never on the quote path, which only reads the
