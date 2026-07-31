@@ -24,8 +24,14 @@ Set-Location $root
 # a watchdog-initiated stop (-KeepPid) keeps the watchdog's own process TREE
 # (its python AND its cmd host / venv shim all match 'hang_watchdog') alive to
 # perform the relight.
+# OURS-ONLY (2026-07-31 adversarial gate): membership is the LAUNCH-SITE
+# signature in ours_predicate.ps1, never a bare keyword — the old keyword net
+# was proven live to select a foreign decoy python and other projects' shells
+# whose command TEXT merely mentioned the tree. Full derivation + the
+# executed-proof coverage (prove_watchdog P7) live in that file.
+. "$PSScriptRoot\ours_predicate.ps1"
 $procs = Get-CimInstance Win32_Process |
-    Where-Object { $_.CommandLine -match 'combomaker|fill_prober|hang_watchdog|watch_main|watch_prober' -and
+    Where-Object { (Test-CombomakerOurs $_) -and
                    $_.ProcessId -ne $PID -and $_.ProcessId -ne $KeepPid -and
                    -not ($KeepPid -ne 0 -and $_.CommandLine -match 'hang_watchdog') }
 if (-not $procs) {
@@ -48,7 +54,7 @@ if (-not $procs) {
     # so it must be flagged here; a watchdog-initiated stop (KeepPid) keeps
     # its own process alive by design.
     $left = Get-CimInstance Win32_Process |
-        Where-Object { $_.CommandLine -match 'combomaker|fill_prober|hang_watchdog|watch_main|watch_prober' -and
+        Where-Object { (Test-CombomakerOurs $_) -and
                        $_.ProcessId -ne $PID -and $_.ProcessId -ne $KeepPid -and
                        -not ($KeepPid -ne 0 -and $_.CommandLine -match 'hang_watchdog') }
     if ($left) {
