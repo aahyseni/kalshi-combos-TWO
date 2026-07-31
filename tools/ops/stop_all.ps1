@@ -8,18 +8,25 @@
 # would refuse anyway (an operator stop force-kills the child, which leaves no
 # halt receipt => default-deny => escalate), but killing it FIRST means the
 # operator never sees a spurious relight_terminal_escalation line on the way out.
-param([switch]$NoPrompt)
+# -KeepPid (2026-07-31): the hang watchdog stops a hung tree through THIS
+# script before relighting it; the pid it passes is its own, so the stop
+# does not kill the process performing the recovery. An operator stop passes
+# nothing and the watchdog dies in the FIRST group (it too can resurrect the
+# bot, so it goes down before the bot does).
+param([switch]$NoPrompt, [int]$KeepPid = 0)
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $root
 
 $procs = Get-CimInstance Win32_Process |
-    Where-Object { $_.CommandLine -match 'combomaker|fill_prober' -and $_.ProcessId -ne $PID }
+    Where-Object { $_.CommandLine -match 'combomaker|fill_prober|hang_watchdog' -and
+                   $_.ProcessId -ne $PID -and $_.ProcessId -ne $KeepPid -and
+                   -not ($KeepPid -ne 0 -and $_.CommandLine -match 'hang_watchdog') }
 if (-not $procs) {
-    Write-Host "Nothing running (no combomaker/prober processes found)." -ForegroundColor Green
+    Write-Host "Nothing running (no combomaker/prober/watchdog processes found)." -ForegroundColor Green
 } else {
-    $supervisors = @($procs | Where-Object { $_.CommandLine -match 'supervisor|relight' })
-    $rest = @($procs | Where-Object { $_.CommandLine -notmatch 'supervisor|relight' })
+    $supervisors = @($procs | Where-Object { $_.CommandLine -match 'supervisor|relight|hang_watchdog' })
+    $rest = @($procs | Where-Object { $_.CommandLine -notmatch 'supervisor|relight|hang_watchdog' })
     foreach ($p in $supervisors) {
         Write-Host "Stopping supervisor/relighter PID $($p.ProcessId)" -ForegroundColor Yellow
         try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {}
@@ -30,8 +37,14 @@ if (-not $procs) {
         try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {}
     }
     Start-Sleep -Seconds 2
+    # Same predicate as the kill list: a watchdog that survived an OPERATOR
+    # stop is exactly the process that could relight against operator intent,
+    # so it must be flagged here; a watchdog-initiated stop (KeepPid) keeps
+    # its own process alive by design.
     $left = Get-CimInstance Win32_Process |
-        Where-Object { $_.CommandLine -match 'combomaker|fill_prober' }
+        Where-Object { $_.CommandLine -match 'combomaker|fill_prober|hang_watchdog' -and
+                       $_.ProcessId -ne $PID -and $_.ProcessId -ne $KeepPid -and
+                       -not ($KeepPid -ne 0 -and $_.CommandLine -match 'hang_watchdog') }
     if ($left) {
         Write-Host "STILL RUNNING (kill by hand):" -ForegroundColor Red
         $left | ForEach-Object { Write-Host "  PID $($_.ProcessId): $($_.CommandLine)" }

@@ -1,5 +1,16 @@
-# One-click bot startup: single-instance guard, dated logs, four windows
-# (bot, main monitor, prober, prober monitor). Run via START_BOT.bat.
+# One-click bot startup: single-instance guard, dated logs, five windows
+# (bot, main monitor, prober, prober monitor, hang watchdog). Run via
+# START_BOT.bat.
+#
+# -Auto / -CallerPid (2026-07-31, the 45h frozen-log outage): the hang
+# watchdog (tools/ops/hang_watchdog.py) relights a stalled tree through THIS
+# script so every guard here (mutex, single-instance, KILL semantics) stays
+# authoritative. -Auto means "no human at the keyboard": the human-gated KILL
+# prompt becomes a refusal (exit 1 — the watchdog latches a halt receipt on
+# that), watchdog state is NOT purged (its flap memory must survive its own
+# relights), and no second watchdog window is spawned. -CallerPid exempts the
+# calling watchdog from the single-instance guard.
+param([switch]$Auto, [int]$CallerPid = 0)
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $root
@@ -21,9 +32,13 @@ if (-not $created) {
 # Only LIVE PYTHON processes refuse; dead cmd/powershell shell windows from a
 # stopped stack (their command lines still name the bot) are swept, not blockers.
 $matches_all = Get-CimInstance Win32_Process |
-    Where-Object { $_.CommandLine -match 'combomaker|fill_prober' -and $_.ProcessId -ne $PID }
+    Where-Object { $_.CommandLine -match 'combomaker|fill_prober|hang_watchdog' -and
+                   $_.ProcessId -ne $PID -and $_.ProcessId -ne $CallerPid }
 $pythons = @($matches_all | Where-Object { $_.Name -match '^python' })
-$shells = @($matches_all | Where-Object { $_.Name -match '^(cmd|powershell)' })
+# In -Auto (a watchdog-initiated relight) the caller's own host cmd window
+# also matches 'hang_watchdog' — it is alive and must not be swept as stale.
+$shells = @($matches_all | Where-Object { $_.Name -match '^(cmd|powershell)' -and
+    -not ($Auto -and $_.CommandLine -match 'hang_watchdog') })
 if ($pythons) {
     Write-Host "REFUSING TO START - the bot/prober is already running:" -ForegroundColor Red
     $pythons | ForEach-Object { Write-Host "  PID $($_.ProcessId): $($_.CommandLine)" }
@@ -52,6 +67,18 @@ foreach ($hb in @("data\heartbeat.txt", "data\supervisor_heartbeat.txt", "data\l
     if (Test-Path $hb) {
         Remove-Item -Force $hb
         Write-Host "Removed stale $hb (nothing was running)" -ForegroundColor Yellow
+    }
+}
+# OPERATOR start = a fresh watchdog episode: clear its flap memory / halt latch
+# (a human relight is exactly the "reviewed and ready" event the latch waits
+# for). NEVER cleared in -Auto — the watchdog's own relights must not launder
+# its restart budget.
+if (-not $Auto) {
+    foreach ($wf in @("data\watchdog_state.json")) {
+        if (Test-Path $wf) {
+            Remove-Item -Force $wf
+            Write-Host "Cleared $wf (operator start = fresh watchdog episode)" -ForegroundColor Yellow
+        }
     }
 }
 # A KILL file blocks startup BY DESIGN (real halt or supervisor emergency).
@@ -97,6 +124,13 @@ elseif (Test-Path "KILL") {
     }
     Write-Host "A KILL file is present - the bot refuses to start with it:" -ForegroundColor Red
     Get-Content "KILL" | ForEach-Object { Write-Host "   $_" -ForegroundColor Red }
+    if ($Auto) {
+        # No human at the keyboard: a KILL that is not auto-clearable (real
+        # risk halt, or a machine KILL from a run that never reached liveness)
+        # requires operator review. Refuse; the watchdog latches on this.
+        Write-Host "AUTO MODE: KILL requires operator review - refusing to start." -ForegroundColor Red
+        exit 1
+    }
     $ans = Read-Host "Reviewed and ready to relight? Delete the KILL file and start? (y/n)"
     if ($ans -ne "y") {
         Write-Host "Leaving KILL in place. Not starting." -ForegroundColor Red
@@ -160,7 +194,7 @@ $ids = @($matched | ForEach-Object { $_.ProcessId })
 $bots = @($matched | Where-Object { $ids -notcontains $_.ParentProcessId })
 if ($bots.Count -eq 1) {
     Write-Host "VERIFIED: exactly one bot process (PID $($bots[0].ProcessId))." -ForegroundColor Green
-    Write-Host "All four windows launched. Close this one freely." -ForegroundColor Green
+    Write-Host "All windows launched. Close this one freely." -ForegroundColor Green
 } elseif ($bots.Count -eq 0) {
     Write-Host "WARNING: no bot process visible yet after 6s - check the MONITOR window for boot lines." -ForegroundColor Yellow
 } else {
@@ -169,5 +203,18 @@ if ($bots.Count -eq 1) {
         Where-Object { $_.Name -match 'python' -and ($_.CommandLine -match 'combomaker|fill_prober') } |
         ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} }
     exit 1
+}
+
+# 5) HANG WATCHDOG (2026-07-31, the 45h frozen-log outage): an EXTERNAL
+#    supervisor that watches WORK (log + decision-flow advance), not PIDs.
+#    Detects the exact 7/29 failure (PID alive, log frozen) and the boot-loop
+#    failure (bot exits instantly at boot), stops/relights through THESE
+#    scripts, and refuses to flap (halt receipt + stays down loud). Launched
+#    LAST so the stack it certifies exists; only on operator starts — a
+#    watchdog-initiated -Auto relight already has a watchdog (the caller).
+#    It holds its own per-tree named mutex, so a stale duplicate refuses.
+if (-not $Auto) {
+    Start-Process cmd -ArgumentList "/k", "title HANG WATCHDOG && echo Watching WORK (log + store advance). Output tees to data\hang_watchdog.log && .venv\Scripts\python.exe tools\ops\hang_watchdog.py run"
+    Write-Host "Hang watchdog launched (window: HANG WATCHDOG)." -ForegroundColor Green
 }
 $mutex.ReleaseMutex()
