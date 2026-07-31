@@ -183,12 +183,44 @@
     {
       "launch_to_first_beat_s": 38.03,
       "log": "live_20260731_0906.log"
+    },
+    {
+      "launch_to_first_beat_s": 35.66,
+      "log": "live_20260731_1723.log"
+    },
+    {
+      "launch_to_first_beat_s": 35.87,
+      "log": "live_20260731_1754.log"
+    },
+    {
+      "launch_to_first_beat_s": 37.91,
+      "log": "live_20260731_1810.log"
+    },
+    {
+      "launch_to_first_beat_s": 36.79,
+      "log": "live_20260731_1818.log"
+    },
+    {
+      "launch_to_first_beat_s": 37.66,
+      "log": "live_20260731_1826.log"
+    },
+    {
+      "launch_to_first_beat_s": 38.62,
+      "log": "live_20260731_1835.log"
+    },
+    {
+      "launch_to_first_beat_s": 38.3,
+      "log": "live_20260731_1844.log"
+    },
+    {
+      "launch_to_first_beat_s": 39.05,
+      "log": "live_20260731_1852.log"
     }
   ],
   "candidate_gate_attempts_max": 2,
-  "candidate_gate_confirm_events": 425,
+  "candidate_gate_confirm_events": 449,
   "candidate_gate_deadline_events": 71,
-  "live_n_positions_last": 9,
+  "live_n_positions_last": 20,
   "live_n_positions_max": 71,
   "max_same_tick_quarantine": 15,
   "max_same_tick_quarantine_where": "live_20260727_1839.log|2026-07-28T01:45:17",
@@ -198,12 +230,12 @@
     "metadata_reads_per_s_ceiling": 30.0,
     "read_capacity": 600,
     "read_refill_per_s": 300,
-    "ts": "2026-07-31T13:06:10.853559Z",
+    "ts": "2026-07-31T22:52:11.051435Z",
     "usage_tier": "advanced",
     "write_capacity": 600,
     "write_refill_per_s": 300
   },
-  "observed_tier_at": "2026-07-31T13:06:10.853559Z",
+  "observed_tier_at": "2026-07-31T22:52:11.051435Z",
   "provenance": {
     "manifest": {
       "live_20260722_relight.log": [
@@ -415,12 +447,44 @@
         1785502814.737
       ],
       "live_20260731_0906.log": [
-        1040191469,
-        1785511671.825
+        1479875409,
+        1785515280.846
+      ],
+      "live_20260731_1723.log": [
+        50171756,
+        1785533613.701
+      ],
+      "live_20260731_1754.log": [
+        59540832,
+        1785535564.295
+      ],
+      "live_20260731_1810.log": [
+        29375596,
+        1785536242.987
+      ],
+      "live_20260731_1818.log": [
+        35985317,
+        1785536778.239
+      ],
+      "live_20260731_1826.log": [
+        34872892,
+        1785537311.289
+      ],
+      "live_20260731_1835.log": [
+        33527853,
+        1785537824.745
+      ],
+      "live_20260731_1844.log": [
+        32992976,
+        1785538288.29
+      ],
+      "live_20260731_1852.log": [
+        36046547,
+        1785538796.898
       ]
     },
-    "scanned_bytes": 22061072067,
-    "scanned_logs": 53,
+    "scanned_bytes": 22813269776,
+    "scanned_logs": 61,
     "source": "fresh scan"
   }
 }
