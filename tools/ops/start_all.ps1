@@ -32,11 +32,23 @@ if (-not $created) {
 # Only LIVE PYTHON processes refuse; dead cmd/powershell shell windows from a
 # stopped stack (their command lines still name the bot) are swept, not blockers.
 $matches_all = Get-CimInstance Win32_Process |
-    Where-Object { $_.CommandLine -match 'combomaker|fill_prober|hang_watchdog' -and
+    Where-Object { $_.CommandLine -match 'combomaker|fill_prober|hang_watchdog|watch_main|watch_prober' -and
                    $_.ProcessId -ne $PID -and $_.ProcessId -ne $CallerPid }
-$pythons = @($matches_all | Where-Object { $_.Name -match '^python' })
-# In -Auto (a watchdog-initiated relight) the caller's own host cmd window
-# also matches 'hang_watchdog' — it is alive and must not be swept as stale.
+# In -Auto (a watchdog-initiated relight) the caller's WHOLE process tree
+# survives the stop pass BY DESIGN (stop_all -KeepPid spares every
+# 'hang_watchdog' match) and none of it is a bot: the venv python.exe is a
+# launcher SHIM whose child (the real interpreter, an IDENTICAL command line)
+# is the -CallerPid — but the shim itself is NOT, so a pid-equality exemption
+# alone can never clear it. 2026-07-31 17:34 ET: exactly that shim (PID 41592,
+# '...python.exe tools\ops\hang_watchdog.py run') tripped this guard, the
+# relight was refused rc=1, and the watchdog latched — detection perfect,
+# recovery blocked. In -Auto, watchdog-matching pythons are the CALLER, never
+# a reason to refuse. Operator starts (-Auto absent) still refuse on them: a
+# live watchdog could relight against operator intent and must be stopped first.
+$pythons = @($matches_all | Where-Object { $_.Name -match '^python' -and
+    -not ($Auto -and $_.CommandLine -match 'hang_watchdog') })
+# The caller's own host cmd window also matches 'hang_watchdog' — it is alive
+# and must not be swept as stale.
 $shells = @($matches_all | Where-Object { $_.Name -match '^(cmd|powershell)' -and
     -not ($Auto -and $_.CommandLine -match 'hang_watchdog') })
 if ($pythons) {

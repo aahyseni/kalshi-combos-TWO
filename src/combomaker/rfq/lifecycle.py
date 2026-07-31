@@ -5651,8 +5651,45 @@ class QuoteLifecycle:
 
     async def _on_quote_accepted(self, msg: JsonDict) -> None:
         t0 = self._clock.monotonic_ns()
+        # HONEST DEADLINE ANCHOR (2026-07-31 double confirm-expiry halt). The
+        # exchange's confirm window (EXCHANGE_CONFIRM_WINDOW_NS, a protocol
+        # fact) opens at the taker's accept — BEFORE this frame crossed the
+        # network, the WS dispatch queue, and the quote-event lane. Anchoring
+        # the derived confirm budget at handler start silently granted the gate
+        # time the exchange had already spent: on all 12 'expired' confirms
+        # ever taped, the in-handler time was <= 1.14s of the 3.0s window —
+        # >= 1.86s died upstream of this line. The WS read loop stamps accept
+        # frames the instant they leave the socket (ws.py priority lane) and
+        # the intake passes the stamp through; anchoring there makes every
+        # in-process delay deduct from the budget automatically, so a future
+        # delivery regression degrades the gate toward its deterministic
+        # fallback (fail-safe) instead of confirming into a dead window. The
+        # residual unmeasurable is network+venue emit time only. Guarded to
+        # [0, t0]: a clockless/foreign stamp can only ever SHRINK the budget's
+        # view of the window, never grow it.
+        recv_ns = msg.get("_ws_recv_mono_ns")
+        if isinstance(recv_ns, int) and 0 < recv_ns <= t0:
+            self._metrics.observe_ms(
+                "confirm.accept_dispatch_delay_ms", (t0 - recv_ns) / 1e6
+            )
+            t0 = recv_ns
         quote_id = str(msg.get("quote_id", ""))
         state = self._open.get(quote_id)
+        if state is None:
+            # FAST-LANE CREATE RACE (2026-07-31): with accepts jumping the
+            # dispatch backlog, an accept can now beat our OWN create POST's
+            # response parse (the taker's auto-accept vs our REST round trip),
+            # in which case ``_open`` has no entry YET. Wait exactly the
+            # measured p99 of the same REST verb once — the only in-flight
+            # state that can legitimately hide an accepted quote is that POST,
+            # and its own latency distribution bounds how long until ``_open``
+            # is populated. No samples yet ⇒ no wait (pre-fast-lane behavior).
+            wait_ms = self._first_measured_quantile_ms(("quote.create_rtt_ms",), 0.99)
+            if wait_ms is not None and wait_ms > 0:
+                await asyncio.sleep(wait_ms / 1e3)
+                state = self._open.get(quote_id)
+                if state is not None:
+                    self._metrics.inc("confirm.accept_beat_create_ack")
         if state is None:
             log.warning("accept_for_unknown_quote", quote_id=quote_id)
             return

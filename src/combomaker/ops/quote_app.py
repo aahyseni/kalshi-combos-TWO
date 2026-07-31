@@ -106,7 +106,11 @@ from combomaker.pricing.grouping import game_key
 from combomaker.pricing.tripwire import taxonomy_impossible
 from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.intake import RfqIntake
-from combomaker.rfq.lifecycle import LifecycleConfig, QuoteLifecycle
+from combomaker.rfq.lifecycle import (
+    EXCHANGE_CONFIRM_WINDOW_S,
+    LifecycleConfig,
+    QuoteLifecycle,
+)
 from combomaker.rfq.models import Rfq, RfqLeg
 from combomaker.rfq.schedule import ScheduleCache
 from combomaker.risk.balance import BalanceTracker, StaleBalanceError
@@ -522,6 +526,77 @@ async def handle_rfq_record_after(
         await handle(rfq)
     finally:
         await record(rfq)
+
+
+class AcceptPriorityGate:
+    """CONFIRM PREEMPTS QUOTING (2026-07-31, the double confirm-expiry halt).
+
+    Both 2026-07-31 kill-switch halts were HALT_CONFIRM_TIMEOUTS: won auctions
+    whose confirm hit the exchange's 3.0s window ('expired'). Measured over
+    EVERY confirm ever taped (1,038 accepts, 12 failures — all 'expired'): the
+    accept-handler's own time was <= 1.14s on every failure, so >= 1.86s of the
+    window died in queue/loop contention with the reprice storm (~500 comms
+    frames/s, 8 pricing workers). The WS priority lane (WsManager.mark_priority)
+    removes the dispatch-backlog wait; THIS gate removes the loop-contention
+    wait: while an accepted quote's confirm is in flight, no NEW quote work
+    starts (intake drops rfq_created pre-parse; rfq workers + the retry loop
+    park), so the confirm chain gets the loop to itself.
+
+    NOTHING HAND-SET — both bounds derive from the venue + the code:
+      * hold bound = EXCHANGE_CONFIRM_WINDOW_S (a protocol fact, rfq/lifecycle):
+        past that window the exchange has already voided the confirm, so a
+        longer hold protects nothing and only costs quoting. Each new accept
+        re-anchors the bound (it owns a fresh window). This is a FAIL-SAFE
+        bound only — the normal release is accept_done() in the worker's
+        ``finally``, which runs on every path (on_quote_accepted catches its
+        own exceptions and re-raises through the worker's logger).
+      * release = pending-count reaching zero (pure bookkeeping, no number).
+
+    Named cost (operator priority 2026-07-31: a banked win beats any number of
+    reprices): quoting pauses for the confirm-handling time, measured median
+    0.53s / max 1.14s per accept, at tens of accepts per day — worst case
+    ~30-60s of paused quoting per day.
+    """
+
+    def __init__(self, clock: Clock, max_hold_s: float) -> None:
+        self._clock = clock
+        self._max_hold_s = max_hold_s
+        self._pending = 0
+        self._deadline_mono_ns = 0
+        self._clear = asyncio.Event()
+        self._clear.set()
+
+    def accept_enqueued(self) -> None:
+        """An accept entered the pipeline — quoting yields NOW."""
+        self._pending += 1
+        self._deadline_mono_ns = self._clock.monotonic_ns() + int(
+            self._max_hold_s * 1e9
+        )
+        self._clear.clear()
+
+    def accept_done(self) -> None:
+        """The accept's confirm handling finished (any outcome)."""
+        self._pending = max(0, self._pending - 1)
+        if self._pending == 0:
+            self._clear.set()
+
+    def holding(self) -> bool:
+        """True while quote work must yield to an in-flight confirm."""
+        if self._clear.is_set():
+            return False
+        if self._clock.monotonic_ns() >= self._deadline_mono_ns:
+            return False  # fail-safe: past the exchange window, holding is moot
+        return True
+
+    async def wait_clear(self) -> None:
+        """Park until the confirm resolves (or its exchange window lapses)."""
+        if not self.holding():
+            return
+        remaining_s = (self._deadline_mono_ns - self._clock.monotonic_ns()) / 1e9
+        try:
+            await asyncio.wait_for(self._clear.wait(), timeout=max(0.0, remaining_s))
+        except TimeoutError:
+            return  # the fail-safe bound above — resume quoting
 
 
 def supervisor_launch_cmd(config: AppConfig) -> list[str]:
@@ -1657,6 +1732,13 @@ class QuoteApp:
         # RFQ bursts (2026-07-14 pipeline audit). Fills stay synchronous & durable.
         store.start_writer()
         ws = WsManager(config.endpoints.ws_url, signer, self._clock, self._metrics)
+        # CONFIRM PRIORITY (2026-07-31 double halt): accept/execute frames jump
+        # the comms dispatch backlog, and while a confirm is in flight all NEW
+        # quote work yields (gate derivation in AcceptPriorityGate). The book
+        # socket is deliberately NOT priority-marked or held — last look needs
+        # its freshness the most exactly while a confirm is in flight.
+        ws.mark_priority("quote_accepted", "quote_executed")
+        accept_gate = AcceptPriorityGate(self._clock, EXCHANGE_CONFIRM_WINDOW_S)
         # DEDICATED order-book socket (2026-07-14 fix). The communications firehose
         # (~650 msg/s exchange-wide RFQ stream on `ws`) and the orderbook_delta feed
         # MUST NOT share a connection: the firehose saturates the dispatcher and
@@ -1678,6 +1760,9 @@ class QuoteApp:
             ws,
             self._metrics,
             series_prefixes=tuple(allowed) if allowed is not None else None,
+            # Confirm-priority intake hold — see AcceptPriorityGate + the
+            # intake docstring. Self-bounding (exchange confirm window).
+            hold_probe=accept_gate.holding,
         )
         inplay = InPlayDetector(self._clock)
 
@@ -2367,6 +2452,11 @@ class QuoteApp:
                     # pool with work queued always does.
                     self._progress.mark(LOOP_QUOTE)
                     try:
+                        # CONFIRM PREEMPTS QUOTING (2026-07-31): park before
+                        # starting new work while a confirm is in flight. The
+                        # dwell check BELOW then discards anything that went
+                        # stale during the hold — no extra staleness risk.
+                        await accept_gate.wait_clear()
                         dwell_s = (self._clock.monotonic_ns() - recv_mono) / 1e9
                         if dwell_s > RFQ_MAX_QUEUE_DWELL_S:
                             # Already too stale to win its window — don't spend a
@@ -2404,6 +2494,8 @@ class QuoteApp:
             async def retry_pending() -> None:
                 while True:
                     await asyncio.sleep(1.0)
+                    if accept_gate.holding():
+                        continue  # confirm in flight — retries are quote work
                     for rfq_id, (rfq, attempts, recv_mono) in list(pending.items()):
                         age_s = (self._clock.monotonic_ns() - recv_mono) / 1e9
                         # Drop once quoted, out of attempts, OR past the RFQ window
@@ -2433,14 +2525,30 @@ class QuoteApp:
             # (preserves per-quote accept→execute order) so confirms never block the
             # firehose consumer. Unbounded + never-drop: quote events are rare (not the
             # firehose) and losing one = a missed confirm / an unbooked fill.
-            quote_event_q: asyncio.Queue[tuple[str, JsonDict]] = asyncio.Queue()
+            quote_event_q: asyncio.Queue[tuple[str, JsonDict, int]] = asyncio.Queue()
 
             async def on_quote_event(kind: str, msg: JsonDict) -> None:
-                quote_event_q.put_nowait((kind, msg))
+                # quote_created is a no-op ack downstream (already counted by
+                # intake's metric) — keep it out of the confirm lane entirely
+                # so it can never sit ahead of an accept (2026-07-31).
+                if kind not in ("quote_accepted", "quote_executed"):
+                    return
+                if kind == "quote_accepted":
+                    # Quoting yields to the confirm from the moment the accept
+                    # is SEEN, not when the worker picks it up — the pipeline
+                    # ahead of the worker is exactly what must go quiet.
+                    accept_gate.accept_enqueued()
+                quote_event_q.put_nowait((kind, msg, self._clock.monotonic_ns()))
 
             async def quote_event_worker() -> None:
                 while True:
-                    kind, msg = await quote_event_q.get()
+                    kind, msg, enq_ns = await quote_event_q.get()
+                    # Lane-wait observability (2026-07-31 measurement gap: the
+                    # tape could not split WS-delivery wait from lane wait).
+                    self._metrics.observe_ms(
+                        f"confirm.lane_wait_ms.{kind}",
+                        (self._clock.monotonic_ns() - enq_ns) / 1e6,
+                    )
                     try:
                         if kind == "quote_accepted":
                             await lifecycle.on_quote_accepted(msg)
@@ -2449,6 +2557,11 @@ class QuoteApp:
                     except Exception:
                         log.exception("quote_event_worker_failed", kind=kind)
                     finally:
+                        if kind == "quote_accepted":
+                            # Release on EVERY path (the gate's stated
+                            # invariant): confirm_ok, decline, and raise all
+                            # come through here.
+                            accept_gate.accept_done()
                         quote_event_q.task_done()
 
             intake.on_rfq(on_rfq_enqueue)

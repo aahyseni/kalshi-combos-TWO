@@ -51,9 +51,11 @@ ESCALATION (bounded — REFUSES to flap):
     2. SHORT-RUN REPEAT: two CONSECUTIVE relights whose healthy span (last
        observed progress minus relight time) was below one detection window
        mean relighting is not producing a working bot. Latch, stay down loud.
-    3. START REFUSED: the start path exiting non-zero (human-gated KILL, guard
-       refusal) latches immediately — the start path's own refusal reasons are
-       authoritative.
+    3. START REFUSED: on a non-zero start exit, ONE full re-sweep (the same
+       stop path) + ONE retry — a refusal caused by our own incomplete sweep
+       (2026-07-31 17:34 ET) is cured, and any refusal that survives a clean
+       re-sweep (human-gated KILL, launch mutex, real duplicate) latches — the
+       start path's own refusal reasons are authoritative.
   A latched halt writes ``data/WATCHDOG_HALT_<stamp>.txt`` (the receipt), keeps
   the tree DOWN, and keeps shouting to console + ``data/hang_watchdog.log``.
   Latch state persists in ``data/watchdog_state.json``; an OPERATOR start
@@ -529,12 +531,38 @@ class Watchdog:
         self.log("WARN", "relighting via the operator start path (-Auto)")
         rc = self._run(self.start_cmd, timeout=300)
         if rc != 0:
+            # START REFUSED → FULL RE-SWEEP → RETRY ONCE (2026-07-31 17:34 ET:
+            # the guard refused over a process the first stop pass had left
+            # behind, and the latch kept a healthy recovery down). The retry
+            # runs the SAME full stop path, verifies nothing of the tree (but
+            # this process) survived, and calls start once more. Exactly ONE
+            # retry: a refusal that survives a clean re-sweep is authoritative
+            # (human-gated KILL, launch mutex, a real duplicate) and latches
+            # exactly as before — the fail-safe posture is unchanged, only a
+            # refusal caused by our own incomplete sweep is cured.
             evidence["start_rc"] = rc
-            self._latch_halt(
-                f"start path refused the relight (rc={rc}) — its reason is authoritative",
-                evidence,
+            self.log(
+                "WARN",
+                f"start path refused (rc={rc}) — full re-sweep, then ONE retry",
             )
-            return "halt_start_refused"
+            resweep_rc = self._run(self.stop_cmd, timeout=180)
+            evidence["resweep_rc"] = resweep_rc
+            pids = self.probes.bot_pids()
+            if pids:
+                evidence["pids_still_alive_after_resweep"] = pids
+                self._latch_halt(
+                    "re-sweep before the start retry could not clear the tree — human needed",
+                    evidence,
+                )
+                return "halt_stop_failed"
+            rc = self._run(self.start_cmd, timeout=300)
+            if rc != 0:
+                evidence["start_retry_rc"] = rc
+                self._latch_halt(
+                    f"start path refused the relight twice (rc={rc}) — its reason is authoritative",
+                    evidence,
+                )
+                return "halt_start_refused"
 
         self._relights.append(
             {"at": _now_utc().isoformat(), "kind": kind, "healthy_span_s": round(healthy_span, 1)}

@@ -18,8 +18,14 @@ $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $root
 
+# FULL SWEEP PREDICATE (2026-07-31 watchdog-relight blockage): includes the
+# monitor windows (watch_main/watch_prober) so this stop pass is the COMPLETE
+# stack teardown — bot, probers, monitors, watchdog — with exactly one carve-out:
+# a watchdog-initiated stop (-KeepPid) keeps the watchdog's own process TREE
+# (its python AND its cmd host / venv shim all match 'hang_watchdog') alive to
+# perform the relight.
 $procs = Get-CimInstance Win32_Process |
-    Where-Object { $_.CommandLine -match 'combomaker|fill_prober|hang_watchdog' -and
+    Where-Object { $_.CommandLine -match 'combomaker|fill_prober|hang_watchdog|watch_main|watch_prober' -and
                    $_.ProcessId -ne $PID -and $_.ProcessId -ne $KeepPid -and
                    -not ($KeepPid -ne 0 -and $_.CommandLine -match 'hang_watchdog') }
 if (-not $procs) {
@@ -42,7 +48,7 @@ if (-not $procs) {
     # so it must be flagged here; a watchdog-initiated stop (KeepPid) keeps
     # its own process alive by design.
     $left = Get-CimInstance Win32_Process |
-        Where-Object { $_.CommandLine -match 'combomaker|fill_prober|hang_watchdog' -and
+        Where-Object { $_.CommandLine -match 'combomaker|fill_prober|hang_watchdog|watch_main|watch_prober' -and
                        $_.ProcessId -ne $PID -and $_.ProcessId -ne $KeepPid -and
                        -not ($KeepPid -ne 0 -and $_.CommandLine -match 'hang_watchdog') }
     if ($left) {

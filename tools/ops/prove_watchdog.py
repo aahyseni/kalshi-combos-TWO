@@ -18,6 +18,19 @@ live store, or Kalshi.
                          actions.
   P4 flap_refusal      — relights that immediately re-hang: exactly two are
                          attempted, then the flap latch stays down loud.
+  P5 start_refused_retry — the EXACT 2026-07-31 17:34 ET class: app dead,
+                         helper processes alive, the start guard refuses ->
+                         the watchdog now does ONE full re-sweep + ONE retry
+                         and the relight SUCCEEDS (no latch).
+  P6 kill_still_refuses — a human-gated KILL refusal survives the re-sweep:
+                         start refuses BOTH times -> latch, receipt, stays
+                         down (fail-safe posture unchanged).
+  P7 ps1_guard_parity  — the SHIPPED stop_all/start_all predicate text,
+                         extracted from the .ps1 files and evaluated against
+                         the 17:34 process table: the stop sweep takes the
+                         whole stack except the watchdog tree; the -Auto
+                         start guard no longer refuses on the watchdog's venv
+                         shim; a REAL leftover bot python still refuses.
 
 Run:  .venv/Scripts/python.exe -m tools.ops.prove_watchdog
 """
@@ -25,6 +38,7 @@ Run:  .venv/Scripts/python.exe -m tools.ops.prove_watchdog
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -274,10 +288,253 @@ def p4_flap_refusal(failures: list[str]) -> None:
     check(out.stdout.count("relight complete") == 2, "two relights logged, not three", failures)
 
 
+def p5_start_refused_retry(failures: list[str]) -> None:
+    print("P5 start_refused_retry (EXACT 17:34 ET class: app dead + helpers alive)")
+    root, data, pid_file, actions, _default_stop = build_scratch(
+        "p5", heartbeat=True, pids=[]
+    )
+    # HELPERS ALIVE: a marker the FIRST stop pass leaves behind (the 17:34
+    # incomplete sweep) and only a SECOND, full re-sweep clears.
+    helpers = root / "helpers.txt"
+    helpers.write_text("python.exe tools\\ops\\hang_watchdog.py run (shim)\n", "ascii")
+    swept_flag = root / "swept.flag"
+    stop_cmd = root / "fake_stop_p5.cmd"
+    stop_cmd.write_text(
+        "\r\n".join(
+            [
+                "@echo off",
+                f'echo stop >> "{actions}"',
+                f'type nul > "{pid_file}"',
+                f'if exist "{swept_flag}" (',
+                f'  del "{helpers}"',
+                ") else (",
+                f'  echo swept > "{swept_flag}"',
+                ")",
+            ]
+        )
+        + "\r\n",
+        encoding="ascii",
+    )
+    # THE REAL start_all SEMANTICS, modeled: refuse rc=1 while a helper is
+    # alive (the single-instance guard), start cleanly once it is gone.
+    writer = root / "writer.py"
+    writer.write_text(WRITER, encoding="utf-8")
+    start_cmd = root / "fake_start_p5.cmd"
+    start_cmd.write_text(
+        "\r\n".join(
+            [
+                "@echo off",
+                f'if exist "{helpers}" (',
+                "  echo REFUSING TO START - the bot/prober is already running:",
+                f'  echo start_refused >> "{actions}"',
+                "  exit /b 1",
+                ")",
+                f'echo start >> "{actions}"',
+                f'echo 4243 > "{pid_file}"',
+                f'"{PY}" "{writer}" --detach "{data / "live_now.log"}" 60 1.0',
+            ]
+        )
+        + "\r\n",
+        encoding="ascii",
+    )
+    out = run_watchdog(root, pid_file, stop_cmd, start_cmd, cycles=20)
+    acts = actions_list(actions)
+    state = read_state(data)
+    check(
+        acts == ["stop", "start_refused", "stop", "start"],
+        f"stop -> refused -> RE-SWEEP -> retry start (got {acts})",
+        failures,
+    )
+    check(state.get("halt") is None, "NO latch — the relight succeeded", failures)
+    check(len(state.get("relights", [])) == 1, "one relight recorded", failures)
+    check(not list(data.glob("WATCHDOG_HALT_*.txt")), "no halt receipt", failures)
+    check("full re-sweep, then ONE retry" in out.stdout, "retry named in the log", failures)
+    check("relight complete" in out.stdout, "relight completion logged", failures)
+
+
+def p6_kill_still_refuses(failures: list[str]) -> None:
+    print("P6 kill_still_refuses (human-gated KILL survives the re-sweep: stays down)")
+    root, data, pid_file, actions, stop_cmd = build_scratch("p6", heartbeat=True, pids=[])
+    start_cmd = root / "fake_start_p6.cmd"
+    # start_all's -Auto KILL refusal: rc=1 EVERY time, re-sweep or not.
+    start_cmd.write_text(
+        "\r\n".join(
+            [
+                "@echo off",
+                "echo AUTO MODE: KILL requires operator review - refusing to start.",
+                f'echo start_refused >> "{actions}"',
+                "exit /b 1",
+            ]
+        )
+        + "\r\n",
+        encoding="ascii",
+    )
+    out = run_watchdog(root, pid_file, stop_cmd, start_cmd, cycles=12)
+    acts = actions_list(actions)
+    state = read_state(data)
+    receipts = list(data.glob("WATCHDOG_HALT_*.txt"))
+    check(
+        acts == ["stop", "start_refused", "stop", "start_refused"],
+        f"exactly ONE retry after a re-sweep, never a third start (got {acts})",
+        failures,
+    )
+    check(
+        "refused the relight twice" in str(state.get("halt", {}).get("reason", "")),
+        "latch reason: refused twice (authoritative)",
+        failures,
+    )
+    check(len(receipts) == 1, "halt receipt written", failures)
+    check("STAYING DOWN" in out.stdout or "HALT LATCHED" in out.stdout, "loud", failures)
+
+
+# The 2026-07-31 17:34 ET process table, verbatim from the watchdog log +
+# receipt (PIDs real; the watchdog child 41593 is the -CallerPid / -KeepPid).
+_T1734 = [
+    (22652, "cmd.exe",
+     r'"C:\Windows\system32\cmd.exe" /k title BOT (quote mode) && '
+     r".venv\Scripts\python.exe -m combomaker.ops.cli run --env prod"),
+    (37500, "cmd.exe",
+     r'"C:\Windows\system32\cmd.exe" /k title FILL PROBER && '
+     r".venv\Scripts\python.exe tools\diagnostics\fill_prober.py"),
+    (31944, "powershell.exe",
+     r"powershell.exe -NoExit -ExecutionPolicy Bypass -File "
+     r"tools\ops\watch_prober.ps1 -Log data\fill_prober_20260731_1723.log"),
+    (31900, "powershell.exe",
+     r"powershell.exe -NoExit -ExecutionPolicy Bypass -File "
+     r"tools\ops\watch_main.ps1 -Log data\live_20260731_1723.log"),
+    (39052, "python.exe", r".venv\Scripts\python.exe  tools\diagnostics\fill_prober.py"),
+    (34844, "python.exe", r".venv\Scripts\python.exe  tools\diagnostics\fill_prober.py"),
+    (41000, "cmd.exe",
+     r'"C:\Windows\system32\cmd.exe" /k title HANG WATCHDOG && '
+     r".venv\Scripts\python.exe tools\ops\hang_watchdog.py run"),
+    # venv SHIM — the 17:34 blocker — and the real interpreter (= the caller).
+    (41592, "python.exe", r".venv\Scripts\python.exe  tools\ops\hang_watchdog.py run"),
+    (41593, "python.exe", r".venv\Scripts\python.exe  tools\ops\hang_watchdog.py run"),
+]
+_CALLER = 41593
+
+
+def _ps1_patterns(text: str, failures: list[str], name: str) -> list[str]:
+    """Every regex used in a ``-match '...'`` of the shipped script text."""
+    pats = re.findall(r"-match\s+'([^']+)'", text)
+    check(bool(pats), f"{name}: -match patterns extracted", failures)
+    return pats
+
+
+def p7_ps1_guard_parity(failures: list[str]) -> None:
+    print("P7 ps1_guard_parity (shipped predicate text vs the 17:34 table)")
+    ops = REPO / "tools" / "ops"
+    stop_text = (ops / "stop_all.ps1").read_text(encoding="utf-8")
+    start_text = (ops / "start_all.ps1").read_text(encoding="utf-8")
+
+    # --- stop_all sweep (KeepPid = watchdog child): evaluate the shipped
+    # predicate — CommandLine -match SWEEP, pid exclusions, KeepPid carve-out.
+    sweep_pats = [p for p in _ps1_patterns(stop_text, failures, "stop_all") if "combomaker" in p]
+    check(bool(sweep_pats), "stop_all: sweep pattern present", failures)
+    sweep = sweep_pats[0]
+    keep_carveout = "-not ($KeepPid -ne 0 -and $_.CommandLine -match 'hang_watchdog')" in stop_text
+    check(keep_carveout, "stop_all: -KeepPid spares the watchdog tree", failures)
+
+    def swept(pid: int, cmdline: str) -> bool:
+        if not re.search(sweep, cmdline, re.IGNORECASE):
+            return False
+        if pid == _CALLER:  # -KeepPid
+            return False
+        return not re.search("hang_watchdog", cmdline, re.IGNORECASE)  # carve-out
+
+    kill = {pid for pid, _n, cl in _T1734 if swept(pid, cl)}
+    check(
+        kill == {22652, 37500, 31944, 31900, 39052, 34844},
+        f"sweep takes bot+prober windows, prober pythons AND BOTH monitors (got {sorted(kill)})",
+        failures,
+    )
+    check(
+        not any(pid in kill for pid in (41000, 41592, _CALLER)),
+        "sweep keeps the whole watchdog tree (host, shim, child)",
+        failures,
+    )
+
+    # --- start_all single-instance guard in -Auto (post-sweep survivors =
+    # exactly the watchdog tree): the $pythons refusal set must be EMPTY.
+    match_pats = [p for p in _ps1_patterns(start_text, failures, "start_all") if "combomaker" in p]
+    check(bool(match_pats), "start_all: matches_all pattern present", failures)
+    matcher = match_pats[0]
+    auto_python_exempt = re.search(
+        r"\$pythons\s*=\s*@\(\$matches_all\s*\|\s*Where-Object\s*\{[^}]*-not\s*\(\$Auto\s*-and\s*\$_\.CommandLine\s*-match\s*'hang_watchdog'\)",
+        start_text,
+    )
+    check(
+        bool(auto_python_exempt),
+        "start_all: -Auto exempts watchdog-matching PYTHONS (the 17:34 fix)",
+        failures,
+    )
+
+    def refuses(table: list[tuple[int, str, str]], *, auto: bool) -> list[int]:
+        out = []
+        for pid, pname, cl in table:
+            if not re.search(matcher, cl, re.IGNORECASE):
+                continue
+            if pid == _CALLER:  # -CallerPid
+                continue
+            if not re.match("python", pname, re.IGNORECASE):
+                continue
+            if auto and re.search("hang_watchdog", cl, re.IGNORECASE):
+                continue
+            out.append(pid)
+        return out
+
+    survivors = [row for row in _T1734 if row[0] in (41000, 41592, _CALLER)]
+    check(
+        refuses(survivors, auto=True) == [],
+        "-Auto guard passes over the surviving watchdog tree (shim included)",
+        failures,
+    )
+    check(
+        refuses(survivors, auto=False) == [41592],
+        "operator (non-Auto) start still refuses on a live watchdog python",
+        failures,
+    )
+    leftover_bot = survivors + [
+        (99999, "python.exe",
+         r".venv\Scripts\python.exe -m combomaker.ops.cli run --env prod --mode quote")
+    ]
+    check(
+        refuses(leftover_bot, auto=True) == [99999],
+        "-Auto guard STILL refuses on a genuine leftover bot python",
+        failures,
+    )
+
+    # --- both scripts must still parse (a broken sweep is a broken recovery).
+    for ps1 in ("stop_all.ps1", "start_all.ps1"):
+        proc = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "$t=$null;$e=$null;"
+                "[System.Management.Automation.Language.Parser]::ParseFile("
+                f"'{ops / ps1}',[ref]$t,[ref]$e)|Out-Null;"
+                "if($e.Count -gt 0){$e|ForEach-Object{Write-Host $_.Message};exit 1};exit 0",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        check(proc.returncode == 0, f"{ps1} parses clean ({proc.stdout.strip() or 'ok'})", failures)
+
+
 def main() -> int:
     failures: list[str] = []
     started = time.monotonic()
-    for proof in (p1_frozen_log_hang, p2_boot_loop, p3_healthy_lull, p4_flap_refusal):
+    for proof in (
+        p1_frozen_log_hang,
+        p2_boot_loop,
+        p3_healthy_lull,
+        p4_flap_refusal,
+        p5_start_refused_retry,
+        p6_kill_still_refuses,
+        p7_ps1_guard_parity,
+    ):
         proof(failures)
     took = time.monotonic() - started
     if failures:
