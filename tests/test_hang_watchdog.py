@@ -267,7 +267,10 @@ def test_long_healthy_runs_between_hangs_keep_relighting(tmp_path: Path) -> None
     assert calls.count("START") == 4
 
 
-def test_start_refusal_latches(tmp_path: Path) -> None:
+def test_start_refusal_retries_once_then_latches(tmp_path: Path) -> None:
+    """2026-07-31 17:34 ET: a start refusal gets ONE full re-sweep + ONE retry
+    before latching; a refusal that survives the clean re-sweep (human-gated
+    KILL, real guard) is authoritative and latches exactly as before."""
     probes, clock = FakeProbes(), Clock()
     dog, calls = make_dog(tmp_path, probes, clock, threshold=100.0)
 
@@ -281,7 +284,31 @@ def test_start_refusal_latches(tmp_path: Path) -> None:
     assert dog.poll_once() == "ok"  # first sighting of the signatures
     clock.t += 101.0
     assert dog.poll_once() == "halt_start_refused"
-    assert calls == ["STOP", "START"]
+    assert calls == ["STOP", "START", "STOP", "START"]  # re-sweep + one retry
+
+
+def test_start_refusal_cured_by_resweep_relights(tmp_path: Path) -> None:
+    """The 17:34 cure at the unit level: the guard refuses while a survivor of
+    the first sweep is present; the re-sweep clears it; the retry relights."""
+    probes, clock = FakeProbes(), Clock()
+    dog, calls = make_dog(tmp_path, probes, clock, threshold=100.0)
+    survivor = {"present": True}
+
+    def run(cmd: str, timeout: float) -> int:
+        calls.append(cmd)
+        if cmd == "STOP":
+            probes.pids = []
+            if calls.count("STOP") >= 2:
+                survivor["present"] = False  # the FULL re-sweep clears it
+            return 0
+        return 1 if survivor["present"] else 0  # guard refuses on the survivor
+
+    dog._run = run  # type: ignore[method-assign]
+    assert dog.poll_once() == "ok"  # first sighting of the signatures
+    clock.t += 101.0
+    assert dog.poll_once() == "relit"
+    assert calls == ["STOP", "START", "STOP", "START"]
+    assert dog._halt is None  # no latch — recovery succeeded
 
 
 def test_stop_failure_latches_loud(tmp_path: Path) -> None:
