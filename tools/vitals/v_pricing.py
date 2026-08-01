@@ -120,6 +120,10 @@ def shipped_skew_params() -> tuple[Any, dict[str, Any]]:
         leg_axis_armed=s.leg_axis_armed,
         conc_enabled=s.conc_enabled,
         conc_armed=s.conc_armed,
+        # 2026-08-01 skew settled-fact resolution (95b9a40): mirror the
+        # quote_app.py passthrough so the gate exercises the shipped posture,
+        # armed or dark, exactly as the live bot builds it.
+        settled_fact_resolution=s.settled_fact_resolution,
     )
     armed = {
         "directional": s.enabled,
@@ -127,6 +131,7 @@ def shipped_skew_params() -> tuple[Any, dict[str, Any]]:
         "pbook": s.pbook_armed,
         "leg_axis": s.leg_axis_armed,
         "concentration": s.conc_armed,
+        "settled_fact_resolution": s.settled_fact_resolution,
     }
     return params, armed
 
