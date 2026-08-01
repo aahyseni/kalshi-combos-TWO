@@ -1,6 +1,6 @@
 # 2026-08-01 — Eviction/capacity feature PORTED to main, self-contained, flag-off dark
 
-**Branch:** `eviction-capacity-port` (off main `022e47f`). **Status: PORTED,
+**Branch:** `eviction-capacity-port` (originally off main `022e47f`; REBASED 2026-08-01 onto origin/main `cdfdcc8` — the reading-b fleet's ratified det-max demotion / kill-anchor re-land pushed first, so this branch rebased + RE-PROVED per the whoever-pushes-second rule; only README/tape-facts watermark conflicts, no code conflicts). **Status: PORTED,
 defaults OFF = today's behaviour. ADVERSARIAL GATE (independent re-execution,
 2026-08-01 morning): NO-SHIP on the original derivation — one CONFIRMED
 arming blocker (§ Adversarial gate, finding G1). G1 REPAIRED SAME DAY
