@@ -98,6 +98,8 @@ from combomaker.risk.exposure import (
     LegRef,
     OpenPosition,
     OpenQuoteRisk,
+    SettledFactProvider,
+    concentration_live_legs,
     stable_ledger_key,
 )
 from combomaker.risk.fill_velocity import FillVelocityTracker
@@ -1462,8 +1464,13 @@ class QuoteLifecycle:
         # score: the BUDGET-NEUTRALITY mechanism (markups are FIXED, so the
         # steer reallocates and must never widen the average quote) and the
         # standardiser that makes the swing economically real.
+        # Key = (position_generation, settled-facts generation) — the second
+        # element is -1 while skew settled-fact resolution is OFF (byte-
+        # identical: a constant key element), and the resolver's monotone fact
+        # count when ON (2026-08-01: facts land at boot WITHOUT a position-
+        # generation move; a gen-only key would pin the unresolved book).
         self._loss_event_book: LossEventBook = build_loss_event_book(())
-        self._loss_event_generation: int = -1
+        self._loss_event_generation: tuple[int, int] = (-1, -1)
         self._steer_centre = SteerCenter()
         # LEG-AXIS PROFILE CACHE (2026-07-27 throughput). The (family x side) /
         # (entity x side) shares read ONLY ``ExposureBook.positions`` — the
@@ -1474,7 +1481,7 @@ class QuoteLifecycle:
         # share dicts on EVERY quote was waste. Keyed exactly like the
         # loss-event book and the peak/P(book) caches.
         self._leg_axis_profile: LegAxisProfile | None = None
-        self._leg_axis_profile_key: tuple[int, float | None] = (-1, None)
+        self._leg_axis_profile_key: tuple[int, float | None, int] = (-1, None, -1)
         # The already-paid-for CRN sample (PRICING joint) behind
         # ``Cov(candidate payoff, pre-existing book P&L)`` — the measured,
         # EV-orthogonal price of concentration (SE 0.0161 c/contract against a
@@ -1951,8 +1958,12 @@ class QuoteLifecycle:
         # CACHED ON THE POSITION GENERATION (2026-07-27 throughput): the shares
         # below read the COMMITTED book only, so they cannot move between two
         # quotes at the same generation. ``p_book`` is part of the key so a
-        # refreshed MC read still lands immediately.
-        key = (gen, p_book)
+        # refreshed MC read still lands immediately. The facts-generation
+        # element (2026-08-01) is a CONSTANT -1 while skew settled-fact
+        # resolution is off; when on, a graded fact landing at a static
+        # position generation must rebuild the resolved shares (the snapshot
+        # this profile is built FROM already resolved them).
+        key = (gen, p_book, self._skew_facts_generation())
         cached = self._leg_axis_profile
         if cached is not None and self._leg_axis_profile_key == key:
             return cached
@@ -2179,12 +2190,27 @@ class QuoteLifecycle:
         one-direction stack can burn. NOTHING here is a count.
         """
         gen = self._exposure.position_generation
-        if gen != self._loss_event_generation:
-            self._loss_event_book = build_loss_event_book(
-                (ticket_bucket(p.legs), float(p.max_loss_cc))
-                for p in self._exposure.positions.values()
-            )
-            self._loss_event_generation = gen
+        key = (gen, self._skew_facts_generation())
+        if key != self._loss_event_generation:
+            facts = self._skew_settled_facts()
+            if facts is None:
+                entries = [
+                    (ticket_bucket(p.legs), float(p.max_loss_cc))
+                    for p in self._exposure.positions.values()
+                ]
+            else:
+                # Settled-leg fact resolution (2026-08-01): the SAME rule the
+                # skew snapshot applies — determined positions are realized
+                # P&L (no loss event), partially-settled ones bucket by their
+                # LIVE legs only, unresolvable legs count in full.
+                entries = []
+                for p in self._exposure.positions.values():
+                    live = concentration_live_legs(p.legs, facts)
+                    if live is None:
+                        continue
+                    entries.append((ticket_bucket(live), float(p.max_loss_cc)))
+            self._loss_event_book = build_loss_event_book(entries)
+            self._loss_event_generation = key
         game_wall_cc = self._enforced_game_budget_cc()
         # ONE owner for the entity denominator (2026-07-27): the same helper the
         # leg-axis profile uses, so the two steers can never drift apart.
@@ -8802,7 +8828,21 @@ class QuoteLifecycle:
             entry_price_cc=constructed.no_bid_cc,
             legs=self._leg_refs(rfq),
         )
-        snap = self._exposure.snapshot(self._marginals, mass_acceptance=True)
+        # SETTLED-LEG FACT RESOLUTION (2026-08-01, flag-gated, PRICE-ONLY).
+        # With ``skew.settled_fact_resolution`` armed, THIS snapshot — the one
+        # the skew composition, the widen-shadow verdict and the leg-axis /
+        # conc profiles read — fact-resolves exchange-determined legs out of
+        # every concentration aggregate (a settled leg is realized P&L, not
+        # concentration; the 7/29 boot fed 7 finished games' positions in as
+        # if live and they never un-concentrated). The LIMIT-CHECK snapshots
+        # (pre-gate, quote-time, confirm) never receive the provider: caps and
+        # risk walls keep seeing the whole committed book. None while dark =
+        # byte-identical to today.
+        snap = self._exposure.snapshot(
+            self._marginals,
+            mass_acceptance=True,
+            settled_facts=self._skew_settled_facts(),
+        )
         skew = compute_inventory_skew(
             candidate,
             snap,
@@ -9107,6 +9147,30 @@ class QuoteLifecycle:
         and the quote-time cap can never disagree about whether the settled
         credit is enforced. False ⇒ SHADOW: still measured, never subtracted."""
         return bool(self._limits.limits.det_max_settlement_aware)
+
+    def _skew_settled_facts(self) -> SettledFactProvider | None:
+        """The graded-fact provider for the SKEW'S concentration snapshot
+        (settled-leg fact resolution, 2026-08-01), or None while the flag is
+        off — the byte-identical default. Reuses ``_settled_fact`` (the det-max
+        FIX 2 provider: graded cache ONLY, never the feed), so boot and
+        intraday resolve through ONE path. PRICE-ONLY: this provider must never
+        be passed to a limit-check / confirm-path snapshot — the caps keep
+        seeing the whole committed book."""
+        if self._skew_params is None or not self._skew_params.settled_fact_resolution:
+            return None
+        return self._settled_fact
+
+    def _skew_facts_generation(self) -> int:
+        """The cache-key element for skew settled-fact resolution: -1 while the
+        flag is off (a CONSTANT — pre-existing cache behaviour is untouched),
+        else the resolver's monotone fact count. Facts land at boot without a
+        position-generation move, so any cache over resolved shares must key on
+        this too (``_leg_axis_profile_from`` / ``_concentration_profile``)."""
+        if self._skew_params is None or not self._skew_params.settled_fact_resolution:
+            return -1
+        if self._settled is None:
+            return 0
+        return self._settled.facts_generation
 
     def _committed_leg_tickers(self) -> frozenset[str]:
         """Distinct leg tickers of the COMMITTED positions, cached per position

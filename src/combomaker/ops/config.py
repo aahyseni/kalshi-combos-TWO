@@ -2229,6 +2229,18 @@ class SkewConfig(StrictModel):
     # built, the steer is never computed, the quote path pays nothing.
     conc_enabled: bool = True
     conc_armed: bool = False
+    # SETTLED-LEG FACT RESOLUTION for the skew's concentration input
+    # (2026-08-01 — the boot-rehydration skew defect: finished games'
+    # rehydrated positions fed the concentration input as if live and never
+    # un-concentrated). When True, the skew's OWN exposure snapshot (and the
+    # leg-axis / conc-steer profiles built from it) fact-resolves exchange-
+    # DETERMINED legs out through the graded-settlement cache — the det-max
+    # FIX 2 provider, never the feed marginal. PRICE-ONLY: the caps' snapshots
+    # never receive the provider. Default False = today's behaviour
+    # byte-for-byte. Arming line: ``pricing.skew.settled_fact_resolution:
+    # true`` (prototype + tape counterfactual:
+    # tools/proto_skew_settled_resolution.py).
+    settled_fact_resolution: bool = False
 
     @field_validator("w_conc", "w_off")
     @classmethod

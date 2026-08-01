@@ -187,6 +187,17 @@ class SkewParams:
     # the steer is not computed at all and the quote path pays nothing for it.
     conc_enabled: bool = True
     conc_armed: bool = False
+    # SETTLED-LEG FACT RESOLUTION (2026-08-01 — the boot-rehydration skew
+    # defect). When True, the lifecycle passes the graded-settlement provider
+    # (``_settled_fact`` — the det-max FIX 2 provider, NEVER the feed marginal)
+    # into the SKEW'S OWN exposure snapshot, so exchange-determined legs are
+    # fact-resolved OUT of every concentration input the skew composition reads
+    # (per-game delta/worst-loss/notional/directional entries + the armed
+    # family/entity axes + the shadow conc loss-event book). PRICE-ONLY by
+    # construction: the caps/limit-check snapshots never receive the provider.
+    # Default False = today's behaviour byte-for-byte; prototyped +
+    # tape-counterfactualed in tools/proto_skew_settled_resolution.py.
+    settled_fact_resolution: bool = False
 
     def validate(self) -> None:
         if self.w_conc < 0.0 or self.w_off < 0.0:

@@ -1977,6 +1977,12 @@ class QuoteApp:
                 # ``conc_enabled: false`` stops it being computed at all.
                 conc_enabled=skew_cfg.conc_enabled,
                 conc_armed=skew_cfg.conc_armed,
+                # SETTLED-LEG FACT RESOLUTION (2026-08-01):
+                # ``pricing.skew.settled_fact_resolution: true`` is the ONE
+                # flip that lets the skew's snapshot fact-resolve exchange-
+                # determined legs out of its concentration input (price-only;
+                # caps unaffected). Default False = today's behaviour.
+                settled_fact_resolution=skew_cfg.settled_fact_resolution,
             )
             skew_limits = SkewLimits(
                 max_event_delta_contracts=risk_cfg.max_event_delta_contracts,

@@ -43,7 +43,7 @@ from __future__ import annotations
 import hashlib
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from fractions import Fraction
 from typing import TYPE_CHECKING
@@ -62,6 +62,66 @@ if TYPE_CHECKING:
 
 MarginalProvider = Callable[[str], float | None]
 """market_ticker -> current P(YES), or None when unavailable."""
+
+SettledFactProvider = Callable[[str], float | None]
+"""market_ticker -> the EXCHANGE'S OWN graded outcome (exactly 0.0 or 1.0), or
+None when it has not determined one. THIS IS NOT a MarginalProvider even though
+the signatures match: the marginal provider walks the live FEED first and can
+legitimately return 0.0/1.0 for a market that is trading, pinned and entirely
+unsettled — resolving concentration off that number would be INFERRING a
+settlement we never read. Wire ONLY the graded-settlement cache here
+(``rfq.lifecycle._settled_fact`` -> ``marketdata.settled``), the same provider
+discipline as the det-max settled-legs fix (27de1e0 FIX 2)."""
+
+
+def concentration_live_legs(
+    legs: tuple[LegRef, ...], settled_facts: SettledFactProvider
+) -> tuple[LegRef, ...] | None:
+    """FACT-RESOLUTION of a requires-all combo's legs for the SKEW'S
+    CONCENTRATION INPUT (2026-08-01 — the boot-rehydration skew defect: at the
+    7/29 05:50Z boot, positions on 7 FINISHED 7/28 games fed the inventory-skew
+    concentration input as if live, and finished games never un-concentrate).
+
+    Returns the LIVE (unresolved) legs — the only legs that may contribute
+    delta / directional / worst-loss / notional / family / entity concentration
+    — or ``None`` when the combo's outcome is exchange-DETERMINED (realized
+    P&L, ZERO concentration on every axis). Same semantics as the det-max
+    settled-legs fix (``sim.book_risk.open_position_settled_cannot_lose``): a
+    leg with an exchange-confirmed settlement is a FACT, not concentration.
+
+      - a leg whose SELECTED side the exchange graded LOST => the requires-all
+        combo can no longer hit: DETERMINED => ``None``;
+      - a leg whose SELECTED side the exchange graded WON  => a FACT — the leg
+        drops out; the remaining live legs keep the position's full loss/
+        notional/delta concentration (partial resolution);
+      - every leg graded selected-WON => the combo HIT: DETERMINED => ``None``;
+      - an UNRESOLVABLE leg (no graded fact, or any value that is not exactly
+        0.0/1.0) stays FULLY counted — fail-closed, UNKNOWN never buys tighter
+        quotes;
+      - a leg-less (reserved-from-exchange-figures) holding is returned as-is:
+        nothing is resolvable, it stays fully counted.
+
+    Pure and side-independent: whether the combo settling YES/NO wins or loses
+    for US is irrelevant here — determination in EITHER direction means no
+    forward uncertainty remains, so nothing is left to concentrate. Boot and
+    intraday share exactly this one resolution path (the graded cache is filled
+    by the maintenance fetcher at boot and as settlements land intraday), so
+    the two can never diverge again."""
+    if not legs:
+        return legs  # leg-less reserve: nothing resolvable, fully counted
+    live: list[LegRef] = []
+    for leg in legs:
+        fact = settled_facts(leg.market_ticker)
+        if fact != 0.0 and fact != 1.0:  # None / non-binary: UNRESOLVED
+            live.append(leg)
+            continue
+        selected = fact if leg.side == "yes" else 1.0 - fact
+        if selected == 0.0:
+            return None  # selected side LOST: the combo can no longer hit
+        # selected == 1.0: graded FACT — drops out of concentration
+    if not live:
+        return None  # every leg graded selected-WON: combo determined (hit)
+    return tuple(live) if len(live) != len(legs) else legs
 
 
 class DeltaProvenance(Enum):
@@ -1334,6 +1394,7 @@ class ExposureBook:
         resting_quote_weight: Fraction | None = None,
         resting_floor_count: int = 3,
         want_loss_units: bool = False,
+        settled_facts: SettledFactProvider | None = None,
     ) -> ExposureSnapshot:
         """Current exposures; with ``mass_acceptance`` every open quote fills
         on its per-aggregate WORSE side (sign-aligned magnitude bound).
@@ -1366,6 +1427,22 @@ class ExposureBook:
         open quotes only. The composed fold stays MONOTONE in the resting set
         AND in the candidate set (E2/F1 lemmas); parity vs the validated
         prototype is pinned by tools/proto_resting_haircut.py part D1.
+
+        ``settled_facts`` (SKEW settled-leg fact resolution, 2026-08-01 —
+        prototyped + tape-validated in tools/proto_skew_settled_resolution.py):
+        None (every pre-existing caller, and the ONLY value the LIMIT-CHECK /
+        confirm paths may ever pass) ⇒ byte-identical to today. When the
+        graded-settlement provider is passed — the PRICE-ONLY skew snapshot in
+        ``QuoteLifecycle._quoting_policy``, flag-gated — every position's legs
+        are resolved through :func:`concentration_live_legs` FIRST: an
+        exchange-DETERMINED position contributes NOTHING to any aggregate
+        (realized P&L is a fact, not concentration), a partially-settled one
+        contributes its full loss/notional/delta under its LIVE legs only, and
+        an unresolvable leg keeps its position fully counted (fail-closed).
+        Open quotes are NOT resolved: a resting quote lives seconds under
+        TTL/cancel-on-invalidate and cannot straddle a settlement the way a
+        rehydrated overnight position does. NEVER wire this into a cap/risk
+        wall: the caps must keep seeing the whole committed book.
         """
         delta_market: dict[str, float] = defaultdict(float)
         delta_game: dict[str, float] = defaultdict(float)
@@ -1398,10 +1475,21 @@ class ExposureBook:
         n_committed = len(committed)
         for i, position in enumerate(committed + list(extra_positions)):
             is_committed = i < n_committed
+            # SKEW settled-leg fact resolution (2026-08-01): with a graded-fact
+            # provider, resolve BEFORE any aggregation. ``None`` legs when the
+            # provider is None keeps the default path operation-identical.
+            pos_legs = position.legs
+            if settled_facts is not None:
+                resolved = concentration_live_legs(position.legs, settled_facts)
+                if resolved is None:
+                    # Exchange-DETERMINED outcome: realized P&L, not
+                    # concentration — the position contributes NOTHING.
+                    continue
+                pos_legs = resolved
             gross_cc += position.max_loss_cc
             loss_combo[position.combo_ticker] += position.max_loss_cc
             seen_keys: set[str] = set()
-            for leg in position.legs:
+            for leg in pos_legs:
                 fk = leg_family_key(leg)
                 ek = leg_entity_key(leg)
                 if is_committed:
@@ -1420,9 +1508,19 @@ class ExposureBook:
             # marginal is never turned into an ordinary usable p=0.5). Its exact
             # premium loss, gross notional, and per-game concentration are still
             # folded below; it simply carries no computable delta.
+            # Settled-leg resolution: deltas are computed on the LIVE legs only
+            # (a graded leg is a FACT — it must not enter the product even when
+            # its market's book still trades through the settlement timer at a
+            # not-exactly-0/1 print). ``pos_legs is position.legs`` on the
+            # default path and for fully-live positions — no allocation there.
+            delta_position = (
+                position
+                if pos_legs is position.legs
+                else replace(position, legs=pos_legs)
+            )
             deltas = (
                 None if not position.risk_modeled
-                else analytic_leg_deltas(position, marginals)
+                else analytic_leg_deltas(delta_position, marginals)
             )
             if deltas is None:
                 # A HELD (committed) position whose live marginal is temporarily
@@ -1437,15 +1535,24 @@ class ExposureBook:
                 # "can't assess this fill" and fails closed.
                 if not is_committed:
                     unknown = True
-            else:
+            elif settled_facts is None:
                 for ticker, delta in deltas.items():
                     delta_market[ticker] += delta
+            else:
+                # Resolved view: only LIVE legs carry delta (a graded leg is a
+                # fact — its residual "sensitivity" at p∈{0,1} is not risk).
+                # Leg tickers are unique within a position, so this is the
+                # same sum restricted to the live subset.
+                for leg in pos_legs:
+                    delta_market[leg.market_ticker] += deltas.get(
+                        leg.market_ticker, 0.0
+                    )
             # Partition the position's legs by game; each game it touches gets an
             # entry carrying ONLY that game's legs (so the per-game mutex partition
             # sees only this game's outcomes) + the FULL position loss (a combo
             # loses fully, attributed to each game's worst case as before).
             pos_legs_by_game: dict[str, list[LegRef]] = defaultdict(list)
-            for leg in position.legs:
+            for leg in pos_legs:
                 if leg.event_ticker:
                     pos_legs_by_game[game_key(leg.event_ticker)].append(leg)
             requires_all = position.our_side is Side.NO
@@ -1474,7 +1581,9 @@ class ExposureBook:
             if deltas is not None:
                 # Leg market tickers are unique within a position (duplicate
                 # legs are rejected by the relationship classifier upstream).
-                for leg in position.legs:
+                # ``pos_legs`` == ``position.legs`` whenever settled_facts is
+                # None (the default path, operation-identical).
+                for leg in pos_legs:
                     if leg.event_ticker:
                         delta_game[game_key(leg.event_ticker)] += deltas.get(
                             leg.market_ticker, 0.0

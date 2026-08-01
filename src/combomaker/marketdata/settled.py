@@ -211,6 +211,17 @@ class SettledMarginalResolver:
         cached = self._results.get(market_ticker)
         return None if cached is None else cached.marginal
 
+    @property
+    def facts_generation(self) -> int:
+        """MONOTONE count of permanently-cached graded facts (results are never
+        removed, so ``len`` is a version counter with no extra state). Cache
+        keys that must react to a fact landing WITHOUT a position-generation
+        move include this (the skew settled-fact resolution's leg-axis profile
+        / loss-event book caches, 2026-08-01): at boot, facts land minutes
+        after rehydration while the position generation is static — a cache
+        keyed on position generation alone would pin the UNRESOLVED shares."""
+        return len(self._results)
+
     def market_no_longer_live(self, market_ticker: str) -> bool:
         """True iff the EXCHANGE told us this market is no longer live: a
         graded 0/1 fact is cached, or the last successful fetch reported a
