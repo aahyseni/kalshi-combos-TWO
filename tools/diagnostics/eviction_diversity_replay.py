@@ -42,6 +42,7 @@ from combomaker.rfq.eviction_value import (  # noqa: E402
     AcceptanceCounters,
     clopper_pearson_lower,
     clopper_pearson_upper,  # noqa: E402
+    derive_open_quote_capacity,
     size_bucket,
 )
 
@@ -157,9 +158,26 @@ def main() -> None:
         med = sorted(per_min.values())[len(per_min) // 2]
         for label, sent_per_min in (("median", med), ("worst", worst)):
             flow = sent_per_min / 60.0 * 4  # create+delete per sent quote
-            cap = int((300.0 - 20.0 - flow) * 20.0 / 4)
+            # The LIVE derivation (rule 8 — never a reimplementation).
+            # Offline stand-ins for the observed inputs: Advanced tier
+            # 300 t/s write; the tier-clamped supervisor withdraw budget
+            # 200 tok/10 s = 20 t/s (the SAME rate passed as the tier
+            # form's reserve and the withdraw form's budget, exactly as
+            # quote_app._derived_capacity_tick wires it post-G1).
+            d = derive_open_quote_capacity(
+                tier_write_rate_per_s=300.0,
+                reserve_rate_per_s=20.0,
+                withdraw_rate_per_s=20.0,
+                measured_flow_tokens_per_s=flow,
+                ttl_s=20.0,
+                refresh_cost_tokens=4,
+                delete_cost_tokens=2,
+                fallback=200,
+            )
             print(f"derived capacity at {label} sent-rate "
-                  f"({sent_per_min}/min -> {flow:.1f} tok/s): {cap}")
+                  f"({sent_per_min}/min -> {flow:.1f} tok/s): {d.capacity} "
+                  f"[tier form {d.tier_capacity}, withdraw form "
+                  f"{d.withdraw_capacity} binds]")
 
     # ---- eviction replay --------------------------------------------------
     logs = [Path(p) for p in (args.log or [])] or sorted(
@@ -217,11 +235,12 @@ def main() -> None:
     print(f"small (<$15) victims evicted as lived: {small_victim}")
     print(f"evictions the DIVERSITY key would have REFUSED "
           f"(victim survives): {reversed_n} / {joined}")
-    print("\nNOTE dES99=0 offline (book-MC snapshot not reconstructable); "
-          "under DERIVED capacity (>=~1,300 at today's write headroom) the "
-          "slot cap never binds at a ~200-quote book, so ALL of today's "
-          "evictions are counterfactually moot on capacity grounds alone; "
-          "the key governs only when capacity genuinely binds.")
+    print("\nNOTE dES99=0 offline (book-MC snapshot not reconstructable). "
+          "POST-G1: derived capacity = min(tier form, withdraw form) and the "
+          "withdraw form binds at ~190 today (the delete path's own 20 tok/s "
+          "budget) — capacity no longer moots the eviction stream; the key "
+          "genuinely governs at today's book sizes until the operator raises "
+          "the withdraw budget (staged decision, 2026-08-01 port report).")
 
 
 if __name__ == "__main__":

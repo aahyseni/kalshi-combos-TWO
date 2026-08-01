@@ -4158,10 +4158,22 @@ class QuoteApp:
         derivation, its exchange-doc verification and the mass-acceptance
         guard argument live in ``rfq/eviction_value.py``):
 
-            capacity = (OBSERVED tier write rate
-                        - kill/withdraw reserve rate
-                        - MEASURED new-quote token rate)
-                       x QUOTE_TTL_S / (create + delete cost)
+            capacity = min(
+                (OBSERVED tier write rate
+                 - kill/withdraw reserve rate
+                 - MEASURED new-quote token rate)
+                    x QUOTE_TTL_S / (create + delete cost),   # exchange tier
+                (withdraw budget rate
+                 - MEASURED delete-share of new-quote flow)
+                    x QUOTE_TTL_S / delete cost,     # bot's own delete budget
+            )
+
+        The second form is the G1 repair (adversarial gate 2026-08-01):
+        every delete flows through the SAME tier-clamped withdraw budget
+        this method passes to the lifecycle (``_tier_clamped_write_budget``
+        -> ``QuoteLifecycle._withdraw_budget`` -> ``_spend_withdraw_tokens``),
+        so the standing book is bounded by the delete path too — today at
+        ~200, exactly the hand cap the derivation dissolves.
 
         Modes (``risk.open_quote_capacity_derived``): "off" — never called;
         "shadow" — derive + LOG ``open_quote_capacity`` beside the enforced
@@ -4195,13 +4207,22 @@ class QuoteApp:
         reserve_capacity, reserve_refill_s = self._api_tier.clamp_write_budget(
             sup.write_budget_capacity, sup.write_budget_refill_s
         )
+        # G1 (2026-08-01): the "reserve" carved out of the tier form IS the
+        # bot's own metered withdraw budget — the ONE conduit every delete
+        # spends (``_tier_clamped_write_budget`` sizes the SAME clamped knob
+        # into ``QuoteLifecycle._withdraw_budget``). Pass it as BOTH the tier
+        # form's reserve and the withdraw form's sustained rate so the
+        # derivation is bounded by the bucket that actually pays deletes.
+        withdraw_rate_per_s = reserve_capacity / reserve_refill_s
         fallback = int(self._config.risk.max_open_quotes)
         derived = derive_open_quote_capacity(
             tier_write_rate_per_s=float(self._api_tier.write_refill_per_s),
-            reserve_rate_per_s=reserve_capacity / reserve_refill_s,
+            reserve_rate_per_s=withdraw_rate_per_s,
+            withdraw_rate_per_s=withdraw_rate_per_s,
             measured_flow_tokens_per_s=flow_tokens_per_s,
             ttl_s=QUOTE_TTL_S,
             refresh_cost_tokens=CREATE_QUOTE_TOKEN_COST + DELETE_QUOTE_TOKEN_COST,
+            delete_cost_tokens=DELETE_QUOTE_TOKEN_COST,
             fallback=fallback,
         )
         checker = self._limit_checker
@@ -4218,9 +4239,13 @@ class QuoteApp:
             tier_write_rate_per_s=derived.tier_write_rate_per_s,
             tier_observed=self._api_tier.observed,
             reserve_rate_per_s=derived.reserve_rate_per_s,
+            withdraw_rate_per_s=derived.withdraw_rate_per_s,
             measured_flow_tokens_per_s=derived.measured_flow_tokens_per_s,
             ttl_s=derived.ttl_s,
             refresh_cost_tokens=derived.refresh_cost_tokens,
+            delete_cost_tokens=derived.delete_cost_tokens,
+            tier_capacity=derived.tier_capacity,
+            withdraw_capacity=derived.withdraw_capacity,
             fallback=derived.fallback,
         )
         if (

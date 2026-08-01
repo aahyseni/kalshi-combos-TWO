@@ -95,6 +95,29 @@ class TestClopperPearsonLower:
         hi = clopper_pearson_upper(8, 5_000, ALPHA)
         assert lo < 8 / 5_000 < hi
 
+    def test_underflow_regime_stays_conservative(self) -> None:
+        """G3 boundary (gate note, 2026-08-01): once ``(1-p)^n`` underflows
+        inside the bisection bracket (n*p > ~745 — multi-day counter scales,
+        e.g. n=50k at p_hat=2%), the LOWER bound clips DOWN (candidate
+        under-credited) and the UPPER converges to p_hat from above (its
+        bisection lo starts at x/n, so an incumbent is never credited below
+        its point estimate). Both directions conservative; inversion
+        impossible (lower <= p_hat <= upper by bracket construction)."""
+        x, n = 1_000, 50_000  # p_hat = 2%, n*p = 1000 >> 745
+        p_hat = x / n
+        lo = clopper_pearson_lower(x, n, ALPHA)
+        hi = clopper_pearson_upper(x, n, ALPHA)
+        # The invariants that make the regime SAFE (no inversion, both
+        # failure directions conservative):
+        assert 0.0 <= lo <= p_hat <= hi <= 1.0
+        # The exact regime's lower bound would sit near ~0.0185; the
+        # underflow clips it DOWN to the representability boundary
+        # (~745/n) — strictly conservative, never inflating:
+        assert lo <= 745 / n + 1e-6
+        # The upper collapses onto the point estimate (documented G3
+        # behaviour — the incumbent keeps at least p_hat credit):
+        assert abs(hi - p_hat) < 1e-9
+
 
 class TestAcceptanceCounters:
     def test_empty_table_is_not_discriminating(self) -> None:
@@ -179,74 +202,100 @@ class TestDes99Allocation:
         assert got == 10_000.0
 
 
+def _derive(**overrides):
+    """Live-like defaults (Advanced tier 300 t/s observed; the tier-clamped
+    supervisor withdraw budget 200 tok/10s = 20 t/s; measured ~0.44 sent/s
+    on 2026-07-31 -> ~1.8 flow tokens/s; TTL 20s; documented create 2 +
+    delete 2)."""
+    kwargs = dict(
+        tier_write_rate_per_s=300.0,
+        reserve_rate_per_s=20.0,
+        withdraw_rate_per_s=20.0,
+        measured_flow_tokens_per_s=1.8,
+        ttl_s=20.0,
+        refresh_cost_tokens=4,
+        delete_cost_tokens=2,
+        fallback=200,
+    )
+    kwargs.update(overrides)
+    return derive_open_quote_capacity(**kwargs)
+
+
 class TestDerivedCapacity:
     def test_live_like_inputs_produce_a_non_zero_capacity(self) -> None:
         """The 2026-07-23 rule: a cap must be PROVEN to produce a non-zero
-        allowance against real inputs BEFORE going live. Advanced tier 300
-        t/s, the 20 t/s withdraw reserve, the measured ~0.44 sent/s (18,656
-        sent over ~12h on 2026-07-31) -> ~1.8 flow tokens/s."""
-        d = derive_open_quote_capacity(
-            tier_write_rate_per_s=300.0,
-            reserve_rate_per_s=20.0,
-            measured_flow_tokens_per_s=1.8,
-            ttl_s=20.0,
-            refresh_cost_tokens=4,
-            fallback=200,
-        )
+        allowance against real inputs BEFORE going live."""
+        d = _derive()
         assert d.usable and d.reason == "derived"
-        assert d.capacity == int((300.0 - 20.0 - 1.8) * 20.0 / 4)  # 1391
-        assert d.capacity > 200  # strictly more capacity than the hand cap
+        assert d.capacity >= 1
+
+    def test_g1_withdraw_form_binds_at_todays_budget(self) -> None:
+        """G1 REGRESSION (adversarial gate 2026-08-01): the tier form alone
+        claimed 1,198-1,272 slots, but every delete flows through the bot's
+        own 20 t/s withdraw budget — sustainable churn is ~200 refreshes per
+        TTL, exactly the hand cap the manual bumps stalled at. The derived
+        capacity must be the MIN of both bucket forms."""
+        d = _derive()
+        assert d.tier_capacity == int((300.0 - 20.0 - 1.8) * 20.0 / 4)  # 1391
+        # withdraw form: (20 - 1.8 * 2/4) * 20 / 2 = 191
+        assert d.withdraw_capacity == int((20.0 - 0.9) * 20.0 / 2)  # 191
+        assert d.capacity == min(d.tier_capacity, d.withdraw_capacity) == 191
+        # Self-consistent with the hand-bumped 200 the withdraw budget was
+        # sized around — never ~6x over the delete path again:
+        assert d.capacity <= 200
+
+    def test_g1_capacity_is_sustainable_by_the_delete_path(self) -> None:
+        """A derived capacity must be refreshable by the delete path's OWN
+        budget: capacity quotes deleting once per TTL may never demand more
+        than the withdraw bucket's sustained rate (with the measured new-flow
+        delete share carved out on top)."""
+        for flow in (0.0, 0.9, 1.8, 6.0, 20.0):
+            d = _derive(measured_flow_tokens_per_s=flow)
+            if not d.usable:
+                continue
+            delete_demand_per_s = (
+                d.capacity * d.delete_cost_tokens / d.ttl_s
+                + flow * d.delete_cost_tokens / d.refresh_cost_tokens
+            )
+            assert delete_demand_per_s <= d.withdraw_rate_per_s + 1e-9
+
+    def test_g1_raised_withdraw_budget_scales_automatically(self) -> None:
+        """The NORTH STAR point of the min-form: if the operator ever raises
+        the withdraw budget, capacity scales by DERIVATION (no knob to move)
+        until the tier form takes over as the binding bucket."""
+        d = _derive(withdraw_rate_per_s=260.0)
+        assert d.usable
+        assert d.withdraw_capacity == int((260.0 - 0.9) * 20.0 / 2)  # 2591
+        assert d.capacity == d.tier_capacity == 1391  # tier now binds
 
     def test_basic_tier_still_quotes(self) -> None:
         """Even the un-upgraded 100 t/s tier derives a workable book."""
-        d = derive_open_quote_capacity(
-            tier_write_rate_per_s=100.0,
-            reserve_rate_per_s=20.0,
-            measured_flow_tokens_per_s=1.8,
-            ttl_s=20.0,
-            refresh_cost_tokens=4,
-            fallback=200,
-        )
+        d = _derive(tier_write_rate_per_s=100.0)
         assert d.usable and d.capacity >= 1
 
     def test_no_measured_window_fails_closed_to_fallback(self) -> None:
-        d = derive_open_quote_capacity(
-            tier_write_rate_per_s=300.0,
-            reserve_rate_per_s=20.0,
-            measured_flow_tokens_per_s=None,
-            ttl_s=20.0,
-            refresh_cost_tokens=4,
-            fallback=200,
-        )
+        d = _derive(measured_flow_tokens_per_s=None)
         assert not d.usable and d.capacity == 200
         assert d.reason == "no_measured_flow_window"
 
     def test_no_headroom_fails_closed(self) -> None:
-        d = derive_open_quote_capacity(
-            tier_write_rate_per_s=25.0,
-            reserve_rate_per_s=20.0,
-            measured_flow_tokens_per_s=6.0,
-            ttl_s=20.0,
-            refresh_cost_tokens=4,
-            fallback=200,
-        )
+        d = _derive(tier_write_rate_per_s=25.0, measured_flow_tokens_per_s=6.0)
         assert not d.usable and d.capacity == 200 and d.reason == "no_headroom"
 
-    def test_bad_tier_or_ttl_fails_closed(self) -> None:
-        base = dict(
-            reserve_rate_per_s=20.0,
-            measured_flow_tokens_per_s=1.0,
-            fallback=200,
+    def test_no_withdraw_headroom_fails_closed(self) -> None:
+        """The withdraw form can be the bucket with no headroom too: measured
+        new-quote deletes already eat the whole withdraw budget."""
+        d = _derive(withdraw_rate_per_s=0.4, measured_flow_tokens_per_s=1.8)
+        assert not d.usable and d.capacity == 200 and d.reason == "no_headroom"
+
+    def test_bad_tier_ttl_or_withdraw_fails_closed(self) -> None:
+        assert not _derive(tier_write_rate_per_s=0.0).usable
+        assert not _derive(ttl_s=0.0).usable
+        assert not _derive(refresh_cost_tokens=0).usable
+        assert not _derive(delete_cost_tokens=0).usable
+        assert (
+            _derive(withdraw_rate_per_s=0.0).reason == "withdraw_rate_unusable"
         )
-        assert not derive_open_quote_capacity(
-            tier_write_rate_per_s=0.0, ttl_s=20.0, refresh_cost_tokens=4, **base
-        ).usable
-        assert not derive_open_quote_capacity(
-            tier_write_rate_per_s=300.0, ttl_s=0.0, refresh_cost_tokens=4, **base
-        ).usable
-        assert not derive_open_quote_capacity(
-            tier_write_rate_per_s=300.0, ttl_s=20.0, refresh_cost_tokens=0, **base
-        ).usable
 
 
 # --------------------------------------------------------------------------

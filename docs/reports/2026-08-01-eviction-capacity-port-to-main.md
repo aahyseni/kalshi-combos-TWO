@@ -2,12 +2,16 @@
 
 **Branch:** `eviction-capacity-port` (off main `022e47f`). **Status: PORTED,
 defaults OFF = today's behaviour. ADVERSARIAL GATE (independent re-execution,
-2026-08-01 morning): NO-SHIP — one CONFIRMED arming blocker found in the
-capacity derivation (§ Adversarial gate, finding G1). The flags-off code is
-byte-identical (re-proven) and the diversity key survived every attack, but
-the commit enshrines a derivation whose headline number (1,198–1,272 slots)
-the delete path cannot physically sustain, so it does not push until G1 is
-repaired.**
+2026-08-01 morning): NO-SHIP on the original derivation — one CONFIRMED
+arming blocker (§ Adversarial gate, finding G1). G1 REPAIRED SAME DAY
+(§ G1 repair below): the capacity derivation is now
+`min(exchange-tier form, withdraw-budget form)` — both terms derived from
+config/documented costs the code already reads; today it self-consistently
+reproduces ~the hand cap (191 at the measured flow) and scales automatically
+with any future withdraw-budget raise. The flags-off code is byte-identical
+(re-proven) and the diversity key survived every attack. Branch pushed after
+the repair + fresh-worktree self-containment proof; merge to main happens at
+the operator restart boundary.**
 
 ## Why a port was needed (the 7/31 lesson)
 
@@ -30,7 +34,7 @@ fast tier) BEFORE any push. A green suite in a dirty tree proves nothing.**
 | 2 | Extract ONLY eviction/capacity hunks onto main | `eviction_value.py` (verbatim), config.py 2 flags + validator, lifecycle.py 9 hunks (imports, LifecycleConfig field, tape+ledger init, 4 slot-diversity methods, `_try_slot_eviction` wiring, `record_quoted`/`record_accepted`), quote_app.py capacity probe + `_derived_capacity_tick`, tests (32), replay tool. Kill-anchor hunks (config flag, `_kill_anchor_readout`, limits.py/book_risk.py/pricing_pool.py/deploy_scale.py, its tests/tools) STAY OUT — grep-verified zero `kill_anchor` references in the ported tree |
 | 3 | Flag-off byte-identity, randomized replays | 200 seeded-random books/candidates driven through the REAL `_try_slot_eviction` under main and under the port (common kwargs only): decisions, survivors, breaches, metrics **byte-identical, 200/200**. Only flags-off observable delta anywhere: the `open_quote_evicted` log line gains `key_kind=absolute_ev` (telemetry; `diversity` appeared 0 times) |
 | 4 | Self-containment proof (fresh scratch worktree of main+commit `fef5268`, CLEAN tree) | import quote_app/lifecycle/eviction_value OK; full suite **3504 passed / 0 failed** (227s); vitals fast **8/8 GREEN** (20.9s checks). Also proven in the committing tree itself: suite 3504/0, vitals fast 8/8. NOTE: a gate run in any worktree needs the gitignored `config/prod-live-wc.local.yaml` copied in — without it the pydantic default `entity_loss_frac=""` crashes V1/V2 with `Fraction('')` (environmental, latent gate-harness sharp edge, worth a guard in `derive.knob`) |
-| 5 | Counterfactual on the LATEST tape (8/1, skew fix armed) | NOT RUN — moot while G1 blocks the push; owed with the G1 repair |
+| 5 | Counterfactual on the LATEST tape (8/1, skew fix armed) | RUN with the G1 repair (read-only, `--since 2026-07-30`): capacity 160 at median flow (withdraw form binds), FAIL-CLOSED at the worst burst window (withdraw headroom −2), diversity key would refuse 470/2,593 joined evictions, table DISCRIMINATING — § Counterfactual |
 | 6 | Arming lines staged COMMENTED in the live local yaml with the derivation quoted | operator flips at a restart; both staged lines are `"shadow"` — still correct under the gate verdict (shadow is log-only) |
 
 ## The feature (recap of the 7/31 build report, unchanged semantics)
@@ -101,6 +105,49 @@ North-Star residue) and makes the two derivations consistent; with a derived
 ~260 tok/s withdraw rate the original capacity arithmetic becomes roughly
 right. New code ⇒ new gate cycle; NOT patched in this port.
 
+### G1 REPAIR (executed 2026-08-01, same branch)
+
+The mechanism, not the number: `derive_open_quote_capacity` now returns
+
+    capacity = min(
+        (tier_write_rate − reserve − measured_flow) × TTL / refresh_cost,   # (a) exchange tier (existing form)
+        (withdraw_rate − measured_flow × delete_cost/refresh_cost)
+            × TTL / delete_cost,                                            # (b) the bot's OWN delete budget (G1)
+    )
+
+* **Form (b)'s inputs are all things the code already reads**: `withdraw_rate`
+  is the SAME tier-clamped supervisor bucket `quote_app._tier_clamped_write_budget`
+  sizes into `QuoteLifecycle._withdraw_budget` (the one delete conduit G1
+  identified) — `_derived_capacity_tick` now passes it as BOTH the tier form's
+  reserve and the withdraw form's sustained rate; `delete_cost` is the
+  documented DeleteQuote cost (2 tokens); the flow carve-out is the measured
+  delete-share of new quoting (`measured_flow × delete_cost/refresh_cost`,
+  drawn from the same bucket) — the safety margin comes from measured
+  headroom, never a typed factor, and inherits the tier form's conservative
+  double-count.
+* **Today's yield**: tier form 1,391 / withdraw form **191** at the measured
+  ~1.8 flow tok/s ⇒ capacity **191** — self-consistent with the hand-bumped
+  200 the manual bumps stalled at (G1's prediction), honest instead of ~6×
+  over the delete path. If the withdraw budget is ever raised the derivation
+  scales by itself (at 260 tok/s the tier form takes over at 1,391) — the
+  knob dissolves per NORTH STAR instead of lying.
+* **Readout fields**: the `open_quote_capacity` log line now prints
+  `tier_capacity` and `withdraw_capacity` separately (and on `no_headroom`,
+  WHICH bucket had none), so the arming readout can see the binding bucket.
+* **Regression tests** (feature suite now 37): G1 sustainability invariant
+  (derived capacity × delete_cost / TTL + measured delete flow ≤
+  withdraw_rate, swept over flow 0→20 tok/s), the min-form binds at 191
+  today, the withdraw-raise auto-scaling case, withdraw-side `no_headroom`
+  and `withdraw_rate_unusable` fail-closed arms.
+* **G3 fixed opportunistically**: the CP-lower docstring's "cannot underflow"
+  claim corrected to the honest boundary statement (n·p ≳ 745 ⇒ lower clips
+  DOWN, upper converges to p̂ — both conservative, inversion impossible) +
+  boundary regression test `test_underflow_regime_stays_conservative` at
+  n=50k, p̂=2%. The module docstring's refresh claim now names BOTH budgets.
+* The counterfactual replay tool now calls the LIVE
+  `derive_open_quote_capacity` (rule 8) instead of an inline tier-only
+  formula, printing both forms.
+
 ### G2 — secondary (arming-plan constraints, not code defects)
 
 * **Adaptive-caps compose bug when BOTH armed:** `_derived_capacity_tick`
@@ -115,6 +162,19 @@ right. New code ⇒ new gate cycle; NOT patched in this port.
   roughly HALF the first-window log line (≈ (280−new)×2.5 ≈ 700 at new≈0).
   Conservative direction, but the 1,272 headline is a first-window number —
   the arming readout must expect the derived value to fall as the book grows.
+  *Post-repair note:* under the min-form the WITHDRAW form (~191) is the
+  binding bucket at today's budget and carries the SAME structure of
+  feedback: `withdraw_capacity = (20 − flow/2) × 10`, and at a book of C
+  refreshing every TTL the measured flow reads `(C/20 + new_rate) × 4`
+  tok/s (the standing book's own refresh double-counted). Fixed point:
+  `C = 200 − C − 20·new_rate ⇒ C ≈ 100 − 10·new_rate` — armed steady-state
+  self-limits to ≈ **95–100 slots** at the live ~0.44 new-quotes/s, ~half
+  the first-window 191 print. Strictly conservative (capacity falls, never
+  rises, as the book grows), same direction as the tier-form half-print
+  above. Both G2 constraints stay RECORDED IN THE ARMING PLAN, not code:
+  capacity `"on"` must not be armed alongside adaptive-caps `enforce` until
+  the two engines compose, and the first-window print will exceed the
+  steady-state one.
 
 ### G3 — boundary note on the CP recurrence (safe direction, documented)
 
@@ -130,33 +190,97 @@ multi-day-persistence change re-checks this.
 
 ## Counterfactual on the LATEST tape (2026-08-01, skew settled-fact fix armed)
 
-NOT RUN by the gate session (moot while G1 blocks the push; the counterfactual
-reads the live store + tape and was deferred to keep I/O off the live bot
-during the vitals run). Owed with the G1 repair cycle.
+RUN with the G1 repair (read-only vs the live store + `live_20260801_0759.log`
+tape; `tools.diagnostics.eviction_diversity_replay --since 2026-07-30`, now
+calling the LIVE post-G1 derivation):
+
+* **Window since 7/30:** 107,760 `quote_sent` / 33 confirm-path accepts.
+  Measured acceptance table (CP bounds at the ratified α=0.02), per 1k:
+  `<$5` 9/13,315 = 0.68 (0.297–1.315); `$5–15` 13/84,702 = 0.15
+  (0.079–0.268); `$15–50` 4/5,155 = 0.78 (0.197–2.051); `$50–150`
+  7/4,181 = **1.67** (0.642–3.540); `>$150` 0/407 (0–9.566).
+  **Table DISCRIMINATING: True** (the $5–15 upper 0.268 sits below the
+  $50–150 lower 0.642) — the post-fix tape reproduces the 7/31 finding that
+  acceptance RISES with size on this flow.
+* **Derived capacity on the 8/1 tape (min-form):** at the median sent-rate
+  (120/min → 8.0 flow tok/s): **160** — tier form 1,360, WITHDRAW form 160
+  binds. At the worst sent-rate window (608/min → 40.5 flow tok/s): the
+  withdraw form is **−2 (no headroom — new-quote churn's delete share 20.25
+  tok/s exceeds the whole 20 tok/s budget) ⇒ the derivation FAILS CLOSED to
+  the configured 200** (tier form alone would have claimed 1,197). This is
+  G1 made visible in the derivation itself: during exactly the burst windows
+  the old form would have raised the cap ~6×, the repaired form reports the
+  delete budget as the binding/again-exhausted resource.
+* **Eviction replay:** 8,946 `open_quote_evicted` events on the tape, 2,593
+  joined to store sizes; victims small (<$15) in 2,479/2,593; the diversity
+  key (degraded dEV×P(accept) form, dES99=0 offline) would have refused
+  **470/2,593**. Under the REPAIRED capacity (~160–191) today's eviction
+  stream is NOT moot — the key genuinely governs at today's book sizes,
+  unlike the pre-G1 ≥1,198 claim that mooted it.
 
 ## Verification tails (verbatim)
 
-See the gate session's structured summary; key tails: feature tests
-`32 passed in 2.11s`; thrash harness `4 passed`; interference `90 passed in
-4.92s`; byte-identity `BYTE-IDENTICAL: 200/200 trial lines match`.
+Gate session tails (pre-repair): feature tests `32 passed in 2.11s`; thrash
+harness `4 passed`; interference `90 passed in 4.92s`; byte-identity
+`BYTE-IDENTICAL: 200/200 trial lines match`.
+
+G1-repair session tails (2026-08-01):
+
+* feature tests: `37 passed in 2.71s`
+* ruff (4 changed files): `All checks passed!`; mypy `eviction_value.py`:
+  `Success: no issues found in 1 source file`
+* vitals fast, in-tree, post-repair: `8/8 vital signs GREEN   (GATE PASS)
+  total 23.9s`
+* counterfactual: `derived capacity at median sent-rate (120/min -> 8.0
+  tok/s): 160 [tier form 1360, withdraw form 160 binds]` / `derived capacity
+  at worst sent-rate (608/min -> 40.5 tok/s): 200 [tier form 1197, withdraw
+  form -2 binds]` (200 = fail-closed fallback, reason `no_headroom`) /
+  `evictions the DIVERSITY key would have REFUSED (victim survives): 470 /
+  2593` / `table discriminating: True`
+* self-containment proof (fresh scratch worktree of main+branch): see the
+  proof tail recorded below at push time.
 
 ## NEXT STEPS
 
-* **Agent (next session, owns):** repair G1 IN THE PORT BRANCH before any
-  push — derive the routine withdraw budget from the observed tier (kill
-  reserve as a `WriteBudget.reserve` carve-out), bound capacity by
-  `min(tier derivation, withdraw_rate × TTL / DELETE_COST)`, add the
-  regression test (a derived capacity must be sustainable by the delete
-  path's own budget), then re-run the FULL adversarial gate: vitals fast 8/8
-  in-tree, commit, fresh scratch worktree of main+commit (import quote_app +
-  full suite + vitals fast), byte-identity replay, counterfactual on the
-  latest tape, THEN push.
-* **Operator (decision owed):** none until G1 is repaired. The staged
-  commented lines in `config/prod-live-wc.local.yaml` (both flags `"shadow"`)
-  remain CORRECT and safe to flip at a restart even before the repair —
-  shadow only logs. Capacity `"on"` is BLOCKED on G1; diversity `"on"` waits
-  for a shadow tape showing the in-process table DISCRIMINATING (unchanged)
-  and does not depend on G1.
+* **DONE (this session, 2026-08-01):** G1 repaired in the port branch
+  (§ G1 repair) — min-form capacity, G1 sustainability regression, G3
+  docstring+boundary test, module docstring naming both budgets, replay tool
+  on the live derivation; vitals fast in-tree, commit, fresh scratch
+  worktree self-containment proof (import + full suite + vitals fast),
+  counterfactual on the latest tape (§ Counterfactual), branch PUSHED.
+  Merge to main happens at the operator restart boundary, per the standing
+  rule.
+* **Operator (decisions owed):**
+  1. *Flip the staged shadow lines at the next restart* — the commented
+     lines in `config/prod-live-wc.local.yaml` (both flags `"shadow"`)
+     remain CORRECT and safe: shadow only logs. Capacity `"on"` is now
+     G1-clean but should soak in shadow first; diversity `"on"` waits for a
+     shadow tape showing the in-process table DISCRIMINATING (unchanged).
+     Neither may be armed `"on"` alongside adaptive-caps `enforce` until the
+     two engines compose (G2a).
+  2. *WITHDRAW-BUDGET RAISE (staged, from the DOCUMENTED number — not
+     changed here).* The documented write allowance for our tier
+     (docs/api-notes/limits-account.md, digested from docs.kalshi.com
+     `getting_started/rate_limits.md` + `GET /account/limits`): **Advanced =
+     300 write tokens/s refill, bucket capacity 2 s = 600 tokens; cancels
+     (DeleteQuote) cost 2 tokens** (batch-cancel worked example; runtime
+     truth `GET /account/endpoint_costs`; the tier is OBSERVED live each
+     boot via `ApiTierLimits`). The supervisor withdraw clamp of 200
+     tok/10 s = 20 tok/s therefore uses **6.7% of the documented
+     allowance** — the exchange permits 150 deletes/s where the bot grants
+     itself 10. Derivation for the raise, every term documented or
+     measured: `withdraw_rate = tier_write_refill (300 observed) −
+     measured create flow (≈0.9 tok/s at the live ~0.44 sent/s × 2-token
+     creates) − cancel-all burst reserve (the documented 600-token bucket
+     capacity already covers a full-book cancel-all of ≤300 quotes in one
+     2 s burst; a sustained reserve of ~40 tok/s keeps a 200-quote
+     cancel-all under 10 s even with zero bucket credit) ⇒ ≈ 260 tok/s`
+     (supervisor knob `2600 tokens / 10 s`). At 260 tok/s the withdraw form
+     yields 2,591 and the TIER form becomes the binding bucket at ~1,391 —
+     the originally headlined capacity, now honest. This is an operator
+     knob change (the knob quote_app clamps and alarms on), so it is staged
+     here as a decision, not applied; once raised, the derived capacity
+     scales by itself — no code change.
 * **Standing:** the reanchor worktree retires only after the repaired branch
   lands (its remaining unique content: parked V12/V13 flow vitals + withdrawn
   demotion history).

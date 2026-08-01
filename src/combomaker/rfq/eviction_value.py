@@ -53,11 +53,22 @@ drives them; nothing in this module touches exchange or book state):
     each; the tier ceiling is OBSERVED live via GET /account/limits,
     ``ApiTierLimits``)). A standing book of N quotes must be re-postable
     every TTL (a reprice or an expiry-relight both cost one delete + one
-    create per cycle — a PROTOCOL cost, 4 tokens), so the write bucket
-    itself bounds the standing book:
+    create per cycle — a PROTOCOL cost, 4 tokens). TWO buckets pay that
+    refresh, and the standing book is bounded by BOTH (gate finding G1,
+    2026-08-01):
 
-        capacity = (tier_write_rate - kill_reserve_rate - measured_flow_rate)
-                   x ttl_s / refresh_cost_tokens
+        capacity = min(
+            # (a) the EXCHANGE tier bucket pays every write:
+            (tier_write_rate - kill_reserve_rate - measured_flow_rate)
+                x ttl_s / refresh_cost_tokens,
+            # (b) the bot's OWN metered withdraw budget pays every DELETE
+            #     (there is exactly one delete conduit — lifecycle
+            #     ``_withdraw_batch`` -> ``_spend_withdraw_tokens`` on
+            #     ``self._withdraw_budget``, sized by quote_app's
+            #     ``_tier_clamped_write_budget``):
+            (withdraw_rate - measured delete-share of flow)
+                x ttl_s / delete_cost_tokens,
+        )
 
     * tier_write_rate: the OBSERVED account write refill (never assumed).
     * kill_reserve_rate: the withdrawal/kill bucket's sustained rate — the
@@ -69,6 +80,25 @@ drives them; nothing in this module touches exchange or book state):
       derived capacity is understated, never overstated.
     * refresh_cost_tokens: create + delete = 4, the documented endpoint
       costs (a protocol fact, not a tuned constant).
+    * withdraw_rate: the sustained refill of the bot's OWN delete budget
+      (the tier-clamped supervisor knob quote_app injects into the
+      lifecycle — today 200 tok/10 s = 20 tok/s). G1 (adversarial gate,
+      2026-08-01): the first form alone claimed 1,198-1,272 slots, but the
+      delete path can only sustain ``withdraw_rate x ttl / delete_cost``
+      = 20 x 20 / 2 = ~200 refreshes — exactly the value the four manual
+      bumps stalled at. Armed without form (b), a grown book's TTL/reprice/
+      eviction withdrawals defer at the FIFO token gate and quotes REST
+      STALE past their reprice point (the 07-26/07-27 maintenance-stall
+      family, adverse-fill exposure). Form (b) makes the derivation honest
+      today (~200, self-consistent with the hand cap) and SCALES
+      AUTOMATICALLY if the withdraw budget is ever raised — the knob
+      dissolves instead of lying.
+    * delete_cost_tokens: DeleteQuote = 2, the documented endpoint cost.
+    * measured delete-share of flow: the delete fraction of the measured
+      new-quote token flow (``measured_flow_rate x delete_cost /
+      refresh_cost``) — new quoting's own deletes draw the SAME withdraw
+      bucket, so form (b) carves them out of the budget before crediting
+      refresh headroom. Same conservative double-count as the tier form.
 
     MASS-ACCEPTANCE GUARD (why capacity is a THROUGHPUT bound, not a risk
     bound): admitting more RESTING quotes admits zero additional risk —
@@ -87,7 +117,7 @@ drives them; nothing in this module touches exchange or book state):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 __all__ = [
     "SIZE_BUCKET_EDGES_CC",
@@ -171,11 +201,26 @@ def clopper_pearson_lower(x: int, n: int, alpha: float) -> float:
     """Exact one-sided Clopper-Pearson LOWER bound,
     ``sup{p : P(X >= x; n, p) <= alpha}``, by bisection on the exact upper
     tail — the same recurrence ``burst_floor.binom_tail_gt`` computes, kept
-    in the SMALL-COUNT regime (``k = x - 1`` accepts, tiny) where it cannot
-    underflow (the textbook duality ``1 - upper(n - x, n)`` walks the
-    recurrence ``n - x`` terms from ``(1-p)^n`` at ``p -> 1``, which
-    underflows to a bound of exactly ``x/n`` — a silently WIDER-than-nothing
-    lie; found at n=1000). Degenerate inputs return 0.0 — NO information =>
+    in the SMALL-COUNT regime (``k = x - 1`` accepts, tiny) where the
+    recurrence stays representable (the textbook duality
+    ``1 - upper(n - x, n)`` walks the recurrence ``n - x`` terms from
+    ``(1-p)^n`` at ``p -> 1``, which underflows to a bound of exactly
+    ``x/n`` — a silently WIDER-than-nothing lie; found at n=1000).
+
+    BOUNDARY (gate note G3, 2026-08-01): "cannot underflow" is NOT strictly
+    true at multi-day counter scales — once ``(1-p)^n`` underflows inside
+    the bisection bracket (``n*p`` ≳ 745, e.g. n≈50k at p̂≈2%), this LOWER
+    bound clips DOWN (candidate under-credited) and ``clopper_pearson_upper``
+    converges to p̂ from above (its bisection ``lo`` starts at ``x/n``, so
+    the incumbent is never credited below its point estimate). BOTH failure
+    directions are conservative and no inversion is possible
+    (``lower <= x/n <= upper`` by construction of the brackets). Counters
+    are per-boot cumulative, so a single live day sits inside the exact
+    regime (verified vs scipy to 1e-15); a future multi-day-persistence
+    change must re-check this boundary (regression-tested in
+    ``TestClopperPearsonLower.test_underflow_regime_stays_conservative``).
+
+    Degenerate inputs return 0.0 — NO information =>
     the smallest possible acceptance credit => fail CLOSED (a thin bucket
     can never inflate a candidate's key)."""
     if n <= 0 or x <= 0 or x > n:
@@ -313,9 +358,13 @@ class DerivedCapacity:
     reason: str
     tier_write_rate_per_s: float
     reserve_rate_per_s: float
+    withdraw_rate_per_s: float
     measured_flow_tokens_per_s: float | None
     ttl_s: float
     refresh_cost_tokens: int
+    delete_cost_tokens: int
+    tier_capacity: int
+    withdraw_capacity: int
     fallback: int
 
 
@@ -323,15 +372,45 @@ def derive_open_quote_capacity(
     *,
     tier_write_rate_per_s: float,
     reserve_rate_per_s: float,
+    withdraw_rate_per_s: float,
     measured_flow_tokens_per_s: float | None,
     ttl_s: float,
     refresh_cost_tokens: int,
+    delete_cost_tokens: int,
     fallback: int,
 ) -> DerivedCapacity:
-    """The write bucket's own bound on a standing quote book (module
-    docstring, mechanism 2). Fail-closed to ``fallback`` (today's configured
-    cap) on any unusable input; the derivation NEVER returns a capacity the
-    bucket cannot actually refresh."""
+    """The standing book's refresh bound, taken over BOTH buckets that pay
+    the refresh (module docstring, mechanism 2):
+
+        capacity = min(tier_form, withdraw_form)
+
+    where
+
+        tier_form     = (tier_write_rate - reserve - measured_flow)
+                        x ttl / refresh_cost                       # exchange
+        withdraw_form = (withdraw_rate
+                         - measured_flow x delete_cost/refresh_cost)
+                        x ttl / delete_cost              # bot's delete budget
+
+    G1 (adversarial gate 2026-08-01): the tier form alone claimed 1,198-1,272
+    slots, but every DELETE flows through the bot's own metered withdraw
+    budget (lifecycle ``_withdraw_batch`` -> ``_spend_withdraw_tokens``,
+    sized from the tier-clamped supervisor knob = 20 tok/s today), so the
+    delete path sustains only ``withdraw_rate x ttl / delete_cost`` ~= 200
+    refreshes per TTL — the withdraw form. The min is the ONLY capacity both
+    buckets can actually refresh; today it reproduces the hand cap (~200)
+    from measured/documented inputs, and it scales automatically with any
+    future withdraw-budget raise (an operator decision, staged in
+    docs/reports/2026-08-01-eviction-capacity-port-to-main.md NEXT STEPS).
+    The withdraw form's flow carve-out (``measured_flow x delete_cost /
+    refresh_cost``) is the measured delete-share of new quoting drawn from
+    the SAME bucket — the safety margin comes from measured headroom, not a
+    typed factor, and inherits the tier form's conservative double-count of
+    the standing book's own refresh.
+
+    Fail-closed to ``fallback`` (today's configured cap) on any unusable
+    input; the derivation never returns a capacity that EITHER bucket cannot
+    actually refresh."""
 
     def _closed(reason: str) -> DerivedCapacity:
         return DerivedCapacity(
@@ -340,9 +419,13 @@ def derive_open_quote_capacity(
             reason=reason,
             tier_write_rate_per_s=tier_write_rate_per_s,
             reserve_rate_per_s=reserve_rate_per_s,
+            withdraw_rate_per_s=withdraw_rate_per_s,
             measured_flow_tokens_per_s=measured_flow_tokens_per_s,
             ttl_s=ttl_s,
             refresh_cost_tokens=refresh_cost_tokens,
+            delete_cost_tokens=delete_cost_tokens,
+            tier_capacity=0,
+            withdraw_capacity=0,
             fallback=fallback,
         )
 
@@ -350,24 +433,45 @@ def derive_open_quote_capacity(
         return _closed("no_measured_flow_window")
     if tier_write_rate_per_s <= 0:
         return _closed("tier_write_rate_unusable")
-    if ttl_s <= 0 or refresh_cost_tokens <= 0:
+    if withdraw_rate_per_s <= 0:
+        return _closed("withdraw_rate_unusable")
+    if ttl_s <= 0 or refresh_cost_tokens <= 0 or delete_cost_tokens <= 0:
         return _closed("invalid_ttl_or_cost")
-    headroom = (
+    tier_headroom = (
         tier_write_rate_per_s - reserve_rate_per_s - measured_flow_tokens_per_s
     )
-    derived = int(headroom * ttl_s / refresh_cost_tokens)
+    tier_capacity = int(tier_headroom * ttl_s / refresh_cost_tokens)
+    # G1: the delete-path bound. New quoting's own deletes draw the same
+    # withdraw bucket, so carve the measured delete-share of flow out first.
+    delete_flow = (
+        measured_flow_tokens_per_s * delete_cost_tokens / refresh_cost_tokens
+    )
+    withdraw_capacity = int(
+        (withdraw_rate_per_s - delete_flow) * ttl_s / delete_cost_tokens
+    )
+    derived = min(tier_capacity, withdraw_capacity)
     if derived < 1:
         # A capacity that cannot admit one quote is a 100%-decline dressed as
-        # a cap (the 2026-07-23 lesson: a cap must be PROVEN to quote).
-        return _closed("no_headroom")
+        # a cap (the 2026-07-23 lesson: a cap must be PROVEN to quote). Keep
+        # the computed per-bucket forms in the readout so the log line shows
+        # WHICH bucket had no headroom.
+        return replace(
+            _closed("no_headroom"),
+            tier_capacity=tier_capacity,
+            withdraw_capacity=withdraw_capacity,
+        )
     return DerivedCapacity(
         capacity=derived,
         usable=True,
         reason="derived",
         tier_write_rate_per_s=tier_write_rate_per_s,
         reserve_rate_per_s=reserve_rate_per_s,
+        withdraw_rate_per_s=withdraw_rate_per_s,
         measured_flow_tokens_per_s=measured_flow_tokens_per_s,
         ttl_s=ttl_s,
         refresh_cost_tokens=refresh_cost_tokens,
+        delete_cost_tokens=delete_cost_tokens,
+        tier_capacity=tier_capacity,
+        withdraw_capacity=withdraw_capacity,
         fallback=fallback,
     )
