@@ -117,3 +117,37 @@ watch the first `det_max_backstop_cc` readouts against the live premium.
   throughput at pre-ship.
 * **other fleet**: eviction/capacity branch rebases on this (whoever pushes
   second rebases + re-runs the self-containment proof).
+
+---
+
+## ADVERSARIAL GATE (2026-08-01, second fleet) — re-executed in a fresh scratch worktree at `cdfdcc8`: VERIFIED, exactly the ratified shape, nothing more
+
+Every check by EXECUTION in an independent worktree (`kct-gate-rb`, not the build tree), interpreter = live venv, frozen-tape snapshot `D:\kct-vdata` for anything touching data. Live bot untouched throughout (GET/read-only; tape read = `tail` on the log copy stream only).
+
+| gate item | how verified | result |
+|---|---|---|
+| (a) backstop DERIVED, never typed | `det_max_backstop_frac()` = `Fraction(1) - Fraction(Decimal(str(RUIN_FLOOR_FRAC)))` = exactly `7/10`, `@cache`d; grep: the only `0.70` literals near the axis are the PRE-EXISTING Reading-A surviving-equity defaults in `book_risk` (`ruin_floor_frac: float = 0.70`, untouched by the diff and pinned by the collision test). Ratification verbatim (incl. Reading-A collision + copula caveat + "operator chose B knowing it") present in `cap_family` comment, test-file header, `config.py`, the staged yaml stanza, and this report | PASS |
+| (b) armed capacity re-produced | `demotion_capacity_proof.py` at boot equity $2,808.37: live book n=39, premium $1,117.74, P(KILL) 0.20% — today `skip_portfolio_det_max` (live tape tail corroborates: 860 det-max skips, 0 cvar), armed ADMITTED, headroom $848.12 to the $1,965.86 backstop; synthetic n=8/20/46 ratios 0.44/0.67/1.10; cheap-NO sweep 25c 0.70 … 92c 1.95 — all identical to the build's table | PASS |
+| (b) boundary flip on the anchors | boundary probe re-run against gate-tree src: P(KILL) 1.1%/1.9% ADMITTED, 2.3%/4.9%/10.4% REFUSED — flip exactly at the ratified 2% budget, det-max silent inside the backstop | PASS |
+| (c) wrong-model pricing | copula test RE-MEASURES (200k paths/rho, not pinned constants): rho 0 inside budget, rho 0.25 > 8× the 2% budget (≈20.8%), rho 1.0 → 29.5% 30%-drawdown event — matches the pinned sweep the operator ratified over | PASS |
+| (c) p_ruin MC gate still armed | three-wiring probe (disarmed / armed-no-governor / fully armed): a p_ruin 6.01% > 5%-budget candidate REFUSED in all three; plus the depleted-equity case (equity 0.75B, loss crosses the 0.70B floor but not the KILL line) where fully-armed the RUIN axis itself fires (`post_ruin_prob_over_budget`) — drawdown convention, 5% budget, unchanged | PASS |
+| (d) no bypass / fail-closed / coherence | n=160/$2,400 refused at BOTH sites; unusable-snapshot fail-closed parametrized armed+disarmed; quote/confirm same flag + same governor guard (half-wired states degrade only in the DECLINE direction, never the renege direction) — all in the 24/24 | PASS |
+| (d) shadow byte-identity, NON-circular | golden EMITTED FRESH at pre-change main `022e47f` (which does not even have the flag) → digest `b136e16e76ce78da…` == fixture == HEAD flag-off regeneration (20,000 + 2,000 cases) | PASS |
+| (d) throughput | `LimitChecker.check` best-round: HEAD flag-off 32.4µs == main 32.4µs (medians noise-dominated by the live bot; logical identity already proven by the golden); armed 36.7µs — admission check only | PASS |
+| (d) canary refuses unratified landings | MUTATION-TESTED, 3 shapes: (1) demotion reverted → ratified-capacity test RED; (2) governor guard dropped → `test_demotion_never_applies_without_its_governor` RED; (3) DISARMED wall silently widened to the backstop → updated canary + golden BOTH RED. Tree restored clean after each | PASS |
+| (e) self-containment | fresh scratch worktree at `origin/main` = `cdfdcc8`: `import quote_app` OK, FULL suite **3,496 passed / 0 failed** (3 deselected, 298s), vitals fast **8/8 GREEN** 21.9s (frozen snapshot + local yaml copied in). Capacity/eviction branch (`7e20dc2`) NOT landed on main → no merge to prove against; they still owe the rebase + re-proof when they push | PASS |
+| (f) zero `eviction_value` in src | `git grep eviction_value -- src` = 0 hits (docs history mentions only) | PASS |
+
+**Verdict: what shipped is exactly the ratification — Reading B on the det-max axis only, both sites, governor-guarded, dark by default, byte-identical off.** No findings. The residual risk remains the RATIFIED trade (comonotone collapse 2.33× the enforced ruin distance; copula-dependent KILL + p_ruin gates day-to-day; copula-free 0.70B floor), on record above.
+
+### ONE-restart arming plan (staged, NOT executed — operator owns the go)
+
+One pregame restart arms everything pending together (quiet-machine ritual, skew-fix precedent):
+
+1. **Quiet machine**: no games in the next ~1h window, `tools.vitals.gate --tier pre-ship` at the LIVE tree must be GREEN first.
+2. **Flags at that restart** (all currently dark): `risk.kill_anchored_book_gate: true` (stanza already staged commented at the end of the gitignored live yaml with the ratification quote; governs because `portfolio_tail_prob_gate` is already true) **+ the capacity/eviction fleet's flags iff their branch has landed and re-proven by then** (they rebase onto `cdfdcc8` and re-run their self-containment proof first — one restart, not two).
+3. **First-hour metrics to watch on the tape**: (i) first armed declines must name the KILL line / `ruin-anchor backstop` in the breach detail (never the old `0.36 bankroll` string); (ii) `det_max_backstop_cc` + `p_kill_night` readouts on every snapshot vs live premium; (iii) armed `check` latency at pre-ship (~+15% budgeted, admission check only); (iv) quotes-per-min vs the pre-restart hour (throughput never regresses); (v) declines on tiny books (n<15) are EXPECTED to rise (lattice regime — the gate binding tighter than the dollar wall on concentrated books is the design, not a defect).
+4. **Abort criteria** (any one → set the flag false, restart at the next quiet window, no other change): armed declines NOT naming the backstop/KILL anchors; P(book) or quotes-per-min degradation beyond the pre-restart hour's band; any breach string claiming a wall that wasn't tested; `det_max_backstop_cc` readout absent or ≠ 0.70×bankroll; any renege (confirm-time decline of a won auction on the det-max/tail axes).
+5. **Stale-bankroll caveat carried** (pre-existing, not this change): the gate bankroll input reads the stale `daily_ruin_anchors` row — verify the boot-equity row is current at the arming restart.
+
+NEXT STEPS: operator — arm decision per the plan above; eviction fleet — rebase onto `cdfdcc8` + re-prove; next session — watch the first armed hour per §3.
