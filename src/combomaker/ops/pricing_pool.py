@@ -434,6 +434,12 @@ class CandidateBookRiskInputs:
     # (byte-identical).
     kill_anchored_book_gate: bool = False
     hard_trip_frac: float | None = None
+    # MARGINAL KILL GATE (2026-08-01 sunk-book ruling) — the SAME
+    # ``RiskLimits.kill_gate_marginal`` flag the quote-time cap honors,
+    # threaded to the worker gate so an inherited over-budget PRE book judges
+    # the candidate's MARGINAL effect instead of level-refusing every fill
+    # (see ``sim/book_risk._candidate_gate``). Default OFF (byte-identical).
+    kill_gate_marginal: bool = False
     # GATE EV SOURCE (2026-07-25 renege root cause #2): when armed, the
     # admission EV sign check uses the calibrated pricing fair's edge for
     # this fill (pricing_edge_cc) instead of the band-high MC EV. None edge
@@ -584,6 +590,7 @@ def _worker_candidate_book_risk(
         kill_tail_prob=inputs.kill_tail_prob,
         kill_anchored_book_gate=inputs.kill_anchored_book_gate,
         hard_trip_frac=inputs.hard_trip_frac,
+        kill_gate_marginal=inputs.kill_gate_marginal,
         gate_ev_from_pricing_fair=inputs.gate_ev_from_pricing_fair,
         pricing_edge_cc=inputs.pricing_edge_cc,
         require_p_book_non_decreasing=inputs.require_p_book_non_decreasing,

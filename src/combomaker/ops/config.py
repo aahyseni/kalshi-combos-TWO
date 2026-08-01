@@ -2828,6 +2828,19 @@ class RiskConfig(StrictModel):
     # on the table. Full mechanics in ``RiskLimits.kill_anchored_book_gate``.
     # False (default) = byte-identical.
     kill_anchored_book_gate: bool = False
+    # MARGINAL KILL GATE (2026-08-01 sunk-book ruling; operator verbatim:
+    # "even if we did have a -EV book we should still quote to increase it;
+    # when we fill something we always fill at +EV"). The armed LEVEL form
+    # froze ALL quoting on the inherited 26-position book on 2026-08-01
+    # (140,338 skip_portfolio_cvar rows, quote_sent = 0, book P(KILL) 0.115
+    # vs the 0.02 budget — a level no refusal can lower). True makes an
+    # OVER-budget book judge each candidate's MARGINAL effect via the
+    # ratified diversity-key machinery (certified risk-reducers always
+    # admit; dES99 <= dEV x CP-lower P(accept) at the ratified alpha);
+    # an UNDER-budget book is byte-identical to the armed level form.
+    # Governs ONLY with ``kill_anchored_book_gate`` armed. Full mechanics in
+    # ``RiskLimits.kill_gate_marginal``. False (default) = byte-identical.
+    kill_gate_marginal: bool = False
     # RENEGE FIXES (2026-07-25 big-fill audit — 49 auctions won, 15 filled,
     # $355 premium won-then-declined in one evening). Both default OFF
     # (byte-identical); arm together at a pregame restart after review.
@@ -3458,6 +3471,7 @@ class RiskConfig(StrictModel):
                 Fraction(Decimal(self.portfolio_kill_tail_prob))
             ),
             kill_anchored_book_gate=self.kill_anchored_book_gate,
+            kill_gate_marginal=self.kill_gate_marginal,
             portfolio_ruin_prob_budget=Fraction(Decimal(self.portfolio_ruin_prob_budget)),
             absolute_notional_multiple=self.absolute_notional_multiple,
             fill_velocity_window_s=self.fill_velocity_window_s,

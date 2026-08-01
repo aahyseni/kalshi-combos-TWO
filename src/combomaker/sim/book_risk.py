@@ -2536,6 +2536,12 @@ def evaluate_candidate_book_risk(
     # that function.
     kill_anchored_book_gate: bool = False,
     hard_trip_frac: float | None = None,
+    # MARGINAL KILL GATE (2026-08-01 sunk-book ruling): threaded from the SAME
+    # ``RiskLimits.kill_gate_marginal`` the quote-time cap reads (one flag,
+    # two sites, no divergence). Armed, an inherited over-budget PRE book no
+    # longer level-refuses every candidate at the confirm gate — see
+    # ``_candidate_gate``. Default off = byte-identical.
+    kill_gate_marginal: bool = False,
     gate_ev_from_pricing_fair: bool = False,
     pricing_edge_cc: float | None = None,
     require_p_book_non_decreasing: bool = False,
@@ -2919,6 +2925,12 @@ def evaluate_candidate_book_risk(
         # (one flag, two sites, no divergence).
         kill_anchored_book_gate=kill_anchored_book_gate,
         hard_trip_frac=hard_trip_frac,
+        # MARGINAL KILL GATE (2026-08-01): the PRE-book vectors of the SAME
+        # model streams, same order, same CRN sample — the regime probe
+        # (is the inherited book already over budget?) and the marginal
+        # charge both read post − pre on shared randomness.
+        kill_gate_marginal=kill_gate_marginal,
+        pre_pnls=(pre_pnl, pre_pnl_c, pre_bridge_pnl, pre_split_pnl),
         require_p_book_non_decreasing=require_p_book_non_decreasing,
         delta_p_book=delta_p_book,
         delta_p_book_se=delta_p_book_se,
@@ -2977,6 +2989,17 @@ def _candidate_gate(
     # re-anchored here — see the det_thr comment below.
     kill_anchored_book_gate: bool = False,
     hard_trip_frac: float | None = None,
+    # MARGINAL KILL GATE (2026-08-01 sunk-book ruling — see
+    # ``risk/limits.RiskLimits.kill_gate_marginal``, the ONE flag both sites
+    # read). When armed AND the PRE book — scored on the SAME CRN sample —
+    # is already OVER the KILL tail budget, the POST level check in (2) is
+    # replaced by the candidate's MARGINAL admission test. ``pre_pnls`` are
+    # the PRE-book P&L vectors of the same model streams ``post_pnls``
+    # carries, in the same order (CRN: post − pre is the candidate's true
+    # marginal effect, not sampling noise). Default off/empty ⇒ every path
+    # below is byte-identical.
+    kill_gate_marginal: bool = False,
+    pre_pnls: Sequence[NDArray[np.float64] | None] = (),
     require_p_book_non_decreasing: bool = False,
     delta_p_book: float = 0.0,
     delta_p_book_se: float = 0.0,
@@ -3134,7 +3157,67 @@ def _candidate_gate(
                 post_pnls, tail_thr, n_samples, ruin_prob_ci_z
             )
             if p_kill > kill_tail_prob:
-                return False, "post_kill_tail_prob_over_budget"
+                # ── MARGINAL KILL GATE (2026-08-01 sunk-book ruling). The
+                # POST book is over the budget — but if the PRE book (same
+                # CRN sample, same worst-model Wilson-upper read) was ALREADY
+                # over, the level is inherited/sunk and refusing this
+                # candidate cannot lower it. Armed, the decision becomes the
+                # candidate's MARGINAL test:
+                #   * CERTIFIED RISK-REDUCER — the existing hedge
+                #     certification measure verbatim (POST governing model
+                #     UNCLAMPED expected tail loss <= PRE, same CRN — never
+                #     a leg-sign heuristic): always admit ("hedges are +EV").
+                #   * else admit iff the candidate does NOT RAISE the
+                #     measured P(KILL-night) — post vs pre on the SAME CRN
+                #     sample, worst model, same Wilson read — i.e. its
+                #     marginal effect on THE RATIFIED ANCHOR itself is
+                #     non-adverse ("quoting more and filling more" that
+                #     leaves P(KILL) where the sunk book put it, or lowers
+                #     it, is exactly the flow the ruling orders admitted).
+                #
+                # JUSTIFIED DEVIATION from the dossier's dEV×P−dES99 form at
+                # THIS site (the dossier invites a strictly better
+                # anchor-derived criterion): the CRN governing-ES difference
+                # is structurally ~the candidate's FULL premium for ANY small
+                # diversifier on a flat-tail book — the post-sort worst-1%
+                # re-SELECTS the (tail ∧ candidate-loses) scenarios, measured
+                # 2026-08-01: a $30.60-premium new-game candidate with
+                # +$1.21 EV and IDENTICAL pre/post P(KILL) (0.04675 ==
+                # 0.04675) charged dES99 +$28.80 — ES "barely credits
+                # diversification" is the exact pathology the tail-prob
+                # anchor was ratified AGAINST (2026-07-25), so an ES-delta
+                # arm here would re-freeze the book at the confirm site. The
+                # dEV×P−dES99 form DOES gate — at the deterministic §(8a)
+                # sites (quote-time cap, reservation, confirm floor), where
+                # dES99 is the ALLOCATED per-game decomposition, not the
+                # resort-inflated CRN delta; DEPTH beyond the KILL line
+                # (which this probability comparison cannot see) stays
+                # governed there and by the det-max backstop / per-game /
+                # entity walls that all still run.
+                #
+                # PRE not measurably over (empty pre vectors count as NOT
+                # over — no free pass: the level check below then stands) ⇒
+                # today's armed level behaviour, byte-identical.
+                pre_over = False
+                pre_p_kill = 0.0
+                if kill_gate_marginal and kill_anchored_book_gate:
+                    has_pre = any(
+                        p is not None and p.size for p in pre_pnls
+                    )
+                    if has_pre:
+                        pre_p_kill = kill_tail_prob_upper(
+                            pre_pnls, tail_thr, n_samples, ruin_prob_ci_z
+                        )
+                        pre_over = pre_p_kill > kill_tail_prob
+                if pre_over:
+                    certified = (
+                        post.governing_model_tail_loss_cc
+                        <= pre.governing_model_tail_loss_cc
+                    )
+                    if not (certified or p_kill <= pre_p_kill):
+                        return False, "kill_marginal_raises_p_kill"
+                else:
+                    return False, "post_kill_tail_prob_over_budget"
         elif post.governing_model_es_99_cc > cvar_thr:
             return False, "post_governing_model_es_over_budget"
 

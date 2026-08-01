@@ -370,6 +370,55 @@ class RiskLimits:
     # limit cases + 2,000 candidate-gate cases,
     # tools/diagnostics/kill_anchor_shadow_golden.py).
     kill_anchored_book_gate: bool = False
+    # ── MARGINAL KILL GATE (2026-08-01, operator ruling — the sunk-book
+    # principle) ──────────────────────────────────────────────────────────
+    # THE DEFECT the LEVEL form showed live (2026-08-01, boot 14:49Z): armed
+    # on an INHERITED 26-position book whose measured P(loss >= the 12% KILL
+    # line) read 0.110-0.115 against the 0.02 budget, §(8a) refused EVERY
+    # candidate — 140,338 skip_portfolio_cvar rows, quote_sent = 0 — because
+    # the level check judges the BOOK, which no candidate can change. The
+    # operator ruled (verbatim): "The only reason the book could be -EV is if
+    # odds have changed... even if we did have a -EV book we should still
+    # quote to increase it; when we fill something we always fill at +EV;
+    # what happens after that we can't decide, besides quoting more and
+    # filling more." The STANDING book is SUNK (sell-only, no unwind); the
+    # ABSOLUTE level constraint belongs to the model-free det-max backstop
+    # (0.70B, stays); the KILL gate must judge the MARGINAL candidate.
+    #
+    # TWO REGIMES when this flag arms ON TOP of the armed
+    # ``kill_anchored_book_gate`` + ``portfolio_tail_prob_gate``:
+    #   * UNDER budget (book P(KILL) <= ``portfolio_kill_tail_prob``):
+    #     behaviour UNCHANGED — §(8a) is silent at quote time and the
+    #     candidate-MC gate admits iff POST P(KILL) <= budget, exactly as
+    #     armed today.
+    #   * OVER budget (the inherited book already past the budget): do NOT
+    #     freeze. A candidate is admitted iff its MARGINAL effect is
+    #     justified — the just-shipped diversity-key metric reused verbatim
+    #     (rfq/eviction_value.py, operator-ratified 2026-07-31):
+    #         admit  iff  dES99 <= dEV x P(accept | size bucket, CP-LOWER at
+    #                     the ratified alpha ``portfolio_kill_tail_prob``)
+    #     i.e. the candidate must add no more marginal tail than the
+    #     expected value it realistically brings. Certified risk-reducers
+    #     (the existing hedge machinery) always admit. NOTE the boundary is
+    #     ``<=`` not ``<`` (deviation from the dossier's strict ``> 0``,
+    #     justified): a DIVERSIFYING candidate on a game the tail
+    #     decomposition does not touch has dES99 == 0 exactly, and at a
+    #     fresh boot the acceptance tape is EMPTY so the CP-lower P(accept)
+    #     is 0 for every bucket — under strict ``>`` the frozen book could
+    #     never quote, never fill, never grow the tape: the same
+    #     100%-decline-dressed-as-a-cap the 2026-07-23 lesson forbids
+    #     (VALIDATE-CAPS-CAN-QUOTE). At ``<=``, zero-marginal-tail flow
+    #     admits immediately while CONCENTRATING flow (dES99 > 0) still
+    #     needs measured acceptance credit to cover its tail — fail-closed
+    #     exactly where it must be.
+    #   The det-max backstop, the staleness fail-closed (an unusable /
+    #   unmeasured snapshot refuses BOTH axes before any regime is read),
+    #   P(ruin) and every deploy-side wall are UNTOUCHED. A caller that
+    #   cannot supply the candidate's marginal facts (``kill_marginal``
+    #   None) keeps the LEVEL form — UNKNOWN never admits.
+    # Default False = the level form exactly as armed 2026-08-01 morning —
+    # byte-identical.
+    kill_gate_marginal: bool = False
     # Portfolio DETERMINISTIC maximum-loss cap (P0-3): the exact all-hit
     # premium-at-risk (+ reserved holdings) as a %-of-bankroll ceiling. Gated
     # INDEPENDENTLY of the sampled-ES cap so the deterministic maximum is its own
@@ -576,6 +625,82 @@ def monotone_pre_quote_breaches(breaches: list[Breach]) -> list[Breach]:
         for b in breaches
         if not b.shadow and b.reason in PRE_PRICING_MONOTONE_REASONS
     ]
+
+
+@dataclass(frozen=True, slots=True)
+class KillMarginalCandidate:
+    """The MARGINAL facts of ONE candidate for the two-regime KILL gate
+    (``RiskLimits.kill_gate_marginal`` — the 2026-08-01 sunk-book ruling).
+
+    Built by the LIFECYCLE (the one owner of the acceptance tape, the stored
+    quote-time EV and the snapshot's per-game tail decomposition) and passed
+    into ``check``; every field reuses machinery that already ships:
+
+      * ``ev_cc`` — the candidate's quote-time EV, the SAME
+        ``_quote_candidate_ev_cc`` figure the eviction ranking stores (None =
+        UNKNOWN ⇒ the caller must not construct this object; a None input to
+        ``check`` keeps the LEVEL form — UNKNOWN never admits).
+      * ``p_accept_lower`` — the exact Clopper-Pearson LOWER bound of the
+        candidate's premium-size bucket on the in-process acceptance tape at
+        the RATIFIED alpha (``portfolio_kill_tail_prob``) —
+        ``rfq/eviction_value.py`` verbatim. A thin/empty bucket reads 0.0
+        (fail-closed: unmeasured acceptance buys no concentrating capacity).
+        Confirm-path callers pass 1.0 — the accept HAPPENED; the probability
+        discount is a quote-time realism haircut, not a confirm-time one.
+      * ``des99_cc`` — the candidate's allocated marginal tail contribution
+        from the book-risk MC's additive per-game CVaR decomposition
+        (``allocate_des99_cc``): 0 for a game the book's tail does not touch
+        (a diversifier), positive on a tail game (a concentrator), negative
+        on a hedge game.
+      * ``certified_risk_reducing`` — True ONLY from the existing hedge
+        certification machinery (state enumeration / CRN tail comparison),
+        never a leg-sign heuristic. Certified reducers always admit
+        ("hedges are +EV").
+    """
+
+    ev_cc: int
+    p_accept_lower: float
+    des99_cc: float
+    certified_risk_reducing: bool = False
+
+
+def kill_envelope_tail_upper(
+    book_risk: PortfolioRisk | None,
+    limits: RiskLimits,
+    bankroll_cc: int | None,
+) -> float | None:
+    """The Wilson-upper P(book loss >= the armed tail threshold) off the
+    snapshot's loss-quantile envelope — THE ONE implementation of the number
+    §(8a)'s tail-probability form gates on, factored out so the lifecycle's
+    regime probe (does the marginal form apply?) and the cap itself can never
+    diverge (same function, same inputs ⇒ same regime).
+
+    Returns None when the tail-probability form cannot evaluate on these
+    inputs — gate off, no bankroll, unusable snapshot, or no envelope — in
+    which case §(8a) takes its ES-fallback / fail-closed paths exactly as
+    before and the marginal form NEVER applies (a regime that cannot be
+    measured is never "over budget with a marginal bypass"; it is the
+    fail-closed level behaviour)."""
+    if book_risk is None or not book_risk.usable:
+        return None
+    if not limits.portfolio_tail_prob_gate:
+        return None
+    if bankroll_cc is None or bankroll_cc <= 0:
+        return None
+    quantiles = getattr(book_risk, "loss_quantiles_cc", ()) or ()
+    n_mc = int(getattr(book_risk, "n_samples", 0) or 0)
+    if not quantiles or n_mc <= 0:
+        return None
+    tail_thr = threshold_cc(
+        limits.hard_trip_frac
+        if limits.kill_anchored_book_gate
+        else limits.portfolio_cvar_frac,
+        bankroll_cc,
+    )
+    n_grid = len(quantiles)
+    k_ge = sum(1 for q in quantiles if q >= tail_thr)
+    p_hat = k_ge / max(1, n_grid - 1)
+    return _wilson_upper(min(1.0, p_hat), n_mc, limits.portfolio_tail_prob_ci_z)
 
 
 class WaiverCertificate(Protocol):
@@ -892,8 +1017,19 @@ class LimitChecker:
         deploy_scale: float = 1.0,
         entity_admission_observer: EntityAdmissionObserver | None = None,
         slate_partition_observer: SlatePartitionObserver | None = None,
+        kill_marginal: KillMarginalCandidate | None = None,
     ) -> list[Breach]:
         """All current breaches, mass-acceptance included.
+
+        ``kill_marginal`` (2026-08-01 sunk-book ruling — see
+        ``RiskLimits.kill_gate_marginal``): the contemplated candidate's
+        marginal facts (quote-time EV, measured CP-lower P(accept),
+        allocated dES99, hedge certification). Consulted by EXACTLY ONE
+        branch — the §(8a) tail-probability form when the marginal flag is
+        armed AND the book's own envelope is already OVER the KILL budget —
+        where it replaces the level refusal with the marginal admission
+        test. None (the default, and every book-only/maintenance caller)
+        keeps the LEVEL form byte-identically: UNKNOWN never admits.
 
         ``candidate_positions``: hypothetical fills being contemplated (last
         look passes the accepted side here). ``adding_quote``: pre-quote check
@@ -1128,6 +1264,7 @@ class LimitChecker:
                 waived_games=waived_games,
                 entity_admission_observer=entity_admission_observer,
                 slate_partition_observer=slate_partition_observer,
+                kill_marginal=kill_marginal,
             )
         )
         return breaches
@@ -1149,6 +1286,7 @@ class LimitChecker:
         waived_games: Mapping[str, WaiverCertificate] | None = None,
         entity_admission_observer: EntityAdmissionObserver | None = None,
         slate_partition_observer: SlatePartitionObserver | None = None,
+        kill_marginal: KillMarginalCandidate | None = None,
     ) -> list[Breach]:
         """The additive %-of-bankroll caps. Every breach carries
         ``shadow=caps_shadow_mode``. Kept in its own method so the enforced-cap
@@ -1670,34 +1808,74 @@ class LimitChecker:
                 # snapshots without the envelope, or the flag off, bind the
                 # governing model ES_0.99 exactly as before (never a free
                 # pass).
-                quantiles = getattr(book_risk, "loss_quantiles_cc", ()) or ()
-                n_mc = int(getattr(book_risk, "n_samples", 0) or 0)
-                if limits.portfolio_tail_prob_gate and quantiles and n_mc > 0:
-                    # Each grid point carries 1/(len-1) probability mass;
-                    # counting POINTS ≥ thr rounds the mass UP (conservative).
-                    n_grid = len(quantiles)
-                    k_ge = sum(1 for q in quantiles if q >= tail_thr)
-                    p_hat = k_ge / max(1, n_grid - 1)
-                    p_upper = _wilson_upper(
-                        min(1.0, p_hat), n_mc, limits.portfolio_tail_prob_ci_z
-                    )
+                # ONE implementation of the envelope number (the helper) —
+                # kept value-identical with the pre-2026-08-01 inline
+                # computation: each grid point carries 1/(len-1) probability
+                # mass, POINTS >= thr round the mass UP (conservative), and
+                # the Wilson upper bound guards MC sampling error. The
+                # lifecycle probes the SAME function to decide whether to
+                # build a marginal-candidate input, so cap and probe can
+                # never disagree about the regime.
+                p_upper = kill_envelope_tail_upper(book_risk, limits, bankroll)
+                if p_upper is not None:
                     if p_upper > limits.portfolio_kill_tail_prob:
-                        anchor_note = (
-                            f" (KILL line {limits.hard_trip_frac} bankroll)"
-                            if limits.kill_anchored_book_gate
-                            else ""
+                        # ── MARGINAL KILL GATE (2026-08-01 sunk-book ruling;
+                        # ``RiskLimits.kill_gate_marginal``). The book is OVER
+                        # the ratified budget — the LEVEL is inherited/sunk
+                        # and no candidate can lower it by being refused. When
+                        # the marginal form is armed AND the caller supplied
+                        # the candidate's marginal facts, the refusal becomes
+                        # the diversity-key admission test (eviction_value.py
+                        # machinery, ratified 2026-07-31): admit iff certified
+                        # risk-reducing, or marginal tail dES99 <= the EV the
+                        # candidate realistically brings (CP-lower P(accept)).
+                        # Un-armed, or with no marginal facts (book-only
+                        # callers), the level refusal stands — UNKNOWN never
+                        # admits.
+                        marginal_armed = (
+                            limits.kill_gate_marginal
+                            and limits.kill_anchored_book_gate
                         )
-                        out.append(
-                            Breach(
-                                ReasonCode.SKIP_PORTFOLIO_CVAR,
-                                f"P(book loss >= {tail_thr}cc) = "
-                                f"{p_upper:.4f} (upper) > kill tail budget "
-                                f"{limits.portfolio_kill_tail_prob:.4f} "
-                                f"(tail-probability form)"
-                                f"{anchor_note}",
-                                shadow=shadow,
+                        if marginal_armed and kill_marginal is not None:
+                            km = kill_marginal
+                            ev_credit_cc = float(km.ev_cc) * km.p_accept_lower
+                            if not (
+                                km.certified_risk_reducing
+                                or km.des99_cc <= ev_credit_cc
+                            ):
+                                out.append(
+                                    Breach(
+                                        ReasonCode.SKIP_PORTFOLIO_CVAR,
+                                        f"book over KILL tail budget "
+                                        f"(P(book loss >= {tail_thr}cc) = "
+                                        f"{p_upper:.4f} (upper) > "
+                                        f"{limits.portfolio_kill_tail_prob:.4f})"
+                                        f" and candidate marginal tail "
+                                        f"{km.des99_cc:.0f}cc > EV credit "
+                                        f"{ev_credit_cc:.0f}cc "
+                                        f"(ev {km.ev_cc}cc x p_accept_lower "
+                                        f"{km.p_accept_lower:.4f}) "
+                                        f"(marginal form)",
+                                        shadow=shadow,
+                                    )
+                                )
+                        else:
+                            anchor_note = (
+                                f" (KILL line {limits.hard_trip_frac} bankroll)"
+                                if limits.kill_anchored_book_gate
+                                else ""
                             )
-                        )
+                            out.append(
+                                Breach(
+                                    ReasonCode.SKIP_PORTFOLIO_CVAR,
+                                    f"P(book loss >= {tail_thr}cc) = "
+                                    f"{p_upper:.4f} (upper) > kill tail budget "
+                                    f"{limits.portfolio_kill_tail_prob:.4f} "
+                                    f"(tail-probability form)"
+                                    f"{anchor_note}",
+                                    shadow=shadow,
+                                )
+                            )
                 elif book_risk.governing_model_es_99_cc > cvar_thr:
                     out.append(
                         Breach(

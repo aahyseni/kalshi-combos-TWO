@@ -123,10 +123,12 @@ from combomaker.risk.limits import (
     ConcentrationCertificate,
     DailyPnl,
     HaltInputs,
+    KillMarginalCandidate,
     LimitChecker,
     PortfolioRisk,
     StartTimeProvider,
     StarvationWatchdog,
+    kill_envelope_tail_upper,
     monotone_pre_quote_breaches,
     threshold_cc,
 )
@@ -3529,6 +3531,13 @@ class QuoteLifecycle:
                 book_risk=self._book_risk_for_check(),
                 apply_resting_haircut=self._config.resting_haircut_at_confirm,
                 deploy_scale=self.deploy_scale_for_check(),
+                # MARGINAL KILL GATE (2026-08-01): confirm-path input (P=1) —
+                # the fallback floor must judge the fill the same way the
+                # reservation did. None while disarmed ⇒ byte-identical.
+                kill_marginal=self._kill_marginal_for_fill(
+                    self._fill_position(quote_id, state),
+                    self._fill_ev_cc(state),
+                ),
             )
         candidate = self._fill_position(quote_id, state)
         raw = self._limits.check(
@@ -3543,6 +3552,11 @@ class QuoteLifecycle:
             book_risk=self._book_risk_for_check(),
             apply_resting_haircut=self._config.resting_haircut_at_confirm,
             deploy_scale=self.deploy_scale_for_check(),
+            # MARGINAL KILL GATE (2026-08-01): same input as the reservation
+            # branch (P=1). None while disarmed ⇒ byte-identical.
+            kill_marginal=self._kill_marginal_for_fill(
+                candidate, self._fill_ev_cc(state)
+            ),
         )
         return self._partition_breaches(raw)
 
@@ -4187,6 +4201,12 @@ class QuoteLifecycle:
             # line rides along as a float.
             kill_anchored_book_gate=bool(limits.kill_anchored_book_gate),
             hard_trip_frac=float(limits.hard_trip_frac),
+            # MARGINAL KILL GATE (2026-08-01 sunk-book ruling): the SAME
+            # RiskLimits flag the quote-time cap enforces, threaded so an
+            # inherited over-budget PRE book judges the candidate's MARGINAL
+            # effect at confirm instead of level-refusing (see
+            # ``sim/book_risk._candidate_gate``). One flag, all sites.
+            kill_gate_marginal=bool(limits.kill_gate_marginal),
             # GATE EV SOURCE (2026-07-25 renege root cause #2): the CALIBRATED
             # pricing fair's edge for THIS fill — the same fair that priced
             # the quote. None when no sized pending fill (the gate then keeps
@@ -4292,6 +4312,13 @@ class QuoteLifecycle:
             # coherence (quote-time never looser than confirm) is exactly what
             # keeps this out of the renege zone. 1.0 while disarmed.
             deploy_scale=self.deploy_scale_for_check(),
+            # MARGINAL KILL GATE (2026-08-01): confirm-path input (P=1) —
+            # the reservation must not level-refuse a fill the marginal
+            # quote-time admission won (renege zone). None while disarmed
+            # / under budget ⇒ byte-identical.
+            kill_marginal=self._kill_marginal_for_fill(
+                candidate, self._fill_ev_cc(state)
+            ),
         )
         self._metrics.observe_ms(
             "confirm.deterministic_check_ms",
@@ -4963,6 +4990,165 @@ class QuoteLifecycle:
             game_key(leg.event_ticker) for leg in quote.legs if leg.event_ticker
         }
 
+    def _book_tail_allocation(
+        self,
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, int]]:
+        """(tail_by_game, det_by_game, quote_dets) — the book-risk MC's
+        additive per-game CVaR decomposition (Σ over games = book CVaR
+        exactly; hedge games NEGATIVE; {} when the snapshot is stale/absent —
+        the allocation then degrades to 0, it never invents tail numbers) and
+        the premium-at-risk allocation denominators over the WHOLE book
+        (resting + committed). Extracted VERBATIM from
+        ``_slot_diversity_decision`` (2026-08-01) so the eviction key and the
+        marginal KILL gate allocate dES99 through ONE implementation."""
+        snap = self._book_risk_for_check()
+        tail_by_game: dict[str, float] = {}
+        if snap is not None and getattr(snap, "usable", False):
+            for tc in getattr(snap, "per_game_tail_cc", ()):  # TailContribution
+                tail_by_game[tc.key] = tail_by_game.get(tc.key, 0.0) + tc.loss_cc
+        det_by_game: dict[str, float] = {}
+        quote_dets: dict[str, int] = {}
+        for qid, q in self._exposure.open_quotes.items():
+            det_q = self._quote_det_consumed_cc(q)
+            quote_dets[qid] = det_q
+            for g in self._quote_games(q):
+                det_by_game[g] = det_by_game.get(g, 0.0) + det_q
+        for pos in self._exposure.positions.values():
+            pos_det = int(getattr(pos, "max_loss_cc", 0))
+            if pos_det <= 0:
+                continue
+            for leg in pos.legs:
+                if leg.event_ticker:
+                    g = game_key(leg.event_ticker)
+                    det_by_game[g] = det_by_game.get(g, 0.0) + pos_det
+                    break  # charge the position once, to its first game
+        return tail_by_game, det_by_game, quote_dets
+
+    def _kill_marginal_input(
+        self,
+        *,
+        games: set[str],
+        det_cc: int,
+        ev_cc: int | None,
+        p_accept_lower: float,
+    ) -> KillMarginalCandidate | None:
+        """The MARGINAL KILL GATE's candidate input for ONE contemplated
+        quote/fill (2026-08-01 sunk-book ruling —
+        ``RiskLimits.kill_gate_marginal``), or None when the marginal form
+        does not apply. Built ONLY when ALL of:
+
+          * the marginal flag AND the KILL-anchored gate are armed (one
+            RiskLimits read — the same object §(8a) enforces from);
+          * the candidate's EV is KNOWN (None ⇒ None ⇒ §(8a) keeps the level
+            form — UNKNOWN never admits);
+          * the book's OWN envelope is OVER the KILL tail budget, probed via
+            the SAME ``kill_envelope_tail_upper`` §(8a) computes with (same
+            snapshot object, same bankroll read ⇒ same regime — the probe
+            and the cap cannot disagree). UNDER budget (the normal state)
+            this returns None having done two attribute reads and one O(1001)
+            envelope scan ONLY when armed — and the armed level form today
+            declines 100% of quotes, so any over-budget build cost replaces
+            certain refusal, never live throughput (THROUGHPUT NEVER
+            REGRESSES: flag off ⇒ this method is never called).
+
+        dES99 rides ``allocate_des99_cc`` over ``_book_tail_allocation`` —
+        the eviction key's machinery verbatim: 0 on a game the book's tail
+        does not touch (a diversifier), positive on a tail game (a
+        concentrator pays its share), negative on a hedge game.
+
+        KNOWN LIMITATION (documented, v1): the allocation is premium-share
+        within a game and cannot see DIRECTION, so a quote-time OFFSETTING
+        hedge on a hot tail game is charged like a concentrator here and
+        admits only on its EV credit; at CONFIRM the exact CRN certification
+        (``_candidate_gate``) admits it regardless ("hedges are +EV" is
+        enforced where certification exists — state enumeration, never a
+        leg-sign heuristic at a site that lacks the state)."""
+        limits = self._limits.limits
+        if not (limits.kill_gate_marginal and limits.kill_anchored_book_gate):
+            return None
+        if ev_cc is None:
+            return None
+        bankroll_cc = self._risk_bankroll_cc()
+        p_upper = kill_envelope_tail_upper(
+            self._book_risk_for_check(), limits, bankroll_cc
+        )
+        if p_upper is None or p_upper <= limits.portfolio_kill_tail_prob:
+            return None
+        tail_by_game, det_by_game, _ = self._book_tail_allocation()
+        for g in games:
+            det_by_game[g] = det_by_game.get(g, 0.0) + det_cc
+        des99_cc = allocate_des99_cc(games, det_cc, tail_by_game, det_by_game)
+        return KillMarginalCandidate(
+            ev_cc=int(ev_cc),
+            p_accept_lower=float(p_accept_lower),
+            des99_cc=float(des99_cc),
+        )
+
+    def _kill_marginal_for_quote(
+        self, result: ConstructedQuote, risk_qty: CentiContracts,
+        quote_risk: OpenQuoteRisk,
+    ) -> KillMarginalCandidate | None:
+        """QUOTE-TIME marginal input: EV = the stored quote-time figure the
+        eviction ranking uses (``_quote_candidate_ev_cc``); P(accept) = the
+        candidate size bucket's exact Clopper-Pearson LOWER bound on the
+        in-process acceptance tape at the ratified alpha
+        (``kill_tail_prob`` = the SAME anchor the eviction key rides) — a
+        thin/empty bucket reads 0.0, so unmeasured acceptance buys no
+        concentrating capacity (fail-closed) while zero-marginal-tail
+        diversifiers still admit.
+
+        THROUGHPUT: the flag guard runs FIRST — disarmed, this is two
+        attribute reads per quote and nothing else."""
+        limits = self._limits.limits
+        if not (limits.kill_gate_marginal and limits.kill_anchored_book_gate):
+            return None
+        ev_cc = self._quote_candidate_ev_cc(result, risk_qty)
+        if ev_cc is None:
+            return None
+        det_cc = self._quote_det_consumed_cc(quote_risk)
+        alpha = float(self._config.kill_tail_prob)
+        bounds = self._accept_tape.bounds(size_bucket(det_cc), alpha)
+        p_lower = bounds.lower if bounds is not None else 0.0
+        return self._kill_marginal_input(
+            games=self._quote_games(quote_risk),
+            det_cc=det_cc,
+            ev_cc=ev_cc,
+            p_accept_lower=p_lower,
+        )
+
+    def _fill_ev_cc(self, state: OpenQuoteState) -> int | None:
+        """The pending fill's quote-time EV: ``_quote_candidate_ev_cc`` at the
+        ACCEPTED quantity when a pending fill is sized, else at the stored
+        risk quantity (the same figure the quote-time admission used). None =
+        UNKNOWN (the marginal KILL input is then not built — level form)."""
+        qty = (
+            state.pending_fill[2]
+            if state.pending_fill is not None
+            else state.risk_qty
+        )
+        return self._quote_candidate_ev_cc(state.constructed, qty)
+
+    def _kill_marginal_for_fill(
+        self, candidate: OpenPosition, ev_cc: int | None
+    ) -> KillMarginalCandidate | None:
+        """CONFIRM-PATH marginal input for an accepted fill: P(accept) = 1.0
+        (the accept HAPPENED — the quote-time realism haircut does not apply
+        to a fill in hand). The exact MC judgment still follows at the
+        candidate gate (CRN pre/post + certification); this input only keeps
+        the deterministic confirm re-checks coherent with the quote-time
+        admission (a stricter confirm than quote is the renege zone)."""
+        games = {
+            game_key(leg.event_ticker)
+            for leg in candidate.legs
+            if leg.event_ticker
+        }
+        return self._kill_marginal_input(
+            games=games,
+            det_cc=int(candidate.max_loss_cc),
+            ev_cc=ev_cc,
+            p_accept_lower=1.0,
+        )
+
     def _slot_diversity_decision(
         self, cand_ev: int, quote_risk: OpenQuoteRisk
     ) -> tuple[str, tuple[OpenQuoteRisk, float, float] | None]:
@@ -5010,31 +5196,10 @@ class QuoteLifecycle:
         if cand_bounds is None:
             self._metrics.inc("quote.eviction_diversity_thin")
             return ("thin", None)
-        # Per-game tail decomposition (Σ over games = book CVaR exactly) from
-        # the snapshot the caps already consume; {} when stale/absent.
-        snap = self._book_risk_for_check()
-        tail_by_game: dict[str, float] = {}
-        if snap is not None and getattr(snap, "usable", False):
-            for tc in getattr(snap, "per_game_tail_cc", ()):  # TailContribution
-                tail_by_game[tc.key] = tail_by_game.get(tc.key, 0.0) + tc.loss_cc
-        # Premium-at-risk per game across the WHOLE book (resting + committed
-        # + this candidate) — the allocation denominator for dES99 shares.
-        det_by_game: dict[str, float] = {}
-        quote_dets: dict[str, int] = {}
-        for qid, q in self._exposure.open_quotes.items():
-            det_q = self._quote_det_consumed_cc(q)
-            quote_dets[qid] = det_q
-            for g in self._quote_games(q):
-                det_by_game[g] = det_by_game.get(g, 0.0) + det_q
-        for pos in self._exposure.positions.values():
-            pos_det = int(getattr(pos, "max_loss_cc", 0))
-            if pos_det <= 0:
-                continue
-            for leg in pos.legs:
-                if leg.event_ticker:
-                    g = game_key(leg.event_ticker)
-                    det_by_game[g] = det_by_game.get(g, 0.0) + pos_det
-                    break  # charge the position once, to its first game
+        # Per-game tail decomposition + premium-at-risk denominators (factored
+        # 2026-08-01 so the marginal KILL gate allocates dES99 through the
+        # EXACT same code — never a second implementation that could drift).
+        tail_by_game, det_by_game, quote_dets = self._book_tail_allocation()
         cand_games = self._quote_games(quote_risk)
         for g in cand_games:
             det_by_game[g] = det_by_game.get(g, 0.0) + cand_det
@@ -5077,6 +5242,8 @@ class QuoteLifecycle:
         risk_qty: CentiContracts,
         quote_risk: OpenQuoteRisk,
         raw_breaches: list[Breach],
+        *,
+        kill_marginal: KillMarginalCandidate | None = None,
     ) -> list[Breach]:
         """VALUE-RANKED ALLOCATION OF A FIXED BUDGET — ONE eviction mechanism,
         two axes (2026-07-25 slot axis; 2026-07-28 FIX 4 det-max axis).
@@ -5117,7 +5284,7 @@ class QuoteLifecycle:
                 return raw_breaches
             return await self._try_axis_eviction(
                 rfq, result, risk_qty, quote_risk, raw_breaches,
-                axis="slot", mode="on",
+                axis="slot", mode="on", kill_marginal=kill_marginal,
             )
         if reasons == {ReasonCode.SKIP_PORTFOLIO_DET_MAX}:
             mode = str(self._config.det_budget_value_ranking)
@@ -5125,7 +5292,7 @@ class QuoteLifecycle:
                 return raw_breaches
             return await self._try_axis_eviction(
                 rfq, result, risk_qty, quote_risk, raw_breaches,
-                axis="det_max", mode=mode,
+                axis="det_max", mode=mode, kill_marginal=kill_marginal,
             )
         return raw_breaches
 
@@ -5139,6 +5306,7 @@ class QuoteLifecycle:
         *,
         axis: str,
         mode: str,
+        kill_marginal: KillMarginalCandidate | None = None,
     ) -> list[Breach]:
         """One axis of the value-ranked reallocation above. ``axis`` selects the
         ranking key ("slot" = raw EV, "det_max" = EV per consumed det-max);
@@ -5278,6 +5446,11 @@ class QuoteLifecycle:
             # solved scale (never diverge — a looser quote-time cap than confirm
             # is the renege zone). 1.0 while disarmed ⇒ byte-identical.
             deploy_scale=self.deploy_scale_for_check(),
+            # MARGINAL KILL GATE: the SAME input the pre-eviction check used —
+            # the re-check must not resurrect the level refusal the marginal
+            # form already judged (an eviction would then delete a quote AND
+            # decline the candidate). None while disarmed ⇒ byte-identical.
+            kill_marginal=kill_marginal,
         )
 
     def _note_watchdog(self, *, risk_declined: bool) -> None:
@@ -5481,6 +5654,13 @@ class QuoteLifecycle:
             risk_qty = new_qty
 
         quote_risk = self._quote_risk(rfq, result, quote_id="pending", qty=risk_qty)
+        # MARGINAL KILL GATE (2026-08-01 sunk-book ruling): the candidate's
+        # marginal facts, built ONLY when the marginal form is armed AND the
+        # book's envelope is already over the KILL budget (None otherwise —
+        # zero work in the normal state; the armed level form it replaces
+        # declined 100% of quotes, so the over-budget build cost displaces
+        # certain refusal, never throughput).
+        kill_marginal = self._kill_marginal_for_quote(result, risk_qty, quote_risk)
         raw_breaches = self._limits.check(
             self._exposure,
             self._marginals,
@@ -5513,6 +5693,7 @@ class QuoteLifecycle:
             # rate), and a logging failure is swallowed inside.
             entity_admission_observer=self._log_entity_admission,
             slate_partition_observer=self._log_slate_partition,
+            kill_marginal=kill_marginal,
         )
         # EV-BASED SLOT EVICTION (2026-07-25 big-fill audit: the slot cap was
         # arrival-order-blind — $3.2M/day of flow died while low-EV leftovers
@@ -5528,7 +5709,8 @@ class QuoteLifecycle:
             or str(self._config.det_budget_value_ranking) != "off"
         ):
             raw_breaches = await self._try_slot_eviction(
-                rfq, result, risk_qty, quote_risk, raw_breaches
+                rfq, result, risk_qty, quote_risk, raw_breaches,
+                kill_marginal=kill_marginal,
             )
         # Watchdog sees the ISSUE decision: any breach (enforced OR shadow) is a
         # would-be decline; only a fully clean check is a real issue (reset). This
@@ -9668,6 +9850,14 @@ class QuoteLifecycle:
                 # deferral could ever hand the denial to the waiver).
                 apply_resting_haircut=self._config.resting_haircut_at_confirm,
                 deploy_scale=self.deploy_scale_for_check(),
+                # MARGINAL KILL GATE (2026-08-01): confirm-path input (P=1 —
+                # the accept happened) so this advisory check cannot renege on
+                # a fill the marginal quote-time admission won. None while
+                # disarmed / under budget ⇒ byte-identical.
+                kill_marginal=self._kill_marginal_for_fill(
+                    candidate,
+                    self._quote_candidate_ev_cc(state.constructed, qty),
+                ),
             )
         )
         # LAST-LOOK MC WAIVER deferral (handoff Problem A). This advisory check
