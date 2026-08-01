@@ -290,6 +290,14 @@ LOOP_STATUS = "status"
 # the measured reasoning). Module-level because the read-budget wait bound below
 # is derived from it.
 RFQ_WORKERS = 8
+# Quote-freshness horizon: price RFQs up to this old (see the measured
+# derivation at the rfq_work queue in run() — combo RFQs live ~11s median, the
+# old 0.4s skipped winnable fresh RFQs during bursts). Module-level since
+# 2026-08-01: the SAME horizon now also feeds the intake's WIRE-AGE pre-parse
+# gate (frames older than this in the WS dispatch backlog are dead on arrival
+# — see RfqIntake's stale_horizon_s derivation), so the two freshness gates
+# cannot drift apart.
+RFQ_MAX_QUEUE_DWELL_S = 1.5
 # How many times a WAITING (slow-path) metadata read re-waits for the read
 # bucket before giving the leg up for this pass. Not a duration — the wait
 # itself is the bucket's own ``seconds_until`` — just a bound on losing the
@@ -1753,6 +1761,20 @@ class QuoteApp:
         # socket is deliberately NOT priority-marked or held — last look needs
         # its freshness the most exactly while a confirm is in flight.
         ws.mark_priority("quote_accepted", "quote_executed")
+        # MARKET-DATA SHED CLASS (2026-08-01 pregame-surge deafness — full
+        # derivation at WsManager._sheddable_types). The rfq_created firehose
+        # + deletions are individually recoverable (one missed auction; the
+        # next arrives in seconds), so a saturated dispatch queue drops the
+        # OLDEST of them and STAYS CONNECTED instead of the overflow⇒
+        # reconnect cycle that made the bot deaf to every new auction for
+        # most of the 2026-08-01 pregame window (14 disconnect cycles,
+        # 276,644 frames discarded, zero new-RFQ intake at the exact hours
+        # this pregame-only bot fills in). Order-integrity frames (the
+        # priority lane above) keep their fail-closed guarantees untouched.
+        # The book socket below is deliberately NOT marked: orderbook deltas
+        # are seq-dependent — shedding one corrupts the mirror silently;
+        # reconnect+resnapshot is the only sound recovery there.
+        ws.mark_sheddable("rfq_created", "rfq_deleted")
         accept_gate = AcceptPriorityGate(self._clock, EXCHANGE_CONFIRM_WINDOW_S)
         # DEDICATED order-book socket (2026-07-14 fix). The communications firehose
         # (~650 msg/s exchange-wide RFQ stream on `ws`) and the orderbook_delta feed
@@ -1778,6 +1800,14 @@ class QuoteApp:
             # Confirm-priority intake hold — see AcceptPriorityGate + the
             # intake docstring. Self-bounding (exchange confirm window).
             hold_probe=accept_gate.holding,
+            # Wire-age pre-parse gate (2026-08-01): the SAME freshness horizon
+            # the worker-side dwell gate enforces, applied at the earliest
+            # observable instant (the WS read loop's receive stamp) so a
+            # surge-deep dispatch backlog drains its dead frames at
+            # subtraction cost instead of parse cost. Derivation in the
+            # intake docstring.
+            stale_horizon_s=RFQ_MAX_QUEUE_DWELL_S,
+            clock=self._clock,
         )
         inplay = InPlayDetector(self._clock)
 
@@ -2422,11 +2452,12 @@ class QuoteApp:
             # before spending a pool slot. Off-loop pricing means CPU never wedges the
             # loop regardless, so the levers here are purely about answering FRESH.
             RFQ_QUEUE_MAX = 32           # buffer RFQ bursts (was 8 → dropped bursts)
-            # Price RFQs up to 1.5s old. Combo RFQs live ~11s median, so the old 0.4s
-            # SKIPPED still-winnable fresh RFQs during bursts — a stop driver. 1.5s
-            # is still well inside the window and, with 8 pool workers, the queue
-            # drains fast enough that few RFQs ever dwell this long.
-            RFQ_MAX_QUEUE_DWELL_S = 1.5
+            # Price RFQs up to RFQ_MAX_QUEUE_DWELL_S (1.5s) old. Combo RFQs live
+            # ~11s median, so the old 0.4s SKIPPED still-winnable fresh RFQs
+            # during bursts — a stop driver. 1.5s is still well inside the
+            # window and, with 8 pool workers, the queue drains fast enough
+            # that few RFQs ever dwell this long. (Hoisted to module level
+            # 2026-08-01 — the intake's wire-age gate shares it.)
             RFQ_RETRY_WINDOW_S = 2.0     # stop retrying a pending RFQ once it's this old
             rfq_work: asyncio.Queue[tuple[Rfq, int]] = asyncio.Queue(maxsize=RFQ_QUEUE_MAX)
             # IN-PLAY SHADOW throughput isolation (2026-07-25): the lifecycle's

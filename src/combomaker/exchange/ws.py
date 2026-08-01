@@ -15,6 +15,7 @@ reconnect attempt, and every (re)connect gets fresh subscriptions with new
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import random
 from collections.abc import Awaitable, Callable
@@ -61,7 +62,10 @@ class WsManager:
     # →fresh-snapshot cycle looped 107×. 20,000 absorbs the burst (peak backlog
     # ~2-5k, drained in ~10-20s while receive() keeps answering server pings);
     # steady state is single-digit msgs/s. Overflow ⇒ genuine runaway ⇒
-    # reconnect (fail-closed), never silently lag the mirrored books.
+    # reconnect (fail-closed), never silently lag the mirrored books — EXCEPT
+    # for frames explicitly classed MARKET-DATA via ``mark_sheddable``, which
+    # shed oldest-first instead (2026-08-01 pregame-surge deafness; derivation
+    # at ``_sheddable_types`` in __init__).
     _QUEUE_MAX = 20_000
 
     def __init__(
@@ -132,6 +136,42 @@ class WsManager:
         self._priority_queue: asyncio.Queue[JsonDict] = asyncio.Queue(
             maxsize=self._QUEUE_MAX
         )
+        # MARKET-DATA SHED CLASS (2026-08-01 pregame-surge deafness). The
+        # fail-closed overflow⇒reconnect above assumed overflow = "genuine
+        # runaway", i.e. transient. The 2026-08-01 pregame surge (12:08–13:06
+        # ET, the ONLY window this pregame-only bot fills in) broke the
+        # assumption: comms inflow exceeded the real-parse drain CONTINUOUSLY
+        # for 62+ minutes — measured from the live tape's 14 overflow cycles:
+        # the 20k queue refilled connect→overflow in 75s..1480s (net
+        # accumulation 14–268 frames/s, worsening into first pitch), 276,644
+        # frames discarded, and every reconnect discarded EVERY queued
+        # rfq_created then re-entered the same saturated regime — ZERO new-RFQ
+        # intake for most of 90 minutes while quoting continued. No finite
+        # queue "fits" a sustained inflow>drain regime, so the repair is a
+        # POLICY split by frame class, not a bigger number:
+        #   - ORDER-INTEGRITY frames (the priority lane: accept/executed) keep
+        #     the fail-closed disconnect on THEIR lane's overflow, untouched.
+        #   - MARKET-DATA frames (``mark_sheddable``: the rfq_created firehose
+        #     + deletions) are individually recoverable — a dropped rfq_created
+        #     is ONE missed auction and the next arrives in seconds, while a
+        #     disconnect drops ALL queued auctions AND the connection. Under
+        #     pressure the OLDEST sheddable frame is dropped (metrics
+        #     ``ws.shed_market_frames`` / ``ws.shed.<type>``) and the socket
+        #     STAYS CONNECTED. Non-sheddable frames displaced while hunting
+        #     the oldest sheddable ride ``_carry`` (dispatched ahead of the
+        #     queue — safe: control frames like ``subscribed`` acks carry no
+        #     seq dependency on market frames, and market frames from a dead
+        #     sid self-drop downstream).
+        #   - A full queue containing NOTHING sheddable is the original
+        #     genuine-runaway signal ⇒ same fail-closed disconnect as before.
+        # Book socket: never calls ``mark_sheddable`` ⇒ byte-identical
+        # behavior (orderbook deltas are seq-dependent; shedding one would
+        # silently corrupt the mirrored book — only reconnect+resnapshot is
+        # sound there).
+        self._sheddable_types: frozenset[str] = frozenset()
+        self._carry: collections.deque[JsonDict] = collections.deque()
+        self._shed_pending: dict[str, int] = {}
+        self._shed_last_log_mono_ns: int | None = None
 
     # --- registration (all before start) ---
 
@@ -145,7 +185,21 @@ class WsManager:
         For rare frames with an EXCHANGE deadline (accept→confirm). Register
         before ``start()``; handlers are unchanged — only queueing order moves.
         """
+        overlap = self._sheddable_types & frozenset(msg_types)
+        if overlap:
+            raise ValueError(f"sheddable types can never be priority: {sorted(overlap)}")
         self._priority_types = self._priority_types | frozenset(msg_types)
+
+    def mark_sheddable(self, *msg_types: str) -> None:
+        """Declare MARKET-DATA frame types: on a full dispatch queue the
+        OLDEST such frame is dropped instead of disconnecting the socket
+        (derivation at ``_sheddable_types`` construction). Register before
+        ``start()``. Never mark seq-dependent streams (orderbook deltas) or
+        exchange-deadlined frames (those go to ``mark_priority``)."""
+        overlap = self._priority_types & frozenset(msg_types)
+        if overlap:
+            raise ValueError(f"priority types can never be sheddable: {sorted(overlap)}")
+        self._sheddable_types = self._sheddable_types | frozenset(msg_types)
 
     def on_disconnect(self, handler: LifecycleHandler) -> None:
         self._on_disconnect.append(handler)
@@ -337,49 +391,121 @@ class WsManager:
                 except ValueError:
                     log.warning("ws_bad_json", name=self._name, data=frame.data[:200])
                     continue
+                # WIRE-RECEIVE STAMP — every frame (2026-08-01, was
+                # priority-only since 2026-07-31). The exchange's clock starts
+                # BEFORE a frame reaches us, so any downstream freshness or
+                # deadline decision must anchor at the earliest instant this
+                # process can observe — right here, off the socket — not at
+                # handler start. Priority frames feed it to the derived
+                # confirm budget; market frames feed the intake's pre-parse
+                # staleness gate (a frame that aged past the quote-freshness
+                # horizon INSIDE this queue is dead — parsing it only slows
+                # the drain the live frames behind it are waiting on). The
+                # stamp rides the envelope (server fields never start with
+                # "_") and reuses the monotonic read taken two lines up —
+                # zero extra clock calls.
+                message["_recv_mono_ns"] = self._last_rx_mono_ns
                 if str(message.get("type", "")) in self._priority_types:
                     # Deadlined frame: its own lane + a wake sentinel so an
                     # idle dispatcher (empty normal queue) wakes immediately.
-                    # Overflow on EITHER queue is the same genuine-runaway
-                    # signal as below — fail closed by reconnecting.
-                    #
-                    # WIRE-RECEIVE STAMP: the exchange's deadline (the 3.0s
-                    # confirm window) opens BEFORE this frame reaches us, so
-                    # every deadline computation downstream must anchor at the
-                    # earliest instant this process can observe — right here,
-                    # off the socket — not at handler start. The stamp rides
-                    # the envelope (server fields never start with "_") and the
-                    # intake copies it through, so any residual in-process
-                    # delay (dispatch, the quote-event queue, loop contention)
-                    # automatically deducts from the derived confirm budget.
-                    message["_recv_mono_ns"] = self._last_rx_mono_ns
+                    # Overflow of the PRIORITY lane is the genuine-runaway
+                    # signal (accepts are tens/day; 20k queued = protocol
+                    # breakdown) — fail closed by reconnecting, unchanged.
                     self._metrics.inc(f"{self._name}.priority_frame")
                     try:
                         self._priority_queue.put_nowait(message)
-                        self._msg_queue.put_nowait(_PRIORITY_WAKE)
-                        continue
                     except asyncio.QueueFull:
                         self._metrics.inc(f"{self._name}.dispatch_queue_overflow")
                         log.error("ws_dispatch_queue_overflow", name=self._name)
                         await ws.close()
                         return
+                    try:
+                        self._msg_queue.put_nowait(_PRIORITY_WAKE)
+                    except asyncio.QueueFull:
+                        # Wake sentinel exists ONLY for the idle-dispatcher
+                        # case; a full normal queue means the dispatcher is
+                        # busy and will drain the priority lane on its next
+                        # iteration anyway — dropping the sentinel loses
+                        # nothing and must NOT disconnect (2026-08-01: a
+                        # disconnect here would drop the just-queued accept).
+                        pass
+                    continue
                 try:
                     self._msg_queue.put_nowait(message)
                 except asyncio.QueueFull:
-                    # Genuine slow consumer: ~QUEUE_MAX frames behind. Fail
-                    # closed — reconnect re-snapshots every book — rather than
-                    # quoting off a mirror we KNOW lags the exchange.
-                    self._metrics.inc(f"{self._name}.dispatch_queue_overflow")
-                    log.error("ws_dispatch_queue_overflow", name=self._name)
-                    await ws.close()
-                    return
+                    # Class-aware overflow (2026-08-01, derivation at
+                    # ``_sheddable_types``): shed the oldest market-data frame
+                    # and stay connected; only a queue with nothing sheddable
+                    # left is a genuine runaway ⇒ fail-closed reconnect.
+                    if not self._shed_oldest_market_for(message):
+                        self._metrics.inc(f"{self._name}.dispatch_queue_overflow")
+                        log.error("ws_dispatch_queue_overflow", name=self._name)
+                        await ws.close()
+                        return
             elif frame.type == aiohttp.WSMsgType.ERROR:
                 log.warning("ws_frame_error", name=self._name)
                 return
 
+    def _shed_oldest_market_for(self, message: JsonDict) -> bool:
+        """Make room for ``message`` by dropping the OLDEST sheddable frame.
+
+        Returns True when room was made and the frame was queued; False means
+        nothing sheddable exists (genuine runaway — caller fails closed).
+        Non-sheddable frames found at the head while hunting are moved to
+        ``_carry`` (the dispatcher drains it ahead of the queue; reordering a
+        control frame EARLIER than market frames is safe — see the class
+        derivation at ``_sheddable_types``). ``_carry`` is bounded by the same
+        ``_QUEUE_MAX`` so a pathological all-control queue still fails closed.
+        """
+        if not self._sheddable_types:
+            return False
+        while True:
+            try:
+                head = self._msg_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break  # everything carried — a slot is free by construction
+            self._msg_queue.task_done()
+            if head is _PRIORITY_WAKE:
+                # Pure wake hint — droppable whenever the dispatcher is busy
+                # (and a full queue proves it is). Frees the slot silently.
+                break
+            if str(head.get("type", "")) in self._sheddable_types:
+                self._record_shed(str(head.get("type", "")))
+                break
+            if len(self._carry) >= self._QUEUE_MAX:
+                return False  # control-frame runaway — keep fail-closed
+            self._carry.append(head)
+        try:
+            self._msg_queue.put_nowait(message)
+        except asyncio.QueueFull:  # pragma: no cover - single-threaded loop
+            return False
+        return True
+
+    def _record_shed(self, msg_type: str) -> None:
+        """Count a shed frame; log LOUDLY but aggregated (a surge sheds
+        hundreds/s — per-frame logging would melt the log). First shed of a
+        burst logs immediately; further sheds aggregate for at most
+        ``max_silence_s`` (the existing liveness window — no new number)."""
+        self._metrics.inc(f"{self._name}.shed_market_frames")
+        self._metrics.inc(f"{self._name}.shed.{msg_type}")
+        self._shed_pending[msg_type] = self._shed_pending.get(msg_type, 0) + 1
+        now = self._clock.monotonic_ns()
+        last = self._shed_last_log_mono_ns
+        if last is None or (now - last) / 1e9 >= self._max_silence_s:
+            log.warning(
+                "ws_shed_market_frames",
+                name=self._name,
+                shed=dict(self._shed_pending),
+                backlog=self._msg_queue.qsize(),
+            )
+            self._shed_pending.clear()
+            self._shed_last_log_mono_ns = now
+
     def _discard_queued(self) -> None:
         """Drop every queued-but-unprocessed message (dead-connection backlog)."""
         dropped = 0
+        dropped += len(self._carry)
+        self._carry.clear()
         for q in (self._priority_queue, self._msg_queue):
             while True:
                 try:
@@ -414,6 +540,20 @@ class WsManager:
                 # its pre-lane cost (2026-07-31 bench in the same-day report).
                 if not self._priority_queue.empty():
                     await self._drain_priority()
+                # Control frames displaced by market-data shedding (see
+                # ``_shed_oldest_market_for``). They came off the queue HEAD,
+                # so they are older than everything still queued INCLUDING the
+                # message just dequeued's successors — draining them here (and
+                # only here: same task as all dispatch, no reentrancy)
+                # preserves control-frame FIFO and delivers them no later than
+                # they would have been. Falsy-deque check = the same O(1)
+                # pattern as the priority guard above.
+                while self._carry:
+                    carried = self._carry.popleft()
+                    try:
+                        await self._dispatch(carried)
+                    except Exception:  # a handler bug must not kill the dispatcher
+                        log.exception("ws_dispatch_failed", name=self._name)
                 if message is not _PRIORITY_WAKE:
                     await self._dispatch(message)
             except Exception:  # a handler bug must not kill the dispatcher

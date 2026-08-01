@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from combomaker.core.clock import Clock
 from combomaker.marketdata.feed import WsLike
 from combomaker.ops.logging import get_logger
 from combomaker.ops.metrics import Metrics
@@ -41,6 +42,8 @@ class RfqIntake:
         *,
         series_prefixes: tuple[str, ...] | None = None,
         hold_probe: Callable[[], bool] | None = None,
+        stale_horizon_s: float | None = None,
+        clock: Clock | None = None,
     ) -> None:
         """``series_prefixes``: PRE-PARSE firehose gate (quote mode only). The
         communications channel is the WHOLE exchange's RFQ stream — measured
@@ -64,11 +67,35 @@ class RfqIntake:
         RFQ we never quote — during a window we would decline to quote anyway
         (a banked win outranks any reprice, operator priority 2026-07-31). The
         probe is self-bounding: it can only answer True inside the exchange's
-        confirm window (the gate's derivation)."""
+        confirm window (the gate's derivation).
+
+        ``stale_horizon_s`` (+ ``clock``, 2026-08-01 pregame-surge deafness):
+        WIRE-AGE pre-parse gate. The WS read loop stamps every frame with the
+        monotonic instant it left the socket (``_recv_mono_ns``); an
+        ``rfq_created`` frame that already spent MORE than this horizon in the
+        dispatch backlog is dropped BEFORE ``Rfq.from_ws`` (metric
+        ``rfq.dropped_stale_preparse``). The RFQ it carries is exactly the one
+        the worker-side dwell gate exists to refuse (quote_app's
+        RFQ_MAX_QUEUE_DWELL_S — the caller passes THAT constant, no new
+        number), except that the dwell clock previously started only at
+        intake enqueue, so dispatch-backlog age was invisible: during the
+        2026-08-01 surge the backlog ran 30-60s deep and every frame was
+        parsed at full cost (~1ms, the dominant drain term) only to price an
+        auction that had already closed. Dropping stale frames at wire-age
+        costs a subtraction, so a saturated queue collapses to its FRESH tail
+        at near no-op drain speed instead of grinding through dead frames —
+        the mechanism that keeps intake ANSWERING during a surge rather than
+        60s behind. Fail-safe: a missing/foreign stamp processes normally
+        (observe mode, tests, replays are byte-identical), and ``rfq_deleted``
+        is never age-dropped (mirror consistency is cheap and ageless)."""
         self._ws = ws
         self._metrics = metrics or Metrics()
         self._series_prefixes = series_prefixes
         self._hold_probe = hold_probe
+        self._stale_horizon_ns = (
+            int(stale_horizon_s * 1e9) if stale_horizon_s is not None else None
+        )
+        self._clock = clock
         self._on_rfq: list[RfqHandler] = []
         self._on_rfq_deleted: list[RfqDeletedHandler] = []
         self._on_quote_event: list[QuoteEventHandler] = []
@@ -138,6 +165,18 @@ class RfqIntake:
         log.info("communications_subscribed", sid=sid)
 
     async def _handle_rfq_created(self, envelope: JsonDict) -> None:
+        if self._stale_horizon_ns is not None and self._clock is not None:
+            # Wire-age pre-parse gate (derivation in __init__): a frame that
+            # aged past the quote-freshness horizon in the dispatch backlog
+            # carries an auction we would refuse to price anyway — drop it
+            # for a subtraction instead of a ~1ms parse.
+            recv_ns = envelope.get("_recv_mono_ns")
+            if (
+                isinstance(recv_ns, int)
+                and self._clock.monotonic_ns() - recv_ns > self._stale_horizon_ns
+            ):
+                self._metrics.inc("rfq.dropped_stale_preparse")
+                return
         if self._hold_probe is not None and self._hold_probe():
             # Confirm in flight: quoting yields to banking the win (see
             # __init__ docstring — bounded by the exchange confirm window).
