@@ -31,8 +31,13 @@ if (-not $created) {
 # two bots on one account) caused a 429 rate storm and quote races. Never again.
 # Only LIVE PYTHON processes refuse; dead cmd/powershell shell windows from a
 # stopped stack (their command lines still name the bot) are swept, not blockers.
+# OURS-ONLY (2026-07-31 adversarial gate): the guard judges LAUNCH-SITE
+# signatures (ours_predicate.ps1), never bare keywords — a foreign python whose
+# argv merely mentions 'combomaker' must neither block a relight (false
+# refusal => watchdog latch => outage) nor be swept as a stale window.
+. "$PSScriptRoot\ours_predicate.ps1"
 $matches_all = Get-CimInstance Win32_Process |
-    Where-Object { $_.CommandLine -match 'combomaker|fill_prober|hang_watchdog|watch_main|watch_prober' -and
+    Where-Object { (Test-CombomakerOurs $_) -and
                    $_.ProcessId -ne $PID -and $_.ProcessId -ne $CallerPid }
 # In -Auto (a watchdog-initiated relight) the caller's WHOLE process tree
 # survives the stop pass BY DESIGN (stop_all -KeepPid spares every
@@ -201,7 +206,8 @@ Start-Process powershell -ArgumentList "-NoExit", "-ExecutionPolicy", "Bypass", 
 # whose parent is NOT itself in the matched set.
 Start-Sleep -Seconds 6
 $matched = @(Get-CimInstance Win32_Process |
-    Where-Object { $_.Name -match 'python' -and $_.CommandLine -match 'combomaker\.ops\.cli run' })
+    Where-Object { $_.Name -match 'python' -and $_.CommandLine -match 'combomaker\.ops\.cli run' -and
+                   (Test-CombomakerOurs $_) })
 $ids = @($matched | ForEach-Object { $_.ProcessId })
 $bots = @($matched | Where-Object { $ids -notcontains $_.ParentProcessId })
 if ($bots.Count -eq 1) {
@@ -212,7 +218,7 @@ if ($bots.Count -eq 1) {
 } else {
     Write-Host "DUPLICATE BOTS DETECTED ($($bots.Count)) - killing EVERYTHING. Run START_BOT.bat once, alone." -ForegroundColor Red
     Get-CimInstance Win32_Process |
-        Where-Object { $_.Name -match 'python' -and ($_.CommandLine -match 'combomaker|fill_prober') } |
+        Where-Object { $_.Name -match 'python' -and (Test-CombomakerOurs $_) } |
         ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} }
     exit 1
 }

@@ -414,35 +414,91 @@ _T1734 = [
 _CALLER = 41593
 
 
-def _ps1_patterns(text: str, failures: list[str], name: str) -> list[str]:
-    """Every regex used in a ``-match '...'`` of the shipped script text."""
-    pats = re.findall(r"-match\s+'([^']+)'", text)
-    check(bool(pats), f"{name}: -match patterns extracted", failures)
-    return pats
+def _eval_ours(cmdlines: list[str]) -> list[bool]:
+    """Evaluate the SHIPPED Test-CombomakerOurs (ours_predicate.ps1) against
+    each command line — the real predicate code, dot-sourced, not a re-model."""
+    ops = REPO / "tools" / "ops"
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".json", delete=False, encoding="utf-8"
+    ) as f:
+        json.dump(cmdlines, f)
+        rows_path = f.name
+    script = (
+        f". '{ops / 'ours_predicate.ps1'}';"
+        f"$rows = Get-Content -Raw '{rows_path}' | ConvertFrom-Json;"
+        "foreach ($cl in $rows) {"
+        " if (Test-CombomakerOurs @{CommandLine=$cl}) {'1'} else {'0'} }"
+    )
+    out = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    Path(rows_path).unlink(missing_ok=True)
+    verdicts = [x.strip() for x in out.stdout.splitlines() if x.strip() in ("0", "1")]
+    if out.returncode != 0 or len(verdicts) != len(cmdlines):
+        raise RuntimeError(f"ours predicate eval failed: rc={out.returncode} {out.stderr[:400]}")
+    return [v == "1" for v in verdicts]
+
+
+# NON-OURS decoys (2026-07-31 adversarial gate): each of these was — or models —
+# a REAL process the old keyword sweep selected for kill on the live box
+# (foreign decoy python, another project's bash shells, venv analysis shells at
+# the 18:35 relight). None may ever be swept or block a start.
+_DECOYS = [
+    (90001, "python.exe",
+     r'"C:\Users\aahys\AppData\Local\Programs\Python\Python313\python.exe"'
+     r' -c "import time; time.sleep(300)" --tag-combomaker-notes'),
+    (90002, "python.exe",
+     r"C:\Users\aahys\kct-reanchor\.venv\Scripts\python.exe -m combomaker.ops.cli"
+     r" run --env prod --mode quote"),
+    (90003, "bash.exe",
+     r'C:\Users\aahys\polymarket-bot\GIT\bin\bash.exe -c "grep combomaker src/x.py'
+     r' && python tools/ops/hang_watchdog.py"'),
+    (90004, "python.exe",
+     r'C:\Users\aahys\kalshi-combos-TWO\.venv\Scripts\python.exe -c'
+     r' "import sqlite3  # combomaker fill_prober watch_main analysis"'),
+    (90005, "powershell.exe",
+     r"powershell.exe -Command Select-String combomaker"
+     r" C:\Users\aahys\kalshi-combos-TWO\src\combomaker\rfq\lifecycle.py"),
+]
 
 
 def p7_ps1_guard_parity(failures: list[str]) -> None:
-    print("P7 ps1_guard_parity (shipped predicate text vs the 17:34 table)")
+    print("P7 ps1_guard_parity (shipped predicate code vs the 17:34 table + decoys)")
     ops = REPO / "tools" / "ops"
     stop_text = (ops / "stop_all.ps1").read_text(encoding="utf-8")
     start_text = (ops / "start_all.ps1").read_text(encoding="utf-8")
 
-    # --- stop_all sweep (KeepPid = watchdog child): evaluate the shipped
-    # predicate — CommandLine -match SWEEP, pid exclusions, KeepPid carve-out.
-    sweep_pats = [p for p in _ps1_patterns(stop_text, failures, "stop_all") if "combomaker" in p]
-    check(bool(sweep_pats), "stop_all: sweep pattern present", failures)
-    sweep = sweep_pats[0]
+    # --- both scripts must judge membership through THE shared predicate.
+    for name, text in (("stop_all", stop_text), ("start_all", start_text)):
+        check(
+            'ours_predicate.ps1"' in text and "Test-CombomakerOurs" in text,
+            f"{name}: dot-sources ours_predicate.ps1 and calls Test-CombomakerOurs",
+            failures,
+        )
     keep_carveout = "-not ($KeepPid -ne 0 -and $_.CommandLine -match 'hang_watchdog')" in stop_text
     check(keep_carveout, "stop_all: -KeepPid spares the watchdog tree", failures)
 
+    # --- evaluate the REAL predicate over the 17:34 table AND the decoys.
+    table = _T1734 + _DECOYS
+    ours = dict(zip([pid for pid, _n, _cl in table], _eval_ours([cl for _p, _n, cl in table]),
+                    strict=True))
+
     def swept(pid: int, cmdline: str) -> bool:
-        if not re.search(sweep, cmdline, re.IGNORECASE):
+        if not ours[pid]:
             return False
         if pid == _CALLER:  # -KeepPid
             return False
         return not re.search("hang_watchdog", cmdline, re.IGNORECASE)  # carve-out
 
-    kill = {pid for pid, _n, cl in _T1734 if swept(pid, cl)}
+    kill = {pid for pid, _n, cl in table if swept(pid, cl)}
+    check(
+        not any(pid in kill for pid, _n, _cl in _DECOYS),
+        f"sweep NEVER takes a non-combomaker process (decoys spared; got {sorted(kill)})",
+        failures,
+    )
     check(
         kill == {22652, 37500, 31944, 31900, 39052, 34844},
         f"sweep takes bot+prober windows, prober pythons AND BOTH monitors (got {sorted(kill)})",
@@ -456,9 +512,6 @@ def p7_ps1_guard_parity(failures: list[str]) -> None:
 
     # --- start_all single-instance guard in -Auto (post-sweep survivors =
     # exactly the watchdog tree): the $pythons refusal set must be EMPTY.
-    match_pats = [p for p in _ps1_patterns(start_text, failures, "start_all") if "combomaker" in p]
-    check(bool(match_pats), "start_all: matches_all pattern present", failures)
-    matcher = match_pats[0]
     auto_python_exempt = re.search(
         r"\$pythons\s*=\s*@\(\$matches_all\s*\|\s*Where-Object\s*\{[^}]*-not\s*\(\$Auto\s*-and\s*\$_\.CommandLine\s*-match\s*'hang_watchdog'\)",
         start_text,
@@ -469,10 +522,13 @@ def p7_ps1_guard_parity(failures: list[str]) -> None:
         failures,
     )
 
-    def refuses(table: list[tuple[int, str, str]], *, auto: bool) -> list[int]:
+    def refuses(rows: list[tuple[int, str, str]], *, auto: bool) -> list[int]:
+        verdicts = dict(
+            zip([p for p, _n, _cl in rows], _eval_ours([cl for _p, _n, cl in rows]), strict=True)
+        )
         out = []
-        for pid, pname, cl in table:
-            if not re.search(matcher, cl, re.IGNORECASE):
+        for pid, pname, cl in rows:
+            if not verdicts[pid]:
                 continue
             if pid == _CALLER:  # -CallerPid
                 continue
@@ -483,6 +539,11 @@ def p7_ps1_guard_parity(failures: list[str]) -> None:
             out.append(pid)
         return out
 
+    check(
+        refuses(_DECOYS, auto=True) == [] and refuses(_DECOYS, auto=False) == [],
+        "a NON-ours python matching the old keywords never blocks a start",
+        failures,
+    )
     survivors = [row for row in _T1734 if row[0] in (41000, 41592, _CALLER)]
     check(
         refuses(survivors, auto=True) == [],
@@ -504,8 +565,8 @@ def p7_ps1_guard_parity(failures: list[str]) -> None:
         failures,
     )
 
-    # --- both scripts must still parse (a broken sweep is a broken recovery).
-    for ps1 in ("stop_all.ps1", "start_all.ps1"):
+    # --- the scripts must still parse (a broken sweep is a broken recovery).
+    for ps1 in ("stop_all.ps1", "start_all.ps1", "ours_predicate.ps1"):
         proc = subprocess.run(
             [
                 "powershell",
