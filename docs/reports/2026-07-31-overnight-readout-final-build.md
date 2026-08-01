@@ -71,11 +71,25 @@ pickoff. The bot earned it in ~14 usable hours.
 - Kill-anchor gate (shadow) — re-lands with `eviction_value.py` actually
   committed this time.
 
+## OVERNIGHT ADDENDUM (written ~01:10 ET 8/1)
+
+- **7/31 closed at 41 fills / $1,653.68** — settlements freed the wall late and
+  the resting book converted. Prior best day: $969.
+- **8/1 already 25 fills / $823.91** by 01:00 ET — the esports window filling
+  hard. Rolling ~28h: **~$2,477**. The operator's "$2k on a busy night" target
+  was effectively hit at TODAY'S walls once uptime held.
+- **The watchdog carried the night alone: two autonomous detect→sweep→relight
+  cycles (22:01, 22:09), each ~11 seconds from escalation to relight complete.**
+  Yesterday each of those was a multi-hour silent outage. Zero false positives
+  across every healthy lull. The underlying exit cause at 22:01/22:09 is
+  UNDIAGNOSED (process exited cleanly-fast, twice, then stabilized for 3h+) —
+  root-cause from the two log tails is the first debugging item today.
+- **Zero confirm failures since the priority lane went live** (was 12 lifetime,
+  incl. the two halts it caused yesterday).
+
 ## NEXT STEPS
 
-- **Runs next:** stall watch through the 02–06Z esports window (the new
-  protections' first real test); settlement sweep frees the det-max wall
-  overnight.
-- **Owner:** me — first-hour metrics on the confirm lane
-  (`confirm.accept_dispatch_delay_ms`, `lane_wait_ms`), watchdog log clean.
+- **Runs next:** morning settlement sweep + F5 settlement watch ($275.43);
+  root-cause the 22:01/22:09 process exits from the log tails.
+- **Owner:** me.
 - **Decisions owed by operator:** the five above, #1 and #2 first.
