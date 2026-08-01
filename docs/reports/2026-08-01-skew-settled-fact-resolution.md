@@ -186,6 +186,31 @@ boot with finished games rehydrated: family/entity components should step as
 games' keys should vanish from the profiles. Rollback = re-comment (one line,
 one restart).
 
+## ADVERSARIAL GATE (2026-08-01 morning, independent re-execution)
+
+The gate re-ran the evidence itself at HEAD (2add0b1):
+
+| check | gate's independent result | verdict |
+|---|---|---|
+| property tests | `tests/test_skew_settled_resolution.py` **11/11**; full suite **3472 passed / 0 failed** (re-run, 255.8s) | ✓ |
+| prototype properties | part A **8/8 PASS** on the live `ExposureBook` | ✓ |
+| parity | C1/C2/C3 PASS; **C4 tape parity re-run (7/29 tape, stride 10): PORT PARITY PASS over every reconstructed book state** | ✓ |
+| counterfactual reproduction | 7/29 replay reproduces the report's table **EXACTLY** (delta p10 −7 / p50 −2 / p90 +21; tightens 25.5%; widened 63.2%→65.6%; logged/RAW/RESOLVED rows identical to the ones above). 8/1 re-run launched by the gate; I/O-crawling behind the live bot at gate close (same mechanism as pre-ship) — the report's 8/1 table stands on its verbatim tool output + the exactly-reproduced 7/29 arm | ✓ (7/29 exact; 8/1 accepted on reproduced-tool evidence) |
+| fail-closed | provider = `SettledMarginalResolver.resolved` — a pure dict `.get`, cannot throw; empty cache/no resolver ⇒ None ⇒ leg fully counted; non-binary garbage (0.5, −1, 2, 0.999999) test-pinned fully counted; facts are permanent (no staleness direction) | ✓ |
+| perverse case (leg settled AGAINST us on a still-live combo) | selected-side-LOST ⇒ combo exchange-DETERMINED (requires-all cannot hit) ⇒ zero concentration is CORRECT (no forward uncertainty, either direction); selected-side-WON ⇒ survivors keep **FULL** `max_loss_cc`/notional and deltas recompute on the stripped (conditional) legs — survivors are never under-widened; both pinned by tests incl. the settlement-timer trap | ✓ |
+| price-only | call-site audit: `limits.py:939` (cap path) and every other `snapshot()` call never pass the provider; only `_quoting_policy` lifecycle.py:8841 does, and its `snap` feeds only `compute_inventory_skew` + leg-axis/conc profiles (pricing steers, `applied_cc` 0 while dark); `test_caps_view_is_never_resolved` pins it | ✓ |
+| boot == intraday | one provider (`_settled_fact` → graded cache only), `facts_generation` cache key covers facts landing at a static position generation; `test_boot_equals_intraday_on_identical_state` | ✓ |
+| flag dark | `SkewParams`/`SkewConfig` default False (test-pinned); staged line **commented** in the live yaml (verified: `# settled_fact_resolution: true`, line 137) | ✓ |
+| vitals | fast 8/8 GREEN evidenced at commit (2add0b1's fresh cache). Gate's own re-runs confirmed the STRUCTURAL blocker: the tape-facts manifest includes the growing live log, so any gate run while the bot writes re-scans ~10GB (gate's first attempt completed the scan in ~7 min under load; the check phase + a second scan were still grinding at gate close). **Pre-ship tier remains OWED AT THE ARMING RESTART** (bot down ⇒ log static ⇒ one scan, then cached) — blocking for ARMING, not for this dark commit | ⚠ owed at arming |
+| throughput | flag-off path structurally a no-op (one `is not None` test per position; exact float-op order preserved, C2 value-identity); author's interleaved bench +1.7% in run noise; not re-benched under the gate's loaded machine (would be noise) | ✓ accepted |
+| lint/type | live modules + tests ruff-clean (all 15 findings are in the tools/ prototype, consistent with the un-linted tools/ norm); mypy not independently re-run | ✓ as scoped |
+
+**Gate verdict: the fix is correct, dark, price-only, and fail-closed; the
+honest re-attribution stands. SHIP stays gated on the operator's arming
+restart, where the pre-ship tier + the vitals-replica passthrough +
+`prove.py` are owed (NEXT STEPS below).** Loss forensics and exit forensics
+gate notes: see the two companion 2026-08-01 reports.
+
 ## NEXT STEPS
 
 - **Operator**: arm `settled_fact_resolution` at the next restart (one
