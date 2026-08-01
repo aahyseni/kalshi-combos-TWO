@@ -237,8 +237,18 @@ G1-repair session tails (2026-08-01):
   form -2 binds]` (200 = fail-closed fallback, reason `no_headroom`) /
   `evictions the DIVERSITY key would have REFUSED (victim survives): 470 /
   2593` / `table discriminating: True`
-* self-containment proof (fresh scratch worktree of main+branch): see the
-  proof tail recorded below at push time.
+* self-containment proof at push time (fresh scratch worktree of the
+  REBASED branch — origin/main moved twice under us: `cdfdcc8` reading-b
+  det-max demotion, then docs `e179c2f`; rebased both times, only
+  README/tape-facts watermark conflicts, zero code conflicts): import
+  quote_app/lifecycle/eviction_value `IMPORT OK`; full suite
+  `3533 passed, 3 deselected in 312.19s` (3,509 ours + reading-b's 24);
+  vitals fast `8/8 vital signs GREEN   (GATE PASS)   total 22.3s`.
+  Proof ran at `0c144ed`; final head `fc3bfb9` differs by DOCS ONLY —
+  git tree hashes of `src/ tests/ tools/ config/` verified IDENTICAL
+  (`f9b63d2 / 84f49d4 / 200a5d9 / 8107acc`). (An earlier scratch vitals
+  attempt printed 1/8 in 0.0s — it raced the read-only counterfactual's
+  store scan; the clean re-run above and the in-tree 8/8 are the verdicts.)
 
 ## NEXT STEPS
 
