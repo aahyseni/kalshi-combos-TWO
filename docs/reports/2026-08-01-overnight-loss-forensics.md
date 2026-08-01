@@ -190,6 +190,25 @@ the whole night's net loss; the other 42 positions collectively made money.
 
 ---
 
+## ADVERSARIAL GATE (2026-08-01 morning, independent re-derivation) — VERIFIED
+
+The gate re-pulled `GET /portfolio/settlements` and `/portfolio/fills` itself
+(read-only, paced 0.7 s/page) and re-derived the night from scratch:
+
+| check | gate's independent read | report's claim | verdict |
+|---|---|---|---|
+| night window ≥ 20:00Z | **45 settlements, net −$174.76** (rev $1,569.47 / cost $1,743.60 / fees $0.63; 28 wins +$403.58 / 17 losses −$578.34) | 45, −$174.7553 | ✓ to the cent (sub-cent Decimal vs cent-rounded rows) |
+| ≥ 23:00Z / ≥ 00:00Z | 42, −$255.96 / 41, −$263.20 | −$255.95 / −$263.18 | ✓ (±1–2¢ sub-cent accumulation) |
+| biggest rows | −143.89 / −86.60 / −65.29 / −47.50 / −40.27 / −39.96 — same tickers, same order | identical | ✓ exact |
+| 7/31 fills | **49 fills / $2,016.69 premium** | 49 / $2,016.68 | ✓ |
+| 8/1 fills | 26 / $717.27 by 06:26 ET (report's 15/$504.77 was the 03:41 read; 11 fills landed since — bot live and filling) | — | ✓ consistent |
+| refit check | classification uses ENTRY-time fairs only (`quote_sent` leg mids, `confirm`, `fills.expected_edge_cc`, `risk_audit` `candidate_ev_cc` — all recorded at entry); F5 was classified mispriced by the PRE-settlement 7/31 19:04 gate, not by tonight's outcome; the ML×TOTAL item stays HYPOTHESIS-labeled, no action | — | ✓ no refit on the P&L window |
+
+Gate verdict: **exchange numbers and the variance-vs-mispricing split stand.**
+The two structural findings (per-combo concentration seam, crash-window
+persistence seam) are carried in NEXT STEPS below and in the exit-forensics
+report's census of the same windows.
+
 ## NEXT STEPS
 
 - **Operator decision owed:** none forced by tonight's P&L (verdict: 1-in-5
