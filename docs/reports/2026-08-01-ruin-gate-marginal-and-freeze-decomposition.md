@@ -163,8 +163,9 @@ vitals pre-ship:    1/1 vital signs GREEN   (GATE PASS)   total 13.5s
 new property tests: 33 passed in 9.85s (15 ruin + 18 kill, both files)
 ```
 
-Self-containment proof (fresh scratch worktree at the final commit): recorded
-in the follow-up docs(gate) commit.
+Self-containment proof (fresh scratch worktree `kct-scratch-ruinmg` at
+`b310f7b`, runtime local yaml copied per fleet recipe): import OK; suite
+**3582 passed, 3 deselected in 260.82s**; vitals fast **8/8 GREEN 21.3s**.
 
 ## 6. ARMING CHECKLIST (operator wants this restart FAST — ONE restart, ALL flags)
 
