@@ -45,6 +45,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from combomaker.core.conventions import Side
+from combomaker.risk.cap_family import det_max_backstop_frac
 from combomaker.risk.exposure import (
     LegRef,
     MarginalProvider,
@@ -2526,6 +2527,15 @@ def evaluate_candidate_book_risk(
     hedge_budget_tail_derived: bool = False,
     tail_prob_gate: bool = False,
     kill_tail_prob: float = 0.02,
+    # KILL-ANCHORED BOOK GATE (2026-07-29; demotion RATIFIED 2026-07-31) —
+    # ONE arming flag, default SHADOW. ``hard_trip_frac`` is the ratified 12%
+    # KILL line the tail-probability budget is measured AT. Armed (with the
+    # tail-probability form governing), det-max is DEMOTED to the ruin-anchor
+    # backstop ``cap_family.det_max_backstop_frac()`` — see
+    # ``risk/limits.RiskLimits.kill_anchored_book_gate`` and the derivation on
+    # that function.
+    kill_anchored_book_gate: bool = False,
+    hard_trip_frac: float | None = None,
     gate_ev_from_pricing_fair: bool = False,
     pricing_edge_cc: float | None = None,
     require_p_book_non_decreasing: bool = False,
@@ -2904,6 +2914,11 @@ def evaluate_candidate_book_risk(
         hedge_budget_tail_derived=hedge_budget_tail_derived,
         tail_prob_gate=tail_prob_gate,
         kill_tail_prob=kill_tail_prob,
+        # KILL-ANCHORED BOOK GATE (2026-07-29) — the ratified anchors, threaded
+        # so the CONFIRM-time gate and the quote-time cap re-anchor together
+        # (one flag, two sites, no divergence).
+        kill_anchored_book_gate=kill_anchored_book_gate,
+        hard_trip_frac=hard_trip_frac,
         require_p_book_non_decreasing=require_p_book_non_decreasing,
         delta_p_book=delta_p_book,
         delta_p_book_se=delta_p_book_se,
@@ -2955,6 +2970,13 @@ def _candidate_gate(
     hedge_budget_tail_derived: bool = False,
     tail_prob_gate: bool = False,
     kill_tail_prob: float = 0.02,
+    # KILL-ANCHORED BOOK GATE (2026-07-29). ONE arming flag, default False =
+    # SHADOW = byte-identical. ``hard_trip_frac`` (the ratified 12% KILL line)
+    # is the ONLY number it consumes, straight from config; None degrades to
+    # today's behaviour (fail closed — never a free pass). det-max is NOT
+    # re-anchored here — see the det_thr comment below.
+    kill_anchored_book_gate: bool = False,
+    hard_trip_frac: float | None = None,
     require_p_book_non_decreasing: bool = False,
     delta_p_book: float = 0.0,
     delta_p_book_se: float = 0.0,
@@ -3092,10 +3114,24 @@ def _candidate_gate(
         and bankroll_cc > 0
     ):
         cvar_thr = portfolio_cvar_frac * bankroll_cc
+        # KILL-ANCHORED RE-ANCHOR (2026-07-29, ONE arming flag, default SHADOW
+        # ⇒ ``tail_thr is cvar_thr`` and this gate is byte-identical). The
+        # ratified anchor is "P(KILL-night) ≤ 2% at the 12% KILL line", but the
+        # armed form has been thresholding on ``portfolio_cvar_frac`` (0.35
+        # live) — 97.22% of the comonotone maximum, which is why it has never
+        # fired once in 104,803 live risk_audit rows. Both anchors come from
+        # config; nothing here is derived. The ES fallback below deliberately
+        # keeps binding on ``cvar_thr`` (an ES magnitude is not a KILL-distance
+        # probability). Keep in sync with ``risk/limits.py`` §(8a).
+        tail_thr = (
+            hard_trip_frac * bankroll_cc
+            if (kill_anchored_book_gate and hard_trip_frac is not None)
+            else cvar_thr
+        )
         has_vectors = any(p is not None and p.size for p in post_pnls)
         if tail_prob_gate and has_vectors and n_samples > 0:
             p_kill = kill_tail_prob_upper(
-                post_pnls, cvar_thr, n_samples, ruin_prob_ci_z
+                post_pnls, tail_thr, n_samples, ruin_prob_ci_z
             )
             if p_kill > kill_tail_prob:
                 return False, "post_kill_tail_prob_over_budget"
@@ -3117,7 +3153,26 @@ def _candidate_gate(
         and bankroll_cc is not None
         and bankroll_cc > 0
     ):
-        det_thr = portfolio_det_max_frac * bankroll_cc
+        # DET-MAX DEMOTION (operator RATIFICATION 2026-07-31): identical
+        # rule, SAME guard, as the quote-time cap in ``risk/limits.py`` —
+        # armed AND the tail-probability form governing ⇒ the wall is the
+        # ruin-anchor backstop ``cap_family.det_max_backstop_frac()``; any
+        # half-wired state (no KILL line threaded, tail gate off) keeps
+        # today's ``portfolio_det_max_frac`` wall — the demotion NEVER applies
+        # without its governor, and quote/confirm can never disagree about
+        # which wall is in force (a looser gate than cap is the renege zone;
+        # a looser cap than gate declines flow the cap admitted). The
+        # 2026-07-31 measured caveats (ruin-convention collision, copula
+        # sweep) live on ``det_max_backstop_frac``; keep in sync.
+        det_thr = (
+            float(det_max_backstop_frac()) * bankroll_cc
+            if (
+                kill_anchored_book_gate
+                and tail_prob_gate
+                and hard_trip_frac is not None
+            )
+            else portfolio_det_max_frac * bankroll_cc
+        )
         post_det_gate = post.deterministic_max_loss_cc
         if post.mutex_aware_det_max_cc is not None:
             post_det_gate = min(post_det_gate, post.mutex_aware_det_max_cc)

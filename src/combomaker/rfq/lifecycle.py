@@ -80,6 +80,7 @@ from combomaker.pricing.quote import ConstructedQuote, NoQuote
 from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.models import Rfq
 from combomaker.risk.balance import BalanceTracker
+from combomaker.risk.cap_family import det_max_backstop_frac
 from combomaker.risk.concentration_steer import (
     CrnBookCache,
     LossEventBook,
@@ -905,6 +906,14 @@ class LifecycleConfig:
     # a one-way book stays hard-blocked. Default OFF (byte-identical ES form).
     tail_prob_gate: bool = False
     kill_tail_prob: float = 0.02
+    # KILL-ANCHORED BOOK GATE (2026-07-29): DELIBERATELY NOT a LifecycleConfig
+    # field. The candidate gate reads the arming flag straight off the SAME
+    # ``RiskLimits`` the quote-time cap enforces (``limits.kill_anchored_book_
+    # gate``, see ``_candidate_gate_inputs``), so cap and gate can never
+    # disagree about the anchor — a second config copy here was a divergence
+    # trap (dead field, removed 2026-07-31 audit). A gate looser than the cap
+    # reneges on won auctions; a gate stricter than the cap declines flow the
+    # cap admitted.
     # AWARD SIZING (2026-07-25 big-fill audit, renege root cause #1): size
     # target-cost candidates at the exchange's actual award (target / taker
     # price, fee-free upper bound) instead of our own cheapest bid — see
@@ -1882,6 +1891,15 @@ class QuoteLifecycle:
                     else int(snap.mutex_aware_det_max_cc)
                 ),
                 p_ruin=round(snap.p_ruin, 4),
+                # KILL-ANCHOR SHADOW READ-OUT (2026-07-29) — the number the
+                # operator ARMS from, and the one that has been invisible: the
+                # book's P(loss ≥ the ratified 12% KILL line) and that line in
+                # cc. Emitted on EVERY snapshot regardless of the arming flag,
+                # so a shadow slate is readable straight off the tape without a
+                # replay. Computed HERE, on the maintenance tick that publishes
+                # the snapshot — never on the quote path (fix isolation +
+                # throughput: ``check`` is untouched by this read-out).
+                **self._kill_anchor_readout(snap),
                 # P(BOOK) VISIBILITY (2026-07-25 operator directive: P(book)
                 # must steer — Phase A publishes the signal every refresh):
                 # P(book P&L > 0), the book EV, and the top tail-concentration
@@ -1911,6 +1929,47 @@ class QuoteLifecycle:
                     )[:3]
                 ],
             )
+
+    def _kill_anchor_readout(self, snap: object) -> dict[str, object]:
+        """SHADOW READ-OUT for the KILL-anchored book gate (2026-07-29).
+
+        Returns ``{kill_line_cc, p_kill_night}`` — the ratified 12%-of-bankroll
+        KILL line and the book's P(loss ≥ that line), read off the SAME
+        loss-quantile envelope ``risk/limits`` §(8a) gates on (same conservative
+        round-UP point count, so the logged number IS the number the armed gate
+        would test). Empty dict when the bankroll or the envelope is
+        unavailable — an absent read-out is never invented.
+
+        ``det_max_backstop_cc`` is the RATIFIED (2026-07-31) armed det-max
+        wall — ``cap_family.det_max_backstop_frac() x bankroll`` — published on
+        every snapshot so the operator can see, before arming, exactly where
+        the demoted wall would sit next to the book's premium.
+
+        Blast radius: telemetry only. It runs on the maintenance tick that
+        publishes a snapshot, never on the quote path, and any failure is
+        swallowed so a logging bug cannot reach pricing or a risk decision.
+        """
+        try:
+            bankroll_cc = self._risk_bankroll_cc()
+            if bankroll_cc is None or bankroll_cc <= 0:
+                return {}
+            limits = self._limits.limits
+            kill_line_cc = int(threshold_cc(limits.hard_trip_frac, bankroll_cc))
+            out: dict[str, object] = {
+                "kill_line_cc": kill_line_cc,
+                # The RATIFIED armed det-max position (demotion, 2026-07-31).
+                "det_max_backstop_cc": int(
+                    threshold_cc(det_max_backstop_frac(), bankroll_cc)
+                ),
+            }
+            quantiles = getattr(snap, "loss_quantiles_cc", ()) or ()
+            if quantiles:
+                n_grid = len(quantiles)
+                k_ge = sum(1 for q in quantiles if q >= kill_line_cc)
+                out["p_kill_night"] = round(k_ge / max(1, n_grid - 1), 5)
+            return out
+        except Exception:  # pragma: no cover - telemetry only
+            return {}
 
     def _enforced_game_budget_cc(self) -> float:
         """The tightest ENFORCED per-game loss budget in cc: min(hard game
@@ -4090,6 +4149,16 @@ class QuoteLifecycle:
             # P(KILL-distance night) instead of the ES99 average. Default OFF.
             tail_prob_gate=self._config.tail_prob_gate,
             kill_tail_prob=self._config.kill_tail_prob,
+            # KILL-ANCHORED BOOK GATE (2026-07-29; demotion RATIFIED
+            # 2026-07-31): read off the SAME ``RiskLimits`` the quote-time cap
+            # enforces (not a second config copy), so cap and gate can never
+            # disagree about the anchor OR about which det-max wall is in
+            # force (armed + governing ⇒ both sites demote to
+            # ``cap_family.det_max_backstop_frac()``; see
+            # ``risk/limits.RiskLimits.kill_anchored_book_gate``). The KILL
+            # line rides along as a float.
+            kill_anchored_book_gate=bool(limits.kill_anchored_book_gate),
+            hard_trip_frac=float(limits.hard_trip_frac),
             # GATE EV SOURCE (2026-07-25 renege root cause #2): the CALIBRATED
             # pricing fair's edge for THIS fill — the same fair that priced
             # the quote. None when no sized pending fill (the gate then keeps

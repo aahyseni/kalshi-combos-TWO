@@ -424,6 +424,16 @@ class CandidateBookRiskInputs:
     # form of the joint-tail budget. Default OFF (byte-identical ES form).
     tail_prob_gate: bool = False
     kill_tail_prob: float = 0.02
+    # KILL-ANCHORED BOOK GATE (2026-07-29; demotion RATIFIED 2026-07-31) —
+    # the SAME RiskLimits arming flag the quote-time cap honors. When armed,
+    # the tail-probability budget is measured at the ratified KILL line
+    # ``hard_trip_frac`` (not portfolio_cvar_frac) AND det-max demotes to the
+    # ruin-anchor backstop ``cap_family.det_max_backstop_frac()`` under the
+    # same guard as the cap (tail form governing; see
+    # ``risk/limits.RiskLimits.kill_anchored_book_gate``). Default OFF
+    # (byte-identical).
+    kill_anchored_book_gate: bool = False
+    hard_trip_frac: float | None = None
     # GATE EV SOURCE (2026-07-25 renege root cause #2): when armed, the
     # admission EV sign check uses the calibrated pricing fair's edge for
     # this fill (pricing_edge_cc) instead of the band-high MC EV. None edge
@@ -572,6 +582,8 @@ def _worker_candidate_book_risk(
         hedge_budget_tail_derived=inputs.hedge_budget_tail_derived,
         tail_prob_gate=inputs.tail_prob_gate,
         kill_tail_prob=inputs.kill_tail_prob,
+        kill_anchored_book_gate=inputs.kill_anchored_book_gate,
+        hard_trip_frac=inputs.hard_trip_frac,
         gate_ev_from_pricing_fair=inputs.gate_ev_from_pricing_fair,
         pricing_edge_cc=inputs.pricing_edge_cc,
         require_p_book_non_decreasing=inputs.require_p_book_non_decreasing,

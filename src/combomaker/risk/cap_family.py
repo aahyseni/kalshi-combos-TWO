@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from decimal import Decimal
 from fractions import Fraction
+from functools import cache
 
 # Defaults (operator 2026-07-22). k = target z-scores; kill anchored at 12%.
 K_DAILY = 3.0
@@ -37,6 +39,81 @@ RUIN_FLOOR_FRAC = 0.30           # unchanged, scale-free
 F_SLATE_PROVISIONAL_CAP = 0.15   # clamp until MLB sigma1/rho measured on real nights
 CROSS_RHO_RATCHET_GATE = 0.05    # >= this blocks any loosen; the formula shrinks above it
 MC_HEADROOM = 1.3                # directional/det_max/cvar = MC_HEADROOM * MC(projected)
+
+
+# ── DET-MAX BACKSTOP (operator RATIFICATION 2026-07-31) ──────────────────────
+# "ratify and finish number 2. i think based on our past fills and quoting if
+# we raise to 2k we'd get a very diverse and profitable book. but we need to
+# open it up as it was on 7/29 just with more capacity."
+#
+# When the KILL-anchored book gate is ARMED (``RiskLimits.kill_anchored_book_
+# gate`` AND the tail-probability form is the governing gate), the portfolio
+# deterministic max-loss cap is DEMOTED from its MC-positioned wall
+# (``portfolio_det_max_frac``, 0.36 live) to a MODEL-FREE BACKSTOP positioned
+# from the ruin anchor:
+#
+#     det_max_backstop_frac() = 1 - RUIN_FLOOR_FRAC = 0.70 of risk bankroll
+#
+# DERIVED, never typed: the operator's stated invariant is "even if the ENTIRE
+# admitted book loses simultaneously, under ANY correlation/model error, equity
+# stays above the 30% ruin floor" — reading "the 30% ruin floor" as an EQUITY
+# FLOOR at 30% of bankroll, the largest simultaneous loss that keeps the
+# invariant is (1 - 0.30) x bankroll. The KILL-tail gate (P(loss >= the 12%
+# KILL line) <= 2%) becomes the GOVERNING constraint on admitted books.
+#
+# RECORDED CONVENTION COLLISION (measured 2026-07-31, on record BEFORE the
+# ratification; docs/reports/2026-07-31-reanchor-esports-size-markup.md):
+# the ENFORCED p_ruin axis reads ruin the OTHER way — ``sim/book_risk`` gates
+# P(equity < 0.70 x bankroll) <= ``portfolio_ruin_prob_budget`` (ruin = a 30%
+# DRAWDOWN; this module's RUIN_FLOOR_FRAC = 0.30 is that drawdown DISTANCE).
+# Under that convention this backstop permits a comonotone collapse of 2.33x
+# the enforced ruin distance, and the residual risk is copula-shaped: the
+# 64-ticket study book the demotion admits measured, under a one-factor copula
+# on the loss indicator (400k paths, pinned in
+# tests/test_kill_anchored_book_gate.py):
+#     rho 0.00 -> P(KILL) 0.6%      rho 0.10 -> P(KILL) 12.1%
+#     rho 0.25 -> P(KILL) 20.8%     rho 1.00 -> P(KILL) = P(30% drawdown) 29.5%
+# The operator ratified the demotion with that measurement on the table. What
+# still guards admitted books: the governing KILL-tail gate, the p_ruin <= 5%
+# candidate budget (both copula-DEPENDENT), and this backstop (copula-FREE at
+# the operator's stated floor). Moving this backstop is an OPERATOR
+# ratification of the ruin anchor itself — never an agent edit, never a typed
+# fraction anywhere downstream (every consumer calls this function).
+#
+# ── THE READING RATIFICATION (operator, 2026-08-01, verbatim): "Reading b" ──
+# The collision above is a READING question, and the operator settled it
+# explicitly. The context he ratified against, stated to him three times with
+# the numbers: READING B = the "ruin floor 30%" anchor means an EQUITY FLOOR
+# (always keep >= 30% of bankroll), so the model-free det-max backstop sits at
+# (1 - 0.30) x risk_bankroll = 0.70B (~$2,100 at today's ~$3,000 bankroll),
+# NOT the 30%-drawdown reading (0.30B). Day-to-day the KILL gate governs:
+# P(night loss >= 12% of bankroll) <= 2% (``portfolio_kill_tail_prob`` 0.02,
+# ``hard_trip_frac`` 0.12 — both existing ratified anchors). Caveat he
+# accepted: at cross-rho 0.25 the target 64-ticket book measures P(KILL)
+# 20.8%; the KILL gate + book diversity is the management mechanism;
+# det-max@0.70B is the model-free floor guaranteeing equity >= 30% under ANY
+# copula. ON RECORD WITH IT: Reading A (30% DRAWDOWN) is the convention
+# enforced elsewhere in this codebase (this module's RUIN_FLOOR_FRAC = 0.30 is
+# a drawdown DISTANCE; ``sim/book_risk`` gates p_ruin at the 0.70
+# surviving-equity floor with the 5% budget), and the operator explicitly
+# chose B for the det-max backstop AXIS, knowing the collision. The p_ruin MC
+# gate (drawdown convention, 5% budget) STAYS ARMED unchanged — it is the
+# probabilistic guard on the 30%-drawdown event; Reading B repositions only
+# the MODEL-FREE det-max axis.
+
+
+@cache
+def det_max_backstop_frac() -> Fraction:
+    """The ARMED det-max backstop as an exact fraction of risk bankroll,
+    derived from the ruin anchor (block comment above): ``1 - RUIN_FLOOR_FRAC``.
+    ``Decimal(str(...))`` keeps the float anchor exact (7/10, never
+    0.2999...). ``@cache`` is safe and throughput-motivated: the input is the
+    module-constant anchor (changing it is an operator ratification + restart,
+    never a live mutation), and the armed quote path calls this per
+    ``LimitChecker.check`` — measured 2026-08-01: re-deriving per call cost
+    ~14us/check on the armed hot path; cached, the armed path prices the
+    Fraction once per process."""
+    return Fraction(1) - Fraction(Decimal(str(RUIN_FLOOR_FRAC)))
 
 
 @dataclass(frozen=True)

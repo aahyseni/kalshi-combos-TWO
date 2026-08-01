@@ -2805,6 +2805,29 @@ class RiskConfig(StrictModel):
     # night. Default OFF = byte-identical ES form.
     portfolio_tail_prob_gate: bool = False
     portfolio_kill_tail_prob: str = "0.02"  # decimal string (house convention)
+    # KILL-ANCHORED BOOK GATE (2026-07-29) — ONE arming flag, DEFAULT SHADOW.
+    # ``portfolio_tail_prob_gate`` above has been ARMED live since 2026-07-25 and
+    # HAS NEVER FIRED: it thresholds the ratified 2% budget on
+    # ``portfolio_cvar_frac x bankroll`` (0.35 live) instead of the ratified KILL
+    # line ``hard_trip_frac x bankroll`` (0.12) — 97.22% of the comonotone
+    # maximum, i.e. unreachable. Measured on the 2026-07-28 tape: 0 occurrences
+    # of the breach string in 104,803 ``risk_audit`` rows; all 1,579
+    # ``skip_portfolio_cvar`` declines were fail-closed staleness. True re-points
+    # the armed form at the KILL line — and does NOTHING ELSE.
+    #
+    # AND (operator RATIFICATION 2026-07-31 — "ratify and finish number 2
+    # ... open it up as it was on 7/29 just with more capacity") arming ALSO
+    # DEMOTES the deterministic max-loss cap: with the KILL gate governing,
+    # det-max moves from ``portfolio_det_max_frac`` (0.36 live) to the
+    # model-free ruin-anchor backstop ``cap_family.det_max_backstop_frac()``
+    # (= 1 - RUIN_FLOOR_FRAC = 0.70 of bankroll). The demotion applies ONLY
+    # while ``portfolio_tail_prob_gate`` is armed too (no governor, no
+    # demotion). The 2026-07-31 measurement that argued against it stays on
+    # record on that function (ruin-convention collision + copula sweep) and
+    # in tests/test_kill_anchored_book_gate.py — the operator ratified with it
+    # on the table. Full mechanics in ``RiskLimits.kill_anchored_book_gate``.
+    # False (default) = byte-identical.
+    kill_anchored_book_gate: bool = False
     # RENEGE FIXES (2026-07-25 big-fill audit — 49 auctions won, 15 filled,
     # $355 premium won-then-declined in one evening). Both default OFF
     # (byte-identical); arm together at a pregame restart after review.
@@ -3398,6 +3421,7 @@ class RiskConfig(StrictModel):
             portfolio_kill_tail_prob=float(
                 Fraction(Decimal(self.portfolio_kill_tail_prob))
             ),
+            kill_anchored_book_gate=self.kill_anchored_book_gate,
             portfolio_ruin_prob_budget=Fraction(Decimal(self.portfolio_ruin_prob_budget)),
             absolute_notional_multiple=self.absolute_notional_multiple,
             fill_velocity_window_s=self.fill_velocity_window_s,

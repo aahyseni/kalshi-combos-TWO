@@ -239,12 +239,16 @@
     {
       "launch_to_first_beat_s": 39.86,
       "log": "live_20260801_0111.log"
+    },
+    {
+      "launch_to_first_beat_s": 46.12,
+      "log": "live_20260801_0759.log"
     }
   ],
   "candidate_gate_attempts_max": 2,
-  "candidate_gate_confirm_events": 490,
+  "candidate_gate_confirm_events": 497,
   "candidate_gate_deadline_events": 72,
-  "live_n_positions_last": 21,
+  "live_n_positions_last": 26,
   "live_n_positions_max": 71,
   "max_same_tick_quarantine": 15,
   "max_same_tick_quarantine_where": "live_20260727_1839.log|2026-07-28T01:45:17",
@@ -254,12 +258,12 @@
     "metadata_reads_per_s_ceiling": 30.0,
     "read_capacity": 600,
     "read_refill_per_s": 300,
-    "ts": "2026-08-01T05:11:12.979758Z",
+    "ts": "2026-08-01T11:59:52.843136Z",
     "usage_tier": "advanced",
     "write_capacity": 600,
     "write_refill_per_s": 300
   },
-  "observed_tier_at": "2026-08-01T05:11:12.979758Z",
+  "observed_tier_at": "2026-08-01T11:59:52.843136Z",
   "provenance": {
     "manifest": {
       "live_20260722_relight.log": [
@@ -531,12 +535,20 @@
         1785561016.054
       ],
       "live_20260801_0111.log": [
-        2075470873,
-        1785579070.482
+        2330649838,
+        1785581085.647
+      ],
+      "live_20260801_0752.log": [
+        2596,
+        1785585161.327
+      ],
+      "live_20260801_0759.log": [
+        2300826749,
+        1785592472.472
       ]
     },
-    "scanned_bytes": 28128708279,
-    "scanned_logs": 68,
+    "scanned_bytes": 30684716589,
+    "scanned_logs": 70,
     "source": "fresh scan"
   }
 }
