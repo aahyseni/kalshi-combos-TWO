@@ -2869,6 +2869,38 @@ class RiskConfig(StrictModel):
     # deleted, the decision path is byte-identical), "on" (armed), "off" (the
     # mechanism never runs at all on this axis).
     det_budget_value_ranking: str = "shadow"
+    # DIVERSITY-AWARE EVICTION KEY (2026-07-31, operator ruling: "5 $1 EV
+    # quotes shouldn't lose to 1 $5 EV quote, especially if the 5 quotes are
+    # diverse"). The SLOT axis of the same eviction mechanism ranks on
+    # MARGINAL BOOK VALUE = dEV x P(accept | size-bucket, measured on our own
+    # in-process tape with Clopper-Pearson bounds at the ratified 0.02 alpha
+    # anchor) - dES99 (the quote's share of the book-risk MC's additive
+    # per-game CVaR decomposition — no new model). Candidate scored at its
+    # CP LOWER bound, incumbent at CP UPPER: the measurement's own confidence
+    # gap IS the churn hysteresis (derived, never typed). FAILS CLOSED to the
+    # absolute-EV key whenever the table is thin or cannot discriminate
+    # buckets beyond its own noise (rfq/eviction_value.py). Modes: "off"
+    # (DEFAULT — byte-identical to today), "shadow" (the diversity verdict is
+    # computed and LOGGED as ``eviction_diversity_shadow`` next to the
+    # absolute-EV decision that still rules), "on" (the diversity key ranks
+    # the slot axis when measurable; absolute-EV otherwise).
+    eviction_diversity_key: str = "off"
+    # DERIVED OPEN-QUOTE CAPACITY (2026-07-31, operator: "we can bump the 200
+    # up"). Dissolves the hand-bumped ``max_open_quotes`` (20->60->120->200)
+    # into the write bucket's own bound on a standing book: capacity =
+    # (OBSERVED tier write rate - kill-reserve rate - measured new-quote
+    # token rate) x quote TTL / (create+delete cost 4, the documented
+    # endpoint costs). Kalshi documents NO maker open-quote cap (docs/
+    # research/rfq_throughput/04-exchange-constraints.md) — the token bucket
+    # is the only exchange constraint, and admitting more RESTING quotes
+    # admits no risk (the confirm path enforces exactly; mass-acceptance
+    # waves cost reneges, never uncapped loss — measured worst burst 25
+    # accepts/$400 per 60s). Modes: "off" (DEFAULT — byte-identical),
+    # "shadow" (derive + LOG ``open_quote_capacity_derived`` each window,
+    # enforcement unchanged), "on" (the derived capacity replaces
+    # max_open_quotes via set_limits each window; fail-closed to the
+    # configured value while unmeasured). rfq/eviction_value.py.
+    open_quote_capacity_derived: str = "off"
     # DEPLOYMENT SCALE (operator LEVER #1, risk/deploy_scale.py). Default OFF =
     # byte-identical: the scale is never solved, never consumed, and every
     # ``LimitChecker.check`` receives 1.0. When armed, the bot SOLVES — off the
@@ -3232,7 +3264,11 @@ class RiskConfig(StrictModel):
     # joining the >= 1 knob set above.
     # FIX 4 arming mode — a tri-state, not a bool, so "measure it live without
     # changing a decision" is a first-class state rather than a code edit.
-    @field_validator("det_budget_value_ranking")
+    @field_validator(
+        "det_budget_value_ranking",
+        "eviction_diversity_key",
+        "open_quote_capacity_derived",
+    )
     @classmethod
     def _eviction_mode(cls, v: str) -> str:
         if v not in ("off", "shadow", "on"):

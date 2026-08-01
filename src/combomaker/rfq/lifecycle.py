@@ -77,6 +77,12 @@ from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.fees import FeeModel, FeeType, FeeUnknownError
 from combomaker.pricing.grouping import game_key
 from combomaker.pricing.quote import ConstructedQuote, NoQuote
+from combomaker.rfq.eviction_value import (
+    AcceptanceCounters,
+    allocate_des99_cc,
+    diversity_key,
+    size_bucket,
+)
 from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.models import Rfq
 from combomaker.risk.balance import BalanceTracker
@@ -957,6 +963,17 @@ class LifecycleConfig:
     # Same mechanism as the slot axis above (one eviction path, not two).
     # Default OFF = SHADOW: the would-be eviction is logged, nothing deleted.
     det_budget_value_ranking: str = "shadow"
+    # DIVERSITY-AWARE EVICTION KEY (2026-07-31 operator ruling: "5 $1 EV
+    # quotes shouldn't lose to 1 $5 EV quote, especially if the 5 quotes are
+    # diverse"). The SLOT axis ranks on MARGINAL BOOK VALUE = dEV x
+    # P(accept | size-bucket, measured in-process, Clopper-Pearson-bounded at
+    # the ratified kill_tail_prob alpha) - dES99 (the quote's share of the
+    # book-risk MC's additive per-game CVaR decomposition). Candidate at CP
+    # LOWER, incumbent at CP UPPER — the confidence gap IS the churn
+    # hysteresis. FAILS CLOSED to the absolute-EV key while the table is
+    # thin. "off" (DEFAULT, byte-identical) / "shadow" (log the diversity
+    # verdict beside the ruling absolute-EV one) / "on".
+    eviction_diversity_key: str = "off"
     # PEAK-CONCENTRATION pricing steer (operator directive 2026-07-18 evening).
     # K cached worst scorelines per game for the committed-book peak profile
     # (sim/peak_profile.build_peak_profile) — rebuilt OFF the hot path on the
@@ -1617,6 +1634,17 @@ class QuoteLifecycle:
         # ordered dict used as a bounded FIFO (``_EVICTION_LEDGER_MAX``). See
         # ``_thrash_blocked`` for the invariant it enforces.
         self._evicted_density: dict[str, float] = {}
+        # SLOT-DIVERSITY anti-thrash ledger (2026-07-31): same invariant,
+        # separate ledger — the diversity key is cc-scale, the det axis' is
+        # a density; one ledger would mix scales (``_note_slot_eviction``).
+        self._evicted_slot_key: dict[str, float] = {}
+        # DIVERSITY-AWARE EVICTION KEY (2026-07-31): the in-process
+        # acceptance tape — quotes SENT vs ACCEPTED per premium-at-risk
+        # bucket. Always recorded (two O(1) list increments; the counters
+        # also feed the shadow read-out); only ``eviction_diversity_key``
+        # decides whether any DECISION ever reads it. Fails closed to the
+        # absolute-EV key while thin (rfq/eviction_value.py).
+        self._accept_tape = AcceptanceCounters()
         # EVENT-DRIVEN POST-FILL RISK PULL (resting-quote haircut, 2026-07-17):
         # single-flight task + the games of recently committed fills (eviction
         # priority: same-game resting quotes first). Armed only while
@@ -4910,6 +4938,138 @@ class QuoteLifecycle:
         prior = self._evicted_density.get(combo_ticker)
         return prior is not None and density <= prior
 
+    # ---- DIVERSITY-AWARE SLOT KEY (2026-07-31) --------------------------
+    # A SEPARATE anti-thrash ledger for the slot-diversity axis: its key is
+    # cc-scale (EV x P(accept) - dES99) while the det axis' is a density
+    # (EV per det unit) — mixing scales in one ledger would corrupt the FIX 4
+    # invariant. Same bounded-FIFO mechanics, same invariant: a combo evicted
+    # at key ``k`` may not itself evict until its OWN key strictly exceeds
+    # ``k``.
+
+    def _note_slot_eviction(self, combo_ticker: str, winner_key: float) -> None:
+        ledger = self._evicted_slot_key
+        prior = ledger.pop(combo_ticker, None)
+        ledger[combo_ticker] = winner_key if prior is None else max(prior, winner_key)
+        while len(ledger) > self._EVICTION_LEDGER_MAX:
+            ledger.pop(next(iter(ledger)))
+
+    def _slot_thrash_blocked(self, combo_ticker: str, key: float) -> bool:
+        prior = self._evicted_slot_key.get(combo_ticker)
+        return prior is not None and key <= prior
+
+    @staticmethod
+    def _quote_games(quote: OpenQuoteRisk) -> set[str]:
+        return {
+            game_key(leg.event_ticker) for leg in quote.legs if leg.event_ticker
+        }
+
+    def _slot_diversity_decision(
+        self, cand_ev: int, quote_risk: OpenQuoteRisk
+    ) -> tuple[str, tuple[OpenQuoteRisk, float, float] | None]:
+        """The slot axis' MARGINAL-BOOK-VALUE ranking (operator ruling
+        2026-07-31: "5 $1 EV quotes shouldn't lose to 1 $5 EV quote,
+        especially if the 5 quotes are diverse").
+
+            key(q) = dEV(q) x P(accept | size-bucket, measured) - dES99(q)
+
+        Returns a TAGGED verdict — the three states are semantically
+        distinct and the caller must never conflate them:
+
+          * ``("evict", (loser, loser_key, candidate_key))`` — the ranking is
+            measurable and the candidate beats the weakest incumbent past
+            the measured noise floor;
+          * ``("hold", None)`` — the ranking is MEASURABLE and says the book
+            as it stands is worth more (in "on" mode this is a REAL verdict:
+            the caller must NOT fall through to the absolute-EV key — the
+            5 diverse $1 quotes just beat the $5 candidate);
+          * ``("thin", None)`` — the ranking is NOT measurable; fall back to
+            the absolute-EV key, i.e. exactly today (fail closed;
+            quiet-failure defense 2). Thin means:
+
+          * the in-process acceptance tape cannot DISCRIMINATE buckets beyond
+            its own Clopper-Pearson noise (``AcceptanceCounters.
+            discriminating`` — a derived criterion, no typed threshold), or
+          * the candidate's or ANY incumbent's bucket has no denominator yet
+            (a rehydrated book from before this boot's tape).
+
+        HYSTERESIS IS DERIVED: the candidate is scored at its bucket's CP
+        LOWER bound, incumbents at their CP UPPER bound — an eviction must
+        clear the measurement's own confidence gap, which shrinks as the
+        tape grows. dES99 rides the book-risk MC's additive per-game CVaR
+        decomposition (``per_game_tail_cc``) allocated by premium-at-risk
+        share — no new model; when the snapshot is stale/absent the term is
+        0 for EVERY quote (the ranking degrades to dEV x P(accept), it never
+        invents tail numbers)."""
+        alpha = float(self._config.kill_tail_prob)
+        tape = self._accept_tape
+        if not tape.discriminating(alpha):
+            self._metrics.inc("quote.eviction_diversity_thin")
+            return ("thin", None)
+        cand_det = self._quote_det_consumed_cc(quote_risk)
+        cand_bounds = tape.bounds(size_bucket(cand_det), alpha)
+        if cand_bounds is None:
+            self._metrics.inc("quote.eviction_diversity_thin")
+            return ("thin", None)
+        # Per-game tail decomposition (Σ over games = book CVaR exactly) from
+        # the snapshot the caps already consume; {} when stale/absent.
+        snap = self._book_risk_for_check()
+        tail_by_game: dict[str, float] = {}
+        if snap is not None and getattr(snap, "usable", False):
+            for tc in getattr(snap, "per_game_tail_cc", ()):  # TailContribution
+                tail_by_game[tc.key] = tail_by_game.get(tc.key, 0.0) + tc.loss_cc
+        # Premium-at-risk per game across the WHOLE book (resting + committed
+        # + this candidate) — the allocation denominator for dES99 shares.
+        det_by_game: dict[str, float] = {}
+        quote_dets: dict[str, int] = {}
+        for qid, q in self._exposure.open_quotes.items():
+            det_q = self._quote_det_consumed_cc(q)
+            quote_dets[qid] = det_q
+            for g in self._quote_games(q):
+                det_by_game[g] = det_by_game.get(g, 0.0) + det_q
+        for pos in self._exposure.positions.values():
+            pos_det = int(getattr(pos, "max_loss_cc", 0))
+            if pos_det <= 0:
+                continue
+            for leg in pos.legs:
+                if leg.event_ticker:
+                    g = game_key(leg.event_ticker)
+                    det_by_game[g] = det_by_game.get(g, 0.0) + pos_det
+                    break  # charge the position once, to its first game
+        cand_games = self._quote_games(quote_risk)
+        for g in cand_games:
+            det_by_game[g] = det_by_game.get(g, 0.0) + cand_det
+        cand_des = allocate_des99_cc(cand_games, cand_det, tail_by_game, det_by_game)
+        cand_key = diversity_key(cand_ev, cand_bounds.lower, cand_des)
+        loser: OpenQuoteRisk | None = None
+        loser_key: float | None = None
+        for qid, q in self._exposure.open_quotes.items():
+            if q.expected_edge_cc is None:
+                continue  # UNKNOWN EV is never a convenient loser (unchanged)
+            q_bounds = tape.bounds(size_bucket(quote_dets[qid]), alpha)
+            if q_bounds is None:
+                # An incumbent this tape has never measured makes the whole
+                # ranking apples-to-oranges — fail closed to absolute-EV.
+                self._metrics.inc("quote.eviction_diversity_thin")
+                return ("thin", None)
+            q_des = allocate_des99_cc(
+                self._quote_games(q), quote_dets[qid], tail_by_game, det_by_game
+            )
+            key = diversity_key(q.expected_edge_cc, q_bounds.upper, q_des)
+            if loser_key is None or key < loser_key:
+                loser, loser_key = q, key
+        if loser is None or loser_key is None:
+            # Nothing rankable rests (all-UNKNOWN EVs) — not a measured HOLD.
+            return ("thin", None)
+        if cand_key <= loser_key:
+            # MEASURED verdict: the candidate does not beat the weakest
+            # incumbent past the measured noise floor — the standing book is
+            # worth more. Never falls through to absolute-EV.
+            return ("hold", None)
+        if self._slot_thrash_blocked(quote_risk.combo_ticker, cand_key):
+            self._metrics.inc("quote.eviction_thrash_blocked")
+            return ("hold", None)
+        return ("evict", (loser, loser_key, cand_key))
+
     async def _try_slot_eviction(
         self,
         rfq: Rfq,
@@ -5015,6 +5175,53 @@ class QuoteLifecycle:
                 key = float(q.expected_edge_cc)
             if loser_key is None or key < loser_key:
                 loser, loser_key = q, key
+        # DIVERSITY-AWARE SLOT KEY (2026-07-31 operator ruling). Computed
+        # AFTER the absolute-EV pass so shadow can log both verdicts side by
+        # side. "off" (default) skips everything — byte-identical. "shadow"
+        # logs the diversity verdict and lets the absolute-EV decision rule
+        # exactly as today. "on" lets a MEASURABLE diversity verdict rule
+        # (evict OR hold) and falls back to absolute-EV only when THIN
+        # (fail closed — rfq/eviction_value.py).
+        diversity_ranked = False
+        if axis == "slot":
+            div_mode = str(self._config.eviction_diversity_key)
+            if div_mode != "off":
+                verdict, payload = self._slot_diversity_decision(
+                    cand_ev, quote_risk
+                )
+                if div_mode == "shadow":
+                    self._metrics.inc("quote.eviction_diversity_shadow")
+                    log.info(
+                        "eviction_diversity_shadow",
+                        verdict=verdict,
+                        would_evict_quote_id=(
+                            payload[0].quote_id if payload else None
+                        ),
+                        diversity_loser_key=(payload[1] if payload else None),
+                        diversity_cand_key=(payload[2] if payload else None),
+                        abs_would_evict_quote_id=(
+                            loser.quote_id
+                            if loser is not None
+                            and loser_key is not None
+                            and cand_key > loser_key
+                            else None
+                        ),
+                        abs_loser_key=loser_key,
+                        abs_cand_key=cand_key,
+                        candidate_rfq_id=rfq.rfq_id,
+                        accept_tape=self._accept_tape.snapshot(),
+                    )
+                elif verdict == "hold":
+                    # Measured verdict: the standing (diverse) book is worth
+                    # more than this candidate — never fall through to the
+                    # absolute-EV key ("5 $1 EV quotes shouldn't lose to 1
+                    # $5 EV quote").
+                    self._metrics.inc("quote.eviction_diversity_hold")
+                    return raw_breaches
+                elif verdict == "evict" and payload is not None:
+                    loser, loser_key, cand_key = payload
+                    diversity_ranked = True
+                # "thin" ⇒ fall through to the absolute-EV decision (today).
         if loser is None or loser_key is None or loser.expected_edge_cc is None:
             return raw_breaches
         if cand_key <= loser_key:
@@ -5040,6 +5247,7 @@ class QuoteLifecycle:
         log.info(
             "open_quote_evicted",
             axis=axis,
+            key_kind="diversity" if diversity_ranked else "absolute_ev",
             evicted_quote_id=loser.quote_id,
             evicted_ev_cc=loser.expected_edge_cc,
             evicted_key=loser_key,
@@ -5049,6 +5257,10 @@ class QuoteLifecycle:
         )
         if axis == "det_max":
             self._note_eviction(loser.combo_ticker, cand_key)
+        elif diversity_ranked:
+            # The evicted combo may not re-evict its way back until its own
+            # diversity key strictly beats the one that displaced it.
+            self._note_slot_eviction(loser.combo_ticker, cand_key)
         await self._delete_quote(loser.quote_id, ReasonCode.DELETE_EVICTED_LOWER_EV)
         return self._limits.check(
             self._exposure,
@@ -5394,10 +5606,12 @@ class QuoteLifecycle:
             self._drop_quote(old_quote_id)
         self._open[quote_id] = state
         self._by_rfq[rfq.rfq_id] = quote_id
-        self._exposure.upsert_quote(
-            self._quote_risk(rfq, result, quote_id=quote_id, qty=risk_qty)
-        )
+        sent_risk = self._quote_risk(rfq, result, quote_id=quote_id, qty=risk_qty)
+        self._exposure.upsert_quote(sent_risk)
         self._metrics.inc("quote.sent")
+        # DIVERSITY-AWARE EVICTION KEY (2026-07-31): the acceptance tape's
+        # DENOMINATOR — one sent quote in its premium-at-risk bucket.
+        self._accept_tape.record_quoted(self._quote_det_consumed_cc(sent_risk))
         await self._store.record_decision(
             "quote_sent",
             rfq.rfq_id,
@@ -5443,6 +5657,18 @@ class QuoteLifecycle:
         caught: that path is the process stopping, where the startup reconcile
         rebuilds the book from the exchange."""
         quote_id = str(msg.get("quote_id", ""))
+        # DIVERSITY-AWARE EVICTION KEY (2026-07-31): the acceptance tape's
+        # NUMERATOR — an accept in the resting quote's premium-at-risk
+        # bucket, recorded BEFORE any handling can drop the mirror entry.
+        # Every accept counts (confirmed OR last-look-declined): the tape
+        # measures the taker's propensity to take our quote, which is what
+        # P(accept | size) prices — what we then do with the accept is the
+        # confirm path's business.
+        accepted_risk = self._exposure.open_quotes.get(quote_id)
+        if accepted_risk is not None:
+            self._accept_tape.record_accepted(
+                self._quote_det_consumed_cc(accepted_risk)
+            )
         try:
             await self._on_quote_accepted(msg)
         except Exception as exc:
