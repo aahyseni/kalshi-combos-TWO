@@ -169,8 +169,12 @@ $ python -m tools.vitals.gate --tier pre-ship
 (Pre-ship tier already run above even though the change loads at restart —
 nothing further owed at arming beyond the checklist watch items.)
 
-Self-containment proof (fresh scratch worktree at the pushed SHA, no local
-state): SELFCONTAIN_PLACEHOLDER
+Self-containment proof (fresh scratch worktree `kct-scratch-wsshed` at
+`7d86c12`, clean status): import OK; **suite 3549/0 (252.5s)**; vitals fast
+**8/8 GREEN 19.3s**. One operational note: the vitals gate NEEDS the
+gitignored runtime `config/prod-live-wc.local.yaml` copied in (the standing
+fleet recipe) — without it the gate silently hangs rather than failing loud
+(observed >12 min; small vitals-UX defect, filed in NEXT STEPS).
 
 ## 4. Blast radius
 
@@ -216,4 +220,6 @@ extended (sentinel fix), never weakened — all their tests re-run green.
   decisions (confirm-failure counter semantics, C1/C3/C5) unchanged.
 - **Next session**: wire `ws.shed_market_frames` + `rfq.dropped_stale_preparse`
   into the periodic report line; consider a vitals check replaying the surge
-  shape (candidate for `prove.py`'s historical-defect set).
+  shape (candidate for `prove.py`'s historical-defect set); vitals-UX: the
+  gate hangs silently (>12 min observed) when `config/prod-live-wc.local.yaml`
+  is absent — should fail loud with a named missing-config error.
