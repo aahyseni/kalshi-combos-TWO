@@ -20,7 +20,7 @@ import os
 import sys
 import threading
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
@@ -50,8 +50,10 @@ from combomaker.exchange.quote_query import (
     open_quote_tickers,
 )
 from combomaker.exchange.rest import (
+    CREATE_QUOTE_TOKEN_COST,
     DEFAULT_ENDPOINT_TOKEN_COST,
     DEFAULT_REQUEST_TIMEOUT_S,
+    DELETE_QUOTE_TOKEN_COST,
     LOWEST_TIER_LIMITS,
     ApiTierLimits,
     KalshiApiError,
@@ -104,6 +106,7 @@ from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
 from combomaker.pricing.grouping import game_key
 from combomaker.pricing.tripwire import taxonomy_impossible
+from combomaker.rfq.eviction_value import derive_open_quote_capacity
 from combomaker.rfq.filters import RfqFilter
 from combomaker.rfq.intake import RfqIntake
 from combomaker.rfq.lifecycle import (
@@ -406,6 +409,9 @@ def build_lifecycle_config(
         # FIX 4 (2026-07-28): value-ranked allocation of the fixed det-max
         # budget, riding the SAME eviction mechanism. Default shadow.
         det_budget_value_ranking=risk_cfg.det_budget_value_ranking,
+        # DIVERSITY-AWARE EVICTION KEY (2026-07-31 operator ruling): the slot
+        # axis ranks on dEV x P(accept|size, measured) - dES99. Default off.
+        eviction_diversity_key=risk_cfg.eviction_diversity_key,
         # DEPLOYMENT SCALE (operator LEVER #1): solved off the maintenance tick
         # from the live envelope; consumed by the deploy-side budgets only.
         # Default OFF ⇒ never solved, never consumed (byte-identical).
@@ -1636,6 +1642,15 @@ class QuoteApp:
         self._metadata_cache: MetadataCache | None = None
         self._metadata_cache_path = str(config.data_dir / "metadata_cache.json")
         self._metadata_persist_ticks = 0
+        # DERIVED OPEN-QUOTE CAPACITY (2026-07-31): window sampler for the
+        # measured new-quote token rate — (mono_ns, quote.sent counter) at
+        # the last derivation — plus the tick counter that paces derivations
+        # to the same ~60s cadence as the metadata flush. The LimitChecker
+        # handle is set in run() so the "on" mode can swap max_open_quotes;
+        # None until then (shadow logging works without it).
+        self._capacity_probe_ticks = 0
+        self._capacity_probe_prev: tuple[int, int] | None = None
+        self._limit_checker: LimitChecker | None = None
         self._stop = asyncio.Event()
         # OBSERVED rate-limit tier + the READ bucket derived from it (2026-07-26).
         # Both start at the fail-safe FLOOR so any code path that reads them
@@ -1858,6 +1873,11 @@ class QuoteApp:
             # percentages into exact Fractions (no binary-float money).
             base_limits = risk_cfg.to_risk_limits()
             limits = LimitChecker(base_limits)
+            # DERIVED OPEN-QUOTE CAPACITY (2026-07-31): the maintenance
+            # loop's capacity derivation needs the live checker to swap
+            # ``max_open_quotes`` in "on" mode (``set_limits``, the
+            # derived_cap_engine seam). Shadow only logs.
+            self._limit_checker = limits
             # Correlation-adaptive cap engine (North Star). off -> None (the static
             # fracs above enforce, byte-identical to prior behaviour); shadow/enforce
             # -> the _adaptive_caps_loop derives the deploy+halt caps nightly and, in
@@ -4107,6 +4127,110 @@ class QuoteApp:
                 except Exception:
                     log.exception("metadata_cache_persist_errored")
                     self._metadata_cache.mark_dirty()
+            # DERIVED OPEN-QUOTE CAPACITY (2026-07-31): ~every 60s (120
+            # ticks x 0.5s — the metadata-flush cadence precedent; the
+            # window IS the rate-measurement denominator). "off" = never
+            # runs, byte-identical. Errors log and keep current limits
+            # (fix isolation: this slow-loop derivation must never reach
+            # the pricing path).
+            self._capacity_probe_ticks += 1
+            if (
+                self._capacity_probe_ticks >= 120
+                and str(self._config.risk.open_quote_capacity_derived) != "off"
+            ):
+                self._capacity_probe_ticks = 0
+                try:
+                    self._derived_capacity_tick()
+                except Exception:
+                    log.exception("open_quote_capacity_tick_errored")
+
+    def _derived_capacity_tick(self) -> None:
+        """DERIVED OPEN-QUOTE CAPACITY (2026-07-31) — one ~60s derivation.
+
+        Dissolves the hand-bumped ``max_open_quotes`` (20 -> 60 -> 120 -> 200)
+        into the write bucket's own bound on a standing book (the full
+        derivation, its exchange-doc verification and the mass-acceptance
+        guard argument live in ``rfq/eviction_value.py``):
+
+            capacity = (OBSERVED tier write rate
+                        - kill/withdraw reserve rate
+                        - MEASURED new-quote token rate)
+                       x QUOTE_TTL_S / (create + delete cost)
+
+        Modes (``risk.open_quote_capacity_derived``): "off" — never called;
+        "shadow" — derive + LOG ``open_quote_capacity`` beside the enforced
+        cap, enforcement unchanged; "on" — a USABLE derivation replaces
+        ``max_open_quotes`` on the live checker via ``set_limits`` (the
+        derived_cap_engine seam; every other field kept as-is, so an
+        adaptive-caps swap is preserved). FAIL-CLOSED: the first window after
+        boot (no rate sample), an unusable tier, or a derivation that cannot
+        admit one quote all keep TODAY'S configured cap. Errors log and keep
+        current limits — the adaptation is repaired, never silently widened."""
+        mode = str(self._config.risk.open_quote_capacity_derived)
+        now_ns = self._clock.monotonic_ns()
+        sent = self._metrics.counter("quote.sent")
+        prev = self._capacity_probe_prev
+        self._capacity_probe_prev = (now_ns, sent)
+        flow_tokens_per_s: float | None = None
+        if prev is not None:
+            prev_ns, prev_sent = prev
+            dt_s = (now_ns - prev_ns) / 1e9
+            if dt_s > 0:
+                # Every sent quote eventually costs its delete too; reprices
+                # re-register as sent quotes, so the standing book's own
+                # refresh is double-counted here — strictly CONSERVATIVE
+                # (capacity understated, never overstated).
+                flow_tokens_per_s = (
+                    max(0, sent - prev_sent)
+                    * (CREATE_QUOTE_TOKEN_COST + DELETE_QUOTE_TOKEN_COST)
+                    / dt_s
+                )
+        sup = self._config.supervisor
+        reserve_capacity, reserve_refill_s = self._api_tier.clamp_write_budget(
+            sup.write_budget_capacity, sup.write_budget_refill_s
+        )
+        fallback = int(self._config.risk.max_open_quotes)
+        derived = derive_open_quote_capacity(
+            tier_write_rate_per_s=float(self._api_tier.write_refill_per_s),
+            reserve_rate_per_s=reserve_capacity / reserve_refill_s,
+            measured_flow_tokens_per_s=flow_tokens_per_s,
+            ttl_s=QUOTE_TTL_S,
+            refresh_cost_tokens=CREATE_QUOTE_TOKEN_COST + DELETE_QUOTE_TOKEN_COST,
+            fallback=fallback,
+        )
+        checker = self._limit_checker
+        enforced_now = (
+            int(checker.limits.max_open_quotes) if checker is not None else None
+        )
+        log.info(
+            "open_quote_capacity",
+            mode=mode,
+            usable=derived.usable,
+            reason=derived.reason,
+            derived_capacity=derived.capacity,
+            enforced_max_open_quotes=enforced_now,
+            tier_write_rate_per_s=derived.tier_write_rate_per_s,
+            tier_observed=self._api_tier.observed,
+            reserve_rate_per_s=derived.reserve_rate_per_s,
+            measured_flow_tokens_per_s=derived.measured_flow_tokens_per_s,
+            ttl_s=derived.ttl_s,
+            refresh_cost_tokens=derived.refresh_cost_tokens,
+            fallback=derived.fallback,
+        )
+        if (
+            mode == "on"
+            and derived.usable
+            and checker is not None
+            and enforced_now != derived.capacity
+        ):
+            checker.set_limits(
+                replace(checker.limits, max_open_quotes=derived.capacity)
+            )
+            log.info(
+                "open_quote_capacity_applied",
+                previous=enforced_now,
+                applied=derived.capacity,
+            )
 
     async def _balance_loop(
         self, rest: KalshiRestClient, tracker: BalanceTracker
