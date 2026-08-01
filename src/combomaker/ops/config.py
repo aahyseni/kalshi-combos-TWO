@@ -2841,6 +2841,21 @@ class RiskConfig(StrictModel):
     # Governs ONLY with ``kill_anchored_book_gate`` armed. Full mechanics in
     # ``RiskLimits.kill_gate_marginal``. False (default) = byte-identical.
     kill_gate_marginal: bool = False
+    # MARGINAL RUIN GATE (2026-08-01, the ruin axis of the same sunk-book
+    # ruling). The p_ruin LEVEL gate froze ALL quoting on the 2026-08-01
+    # evening slate (skip_portfolio_ruin 1,044/5min, sent = 0, p_ruin 0.2994
+    # vs the 0.05 budget — a level no refusal can lower, while the refused
+    # pregame flow was measured to be the cure: three in-flight fills that
+    # landed moved p_ruin 0.2994 -> 0.1649 in 90 s). True makes an OVER-budget
+    # book judge each candidate's MARGINAL effect via the same ratified
+    # diversity-key machinery the marginal KILL gate rides (certified
+    # risk-reducers always admit; dES99 <= dEV x CP-lower P(accept) at the
+    # ratified alpha; concentrators refuse), and the confirm MC gate admits
+    # only fills that do not raise the CRN-measured P(ruin). An UNDER-budget
+    # book is byte-identical to today. Independent of the KILL-gate flags.
+    # Full mechanics in ``RiskLimits.ruin_gate_marginal``. False (default) =
+    # byte-identical.
+    ruin_gate_marginal: bool = False
     # RENEGE FIXES (2026-07-25 big-fill audit — 49 auctions won, 15 filled,
     # $355 premium won-then-declined in one evening). Both default OFF
     # (byte-identical); arm together at a pregame restart after review.
@@ -3472,6 +3487,7 @@ class RiskConfig(StrictModel):
             ),
             kill_anchored_book_gate=self.kill_anchored_book_gate,
             kill_gate_marginal=self.kill_gate_marginal,
+            ruin_gate_marginal=self.ruin_gate_marginal,
             portfolio_ruin_prob_budget=Fraction(Decimal(self.portfolio_ruin_prob_budget)),
             absolute_notional_multiple=self.absolute_notional_multiple,
             fill_velocity_window_s=self.fill_velocity_window_s,

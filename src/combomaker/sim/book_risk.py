@@ -2542,6 +2542,13 @@ def evaluate_candidate_book_risk(
     # longer level-refuses every candidate at the confirm gate — see
     # ``_candidate_gate``. Default off = byte-identical.
     kill_gate_marginal: bool = False,
+    # MARGINAL RUIN GATE (2026-08-01 sunk-book ruling, the ruin axis):
+    # threaded from the SAME ``RiskLimits.ruin_gate_marginal`` the quote-time
+    # P(ruin) cap reads (one flag, two sites, no divergence). Armed, an
+    # inherited over-budget PRE book no longer level-refuses every candidate
+    # at the confirm gate's P(ruin) check — see ``_candidate_gate`` (4).
+    # Default off = byte-identical.
+    ruin_gate_marginal: bool = False,
     gate_ev_from_pricing_fair: bool = False,
     pricing_edge_cc: float | None = None,
     require_p_book_non_decreasing: bool = False,
@@ -2931,6 +2938,10 @@ def evaluate_candidate_book_risk(
         # charge both read post − pre on shared randomness.
         kill_gate_marginal=kill_gate_marginal,
         pre_pnls=(pre_pnl, pre_pnl_c, pre_bridge_pnl, pre_split_pnl),
+        # MARGINAL RUIN GATE (2026-08-01): the pre/post tail axes already
+        # carry p_ruin (+ Wilson upper) on the SAME CRN sample and the SAME
+        # equity/floor — check (4) reads them directly.
+        ruin_gate_marginal=ruin_gate_marginal,
         require_p_book_non_decreasing=require_p_book_non_decreasing,
         delta_p_book=delta_p_book,
         delta_p_book_se=delta_p_book_se,
@@ -3000,6 +3011,12 @@ def _candidate_gate(
     # below is byte-identical.
     kill_gate_marginal: bool = False,
     pre_pnls: Sequence[NDArray[np.float64] | None] = (),
+    # MARGINAL RUIN GATE (2026-08-01, the ruin axis of the same sunk-book
+    # ruling): armed AND the PRE book already over the ruin budget, check (4)
+    # judges the candidate's marginal effect on P(ruin) itself (pre/post on
+    # shared CRN via the pre/post tail axes) instead of level-refusing.
+    # Default off = every path byte-identical.
+    ruin_gate_marginal: bool = False,
     require_p_book_non_decreasing: bool = False,
     delta_p_book: float = 0.0,
     delta_p_book_se: float = 0.0,
@@ -3278,7 +3295,47 @@ def _candidate_gate(
     # (fail-closed against MC sampling error, never a convenient point estimate).
     if portfolio_ruin_prob_budget is not None:
         if max(post.p_ruin, post.p_ruin_upper) > portfolio_ruin_prob_budget:
-            return False, "post_ruin_prob_over_budget"
+            # ── MARGINAL RUIN GATE (2026-08-01 sunk-book ruling, the ruin
+            # axis — ``RiskLimits.ruin_gate_marginal``; constitutional rule:
+            # only the model-free det-max backstop is a LEVEL gate). The POST
+            # book is over the ruin budget — but if the PRE book (SAME CRN
+            # sample, SAME equity basis and ruin floor, same Wilson read) was
+            # ALREADY over, the level is inherited/sunk and refusing this
+            # candidate cannot lower it: 2026-08-01 evening the level form
+            # froze ALL quoting at p_ruin 0.2994 vs the 0.05 budget
+            # (skip_portfolio_ruin 1,044/5 min, sent = 0) while three
+            # in-flight pregame fills that DID land moved the measured
+            # p_ruin 0.2994 → 0.1649 within 90 s — the refused flow was the
+            # cure, not the disease. Armed + PRE-over, the decision becomes
+            # the candidate's MARGINAL test, mirroring the KILL form above:
+            #   * CERTIFIED RISK-REDUCER — the existing certification measure
+            #     verbatim (POST governing model UNCLAMPED expected tail loss
+            #     <= PRE on shared CRN, never a leg-sign heuristic): admit
+            #     ("hedges are +EV").
+            #   * else admit iff the candidate does NOT RAISE the measured
+            #     P(ruin) itself — post vs pre on the SAME CRN sample, the
+            #     anchor's own marginal (a diversifying pregame fill whose
+            #     premium is tiny against the ruin distance moves p_ruin by
+            #     ~0 and admits; a concentrator that deepens the ruin-crossing
+            #     scenarios raises it and refuses).
+            # PRE not measurably over (or the flag disarmed) ⇒ the level
+            # refusal below stands byte-identically — UNKNOWN never admits.
+            pre_ruin_over = ruin_gate_marginal and (
+                max(pre.p_ruin, pre.p_ruin_upper) > portfolio_ruin_prob_budget
+            )
+            if pre_ruin_over:
+                certified = (
+                    post.governing_model_tail_loss_cc
+                    <= pre.governing_model_tail_loss_cc
+                )
+                if not (
+                    certified
+                    or max(post.p_ruin, post.p_ruin_upper)
+                    <= max(pre.p_ruin, pre.p_ruin_upper)
+                ):
+                    return False, "ruin_marginal_raises_p_ruin"
+            else:
+                return False, "post_ruin_prob_over_budget"
 
     # (5) POST gross utilization backstop (Σ contracts×$1 ≤ multiple×bankroll).
     if (

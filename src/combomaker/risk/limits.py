@@ -419,6 +419,26 @@ class RiskLimits:
     # Default False = the level form exactly as armed 2026-08-01 morning —
     # byte-identical.
     kill_gate_marginal: bool = False
+    # ── MARGINAL RUIN GATE (2026-08-01, the ruin axis of the same sunk-book
+    # ruling — constitutional: the standing book is SUNK; only the model-free
+    # det-max backstop (0.70B) is a LEVEL gate; every other risk gate judges
+    # the MARGINAL candidate). THE FREEZE this repairs (2026-08-01 evening
+    # slate, measured): §(9)'s level form read p_ruin 0.2994 == upper vs the
+    # 0.05 budget and refused EVERYTHING — skip_portfolio_ruin 1,044/5 min,
+    # quote_sent = 0 — while every new fill was PREGAME-ONLY (future games =
+    # diversifiers against the in-play book carrying the ruin mass); three
+    # in-flight fills that DID land moved the measured p_ruin 0.2994 → 0.1649
+    # within 90 s. Armed (with the lifecycle supplying the candidate's
+    # marginal facts): an OVER-budget book admits certified risk-reducers and
+    # candidates whose allocated dES99 <= dEV × CP-lower P(accept) — the SAME
+    # ``KillMarginalCandidate`` object and criterion the marginal KILL gate
+    # rides (one machinery, two axes) — and refuses concentrators; the
+    # confirm-path mirror in ``sim/book_risk._candidate_gate`` (4) admits
+    # only fills that do not RAISE the CRN-measured P(ruin) (certified
+    # reducers exempt). UNDER budget: §(9) is silent at quote time exactly as
+    # today. Independent of ``kill_anchored_book_gate`` (the ruin axis has no
+    # anchor re-read to guard). Default False = byte-identical level form.
+    ruin_gate_marginal: bool = False
     # Portfolio DETERMINISTIC maximum-loss cap (P0-3): the exact all-hit
     # premium-at-risk (+ reserved holdings) as a %-of-bankroll ceiling. Gated
     # INDEPENDENTLY of the sampled-ES cap so the deterministic maximum is its own
@@ -1967,15 +1987,56 @@ class LimitChecker:
                 getattr(book_risk, "p_ruin_upper", book_risk.p_ruin),
             )
             if book_risk.usable and gated_ruin > ruin_budget:
-                out.append(
-                    Breach(
-                        ReasonCode.SKIP_PORTFOLIO_RUIN,
-                        f"P(ruin) {book_risk.p_ruin:.4f} (upper "
-                        f"{gated_ruin:.4f}) > budget {ruin_budget:.4f} "
-                        f"(equity below ruin floor this settlement wave)",
-                        shadow=shadow,
+                # ── MARGINAL RUIN GATE (2026-08-01 sunk-book ruling, the
+                # ruin axis — ``RiskLimits.ruin_gate_marginal``). The BOOK is
+                # over the ruin budget — a LEVEL no refusal can lower (the
+                # standing book is sunk; 2026-08-01 evening this branch froze
+                # ALL quoting at p_ruin 0.2994 vs 0.05 — 1,044 refusals/5min,
+                # sent = 0 — while the pregame flow it was refusing was the
+                # measured CURE: three fills that landed from in-flight
+                # reservations moved p_ruin 0.2994 → 0.1649 within 90 s).
+                # Armed, with the candidate's marginal facts supplied, the
+                # refusal becomes the SAME diversity-key admission test the
+                # marginal KILL gate rides (one criterion, one machinery —
+                # ``KillMarginalCandidate`` built by the lifecycle): admit
+                # iff certified risk-reducing, or allocated marginal tail
+                # dES99 <= the EV the candidate realistically brings
+                # (CP-lower P(accept) at the ratified alpha). Un-armed, or
+                # with no marginal facts (book-only/maintenance callers), the
+                # level refusal stands byte-identically — UNKNOWN never
+                # admits. The det-max backstop above and the unusable-
+                # snapshot fail-closed path are untouched.
+                if limits.ruin_gate_marginal and kill_marginal is not None:
+                    km = kill_marginal
+                    ev_credit_cc = float(km.ev_cc) * km.p_accept_lower
+                    if not (
+                        km.certified_risk_reducing
+                        or km.des99_cc <= ev_credit_cc
+                    ):
+                        out.append(
+                            Breach(
+                                ReasonCode.SKIP_PORTFOLIO_RUIN,
+                                f"book over ruin budget (P(ruin) "
+                                f"{book_risk.p_ruin:.4f} (upper "
+                                f"{gated_ruin:.4f}) > {ruin_budget:.4f}) "
+                                f"and candidate marginal tail "
+                                f"{km.des99_cc:.0f}cc > EV credit "
+                                f"{ev_credit_cc:.0f}cc "
+                                f"(ev {km.ev_cc}cc x p_accept_lower "
+                                f"{km.p_accept_lower:.4f}) (marginal form)",
+                                shadow=shadow,
+                            )
+                        )
+                else:
+                    out.append(
+                        Breach(
+                            ReasonCode.SKIP_PORTFOLIO_RUIN,
+                            f"P(ruin) {book_risk.p_ruin:.4f} (upper "
+                            f"{gated_ruin:.4f}) > budget {ruin_budget:.4f} "
+                            f"(equity below ruin floor this settlement wave)",
+                            shadow=shadow,
+                        )
                     )
-                )
 
         return out
 

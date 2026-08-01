@@ -440,6 +440,14 @@ class CandidateBookRiskInputs:
     # the candidate's MARGINAL effect instead of level-refusing every fill
     # (see ``sim/book_risk._candidate_gate``). Default OFF (byte-identical).
     kill_gate_marginal: bool = False
+    # MARGINAL RUIN GATE (2026-08-01, the ruin axis of the same sunk-book
+    # ruling) — the SAME ``RiskLimits.ruin_gate_marginal`` flag §(9)'s
+    # quote-time cap honors, threaded to the worker gate so an inherited
+    # over-ruin-budget PRE book judges the candidate's marginal effect on
+    # P(ruin) instead of level-refusing every fill (see
+    # ``sim/book_risk._candidate_gate`` check (4)). Default OFF
+    # (byte-identical).
+    ruin_gate_marginal: bool = False
     # GATE EV SOURCE (2026-07-25 renege root cause #2): when armed, the
     # admission EV sign check uses the calibrated pricing fair's edge for
     # this fill (pricing_edge_cc) instead of the band-high MC EV. None edge
@@ -591,6 +599,7 @@ def _worker_candidate_book_risk(
         kill_anchored_book_gate=inputs.kill_anchored_book_gate,
         hard_trip_frac=inputs.hard_trip_frac,
         kill_gate_marginal=inputs.kill_gate_marginal,
+        ruin_gate_marginal=inputs.ruin_gate_marginal,
         gate_ev_from_pricing_fair=inputs.gate_ev_from_pricing_fair,
         pricing_edge_cc=inputs.pricing_edge_cc,
         require_p_book_non_decreasing=inputs.require_p_book_non_decreasing,

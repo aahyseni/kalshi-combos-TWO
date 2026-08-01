@@ -4207,6 +4207,9 @@ class QuoteLifecycle:
             # effect at confirm instead of level-refusing (see
             # ``sim/book_risk._candidate_gate``). One flag, all sites.
             kill_gate_marginal=bool(limits.kill_gate_marginal),
+            # MARGINAL RUIN GATE (2026-08-01): same threading discipline —
+            # the one RiskLimits flag §(9) enforces from (no divergence).
+            ruin_gate_marginal=bool(limits.ruin_gate_marginal),
             # GATE EV SOURCE (2026-07-25 renege root cause #2): the CALIBRATED
             # pricing fair's edge for THIS fill — the same fair that priced
             # the quote. None when no sized pending fill (the gate then keeps
@@ -5064,15 +5067,34 @@ class QuoteLifecycle:
         enforced where certification exists — state enumeration, never a
         leg-sign heuristic at a site that lacks the state)."""
         limits = self._limits.limits
-        if not (limits.kill_gate_marginal and limits.kill_anchored_book_gate):
+        kill_armed = limits.kill_gate_marginal and limits.kill_anchored_book_gate
+        # MARGINAL RUIN GATE (2026-08-01, the ruin axis of the same ruling):
+        # the SAME candidate input serves §(9)'s marginal form — one object,
+        # one criterion, two axes. The ruin axis needs no anchor re-read, so
+        # it arms on its own flag.
+        ruin_armed = limits.ruin_gate_marginal
+        if not (kill_armed or ruin_armed):
             return None
         if ev_cc is None:
             return None
-        bankroll_cc = self._risk_bankroll_cc()
-        p_upper = kill_envelope_tail_upper(
-            self._book_risk_for_check(), limits, bankroll_cc
-        )
-        if p_upper is None or p_upper <= limits.portfolio_kill_tail_prob:
+        # REGIME PROBES — build the input iff an ARMED axis is over ITS
+        # budget (an under-budget axis never consults the marginal input, so
+        # building nothing is byte-identical there). Each probe reads the
+        # SAME snapshot/limits objects its cap enforces from, so probe and
+        # cap can never disagree about the regime.
+        over_budget = False
+        if kill_armed:
+            bankroll_cc = self._risk_bankroll_cc()
+            p_upper = kill_envelope_tail_upper(
+                self._book_risk_for_check(), limits, bankroll_cc
+            )
+            over_budget = (
+                p_upper is not None
+                and p_upper > limits.portfolio_kill_tail_prob
+            )
+        if not over_budget and ruin_armed:
+            over_budget = self._ruin_over_budget()
+        if not over_budget:
             return None
         tail_by_game, det_by_game, _ = self._book_tail_allocation()
         for g in games:
@@ -5083,6 +5105,22 @@ class QuoteLifecycle:
             p_accept_lower=float(p_accept_lower),
             des99_cc=float(des99_cc),
         )
+
+    def _ruin_over_budget(self) -> bool:
+        """§(9)'s OWN regime read, for the marginal-input probe: the CURRENT
+        snapshot's gated P(ruin) — max of the point estimate and its Wilson
+        upper bound, exactly the number the quote-time ruin cap enforces (same
+        snapshot object via ``_book_risk_for_check``, same budget read) — is
+        over ``portfolio_ruin_prob_budget``. An absent/unusable snapshot reads
+        False: §(8)'s fail-closed branch refuses those books outright, so no
+        marginal input is ever needed (and none could admit them)."""
+        snap = self._book_risk_for_check()
+        if snap is None or not getattr(snap, "usable", False):
+            return False
+        gated = max(
+            snap.p_ruin, getattr(snap, "p_ruin_upper", snap.p_ruin)
+        )
+        return gated > float(self._limits.limits.portfolio_ruin_prob_budget)
 
     def _kill_marginal_for_quote(
         self, result: ConstructedQuote, risk_qty: CentiContracts,
@@ -5100,7 +5138,10 @@ class QuoteLifecycle:
         THROUGHPUT: the flag guard runs FIRST — disarmed, this is two
         attribute reads per quote and nothing else."""
         limits = self._limits.limits
-        if not (limits.kill_gate_marginal and limits.kill_anchored_book_gate):
+        if not (
+            (limits.kill_gate_marginal and limits.kill_anchored_book_gate)
+            or limits.ruin_gate_marginal
+        ):
             return None
         ev_cc = self._quote_candidate_ev_cc(result, risk_qty)
         if ev_cc is None:
