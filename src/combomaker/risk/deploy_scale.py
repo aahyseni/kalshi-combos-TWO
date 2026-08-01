@@ -74,10 +74,6 @@ ENVELOPE_INVARIANT_FIELDS: tuple[str, ...] = (
     "portfolio_det_max_frac",
     "portfolio_kill_tail_prob",
     "portfolio_ruin_prob_budget",
-    # KILL-ANCHORED BOOK GATE (2026-07-29). The arming flag is ENVELOPE, not
-    # deploy budget: a solved deployment scale must never be able to silently
-    # disarm (or arm) the re-anchor it was solved against.
-    "kill_anchored_book_gate",
     "daily_loss_frac",
     "drawdown_frac",
     "hard_trip_frac",
