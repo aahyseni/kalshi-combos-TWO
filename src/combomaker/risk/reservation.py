@@ -66,6 +66,7 @@ from combomaker.risk.limits import (
     Breach,
     DailyPnl,
     HaltInputs,
+    KillMarginalCandidate,
     LimitChecker,
     PortfolioRisk,
     StartTimeProvider,
@@ -289,6 +290,7 @@ class RiskReservationService:
         waived_games: Mapping[str, WaiverCertificate] | None = None,
         apply_resting_haircut: bool = False,
         deploy_scale: float = 1.0,
+        kill_marginal: KillMarginalCandidate | None = None,
     ) -> ReserveResult:
         """Atomically reserve headroom for ``candidate`` if the limits allow it.
 
@@ -361,6 +363,10 @@ class RiskReservationService:
             # The caller passes the SAME ``deploy_scale_for_check()`` value; the
             # default 1.0 is byte-identical to before this existed.
             deploy_scale=deploy_scale,
+            # MARGINAL KILL GATE (2026-08-01): the candidate's marginal facts,
+            # forwarded verbatim — consulted ONLY by §(8a)'s armed marginal
+            # form on an over-budget book (None = level form, byte-identical).
+            kill_marginal=kill_marginal,
         )
         enforced = self._split(raw)
         if enforced:
@@ -397,6 +403,7 @@ class RiskReservationService:
         book_risk: PortfolioRisk | None = None,
         apply_resting_haircut: bool = False,
         deploy_scale: float = 1.0,
+        kill_marginal: KillMarginalCandidate | None = None,
     ) -> list[Breach]:
         """RE-CHECK the ENFORCED deterministic caps for an ALREADY-HELD
         reservation against the **current** book. Returns the enforced breaches
@@ -445,6 +452,9 @@ class RiskReservationService:
             book_risk=book_risk,
             apply_resting_haircut=apply_resting_haircut,
             deploy_scale=deploy_scale,
+            # MARGINAL KILL GATE (2026-08-01): forwarded verbatim (see
+            # ``try_reserve``); None = level form, byte-identical.
+            kill_marginal=kill_marginal,
         )
         return self._split(raw)
 
