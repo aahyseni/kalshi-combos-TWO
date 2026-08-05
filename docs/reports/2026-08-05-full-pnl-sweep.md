@@ -28,8 +28,8 @@ settled combo tickers** (vs 289 at the last pooled read — 2.3×).
 | **WRONG** (reversed) | expensive-NO ≈ +1.2%, twice-replicated | third replication FAILED: 80–92¢ band **−2.9% ROI** (n=42, 8 cl), 92¢+ **−7.6%** (n=6) — both HYPOTHESIS-thin, but the sign flipped |
 | **CONFIRMED** | cheap-NO +77.9% stays dead | <40¢ band −0.3% ROI (n=68, 10 cl); 40–60¢ **−2.9%** (n=285, 11 cl, P(real≤0)=0.670) |
 | **CONFIRMED** | GAME×TOTAL / GAME×KS positive (correlation-credit watch) | GAME×TOTAL **+$307.63 real / +$268.21 excess** (n=65, 8 cl, P(real≤0)=0.000) — 3rd consecutive replication, still <10 cl; GAME×KS +$51.14 |
-| **CONFIRMED** | KXMLBHIT and pure-KS negative | pure-KS **−$167.88 / excess −$229.10** (8 cl); HIT-any excess −$44.01 (7 cl) — HIT improved vs the −$147 read, KS got worse |
-| **CONFIRMED** | 8/3 = 100 fills/$2,230, 8/4 = 115/$2,132; 8/5 halt at −$233 | exact to the fill: 100/$2,230.31 and 115/$2,131.57; settles before the 8/5 06:31 ET halt = **−$231.05** |
+| **SPLIT** (was CONFIRMED) | KXMLBHIT and pure-KS negative | pure-KS **−$167.88 / excess −$229.10** (8 cl) stays negative — but leave-one-cluster-out flips its realized sign (+$19.85), so HYP; **HIT-any realized FLIPPED POSITIVE (+$44.35)**, excess still −$44.01 (7 cl, sign-flip P=0.46) — the standing "HIT negative" claim is NOT replicated on realized $ |
+| **CONFIRMED** | 8/3 = 100 fills/$2,230, 8/4 = 115/$2,132; 8/5 halt at −$233 | exact to the fill **store-side**: 100/$2,230.31 and 115/$2,131.57 (exchange-side runs slightly higher — 102/$2,251.34 and 118/$2,189.51 — the fills-store gaps); settles before the 8/5 06:31 ET halt = **−$231.05** |
 | **CONFIRMED** | the single-combo concentration seam | top-10 \|P&L\| rows = **+$552.70 net = 121% of the era's entire +$455.03**; top 10% of tickets carry 41.3% of premium |
 | **RESOLVED** (was open) | "3 TAKER prints on a maker-only book — trace the path" | every era taker print is **`fill_recovery_late_execution`** — the INCIDENT-C recovery booking a quote the exchange first reported cancelled/failed; the late print is marked taker. NOT a rogue quoting path. 6 new ones today (8/5 16:03–17:18 ET), store edge negative on all 6 |
 | **NEW** | ledger overstates losses on multi-fill positions | 24 era tickers, ledger shows **$132.24 more loss than the exchange** (16 of them multi-`position_ledger`-row); `halt_daily_loss` anchors read this overstated number |
@@ -51,8 +51,10 @@ the whole sweep)**; 40–60¢ gave back −$132, 80¢+ gave back −$73, 5+-leg 
 gave back −$384. Whales still carry everything: top-10 tickets = 121% of net.
 The 7/31 machine repairs **changed volume, not edge**: model EV accrual is
 2.58¢/$1 pre-8/1 vs 2.55¢/$1 post; premium deployed jumped 2.5×; post-era
-realized +$325.19 with P(real≤0)=0.016 but only 6 clusters (HYP). The taker
-mystery is closed (late-execution recovery prints, adverse by construction).
+realized +$325.19 on EV-recovered rows (+$282.23 on ALL rows, P(real≤0)=0.103)
+— HYP. The taker
+mystery is closed (late-execution recovery prints, adverse by construction —
+all 11 era prints matched 1:1 to `fill_recovery_late_execution` log events).
 Accounting seams found: ledger overstates era losses by $132.24 (multi-fill
 double-count — **this is the number the daily-loss halt reads**) and 7
 settlements (−$94.07) are invisible to both stores. **Best next $: (1) the
@@ -108,14 +110,18 @@ the 2.5× cheap-NO taxes were built against, sign now reversed vs the old +1.2%.
 
 **Leg families (top cells, excess $):** GAME×TOTAL +$268.21 (n=65, 8 cl,
 P(real≤0)=0.000) · HRR×KS +$155.00 · HR×KS +$101.84 · KS×SPREAD +$91.90 ·
-GAME×KS +$39.83 — versus pure-KS **−$229.10** (n=113, 8 cl), pure-SPREAD
-**−$155.40** (n=7, NEW watch cell; 5 of 7 rows lost, no single whale),
-HR −$95.74, HIT-any −$44.01 (n=149, 7 cl). Same-game GAME×anything credit keeps
-replicating; single-family prop stacks keep bleeding. All [HYP<10cl].
+GAME×KS +$39.83 — versus pure-KS **−$229.10** (n=113, 8 cl; realized −$167.88
+but leave-one-cluster-out flips it to +$19.85), pure-SPREAD **−$155.40 excess /
+−$154.06 realized** (n=7, NEW watch cell; 5 of 7 rows lost, no single whale —
+but only **2 clusters** and dropping one flips the sign to +$38.43),
+HR −$95.74, HIT-any excess −$44.01 but **realized +$44.35** (n=149, 7 cl,
+sign-flip P=0.46 — the standing "HIT negative" is not replicated on realized).
+Same-game GAME×anything credit keeps replicating; single-family prop stacks
+mostly keep bleeding. All [HYP<10cl].
 
-**Sport:** MLB 640 rows +$462.30 (9 cl); esports 14 rows +$86.80 (5 cl, incl.
-the KXCS2GAME +$72.90); unknown-legs 7 rows −$94.07 (the invisible ones).
-Esports-collection naming still ≠ esports legs.
+**Sport:** MLB 640 rows +$462.30 (9 cl [HYP], sign-flip P=0.10); esports 14
+rows +$86.80 (5 cl [HYP], incl. the KXCS2GAME +$72.90); unknown-legs 7 rows
+−$94.07 (the invisible ones). Esports-collection naming still ≠ esports legs.
 
 **Ticket size:** <$5: +$3.50 · $5–15: +$62.20 · $15–30: +$90.96 · $30–60:
 **−$165.40** · $60+: **+$463.77** (n=58, 9 cl [HYP]). Top-10 |P&L| rows net
@@ -124,14 +130,21 @@ Esports-collection naming still ≠ esports legs.
 top-10 are near-coin 2–3-leg tickets ≥130 contracts with |EV| < $5 — the P1
 per-structure-bounds seam, measured again from both signs.
 
-**Leg count:** 2-leg +$652.81 (10 cl) · 3-leg +$290.05 (11 cl) · 4-leg −$9.46 ·
-5+-leg **−$384.29, excess −$454.45, −27% ROI** (n=84, 7 cl [HYP]; worst-3 rows
-−$285, but still −$99 without them). Compounding correlation error with leg
-count is the natural mechanism — measurement item, not a knob.
+**Leg count:** 2-leg +$652.81 (10 cl, sign robust: P(flip)=0.016) · 3-leg
++$290.05 (11 cl but sign-flip P=0.195 under cluster resampling → **[HYP]
+despite the cluster count**) · 4-leg −$9.46 (coin-flip) · 5+-leg **−$384.29,
+excess −$454.45, −27% ROI** (n=84, 7 cl [HYP] by cluster count, though the
+sign itself is LOCO-stable and P(flip)=0.000; worst-3 rows −$285, but still
+−$99 without them). Compounding correlation error with leg count is the
+natural mechanism — measurement item, not a knob.
 
 **Maker vs taker:** maker-only 656 rows +$474.93; taker-touched 5 rows −$19.90.
-**Trace closed:** all era taker prints (7/31, 8/1 ×3, 8/2, 8/5 ×6) are
-`fill_recovery_late_execution` events — the quote was reported cancelled/
+**Trace closed (log-verified):** all 11 era taker prints (7/31, 8/1 ×3, 8/2,
+8/5 ×6) matched **1:1 by `created_time` + ticker to
+`fill_recovery_late_execution` WARNING events in the live logs**
+(`live_20260731_1818` / `_20260801_1142/_1412/_1957` / `_20260805_1601/_1718`),
+emitted at `src/combomaker/rfq/lifecycle.py:7067`, every event carrying
+`is_taker=true` — the quote was reported cancelled/
 "execution failed", the INCIDENT-C verifier later found the true execution and
 booked it; the exchange marks that print taker. No quoting path crossed the
 book. The 6 prints today (16:03–17:18 ET, ~58 contracts @~51.6¢) all carry
@@ -148,16 +161,22 @@ present, evidence-blocked by the missing axis. **Zero in-play fills era-wide**
 
 **Day-by-day (ET settle day / premium deployed that ET day):**
 
-| day | n | W/L | realized | EV | cum | deployed |
-|---|---|---|---|---|---|---|
-| 7/28 | 88 | 62/26 | **+$408.77** | +$30.94 | +$408.77 | $1,266.19 |
-| 7/29 | 42 | 22/20 | −$140.44 | +$30.19 | +$268.34 | $287.87 |
-| 7/31 | 22 | 17/5 | −$10.34 | +$14.70 | +$257.99 | $1,714.72 |
-| 8/1 | 116 | 71/45 | +$291.89 | +$66.13 | +$549.88 | $2,450.17 |
-| 8/2 | 191 | 104/87 | **−$264.43** | +$75.57 | +$285.46 | $2,778.82 |
-| 8/3 | 79 | 49/30 | +$198.34 | +$40.07 | +$483.79 | $2,230.31 |
-| 8/4 | 93 | 54/39 | +$179.48 | +$55.84 | +$663.28 | $2,131.57 |
-| 8/5 | 30 | 14/16 | −$208.24 | +$19.00 | **+$455.03** | $797.69 |
+| day | n | W/L | realized | EV | cum | deployed (exch) | deployed (store) |
+|---|---|---|---|---|---|---|---|
+| 7/28 | 88 | 62/26 | **+$408.77** | +$30.94 | +$408.77 | $1,260.39 | $1,266.19 |
+| 7/29 | 42 | 22/20 | −$140.44 | +$30.19 | +$268.34 | $287.87 | $287.87 |
+| 7/31 | 22 | 17/5 | −$10.34 | +$14.70 | +$257.99 | $2,016.68 | $1,714.72 |
+| 8/1 | 116 | 71/45 | +$291.89 | +$66.13 | +$549.88 | $2,456.57 | $2,450.17 |
+| 8/2 | 191 | 104/87 | **−$264.43** | +$75.57 | +$285.46 | $2,782.04 | $2,778.82 |
+| 8/3 | 79 | 49/30 | +$198.34 | +$40.07 | +$483.79 | $2,251.34 | $2,230.31 |
+| 8/4 | 93 | 54/39 | +$179.48 | +$55.84 | +$663.28 | $2,189.51 | $2,131.57 |
+| 8/5 | 30 | 14/16 | −$208.24 | +$19.00 | **+$455.03** | $797.01 | $797.69 |
+
+Deployed provenance (verification fix): the exchange column is the truth
+(`/portfolio/fills` per ET fill day); the store column is the local fills
+ledger. The biggest gap is **7/31: store $1,714.72 vs exchange $2,016.68
+(−$301.96)** — the era's 18 fills-store gaps concentrate there. The memory-row
+"confirmations" above (8/3, 8/4) are store-side counts.
 
 Deployment tripled post-8/1 while daily EV rose proportionally (~+$60/day at
 ~$2.4k/day) — the repairs bought throughput at constant per-$ edge.
@@ -171,7 +190,8 @@ Deployment tripled post-8/1 while daily EV rose proportionally (~+$60/day at
 | **P(excess≤0)** | **0.242** (0.200 @ 289 settles, 0.061 @ ~2 wks ago) | still HYPOTHESIS — 2.3× the data, the claim got weaker again |
 | P(realized≤0) | 0.127 (21 clusters) | |
 | pre-8/1-ET fills | n=172, prem $3,720.73, EV +$96.06 (**2.58¢/$1**), real +$239.23, P(exc≤0)=0.307 (9 cl) | |
-| post-8/1-ET fills | n=474, prem $9,272.70, EV +$236.37 (**2.55¢/$1**), real +$325.19, P(exc≤0)=0.372, P(real≤0)=**0.016** (6 cl [HYP]) | |
+| post-8/1-ET fills | n=474, prem $9,272.70, EV +$236.37 (**2.55¢/$1**), real +$325.19, P(exc≤0)=0.372, P(real≤0)=**0.016** (6 cl [HYP]) | EV-recovered rows only |
+| post-8/1-ET fills, ALL rows (verification fix) | real **+$282.23** incl. the no-EV rows (invisible settles etc.), 11 cl, P(real≤0)=**0.103** — the 0.016 above is flattered by dropping −$109.39 of no-EV rows; post-era profitability is HYP either way | adversarial re-derivation |
 
 **Verdict: the machine repairs changed VOLUME (2.5×), not the per-$ edge
 (2.58 → 2.55¢/$1 model EV; excess remains statistically zero).** The book earns
@@ -194,7 +214,7 @@ whale-shaped losses inside it, not miscounting.
 
 | # | candidate | class | measured basis | est. $ |
 |---|---|---|---|---|
-| 1 | **Utilization-backstop repair** (per-game double-count ×3.6 + ratify 3×) — the standing REMIND-8/2 decision | **[DECISION]** (fix is [MEASURED-STRUCTURAL]) | 8/5: 182,975 util=1.00 near-cap events + 122,919 cap-skips vs 36 accepts; model EV runs +2.5¢/$1 on admitted flow | largest: each $1k/day premium re-admitted ≈ +$25/day model EV; era days ran $2.2–2.8k deployed |
+| 1 | **Utilization-backstop repair** (per-game double-count ×3.6 + ratify 3×) — the standing REMIND-8/2 decision | **[DECISION]** (fix is [MEASURED-STRUCTURAL]) | 8/5: 182,975 util=1.00 near-cap events + 122,919 cap-skips vs 36 accepts; model EV runs +2.5¢/$1 on admitted flow | largest: each $1k/day premium re-admitted ≈ +$25/day model EV; era days ran $2.2–2.8k deployed. Caveat: the +2.5¢/$1 is measured on ADMITTED flow — refused flow need not carry the same EV; the $ figure is an anchor, not a forecast |
 | 2 | **P1 Stage-1 per-STRUCTURE net bounds** (reservation path; dossier 7/25) | [MEASURED-STRUCTURAL] | top-10 tickets = 121% of era net; $60+ band ±$464; the −$143.89 whale class re-measured from the win side (+$96 near-coins ×4) | tames the ±$100–150/night single-ticket swing that currently IS the P&L |
 | 3 | **Accounting sweep extension** (blast radius: monitoring/halt inputs only, never pricing) | [MEASURED-STRUCTURAL] | ledger −$132.24 loss-overstatement (multi-fill positions); 7 invisible settlements −$94.07; 18 store gaps; 15 scalar settles | correctness of `halt_daily_loss` input (the 8/5 halt read −$233 vs true −$231 — benign today, mechanism unsound) |
 | 4 | Late-execution recovery = adverse class: persist recovery-time edge + `is_taker`, feed pickoff monitor | [MEASURED-STRUCTURAL] (small $) | 11 era prints, settled ones −$19.90; 6/6 today negative store edge vs positive gate EV | small direct $; closes the last "unexplained path" |
@@ -206,6 +226,51 @@ whale-shaped losses inside it, not miscounting.
 
 **No refit performed or recommended from any P&L cut above.** Items 6–8 are
 pre-registered watches; action requires structural measurement at ≥10 clusters.
+
+## 6) Adversarial verification addendum (same day, independent re-derivation)
+
+A second pass re-derived the table from the **raw exchange cache only**
+(`ex_settlements.json`/`ex_fills.json`, entry price from exchange
+`no_total_cost/no_count` — not the sweep's intermediates or the db-store), with
+an independently coded cluster bootstrap on a different seed
+(`sweep/adv_rederive.py`, `sweep/adv_stress.py`).
+
+**Re-derived EXACTLY:** era 661 / **+$455.03** / 393W-268L 59.5% / cw entry
+58.3¢; full-pull 913 / +$1,074.67; ledger era +$416.88 (Δ +$38.15) and full
++$608.40; all five entry-band rows to the cent (−2.76 / −132.29 / **+663.31** /
+−50.09 / −23.14) with identical W%; all eight day-realized rows; maker-only
++$474.93 vs taker −$19.90; top-10 = +$552.70 (121%, 10.8% gross); top-decile
+premium share 41.3%; P(real≤0)=0.127; P(exc≤0)=0.239 vs 0.242 (seed noise);
+8/2 store fills 191/$2,778.82. **Named provenance deltas (not errors, now
+labeled):** headline premium $13,428.75 is the store-preferred hybrid —
+pure exchange cost basis is **$13,433.04** (Δ $4.29, the store gaps); contracts
+23,051 store-hybrid vs 23,060 exchange; the day-table deployed column was
+store-side in the draft (fixed above — 7/31 was understated by $301.96).
+
+**Cluster-robustness stress (leave-one-cluster-out + 40k-draw bootstrap):**
+
+| cell | LOCO sign flips | P(sign flip) | verdict |
+|---|---|---|---|
+| **60–80¢ +$663.31** | 0 of 16 (worst +$419.42) | 0.003 | **ROBUST — stands as the sweep's one solid cell** |
+| 2-leg +$652.81 | 0 of 10 (worst +$305.31) | 0.016 | robust |
+| 5+-leg −$384.29 / GAME×TOTAL +$307.63 | 0 flips, P=0.000 | 0.000 | sign-stable but 7–8 cl → stay [HYP] by cluster rule |
+| era realized +$455.03 | 0 of 21 (worst +$225.06) | 0.127 | positive but not significant (as reported) |
+| era excess +$231.99 | 0 of 14 (worst +$47.00) | 0.239 | HYPOTHESIS (as reported) |
+| 3-leg +$290.05 | 0 flips | **0.195** | **demoted to [HYP]** despite 11 cl |
+| MLB +$462.30 / $60+ +$463.77 / esports +$86.80 | 0 flips | 0.103 / 0.164 / 0.158 | [HYP] |
+| pure-KS −$167.88 | **1 flip (→ +$19.85)** | 0.287 | [HYP], one cluster carries the sign |
+| pure-SPREAD −$154.06 real | **1 flip (→ +$38.43), only 2 clusters** | 0.249 | [HYP], barely a cell |
+| HIT-any | realized **+$44.35** vs excess −$44.01 | 0.46 | coin-flip — standing "HIT negative" NOT replicated |
+| <40¢ / 40–60¢ / 80–92¢ / 4-leg / $30–60 | 1–5 flips | 0.24–0.49 | signs are noise; only the "no edge here" reading survives |
+
+**Tag audit (improvement ranking):** all five [MEASURED-STRUCTURAL] tags
+verified structural (mechanism defects or measurement builds — none is a
+markup/sizing change derived from a P&L cut); the #1 $-estimate got an
+admitted-vs-refused-flow transfer caveat. **Taker trace verified to code:**
+11/11 era taker prints matched 1:1 (created_time + ticker + `is_taker=true`) to
+`fill_recovery_late_execution` events in the live logs, emitted at
+`lifecycle.py:7067`. **Core verdict: every headline number survived; the
+demotions above are the only changes.**
 
 ## NEXT STEPS
 
