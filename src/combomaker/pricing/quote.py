@@ -129,6 +129,7 @@ def construct_quote(
     markup_cc: int = 0,
     width_multiplier: float = 1.0,
     basket_extra_applies: bool = False,
+    dnp_ask_floor_cc: int | None = None,
     params: QuoteParams | None = None,
 ) -> ConstructedQuote | NoQuote:
     p = params or QuoteParams()
@@ -216,6 +217,20 @@ def construct_quote(
     # YES and more for NO (attract the flow that flattens us).
     yes_raw = fair_cc - margin - fee_yes - inventory_skew_cc
     no_raw = (CC_PER_DOLLAR - fair_cc) - margin - fee_no + inventory_skew_cc
+
+    # DNP SCALAR ASK FLOOR (2026-08-06, pricing/dnp_scalar.py): for a
+    # single-player-driven combo the caller passes the DNP settlement value
+    # ⌊∏s⌋ (centi-cents). The implied YES ask ($1 − no_bid) must never sit
+    # BELOW it: a taker who KNOWS the player is scratched (h=1 — the measured
+    # 3-for-3 pickoff class) would otherwise buy our YES under what the
+    # exchange will pay it on the scratch. Clamping ``no_raw`` DOWN only ever
+    # RAISES the ask (never lowers one — property-tested), and both later
+    # clamps (free-money, grid snap-down) also only lower ``no_bid``, so the
+    # floor survives them. Inactive (byte-identical arithmetic) whenever the
+    # normal ask already clears the floor — i.e. whenever the DNP gap
+    # Δ = ⌊∏s⌋ − fair is inside the margin — which is every normal combo.
+    if dnp_ask_floor_cc is not None and dnp_ask_floor_cc > 0:
+        no_raw = min(no_raw, CC_PER_DOLLAR - dnp_ask_floor_cc)
 
     clamped_free_money = False
     if yes_cap_cc is not None and yes_raw > yes_cap_cc - p.free_money_margin_cc:

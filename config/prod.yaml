@@ -23,6 +23,15 @@ pricing:
     # YES (accepting our yes_bid = the -14c/ct adversely-selected fade side).
     # See docs/reports/2026-07-08-combo-yes-no-side-mechanics.md.
     sell_parlays_only: true
+  # DNP SCALAR GUARD (2026-08-06 build, SHADOW-DARK — operator ratification,
+  # verbatim: "I don't want to get picked off by full scalar ones"). ARMING
+  # LINE (uncomment at the operator's next restart; also in the .local.yaml
+  # the live bot loads): void-branch fair mixture (measured hazard h) + the
+  # implied-YES-ask floor at the DNP settlement value ⌊∏s⌋ for combos whose
+  # legs all ride ONE player — "we either profit or don't lose" on a scratch.
+  # docs/reports/2026-08-06-dnp-scalar-guard-build.md.
+  # dnp_scalar:
+  #   enabled: true
 
 # Pregame-only quote gate (Phase 3, operator directive 2026-07-10) is ACTIVE
 # by default: combos with ANY in-play or unknown-start leg are declined, all

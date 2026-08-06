@@ -71,3 +71,17 @@ enhancement spec: operator memory `project_kct_player_level_risk_gap`.
   checked, never hot-patched (owner: me; operator prioritizes).
 - **Watch:** continued same-player hammering growing one-entity concentration until
   the player-level cap exists (owner: me).
+
+---
+
+**SCALAR CAVEAT (added 2026-08-06).** Every "CLEAN / mutex-containment bound
+holds" claim above is a **binary-settlement** statement only. The AZ@STL Marte
+combo in this very slate settled **scalar** (DNP: leg `result="scalar"` ⇒ combo
+pays ⌊∏ leg marks⌋ = the independence product), which **bypasses** the mutex/
+containment bound rather than testing it — the slate reconcile's "Marte shorts
+−$18.98, mutex bound HELD" absorbed a −$9.22 scalar BYPASS (T1) without
+recognizing it. Two more identical pickoffs followed 8/5 (total −$39.75,
+3-for-3 on offered volume). Forensics + the exact rule text:
+[2026-08-06-dnp-scalar-pickoff.md](2026-08-06-dnp-scalar-pickoff.md); guard
+build (void-branch pricing + DNP ask floor):
+[2026-08-06-dnp-scalar-guard-build.md](2026-08-06-dnp-scalar-guard-build.md).

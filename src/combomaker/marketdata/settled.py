@@ -148,6 +148,12 @@ class SettledMarginalResolver:
         # inconsistent row). Remembered so they are not refetched forever;
         # their legs stay UNKNOWN (fail-closed).
         self._unresolvable: set[str] = set()
+        # GRADED scalar outcomes specifically (a subset of the unresolvable
+        # bookkeeping): a scalar grade is a settlement FACT — just not a 0/1
+        # one — and it is exactly the DNP/rain evidence the scalar-hazard
+        # measurement counts (pricing/dnp_scalar.py). Permanent, like
+        # ``_results``: a settlement never changes.
+        self._scalar_results: set[str] = set()
         # ticker → recheck floor (monotonic ns) set when a fetch found the
         # market LIVE. A held leg's book can flicker invalid during a WS
         # resync; without the floor every flicker would re-note + refetch on
@@ -221,6 +227,23 @@ class SettledMarginalResolver:
         after rehydration while the position generation is static — a cache
         keyed on position generation alone would pin the UNRESOLVED shares."""
         return len(self._results)
+
+    @property
+    def leg_outcome_generation(self) -> int:
+        """MONOTONE version counter over EVERY graded outcome this cache holds
+        — binary facts + graded scalars (both permanent, never removed). The
+        lifecycle's DNP-hazard refresh keys on it: unchanged generation ⇒ no
+        recount (cheap int compare on the maintenance tick)."""
+        return len(self._results) + len(self._scalar_results)
+
+    def leg_outcomes(self) -> list[tuple[str, str]]:
+        """Every graded leg outcome as ``(ticker, result)`` with result in
+        {"yes", "no", "scalar"} — the session's settled-leg corpus for the
+        DNP-hazard measurement (pricing/dnp_scalar.counts_from_outcomes).
+        Pure in-memory read; called on the slow loop only."""
+        rows = [(t, r.result) for t, r in self._results.items()]
+        rows.extend((t, "scalar") for t in self._scalar_results)
+        return rows
 
     def market_no_longer_live(self, market_ticker: str) -> bool:
         """True iff the EXCHANGE told us this market is no longer live: a
@@ -453,10 +476,14 @@ class SettledMarginalResolver:
 
         if result == "scalar":
             # A scalar outcome is never a 0/1 leg fact — permanently
-            # unresolvable here; the leg stays UNKNOWN (fail-closed).
+            # unresolvable here; the leg stays UNKNOWN (fail-closed). A GRADED
+            # scalar is still a settlement fact for the DNP-hazard measurement
+            # (leg_outcomes) — recorded separately, never a marginal.
             log.warning("settled_scalar_unresolvable", ticker=ticker, status=status)
             self._drop_pending(ticker)
             self._unresolvable.add(ticker)
+            if status in GRADED_STATUSES:
+                self._scalar_results.add(ticker)
             return False
 
         if result in ("yes", "no") and status in GRADED_STATUSES:

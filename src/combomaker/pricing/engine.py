@@ -29,6 +29,11 @@ from combomaker.marketdata.feed import OrderbookFeed
 from combomaker.marketdata.metadata import MetadataCache
 from combomaker.ops.config import PricingConfig
 from combomaker.ops.logging import get_logger
+from combomaker.pricing.dnp_scalar import (
+    DnpHazards,
+    baseline_hazards,
+    single_player_scope,
+)
 from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
 from combomaker.pricing.joint import JointEstimate, price_containment, price_joint_matrices
 from combomaker.pricing.legs import KalshiBookSource, LegBelief, OddsSource, blend_beliefs
@@ -217,6 +222,17 @@ class PricingEngine:
             )
             else None
         )
+        # DNP scalar guard (2026-08-06, pricing/dnp_scalar.py): void-branch
+        # mixture + sniper ask floor for single-player-driven combos. SHADOW
+        # default OFF — with the flag off the suffix does ZERO extra work and
+        # the pricer is byte-identical (era-replay proven). getattr: duck-typed
+        # test configs without the field mean "disabled", never a crash.
+        dnp_cfg = getattr(config, "dnp_scalar", None)
+        self._dnp_enabled = bool(dnp_cfg is not None and dnp_cfg.enabled)
+        # Hazards start at the measured baseline table; the lifecycle MERGES
+        # the live session's settled-leg counts on the settlement cadence via
+        # set_dnp_hazard_counts (slow loop — never the quote path).
+        self._dnp_hazards: DnpHazards = baseline_hazards()
 
     @property
     def sgp_params(self) -> SgpParams:
@@ -346,6 +362,39 @@ class PricingEngine:
         leg_books = [self._feed.book(leg.market_ticker) for leg in rfq.legs]
         yes_cap, no_cap = free_money_caps(leg_books, sides)
 
+        # DNP SCALAR GUARD (2026-08-06). Runs AFTER the joint memo (the cached
+        # JointEstimate stays pure) and only when the flag is armed — flag off
+        # is zero extra work. For a single-player-driven combo:
+        #  1. VOID-BRANCH MIXTURE: fair ← (1−h)·V_corr + h·⌊∏s⌋ with h = the
+        #     measured DNP hazard (max over the combo's leg families;
+        #     family-thin fails closed to pooled). Applied only when the DNP
+        #     value EXCEEDS the correlated fair (Δ > 0) — the correction may
+        #     only raise our ask, mirroring UNKNOWN→widen. No corpus ⇒ no
+        #     mixture (the floor below carries the protection alone).
+        #  2. SNIPER FLOOR: construct_quote floors the implied YES ask at
+        #     ⌊∏s⌋, so a taker who KNOWS the scratch (h=1) pays at least the
+        #     scalar settlement value — we either profit or don't lose.
+        dnp_floor_cc: int | None = None
+        if self._dnp_enabled:
+            dnp_scope = single_player_scope(rfq.legs, beliefs, sides)
+            if dnp_scope is not None:
+                dnp_floor_cc = dnp_scope.floor_cc
+                floor_p = dnp_scope.floor_cc / CC_PER_DOLLAR
+                if floor_p > joint.p:
+                    hazard = self._dnp_hazards.hazard_for(dnp_scope.families)
+                    if hazard is not None and hazard > 0.0:
+                        mixed_p = (1.0 - hazard) * joint.p + hazard * floor_p
+                        joint = replace(
+                            joint,
+                            p=mixed_p,
+                            notes=(
+                                *joint.notes,
+                                f"dnp void-branch: h={hazard:.4f} "
+                                f"floor={dnp_scope.floor_cc}cc "
+                                f"entity={dnp_scope.entity or 'UNKNOWN'}",
+                            ),
+                        )
+
         markup_sport, markup_cc = self._markup.markup_for(
             (leg.market_ticker for leg in rfq.legs),
             fair_cc=int(round(joint.p * 10_000)),
@@ -372,6 +421,7 @@ class PricingEngine:
             markup_cc=markup_cc,
             width_multiplier=self._width_multiplier(beliefs, sides),
             basket_extra_applies=is_single_family_no_basket(list(rfq.legs), sides),
+            dnp_ask_floor_cc=dnp_floor_cc,
             params=self._quote_params,
         )
         return self._enforce_sell_only(quote)
@@ -381,6 +431,15 @@ class PricingEngine:
         """(hits, misses, size) of the joint memo — observability seam for the
         quote app to log the live hit rate (the throughput lever)."""
         return self._joint_cache_hits, self._joint_cache_misses, len(self._joint_cache)
+
+    def set_dnp_hazard_counts(self, live_counts: dict[str, tuple[int, int]]) -> None:
+        """Merge the LIVE session's settled-leg counts (family → (scalar_n,
+        finalized_n), from the settled-leg cache) onto the measured baseline —
+        the settlement-cadence refresh of the DNP hazard, so h keeps adapting
+        as our own legs grade. Called from the lifecycle's maintenance tick
+        (slow loop, only when the settled generation moved); a plain attribute
+        swap of an immutable value, so the quote path never sees a torn read."""
+        self._dnp_hazards = baseline_hazards().merged(live_counts)
 
     def _joint_cached(
         self,

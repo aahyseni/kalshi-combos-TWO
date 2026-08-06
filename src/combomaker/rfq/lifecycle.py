@@ -73,6 +73,7 @@ from combomaker.ops.pricing_pool import (
     _worker_state_worst_case,
 )
 from combomaker.ops.write_budget import TokenBudget, WriteBudget
+from combomaker.pricing import dnp_scalar
 from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.fees import FeeModel, FeeType, FeeUnknownError
 from combomaker.pricing.grouping import game_key
@@ -1617,6 +1618,12 @@ class QuoteLifecycle:
         self._settled = settled_marginals
         # Single-flight fetch task (the book-risk-task pattern in miniature).
         self._settled_task: asyncio.Task[int] | None = None
+        # DNP-hazard refresh watermark (2026-08-06, pricing/dnp_scalar.py):
+        # the settled cache's leg_outcome_generation last pushed into the
+        # engine's hazard merge. -1 forces one push on the first tick with a
+        # resolver wired, so the engine's baseline picks up any rehydrated
+        # facts immediately.
+        self._dnp_hazard_gen: int = -1
         # Committed-position leg tickers, cached per position generation, so
         # the hot-path fallback only ever REGISTERS resolution candidates for
         # legs we actually HOLD (an RFQ leg with no book stays a plain
@@ -8344,6 +8351,26 @@ class QuoteLifecycle:
             return
         self._settled_task = asyncio.ensure_future(self._settled.resolve_pending())
 
+    def _maybe_refresh_dnp_hazards(self) -> None:
+        """Push the session's settled-leg outcome counts into the engine's
+        DNP-hazard merge whenever the settled cache's outcome generation
+        moved (pricing/dnp_scalar.py — the settlement-cadence refresh of the
+        measured hazard h). Cheap int compare per tick; the recount walks the
+        permanent outcome cache only when a new fact landed. Fail-isolated:
+        any error logs and leaves the watermark unmoved (retried next tick) —
+        never raises into the maintenance tick."""
+        if self._settled is None:
+            return
+        try:
+            generation = self._settled.leg_outcome_generation
+            if generation == self._dnp_hazard_gen:
+                return
+            counts = dnp_scalar.counts_from_outcomes(self._settled.leg_outcomes())
+            self._engine.set_dnp_hazard_counts(counts)
+            self._dnp_hazard_gen = generation
+        except Exception as exc:  # noqa: BLE001 — diagnostics only, never the tick
+            log.warning("dnp_hazard_refresh_failed", error=repr(exc))
+
     async def maintenance_tick(self) -> None:
         """TTL expiry + reprice + P&L mark + daily-loss halt. Every few 100ms."""
         self._refresh_daily_pnl()
@@ -8377,6 +8404,13 @@ class QuoteLifecycle:
         # recompute paths above, which are what REGISTER the missing committed
         # legs (via ``_marginals``), so the first pass already sees them all.
         self._maybe_resolve_settled_marginals()
+        # DNP-HAZARD REFRESH (2026-08-06): when a new graded outcome (binary
+        # or scalar) landed in the settled cache, recount the session's
+        # settled-leg corpus and merge it onto the engine's measured baseline
+        # hazard (pricing/dnp_scalar.py). Slow loop only — a generation
+        # compare per tick, a recount only when it moved. Errors log and
+        # retry next tick; they never reach the pricing path (fix isolation).
+        self._maybe_refresh_dnp_hazards()
         # SETTLEMENT RECEIVABLES (2026-07-19): once a position's outcome is
         # KNOWN from graded facts, its predicted credit shields the give-back
         # halts from the settlement-cascade equity trough. After the resolver
