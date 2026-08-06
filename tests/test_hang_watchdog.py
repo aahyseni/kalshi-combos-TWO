@@ -228,27 +228,46 @@ def test_boot_failure_never_relights(tmp_path: Path) -> None:
     assert calls == ["STOP"]
 
 
-def test_two_short_relights_latch_flap(tmp_path: Path) -> None:
+def test_two_short_relights_back_off_and_keep_retrying(tmp_path: Path) -> None:
+    """2026-08-06 operator ruling ("if bot crashes, restart, thats it"): a flap
+    streak BACKS OFF (threshold x streak, capped 900s) and relights again -
+    it never latches. Only a human-gated start refusal latches. The old
+    permanent flap latch twice turned a bounded outage (exchange maintenance,
+    a daily halt) into an unbounded one."""
     probes, clock = FakeProbes(), Clock()
     dog, calls = make_dog(tmp_path, probes, clock, threshold=100.0)
-    assert dog.poll_once() == "ok"
-    # healthy for a long spell, then hang -> relight 1
-    clock.t += 500.0
-    probes.log = ("live.log", 500, 5)
-    assert dog.poll_once() == "ok"
-    clock.t += 101.0
-    assert dog.poll_once() == "relit"
-    # run 1 hangs immediately (one re-sighting poll, then zero progress)
-    assert dog.poll_once() == "ok"
-    clock.t += 101.0
-    assert dog.poll_once() == "relit"
-    # run 2 hangs immediately too -> flap latch, NOT a third relight
-    assert dog.poll_once() == "ok"
-    clock.t += 101.0
-    assert dog.poll_once() == "halt_flap"
-    assert calls == ["STOP", "START", "STOP", "START", "STOP"]
-    state = json.loads((tmp_path / "data" / hw.STATE_FILE).read_text(encoding="utf-8"))
-    assert state["halt"] is not None
+    slept: list[float] = []
+    dog_time_sleep = hw.time.sleep
+    hw.time.sleep = lambda s: slept.append(s)  # type: ignore[assignment]
+    try:
+        assert dog.poll_once() == "ok"
+        clock.t += 500.0
+        probes.log = ("live.log", 500, 5)
+        assert dog.poll_once() == "ok"
+        clock.t += 101.0
+        assert dog.poll_once() == "relit"
+        assert dog.poll_once() == "ok"
+        clock.t += 101.0
+        assert dog.poll_once() == "relit"
+        # run 2 hangs immediately too -> BACKOFF then a THIRD relight
+        assert dog.poll_once() == "ok"
+        clock.t += 101.0
+        assert dog.poll_once() == "relit"
+        assert slept and slept[-1] == 200.0  # threshold(100) x streak(2)
+        # never latched
+        state = json.loads(
+            (tmp_path / "data" / hw.STATE_FILE).read_text(encoding="utf-8")
+        )
+        assert state.get("halt") is None
+        assert calls.count("START") == 3
+        # streak of 8+ caps at 900s
+        for _ in range(6):
+            assert dog.poll_once() == "ok"
+            clock.t += 101.0
+            dog.poll_once()
+        assert max(slept) <= 900.0
+    finally:
+        hw.time.sleep = dog_time_sleep
 
 
 def test_long_healthy_runs_between_hangs_keep_relighting(tmp_path: Path) -> None:

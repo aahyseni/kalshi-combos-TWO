@@ -509,24 +509,34 @@ class Watchdog:
             )
             return "halt_boot_loop"
 
-        # Flap guard 2: two consecutive short-lived relights. The run that just
-        # died was started by the most recent relight — record its shortness ON
-        # that relight, then latch if the last TWO relights both produced runs
-        # that could not survive one detection window.
+        # Flap guard 2 — REWORKED 2026-08-06 (operator ruling, verbatim: "if
+        # bot crashes, restart, thats it"). The permanent flap LATCH twice kept
+        # a healthy recovery down for HOURS after a transient outside cause
+        # ended (Kalshi's Thu 03-05 ET maintenance 503s on 8/6; the daily halt
+        # on 8/5) — the latch turned a bounded outage into an unbounded one.
+        # Consecutive short-lived relights now BACK OFF instead of latching:
+        # wait = threshold x streak, capped 900s (the documented ~2h
+        # maintenance window is survivable in ~8 capped retries), retrying
+        # forever. A HUMAN-gated start refusal still latches (guard below,
+        # unchanged) and boot-loop guard 1 (no heartbeat) is unchanged.
         short = healthy_span < self.threshold_s
         if self._relights:
             self._relights[-1]["short_run"] = short
-        if (
-            len(self._relights) >= 2
-            and bool(self._relights[-1].get("short_run"))
-            and bool(self._relights[-2].get("short_run"))
-        ):
+        streak = 0
+        for r in reversed(self._relights):
+            if bool(r.get("short_run")):
+                streak += 1
+            else:
+                break
+        if streak >= 2:
+            backoff_s = min(self.threshold_s * streak, 900.0)
             self._save_state()
-            self._latch_halt(
-                "flap: two consecutive relights died within one detection window",
-                evidence,
+            self.log(
+                "WARN",
+                f"flap streak {streak}: backing off {backoff_s:.0f}s then "
+                "relighting (retry-forever; only a human KILL latches)",
             )
-            return "halt_flap"
+            time.sleep(backoff_s)
 
         self.log("WARN", "relighting via the operator start path (-Auto)")
         rc = self._run(self.start_cmd, timeout=300)
