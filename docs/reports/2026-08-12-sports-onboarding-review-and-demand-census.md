@@ -24,7 +24,18 @@ byte-identical).
 
 ---
 
-## 1) Demand census — what takers actually request TODAY
+> **RETRACTED (same day, hours later):** §1's conclusion is WRONG. The `rfqs`
+> store only records RFQs that survive the intake firehose gate
+> (`rfq/intake.py:186` drops any RFQ with a non-allowlisted leg BEFORE the
+> recorder), so "zero non-allowlisted rows" measured our own blindness, not
+> demand. The exchange's open-RFQ set (REST) is ~25%+ non-allowlisted —
+> tennis, soccer (incl. 927 open UECL RFQs), WNBA, F5. Operator caught it.
+> Corrected analysis + league validation:
+> [2026-08-12-soccer-league-validation-and-rfq-demand-retraction.md](2026-08-12-soccer-league-validation-and-rfq-demand-retraction.md).
+> The wiring-order logic below survives only partially — soccer demand is
+> IMMEDIATE, not merely seasonal.
+
+## 1) Demand census — what takers actually request TODAY [RETRACTED — see banner]
 
 New tool: **`tools/diagnostics/rfq_series_census.py`** (read-only, `mode=ro`;
 verified against the recording seam: `record_rfq` fires BEFORE any filter or
