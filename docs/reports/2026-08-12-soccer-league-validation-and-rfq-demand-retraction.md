@@ -131,16 +131,31 @@ League-specific work items (the compressed playbook pass, Stages 0–2 + 6–7):
    prove untouched sports identical.
 6. **SHARD1 check** (above) + `mvec_eligibility_scan.py` baseline refresh.
 
+## ADDENDUM (same day) — settlement rules PINNED, no operator paste needed
+
+The WC-era pin existed (NOTES.md I8/C1) and the club-league rule text was
+scraped from live market objects (`docs/calibration/club_soccer_rules_pin.md`):
+**all 12 game-level series across the three leagues carry the identical WC
+convention** — "after 90 minutes plus stoppage time (does not include extra
+time or penalties)"; BTTS carries the own-goals clause; UECL ADVANCE is the
+ET+pens TIE market (the exact KXWCGAME/KXWCADVANCE coexistence the adapter
+already maps). **NEW CATCH: the 48-hour cancel/reschedule SCALAR rule applies
+to club soccer** (same surface as MLB's rain rule; WC never exercised it) ⇒
+`farmable=False` for ALL club-soccer impossibility cells — do NOT inherit
+WC's farmable patterns. Also: expected_expiration ≈ kickoff+2h on club
+exemplars (WC-era offset needs re-derivation); home/away frame still to pin
+per league (blocking DC home-advantage; L1 protocol).
+
 ## NEXT STEPS
 
-- **Me (next session): execute the wiring** — Stage 0 recon artifacts (ticker
-  shapes from tape/API — done above in part), classification + conventions +
-  parity + judge + backtest gate, per the playbook, La Liga + MLS (4 families)
-  and UECL (GAME only) first; UECL matches run 8/12–13, La Liga opens 8/15.
-- **Operator asks (front-load):** the rules text for the three leagues'
-  GAME/TOTAL/SPREAD/BTTS series (settlement scope pinning); confirmation to
-  keep UECL at ML-only despite TOTAL/SPREAD/BTTS being live on the API.
+- **Me (next session): execute the wiring** — classification + conventions +
+  parity + judge + backtest gate per the playbook: La Liga + MLS (4 families),
+  UECL (GAME only). Settlement scopes are PINNED (addendum); remaining
+  Stage-0 items: home/away frame pin per league, per-league expiration
+  offsets, SHARD1 check.
+- **Operator asks:** only one left — confirm UECL stays ML-only despite
+  TOTAL/SPREAD/BTTS/ADVANCE being live on the API.
 - **Bookkeeping:** census tool rewritten (REST demand detector); sports-review
   report demand section superseded; NOTES.md rows owed at wiring: SHARD1
-  collection, club game-code convention, home/away frame, league settlement
-  scopes.
+  collection, club game-code convention, home/away frame, 48h-scalar
+  farmable=False for club soccer.
