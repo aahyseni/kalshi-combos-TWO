@@ -313,10 +313,15 @@ def test_waivable_reason_code_set_is_exactly_the_per_game_caps() -> None:
     # per-game worst-case cap emits it WITH a game key (same game-loss
     # aggregate the waiver certifies); the DELTA family emits it with
     # game=None and stays fail-closed at the game-key check.
+    # 2026-08-13 (P1 Stage-1): SKIP_GAME_DIRECTION_NET_CAP joined — a
+    # directional concentration cap that carries its game key; a certified
+    # hedge always fills. The STRUCTURE bound is deliberately absent (a
+    # same-structure re-hit is never a hedge).
     assert WAIVABLE_RESERVATION_BREACHES == {
         ReasonCode.SKIP_GAME_LOSS_CAP,
         ReasonCode.SKIP_DIRECTIONAL_CAP,
         ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH,
+        ReasonCode.SKIP_GAME_DIRECTION_NET_CAP,
     }
 
 

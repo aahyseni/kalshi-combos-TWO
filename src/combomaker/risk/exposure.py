@@ -715,6 +715,18 @@ class ExposureSnapshot:
     # UNKNOWN branch: False ⇒ the census was never taken and NO consumer may
     # derive a permissive number from it. Never inferred from emptiness.
     loss_units_built: bool = False
+    # ACCUMULATED per-game one-direction NET (P1 Stage-1, operator 2026-08-13):
+    # the mutex-aware branch-max directional fold (identical semantics to
+    # ``directional_by_game_cc``) over COMMITTED + extra_positions (reserved +
+    # candidate) ONLY — NEVER resting quotes (the serial reservation chain
+    # re-checks at every fill, exactly the ``loss_by_combo_cc`` convention).
+    # Loss-equivalent cc. ``directional_net_built`` is the explicit UNKNOWN
+    # branch (mirror ``loss_units_built`` above): False ⇒ the census was never
+    # taken and no consumer may read a permissive zero. Built only when
+    # ``want_directional_net=True`` (the flag-gated check asks; other snapshot
+    # callers pay nothing — throughput-never-regresses).
+    directional_net_by_game_cc: dict[str, int] = field(default_factory=dict)
+    directional_net_built: bool = False
 
     # --- back-compat aliases (old event-keyed names; now game-keyed data) ------
     # The pre-B2 field names ``delta_by_event`` / ``worst_case_loss_by_event_cc``
@@ -1394,6 +1406,7 @@ class ExposureBook:
         resting_quote_weight: Fraction | None = None,
         resting_floor_count: int = 3,
         want_loss_units: bool = False,
+        want_directional_net: bool = False,
         settled_facts: SettledFactProvider | None = None,
     ) -> ExposureSnapshot:
         """Current exposures; with ``mass_acceptance`` every open quote fills
@@ -1601,6 +1614,20 @@ class ExposureBook:
                     game_dir_entries[game].append(entry)
                     if is_committed:
                         committed_dir_entries[game].append(entry)
+
+        # P1 STAGE-1 accumulated one-direction NET per game (2026-08-13): fold
+        # here — AFTER the position loop, BEFORE the mass-acceptance quote fold
+        # below appends resting-quote contributions into ``game_dir_entries``.
+        # This point is load-bearing: fold any later and resting quotes leak
+        # into the "accumulated committed net", double-counting the defense the
+        # reservation chain already enforces (no-double-risk-layers) and
+        # breaking the ``loss_by_combo_cc`` convention this axis mirrors.
+        directional_net: dict[str, int] = {}
+        if want_directional_net:
+            directional_net = {
+                game: int(_mutex_directional_game_cc(entries, self._is_me_event))
+                for game, entries in game_dir_entries.items()
+            }
 
         # Quote-time resting haircut: armed iff a weight < 1 was passed (the
         # confirm-path/pre-existing callers pass None ⇒ the 100% fold below is
@@ -1851,6 +1878,8 @@ class ExposureBook:
             loss_by_entity_cc=dict(loss_entity_all),
             loss_units=tuple(loss_units),
             loss_units_built=bool(want_loss_units),
+            directional_net_by_game_cc=directional_net,
+            directional_net_built=bool(want_directional_net),
             worst_case_loss_by_game_cc=game_worst,
             gross_settlement_notional_by_game_cc=dict(game_notional),
             directional_by_game_cc=game_directional,

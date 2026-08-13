@@ -2395,6 +2395,49 @@ class QuoteApp:
                     )
                 except Exception:
                     log.exception("realized_pnl_seed_failed")
+                # ACCEPTANCE-TAPE BOOT SEED (2026-08-13, the 8/1 empty-tape
+                # defect). OFF-THREAD single-flight: the reconstruction reads
+                # ~77s cold from the 150GB store, so boot is never delayed —
+                # the tape stays empty (today's fail-safe) until the seed
+                # lands, and the ADDITIVE merge is race-free against intraday
+                # increments. A second READ-ONLY stdlib connection: never the
+                # shared aiosqlite writer thread (the 2026-07-26 stall).
+                # Failure ⇒ empty tape ⇒ exactly today (never blocks boot).
+                if config.risk.acceptance_seed_from_store:
+                    seed_db = config.data_dir / config.observe.db_name_for(
+                        config.env
+                    )
+                    seed_award = config.risk.risk_qty_award_sizing
+
+                    async def _seed_acceptance() -> None:
+                        from dataclasses import asdict
+
+                        from combomaker.ops.acceptance_seed import (
+                            seed_counts_from_store,
+                        )
+
+                        try:
+                            res = await asyncio.to_thread(
+                                seed_counts_from_store,
+                                seed_db,
+                                now_utc=self._clock.now().astimezone(UTC),
+                                award_sizing=seed_award,
+                            )
+                            if res is None:
+                                log.warning("acceptance_tape_seed_failed")
+                                return
+                            lifecycle.seed_acceptance_tape(
+                                res.quoted, res.accepted
+                            )
+                            log.info(
+                                "acceptance_tape_seed_result", **asdict(res)
+                            )
+                        except Exception:
+                            log.exception("acceptance_tape_seed_failed")
+
+                    self._acceptance_seed_task = asyncio.create_task(
+                        _seed_acceptance(), name="acceptance-seed"
+                    )
                 await self._startup_book_risk_snapshot(lifecycle)
                 # LAUNCH THE EXTERNAL SUPERVISOR (separate OS process) BEFORE the
                 # preflight so its own-heartbeat is beating when external_kill_
@@ -2760,6 +2803,9 @@ class QuoteApp:
             try:
                 await self._stop.wait()
             finally:
+                seed_task = getattr(self, "_acceptance_seed_task", None)
+                if seed_task is not None:
+                    seed_task.cancel()
                 for task in tasks:
                     task.cancel()
                 # BOUNDED SHUTDOWN (2026-07-27). Ordered, NAMED stages handed to

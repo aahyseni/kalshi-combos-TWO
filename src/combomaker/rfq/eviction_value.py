@@ -119,6 +119,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from combomaker.core.money import CC_PER_DOLLAR
+
 __all__ = [
     "SIZE_BUCKET_EDGES_CC",
     "AcceptanceCounters",
@@ -129,6 +131,8 @@ __all__ = [
     "clopper_pearson_lower",
     "clopper_pearson_upper",
     "derive_open_quote_capacity",
+    "det_consumed_cc",
+    "risk_qty_from_terms",
     "diversity_key",
     "size_bucket",
 ]
@@ -195,6 +199,44 @@ def size_bucket(det_cc: int) -> int:
         if det_cc < edge:
             return i
     return N_BUCKETS - 1
+
+
+def det_consumed_cc(contracts_cc: int, yes_bid_cc: int, no_bid_cc: int) -> int:
+    """The det-max budget a quote consumes: worse quotable side's premium at
+    risk, ``contracts × bid // 100``. ONE implementation (2026-08-13): the
+    lifecycle's ``_quote_det_consumed_cc`` delegates here, and the boot-time
+    acceptance seed (``ops/acceptance_seed.py``) reconstructs historical det
+    from the SAME arithmetic — hard rule 8, parity-tested to the cent."""
+    return max(contracts_cc * bid // 100 for bid in (yes_bid_cc, no_bid_cc, 0))
+
+
+def risk_qty_from_terms(
+    contracts_centi: int | None,
+    target_cost_cc: int | None,
+    yes_bid_cc: int,
+    no_bid_cc: int,
+    *,
+    award_sizing: bool,
+) -> int | None:
+    """Full-RFQ size in centi-contracts, or None = unresolvable = no-quote —
+    the EXACT arithmetic of the lifecycle's ``_risk_qty`` (which delegates
+    here; see its docstring for the two target-cost forms and their audit
+    history). Extracted 2026-08-13 so the acceptance seed reconstructs
+    historical sizes from the SAME function, never a near-copy."""
+    if contracts_centi is not None:
+        return contracts_centi
+    if target_cost_cc is not None:
+        bids = [int(bid) for bid in (yes_bid_cc, no_bid_cc) if bid > 0]
+        if not bids:
+            return None
+        if award_sizing:
+            denom = CC_PER_DOLLAR - max(bids)
+            if denom < 100:
+                return None
+        else:
+            denom = max(100, min(bids))
+        return -(-int(target_cost_cc) * 100 // denom)
+    return None
 
 
 def clopper_pearson_lower(x: int, n: int, alpha: float) -> float:
@@ -271,6 +313,30 @@ class AcceptanceCounters:
 
     def record_accepted(self, det_cc: int) -> None:
         self._accepted[size_bucket(det_cc)] += 1
+
+    def seed_counts(self, quoted: list[int], accepted: list[int]) -> None:
+        """Boot-time seed from the STORE's measured history (2026-08-13, the
+        8/1 empty-tape defect: day-one CP-lower = 0 for every bucket, only
+        dES99<=0 diversifiers admit — the 0.6% brick). MEASURED ONLY (North
+        Star): the caller reconstructs (bucket, quoted, accepted) from the
+        decisions/rfqs tape via the SAME sizing arithmetic the live path
+        runs (``det_consumed_cc`` / ``risk_qty_from_terms``). ADDITIVE, never
+        assignment — the seed may land after intraday increments (it runs
+        off-thread), and an order-free merge has no race. Per-bucket accepted
+        is clamped to quoted (the ``bounds`` convention). G3 boundary note:
+        the 24h seed window keeps every bucket's n·p ≈ x ≤ ~25, ~30× inside
+        the (1-p)^n underflow boundary the ``clopper_pearson_lower`` docstring
+        flags for multi-day persistence — re-check before widening the
+        window."""
+        if len(quoted) != N_BUCKETS or len(accepted) != N_BUCKETS:
+            raise ValueError(
+                f"seed shape {len(quoted)}/{len(accepted)} != {N_BUCKETS} buckets"
+            )
+        if any(q < 0 for q in quoted) or any(a < 0 for a in accepted):
+            raise ValueError("negative seed count")
+        for i in range(N_BUCKETS):
+            self._quoted[i] += quoted[i]
+            self._accepted[i] += min(accepted[i], quoted[i])
 
     def bounds(self, bucket: int, alpha: float) -> BucketBounds | None:
         """The bucket's measured acceptance with exact CP bounds; None when

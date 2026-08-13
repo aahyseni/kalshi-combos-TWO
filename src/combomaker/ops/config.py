@@ -2876,6 +2876,16 @@ class RiskConfig(StrictModel):
     # Full mechanics in ``RiskLimits.ruin_gate_marginal``. False (default) =
     # byte-identical.
     ruin_gate_marginal: bool = False
+    # ACCEPTANCE-TAPE BOOT SEED (2026-08-13, the 8/1 empty-tape defect: on
+    # arming day the marginal gates' CP-lower P(accept|bucket) read 0.0 and
+    # only dES99<=0 diversifiers admitted — the 0.6% brick). True ⇒ at boot,
+    # quote_app reconstructs the last 24h of (quoted, accepted) per size
+    # bucket from the store's OWN decisions tape (off-thread, ~77s measured,
+    # read-only second connection) and additively seeds the in-process tape —
+    # measured, never invented. False (default) = byte-identical: no store
+    # read, empty tape, exactly today. Failure of the seed = empty tape =
+    # today (fail-safe). Arms WITH the marginal-gate stanza at one restart.
+    acceptance_seed_from_store: bool = False
     # RENEGE FIXES (2026-07-25 big-fill audit — 49 auctions won, 15 filled,
     # $355 premium won-then-declined in one evening). Both default OFF
     # (byte-identical); arm together at a pregame restart after review.
@@ -3112,7 +3122,23 @@ class RiskConfig(StrictModel):
     # True = build the certificate and LOG it (``entity_tier_admission``
     # events carry would_admit) while the cap still refuses exactly as today.
     entity_admission_enabled: bool = False
+    # P1 STAGE-1 STRUCTURE BOUND (operator 2026-08-13 — the whale seam, 6
+    # sightings): accumulated committed+reserved+candidate premium on ONE
+    # combo MARKET vs the per-combo ANCHOR fraction of bankroll. Empty string
+    # = axis OFF (byte-identical). Arming value = "0.01" (the ratified
+    # per-combo anchor — cap_family.PER_COMBO_FRAC — never a new number).
+    structure_loss_frac: str = ""
+    structure_bound_armed: bool = False
+    # DERIVE-BEFORE-ARM companion: log-only would_refuse readout.
+    structure_bound_enabled: bool = False
     directional_frac: str = "0.10"        # net one-directional / theme
+    # P1 STAGE-1 GAME-DIRECTION NET BOUND (operator 2026-08-13): accumulated
+    # committed+reserved+candidate one-direction net per game (mutex-aware
+    # branch-max fold) vs a fraction of bankroll, judged against the sunk
+    # committed baseline. Empty string = axis OFF (byte-identical). Waivable.
+    game_direction_net_frac: str = ""
+    game_direction_net_armed: bool = False
+    game_direction_net_enabled: bool = False
     slate_loss_frac: str = "0.08"         # Σ game loss over one slate
     # FIX 2 — SLATE AGGREGATION BY PARTITION (operator 2026-07-27: "stop summing
     # losses that cannot all occur"). False (default) = SHADOW: the naive
@@ -3489,6 +3515,20 @@ class RiskConfig(StrictModel):
             ),
             entity_admission_armed=self.entity_admission_armed,
             entity_admission_enabled=self.entity_admission_enabled,
+            structure_loss_frac=(
+                Fraction(Decimal(self.structure_loss_frac))
+                if self.structure_loss_frac
+                else None
+            ),
+            structure_bound_armed=self.structure_bound_armed,
+            structure_bound_enabled=self.structure_bound_enabled,
+            game_direction_net_frac=(
+                Fraction(Decimal(self.game_direction_net_frac))
+                if self.game_direction_net_frac
+                else None
+            ),
+            game_direction_net_armed=self.game_direction_net_armed,
+            game_direction_net_enabled=self.game_direction_net_enabled,
             slate_partition_armed=self.slate_partition_armed,
             slate_partition_enabled=self.slate_partition_enabled,
             directional_frac=Fraction(Decimal(self.directional_frac)),

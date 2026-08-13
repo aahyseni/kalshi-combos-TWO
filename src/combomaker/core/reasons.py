@@ -56,6 +56,16 @@ class ReasonCode(StrEnum):
     # 4+ Ks" — above its %-of-bankroll ceiling. The leg-axis steer PRICES this
     # concentration; this is the hard wall that refuses it.
     SKIP_ENTITY_LOSS_CAP = "skip_entity_loss_cap"
+    # P1 STAGE-1 (operator 2026-08-13, the whale seam — 6 sightings): the
+    # ACCUMULATED committed+reserved+candidate premium on ONE combo MARKET
+    # (structure) above the per-combo ANCHOR fraction of bankroll. Candidate-
+    # key-scoped; NOT waivable (a same-structure re-hit is never a hedge).
+    SKIP_STRUCTURE_LOSS_CAP = "skip_structure_loss_cap"
+    # P1 STAGE-1: the ACCUMULATED one-direction net per GAME (committed +
+    # reserved + candidate, mutex-aware branch-max fold) above its fraction of
+    # bankroll — judged against the SUNK committed baseline (marginal, never a
+    # level gate). Waivable: a certified hedge always fills.
+    SKIP_GAME_DIRECTION_NET_CAP = "skip_game_direction_net_cap"
     SKIP_DIRECTIONAL_CAP = "skip_directional_cap"        # net one-directional theme
     SKIP_SLATE_CAP = "skip_slate_cap"                    # Σ game loss over a slate
     # Loose backstop ABOVE the % caps on the gross-settlement-notional axis

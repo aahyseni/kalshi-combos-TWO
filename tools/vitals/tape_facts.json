@@ -679,12 +679,28 @@
     {
       "launch_to_first_beat_s": 44.51,
       "log": "live_20260813_0702.log"
+    },
+    {
+      "launch_to_first_beat_s": 46.07,
+      "log": "live_20260813_0842.log"
+    },
+    {
+      "launch_to_first_beat_s": 49.18,
+      "log": "live_20260813_0928.log"
+    },
+    {
+      "launch_to_first_beat_s": 45.24,
+      "log": "live_20260813_0937.log"
+    },
+    {
+      "launch_to_first_beat_s": 45.5,
+      "log": "live_20260813_1014.log"
     }
   ],
   "candidate_gate_attempts_max": 2,
-  "candidate_gate_confirm_events": 2585,
+  "candidate_gate_confirm_events": 2611,
   "candidate_gate_deadline_events": 79,
-  "live_n_positions_last": 49,
+  "live_n_positions_last": 71,
   "live_n_positions_max": 139,
   "max_same_tick_quarantine": 19,
   "max_same_tick_quarantine_where": "live_20260809_2212.log|2026-08-10T02:43:13",
@@ -694,12 +710,12 @@
     "metadata_reads_per_s_ceiling": 30.0,
     "read_capacity": 600,
     "read_refill_per_s": 300,
-    "ts": "2026-08-13T11:02:50.086474Z",
+    "ts": "2026-08-13T14:14:55.202654Z",
     "usage_tier": "advanced",
     "write_capacity": 600,
     "write_refill_per_s": 300
   },
-  "observed_tier_at": "2026-08-13T11:02:50.086474Z",
+  "observed_tier_at": "2026-08-13T14:14:55.202654Z",
   "provenance": {
     "manifest": {
       "live_20260722_relight.log": [
@@ -1415,12 +1431,28 @@
         1786618936.431
       ],
       "live_20260813_0702.log": [
-        787197904,
-        1786622596.918
+        1243294584,
+        1786624919.881
+      ],
+      "live_20260813_0842.log": [
+        31566404,
+        1786625179.078
+      ],
+      "live_20260813_0928.log": [
+        91497770,
+        1786628206.481
+      ],
+      "live_20260813_0937.log": [
+        510966220,
+        1786630482.242
+      ],
+      "live_20260813_1014.log": [
+        1810294453,
+        1786639349.972
       ]
     },
-    "scanned_bytes": 164872635227,
-    "scanned_logs": 179,
+    "scanned_bytes": 167773059182,
+    "scanned_logs": 183,
     "source": "fresh scan"
   }
 }

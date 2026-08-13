@@ -58,6 +58,7 @@ from combomaker.risk.exposure import (
     MarginalProvider,
     OpenPosition,
     leg_entity_key,
+    mutex_scenario_bound,
     partitioned_worst_case_cc,
 )
 from combomaker.risk.exposure import (
@@ -236,9 +237,36 @@ class RiskLimits:
     # ARMED cap WOULD take, while the cap still refuses exactly as today. Off by
     # default so an untouched deployment pays nothing at all.
     entity_admission_enabled: bool = False
+    # P1 STAGE-1 STRUCTURE BOUND (operator 2026-08-13: "caps any one structure
+    # at the ~1% anchor" — the whale seam, 6 sightings, top-3 tickets = 82% of
+    # the 8/13 −$473). Bounds the ACCUMULATED committed+reserved+candidate
+    # premium (``ExposureSnapshot.loss_by_combo_cc`` — max_loss_cc, the SAME
+    # measure as ``per_combo_loss_frac``; never summed with the directional or
+    # notional axes) on ONE combo MARKET (the dossier's "structure").
+    # None (default) ⇒ the axis is not evaluated (byte-identical). The arming
+    # value is the ratified per-combo ANCHOR (1% — cap_family.PER_COMBO_FRAC),
+    # never a new number; derived-caps deployments track the derived anchor.
+    structure_loss_frac: Fraction | None = None
+    structure_bound_armed: bool = False
+    # DERIVE-BEFORE-ARM companion (the entity/slate split): True ⇒ the verdict
+    # the ARMED bound would take is handed to ``structure_bound_observer``
+    # while enforcement stays exactly today's. Off by default: zero cost.
+    structure_bound_enabled: bool = False
     # One-directional / theme: net directional exposure to one leg outcome across
     # games (LOSS-equivalent; see the check site for the interpretation). 10%.
     directional_frac: Fraction = Fraction(10, 100)
+    # P1 STAGE-1 GAME-DIRECTION NET BOUND (operator 2026-08-13): the
+    # ACCUMULATED one-direction net per game — committed + reserved +
+    # candidate, mutex-aware branch-max fold (``directional_net_by_game_cc``,
+    # LOSS-EQUIVALENT directional cc, the SAME measure as ``directional_frac``)
+    # — judged against the SUNK committed baseline (marginal, never a level
+    # gate on the standing book: the 2026-08-01 constitutional). None
+    # (default) ⇒ axis off, byte-identical. Waivable (a certified hedge always
+    # fills). Arming fraction: derived (see derived_cap_engine join) or a
+    # ratified layer-2 anchor — never a hand number.
+    game_direction_net_frac: Fraction | None = None
+    game_direction_net_armed: bool = False
+    game_direction_net_enabled: bool = False
     # SLATE / time-window pre-trade cap: Σ worst_case_loss_by_game over all games
     # in ONE slate (LOSS axis). Start = same as the game cap. 8%.
     slate_loss_frac: Fraction = Fraction(8, 100)
@@ -839,6 +867,20 @@ the operator is deciding about), so the happy path pays nothing. Purely
 observational — ``check`` never branches on it."""
 
 
+StructureBoundObserver = Callable[[str, int, int, bool], None]
+"""P1 Stage-1 read-out sink: ``(combo_ticker, accumulated_cc, threshold_cc,
+would_refuse)`` for every candidate structure over the anchor. Purely
+observational — ``check`` never branches on it; fires only past the threshold,
+so it is bounded by the breach rate. None (default) ⇒ zero cost."""
+
+
+GameDirectionObserver = Callable[[str, int, int, int, bool], None]
+"""P1 Stage-1 read-out sink: ``(game, net_with_cc, committed_baseline_cc,
+threshold_cc, would_refuse)`` for every candidate game whose accumulated
+one-direction net crosses the fraction AND rises above the sunk committed
+baseline. Purely observational; bounded by the breach rate."""
+
+
 def _entity_admits(
     cert: ConcentrationCertificate | None,
     key: str,
@@ -1037,6 +1079,8 @@ class LimitChecker:
         deploy_scale: float = 1.0,
         entity_admission_observer: EntityAdmissionObserver | None = None,
         slate_partition_observer: SlatePartitionObserver | None = None,
+        structure_bound_observer: StructureBoundObserver | None = None,
+        game_direction_observer: GameDirectionObserver | None = None,
         kill_marginal: KillMarginalCandidate | None = None,
     ) -> list[Breach]:
         """All current breaches, mass-acceptance included.
@@ -1180,6 +1224,15 @@ class LimitChecker:
             want_loss_units=(
                 limits.slate_partition_armed or limits.slate_partition_enabled
             ),
+            # P1 Stage-1: the accumulated per-game direction fold is built only
+            # when its lever will read it (same convention as loss_units).
+            want_directional_net=(
+                limits.game_direction_net_frac is not None
+                and (
+                    limits.game_direction_net_armed
+                    or limits.game_direction_net_enabled
+                )
+            ),
         )
         if snapshot.unknown_marginals:
             breaches.append(
@@ -1284,6 +1337,8 @@ class LimitChecker:
                 waived_games=waived_games,
                 entity_admission_observer=entity_admission_observer,
                 slate_partition_observer=slate_partition_observer,
+                structure_bound_observer=structure_bound_observer,
+                game_direction_observer=game_direction_observer,
                 kill_marginal=kill_marginal,
             )
         )
@@ -1306,6 +1361,8 @@ class LimitChecker:
         waived_games: Mapping[str, WaiverCertificate] | None = None,
         entity_admission_observer: EntityAdmissionObserver | None = None,
         slate_partition_observer: SlatePartitionObserver | None = None,
+        structure_bound_observer: StructureBoundObserver | None = None,
+        game_direction_observer: GameDirectionObserver | None = None,
         kill_marginal: KillMarginalCandidate | None = None,
     ) -> list[Breach]:
         """The additive %-of-bankroll caps. Every breach carries
@@ -1566,6 +1623,58 @@ class LimitChecker:
                     )
                 )
 
+        # (3d) P1 STAGE-1 STRUCTURE BOUND (operator 2026-08-13 — the whale
+        # seam, 6 sightings: single near-coin tickets at 2.9–3.7% of bankroll
+        # carrying pennies of EV; top-3 = 82% of the 8/13 −$473). Same
+        # accumulation source as (3b) — ``loss_by_combo_cc``: committed +
+        # reserved + this check's candidates on ONE combo MARKET, never
+        # resting quotes — but bound at its OWN flag-gated fraction (the
+        # ratified per-combo ANCHOR, 1%) instead of the live per-combo wall
+        # (5%). Deliberate differences from (3b): NO ``total >
+        # position.max_loss_cc`` guard (a lone whale candidate must trip it —
+        # the accumulation includes the candidate and flow to an over-anchor
+        # structure always worsens it: marginal judgment per the 2026-08-01
+        # sunk-book constitutional), candidate-key scope inherited (the
+        # 2026-07-26 bricking lesson), and the enabled/armed observer split
+        # (the slate-partition pattern). NOT waivable: a same-structure
+        # re-hit is never a hedge. Breach carries game=None.
+        if (
+            limits.structure_loss_frac is not None
+            and candidates
+            and (limits.structure_bound_armed or limits.structure_bound_enabled)
+        ):
+            structure_thr = threshold_cc(limits.structure_loss_frac, bankroll)
+            seen_structure: set[str] = set()
+            for position in candidates:
+                ticker = position.combo_ticker
+                if ticker in seen_structure:
+                    continue
+                seen_structure.add(ticker)
+                total = snapshot.loss_by_combo_cc.get(ticker, 0)
+                if total <= structure_thr:
+                    continue
+                if structure_bound_observer is not None:
+                    try:  # pragma: no cover - telemetry only
+                        structure_bound_observer(
+                            ticker,
+                            total,
+                            structure_thr,
+                            limits.structure_bound_armed,
+                        )
+                    except Exception:
+                        pass
+                if limits.structure_bound_armed:
+                    out.append(
+                        Breach(
+                            ReasonCode.SKIP_STRUCTURE_LOSS_CAP,
+                            f"structure {ticker} ACCUMULATED loss {total}cc "
+                            f"(committed+reserved+candidate) > "
+                            f"{limits.structure_loss_frac} bankroll = "
+                            f"{structure_thr}cc",
+                            shadow=shadow,
+                        )
+                    )
+
         # (4) One-directional / theme cap (P0-9: mutex-aware hedge semantics).
         # INTERPRETATION: the net directional exposure to a game's single RESULT
         # outcome, aggregated per GAME, in LOSS-equivalent cc. Binds on
@@ -1601,6 +1710,77 @@ class LimitChecker:
                         game=game,
                     )
                 )
+
+        # (4b) P1 STAGE-1 GAME-DIRECTION ACCUMULATED NET (operator
+        # 2026-08-13). Binds ``directional_net_by_game_cc`` — the SAME
+        # mutex-aware branch-max fold as (4), but over committed + reserved +
+        # candidate ONLY (never resting quotes: the reservation chain
+        # re-checks at every fill, the loss_by_combo_cc convention) — and
+        # judges the MARGINAL against the SUNK committed baseline (the
+        # 2026-08-01 constitutional: a book already over the line never
+        # blocks flow that doesn't worsen it; drop the baseline early-out and
+        # this becomes the 8/1 freeze shape). Candidate-game-scoped (the
+        # 7/26 bricking lesson). WAIVABLE per game: a certified hedge always
+        # fills (validated vs game_thr — the same documented-deliberate
+        # convention as check (4); dossier doctrine re-confirmation owed).
+        if (
+            limits.game_direction_net_frac is not None
+            and candidates
+            and (
+                limits.game_direction_net_armed
+                or limits.game_direction_net_enabled
+            )
+            and snapshot.directional_net_built
+        ):
+            from combomaker.pricing.grouping import game_key
+
+            dir_net_thr = threshold_cc(limits.game_direction_net_frac, bankroll)
+            candidate_games: set[str] = set()
+            for position in candidates:
+                for leg in position.legs:
+                    if leg.event_ticker:
+                        candidate_games.add(game_key(leg.event_ticker))
+            for game in sorted(candidate_games):
+                net_with = snapshot.directional_net_by_game_cc.get(game, 0)
+                if net_with <= dir_net_thr:
+                    continue
+                # SUNK-BOOK BASELINE: fold the COMMITTED-only census lazily
+                # (bounded by the breach rate — the entity lazy-load
+                # precedent) with the same public branch-max fold.
+                baseline = int(
+                    mutex_scenario_bound(
+                        snapshot.committed_dir_entries_by_game.get(game, ()),
+                        book.is_me_event,
+                    )
+                )
+                if net_with <= baseline:
+                    continue  # zero-contribution / pure-hedge candidate passes
+                if _waiver_covers(waived_games, game, game_thr):
+                    continue  # certified hedges bypass (invariant 11)
+                if game_direction_observer is not None:
+                    try:  # pragma: no cover - telemetry only
+                        game_direction_observer(
+                            game,
+                            net_with,
+                            baseline,
+                            dir_net_thr,
+                            limits.game_direction_net_armed,
+                        )
+                    except Exception:
+                        pass
+                if limits.game_direction_net_armed:
+                    out.append(
+                        Breach(
+                            ReasonCode.SKIP_GAME_DIRECTION_NET_CAP,
+                            f"game {game} ACCUMULATED one-direction net "
+                            f"{net_with}cc (committed {baseline}cc + "
+                            f"reserved/candidate) > "
+                            f"{limits.game_direction_net_frac} bankroll = "
+                            f"{dir_net_thr}cc",
+                            shadow=shadow,
+                            game=game,
+                        )
+                    )
 
         # (5) SLATE cap — Σ worst_case_loss_by_game over all games in ONE slate.
         # Slate key = US/Eastern calendar day of the game's earliest known leg

@@ -81,7 +81,9 @@ from combomaker.pricing.quote import ConstructedQuote, NoQuote
 from combomaker.rfq.eviction_value import (
     AcceptanceCounters,
     allocate_des99_cc,
+    det_consumed_cc,
     diversity_key,
+    risk_qty_from_terms,
     size_bucket,
 )
 from combomaker.rfq.filters import RfqFilter
@@ -255,6 +257,12 @@ WAIVABLE_RESERVATION_BREACHES: frozenset[ReasonCode] = frozenset(
         # fail closed at the "waivable breach missing its game key" check —
         # a delta breach can never be waived.
         ReasonCode.SKIP_MASS_ACCEPTANCE_BREACH,
+        # P1 Stage-1 (2026-08-13): the accumulated game-direction NET bound is
+        # a directional concentration cap — a certified hedge always fills
+        # (the breach carries its game key; the enforcement site re-validates
+        # the certificate). The STRUCTURE bound is deliberately NOT here: a
+        # same-structure re-hit is never a hedge.
+        ReasonCode.SKIP_GAME_DIRECTION_NET_CAP,
     }
 )
 
@@ -266,7 +274,15 @@ WAIVABLE_RESERVATION_BREACHES: frozenset[ReasonCode] = frozenset(
 # they carry no game attribution, and the confirm-path exact enforcement +
 # TTL/reprice sweeps remain their backstop.
 EVICTABLE_ON_FILL_BREACHES: frozenset[ReasonCode] = frozenset(
-    {ReasonCode.SKIP_GAME_LOSS_CAP, ReasonCode.SKIP_DIRECTIONAL_CAP}
+    {
+        ReasonCode.SKIP_GAME_LOSS_CAP,
+        ReasonCode.SKIP_DIRECTIONAL_CAP,
+        # P1 Stage-1 (2026-08-13): a fill that pushes a game's accumulated
+        # one-direction net over the anchor may pull resting quotes on that
+        # (game-keyed) axis, same as the two caps above. Only reachable when
+        # game_direction_net_armed.
+        ReasonCode.SKIP_GAME_DIRECTION_NET_CAP,
+    }
 )
 
 
@@ -1706,6 +1722,17 @@ class QuoteLifecycle:
         it prices only when this reads 0 (the pool is provably idle)."""
         self._rfq_backlog_depth = probe
 
+    def seed_acceptance_tape(self, quoted: list[int], accepted: list[int]) -> None:
+        """Boot-time acceptance seed (2026-08-13, the 8/1 empty-tape defect):
+        additively merge the store-measured (quoted, accepted) per-bucket
+        counts into the in-process tape. Called by quote_app's off-thread
+        boot seed; additive merge makes the late landing race-free against
+        intraday increments. Raises on malformed input (the caller catches
+        and fails to today's empty-tape behavior)."""
+        self._accept_tape.seed_counts(quoted, accepted)
+        self._metrics.inc("quote.acceptance_tape_seeded")
+        log.info("acceptance_tape_seeded", quoted=list(quoted), accepted=list(accepted))
+
     def _risk_bankroll_cc(self) -> int | None:
         """The live risk-capital denominator in cc for the %-of-bankroll caps,
         or None when unavailable/stale (fail-closed — the checker then emits
@@ -2143,6 +2170,44 @@ class QuoteLifecycle:
                 partitioned_cc=int(partitioned_cc),
                 threshold_cc=int(threshold_cc),
                 would_admit=bool(partitioned_cc <= threshold_cc),
+            )
+        except Exception:  # pragma: no cover - telemetry must never propagate
+            pass
+
+    def _log_structure_bound(
+        self, combo_ticker: str, accumulated_cc: int, threshold_cc: int,
+        would_refuse: bool,
+    ) -> None:
+        """P1 STAGE-1 SHADOW READ-OUT: one structured line per candidate
+        structure over the anchor — the number the operator arms from while
+        enforcement stays exactly today's. Fires only past the threshold
+        (bounded by the breach rate). Telemetry only; swallowed on failure."""
+        try:
+            log.info(
+                "structure_bound_shadow",
+                structure=combo_ticker,
+                accumulated_cc=int(accumulated_cc),
+                threshold_cc=int(threshold_cc),
+                would_refuse=bool(would_refuse),
+            )
+        except Exception:  # pragma: no cover - telemetry must never propagate
+            pass
+
+    def _log_game_direction_net(
+        self, game: str, net_with_cc: int, committed_baseline_cc: int,
+        threshold_cc: int, would_refuse: bool,
+    ) -> None:
+        """P1 STAGE-1 SHADOW READ-OUT for the accumulated per-game direction
+        net: the fold WITH the candidate vs the sunk committed baseline and
+        the anchor. Fires only on a would-be refusal. Telemetry only."""
+        try:
+            log.info(
+                "game_direction_net_shadow",
+                game=game,
+                net_with_cc=int(net_with_cc),
+                committed_baseline_cc=int(committed_baseline_cc),
+                threshold_cc=int(threshold_cc),
+                would_refuse=bool(would_refuse),
             )
         except Exception:  # pragma: no cover - telemetry must never propagate
             pass
@@ -4935,10 +5000,12 @@ class QuoteLifecycle:
         arithmetic ``sim.book_risk._det_and_gross`` charges the hypothetical
         fill (both quotable sides fold in as hypotheticals and the det axis
         takes the worse). Correlation-INDEPENDENT by construction, which is
-        what makes ranking on it MODEL-FREE (FIX 4, 2026-07-28)."""
-        return max(
-            int(quote.contracts) * int(bid) // 100
-            for bid in (int(quote.yes_bid_cc), int(quote.no_bid_cc), 0)
+        what makes ranking on it MODEL-FREE (FIX 4, 2026-07-28). Arithmetic
+        lives in ``rfq/eviction_value.det_consumed_cc`` (ONE implementation —
+        the acceptance seed reconstructs historical det from the same
+        function; parity-tested)."""
+        return det_consumed_cc(
+            int(quote.contracts), int(quote.yes_bid_cc), int(quote.no_bid_cc)
         )
 
     @staticmethod
@@ -5741,6 +5808,8 @@ class QuoteLifecycle:
             # rate), and a logging failure is swallowed inside.
             entity_admission_observer=self._log_entity_admission,
             slate_partition_observer=self._log_slate_partition,
+            structure_bound_observer=self._log_structure_bound,
+            game_direction_observer=self._log_game_direction_net,
             kill_marginal=kill_marginal,
         )
         # EV-BASED SLOT EVICTION (2026-07-25 big-fill audit: the slot cap was
@@ -9781,30 +9850,19 @@ class QuoteLifecycle:
         this is armed TOGETHER with ``release_accepted_quote_exposure``
         (2026-07-25 review: without the release, the accepted quote's own
         resting entry still double-counted the fill at confirm)."""
-        if rfq.contracts is not None:
-            return rfq.contracts
-        if rfq.target_cost_cc is not None:
-            bids = [
-                int(bid)
-                for bid in (constructed.yes_bid_cc, constructed.no_bid_cc)
-                if bid > 0
-            ]
-            if not bids:
-                return None
-            if self._config.risk_qty_award_sizing:
-                # Taker price for accepting side s = $1 − our bid on s; the
-                # worst case (most contracts) is the side with the HIGHEST
-                # bid. A bid above 99¢ would make the 1¢ floor an UNDER-
-                # estimate of the award (the ceiling inverts — 2026-07-25
-                # review): unresolvable ⇒ no-quote, never an understated
-                # candidate (hard rule 6).
-                denom = CC_PER_DOLLAR - max(bids)
-                if denom < 100:
-                    return None
-            else:
-                denom = max(100, min(bids))
-            return CentiContracts(-(-int(rfq.target_cost_cc) * 100 // denom))
-        return None
+        # Arithmetic lives in ``rfq/eviction_value.risk_qty_from_terms`` (ONE
+        # implementation — the acceptance seed reconstructs historical sizes
+        # from the same function; parity-tested to the cent). The award-form
+        # semantics above (bid > 99¢ unresolvable, fees excluded, ceiling
+        # division) are preserved verbatim there.
+        qty = risk_qty_from_terms(
+            None if rfq.contracts is None else int(rfq.contracts),
+            None if rfq.target_cost_cc is None else int(rfq.target_cost_cc),
+            int(constructed.yes_bid_cc),
+            int(constructed.no_bid_cc),
+            award_sizing=self._config.risk_qty_award_sizing,
+        )
+        return None if qty is None else CentiContracts(qty)
 
     def _quote_risk(
         self, rfq: Rfq, constructed: ConstructedQuote, *, quote_id: str, qty: CentiContracts

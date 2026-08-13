@@ -94,5 +94,20 @@ class DerivedCapEngine:
             directional_frac=book(caps.directional_frac, slate_f),
             portfolio_det_max_frac=book(caps.portfolio_det_max_frac, slate_f),
             portfolio_cvar_frac=book(caps.portfolio_cvar_frac, dd_f),
+            # P1 Stage-1 (2026-08-13), None-preserving: an OFF axis stays OFF
+            # under derived caps (blindly replacing would arm it unflagged).
+            # When on, the structure bound TRACKS the derived per-combo anchor
+            # and the direction net tracks the derived directional — no new
+            # number ever.
+            structure_loss_frac=(
+                None
+                if self._base.structure_loss_frac is None
+                else _to_frac(caps.per_combo_loss_frac)
+            ),
+            game_direction_net_frac=(
+                None
+                if self._base.game_direction_net_frac is None
+                else book(caps.directional_frac, slate_f)
+            ),
         )
         return new, caps, est
