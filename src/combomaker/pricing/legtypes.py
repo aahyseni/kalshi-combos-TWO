@@ -268,6 +268,13 @@ _KEYWORDS: tuple[tuple[str, LegType], ...] = (
     # 2026-07-07): team corners = KXWCTCORNERS, total corners = KXWCCORNERS.
     ("TCORNERS", LegType.CORNERS_TEAM),
     ("CORNERS", LegType.CORNERS),
+    # LALIGAADVANCE must precede ADVANCE (it contains it). KXLALIGAADVANCE is
+    # a La Liga promotion/season series, NOT the two-team tie market the
+    # ADVANCE family models: typing it ADVANCE would hand it the advance
+    # complement logic + advance rho rows. Explicit UNKNOWN blocker = widen,
+    # never masquerade (the LEADERMLB / F5TOTAL pattern). Club-soccer wiring
+    # 2026-08-13.
+    ("LALIGAADVANCE", LegType.UNKNOWN),
     ("ADVANCE", LegType.ADVANCE),
     ("EXTRAS", LegType.EXTRAS),
     ("SPREAD", LegType.SPREAD),
@@ -421,6 +428,13 @@ _SPORT_KEYWORDS: tuple[tuple[str, Sport], ...] = (
     ("NASCAR", Sport.RACING),
     ("WC", Sport.SOCCER),
     ("UCL", Sport.SOCCER),
+    # UECL (Conference League, KXUECL*) is NOT caught by "UCL": substring
+    # matching is contiguous and U-E-C-L never contains U-C-L. Without its own
+    # row KXUECL* classified Sport.UNKNOWN — no DC structural, no soccer rho
+    # table, "other" markup (the KXMENWORLDCUP zero-markup incident class).
+    # Club-soccer wiring 2026-08-13; no substring relation with any other
+    # keyword in either direction.
+    ("UECL", Sport.SOCCER),
     ("MLS", Sport.SOCCER),
     ("EPL", Sport.SOCCER),
     ("BRASILEIRO", Sport.SOCCER),

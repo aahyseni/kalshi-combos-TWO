@@ -267,9 +267,21 @@ class PregameGate:
         scheduled = self._schedule.peek_start(meta.event_ticker)
         if scheduled is not None:
             return LegStart(start=scheduled, precise=True)
+        # occurrence_datetime joined the anchor set 2026-08-13 (club-soccer
+        # wiring): Kalshi creates extra club line rungs ON GAME DAY whose
+        # expected_expiration_time is creation-relative (+2h vs siblings,
+        # live-verified KXUECLTOTAL-26AUG12SCRPAI-7) while occurrence_datetime
+        # keeps the event-stable value — without it the estimate ladder read
+        # that leg pregame ~1.3h into the live match. min() keeps this
+        # fail-closed; WC/MLB unchanged (their occ == exp_exp, and MLB rides
+        # the embedded precise tier anyway).
         anchors = [
             t.astimezone(UTC)
-            for t in (meta.close_time, meta.expected_expiration_time)
+            for t in (
+                meta.close_time,
+                meta.expected_expiration_time,
+                meta.occurrence_datetime,
+            )
             if t is not None and t.tzinfo is not None  # naive time = no clock
         ]
         if not anchors:

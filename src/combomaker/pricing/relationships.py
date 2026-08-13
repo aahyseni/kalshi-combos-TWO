@@ -167,6 +167,33 @@ _OVER_HALF_LINE = 1
 # it implies no goal — only a TEAM win does.
 _DRAW_SUFFIXES = frozenset({"TIE", "DRAW"})
 
+# --- Farm certainty is a SERIES property, not only a logic property ------------
+# farmable=True additionally requires EVERY leg to sit on a farm-certain series:
+# an "airtight" impossibility is only bankable when the combo cannot
+# scalar-settle, and a farm sells YES on the WHOLE combo — one scalar-able leg
+# anywhere breaks the certainty (the combo product multiplies scalar outcomes).
+# KXWC is pinned airtight (NOTES.md I8, rule-book verified: WC reschedule
+# horizon "over two weeks" — effectively never inside a tournament window).
+# CLUB soccer (KXLALIGA / KXMLS / KXUECL) instead carries the 48h
+# cancel/reschedule "resolves to a fair price" SCALAR rule
+# (docs/calibration/club_soccer_rules_pin.md) — the same surface as MLB's rain
+# rule, which is why every MLB cell below is already not-farmable. Club
+# impossibility cells are therefore IMPOSSIBLE-no-quote, never a farm.
+# Fail-closed: a series not listed here is never farm-certain.
+# resolve_pricing_alias so championship legs aliased to synthetic KXWCADVANCE
+# tickers stay farm-certain (pinned by test_pricing_aliases).
+_FARM_CERTAIN_SERIES_PREFIXES: tuple[str, ...] = ("KXWC",)
+
+
+def _farm_certain(legs: tuple[RfqLeg, ...] | list[RfqLeg]) -> bool:
+    return all(
+        resolve_pricing_alias(leg.market_ticker)
+        .split("-", 1)[0]
+        .upper()
+        .startswith(_FARM_CERTAIN_SERIES_PREFIXES)
+        for leg in legs
+    )
+
 
 def _total_line(market_ticker: str) -> int | None:
     """Integer line N from a TOTAL / FIRST_HALF_TOTAL ticker suffix (``…-3`` -> 3,
@@ -472,7 +499,10 @@ def classify_legs(
                 # Airtight tautology: YES-and-NO of one market can never both
                 # settle YES ⇒ farmable.
                 return Relationship(
-                    RelationshipKind.IMPOSSIBLE, (), tuple(notes), farmable=True
+                    RelationshipKind.IMPOSSIBLE,
+                    (),
+                    tuple(notes),
+                    farmable=_farm_certain(legs),
                 )
             notes.append(f"duplicate leg: {market}")
             return Relationship(RelationshipKind.UNKNOWN, (), tuple(notes))
@@ -565,7 +595,10 @@ def classify_legs(
                 )
                 # Airtight nested-line containment tautology ⇒ farmable.
                 return Relationship(
-                    RelationshipKind.IMPOSSIBLE, (), tuple(notes), farmable=True
+                    RelationshipKind.IMPOSSIBLE,
+                    (),
+                    tuple(notes),
+                    farmable=_farm_certain(legs),
                 )
             if isinstance(verdict, tuple):
                 containments.append(verdict)
@@ -783,7 +816,10 @@ def classify_legs(
                 )
                 # Airtight one-scoreline scoring tautology ⇒ farmable.
                 return Relationship(
-                    RelationshipKind.IMPOSSIBLE, (), tuple(notes), farmable=True
+                    RelationshipKind.IMPOSSIBLE,
+                    (),
+                    tuple(notes),
+                    farmable=_farm_certain(legs),
                 )
             if isinstance(verdict, tuple):
                 containments.append(verdict)
@@ -848,6 +884,8 @@ def classify_legs(
                         types[sp_i] is LegType.FIRST_HALF_SPREAD
                         and types[tot_i] is LegType.TOTAL
                     )
+                    # club soccer is never farm-certain (48h scalar rule)
+                    and _farm_certain(legs)
                 ),
             )
 
@@ -882,7 +920,10 @@ def classify_legs(
                 )
                 # Airtight scoring tautology ⇒ farmable.
                 return Relationship(
-                    RelationshipKind.IMPOSSIBLE, (), tuple(notes), farmable=True
+                    RelationshipKind.IMPOSSIBLE,
+                    (),
+                    tuple(notes),
+                    farmable=_farm_certain(legs),
                 )
             if isinstance(verdict, tuple):
                 containments.append(verdict)
@@ -925,7 +966,10 @@ def classify_legs(
                 # Airtight scoring tautology (a regulation win needs a goal)
                 # ⇒ farmable.
                 return Relationship(
-                    RelationshipKind.IMPOSSIBLE, (), tuple(notes), farmable=True
+                    RelationshipKind.IMPOSSIBLE,
+                    (),
+                    tuple(notes),
+                    farmable=_farm_certain(legs),
                 )
             if isinstance(verdict, tuple):
                 containments.append(verdict)
@@ -963,7 +1007,10 @@ def classify_legs(
                 )
                 # Airtight scoring tautology (FT goals ≥ 1H goals) ⇒ farmable.
                 return Relationship(
-                    RelationshipKind.IMPOSSIBLE, (), tuple(notes), farmable=True
+                    RelationshipKind.IMPOSSIBLE,
+                    (),
+                    tuple(notes),
+                    farmable=_farm_certain(legs),
                 )
             if isinstance(verdict, tuple):
                 containments.append(verdict)
@@ -1026,7 +1073,10 @@ def classify_legs(
                 # Airtight rule-book tautology (a knockout produces exactly
                 # one advancer, incl. ET/pens) ⇒ farmable, like Families 1-3.
                 return Relationship(
-                    RelationshipKind.IMPOSSIBLE, (), tuple(notes), farmable=True
+                    RelationshipKind.IMPOSSIBLE,
+                    (),
+                    tuple(notes),
+                    farmable=_farm_certain(legs),
                 )
             if pair_sides == ("yes", "no"):
                 containments.append((a_i, b_i))

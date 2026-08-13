@@ -74,12 +74,30 @@ def test_unknown_exclusivity_for_multi_leg_event_is_unknown() -> None:
 
 
 def test_same_market_both_sides_impossible_without_provider() -> None:
-    legs = (leg("M1", "E1", "yes"), leg("M1", "E1", "no"))
+    # Farm-certain series (KXWC): the airtight tautology farms.
+    wc = "KXWCGAME-26JUL05MEXENG-MEX"
+    legs = (leg(wc, "E1", "yes"), leg(wc, "E1", "no"))
     rel = classify_legs(legs, ExplodingProvider())  # decided before event lookup
     assert rel.kind is RelationshipKind.IMPOSSIBLE
     assert rel.same_event_groups == ()
-    # Airtight tautology (YES-and-NO of one market) ⇒ farmable.
+    # Airtight tautology (YES-and-NO of one market) ⇒ farmable on KXWC.
     assert rel.farmable is True
+
+
+def test_same_market_both_sides_club_soccer_impossible_never_farms() -> None:
+    # Club soccer carries the 48h cancel/reschedule SCALAR rule
+    # (docs/calibration/club_soccer_rules_pin.md): [X yes, X no] settles
+    # V×(1−V) > 0 on a reschedule — NOT certain-NO. IMPOSSIBLE-no-quote,
+    # never a farm. Same for any non-farm-certain synthetic series.
+    club = "KXLALIGAGAME-26AUG26RMARSO-RMA"
+    legs = (leg(club, "E1", "yes"), leg(club, "E1", "no"))
+    rel = classify_legs(legs, ExplodingProvider())
+    assert rel.kind is RelationshipKind.IMPOSSIBLE
+    assert rel.farmable is False
+    synth = (leg("M1", "E1", "yes"), leg("M1", "E1", "no"))
+    rel_synth = classify_legs(synth, ExplodingProvider())
+    assert rel_synth.kind is RelationshipKind.IMPOSSIBLE
+    assert rel_synth.farmable is False  # fail-closed: unknown series never farm
 
 
 def test_same_market_same_side_twice_is_degenerate_unknown() -> None:

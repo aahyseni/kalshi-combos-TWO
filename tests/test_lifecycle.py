@@ -29,6 +29,7 @@ from tests.test_filters import Harness
 from tests.test_pricing_engine import (
     CROSS_EVENT_LEGS,
     SAME_MARKET_BOTH_SIDES,
+    WC_MARKET,
     combo,
     seed_event,
 )
@@ -140,6 +141,20 @@ async def rig(tmp_path: Path) -> Rig:
     seed_event(h, "E2", exclusive=True)
     store = await Store.open(tmp_path / "t.sqlite3", h.clock)
     return Rig(h, store)
+
+
+async def seed_wc_book(rig: Rig) -> None:
+    """Farm tests ride WC_MARKET (farmable now requires a farm-certain KXWC
+    series). Seeded at a HIGH seq so the shared fixture's M1/M2 seq layout —
+    which the reprice/delta tests depend on — is untouched."""
+    from tests.test_feed import snapshot_env
+
+    rig.h.feed.watch([WC_MARKET])
+    env = snapshot_env(5, 50, WC_MARKET)
+    env["msg"]["yes_dollars_fp"] = [["0.3000", "50.00"], ["0.4700", "20.00"]]
+    env["msg"]["no_dollars_fp"] = [["0.4000", "60.00"], ["0.5100", "25.00"]]
+    await rig.h.ws.deliver(env)
+    rig.h.with_meta(WC_MARKET)
 
 
 @pytest.fixture()
@@ -386,6 +401,7 @@ async def test_farm_yes_side_accept_never_confirms(rig: Rig) -> None:
     """End-to-end #1 invariant: a farmed combo quotes YES at 0, and even if an
     accept lands on that declined side we NEVER confirm — we can never end up
     long the worthless YES."""
+    await seed_wc_book(rig)
     await rig.lifecycle.handle_rfq(combo(SAME_MARKET_BOTH_SIDES))
     assert len(rig.sender.created) == 1
     assert rig.sender.created[0]["yes"] == 0     # farm: YES side declined
@@ -399,6 +415,7 @@ async def test_farm_yes_side_accept_never_confirms(rig: Rig) -> None:
 
 
 async def test_farm_no_side_accept_books_farmed_position(rig: Rig) -> None:
+    await seed_wc_book(rig)
     await rig.lifecycle.handle_rfq(combo(SAME_MARKET_BOTH_SIDES))
     await rig.lifecycle.on_quote_accepted(accepted_msg("q1", "no"))
     await rig.lifecycle.on_quote_executed({"quote_id": "q1"})

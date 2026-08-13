@@ -1079,6 +1079,32 @@ def build_sgp_correlation(
                 rho, band = params.default_rho, fallback_band
                 untyped += 1
                 notes.append(f"untyped pair {key}: flat prior {rho}")
+            elif LegType.ADVANCE in (types[i], types[j]) and not (
+                resolve_pricing_alias(
+                    legs[i if types[i] is LegType.ADVANCE else j].market_ticker
+                )
+                .split("-", 1)[0]
+                .upper()
+                .startswith("KXWC")
+            ):
+                # TWO-LEGGED-TIE ADVANCE REGIME GUARD (club wiring 2026-08-13).
+                # Every measured advance|* prior below was calibrated on
+                # SINGLE-MATCH advance (KXWC knockout: advance = THIS match's
+                # result incl. ET/pens). A two-legged tie's ADVANCE (KXUECL*)
+                # couples to this leg's result through the LEG-1 AGGREGATE — a
+                # different regime (the advance-rho config comment pins it:
+                # "two-legged UCL/UEL/UECL is a DIFFERENT regime, symmetric→0";
+                # a team can lose this match and still advance). Fail-closed:
+                # same-game pairs price as UNTYPED (flat prior + widened band)
+                # instead of borrowing single-match numbers; cross-game pairs
+                # never reach this same-event loop. KXWC — including pricing
+                # aliases onto synthetic KXWCADVANCE — keeps the measured
+                # regime.
+                rho, band = params.default_rho, fallback_band
+                untyped += 1
+                notes.append(
+                    f"two-legged-tie advance pair {key}: flat prior {rho}"
+                )
             else:
                 pair_types = {types[i], types[j]}
                 # NESTED SAME-LADDER RUNGS FIRST (2026-07-27). Two rungs of ONE

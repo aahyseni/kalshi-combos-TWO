@@ -52,6 +52,16 @@ class MarketMeta:
     expected_expiration_time: datetime | None
     raw: JsonDict                     # full payload for fields we don't model yet
     fetched_mono_ns: int
+    # Third pregame anchor (club-soccer wiring 2026-08-13): Kalshi creates
+    # extra club TOTAL rungs ON GAME DAY with a creation-relative
+    # expected_expiration_time (+2h vs siblings, live-verified on
+    # KXUECLTOTAL-26AUG12SCRPAI-7) while occurrence_datetime stays at the
+    # event-stable value — min() over all three anchors is fail-closed (an
+    # earlier estimated start only ever declines sooner; None = absent, the
+    # anchor simply doesn't participate). Defaulted LAST so existing
+    # constructor sites (tools/tests harness seams) stay valid. NOT part of
+    # the metadata-change settlement fingerprint: anchor input only.
+    occurrence_datetime: datetime | None = None
 
     def age_s(self, clock: Clock) -> float:
         return (clock.monotonic_ns() - self.fetched_mono_ns) / 1e9
@@ -346,6 +356,7 @@ class MetadataCache:
             expected_expiration_time=_parse_time(
                 market.get("expected_expiration_time")
             ),
+            occurrence_datetime=_parse_time(market.get("occurrence_datetime")),
             raw=market,
             fetched_mono_ns=fetched_mono_ns,
         )
@@ -371,6 +382,7 @@ class MetadataCache:
             event_ticker=None,
             close_time=None,
             expected_expiration_time=None,
+            occurrence_datetime=None,
             raw={},
             fetched_mono_ns=self._clock.monotonic_ns(),
         )
@@ -408,6 +420,7 @@ class MetadataCache:
             event_ticker=market.get("event_ticker"),
             close_time=_parse_time(market.get("close_time")),
             expected_expiration_time=_parse_time(market.get("expected_expiration_time")),
+            occurrence_datetime=_parse_time(market.get("occurrence_datetime")),
             raw=market,
             fetched_mono_ns=self._clock.monotonic_ns(),
         )

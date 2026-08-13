@@ -16,9 +16,13 @@ from tests.test_filters import Harness
 
 REPO_ROOT = Path(__file__).resolve().parents[1]  # module scope: no Path I/O inside async tests
 
+# Farm tests ride a KXWC ticker: farmable=True now additionally requires every
+# leg on a farm-certain series (KXWC — club soccer's 48h reschedule scalar rule
+# broke the airtight bar; see relationships._FARM_CERTAIN_SERIES_PREFIXES).
+WC_MARKET = "KXWCGAME-26JUL05MEXENG-MEX"
 SAME_MARKET_BOTH_SIDES = [
-    {"market_ticker": "M1", "side": "yes", "event_ticker": "E1"},
-    {"market_ticker": "M1", "side": "no", "event_ticker": "E1"},
+    {"market_ticker": WC_MARKET, "side": "yes", "event_ticker": "E1"},
+    {"market_ticker": WC_MARKET, "side": "no", "event_ticker": "E1"},
 ]
 
 
@@ -52,7 +56,7 @@ def seed_event(h: Harness, event_ticker: str, exclusive: bool | None) -> None:
 
 async def engine_harness() -> tuple[PricingEngine, Harness]:
     h = Harness()
-    await h.with_books(["M1", "M2"])
+    await h.with_books(["M1", "M2", WC_MARKET])
     h.with_meta("KXMVE-C1")  # combo market metadata incl. 1-cent grid
     seed_event(h, "E1", exclusive=True)
     seed_event(h, "E2", exclusive=True)
@@ -249,7 +253,7 @@ async def test_farmable_impossible_is_farmed_not_declined() -> None:
     assert result.farmed is True
     assert result.yes_bid_cc == 0          # never long the worthless YES
     assert result.fair_cc == 0             # true fair of an impossible combo
-    # M1 marginal 0.4789 ⇒ naive 0.4789*0.5211 = 0.2496 ⇒ ask 2495cc ⇒ bid NO
+    # leg marginal 0.4789 ⇒ naive 0.4789*0.5211 = 0.2496 ⇒ ask 2495cc ⇒ bid NO
     # at $1 - 0.2495 = 0.7505, snapped down to the cent grid.
     assert result.no_bid_cc == 7_500
     assert result.width_components_cc == {"farm_sell_price": 2_500}
@@ -261,10 +265,10 @@ async def test_farm_ask_is_below_every_selected_leg_marginal() -> None:
     engine, h = await engine_harness()
     result = engine.price(combo(SAME_MARKET_BOTH_SIDES), time_to_close_s=100_000)
     assert isinstance(result, ConstructedQuote)
-    p = KalshiBookSource(h.feed).marginal("M1")
+    p = KalshiBookSource(h.feed).marginal(WC_MARKET)
     assert p is not None
     farm_ask = 10_000 - int(result.no_bid_cc)  # implied YES sell price = 1 - no_bid
-    # selected marginals: M1 yes = p, M1 no = 1 - p, both in cc
+    # selected marginals: leg yes = p, leg no = 1 - p, both in cc
     assert farm_ask < int(cc_from_prob(p.p))          # below the yes-leg marginal
     assert farm_ask < int(cc_from_prob(1.0 - p.p))    # below the no-leg marginal
 
@@ -301,7 +305,7 @@ async def test_farm_without_beliefs_falls_back_to_no_quote() -> None:
     """Never farm blind: a missing/invalid leg book ⇒ the ordinary
     SKIP_LOGICALLY_IMPOSSIBLE no-quote, never a farm at an unknown price."""
     engine, h = await engine_harness()
-    h.feed.book("M1").invalidate("test")
+    h.feed.book(WC_MARKET).invalidate("test")
     result = engine.price(combo(SAME_MARKET_BOTH_SIDES), time_to_close_s=100_000)
     assert isinstance(result, NoQuote)
     assert result.reason == ReasonCode.SKIP_LOGICALLY_IMPOSSIBLE
