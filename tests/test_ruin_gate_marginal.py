@@ -182,9 +182,12 @@ DIVERSIFIER = KillMarginalCandidate(
     des99_cc=0.0,
 )
 CONCENTRATOR = KillMarginalCandidate(
+    # 2026-08-14 corrected criterion: unconditional tail cost
+    # 600_000 x ES_TAIL_ALPHA = 6_000cc > 5_000cc EV (see the kill-gate
+    # twin for the fixture recalibration note).
     ev_cc=5_000,
     p_accept_lower=1.0,
-    des99_cc=400_000.0,
+    des99_cc=600_000.0,
 )
 CERTIFIED = KillMarginalCandidate(
     ev_cc=-2_000,
@@ -224,21 +227,28 @@ class TestQuoteTimeOverBudget:
         assert "(marginal form)" in ruin[0].detail
         assert "over ruin budget" in ruin[0].detail
 
-    def test_measured_acceptance_buys_exactly_proportional_capacity(
-        self, over_budget
-    ) -> None:
+    def test_admission_boundary_is_tail_weighted_ev(self, over_budget) -> None:
+        """Corrected 2026-08-14: boundary is dES99 x ES_TAIL_ALPHA <= ev;
+        p_accept_lower gates NOTHING (the arming-day incident pin — see the
+        kill-gate twin for the derivation)."""
         _, snap = over_budget
         at_boundary = KillMarginalCandidate(
-            ev_cc=10_000, p_accept_lower=0.25, des99_cc=2_500.0
+            ev_cc=10_000, p_accept_lower=0.25, des99_cc=1_000_000.0
         )
         over_boundary = KillMarginalCandidate(
-            ev_cc=10_000, p_accept_lower=0.25, des99_cc=2_501.0
+            ev_cc=10_000, p_accept_lower=0.25, des99_cc=1_000_100.0
         )
         assert ReasonCode.SKIP_PORTFOLIO_RUIN not in _reasons(
             _limits(marginal=True), snap, at_boundary
         )
         assert ReasonCode.SKIP_PORTFOLIO_RUIN in _reasons(
             _limits(marginal=True), snap, over_boundary
+        )
+        tiny_p_accept_covered = KillMarginalCandidate(
+            ev_cc=10_000, p_accept_lower=0.000137, des99_cc=900_000.0
+        )
+        assert ReasonCode.SKIP_PORTFOLIO_RUIN not in _reasons(
+            _limits(marginal=True), snap, tiny_p_accept_covered
         )
 
     def test_certified_risk_reducer_always_admits(self, over_budget) -> None:

@@ -46,6 +46,7 @@ from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from combomaker.core.reasons import ReasonCode
+from combomaker.rfq.eviction_value import ES_TAIL_ALPHA, marginal_tail_admit
 from combomaker.risk.cap_family import det_max_backstop_frac
 from combomaker.risk.entity_admission import (
     EntityLoad,
@@ -421,24 +422,23 @@ class RiskLimits:
     #     armed today.
     #   * OVER budget (the inherited book already past the budget): do NOT
     #     freeze. A candidate is admitted iff its MARGINAL effect is
-    #     justified — the just-shipped diversity-key metric reused verbatim
-    #     (rfq/eviction_value.py, operator-ratified 2026-07-31):
-    #         admit  iff  dES99 <= dEV x P(accept | size bucket, CP-LOWER at
-    #                     the ratified alpha ``portfolio_kill_tail_prob``)
-    #     i.e. the candidate must add no more marginal tail than the
-    #     expected value it realistically brings. Certified risk-reducers
-    #     (the existing hedge machinery) always admit. NOTE the boundary is
-    #     ``<=`` not ``<`` (deviation from the dossier's strict ``> 0``,
-    #     justified): a DIVERSIFYING candidate on a game the tail
-    #     decomposition does not touch has dES99 == 0 exactly, and at a
-    #     fresh boot the acceptance tape is EMPTY so the CP-lower P(accept)
-    #     is 0 for every bucket — under strict ``>`` the frozen book could
-    #     never quote, never fill, never grow the tape: the same
-    #     100%-decline-dressed-as-a-cap the 2026-07-23 lesson forbids
-    #     (VALIDATE-CAPS-CAN-QUOTE). At ``<=``, zero-marginal-tail flow
-    #     admits immediately while CONCENTRATING flow (dES99 > 0) still
-    #     needs measured acceptance credit to cover its tail — fail-closed
-    #     exactly where it must be.
+    #     justified — ``marginal_tail_admit`` (rfq/eviction_value.py):
+    #         admit  iff  dES99 x ES_TAIL_ALPHA <= dEV
+    #     CORRECTED 2026-08-14 from the original ``dES99 <= dEV x
+    #     P(accept, CP-LOWER)`` form after the arming-day incident (1,307
+    #     quotes / 4 fills / 6 of 10 accepts reneged; store-measured
+    #     refusals 174,000-292,000x over). Two derivation fixes, both on
+    #     the function's docstring: P(accept) cancels at a fill-conditional
+    #     decision (the eviction metric it reused holds risk
+    #     unconditionally — this site does not), and dES99 is
+    #     conditional-on-tail so it carries the ES tail mass before it can
+    #     be compared to unconditional EV. Certified risk-reducers (the
+    #     existing hedge machinery) always admit. The boundary stays
+    #     ``<=``: a DIVERSIFYING candidate on a game the tail decomposition
+    #     does not touch has dES99 == 0 exactly and admits immediately even
+    #     at zero EV, while CONCENTRATING flow (dES99 > 0) must earn its
+    #     tail-weighted charge — fail-closed exactly where it must be
+    #     (VALIDATE-CAPS-CAN-QUOTE, 2026-07-23 and again 2026-08-14).
     #   The det-max backstop, the staleness fail-closed (an unusable /
     #   unmeasured snapshot refuses BOTH axes before any regime is read),
     #   P(ruin) and every deploy-side wall are UNTOUCHED. A caller that
@@ -1697,7 +1697,40 @@ class LimitChecker:
         # the true loss bound the directional proxy overstates. Quote-time
         # callers pass no waivers — behaviour byte-identical.
         directional_thr = threshold_cc(limits.directional_frac, bankroll)
+        # CANDIDATE-GAME SCOPING (2026-08-14 defect repair — the 2026-08-01
+        # sunk-book constitution: only the det-max backstop is a LEVEL gate;
+        # the standing book must never refuse flow it does not touch.
+        # Live-proven 10:03 ET 2026-08-14 (store decision 111700015): a PURE
+        # 7-leg next-day MLS parlay was refused because an MLB game's
+        # standing book direction (26AUG141420STLCHC) sat over this wall —
+        # 7,213 soccer + 1,249 esports refusals in one day, the exact "8/1
+        # freeze shape" check (4b)'s comment below warns about. With
+        # candidates present the wall now judges ONLY the games the
+        # candidate touches: for an untouched game ``directional_by_game_cc``
+        # is purely the sunk book and refusing the candidate cannot lower
+        # it. A candidate leg with an UNKNOWN event ticker disables scoping
+        # for that check (fail closed — UNKNOWN never narrows a wall).
+        # Book-only callers (no candidates: audits, eviction, monitoring)
+        # keep the full-book sweep byte-identically. Touched games keep
+        # today's exact behaviour (fail-closed: the with-candidate census vs
+        # the wall, hedge waivers unchanged) — the mass-acceptance
+        # dominance property is per-game and is untouched by scoping.
+        cand_dir_games: set[str] | None = None
+        if candidates:
+            from combomaker.pricing.grouping import game_key
+
+            cand_dir_games = set()
+            for position in candidates:
+                for leg in position.legs:
+                    if not leg.event_ticker:
+                        cand_dir_games = None  # UNKNOWN ⇒ full sweep
+                        break
+                    cand_dir_games.add(game_key(leg.event_ticker))
+                if cand_dir_games is None:
+                    break
         for game, directional_cc in snapshot.directional_by_game_cc.items():
+            if cand_dir_games is not None and game not in cand_dir_games:
+                continue
             if directional_cc > directional_thr:
                 if _waiver_covers(waived_games, game, game_thr):
                     continue
@@ -2037,11 +2070,18 @@ class LimitChecker:
                             and limits.kill_anchored_book_gate
                         )
                         if marginal_armed and kill_marginal is not None:
+                            # CORRECTED 2026-08-14 (arming-day incident:
+                            # 1,307 quotes / 4 fills; refusals measured
+                            # 174,000-292,000x over): the criterion is the
+                            # units-correct ``marginal_tail_admit`` — dES99
+                            # weighted by the ES tail mass vs unweighted EV,
+                            # P(accept) on NEITHER side (it cancels at a
+                            # fill-conditional decision; the derivation and
+                            # incident live on the function).
                             km = kill_marginal
-                            ev_credit_cc = float(km.ev_cc) * km.p_accept_lower
                             if not (
                                 km.certified_risk_reducing
-                                or km.des99_cc <= ev_credit_cc
+                                or marginal_tail_admit(km.des99_cc, km.ev_cc)
                             ):
                                 out.append(
                                     Breach(
@@ -2051,10 +2091,10 @@ class LimitChecker:
                                         f"{p_upper:.4f} (upper) > "
                                         f"{limits.portfolio_kill_tail_prob:.4f})"
                                         f" and candidate marginal tail "
-                                        f"{km.des99_cc:.0f}cc > EV credit "
-                                        f"{ev_credit_cc:.0f}cc "
-                                        f"(ev {km.ev_cc}cc x p_accept_lower "
-                                        f"{km.p_accept_lower:.4f}) "
+                                        f"{km.des99_cc:.0f}cc x alpha "
+                                        f"{ES_TAIL_ALPHA} > ev {km.ev_cc}cc "
+                                        f"(p_accept_lower "
+                                        f"{km.p_accept_lower:.4f} informational) "
                                         f"(marginal form)",
                                         shadow=shadow,
                                     )
@@ -2187,11 +2227,12 @@ class LimitChecker:
                 # admits. The det-max backstop above and the unusable-
                 # snapshot fail-closed path are untouched.
                 if limits.ruin_gate_marginal and kill_marginal is not None:
+                    # CORRECTED 2026-08-14 — same units + conditioning
+                    # repair as §(8a); derivation on ``marginal_tail_admit``.
                     km = kill_marginal
-                    ev_credit_cc = float(km.ev_cc) * km.p_accept_lower
                     if not (
                         km.certified_risk_reducing
-                        or km.des99_cc <= ev_credit_cc
+                        or marginal_tail_admit(km.des99_cc, km.ev_cc)
                     ):
                         out.append(
                             Breach(
@@ -2200,10 +2241,10 @@ class LimitChecker:
                                 f"{book_risk.p_ruin:.4f} (upper "
                                 f"{gated_ruin:.4f}) > {ruin_budget:.4f}) "
                                 f"and candidate marginal tail "
-                                f"{km.des99_cc:.0f}cc > EV credit "
-                                f"{ev_credit_cc:.0f}cc "
-                                f"(ev {km.ev_cc}cc x p_accept_lower "
-                                f"{km.p_accept_lower:.4f}) (marginal form)",
+                                f"{km.des99_cc:.0f}cc x alpha "
+                                f"{ES_TAIL_ALPHA} > ev {km.ev_cc}cc "
+                                f"(p_accept_lower {km.p_accept_lower:.4f} "
+                                f"informational) (marginal form)",
                                 shadow=shadow,
                             )
                         )

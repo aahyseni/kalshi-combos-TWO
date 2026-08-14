@@ -386,6 +386,43 @@ def diversity_key(ev_cc: int, p_accept: float, des99_cc: float) -> float:
     return float(ev_cc) * p_accept - des99_cc
 
 
+# Tail mass of the dES99 decomposition. ``allocate_des99_cc`` splits the
+# book's ES_0.99 — the expected loss CONDITIONAL on being in the worst 1% of
+# nights — so a candidate's allocated share is a conditional-on-tail number.
+# Comparing it against UNCONDITIONAL EV requires weighting by the tail's own
+# probability mass (1 - 0.99). This is a units fact of the ES definition,
+# not a tunable: change the ES level and this changes with it.
+ES_TAIL_ALPHA = 0.01
+
+
+def marginal_tail_admit(des99_cc: float, ev_cc: int) -> bool:
+    """The 2026-08-01 sunk-book marginal admission test, CORRECTED
+    2026-08-14 (arming-day incident: 1,307 quotes / 4 fills all day).
+
+    Admit iff the candidate's unconditional marginal tail cost — its
+    allocated conditional dES99 weighted by the tail's probability mass —
+    is covered by its unconditional EV. Two derivation facts vs the
+    original ``dES99 <= dEV x P(accept)`` form (both measured live
+    2026-08-14, refusals 174,000-292,000x over):
+
+    * P(accept) appears on NEITHER side: at the admission decision the EV
+      and the tail BOTH materialize only if the quote fills, so the
+      acceptance probability cancels. (It stays in ``diversity_key``
+      above, where it is CORRECT — a resting quote's reservation holds
+      capacity unconditionally while its EV remains conditional. The 8/1
+      gate reused that eviction metric verbatim in a context where its
+      conditioning assumption does not hold.)
+    * dES99 is conditional-on-tail (mean of the worst 1%); EV is
+      unconditional — the raw comparison was off by the tail mass. The
+      weighted form still refuses genuine tail-concentrators (a same-game
+      whale's allocated dES99 x alpha exceeds its thin EV) while ordinary
+      diversifying flow admits; deterministic concentration walls
+      (structure/per-combo/entity/directional/size) are untouched and
+      keep refusing whales regardless.
+    """
+    return des99_cc * ES_TAIL_ALPHA <= float(ev_cc)
+
+
 def allocate_des99_cc(
     quote_games: frozenset[str] | set[str],
     quote_det_cc: int,

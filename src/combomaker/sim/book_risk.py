@@ -3231,7 +3231,41 @@ def _candidate_gate(
                         post.governing_model_tail_loss_cc
                         <= pre.governing_model_tail_loss_cc
                     )
-                    if not (certified or p_kill <= pre_p_kill):
+                    # CORRECTED 2026-08-14 (renege incident: 6 of 10
+                    # accepted quotes declined here, 3 with POSITIVE EV —
+                    # we backed out of won auctions). The strict
+                    # ``p_kill <= pre_p_kill`` on a shared-CRN sample is
+                    # quantized at 1/n_samples: a small fill flipping ONE
+                    # path across the KILL line registered as a "raise".
+                    # Two derived allowances, no new constants:
+                    #   * NOISE QUANTUM — a delta within z paths of the
+                    #     shared sample (z = the ratified ``ruin_prob_ci_z``
+                    #     the estimator itself uses) is inside the
+                    #     measurement's own resolution and cannot be called
+                    #     a raise at that confidence.
+                    #   * EV-PRICED — a real raise is admitted iff its
+                    #     marginal expected KILL-cost, priced at the
+                    #     anchored KILL line (delta-p x ``tail_thr``), is
+                    #     covered by the candidate's own edge
+                    #     (``admission_ev``, the gate's ratified EV
+                    #     source). Both sides are fill-certain at confirm —
+                    #     dimensionally and conditionally symmetric.
+                    # Whale-scale raises fail both and still decline.
+                    delta_p_kill = p_kill - pre_p_kill
+                    kill_noise_quantum = (
+                        ruin_prob_ci_z / float(n_samples)
+                        if n_samples > 0
+                        else 0.0
+                    )
+                    ev_covers_kill_cost = (
+                        max(0.0, admission_ev)
+                        >= delta_p_kill * float(tail_thr)
+                    )
+                    if not (
+                        certified
+                        or delta_p_kill <= kill_noise_quantum
+                        or ev_covers_kill_cost
+                    ):
                         return False, "kill_marginal_raises_p_kill"
                 else:
                     return False, "post_kill_tail_prob_over_budget"
@@ -3328,10 +3362,34 @@ def _candidate_gate(
                     post.governing_model_tail_loss_cc
                     <= pre.governing_model_tail_loss_cc
                 )
+                # CORRECTED 2026-08-14 — the same two derived allowances as
+                # the KILL form above (rationale there): a shared-CRN delta
+                # within the estimator's z-path quantum is not a measured
+                # raise, and a real raise admits iff its marginal expected
+                # ruin-cost priced at the ruin line (the model-free 0.70B
+                # det backstop distance — ``det_max_backstop_frac``) is
+                # covered by the candidate's own edge. No bankroll ⇒ no
+                # EV-priced allowance (fail closed to quantum-only).
+                delta_p_ruin = max(post.p_ruin, post.p_ruin_upper) - max(
+                    pre.p_ruin, pre.p_ruin_upper
+                )
+                ruin_noise_quantum = (
+                    ruin_prob_ci_z / float(n_samples)
+                    if n_samples > 0
+                    else 0.0
+                )
+                ev_covers_ruin_cost = False
+                if bankroll_cc is not None and bankroll_cc > 0:
+                    ruin_line_cc = float(det_max_backstop_frac()) * float(
+                        bankroll_cc
+                    )
+                    ev_covers_ruin_cost = (
+                        max(0.0, admission_ev) >= delta_p_ruin * ruin_line_cc
+                    )
                 if not (
                     certified
-                    or max(post.p_ruin, post.p_ruin_upper)
-                    <= max(pre.p_ruin, pre.p_ruin_upper)
+                    or delta_p_ruin <= ruin_noise_quantum
+                    or ev_covers_ruin_cost
                 ):
                     return False, "ruin_marginal_raises_p_ruin"
             else:

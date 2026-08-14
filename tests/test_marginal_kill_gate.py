@@ -177,10 +177,15 @@ DIVERSIFIER = KillMarginalCandidate(
     des99_cc=0.0,
 )
 CONCENTRATOR = KillMarginalCandidate(
-    # Marginal tail far beyond any EV credit — the fifth ticket on the hot game.
+    # Marginal tail beyond its EV even after the ES tail-mass weighting
+    # (2026-08-14 corrected criterion): unconditional tail cost
+    # 600_000 x ES_TAIL_ALPHA = 6_000cc > 5_000cc EV — the whale-scale
+    # ticket on the hot game. (At the pre-fix 400_000 the weighted cost
+    # 4_000 < 5_000 EV ADMITS — that shape is priced-in flow, not a
+    # concentrator; the old fixture was calibrated to the broken formula.)
     ev_cc=5_000,
     p_accept_lower=1.0,
-    des99_cc=400_000.0,
+    des99_cc=600_000.0,
 )
 
 
@@ -245,23 +250,39 @@ class TestQuoteTimeOverBudget:
         assert "(marginal form)" in cvar[0].detail
         assert "candidate marginal tail" in cvar[0].detail
 
-    def test_measured_acceptance_buys_exactly_proportional_capacity(
-        self, over_budget
-    ) -> None:
-        """The admission boundary is dES99 <= ev x p_accept_lower — the
-        candidate's marginal tail must be covered by the EV it REALISTICALLY
-        brings (CP-lower measured acceptance), no other number."""
+    def test_admission_boundary_is_tail_weighted_ev(self, over_budget) -> None:
+        """The admission boundary (corrected 2026-08-14) is
+        dES99 x ES_TAIL_ALPHA <= ev — the candidate's UNCONDITIONAL marginal
+        tail cost covered by its unconditional EV, no other number. At
+        ev=10_000 the boundary sits at des99 = 1_000_000 exactly (``<=``)."""
         _, snap = over_budget
         lim = _limits(marginal=True)
-        ev, des = 10_000, 4_000.0
+        ev = 10_000
         covered = KillMarginalCandidate(
-            ev_cc=ev, p_accept_lower=0.5, des99_cc=des  # credit 5000 >= 4000
+            ev_cc=ev, p_accept_lower=1.0, des99_cc=1_000_000.0  # cost == ev
         )
         uncovered = KillMarginalCandidate(
-            ev_cc=ev, p_accept_lower=0.3, des99_cc=des  # credit 3000 < 4000
+            ev_cc=ev, p_accept_lower=1.0, des99_cc=1_000_100.0  # cost > ev
         )
         assert ReasonCode.SKIP_PORTFOLIO_CVAR not in _reasons(lim, snap, covered)
         assert ReasonCode.SKIP_PORTFOLIO_CVAR in _reasons(lim, snap, uncovered)
+
+    def test_p_accept_no_longer_gates_admission(self, over_budget) -> None:
+        """REGRESSION PIN — the 2026-08-14 arming-day incident: the original
+        form multiplied EV by the CP-lower P(accept) (~2e-4 from a sparse
+        seeded tape) while charging 100% of the conditional tail, refusing
+        ordinary flow at 174,000x over (1,307 quotes / 4 fills all day).
+        At a fill-conditional decision the acceptance probability cancels:
+        a tail-covered candidate must admit at ANY p_accept_lower."""
+        _, snap = over_budget
+        lim = _limits(marginal=True)
+        for p_low in (0.0, 0.000137, 1.0):
+            cand = KillMarginalCandidate(
+                ev_cc=10_000, p_accept_lower=p_low, des99_cc=900_000.0
+            )
+            assert ReasonCode.SKIP_PORTFOLIO_CVAR not in _reasons(
+                lim, snap, cand
+            ), f"tail-covered candidate refused at p_accept_lower={p_low}"
 
     def test_certified_risk_reducer_always_admits(self, over_budget) -> None:
         """Hedges are +EV: certification (state enumeration / CRN, never a
@@ -375,6 +396,7 @@ def _gate(
     admission_ev: float = 1_000.0,
     pre_tail: float = 150_000.0,
     post_tail: float = 150_000.0,
+    ruin_prob_ci_z: float = 0.0,
 ) -> tuple[bool, str]:
     return _candidate_gate(
         admission_ev=admission_ev,
@@ -397,6 +419,7 @@ def _gate(
         pre_pnls=(_pnl(pre_frac, 200_000.0),),
         post_pnls=(_pnl(post_frac, 200_000.0),),
         n_samples=1_000,
+        ruin_prob_ci_z=ruin_prob_ci_z,
     )
 
 
@@ -415,14 +438,61 @@ class TestConfirmGateTwoRegimes:
 
     def test_over_budget_concentrator_refuses(self) -> None:
         """A candidate that RAISES the measured P(KILL-night) on the shared
-        CRN sample is refused — its marginal effect on the ratified anchor
-        itself is adverse."""
+        CRN sample beyond its own edge is refused — its marginal effect on
+        the ratified anchor itself is adverse. (Delta-p 0.03 priced at the
+        120_000cc KILL line = 3_600cc >> the 1_000cc admission EV.)"""
         confirm, reason = _gate(
             marginal=True, pre_frac=0.05, post_frac=0.08,
             pre_tail=150_000.0, post_tail=155_000.0,  # tail grows too — not
             # a certified reducer (equal tails WOULD certify: post <= pre)
         )
         assert (confirm, reason) == (False, "kill_marginal_raises_p_kill")
+
+    def test_small_raise_covered_by_ev_admits(self) -> None:
+        """CORRECTED 2026-08-14 (renege incident: 6/10 accepts declined, 3
+        +EV): a ONE-PATH raise on the shared CRN sample (delta-p 0.001 at
+        n=1_000) priced at the KILL line costs 120cc — covered by the
+        1_000cc admission EV => ADMIT. Under the pre-fix strict comparison
+        this exact shape reneged on a won auction."""
+        confirm, reason = _gate(
+            marginal=True, pre_frac=0.05, post_frac=0.051,
+            pre_tail=150_000.0, post_tail=155_000.0,  # not certified
+        )
+        assert (confirm, reason) == (True, "")
+
+    def test_ev_pricing_boundary_at_the_kill_line(self) -> None:
+        """The EV-priced allowance is delta-p x KILL-line <= admission EV,
+        exactly: delta-p 0.008 costs 960cc <= 1_000cc admits; delta-p 0.010
+        costs 1_200cc > 1_000cc declines."""
+        covered = _gate(
+            marginal=True, pre_frac=0.05, post_frac=0.058,
+            pre_tail=150_000.0, post_tail=155_000.0,
+        )
+        assert covered == (True, "")
+        uncovered = _gate(
+            marginal=True, pre_frac=0.05, post_frac=0.060,
+            pre_tail=150_000.0, post_tail=155_000.0,
+        )
+        assert uncovered == (False, "kill_marginal_raises_p_kill")
+
+    def test_noise_quantum_tolerates_single_path_flip(self) -> None:
+        """A delta within z paths of the shared sample (z/n_samples) is
+        inside the estimator's own resolution — admitted even when the EV
+        allowance cannot cover it (admission_ev 1cc here). One flipped path
+        at n=1_000 (Wilson-upper delta ~0.0011 after the bound's own slope)
+        sits inside the z=2 quantum 0.002; at z=0 the quantum is 0 and the
+        same shape declines."""
+        one_path = dict(
+            pre_frac=0.05, post_frac=0.051,
+            pre_tail=150_000.0, post_tail=155_000.0,
+            admission_ev=1.0,
+        )
+        assert _gate(marginal=True, ruin_prob_ci_z=2.0, **one_path) == (
+            True, "",
+        )
+        assert _gate(marginal=True, ruin_prob_ci_z=0.0, **one_path) == (
+            False, "kill_marginal_raises_p_kill",
+        )
 
     def test_over_budget_certified_reducer_admits(self) -> None:
         """The existing certification measure verbatim (POST unclamped tail

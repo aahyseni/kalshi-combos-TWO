@@ -258,3 +258,80 @@ class TestDirectionalCapWiring:
             book, lambda t: 0.5, DailyPnl(), risk_bankroll_cc=bankroll,
         )
         assert any(b.reason is ReasonCode.SKIP_DIRECTIONAL_CAP for b in breaches)
+
+
+OTHER_GAME_LEG = LegRef(
+    "KXMLSGAME-26AUG16ATLNYC-ATL", "KXMLSGAME-26AUG16ATLNYC", "yes"
+)
+UNKNOWN_EVENT_LEG = LegRef("KXWCGAME-26JUL15ENGARG-ARG", "", "yes")
+
+
+class TestDirectionalCapCandidateScoping:
+    """2026-08-14 defect repair (the 8/1 sunk-book constitution): the
+    standing book's directional wall must never refuse a candidate on a
+    game the candidate does not touch — live-proven 10:03 ET 2026-08-14
+    (store decision 111700015: a pure 7-leg MLS parlay refused for an MLB
+    game's book direction; 8,462 soccer/esports refusals in one day).
+    NOTE (vitals-gate lesson): no pre-existing test varied this
+    discriminating variable — these pins are the first."""
+
+    def _checker(self):
+        # Same derivation as TestDirectionalCapWiring._checker: 10%
+        # directional_frac of a $15.00 bankroll = 15000cc threshold.
+        limits = RiskLimits(caps_shadow_mode=False)
+        return LimitChecker(limits), 150_000
+
+    def _over_wall_book(self):
+        # Same shape as test_concentration_trips_directional_cap: the
+        # standing book's ENGARG direction (20000cc) is OVER the 15000cc
+        # wall before any candidate arrives — the sunk-book regime.
+        book = ExposureBook(CONV, is_me_event=ME)
+        book.add_position(_pos("p1", ARG, 7000, contracts=100))
+        book.add_position(_pos("p2", ARG, 5000, contracts=100))
+        return book
+
+    def test_candidate_on_untouched_game_is_not_refused(self):
+        checker, bankroll = self._checker()
+        book = self._over_wall_book()
+        candidate = _pos("cand", OTHER_GAME_LEG, 5000, contracts=10)
+        breaches = checker.check(
+            book, lambda t: 0.5, DailyPnl(), candidate_positions=[candidate],
+            risk_bankroll_cc=bankroll,
+        )
+        assert not any(
+            b.reason is ReasonCode.SKIP_DIRECTIONAL_CAP for b in breaches
+        ), "sunk book's over-wall game refused a candidate that never touches it"
+
+    def test_candidate_on_the_over_wall_game_still_refuses(self):
+        checker, bankroll = self._checker()
+        book = self._over_wall_book()
+        candidate = _pos("cand", ARG, 5000, contracts=10)  # touches ENGARG
+        breaches = checker.check(
+            book, lambda t: 0.5, DailyPnl(), candidate_positions=[candidate],
+            risk_bankroll_cc=bankroll,
+        )
+        assert any(
+            b.reason is ReasonCode.SKIP_DIRECTIONAL_CAP for b in breaches
+        )
+
+    def test_unknown_event_ticker_disables_scoping_fail_closed(self):
+        checker, bankroll = self._checker()
+        book = self._over_wall_book()
+        candidate = _pos("cand", UNKNOWN_EVENT_LEG, 5000, contracts=10)
+        breaches = checker.check(
+            book, lambda t: 0.5, DailyPnl(), candidate_positions=[candidate],
+            risk_bankroll_cc=bankroll,
+        )
+        assert any(
+            b.reason is ReasonCode.SKIP_DIRECTIONAL_CAP for b in breaches
+        ), "UNKNOWN event ticker must keep the full-book sweep (fail closed)"
+
+    def test_book_only_callers_keep_the_full_sweep(self):
+        checker, bankroll = self._checker()
+        book = self._over_wall_book()
+        breaches = checker.check(
+            book, lambda t: 0.5, DailyPnl(), risk_bankroll_cc=bankroll,
+        )
+        assert any(
+            b.reason is ReasonCode.SKIP_DIRECTIONAL_CAP for b in breaches
+        ), "no-candidate audits must still report the standing breach"
