@@ -258,9 +258,17 @@ class Store:
         # rewrite and synchronous=NORMAL fsyncs only at CHECKPOINT (not per commit),
         # so a commit is now ~microseconds and the write path can't stall the loop.
         # busy_timeout absorbs the brief checkpoint lock on the large DB.
+        # ORDERING (2026-08-15 boot-race fix, second live occurrence): the
+        # busy_timeout must be set BEFORE the WAL pragma. journal_mode=WAL
+        # takes a brief exclusive lock; with busy_timeout still at its 0
+        # default, a concurrent reader (the watchdog's store probe, a
+        # diagnostic mode=ro scan of the ~150GB store) at that instant makes
+        # it raise ``database is locked`` and the boot DIES (2026-08-14
+        # 09:20 ET false start; 2026-08-15 12:06 ET, 25 min of downtime
+        # mid-slate). With the timeout first, the same collision waits.
+        await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=NORMAL")
-        await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         # autocheckpoint OFF (2026-07-14): with it ON, a 2000-page checkpoint
         # fired INLINE on every writer commit that crossed the threshold — on the
         # ~2GB DB that ran near-continuously during bursts, so the background
