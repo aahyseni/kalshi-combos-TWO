@@ -144,6 +144,16 @@ class ReasonCode(StrEnum):
     # malformed combo), inflating the "classifier unknown" tally with non-classifier
     # causes — now split out so the count is honest.
     SKIP_CLASSIFIER_UNKNOWN = "skip_classifier_unknown"
+    # PICKOFF GUARD (2026-08-15): a same-game TIE-moneyline × TOTAL combo whose
+    # Dixon-Coles inversion REJECTED must decline, never copula-fallback — the
+    # fallback pair rho (soccer moneyline|total +0.28) is TEAM-oriented and
+    # wrong-signed for the draw outcome (truth ~−0.45), pricing P(draw∧under)
+    # BELOW independence. Measured 8/13-8/15: ALL 8 pickoff fills (two sharp
+    # takers, +2.7..+6.7c rich vs 12-22 maker fields, $263 at risk) landed on
+    # exactly this fallback state — 14 of 3,208 tie×total quotes; the 3,194
+    # structurally-priced ones took zero. Removed when the tie-oriented rho +
+    # CHALLENGE-band repair ships (post-freeze recipe in the 8/15 report).
+    SKIP_STRUCTURAL_FALLBACK_TIE_TOTAL = "skip_structural_fallback_tie_total"
     # We have no PRICE GRID for the combo market (metadata not fetched / no grid on
     # an RFQ-generated multi-game market). Missing data ⇒ no-quote (rule 6); NOT a
     # classifier failure.

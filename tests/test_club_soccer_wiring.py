@@ -146,6 +146,99 @@ def test_club_combos_take_soccer_markup_never_other() -> None:
     assert sport_of([LALIGA_GAME, "KXMLBGAME-26AUG121340BALMIN-BAL"]) == "other"
 
 
+# --- 2026-08-15 league expansion (Liga MX / EFL Championship / UCL / EPL +
+# classified-only CLUBF/CHNSL/ENGCS) --------------------------------------------
+
+EXPANSION_TICKERS = [
+    ("KXLIGAMXGAME-26AUG16TIJMTY-TIE", LegType.MONEYLINE),
+    ("KXLIGAMXTOTAL-26AUG16TIJMTY-3", LegType.TOTAL),
+    ("KXLIGAMXSPREAD-26AUG16TIJMTY-MTY2", LegType.SPREAD),
+    ("KXLIGAMXBTTS-26AUG16TIJMTY-BTTS", LegType.BTTS),
+    ("KXEFLCHAMPIONSHIPGAME-26AUG16WBALEE-WBA", LegType.MONEYLINE),
+    ("KXEFLCHAMPIONSHIPTOTAL-26AUG16WBALEE-3", LegType.TOTAL),
+    ("KXUCLGAME-26AUG19CELKAI-CEL", LegType.MONEYLINE),
+    ("KXUCLTOTAL-26AUG19CELKAI-3", LegType.TOTAL),
+    ("KXUCLBTTS-26AUG19CELKAI-BTTS", LegType.BTTS),
+    ("KXEPLGAME-26AUG15LIVBOU-LIV", LegType.MONEYLINE),
+    ("KXEPLBTTS-26AUG15LIVBOU-BTTS", LegType.BTTS),
+]
+
+
+@pytest.mark.parametrize("ticker,expected", EXPANSION_TICKERS)
+def test_expansion_series_classify_to_wc_families(
+    ticker: str, expected: LegType
+) -> None:
+    assert classify_leg(ticker) is expected
+
+
+@pytest.mark.parametrize(
+    "ticker",
+    [t for t, _ in EXPANSION_TICKERS]
+    + [
+        # Classified-but-NOT-allowlisted (friendlies-class): sport must
+        # still resolve so they can never price as UNKNOWN/zero-markup.
+        "KXCLUBFGAME-26AUG16ARSVIL-ARS",
+        "KXCHNSLGAME-26AUG16SHASHE-SHA",
+        "KXENGCSGAME-26AUG16LIVCRY-LIV",
+    ],
+)
+def test_expansion_series_classify_sport_soccer(ticker: str) -> None:
+    assert classify_sport(ticker) is Sport.SOCCER
+
+
+def test_expansion_combos_take_soccer_markup_never_other() -> None:
+    # The zero-markup money trap (KXMENWORLDCUP incident class): every new
+    # league prefix must resolve to the soccer markup tier.
+    assert sport_of(
+        ["KXLIGAMXGAME-26AUG16TIJMTY-TIE", "KXMLSGAME-26AUG16ATLNYC-ATL"]
+    ) == "soccer"
+    assert sport_of(
+        [
+            "KXEFLCHAMPIONSHIPGAME-26AUG16WBALEE-WBA",
+            "KXCLUBFGAME-26AUG16ARSVIL-ARS",
+        ]
+    ) == "soccer"
+    assert sport_of(
+        ["KXUCLGAME-26AUG19CELKAI-CEL", "KXEPLGAME-26AUG15LIVBOU-LIV"]
+    ) == "soccer"
+    # EFL ≠ NFL/EPL collision pin: the keyword must not leak into football.
+    assert sport_of(["KXNFLGAME-26SEP07KCBAL-KC"]) != "soccer"
+
+
+# --- 2026-08-15 pickoff guard: same-game TIE×TOTAL never copula-fallbacks ------
+
+
+def test_same_game_tie_total_trigger() -> None:
+    from combomaker.pricing.engine import _same_game_tie_total
+
+    tie = leg("KXLALIGAGAME-26AUG15ALAGET-TIE", "KXLALIGAGAME-26AUG15ALAGET")
+    total = leg("KXLALIGATOTAL-26AUG15ALAGET-3", "KXLALIGATOTAL-26AUG15ALAGET", "no")
+    team = leg("KXLALIGAGAME-26AUG15ALAGET-ALA", "KXLALIGAGAME-26AUG15ALAGET")
+    spread = leg(
+        "KXLALIGASPREAD-26AUG15ALAGET-ALA1", "KXLALIGASPREAD-26AUG15ALAGET"
+    )
+    other_total = leg(
+        "KXMLSTOTAL-26AUG16ATLNYC-3", "KXMLSTOTAL-26AUG16ATLNYC", "no"
+    )
+    # The pickoff shape: TIE-moneyline × TOTAL in ONE same-event group.
+    assert _same_game_tie_total([tie, total], ((0, 1),)) is True
+    # Same legs, DIFFERENT games (cross-game): the copula prices independent
+    # games correctly — no trigger.
+    assert _same_game_tie_total([tie, other_total], ((0,), (1,))) is False
+    # Team-oriented ML × total: the +0.28 rho is calibrated for exactly this
+    # — no trigger.
+    assert _same_game_tie_total([team, total], ((0, 1),)) is False
+    # Tie × spread: not the guarded pair.
+    assert _same_game_tie_total([tie, spread], ((0, 1),)) is False
+    # A wider combo where ONE group carries the bad pair still triggers.
+    assert (
+        _same_game_tie_total(
+            [tie, total, other_total], ((0, 1), (2,))
+        )
+        is True
+    )
+
+
 # --- 3. farm gating (the 48h-scalar money trap) ---------------------------------
 
 

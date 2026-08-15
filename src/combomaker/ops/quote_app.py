@@ -54,8 +54,10 @@ from combomaker.exchange.rest import (
     DEFAULT_ENDPOINT_TOKEN_COST,
     DEFAULT_REQUEST_TIMEOUT_S,
     DELETE_QUOTE_TOKEN_COST,
+    INSUFFICIENT_BALANCE_CODE,
     LOWEST_TIER_LIMITS,
     ApiTierLimits,
+    CashGatedError,
     KalshiApiError,
     KalshiRestClient,
     RateLimitedError,
@@ -898,6 +900,93 @@ class RateLimitRecordingSender:
         except RateLimitedError:
             self._window.record()
             raise
+
+
+class CashGateSender:
+    """A thin ``QuoteSender`` decorator (2026-08-15, operator lever 4 — the
+    dead-time/cash-storm fix): after the exchange refuses a create with
+    ``insufficient_balance`` (HTTP 400), refuse further creates LOCALLY
+    (``CashGatedError``, no HTTP) until the balance tracker produces a NEW
+    poll reading — at which point exactly ONE exchange probe is allowed, and
+    a successful create clears the gate entirely.
+
+    Why: cash exhaustion was discovered by erroring — 225k insufficient_
+    balance 400s/day at 7.2/s peak (2026-08-13), 181k on 2026-08-15 — each
+    burning write budget and log volume to learn a fact the balance poll
+    already knows. Probe cadence = the poll cadence (``last_poll_ns_or_
+    none``): fully derived, no hand-set timer, and settlements freeing cash
+    are discovered on the very next reading. DELETE and CONFIRM are NEVER
+    gated (withdrawals and accepted-quote confirms are risk-reducing /
+    contractual — gating a confirm would be a renege). Wraps the
+    429-recording sender (both decorators stay pristine, hard rule 8);
+    ``CashGatedError`` is status-0/local so it never feeds the 429-burst
+    breaker."""
+
+    def __init__(self, inner: RateLimitRecordingSender, balance: Any) -> None:
+        self._inner = inner
+        self._balance = balance
+        # Poll stamp at the moment of the last exchange insufficient_balance
+        # refusal; None = gate open.
+        self._gated_at_poll_ns: int | None = None
+        self._gated_creates = 0  # local refusals since gating (telemetry)
+
+    async def create_quote(
+        self,
+        rfq_id: str,
+        *,
+        yes_bid_cc: CentiCents,
+        no_bid_cc: CentiCents,
+        rest_remainder: bool = False,
+    ) -> JsonDict:
+        if self._gated_at_poll_ns is not None:
+            poll_ns = self._balance.last_poll_ns_or_none()
+            if poll_ns is not None and poll_ns == self._gated_at_poll_ns:
+                self._gated_creates += 1
+                raise CashGatedError()
+            # New reading (or tracker reset): allow ONE probe; on failure the
+            # gate re-stamps to the new reading below.
+        try:
+            result = await self._inner.create_quote(
+                rfq_id,
+                yes_bid_cc=yes_bid_cc,
+                no_bid_cc=no_bid_cc,
+                rest_remainder=rest_remainder,
+            )
+        except KalshiApiError as e:
+            if e.code == INSUFFICIENT_BALANCE_CODE:
+                was_gated = self._gated_at_poll_ns is not None
+                self._gated_at_poll_ns = self._balance.last_poll_ns_or_none()
+                if not was_gated:
+                    log.warning(
+                        "cash_gate_armed",
+                        rfq_id=rfq_id,
+                        suppressed_since_gate=self._gated_creates,
+                    )
+            raise
+        if self._gated_at_poll_ns is not None:
+            log.info(
+                "cash_gate_cleared",
+                rfq_id=rfq_id,
+                suppressed_creates=self._gated_creates,
+            )
+            self._gated_at_poll_ns = None
+            self._gated_creates = 0
+        return result
+
+    async def delete_quote(self, quote_id: str) -> JsonDict:
+        return await self._inner.delete_quote(quote_id)
+
+    async def confirm_quote(self, quote_id: str) -> JsonDict:
+        return await self._inner.confirm_quote(quote_id)
+
+    async def get_quote(self, quote_id: str) -> JsonDict:
+        return await self._inner.get_quote(quote_id)
+
+    async def get_quotes(self, **params: Any) -> JsonDict:
+        return await self._inner.get_quotes(**params)
+
+    async def get_fills(self, **params: str | int) -> JsonDict:
+        return await self._inner.get_fills(**params)
 
 
 class PositionsGetter(Protocol):
@@ -2045,8 +2134,11 @@ class QuoteApp:
                 enabled=widen_cfg.enabled, util_threshold=widen_cfg.util_threshold
             )
             # Quote mode: wrap the REST sender so create/delete/confirm 429s feed
-            # the rate-limit-burst breaker (not just the polls). Paper never 429s.
-            sender: PaperSender | RateLimitRecordingSender
+            # the rate-limit-burst breaker (not just the polls), then wrap THAT
+            # in the cash gate (2026-08-15 lever 4): one insufficient_balance
+            # probe per fresh balance reading instead of a 181k/day 400-storm.
+            # Paper never 429s and never runs out of cash.
+            sender: PaperSender | CashGateSender
             # FILL-RECORD RECOVERY (2026-07-16 P1): the GET-capable handle the
             # lifecycle's recovery sweep polls — the SAME wrapped REST sender the
             # write path uses (its get_quote taps 429s into the burst breaker
@@ -2057,8 +2149,11 @@ class QuoteApp:
                 sender = PaperSender()
                 quote_getter = None
             else:
-                sender = RateLimitRecordingSender(rest, self._rate_limit_window)
-                quote_getter = sender
+                rate_tapped = RateLimitRecordingSender(
+                    rest, self._rate_limit_window
+                )
+                sender = CashGateSender(rate_tapped, balance_tracker)
+                quote_getter = rate_tapped
             # Real fee model for the fill fee the ledger books at execution
             # (defense #3): $0 for our combo maker quadratic fills, correct for a
             # nonzero-fee series. Built from the SAME config the engine uses.

@@ -35,11 +35,27 @@ def _leg_sport(ticker: str) -> str:
     ticker = resolve_pricing_alias(ticker)
     if ticker.startswith("KXWC"):
         return "soccer"
-    # CLUB SOCCER (2026-08-13 operator wire): La Liga / MLS / UECL ride the
-    # soccer markup tier — same 90'-regulation families as KXWC (rules pin:
-    # docs/calibration/club_soccer_rules_pin.md); the allowlist still governs
-    # admission. "KXMLS" != "KXMLB" at char 4 — no collision.
-    if ticker.startswith(("KXLALIGA", "KXMLS", "KXUECL")):
+    # CLUB SOCCER (2026-08-13 operator wire; EXPANDED 2026-08-15 "wire more
+    # soccer leagues" — Liga MX / EFL Championship / UCL / EPL + the
+    # classified-but-not-allowlisted CHNSL/CLUBF/ENGCS so no soccer leg can
+    # ever ride 'other' at ZERO markup, the KXMENWORLDCUP incident class):
+    # all ride the soccer markup tier — same 90'-regulation families as KXWC
+    # (rules pin: docs/calibration/club_soccer_rules_pin.md); the allowlist
+    # still governs admission. "KXMLS" != "KXMLB" at char 4 — no collision.
+    if ticker.startswith(
+        (
+            "KXLALIGA",
+            "KXMLS",
+            "KXUECL",
+            "KXLIGAMX",
+            "KXEFLCHAMPIONSHIP",
+            "KXUCL",
+            "KXEPL",
+            "KXCHNSL",
+            "KXCLUBF",
+            "KXENGCS",
+        )
+    ):
         return "soccer"
     if ticker.startswith("KXMLB"):
         return "mlb"

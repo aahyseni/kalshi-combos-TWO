@@ -108,6 +108,34 @@ def is_single_family_no_basket(legs: list[RfqLeg], sides: list[str]) -> bool:
     return len(families) == 1 and next(iter(families)) in _BASKET_PROP_FAMILIES
 
 
+def _same_game_tie_total(
+    legs: list[RfqLeg], groups: tuple[tuple[int, ...], ...]
+) -> bool:
+    """True iff any same-event group pairs a TIE-outcome moneyline leg with a
+    TOTAL leg — the trigger for the 2026-08-15 pickoff guard (see
+    ``ReasonCode.SKIP_STRUCTURAL_FALLBACK_TIE_TOTAL``): on structural
+    fallback this shape's copula rho is team-oriented and wrong-signed for
+    the draw outcome. The TIE outcome is the ticker's last segment (source
+    of truth: KXLALIGAGAME-26AUG15ALAGET-TIE and the KXWC 3-way GAME
+    convention)."""
+    for group in groups:
+        has_tie_ml = False
+        has_total = False
+        for i in group:
+            ticker = legs[i].market_ticker
+            leg_type = classify_leg(ticker)
+            if (
+                leg_type is LegType.MONEYLINE
+                and ticker.upper().rsplit("-", 1)[-1] == "TIE"
+            ):
+                has_tie_ml = True
+            elif leg_type is LegType.TOTAL:
+                has_total = True
+        if has_tie_ml and has_total:
+            return True
+    return False
+
+
 @dataclass(slots=True)
 class _JointInputs:
     """Carrier for the loop-side prefix result: everything the joint estimation
@@ -594,6 +622,25 @@ class PricingEngine:
         ):
             joint, reason = self._structural.try_price(list(rfq.legs), beliefs, sides)
             if joint is None:
+                # PICKOFF GUARD (2026-08-15, operator-confirmed incident): a
+                # same-game TIE×TOTAL pair whose DC inversion rejected must
+                # DECLINE, never fall to the copula — the fallback rho
+                # (soccer moneyline|total +0.28) is team-oriented and
+                # wrong-signed for the draw outcome, pricing P(draw∧under)
+                # BELOW independence (ALAGET: 30.4c structural → 20.5c
+                # fallback on a 0.35c mid move; takers accepted ONLY the
+                # flipped states, 8/8 pickoff fills). The 99.6% of tie×total
+                # flow that prices structurally is untouched. Full repair
+                # (tie-oriented rho + CHALLENGE band + structural_fits
+                # wiring) is the post-freeze recipe in the 8/15 report.
+                if _same_game_tie_total(
+                    list(rfq.legs), relationship.same_event_groups
+                ):
+                    return NoQuote(
+                        ReasonCode.SKIP_STRUCTURAL_FALLBACK_TIE_TOTAL,
+                        f"same-game tie×total declined on structural "
+                        f"fallback (wrong-signed copula rho): {reason}",
+                    )
                 fallback_note = f"structural fallback: {reason}"
         if joint is None:
             sgp = build_sgp_correlation(

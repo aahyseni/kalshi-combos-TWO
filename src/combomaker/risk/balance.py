@@ -575,26 +575,38 @@ class BalanceTracker:
     def risk_bankroll_cc(self) -> CentiCents:
         """The RISK-CAPITAL DENOMINATOR the %-of-bankroll caps scale from:
 
-            min(start_of_day_equity, available_cash + haircut · portfolio_value)
+            available_cash + haircut · portfolio_value
 
-        The ``min`` does two jobs at once: the right term keeps the denominator
-        ~flat when capital is merely DEPLOYED (cash falls, position mark rises —
-        deployed != lost, so caps must not shrink), while the left term (SOD
-        equity) prevents an intraday mark-to-model GAIN from inflating the caps.
-        The haircut applies ONLY to ``portfolio_value`` (the softer mark), never
-        to cash. Fails closed on stale — the whole denominator is UNKNOWN and
-        every cap must breach.
+        CONTINUOUS as of 2026-08-15 (operator ruling, verbatim: "equity
+        should be read continuously"): the denominator is the exchange's own
+        live deployed-aware equity, refreshed on every balance poll. The
+        haircut applies ONLY to ``portfolio_value`` (the softer mark), never
+        to cash — that is what tempers mark-to-model inflation now.
+
+        HISTORY (why the old min() had to go): the previous form
+        ``min(start_of_day_equity, this)`` re-anchored SOD only at UTC
+        midnight or process BOOT (in-memory tracker), so a mid-day watchdog
+        relight pinned the denominator at the relight-instant equity and
+        realized settled CASH could never lift it — an intraday
+        ratchet-DOWN-only. Measured 2026-08-15: the 23:27 ET relight
+        anchored $4,181.81 against true equity ~$5,000 (all walls 10.8-16.4%
+        tight, kill_line byte-pinned 2,250 snapshots) and the lagged anchor
+        fired a FALSE halt_hard_trip at 21:57 ET ($530.14 give-back vs the
+        lagged $514.35 threshold; $600 at true equity = no trip). The SOD
+        anchor itself STAYS (``start_of_day_equity_cc``) — the give-back /
+        drawdown halts still measure within-day P&L against it; only the
+        capacity denominator stops being pinned to it.
+
+        Fails closed on stale — the whole denominator is UNKNOWN and every
+        cap must breach.
         """
         self._fresh_or_raise()
         assert self._available_cash_cc is not None
         assert self._portfolio_value_cc is not None
-        if self._start_of_day_equity_cc is None:
-            raise StaleBalanceError("start-of-day equity not anchored yet")
         haircut_pv = (
             self._haircut.numerator * int(self._portfolio_value_cc)
         ) // self._haircut.denominator
-        deployed_aware = int(self._available_cash_cc) + haircut_pv
-        return CentiCents(min(int(self._start_of_day_equity_cc), deployed_aware))
+        return CentiCents(int(self._available_cash_cc) + haircut_pv)
 
     @property
     def bankroll_cc(self) -> CentiCents:
@@ -609,6 +621,13 @@ class BalanceTracker:
         """Non-raising accessor for display/logging: available cash, or None
         when stale."""
         return None if self.is_stale else self._available_cash_cc
+
+    def last_poll_ns_or_none(self) -> int | None:
+        """Monotonic stamp of the last SUCCESSFUL balance poll, or None if
+        never polled. A new value means the exchange produced a NEW cash
+        reading — the cash-gate sender keys its probe cadence on exactly
+        this (one exchange probe per fresh reading, never a hand-set timer)."""
+        return self._last_poll_ns
 
     def available_cash_cc_or_none(self) -> CentiCents | None:
         """Non-raising current AVAILABLE CASH (Kalshi ``balance``), or None when

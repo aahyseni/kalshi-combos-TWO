@@ -328,12 +328,22 @@ _FIRST_HALF_MAP: dict[LegType, LegType] = {
 }
 
 
+def _period_scan_series(series: str) -> str:
+    """The series string the period regexes may scan. "CHAMPIONSHIP" contains
+    the bare second-half token "SH" (found by the 2026-08-15 EFL Championship
+    wire: KXEFLCHAMPIONSHIPGAME read as a period market and classified
+    UNKNOWN) — mask the league word before any period scan; a league NAME
+    must never read as a period window. Same blocker doctrine as
+    LALIGAADVANCE-before-ADVANCE above."""
+    return series.replace("CHAMPIONSHIP", "")
+
+
 def is_period_leg(market_ticker: str) -> bool:
     """True for a period/derived market (first/second half, quarter). Gates the
     structural inverter (no half-time scoreline window) and the same-game
     regroup — matched on the SERIES prefix only."""
     series = resolve_pricing_alias(market_ticker).split("-", 1)[0].upper()
-    return _PERIOD_SERIES.search(series) is not None
+    return _PERIOD_SERIES.search(_period_scan_series(series)) is not None
 
 
 def classify_leg(market_ticker: str) -> LegType:
@@ -356,8 +366,9 @@ def _classify_leg_raw(market_ticker: str) -> LegType:
         if keyword in series:
             base = leg_type
             break
-    if _PERIOD_SERIES.search(series):
-        if _FIRST_HALF_SERIES.search(series):
+    period_series = _period_scan_series(series)
+    if _PERIOD_SERIES.search(period_series):
+        if _FIRST_HALF_SERIES.search(period_series):
             mapped = _FIRST_HALF_MAP.get(base)
             if mapped is not None:
                 return mapped
@@ -441,6 +452,21 @@ _SPORT_KEYWORDS: tuple[tuple[str, Sport], ...] = (
     ("LALIGA", Sport.SOCCER),
     ("SERIEA", Sport.SOCCER),
     ("BUNDESLIGA", Sport.SOCCER),
+    # 2026-08-15 league expansion (operator "wire more soccer leagues";
+    # census-observed live series: KXLIGAMXGAME 596 open RFQs + 697 in
+    # MLS cross-combos, KXEFLCHAMPIONSHIPGAME/TOTAL 478+, KXCHNSLGAME,
+    # KXCLUBFGAME 5,676, KXENGCS*). No substring relation with any keyword
+    # above in either direction (checked both ways, incl. "EFL"⊅"NFL"/"EPL").
+    # Classification only — the ALLOWLIST still governs admission: CLUBF
+    # (friendlies) and CHNSL are classified here so they can never price as
+    # UNKNOWN/zero-markup, but are NOT allowlisted (friendlies carry
+    # rotation/motivation noise the competitive-club DC fit never saw —
+    # operator decision owed before admitting them).
+    ("LIGAMX", Sport.SOCCER),
+    ("EFLCHAMPIONSHIP", Sport.SOCCER),
+    ("CHNSL", Sport.SOCCER),
+    ("CLUBF", Sport.SOCCER),
+    ("ENGCS", Sport.SOCCER),
 )
 
 

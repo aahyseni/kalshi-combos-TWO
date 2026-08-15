@@ -70,6 +70,33 @@ class ReadBudgetExhausted(KalshiApiError):
         self.cost = cost
 
 
+# The exchange's error code on a create the account cannot collateralize —
+# the exact string observed in live 400 bodies (2026-08-14/15 storms: 225k/day
+# peak 7.2/s). Named here so the cash-gate sender and any handler match ONE
+# constant instead of re-typing the exchange's string.
+INSUFFICIENT_BALANCE_CODE = "insufficient_balance"
+
+
+class CashGatedError(KalshiApiError):
+    """OUR OWN cash gate refused this create before it was emitted.
+
+    The local mirror of the exchange's insufficient-balance 400, raised
+    *instead of* making the request while the account's last cash reading
+    cannot have improved (same balance poll as the last refusal). Subclasses
+    ``KalshiApiError`` so every existing "a create may fail, log and move on"
+    handler degrades identically; ``status`` 0 and a local code because no
+    HTTP request was ever made — it must never feed the 429-burst breaker
+    (same doctrine as ``ReadBudgetExhausted``)."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            0,
+            "local_cash_gate",
+            "local cash gate refused create (exchange balance unchanged "
+            "since last insufficient_balance refusal)",
+        )
+
+
 # The per-request wall bound every REST call already runs under. Named so a
 # caller that must bound a call reached through a PROTOCOL (which cannot see the
 # aiohttp timeout — e.g. the lifecycle's quote withdrawal) reuses this one number

@@ -320,11 +320,16 @@ class TestEquityAwareDenominator:
         # The two raw figures are never merged into one another.
         assert bt.available_cash_cc != bt.exchange_equity_cc
 
-    async def test_min_picks_the_smaller_mark_gain_cannot_inflate(self) -> None:
-        # First poll (SOD) anchors equity at cash+pv. A later intraday poll shows
-        # a mark-to-model GAIN; the denominator must stay capped at SOD equity.
+    async def test_denominator_is_continuous_and_sod_is_untouched(self) -> None:
+        # CONTINUOUS EQUITY (operator ruling 2026-08-15, replacing the SOD
+        # min(): the old pin "mark gain cannot inflate" made the denominator
+        # an intraday ratchet-DOWN-only — a relight re-anchored SOD at the
+        # equity trough ($4,181.81 vs true ~$5k, all walls 10.8-16.4% tight,
+        # plus a FALSE hard-trip halt at 21:57 ET 8/14). The denominator now
+        # follows cash + haircut*pv on every poll; mark inflation is tempered
+        # by the haircut, and the give-back halts still measure vs SOD/peak.
         bt, clock = tracker()
-        # SOD: cash $1000 (100000 cents -> 10_000_000 cc), pv 0 -> SOD equity $1000.
+        # First poll: cash $1000 (100000 cents -> 10_000_000 cc), pv 0.
         await bt.refresh(
             FakeBalanceSource({"balance": 100000, "portfolio_value": 0})
         )
@@ -333,10 +338,25 @@ class TestEquityAwareDenominator:
         await bt.refresh(
             FakeBalanceSource({"balance": 100000, "portfolio_value": 50000})
         )
-        # cash + 0.5*pv = 10_000_000 + 0.5*(5_000_000) = 10_000_000 + 2_500_000
-        # = 12_500_000, but SOD equity was 10_000_000 -> min caps it.
+        # SOD anchor unchanged (halts still key on it)...
         assert bt.start_of_day_equity_cc == sod == CC(10_000_000)
-        assert bt.risk_bankroll_cc == CC(10_000_000)  # min picked SOD, not the gain
+        # ...but the capacity denominator reads the LIVE deployed-aware
+        # equity: cash + 0.5*pv = 10_000_000 + 2_500_000.
+        assert bt.risk_bankroll_cc == CC(12_500_000)
+
+    async def test_denominator_rises_with_realized_settled_cash(self) -> None:
+        # THE INCIDENT PIN (2026-08-15): settlements credit CASH intraday;
+        # the denominator must follow it up — the old min(SOD, ...) could not.
+        bt, _clock = tracker()
+        await bt.refresh(
+            FakeBalanceSource({"balance": 100000, "portfolio_value": 0})
+        )
+        assert bt.risk_bankroll_cc == CC(10_000_000)
+        # A settlement wave credits +$200 cash the same UTC day.
+        await bt.refresh(
+            FakeBalanceSource({"balance": 120000, "portfolio_value": 0})
+        )
+        assert bt.risk_bankroll_cc == CC(12_000_000)  # follows settled cash UP
 
     async def test_deploy_capital_denominator_stays_flat_not_shrunk(self) -> None:
         # SOD: all cash, nothing deployed. Then deploy $500 into positions:
