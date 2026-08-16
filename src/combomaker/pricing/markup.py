@@ -28,6 +28,28 @@ if TYPE_CHECKING:  # avoid a runtime pricing->ops import cycle; config is duck-t
     from combomaker.ops.config import MarkupConfig
 
 
+def _is_cross_game_ml_parlay(leg_tickers: list[str]) -> bool:
+    """True iff EVERY leg is a MONEYLINE on a DISTINCT game — the popular
+    cross-game ML parlay shape the ml_parlay_cc override prices (2026-08-16).
+    Game identity = the ticker's middle segment (SERIES-GAMECODE-OUTCOME,
+    the exchange's own convention). Fail-safe False on: fewer than 2 legs,
+    any non-MONEYLINE leg, any unparseable ticker, any repeated game code
+    (same-game/mutex shapes keep full tiers)."""
+    from combomaker.pricing.legtypes import LegType, classify_leg
+
+    if len(leg_tickers) < 2:
+        return False
+    games: set[str] = set()
+    for ticker in leg_tickers:
+        if classify_leg(ticker) is not LegType.MONEYLINE:
+            return False
+        parts = resolve_pricing_alias(ticker).split("-")
+        if len(parts) < 3:
+            return False
+        games.add(parts[1])
+    return len(games) == len(leg_tickers)
+
+
 def _leg_sport(ticker: str) -> str:
     # Pricing aliases apply (2026-07-16): an aliased champion leg tags as its
     # structural equivalent's sport — otherwise a KXMENWORLDCUP leg tagged
@@ -54,6 +76,14 @@ def _leg_sport(ticker: str) -> str:
             "KXCHNSL",
             "KXCLUBF",
             "KXENGCS",
+            # 2026-08-16 operator wire (Serie A / Ligue 1) + Bundesliga/
+            # Brasileiro future-proofing — all classified soccer in
+            # legtypes; mapped here so none can ever ride 'other' at ZERO
+            # markup (the KXMENWORLDCUP incident class).
+            "KXSERIEA",
+            "KXLIGUE1",
+            "KXBUNDESLIGA",
+            "KXBRASILEIRO",
         )
     ):
         return "soccer"
@@ -97,6 +127,17 @@ class MarkupPolicy:
     # every tier the flat by_sport value applies. Registered only for ENABLED
     # sports (dark stays dark).
     tiers_by_sport: dict[str, tuple[tuple[int, int], ...]]
+    # ML-PARLAY OVERRIDE (2026-08-16 composition tilt, operator "do all of
+    # it"): a CROSS-GAME, MONEYLINE-ONLY parlay below the fair bound prices
+    # at this flat markup instead of the sport's longshot tiers. Evidence:
+    # the class is 33.0% of the entire RFQ tape and we filled 0/529 quoted —
+    # losing by exactly the tier markup (field clears our-fair +0.05-0.25c
+    # on 1,122 matched auctions). Scope-guarded: only MLB/soccer, only when
+    # EVERY leg is a MONEYLINE on a DISTINCT game (same-game/mutex shapes
+    # and prop-carrying combos keep full tiers — the whale/model-risk bands).
+    # 0 = dark (today's behaviour byte-identical).
+    ml_parlay_cc: int = 0
+    ml_parlay_fair_below_cc: int = 3500
 
     @classmethod
     def from_config(cls, cfg: MarkupConfig) -> MarkupPolicy:
@@ -131,6 +172,10 @@ class MarkupPolicy:
             by_sport=by,
             series_adders=adders,
             tiers_by_sport=tiers,
+            ml_parlay_cc=int(getattr(cfg, "ml_parlay_cc", 0) or 0),
+            ml_parlay_fair_below_cc=int(
+                getattr(cfg, "ml_parlay_fair_below_cc", 3500) or 3500
+            ),
         )
 
     def markup_cc(self, sport: str) -> int:
@@ -190,4 +235,16 @@ class MarkupPolicy:
                 if fair_cc < below:
                     base = cc
                     break
+            # ML-PARLAY OVERRIDE (2026-08-16, see the field's docstring):
+            # replaces the tier for cross-game ML-only MLB/soccer parlays
+            # below the fair bound. Fail-safe: any leg that is not a
+            # MONEYLINE, any repeated game code, or any unparseable ticker
+            # keeps the tier markup untouched.
+            if (
+                self.ml_parlay_cc > 0
+                and sport in ("mlb", "soccer")
+                and fair_cc < self.ml_parlay_fair_below_cc
+                and _is_cross_game_ml_parlay(legs)
+            ):
+                base = self.ml_parlay_cc
         return sport, base + self._series_adder_cc(legs)

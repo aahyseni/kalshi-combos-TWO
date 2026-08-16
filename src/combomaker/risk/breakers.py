@@ -259,6 +259,19 @@ class BreakerThresholds:
     rate_limit_window_s: float = 10.0
     max_rate_limit_in_window: int = 10
     max_marginal_jump: float = 0.25
+    # SINGLE-TICKER QUARANTINE (2026-08-16 flap-loop incident: ONE ungraded
+    # post-game K-market oscillating 0.63<->0.92 tripped 7 hard halts
+    # 01:44-06:22 ET, each cancel_all destroying the entire resting book).
+    # A ticker that trips the jump watch this many times without an
+    # intervening clear reading is OSCILLATING — a bad/thin book on one
+    # market, not the broad feed-corruption signature the hard halt exists
+    # for — and is QUARANTINED from the jump watch (baseline purged, loudly
+    # logged) instead of killing the book. One-off jumps (a real event +
+    # re-baseline) reset the strike count on the next clear reading; broad
+    # corruption trips DIFFERENT tickers and still escalates exactly as
+    # before. 3 = the smallest count that separates oscillation (needs >=3
+    # threshold-crossing reversals) from event+retest (2).
+    marginal_jump_quarantine_strikes: int = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,6 +371,13 @@ class CircuitBreakers:
         self._thr = thresholds
         self._clock = clock
         self._last_marginal: dict[str, float] = {}
+        # Per-ticker consecutive jump-trip strikes + the quarantine set (see
+        # ``BreakerThresholds.marginal_jump_quarantine_strikes``). Strikes
+        # reset on the ticker's next clear reading; quarantine lasts the
+        # process lifetime (a flapping book stays suspect until a relight
+        # re-baselines the world).
+        self._jump_strikes: dict[str, int] = {}
+        self._jump_quarantined: set[str] = set()
         # per-reason first-bad MONOTONIC-ns timestamp (a wall-clock step must never
         # move a safety escalation) + the recovery streak for flap resistance.
         self._bad_since: dict[ReasonCode, int] = {}
@@ -422,6 +442,13 @@ class CircuitBreakers:
     ) -> BreakerVerdict:
         tripped: BreakerVerdict | None = None
         for ticker, cur in marginals.items():
+            if ticker in self._jump_quarantined:
+                # SINGLE-TICKER QUARANTINE (2026-08-16 flap-loop): this
+                # market already proved it oscillates; its moves no longer
+                # feed the halt. Baseline stays purged so a later revival
+                # re-baselines cleanly (prev None => clear).
+                self._last_marginal.pop(ticker, None)
+                continue
             if ticker in settled_tickers or ticker in inplay_tickers:
                 # SETTLED-LEG EXEMPTION (2026-07-18 02:17Z live halt): the
                 # exchange confirmed this market is no longer live, so there
@@ -441,8 +468,34 @@ class CircuitBreakers:
             verdict = detect_marginal_jump(
                 prev, cur, ticker=ticker, max_jump=self._thr.max_marginal_jump
             )
-            if verdict.tripped and tripped is None:
-                tripped = verdict
+            if verdict.tripped:
+                strikes = self._jump_strikes.get(ticker, 0) + 1
+                self._jump_strikes[ticker] = strikes
+                if strikes >= self._thr.marginal_jump_quarantine_strikes:
+                    # OSCILLATION, not the broad-corruption signature the
+                    # hard halt exists for: quarantine THIS market from the
+                    # jump watch instead of killing the whole book (7
+                    # cancel_all halts from one K-market, 2026-08-16
+                    # 01:44-06:22 ET). Broad corruption trips DIFFERENT
+                    # tickers (each under its own strike count) and still
+                    # escalates through the grace machinery unchanged.
+                    self._jump_quarantined.add(ticker)
+                    self._jump_strikes.pop(ticker, None)
+                    self._last_marginal.pop(ticker, None)
+                    log.warning(
+                        "marginal_jump_ticker_quarantined",
+                        ticker=ticker,
+                        strikes=strikes,
+                        detail=verdict.detail,
+                    )
+                    continue
+                if tripped is None:
+                    tripped = verdict
+            else:
+                # A clear reading forgives the strikes: a one-off real event
+                # (goal/injury) re-baselines and must never accumulate
+                # toward quarantine across unrelated days.
+                self._jump_strikes.pop(ticker, None)
             # Update baseline to the readable current value (a None current keeps
             # the old baseline so a recovered feed compares against the last good
             # reading, not a phantom).

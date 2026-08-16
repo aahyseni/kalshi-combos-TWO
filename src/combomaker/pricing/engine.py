@@ -112,15 +112,18 @@ def _same_game_tie_total(
     legs: list[RfqLeg], groups: tuple[tuple[int, ...], ...]
 ) -> bool:
     """True iff any same-event group pairs a TIE-outcome moneyline leg with a
-    TOTAL leg — the trigger for the 2026-08-15 pickoff guard (see
-    ``ReasonCode.SKIP_STRUCTURAL_FALLBACK_TIE_TOTAL``): on structural
-    fallback this shape's copula rho is team-oriented and wrong-signed for
-    the draw outcome. The TIE outcome is the ticker's last segment (source
-    of truth: KXLALIGAGAME-26AUG15ALAGET-TIE and the KXWC 3-way GAME
-    convention)."""
+    TOTAL **or BTTS** leg — the trigger for the 2026-08-15 pickoff guard
+    (see ``ReasonCode.SKIP_STRUCTURAL_FALLBACK_TIE_TOTAL``): on structural
+    fallback these shapes' copula rho is team-oriented and wrong-signed for
+    the draw outcome. BTTS added 2026-08-16: the same sharp taker the
+    tie×total guard blanked took a tie×BTTS variant at NO 82.1c the next
+    morning — a 1-1/2-2 draw hits both legs (positively correlated), the
+    identical wrong-sign family. The TIE outcome is the ticker's last
+    segment (source of truth: KXLALIGAGAME-26AUG15ALAGET-TIE and the KXWC
+    3-way GAME convention)."""
     for group in groups:
         has_tie_ml = False
-        has_total = False
+        has_corr_partner = False
         for i in group:
             ticker = legs[i].market_ticker
             leg_type = classify_leg(ticker)
@@ -129,9 +132,9 @@ def _same_game_tie_total(
                 and ticker.upper().rsplit("-", 1)[-1] == "TIE"
             ):
                 has_tie_ml = True
-            elif leg_type is LegType.TOTAL:
-                has_total = True
-        if has_tie_ml and has_total:
+            elif leg_type in (LegType.TOTAL, LegType.BTTS):
+                has_corr_partner = True
+        if has_tie_ml and has_corr_partner:
             return True
     return False
 

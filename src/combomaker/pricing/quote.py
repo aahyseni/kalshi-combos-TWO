@@ -174,13 +174,18 @@ def construct_quote(
     # quote is not just thin — it is negative-EV, and the confirm-time
     # admission gate DECLINES negative-EV fills, so it would manufacture
     # exactly the won-then-reneged auctions the 2026-07-25 audit eliminated.
-    # Cap the rebate at the margin we are charging: we may give away up to the
-    # whole edge to win balancing flow, never more. Derived (the margin is the
-    # live tier), no hand-set number. The WIDEN direction is untouched — making
-    # a combo dearer is always safe — and the free-money clamp still applies
-    # below.
-    if inventory_skew_cc > margin:
-        inventory_skew_cc = margin
+    # POST-REBATE EDGE FLOOR (2026-08-16, operator-ratified package —
+    # tightened from the 2026-07-26 "whole edge" cap): the rebate may give
+    # away at most HALF the margin, so every rebated quote retains >= half
+    # its tier edge. Measured need: the whole-edge cap manufactured sub-1c
+    # coinflip fills — 24% of post-restart premium landed at 0.84% retained
+    # edge (16/94 fills compressed to <0.5c/ct, one $33.70 ticket at
+    # 0.19c/ct), the exact composition that pins P(book) at ~0.45. Derived
+    # from the live margin (a structural fraction, not a new knob); the
+    # WIDEN direction is untouched — making a combo dearer is always safe —
+    # and the free-money clamp still applies below.
+    if inventory_skew_cc > margin // 2:
+        inventory_skew_cc = margin // 2
 
     # The fill happens at the BID, not at fair, and the quadratic fee peaks at
     # $0.50 — computing it at fair under-charges the side whose bid sits

@@ -467,6 +467,11 @@ _SPORT_KEYWORDS: tuple[tuple[str, Sport], ...] = (
     ("CHNSL", Sport.SOCCER),
     ("CLUBF", Sport.SOCCER),
     ("ENGCS", Sport.SOCCER),
+    # 2026-08-16 operator wire (UCL/EPL/Serie A/Ligue 1 — UCL/EPL/SERIEA
+    # rows already exist above). "LIGUE1" has no substring relation with
+    # any keyword above in either direction (checked; "F1" is not contiguous
+    # in L-I-G-U-E-1).
+    ("LIGUE1", Sport.SOCCER),
 )
 
 

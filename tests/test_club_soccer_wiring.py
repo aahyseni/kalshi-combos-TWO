@@ -161,6 +161,17 @@ EXPANSION_TICKERS = [
     ("KXUCLBTTS-26AUG19CELKAI-BTTS", LegType.BTTS),
     ("KXEPLGAME-26AUG15LIVBOU-LIV", LegType.MONEYLINE),
     ("KXEPLBTTS-26AUG15LIVBOU-BTTS", LegType.BTTS),
+    # 2026-08-16 operator wire: Serie A + Ligue 1 (four families) + UCL
+    # ADVANCE (two-legged ties — the sgp copula-only guard covers it).
+    ("KXSERIEAGAME-26AUG23JUVCOM-TIE", LegType.MONEYLINE),
+    ("KXSERIEATOTAL-26AUG23JUVCOM-3", LegType.TOTAL),
+    ("KXSERIEASPREAD-26AUG23JUVCOM-JUV1", LegType.SPREAD),
+    ("KXSERIEABTTS-26AUG23JUVCOM-BTTS", LegType.BTTS),
+    ("KXLIGUE1GAME-26AUG17PSGNAN-PSG", LegType.MONEYLINE),
+    ("KXLIGUE1TOTAL-26AUG17PSGNAN-3", LegType.TOTAL),
+    ("KXLIGUE1SPREAD-26AUG17PSGNAN-PSG1", LegType.SPREAD),
+    ("KXLIGUE1BTTS-26AUG17PSGNAN-BTTS", LegType.BTTS),
+    ("KXUCLADVANCE-26AUG19CELKAI-CEL", LegType.ADVANCE),
 ]
 
 
@@ -230,6 +241,15 @@ def test_same_game_tie_total_trigger() -> None:
     assert _same_game_tie_total([team, total], ((0, 1),)) is False
     # Tie × spread: not the guarded pair.
     assert _same_game_tie_total([tie, spread], ((0, 1),)) is False
+    # Tie × BTTS (2026-08-16 extension): the same wrong-sign family — a
+    # 1-1/2-2 draw hits both legs; the variant was taken by the same sharp
+    # taker the tie×total guard blanked. Same game triggers; cross-game not.
+    btts = leg("KXLALIGABTTS-26AUG15ALAGET-BTTS", "KXLALIGABTTS-26AUG15ALAGET")
+    assert _same_game_tie_total([tie, btts], ((0, 1),)) is True
+    other_btts = leg(
+        "KXMLSBTTS-26AUG16ATLNYC-BTTS", "KXMLSBTTS-26AUG16ATLNYC"
+    )
+    assert _same_game_tie_total([tie, other_btts], ((0,), (1,))) is False
     # A wider combo where ONE group carries the bad pair still triggers.
     assert (
         _same_game_tie_total(

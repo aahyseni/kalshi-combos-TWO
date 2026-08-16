@@ -2513,6 +2513,16 @@ class MarkupConfig(StrictModel):
     2026-07-13: WC longshot parlays settle 13.8% vs priced 19.6%)."""
 
     enabled: bool = False  # master switch
+    # ML-PARLAY OVERRIDE (2026-08-16 composition tilt): flat markup cc for
+    # CROSS-GAME MONEYLINE-ONLY MLB/soccer parlays below the fair bound,
+    # replacing the sport's longshot tiers on exactly that shape. Evidence
+    # (docs/reports/2026-08-16-pbook-composition-deep-dive-and-plan.md):
+    # the class = 33.0% of the RFQ tape, 0/529 fills, lost by exactly the
+    # tier markup (field clears our-fair +0.05-0.25c, 1,122 matched
+    # auctions). Same-game/mutex/prop-carrying combos keep full tiers.
+    # 0 = dark (byte-identical).
+    ml_parlay_cc: int = 0
+    ml_parlay_fair_below_cc: int = 3500
     soccer: SportMarkupConfig = Field(default_factory=SportMarkupConfig)
     mlb: SportMarkupConfig = Field(default_factory=SportMarkupConfig)
     # ESPORTS / RACING (2026-07-26 operator: winners only; "could be a

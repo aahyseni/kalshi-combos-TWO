@@ -198,3 +198,68 @@ def test_tier_validation_rejects_unsorted() -> None:
                 MarkupTier(fair_below_cc=200, markup_cc=500),
             ],
         )
+
+
+# --- 2026-08-16 ML-parlay override (the composition tilt's entry ticket) -------
+
+
+def _ml_cfg(**kw) -> MarkupPolicy:
+    from combomaker.ops.config import MarkupTier
+
+    return MarkupPolicy.from_config(
+        MarkupConfig(
+            enabled=True,
+            ml_parlay_cc=100,
+            mlb=SportMarkupConfig(
+                enabled=True,
+                markup_cc=200,
+                tiers=[MarkupTier(fair_below_cc=1000, markup_cc=400),
+                       MarkupTier(fair_below_cc=2000, markup_cc=300)],
+            ),
+            soccer=SportMarkupConfig(enabled=True, markup_cc=200),
+            **kw,
+        )
+    )
+
+
+ML_A = "KXMLBGAME-26AUG16NYYBOS-NYY"
+ML_B = "KXMLBGAME-26AUG16SEAHOU-SEA"
+ML_C = "KXMLBGAME-26AUG16KCLAA-KC"
+
+
+def test_ml_parlay_override_replaces_longshot_tier() -> None:
+    p = _ml_cfg()
+    # A 3-leg cross-game ML parlay at 8c fair: the 4c tier would price it;
+    # the override prices 1c (the measured field-clearing level).
+    assert p.markup_for([ML_A, ML_B, ML_C], fair_cc=800) == ("mlb", 100)
+    # Above the fair bound: normal base applies (mains are not the class).
+    assert p.markup_for([ML_A, ML_B], fair_cc=4000) == ("mlb", 200)
+
+
+def test_ml_parlay_override_never_touches_prop_or_same_game_shapes() -> None:
+    p = _ml_cfg()
+    # A prop leg keeps the full longshot tier (the whale's cell).
+    prop = "KXMLBKS-26AUG16SEAHOU-HOULCASTILLO58-6"
+    assert p.markup_for([ML_A, prop], fair_cc=800) == ("mlb", 400)
+    # Same-game ML pair (repeated game code) keeps the tier.
+    same_game = "KXMLBGAME-26AUG16NYYBOS-BOS"
+    assert p.markup_for([ML_A, same_game], fair_cc=800) == ("mlb", 400)
+    # A single leg is not a parlay.
+    assert p.markup_for([ML_A], fair_cc=800) == ("mlb", 400)
+
+
+def test_ml_parlay_override_dark_by_default() -> None:
+    from combomaker.ops.config import MarkupTier
+
+    cfg = MarkupConfig(
+        enabled=True,
+        mlb=SportMarkupConfig(
+            enabled=True,
+            markup_cc=200,
+            tiers=[MarkupTier(fair_below_cc=1000, markup_cc=400)],
+        ),
+    )
+    p = MarkupPolicy.from_config(cfg)
+    assert p.ml_parlay_cc == 0
+    # Byte-identical: the tier still prices the shape.
+    assert p.markup_for([ML_A, ML_B], fair_cc=800) == ("mlb", 400)

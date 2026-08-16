@@ -194,6 +194,85 @@ async def test_coordinator_tracks_marginal_baseline_across_ticks() -> None:
     assert not v3.tripped and not ks.halted
 
 
+async def test_oscillating_single_ticker_quarantines_instead_of_halting() -> None:
+    """2026-08-16 flap-loop pin: ONE ungraded post-game K-market oscillating
+    0.63<->0.92 tripped 7 hard halts in one night, each cancel_all destroying
+    the entire resting book. A single ticker accumulating
+    ``marginal_jump_quarantine_strikes`` consecutive jump trips is
+    QUARANTINED from the jump watch (loudly logged) — the book survives."""
+    breakers, ks, clock = _breakers()
+    # Baseline.
+    await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=1.0, marginals={"K": 0.63}))
+    # Oscillate past the 0.25 threshold repeatedly: strikes 1, 2, then
+    # quarantine on the 3rd — each tick advances well past the grace window
+    # (the pre-fix behaviour would have escalated to the hard kill).
+    seq = [0.92, 0.63, 0.92, 0.63, 0.92]
+    for cur in seq:
+        clock.advance(16.0)
+        await breakers.evaluate_and_halt(
+            BreakerInputs(rx_age_s=1.0, marginals={"K": cur})
+        )
+    assert not ks.halted, "an oscillating single market must never kill the book"
+    # Quarantined: further violent moves on that ticker no longer trip at all.
+    clock.advance(16.0)
+    v = await breakers.evaluate_and_halt(
+        BreakerInputs(rx_age_s=1.0, marginals={"K": 0.05})
+    )
+    assert not v.tripped and not ks.halted
+
+
+async def test_one_off_event_resets_strikes_never_quarantines() -> None:
+    """A real event (goal/injury) jumps ONCE and re-baselines; the next clear
+    reading forgives the strike — three separate one-off events across the
+    session must never accumulate to quarantine (the watch stays armed)."""
+    breakers, ks, clock = _breakers()
+    await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=1.0, marginals={"L": 0.30}))
+    for jump_to in (0.60, 0.30, 0.60):
+        clock.advance(16.0)
+        v = await breakers.evaluate_and_halt(
+            BreakerInputs(rx_age_s=1.0, marginals={"L": jump_to})
+        )
+        assert v.tripped and v.reason is ReasonCode.HALT_MARGINAL_JUMP
+        # Stable tick: strike forgiven, timer clears.
+        clock.advance(16.0)
+        await breakers.evaluate_and_halt(
+            BreakerInputs(rx_age_s=1.0, marginals={"L": jump_to})
+        )
+        clock.advance(16.0)
+        v_clear = await breakers.evaluate_and_halt(
+            BreakerInputs(rx_age_s=1.0, marginals={"L": jump_to})
+        )
+        assert not v_clear.tripped
+    # The watch is still ARMED for this ticker (never quarantined): a fresh
+    # jump still trips.
+    clock.advance(16.0)
+    v = await breakers.evaluate_and_halt(
+        BreakerInputs(rx_age_s=1.0, marginals={"L": 0.05})
+    )
+    assert v.tripped and v.reason is ReasonCode.HALT_MARGINAL_JUMP
+
+
+async def test_broad_multi_ticker_corruption_still_escalates() -> None:
+    """The hard halt's real job is unchanged: corruption tripping DIFFERENT
+    tickers (each under its own strike count) sustains through the grace
+    window and still hard-kills."""
+    breakers, ks, clock = _breakers()
+    legs = {f"T{i}": 0.50 for i in range(8)}
+    await breakers.evaluate_and_halt(BreakerInputs(rx_age_s=1.0, marginals=dict(legs)))
+    # Each tick, a DIFFERENT ticker jumps (broad corruption signature).
+    flipped = dict(legs)
+    for ticker in (f"T{i}" for i in range(4)):
+        clock.advance(16.0)
+        flipped = dict(flipped)
+        flipped[ticker] = 0.95 if flipped[ticker] == 0.50 else 0.50
+        await breakers.evaluate_and_halt(
+            BreakerInputs(rx_age_s=1.0, marginals=dict(flipped))
+        )
+    assert ks.halted, "broad corruption must still escalate to the hard halt"
+    assert ks.halt_event is not None
+    assert ks.halt_event.reason is ReasonCode.HALT_MARGINAL_JUMP
+
+
 async def test_coordinator_unmapped_game_trips() -> None:
     breakers, ks, _clock = _breakers()
     v = await breakers.evaluate_and_halt(
