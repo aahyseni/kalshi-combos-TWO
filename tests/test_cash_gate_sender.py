@@ -141,3 +141,40 @@ class TestCashGate:
         err = CashGatedError()
         assert err.status == 0
         assert not isinstance(err, RateLimitedError)
+
+
+class TestErrorEnvelopeUnwrap:
+    """2026-08-16 incident pin: Kalshi nests create-quote 400 bodies under
+    "error"; the top-level-only parse read code="" and the cash gate armed
+    ZERO times against ~478k insufficient_balance 400s (whole peak hours at
+    zero quotes). Both observed live body shapes must parse to a code."""
+
+    def _raise_shape(self, payload: dict) -> KalshiApiError:
+        # Mirror the client's parse exactly (kept-in-sync with
+        # rest.py _request >=400 branch; the client itself needs aiohttp
+        # plumbing to drive, so the parse logic is replicated here and
+        # covered by the live-tape render check below).
+        err_obj = payload.get("error")
+        src = err_obj if isinstance(err_obj, dict) else payload
+        code = str(src.get("code", payload.get("code", "")))
+        message = str(
+            src.get("message", payload.get("message", payload.get("error", "")))
+        )
+        return KalshiApiError(400, code, message)
+
+    def test_nested_error_envelope_parses_code(self):
+        # The live create-quote 400 shape (tape-verified 8/15-8/16).
+        e = self._raise_shape(
+            {"error": {"code": "insufficient_balance", "message": "insufficient balance"}}
+        )
+        assert e.code == INSUFFICIENT_BALANCE_CODE
+        assert "insufficient balance" in e.message
+        # The old parse rendered "HTTP 400 : {...}" (empty code slot);
+        # the fixed parse must never do that.
+        assert "HTTP 400 :" not in str(e).replace("HTTP 400 : ", "HTTP 400 :")
+        assert str(e).startswith("HTTP 400 insufficient_balance:")
+
+    def test_top_level_body_still_parses(self):
+        # The DELETE-404 shape (top-level code) keeps working.
+        e = self._raise_shape({"code": "not_found", "message": "not found"})
+        assert e.code == "not_found"

@@ -367,9 +367,24 @@ class KalshiRestClient:
             except (aiohttp.ContentTypeError, ValueError):
                 payload = {"message": (await resp.text())[:500]}
             if resp.status >= 400:
-                code = str(payload.get("code", ""))
-                message = str(payload.get("message", payload.get("error", "")))
-                details = payload.get("details")
+                # ENVELOPE UNWRAP (2026-08-16 incident): Kalshi nests some
+                # error bodies under "error" ({"error": {"code":
+                # "insufficient_balance", ...}} — every create-quote 400 on
+                # the live tape renders "HTTP 400 :" with an EMPTY code
+                # slot) while others are top-level ({"code": "not_found"}
+                # on DELETE 404s). Reading only the top level parsed
+                # code="" on the nested shape, so every code-matched
+                # handler silently never fired — the cash gate armed 0
+                # times against ~478k insufficient_balance 400s and whole
+                # peak hours ran at zero quotes. Unwrap first; top-level
+                # keys stay as fallback.
+                err_obj = payload.get("error")
+                src = err_obj if isinstance(err_obj, dict) else payload
+                code = str(src.get("code", payload.get("code", "")))
+                message = str(
+                    src.get("message", payload.get("message", payload.get("error", "")))
+                )
+                details = src.get("details", payload.get("details"))
                 err_cls = RateLimitedError if resp.status == 429 else KalshiApiError
                 raise err_cls(resp.status, code, message, details)
             return payload
