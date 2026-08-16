@@ -929,6 +929,15 @@ class CashGateSender:
         # refusal; None = gate open.
         self._gated_at_poll_ns: int | None = None
         self._gated_creates = 0  # local refusals since gating (telemetry)
+        # DELETES free collateral (2026-08-16 PM incident): the poll-only
+        # probe cadence (~6/min) throttled creates to a trickle while our
+        # own resting quotes' TTL deletions were releasing collateral
+        # continuously — 404,314 suppressed creates / 3,348 sends / $1,082
+        # deployed on $4.7k equity in 4.5h. Each successful delete_quote is
+        # a measured collateral-release event and now also licenses a probe
+        # (cadence ≈ the delete churn, ~50/min at normal flow — still ~100x
+        # fewer 400s than the pre-gate storm at 7.2/s).
+        self._deletes_since_gate = 0
 
     async def create_quote(
         self,
@@ -940,11 +949,14 @@ class CashGateSender:
     ) -> JsonDict:
         if self._gated_at_poll_ns is not None:
             poll_ns = self._balance.last_poll_ns_or_none()
-            if poll_ns is not None and poll_ns == self._gated_at_poll_ns:
+            fresh_poll = poll_ns is None or poll_ns != self._gated_at_poll_ns
+            if not fresh_poll and self._deletes_since_gate == 0:
                 self._gated_creates += 1
                 raise CashGatedError()
-            # New reading (or tracker reset): allow ONE probe; on failure the
-            # gate re-stamps to the new reading below.
+            # A new reading OR a collateral-freeing delete since the last
+            # refusal: allow ONE probe (consume the signal); on failure the
+            # gate re-stamps below.
+            self._deletes_since_gate = 0
         try:
             result = await self._inner.create_quote(
                 rfq_id,
@@ -956,6 +968,7 @@ class CashGateSender:
             if e.code == INSUFFICIENT_BALANCE_CODE:
                 was_gated = self._gated_at_poll_ns is not None
                 self._gated_at_poll_ns = self._balance.last_poll_ns_or_none()
+                self._deletes_since_gate = 0
                 if not was_gated:
                     log.warning(
                         "cash_gate_armed",
@@ -974,7 +987,11 @@ class CashGateSender:
         return result
 
     async def delete_quote(self, quote_id: str) -> JsonDict:
-        return await self._inner.delete_quote(quote_id)
+        result = await self._inner.delete_quote(quote_id)
+        if self._gated_at_poll_ns is not None:
+            # Collateral released — license a probe (see __init__ note).
+            self._deletes_since_gate += 1
+        return result
 
     async def confirm_quote(self, quote_id: str) -> JsonDict:
         return await self._inner.confirm_quote(quote_id)

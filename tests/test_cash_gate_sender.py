@@ -122,6 +122,40 @@ class TestCashGate:
         assert inner.create_calls == 2
 
     @pytest.mark.asyncio
+    async def test_delete_licenses_a_probe_without_a_new_poll(self):
+        """2026-08-16 PM incident pin: poll-only probing throttled creates to
+        ~6/min while our own quote deletions freed collateral continuously
+        (404,314 suppressed / 3,348 sends / $1,082 deployed on $4.7k). A
+        successful delete now licenses ONE probe at the SAME poll reading."""
+        sender, inner, _bal = _mk()
+        inner.outcomes = ["no_cash"]  # then ok
+        with pytest.raises(KalshiApiError):
+            await _create(sender)
+        # Same poll, no delete: locally refused.
+        with pytest.raises(CashGatedError):
+            await _create(sender)
+        # A delete frees collateral → one probe allowed at the same poll.
+        await sender.delete_quote("q1")
+        assert (await _create(sender))["quote"]["id"] == "q1"
+        assert inner.create_calls == 2
+
+    @pytest.mark.asyncio
+    async def test_failed_delete_probe_regates_until_next_signal(self):
+        sender, inner, bal = _mk()
+        inner.outcomes = ["no_cash", "no_cash"]  # arm, then probe fails too
+        with pytest.raises(KalshiApiError):
+            await _create(sender)
+        await sender.delete_quote("q1")
+        with pytest.raises(KalshiApiError):  # the licensed probe (exchange 400)
+            await _create(sender)
+        # Signal consumed + re-stamped: local again until the next delete/poll.
+        with pytest.raises(CashGatedError):
+            await _create(sender)
+        assert inner.create_calls == 2
+        bal.poll_ns = 2_000  # a fresh poll still licenses a probe as before
+        assert (await _create(sender))["quote"]["id"] == "q1"
+
+    @pytest.mark.asyncio
     async def test_delete_and_confirm_are_never_gated(self):
         sender, inner, _bal = _mk()
         inner.outcomes = ["no_cash"]
