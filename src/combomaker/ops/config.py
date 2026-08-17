@@ -2896,6 +2896,15 @@ class RiskConfig(StrictModel):
     # read, empty tape, exactly today. Failure of the seed = empty tape =
     # today (fail-safe). Arms WITH the marginal-gate stanza at one restart.
     acceptance_seed_from_store: bool = False
+    # CASH GATE (2026-08-15 sender decorator; flag added 2026-08-16 evening
+    # after the SHARD-WALLET discovery disproved its premise): the gate
+    # treated any insufficient_balance 400 as GLOBAL cash exhaustion, but
+    # the 400s were one under-funded exchange SHARD wallet ($8.79) refusing
+    # 57.9% of flow — the gate then suppressed 697,365 creates in one day
+    # (97.9%), collapsing sends 300/min -> 13/min. False = the sender is
+    # not wrapped at all (pre-2026-08-15 create behaviour, byte-identical).
+    # Re-arm only as the 9/1 SHARD-AWARE gate (per-shard keying).
+    cash_gate_enabled: bool = True
     # RENEGE FIXES (2026-07-25 big-fill audit — 49 auctions won, 15 filled,
     # $355 premium won-then-declined in one evening). Both default OFF
     # (byte-identical); arm together at a pregame restart after review.

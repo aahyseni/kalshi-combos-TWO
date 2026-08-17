@@ -2155,7 +2155,7 @@ class QuoteApp:
             # in the cash gate (2026-08-15 lever 4): one insufficient_balance
             # probe per fresh balance reading instead of a 181k/day 400-storm.
             # Paper never 429s and never runs out of cash.
-            sender: PaperSender | CashGateSender
+            sender: PaperSender | CashGateSender | RateLimitRecordingSender
             # FILL-RECORD RECOVERY (2026-07-16 P1): the GET-capable handle the
             # lifecycle's recovery sweep polls — the SAME wrapped REST sender the
             # write path uses (its get_quote taps 429s into the burst breaker
@@ -2169,7 +2169,14 @@ class QuoteApp:
                 rate_tapped = RateLimitRecordingSender(
                     rest, self._rate_limit_window
                 )
-                sender = CashGateSender(rate_tapped, balance_tracker)
+                # cash_gate_enabled False (2026-08-16 shard discovery — see
+                # the config field): the sender is NOT wrapped, restoring
+                # the pre-gate create behaviour byte-identically.
+                sender = (
+                    CashGateSender(rate_tapped, balance_tracker)
+                    if config.risk.cash_gate_enabled
+                    else rate_tapped
+                )
                 quote_getter = rate_tapped
             # Real fee model for the fill fee the ledger books at execution
             # (defense #3): $0 for our combo maker quadratic fills, correct for a
