@@ -394,8 +394,17 @@ class KalshiRestClient:
     async def get_exchange_status(self) -> JsonDict:
         return await self._request("GET", "/exchange/status", auth=False)
 
-    async def get_balance(self) -> JsonDict:
-        return await self._request("GET", "/portfolio/balance")
+    async def get_balance(self, exchange_index: int | None = None) -> JsonDict:
+        """Account balance. ``balance`` is the TOTAL across exchange shards;
+        ``portfolio_value`` is SCOPED to ``exchange_index`` (exchange default
+        0) — live-verified 2026-08-17 (idx0 pv $1,264.23 vs idx1 pv $4.06).
+        Callers that need whole-book equity must sum PV across the shards
+        enumerated in ``balance_breakdown`` (the operator's constitutional
+        ruling: shards are parts of ONE book/balance, never risk entities)."""
+        params: dict[str, str | int] = {}
+        if exchange_index is not None:
+            params["exchange_index"] = exchange_index
+        return await self._request("GET", "/portfolio/balance", params=params)
 
     async def get_api_limits(self) -> JsonDict:
         return await self._request("GET", "/account/limits")

@@ -1006,6 +1006,49 @@ class CashGateSender:
         return await self._inner.get_fills(**params)
 
 
+class WholeBookBalanceSource:
+    """BalanceSource that merges per-shard exchange readings into ONE
+    whole-book payload (operator constitutional ruling 2026-08-17: shards
+    are parts of a single book/balance — one total capital, one risk book;
+    Kalshi's per-shard wallets are plumbing, never risk entities).
+
+    The exchange's ``balance`` field is already the cross-shard TOTAL, but
+    ``portfolio_value`` is scoped to one shard per call (live-verified:
+    idx0 pv $1,264.23 vs idx1 pv $4.06 on the same account). Without this
+    merge, every SHARD1 fill made the risk denominator SHRINK (cash left
+    the total; the position's value never entered it) — the exact
+    "deployed != lost" failure the deployed-aware denominator exists to
+    prevent, resurrected by sharding. This source sums PV across every
+    shard enumerated in ``balance_breakdown`` (dynamic — a new shard is
+    picked up on its first appearance) and returns the standard payload
+    shape, so ``BalanceTracker`` parses it unchanged. One extra GET per
+    additional shard per poll (~6/min at today's 2 shards — read-budget
+    noise). Any per-shard fetch failure raises, so a partial reading can
+    never masquerade as whole-book (the tracker's stale fail-closed then
+    governs)."""
+
+    def __init__(self, rest: KalshiRestClient) -> None:
+        self._rest = rest
+
+    async def get_balance(self) -> JsonDict:
+        base = await self._rest.get_balance()
+        breakdown = base.get("balance_breakdown") or []
+        extra_indices = sorted(
+            {
+                int(row.get("exchange_index", 0))
+                for row in breakdown
+                if int(row.get("exchange_index", 0)) != 0
+            }
+        )
+        total_pv = int(base.get("portfolio_value", 0))
+        for idx in extra_indices:
+            shard = await self._rest.get_balance(exchange_index=idx)
+            total_pv += int(shard.get("portfolio_value", 0))
+        merged = dict(base)
+        merged["portfolio_value"] = total_pv
+        return merged
+
+
 class PositionsGetter(Protocol):
     """GET /portfolio/positions slice the periodic position-reconcile net
     reads (2026-07-18 requirement 3). A protocol so tests fake it without a
@@ -4467,9 +4510,10 @@ class QuoteApp:
         reading to age out ⇒ the caps fail closed (they never quote off a guessed
         bankroll). Shadow in Phase 2, so a dark poll has zero quote impact today —
         but the poll keeps the shadow numbers honest on the tape."""
+        source = WholeBookBalanceSource(rest)
         while True:
             try:
-                await tracker.refresh(rest)
+                await tracker.refresh(source)
             except RateLimitedError as exc:
                 self._rate_limit_window.record()  # feed the 429-burst breaker
                 log.warning("balance_poll_rate_limited", error=str(exc))
