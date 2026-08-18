@@ -437,6 +437,43 @@ class Watchdog:
             pass
 
     # -- escalation ---------------------------------------------------------
+    def _corpse_human_kill_reason(self) -> str | None:
+        """The dead bot's cause of death, IF it was a human-gated KILL.
+
+        2026-08-17 23:39/23:43 ET incident: the -Auto relight path launched
+        straight through a ``halt_hard_trip`` ("KILL, human-only clear")
+        TWICE — the engine's kill-switch state is in-process only, so a
+        corpse dead by KILL looks identical to a crash from out here. The
+        engine self-describes human-gated kills in the halt event's detail
+        ("human-only clear"), so the corpse's newest log IS the persisted
+        receipt: if its last kill_switch_halt is human-gated, auto-relight
+        must LATCH (the documented "only a human KILL latches" contract,
+        finally enforced). An operator START (non -Auto) still purges the
+        latch and opens a fresh episode — the human clear path unchanged."""
+        try:
+            logs = sorted(
+                self.data_dir.glob("live_*.log"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if not logs:
+                return None
+            with logs[0].open("rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - 262_144))
+                tail = fh.read().decode("utf-8", errors="replace")
+            last_halt = None
+            for line in tail.splitlines():
+                if '"event": "kill_switch_halt"' in line:
+                    last_halt = line
+            if last_halt and "human-only clear" in last_halt:
+                m = re.search(r'"reason": "([a-z_]+)"', last_halt)
+                return m.group(1) if m else "human_gated_kill"
+        except OSError:
+            pass  # unreadable log ⇒ no receipt ⇒ ordinary relight path
+        return None
+
     def _latch_halt(self, reason: str, evidence: dict[str, object]) -> None:
         self._halt = {"at": _now_utc().isoformat(), "reason": reason, "evidence": evidence}
         self._save_state()
@@ -537,6 +574,21 @@ class Watchdog:
                 "relighting (retry-forever; only a human KILL latches)",
             )
             time.sleep(backoff_s)
+
+        # HUMAN-GATED KILL RESPECT (2026-08-17 incident — see
+        # ``_corpse_human_kill_reason``): a bot dead by a human-only-clear
+        # KILL must stay down until the OPERATOR starts it. Checked at the
+        # last instant before every -Auto relight so no earlier guard can
+        # route around it.
+        kill_reason = self._corpse_human_kill_reason()
+        if kill_reason:
+            evidence["human_gated_kill"] = kill_reason
+            self._latch_halt(
+                f"bot died by human-gated KILL ({kill_reason}) — auto-relight "
+                "refused; operator START required",
+                evidence,
+            )
+            return "halt_human_kill"
 
         self.log("WARN", "relighting via the operator start path (-Auto)")
         rc = self._run(self.start_cmd, timeout=300)
