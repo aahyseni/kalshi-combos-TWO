@@ -84,6 +84,12 @@ def _leg_sport(ticker: str) -> str:
             "KXLIGUE1",
             "KXBUNDESLIGA",
             "KXBRASILEIRO",
+            # 2026-08-26 operator wire (Saudi Pro League — Kalshi's only
+            # Saudi soccer base ticker, live-verified; BUNDESLIGA above
+            # covers the 8/26 Bundesliga wire and also Bundesliga 2 /
+            # 1H / futures siblings, which is correct soccer-markup
+            # tagging; the allowlist still governs admission).
+            "KXSAUDIPL",
         )
     ):
         return "soccer"

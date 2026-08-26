@@ -472,6 +472,19 @@ _SPORT_KEYWORDS: tuple[tuple[str, Sport], ...] = (
     # any keyword above in either direction (checked; "F1" is not contiguous
     # in L-I-G-U-E-1).
     ("LIGUE1", Sport.SOCCER),
+    # 2026-08-26 operator wire (Bundesliga + Saudi Pro League; BUNDESLIGA
+    # row already exists above). Kalshi lists the Saudi league ONLY as
+    # KXSAUDIPL* (Saudi Pro League — SAUDIPRO/SPL/ROSHN/SAUDI/SAUDIPREM
+    # all 404, live-verified 8/26). "SAUDIPL" has no substring relation
+    # with any keyword above in either direction (checked both ways;
+    # "EPL" is not contiguous in S-A-U-D-I-P-L). NOTE: KXBBLGAME is
+    # Bundesliga BASKETBALL — no string collision with "BUNDESLIGA"
+    # (B-B-L), stays UNKNOWN; KXBUNDESLIGA2* (Bundesliga 2, a DIFFERENT
+    # league) matches the BUNDESLIGA keyword and classifies soccer —
+    # true facts; ADMISSION is gated by the exact-family-with-dash
+    # allowlist style (KXBUNDESLIGAGAME- is not a prefix of
+    # KXBUNDESLIGA2GAME-), test-pinned in test_club_soccer_wiring.
+    ("SAUDIPL", Sport.SOCCER),
 )
 
 

@@ -127,6 +127,10 @@ def test_laliga_advance_blocker_never_types_advance() -> None:
         "KXMLSJOIN-26-MIA",           # transfers
         "KXMLSSKILLS-26-XYZ",         # skills challenge
         "KXMLSLEADER-26-XYZ",         # season leader (LEADERMLB blocker ≠ this)
+        # 2026-08-26 wire: Bundesliga futures/specials stay UNKNOWN
+        "KXBUNDESLIGALEADER-26-BMU",         # season leader
+        "KXBUNDESLIGARELEGATION-26-HSV",     # relegation futures
+        "KXBUNDESLIGASCORE-26AUG30FCASCH-11",  # correct score
     ],
 )
 def test_club_special_series_stay_unknown(ticker: str) -> None:
@@ -172,6 +176,18 @@ EXPANSION_TICKERS = [
     ("KXLIGUE1SPREAD-26AUG17PSGNAN-PSG1", LegType.SPREAD),
     ("KXLIGUE1BTTS-26AUG17PSGNAN-BTTS", LegType.BTTS),
     ("KXUCLADVANCE-26AUG19CELKAI-CEL", LegType.ADVANCE),
+    # 2026-08-26 operator wire: Bundesliga + Saudi Pro League (four
+    # families each; no ADVANCE — Bundesliga has no ADVANCE series,
+    # KXSAUDIPLADVANCE is listed-but-empty and stays unwired). Real
+    # production tickers, live API 2026-08-26.
+    ("KXBUNDESLIGAGAME-26SEP06SGEFCA-TIE", LegType.MONEYLINE),
+    ("KXBUNDESLIGATOTAL-26AUG30FCASCH-6", LegType.TOTAL),
+    ("KXBUNDESLIGASPREAD-26AUG30FCASCH-SCH3", LegType.SPREAD),
+    ("KXBUNDESLIGABTTS-26AUG30FCASCH-BTTS", LegType.BTTS),
+    ("KXSAUDIPLGAME-26SEP01HILAAS-TIE", LegType.MONEYLINE),
+    ("KXSAUDIPLTOTAL-26AUG28KHAHIL-6", LegType.TOTAL),
+    ("KXSAUDIPLSPREAD-26AUG28KHAHIL-KHA3", LegType.SPREAD),
+    ("KXSAUDIPLBTTS-26AUG28KHAHIL-BTTS", LegType.BTTS),
 ]
 
 
@@ -214,6 +230,47 @@ def test_expansion_combos_take_soccer_markup_never_other() -> None:
     ) == "soccer"
     # EFL ≠ NFL/EPL collision pin: the keyword must not leak into football.
     assert sport_of(["KXNFLGAME-26SEP07KCBAL-KC"]) != "soccer"
+    # 2026-08-26 wire: Bundesliga + Saudi combos ride the soccer tier.
+    assert sport_of(
+        ["KXBUNDESLIGAGAME-26SEP06SGEFCA-TIE", "KXEPLGAME-26AUG15LIVBOU-LIV"]
+    ) == "soccer"
+    assert sport_of(
+        ["KXSAUDIPLGAME-26SEP01HILAAS-TIE", "KXSAUDIPLBTTS-26AUG28KHAHIL-BTTS"]
+    ) == "soccer"
+
+
+# --- 2026-08-26 Bundesliga/Saudi wire: the sibling-series traps ---------------
+
+
+def test_bundesliga_two_never_matches_the_allowlisted_family_prefixes() -> None:
+    # KXBUNDESLIGA2* is Bundesliga 2 — a DIFFERENT league sharing the
+    # character prefix. The exact-family-with-dash allowlist style is the
+    # admission gate: no Bundesliga 2 series starts with an allowlisted
+    # Bundesliga family prefix. (Classification correctly tags it soccer —
+    # true facts — but it must never be ADMITTED via the Bundesliga rows.)
+    allowlisted = (
+        "KXBUNDESLIGAGAME-", "KXBUNDESLIGATOTAL-",
+        "KXBUNDESLIGASPREAD-", "KXBUNDESLIGABTTS-",
+    )
+    for b2 in (
+        "KXBUNDESLIGA2GAME-26AUG29HANF95-HAN",
+        "KXBUNDESLIGA2TOTAL-26AUG29HANF95-3",
+        "KXBUNDESLIGA2SPREAD-26AUG29HANF95-HAN1",
+        "KXBUNDESLIGA2BTTS-26AUG29HANF95-BTTS",
+    ):
+        assert not b2.startswith(allowlisted)
+    # Sport classification is soccer for B2 (it IS soccer) — regression-pin
+    # so a future "fix" doesn't flip it to UNKNOWN and zero-markup a leg
+    # that some day gets deliberately admitted.
+    assert classify_sport("KXBUNDESLIGA2GAME-26AUG29HANF95-HAN") is Sport.SOCCER
+
+
+def test_bundesliga_basketball_is_not_soccer() -> None:
+    # KXBBLGAME = Bundesliga BASKETBALL (Basketball Bundesliga). "BBL" has
+    # no contiguous-substring relation with "BUNDESLIGA" — must stay off
+    # the soccer machinery entirely.
+    assert classify_sport("KXBBLGAME-26SEP20BERBAY-BER") is Sport.UNKNOWN
+    assert sport_of(["KXBBLGAME-26SEP20BERBAY-BER"]) != "soccer"
 
 
 # --- 2026-08-15 pickoff guard: same-game TIE×TOTAL never copula-fallbacks ------
