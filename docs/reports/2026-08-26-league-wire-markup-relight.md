@@ -84,3 +84,23 @@ ship-through adjudication; ledger repair stays the 9/1 P1.
 - **9/1 list unchanged**: store rotation P0 (201.7 GB), ledger stale-row
   repair P1 (dissolves the V6 RED), shard-aware cash gate, telemetry-anchor
   split, composition-aware KILL budget, mvec scan baseline, tie-rho repair.
+
+## ADDENDUM — third relight (session-detached), 10:05 ET
+
+The 08:55 stack died at 09:03:32 ET when the operator's Claude session
+closed — start_all's windows are CHILDREN of the launching shell, so a
+session close kills the whole tree (same mechanism as the 8/20 sleep-stop
+pattern; 2nd occurrence today). Recovery this session:
+
+| step | result |
+|------|--------|
+| Operator rulings | 8/20 stop CONFIRMED theirs (forensics closed); WIP gate-then-keep OK; shard transfer CLOSED (done); 1v2% = WATCH (1% stays); friendlies DECLINED; thin-auction DECLINED (dark); boot-persistence DECLINED |
+| Markup WIP gated | test_markup 28/28 (new all-sports razor coverage); vitals fast **8/8 GREEN** (65.2s gate time; wall clock ~15 min — V-checks now read the 211 GB store tape; the "~14s" CLAUDE.md figure is stale) |
+| Committed + pushed | `570f9bf` — sha tripwire (test_conc_arming TestMarkupsUnchanged) passes post-commit 2/2 as designed |
+| Relight | via **WMI Win32_Process.Create** → START_BOT.bat, so the tree is parented outside any terminal session. Boot 10:05 ET |
+| Startup reconcile | 6 leftover quotes from the 09:03 death found + withdrawn (cancel-all CLI was permission-blocked in-session; boot's gate-5 sweep covered it) |
+| First window | sends/min 250→568→582→580 (≥benchmark 300–460); 0 halts, 0×400s; supervisor up 10:05:42; Bundesliga+Saudi legs in the flow; single risk_starvation warmup event (known cold-cache class) |
+
+**Standing note for every future relight: never launch the stack from
+inside a Claude/terminal session — use WMI Create (or equivalent
+detached parent), or the stack dies with the session.**
