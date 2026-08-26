@@ -138,6 +138,17 @@ class MarkupPolicy:
     # 0 = dark (today's behaviour byte-identical).
     ml_parlay_cc: int = 0
     ml_parlay_fair_below_cc: int = 3500
+    # THIN-AUCTION MARGIN BUMP (2026-08-19 auction-competition measurement,
+    # operator-blessed p_book lever): +bonus cc retained margin on MLB/soccer
+    # combos whose fair >= the min bound — those auction pools mostly go
+    # BEGGING (35-65c fair: 80% expire with no print from ANY maker within
+    # 30min, winner gap +2.1c median when one does clear; >=65c: 88% / +1.5c),
+    # so the bonus costs ~nothing in fill probability. Disjoint from the
+    # ml_parlay override (that one requires fair < ml_parlay_fair_below_cc =
+    # 3500 = this bound); the razor pool (fair < 35c, 81% clear, wins at
+    # +0.1c) is UNTOUCHED. 0 = dark (today's behaviour byte-identical).
+    thin_auction_bonus_cc: int = 0
+    thin_auction_fair_min_cc: int = 3500
 
     @classmethod
     def from_config(cls, cfg: MarkupConfig) -> MarkupPolicy:
@@ -175,6 +186,10 @@ class MarkupPolicy:
             ml_parlay_cc=int(getattr(cfg, "ml_parlay_cc", 0) or 0),
             ml_parlay_fair_below_cc=int(
                 getattr(cfg, "ml_parlay_fair_below_cc", 3500) or 3500
+            ),
+            thin_auction_bonus_cc=int(getattr(cfg, "thin_auction_bonus_cc", 0) or 0),
+            thin_auction_fair_min_cc=int(
+                getattr(cfg, "thin_auction_fair_min_cc", 3500) or 3500
             ),
         )
 
@@ -247,4 +262,17 @@ class MarkupPolicy:
                 and _is_cross_game_ml_parlay(legs)
             ):
                 base = self.ml_parlay_cc
+            # THIN-AUCTION MARGIN BUMP (2026-08-19, see the field's
+            # docstring): fair >= 35c combo auctions mostly EXPIRE with no
+            # fill from ANY maker (80-88% no print per the 8/19 forensics
+            # report), so +1c retained margin there is ~free p_book. Adds ON
+            # TOP of the tier/base already computed; mutually exclusive with
+            # the ml_parlay override (that shape sits strictly below this
+            # bound). Bonus 0 = byte-identical.
+            if (
+                self.thin_auction_bonus_cc > 0
+                and sport in ("mlb", "soccer")
+                and fair_cc >= self.thin_auction_fair_min_cc
+            ):
+                base += self.thin_auction_bonus_cc
         return sport, base + self._series_adder_cc(legs)

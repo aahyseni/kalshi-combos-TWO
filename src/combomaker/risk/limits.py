@@ -45,6 +45,7 @@ from fractions import Fraction
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
+from combomaker.core.money import CC_PER_DOLLAR
 from combomaker.core.reasons import ReasonCode
 from combomaker.rfq.eviction_value import ES_TAIL_ALPHA, marginal_tail_admit
 from combomaker.risk.cap_family import det_max_backstop_frac
@@ -631,8 +632,10 @@ class Breach:
 #                             candidate only ADDS entries to a game, and the
 #                             ME-count fold-switch only moves TOWARD the larger
 #                             comonotone sum.
-#   SKIP_UTILIZATION_BACKSTOP Σ gross settlement notional — every candidate
-#                             adds a non-negative notional.
+#   SKIP_UTILIZATION_BACKSTOP once-counted Σ gross settlement notional — every
+#                             candidate adds a non-negative notional to the
+#                             base term (the haircut composition is monotone
+#                             in base+full, exposure.py's E2/F1 lemma note).
 #   SKIP_BANKROLL_UNAVAILABLE candidate-independent (bankroll reading only).
 #
 # EXCLUDED (deliberately — each exclusion is load-bearing):
@@ -1040,6 +1043,48 @@ class PortfolioRisk(Protocol):
     def det_max_hedge_credit_cc(self) -> float: ...
 
 
+def _once_counted_notional_cc(
+    book: ExposureBook, candidates: list[OpenPosition]
+) -> tuple[int, list[int]]:
+    """Gross-settlement-notional census with every ticket counted exactly ONCE.
+
+    Returns ``(base_cc, resting_cc)``: ``base_cc`` = Σ contracts × $1 over
+    committed positions + candidates/reservations; ``resting_cc`` = one entry
+    per ACCEPTABLE resting quote (both sides of a quote carry the SAME contract
+    count, so the worst-side hypothetical notional equals either side's; a
+    both-sides-declined quote creates no position and contributes nothing —
+    the snapshot's empty-hypotheticals skip, mirrored).
+
+    WHY (operator-RATIFIED 2026-08-12, deferred-updates ledger item A.1 —
+    "count notional ONCE per combo"): the snapshot's per-game map attributes a
+    ticket's FULL notional to EVERY game it touches — correct as a per-game
+    concentration read, but summing it across games charged a 3–4-game combo
+    3–4× on the whole-book utilization backstop (measured live ×3.6–5.6).
+    Settlement notional is escrowed ONCE per ticket, never once per game. This
+    is the SAME de-duplication FIX 2 gave the slate cap (``exposure.LossUnit``)
+    ported onto the utilization axis, and it matches the semantics the MC
+    candidate gate's POST backstop already binds on
+    (``sim.book_risk``: Σ ``gross_settlement_notional_cc``, once each).
+
+    FAIL-CLOSED: an UNGAMED ticket (no identifiable game on any leg) is
+    COUNTED here — the per-game roll-up dropped it entirely (fail-open); a
+    census may never derive a permissive number from missing game metadata.
+    """
+    base_cc = 0
+    for position in book.positions.values():
+        base_cc += position.gross_settlement_notional_cc
+    for position in candidates:
+        base_cc += position.gross_settlement_notional_cc
+    resting_cc: list[int] = []
+    for quote in book.open_quotes.values():
+        if quote.yes_bid_cc == 0 and quote.no_bid_cc == 0:
+            continue
+        # contracts × $1 — keep in sync with
+        # ``OpenPosition.gross_settlement_notional_cc``.
+        resting_cc.append(int(quote.contracts) * CC_PER_DOLLAR // 100)
+    return base_cc, resting_cc
+
+
 class LimitChecker:
     def __init__(self, limits: RiskLimits) -> None:
         self._limits = limits
@@ -1331,6 +1376,9 @@ class LimitChecker:
                 daily_pnl,
                 risk_bankroll_cc=risk_bankroll_cc,
                 bankroll_source_configured=bankroll_source_configured,
+                # The utilization backstop's own once-counted resting fold must
+                # track the SAME call-site haircut semantics the snapshot used.
+                apply_resting_haircut=apply_resting_haircut,
                 start_time_provider=start_time_provider,
                 halt_inputs=halt_inputs,
                 book_risk=book_risk,
@@ -1355,6 +1403,7 @@ class LimitChecker:
         *,
         risk_bankroll_cc: int | None,
         bankroll_source_configured: bool = True,
+        apply_resting_haircut: bool = False,
         start_time_provider: StartTimeProvider | None,
         halt_inputs: HaltInputs | None,
         book_risk: PortfolioRisk | None = None,
@@ -1426,8 +1475,35 @@ class LimitChecker:
         # the fail-closed branch above stands in (a stale poll blocks new quoting
         # entirely once enforced, which is a stricter backstop than a loose
         # multiple — so nothing runs away in the dark).
+        #
+        # ONCE-COUNTED MEASURE (operator-RATIFIED 2026-08-12, shipped 2026-08-19).
+        # The old measure summed ``gross_settlement_notional_by_game_cc``, which
+        # charges a multi-game ticket's FULL notional once PER GAME it touches —
+        # measured live ×3.6–5.6 (2026-08-19: wall read 129,050,900cc against
+        # 23,034,033cc of true once-counted notional at the same moment; the
+        # 8/18 renege declined a WON auction on 133,559,100cc vs ~33,070,000cc
+        # true, missing the wall by 0.086%). ``_once_counted_notional_cc``
+        # counts each ticket exactly once; the resting fold keeps the call
+        # site's haircut semantics on the ADDITIVE axis (base floor — no mutex
+        # regime here), exactly the whole-book premium-gross composition. The
+        # 3× multiple is the ratified policy anchor, untouched.
         backstop_cc = limits.absolute_notional_multiple * bankroll
-        total_notional_cc = sum(snapshot.gross_settlement_notional_by_game_cc.values())
+        base_notional_cc, resting_notional_cc = _once_counted_notional_cc(
+            book, candidates
+        )
+        full_notional_cc = base_notional_cc + sum(resting_notional_cc)
+        if apply_resting_haircut and limits.resting_quote_weight < 1:
+            total_notional_cc = _haircut_compose_cc(
+                base_notional_cc,
+                full_notional_cc,
+                _topk_sum_int(
+                    resting_notional_cc, max(0, limits.resting_floor_count)
+                ),
+                limits.resting_quote_weight.numerator,
+                limits.resting_quote_weight.denominator,
+            )
+        else:
+            total_notional_cc = full_notional_cc
         if total_notional_cc > backstop_cc:
             out.append(
                 Breach(

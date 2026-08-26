@@ -209,9 +209,10 @@ CREATE INDEX IF NOT EXISTS idx_position_ledger_leghash ON position_ledger (leg_s
 #
 # IMPORTANT: busy_timeout only bounds SQLite's own LOCK waits. It does NOT bound
 # the time a statement spends QUEUED behind other work on the single aiosqlite
-# connection thread (the background tape writer's 1000-statement batches and its
-# WAL TRUNCATE/PASSIVE checkpoints all run there). That queueing is the actual
-# 2026-07-26 stall, and only an asyncio-level ``wait_for`` can bound it.
+# connection thread (the background tape writer's 1000-statement batches run
+# there; its WAL TRUNCATE/PASSIVE checkpoints moved to a DEDICATED second
+# connection, 2026-08-19). That queueing is the actual 2026-07-26 stall, and
+# only an asyncio-level ``wait_for`` can bound it.
 BUSY_TIMEOUT_MS = 5000
 STORE_OP_TIMEOUT_S = BUSY_TIMEOUT_MS / 1000.0
 
@@ -226,9 +227,27 @@ class Store:
     _CHECKPOINT_EVERY_WRITES = 5000
     _CHECKPOINT_RETRY_WRITES = 500
 
-    def __init__(self, db: aiosqlite.Connection, clock: Clock) -> None:
+    def __init__(
+        self,
+        db: aiosqlite.Connection,
+        clock: Clock,
+        *,
+        ckpt_db: aiosqlite.Connection | None = None,
+    ) -> None:
         self._db = db
         self._clock = clock
+        # DEDICATED CHECKPOINT CONNECTION (2026-08-19 self-lock fix). WAL
+        # checkpoints run here, NEVER on the shared connection: a read cursor
+        # held open across an await on the SAME connection (maintenance tick /
+        # settlement poller scans) made EVERY TRUNCATE **and** PASSIVE raise
+        # SQLITE_LOCKED 'database table is locked' — 3,120 consecutive
+        # checkpoint failures live, a 6GB WAL, writer 2h35m behind. Against a
+        # SEPARATE connection the same readers yield a busy=1 VERDICT
+        # (non-raising, the already-handled path) and PASSIVE still folds
+        # pages up to the read-mark. None only for legacy direct
+        # constructions (read-only diagnostics that never start the writer);
+        # ``Store.open`` always provides it.
+        self._ckpt_db = ckpt_db
         # Optional background writer for NON-critical tape (rfqs, decisions,
         # deletions). OFF by default → writes are SYNCHRONOUS (tests + read-after-
         # write stay correct, no leaked task). The app calls start_writer() so the
@@ -240,6 +259,11 @@ class Store:
         self._write_q: asyncio.Queue[tuple[str, tuple[Any, ...]]] | None = None
         self._writer_task: asyncio.Task[None] | None = None
         self._dropped_writes = 0
+        # Cumulative _dropped_writes as of the last ``store_writer_stats``
+        # emit — the delta between emits is the alarm signal (2026-08-19:
+        # ~75-80% of a day's tape rows were silently dropped while the
+        # counter incremented with NO reader anywhere).
+        self._dropped_writes_reported = 0
         # WAL-checkpoint health counters (2026-07-18): failed/busy TRUNCATE
         # attempts and PASSIVE fallbacks that ran. Public so an ops surface can
         # report them alongside dropped writes.
@@ -300,7 +324,14 @@ class Store:
                 "UNIQUE index could not be created; record_fill's INSERT-if-"
                 "absent still guards new writes; de-dup the table offline",
             )
-        return cls(db, clock)
+        # DEDICATED CHECKPOINT CONNECTION (2026-08-19 self-lock fix — see
+        # __init__). Only busy_timeout carries over: journal_mode=WAL is a
+        # property of the DB FILE (already set above), and this connection
+        # runs nothing but wal_checkpoint pragmas, so the writer-path pragmas
+        # (synchronous, wal_autocheckpoint) are irrelevant here.
+        ckpt_db = await aiosqlite.connect(path)
+        await ckpt_db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        return cls(db, clock, ckpt_db=ckpt_db)
 
     def start_writer(self) -> None:
         """Enable the off-hot-path background writer (the app calls this; tests
@@ -325,6 +356,13 @@ class Store:
                 await self._writer_task
             except asyncio.CancelledError:
                 pass
+        # Checkpoint connection FIRST: were it still open when the main
+        # connection closed, the main close's implicit final WAL fold would
+        # see a second live connection and skip the truncate. Closed first,
+        # the main connection is the LAST one and its close-time checkpoint
+        # resets the WAL.
+        if self._ckpt_db is not None:
+            await self._ckpt_db.close()
         await self._db.close()
 
     async def _write(self, sql: str, params: tuple[Any, ...]) -> None:
@@ -391,12 +429,24 @@ class Store:
                         if await self._wal_checkpoint()
                         else self._CHECKPOINT_RETRY_WRITES
                     )
+                    # Dropped-tape visibility rides the checkpoint cadence
+                    # (2026-08-19): _dropped_writes had NO reader anywhere
+                    # while ~75-80% of a day's tape silently vanished.
+                    self._emit_writer_stats()
             for _ in batch:
                 q.task_done()
 
     async def _wal_checkpoint(self) -> bool:
         """ONE bounded manual checkpoint attempt (writer task only). Returns
         True iff the TRUNCATE fully completed (the WAL was reset).
+
+        RUNS ON THE DEDICATED CHECKPOINT CONNECTION (2026-08-19 self-lock
+        fix): on the SHARED connection, any read cursor open across an await
+        made BOTH pragmas raise SQLITE_LOCKED, so the checkpoint could never
+        run at all. Cross-connection, a live reader is a busy=1 verdict
+        (handled below) and PASSIVE still folds pages up to the read-mark.
+        A legacy direct construction without a checkpoint connection falls
+        back to the shared one (it never starts the writer).
 
         A raised error ('database table is locked') AND a busy verdict (the
         pragma's first result column — TRUNCATE that could not finish reports
@@ -406,11 +456,18 @@ class Store:
         PASSIVE checkpoint before giving up the cycle. PASSIVE copies what it
         can without blocking readers, so the WAL keeps getting folded even
         while the TRUNCATE lock is starved by a long-lived cursor."""
+        db = self._ckpt_db if self._ckpt_db is not None else self._db
         failure: str
         try:
-            cursor = await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            cursor = await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             row = await cursor.fetchone()
+            await cursor.close()
             if row is None or not row[0]:
+                log.info(
+                    "store_writer_checkpoint_ok",
+                    wal_frames=None if row is None else row[1],
+                    checkpointed=None if row is None else row[2],
+                )
                 return True
             failure = f"busy (wal_frames={row[1]}, checkpointed={row[2]})"
         except Exception as exc:  # noqa: BLE001 - the pragma's failure IS the signal
@@ -418,7 +475,8 @@ class Store:
         self.checkpoint_failures += 1
         passive_ok = False
         try:
-            await self._db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            passive_cursor = await db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            await passive_cursor.close()
             passive_ok = True
             self.checkpoint_passive_fallbacks += 1
         except Exception:  # noqa: BLE001 - fallback is best-effort
@@ -431,6 +489,25 @@ class Store:
             retry_after_writes=self._CHECKPOINT_RETRY_WRITES,
         )
         return False
+
+    def _emit_writer_stats(self) -> None:
+        """Writer observability on the checkpoint cadence (2026-08-19):
+        cumulative dropped tape writes, the delta since the last emit, and
+        the live queue depth. WARNING whenever tape was dropped since the
+        last emit — drop-on-overflow is the DESIGNED hot-path behaviour, but
+        it must never again be invisible (~75-80% of a day's tape rows gone
+        with nothing reading the counter)."""
+        dropped = self._dropped_writes
+        delta = dropped - self._dropped_writes_reported
+        self._dropped_writes_reported = dropped
+        q = self._write_q
+        emit = log.warning if delta > 0 else log.info
+        emit(
+            "store_writer_stats",
+            dropped_writes_total=dropped,
+            dropped_writes_delta=delta,
+            queue_depth=0 if q is None else q.qsize(),
+        )
 
     def _now(self) -> str:
         return self._clock.now().isoformat()
@@ -801,6 +878,13 @@ class Store:
         handler now closes those rows from EXCHANGE TRUTH, and this is the read
         it does it with: everything needed to recompute the position's realized
         P&L under the one payout formula, and nothing else."""
+        # MATERIALIZED READ (2026-08-19 checkpoint self-lock fix): fetchall
+        # inside the cursor scope, transform outside. A cursor iterated
+        # across await points on the shared connection held SQLite's read
+        # lock open, which is exactly what made every WAL checkpoint raise
+        # SQLITE_LOCKED. Every bounded read in this class follows this shape
+        # now (position_ledger and fills are a few thousand rows); the one
+        # UNBOUNDED read, ``decision_reason_counts``, pages with fetchmany.
         async with self._db.execute(
             "SELECT position_id, combo_ticker, our_side, contracts_centi,"
             " entry_price_cc, opened_at FROM position_ledger"
@@ -808,17 +892,18 @@ class Store:
             " ORDER BY opened_at ASC, position_id ASC",
             (combo_ticker,),
         ) as cursor:
-            return [
-                {
-                    "position_id": str(r[0]),
-                    "combo_ticker": str(r[1]),
-                    "our_side": str(r[2]),
-                    "contracts_centi": int(r[3]),
-                    "entry_price_cc": int(r[4]),
-                    "opened_at": str(r[5]),
-                }
-                async for r in cursor
-            ]
+            rows = await cursor.fetchall()
+        return [
+            {
+                "position_id": str(r[0]),
+                "combo_ticker": str(r[1]),
+                "our_side": str(r[2]),
+                "contracts_centi": int(r[3]),
+                "entry_price_cc": int(r[4]),
+                "opened_at": str(r[5]),
+            }
+            for r in rows
+        ]
 
     async def open_ledger_tickers(self) -> set[str]:
         """Every DISTINCT combo ticker carrying an OPEN ``position_ledger``
@@ -832,7 +917,8 @@ class Store:
         async with self._db.execute(
             "SELECT DISTINCT combo_ticker FROM position_ledger WHERE status='open'"
         ) as cursor:
-            return {str(r[0]) async for r in cursor}
+            rows = await cursor.fetchall()
+        return {str(r[0]) for r in rows}
 
     async def open_ledger_identities(self) -> list[tuple[str, str, str]]:
         """``(leg_set_hash, combo_ticker, our_side)`` of every OPEN ledger row —
@@ -843,7 +929,8 @@ class Store:
             "SELECT leg_set_hash, combo_ticker, our_side FROM position_ledger"
             " WHERE status='open'"
         ) as cursor:
-            return [(str(r[0]), str(r[1]), str(r[2])) async for r in cursor]
+            rows = await cursor.fetchall()
+        return [(str(r[0]), str(r[1]), str(r[2])) for r in rows]
 
     async def ledger_position(self, position_id: str) -> JsonDict | None:
         """Read one ledger row by position_id (reports/tests). None if absent."""
@@ -933,7 +1020,8 @@ class Store:
         async with self._db.execute(
             "SELECT DISTINCT order_id FROM fills WHERE order_id IS NOT NULL"
         ) as cursor:
-            return {str(row[0]) async for row in cursor}
+            rows = await cursor.fetchall()
+        return {str(row[0]) for row in rows}
 
     async def fill_null_order_id_keys(self) -> set[tuple[str, int]]:
         """(combo_ticker, contracts_centi) of every fills row WITHOUT an
@@ -945,7 +1033,8 @@ class Store:
             "SELECT combo_ticker, contracts_centi FROM fills "
             "WHERE order_id IS NULL"
         ) as cursor:
-            return {(str(row[0]), int(row[1])) async for row in cursor}
+            rows = await cursor.fetchall()
+        return {(str(row[0]), int(row[1])) for row in rows}
 
     async def has_fill_for_ticker(self, combo_ticker: str) -> bool:
         """True iff ANY fills row exists for this combo ticker. Used by the
@@ -1127,10 +1216,11 @@ class Store:
             " GROUP BY combo_ticker, leg_set_hash",
             tuple(tickers),
         ) as cursor:
-            async for combo_ticker, _hash, legs_json, collection in cursor:
-                if not legs_json:
-                    continue
-                legsets.setdefault(combo_ticker, {})[legs_json] = collection
+            rows = await cursor.fetchall()
+        for combo_ticker, _hash, legs_json, collection in rows:
+            if not legs_json:
+                continue
+            legsets.setdefault(combo_ticker, {})[legs_json] = collection
         return legsets
 
     async def held_positions(self, combo_tickers: list[str]) -> list[JsonDict]:
@@ -1198,58 +1288,72 @@ class Store:
                 " GROUP BY market_ticker, legs_json"
             )
             async with self._db.execute(legs_q, tuple(tape_needed)) as cursor:
-                async for market_ticker, legs_json, collection in cursor:
-                    if not legs_json:
-                        continue
-                    tape_legsets.setdefault(market_ticker, {})[legs_json] = collection
+                legs_rows = await cursor.fetchall()
+            for market_ticker, legs_json, collection in legs_rows:
+                if not legs_json:
+                    continue
+                tape_legsets.setdefault(market_ticker, {})[legs_json] = collection
 
         out: list[JsonDict] = []
         async with self._db.execute(fills_q, tuple(tickers)) as cursor:
-            async for combo_ticker, our_side, ctr, loss_num in cursor:
-                if not ctr:
-                    continue
-                # LEDGER-FIRST: the durable ledger wins over the lossy tape.
-                distinct = ledger_legsets.get(combo_ticker)
-                source = "position_ledger"
-                if not distinct:
-                    distinct = tape_legsets.get(combo_ticker)
-                    source = "rfqs_tape"
-                if not distinct:
-                    # No leg definition in ANY durable source ⇒ cannot model ⇒ not
-                    # rehydrated here. The caller RESERVES it from exchange figures
-                    # (unknown legs must never mean zero exposure).
-                    continue
-                if len(distinct) > 1:
-                    # CONFLICTING leg definitions for the same combo ticker: the
-                    # originating identity is ambiguous. Fail closed — reject rather
-                    # than guess (the caller then reserves it from exchange figures).
-                    log.warning(
-                        "held_positions.conflicting_leg_sets",
-                        combo_ticker=combo_ticker,
-                        distinct_leg_sets=len(distinct),
-                        source=source,
-                    )
-                    continue
-                legs_json, collection = next(iter(distinct.items()))
-                out.append(
-                    {
-                        "combo_ticker": combo_ticker,
-                        "our_side": our_side,
-                        "contracts_centi": int(ctr),
-                        "entry_price_cc": int(loss_num) // int(ctr),
-                        "collection": collection,
-                        "legs": json.loads(legs_json),
-                        "legs_source": source,
-                    }
+            fills_rows = await cursor.fetchall()
+        for combo_ticker, our_side, ctr, loss_num in fills_rows:
+            if not ctr:
+                continue
+            # LEDGER-FIRST: the durable ledger wins over the lossy tape.
+            distinct = ledger_legsets.get(combo_ticker)
+            source = "position_ledger"
+            if not distinct:
+                distinct = tape_legsets.get(combo_ticker)
+                source = "rfqs_tape"
+            if not distinct:
+                # No leg definition in ANY durable source ⇒ cannot model ⇒ not
+                # rehydrated here. The caller RESERVES it from exchange figures
+                # (unknown legs must never mean zero exposure).
+                continue
+            if len(distinct) > 1:
+                # CONFLICTING leg definitions for the same combo ticker: the
+                # originating identity is ambiguous. Fail closed — reject rather
+                # than guess (the caller then reserves it from exchange figures).
+                log.warning(
+                    "held_positions.conflicting_leg_sets",
+                    combo_ticker=combo_ticker,
+                    distinct_leg_sets=len(distinct),
+                    source=source,
                 )
+                continue
+            legs_json, collection = next(iter(distinct.items()))
+            out.append(
+                {
+                    "combo_ticker": combo_ticker,
+                    "our_side": our_side,
+                    "contracts_centi": int(ctr),
+                    "entry_price_cc": int(loss_num) // int(ctr),
+                    "collection": collection,
+                    "legs": json.loads(legs_json),
+                    "legs_source": source,
+                }
+            )
         return out
 
     async def decision_reason_counts(self) -> dict[str, int]:
+        # The ONE unbounded read here (decisions grows without bound on the
+        # live DB), so it pages with fetchmany rather than materializing —
+        # a fetchall could hold the whole table in memory. The statement
+        # stays open between chunks, but each chunk's await is bounded and
+        # the checkpoint no longer shares this connection (2026-08-19).
         counts: dict[str, int] = {}
-        async with self._db.execute("SELECT reasons_json FROM decisions") as cursor:
-            async for row in cursor:
-                for reason in json.loads(row[0]):
-                    counts[reason] = counts.get(reason, 0) + 1
+        cursor = await self._db.execute("SELECT reasons_json FROM decisions")
+        try:
+            while True:
+                rows = await cursor.fetchmany(10_000)
+                if not rows:
+                    break
+                for row in rows:
+                    for reason in json.loads(row[0]):
+                        counts[reason] = counts.get(reason, 0) + 1
+        finally:
+            await cursor.close()
         return counts
 
     async def decision_kind_counts(self) -> dict[str, int]:
@@ -1257,8 +1361,9 @@ class Store:
         async with self._db.execute(
             "SELECT kind, COUNT(*) FROM decisions GROUP BY kind"
         ) as cursor:
-            async for row in cursor:
-                counts[str(row[0])] = int(row[1])
+            rows = await cursor.fetchall()
+        for row in rows:
+            counts[str(row[0])] = int(row[1])
         return counts
 
     async def ev_summary(self) -> dict[str, object]:
@@ -1288,13 +1393,14 @@ class Store:
             " WHERE fair_now_cc IS NOT NULL AND fair_at_fill_cc IS NOT NULL"
             " GROUP BY horizon_s ORDER BY horizon_s"
         ) as cursor:
-            async for row in cursor:
-                out.append(
-                    {
-                        "horizon_s": float(row[0]),
-                        "n": int(row[1]),
-                        "mean_fair_drift_cc": None if row[2] is None else float(row[2]),
-                        "mean_raw_mid_drift_cc": None if row[3] is None else float(row[3]),
-                    }
-                )
+            rows = await cursor.fetchall()
+        for row in rows:
+            out.append(
+                {
+                    "horizon_s": float(row[0]),
+                    "n": int(row[1]),
+                    "mean_fair_drift_cc": None if row[2] is None else float(row[2]),
+                    "mean_raw_mid_drift_cc": None if row[3] is None else float(row[3]),
+                }
+            )
         return out

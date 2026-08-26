@@ -351,6 +351,141 @@ class TestUtilizationBackstop:
         assert r2_reasons(breaches) == [ReasonCode.SKIP_BANKROLL_UNAVAILABLE]
 
 
+# --- ONCE-COUNTED utilization measure (operator-RATIFIED 2026-08-12, shipped
+# 2026-08-19). The old wall summed gross_settlement_notional_by_game_cc, so a
+# multi-game ticket's notional was charged once PER GAME it touched (measured
+# live ×3.6–5.6; 3,094 artifact refusals on 8/19 alone, and the 8/18 renege
+# declined a WON auction missing the wall by 0.086%). The corrected measure
+# counts each ticket exactly ONCE across book + candidates + resting quotes:
+# max-loss-notional semantics per ticket, SUMMED across tickets — a game shared
+# by two combos never doubles either combo's notional, and distinct games SUM. -
+LEG_C = (LegRef("C", "SER-GAME3", "yes"),)
+LEG_D = (LegRef("D", "SER-GAME4", "yes"),)
+MARG4 = provider({"A": 0.5, "B": 0.5, "C": 0.5, "D": 0.5})
+
+
+class TestUtilizationOnceCounted:
+    def test_two_combos_sharing_a_game_do_not_double_count(self) -> None:
+        # Two 2-game combos sharing GAME2: (GAME1+GAME2) and (GAME2+GAME3),
+        # $100 notional each. Once-counted = 2_000_000cc; the old per-game
+        # roll-up read 4_000_000cc (each combo charged in BOTH its games).
+        # Backstop 3 × $90 = 2_700_000cc sits between the two → the wall must
+        # NOT fire.
+        book = empty_book()
+        book.add_position(
+            make_position("p1", LEG_A + LEG_B, contracts=10_000, entry_price=100)
+        )
+        book.add_position(
+            make_position("p2", LEG_B + LEG_C, contracts=10_000, entry_price=100)
+        )
+        breaches = checker(absolute_notional_multiple=3, **{
+            k: v for k, v in LOOSE.items() if k != "absolute_notional_multiple"
+        }).check(book, MARG4, DailyPnl(), risk_bankroll_cc=900_000)
+        rs = r2_reasons(breaches)
+        assert ReasonCode.SKIP_UTILIZATION_BACKSTOP not in rs
+        assert ReasonCode.SKIP_BANKROLL_UNAVAILABLE not in rs  # wall computed
+
+    def test_distinct_games_sum_never_max(self) -> None:
+        # Two single-game combos in DIFFERENT games, $100 notional each:
+        # once-counted total 2_000_000cc. Backstop 3 × $60 = 1_800_000cc →
+        # fires (a within-game max/dedupe reading 1_000_000cc would not).
+        book = empty_book()
+        book.add_position(make_position("p1", LEG_A, contracts=10_000, entry_price=100))
+        book.add_position(make_position("p2", LEG_C, contracts=10_000, entry_price=100))
+        breaches = checker(absolute_notional_multiple=3, **{
+            k: v for k, v in LOOSE.items() if k != "absolute_notional_multiple"
+        }).check(book, MARG4, DailyPnl(), risk_bankroll_cc=600_000)
+        assert ReasonCode.SKIP_UTILIZATION_BACKSTOP in r2_reasons(breaches)
+        # ... and at 3 × $70 = 2_100_000cc ≥ the same book, it does not.
+        breaches = checker(absolute_notional_multiple=3, **{
+            k: v for k, v in LOOSE.items() if k != "absolute_notional_multiple"
+        }).check(book, MARG4, DailyPnl(), risk_bankroll_cc=700_000)
+        assert ReasonCode.SKIP_UTILIZATION_BACKSTOP not in r2_reasons(breaches)
+
+    def test_regression_pin_the_818_renege_shape_passes_once_counted(self) -> None:
+        # THE 8/18 RENEGE (live receipts, 2026-08-19 morning readout): the wall
+        # read 133,559,100cc against limit 3 × bankroll = 133,444,386cc —
+        # declining a WON auction by 0.086% — while the true once-counted book
+        # was ~33,070,000cc. Reconstruct the shape: ten 4-game combos of
+        # 3_340_000cc notional each. Old measure = 4 × 33_400_000 =
+        # 133_600_000cc > limit (the renege); corrected = 33_400_000cc → passes
+        # with ~4× of room.
+        bankroll = 44_481_462  # 3× = 133_444_386cc, the live 8/18 limit
+        legs = LEG_A + LEG_B + LEG_C + LEG_D
+        book = empty_book()
+        for i in range(10):
+            book.add_position(
+                make_position(f"r{i}", legs, contracts=33_400, entry_price=100)
+            )
+        # The old per-game-summed measure still reads OVER the limit on this
+        # book — the exact artifact-refusal shape the fix removes.
+        snap = book.snapshot(MARG4, mass_acceptance=True)
+        old_measure = sum(snap.gross_settlement_notional_by_game_cc.values())
+        assert old_measure == 133_600_000 > 3 * bankroll
+        breaches = checker(absolute_notional_multiple=3, **{
+            k: v for k, v in LOOSE.items() if k != "absolute_notional_multiple"
+        }).check(book, MARG4, DailyPnl(), risk_bankroll_cc=bankroll)
+        assert ReasonCode.SKIP_UTILIZATION_BACKSTOP not in r2_reasons(breaches)
+
+    def test_still_refuses_when_true_notional_exceeds_backstop(self) -> None:
+        # ONE 3-game combo of 300.00 contracts: once-counted notional
+        # 3_000_000cc — genuinely over 3 × $90 = 2_700_000cc even counted
+        # ONCE → the wall refuses (the backstop still backstops).
+        book = empty_book()
+        book.add_position(
+            make_position(
+                "p1", LEG_A + LEG_B + LEG_C, contracts=30_000, entry_price=100
+            )
+        )
+        breaches = checker(absolute_notional_multiple=3, **{
+            k: v for k, v in LOOSE.items() if k != "absolute_notional_multiple"
+        }).check(book, MARG4, DailyPnl(), risk_bankroll_cc=900_000)
+        assert ReasonCode.SKIP_UTILIZATION_BACKSTOP in r2_reasons(breaches)
+
+    def test_candidate_scoped_book_plus_candidate(self) -> None:
+        # The wall judges BOOK + CANDIDATE: committed 1_500_000cc alone fits
+        # 3 × $60 = 1_800_000cc; a 400_000cc-notional candidate tips the
+        # once-counted total to 1_900_000cc → fires WITH the candidate only
+        # (candidate-monotone, the F1 pre-gate lemma).
+        book = empty_book()
+        book.add_position(make_position("p1", LEG_A, contracts=15_000, entry_price=100))
+        cand = make_position("cand", LEG_B, contracts=4_000, entry_price=100)
+        chk = checker(absolute_notional_multiple=3, **{
+            k: v for k, v in LOOSE.items() if k != "absolute_notional_multiple"
+        })
+        without = chk.check(book, MARG4, DailyPnl(), risk_bankroll_cc=600_000)
+        assert ReasonCode.SKIP_UTILIZATION_BACKSTOP not in r2_reasons(without)
+        with_cand = chk.check(
+            book, MARG4, DailyPnl(),
+            candidate_positions=[cand], risk_bankroll_cc=600_000,
+        )
+        assert ReasonCode.SKIP_UTILIZATION_BACKSTOP in r2_reasons(with_cand)
+
+    def test_resting_quote_counts_once_and_dead_quote_never(self) -> None:
+        # A resting 2-game quote (mass acceptance) contributes its notional
+        # ONCE (1_000_000cc — the old roll-up charged 2_000_000cc across its
+        # two games): under 3 × $40 = 1_200_000cc the wall must not fire.
+        book = empty_book()
+        book.upsert_quote(make_quote("q1", LEG_A + LEG_B, contracts=10_000))
+        snap = book.snapshot(MARG4, mass_acceptance=True)
+        old_measure = sum(snap.gross_settlement_notional_by_game_cc.values())
+        assert old_measure == 2_000_000  # the double-count, for contrast
+        breaches = checker(absolute_notional_multiple=3, **{
+            k: v for k, v in LOOSE.items() if k != "absolute_notional_multiple"
+        }).check(book, MARG4, DailyPnl(), risk_bankroll_cc=400_000)
+        assert ReasonCode.SKIP_UTILIZATION_BACKSTOP not in r2_reasons(breaches)
+        # A both-sides-declined quote creates no position → contributes
+        # NOTHING (mirrors the snapshot's empty-hypotheticals skip).
+        dead = empty_book()
+        dead.upsert_quote(
+            make_quote("q0", LEG_A, yes_bid=0, no_bid=0, contracts=1_000_000)
+        )
+        breaches = checker(absolute_notional_multiple=3, **{
+            k: v for k, v in LOOSE.items() if k != "absolute_notional_multiple"
+        }).check(dead, MARG4, DailyPnl(), risk_bankroll_cc=100_000)
+        assert ReasonCode.SKIP_UTILIZATION_BACKSTOP not in r2_reasons(breaches)
+
+
 class TestDirectionalCap:
     def test_fires_when_net_directional_exposure_exceeds_cap(self) -> None:
         # 100.00 YES contracts on leg A at p=0.5 → delta_by_game[GAME1] = +100

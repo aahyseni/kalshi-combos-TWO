@@ -695,12 +695,260 @@
     {
       "launch_to_first_beat_s": 45.5,
       "log": "live_20260813_1014.log"
+    },
+    {
+      "launch_to_first_beat_s": 50.32,
+      "log": "live_20260813_1317.log"
+    },
+    {
+      "launch_to_first_beat_s": 48.77,
+      "log": "live_20260813_1324.log"
+    },
+    {
+      "launch_to_first_beat_s": 49.8,
+      "log": "live_20260813_1334.log"
+    },
+    {
+      "launch_to_first_beat_s": 48.44,
+      "log": "live_20260813_1343.log"
+    },
+    {
+      "launch_to_first_beat_s": 48.92,
+      "log": "live_20260813_1352.log"
+    },
+    {
+      "launch_to_first_beat_s": 48.46,
+      "log": "live_20260813_1355.log"
+    },
+    {
+      "launch_to_first_beat_s": 48.77,
+      "log": "live_20260813_1407.log"
+    },
+    {
+      "launch_to_first_beat_s": 50.55,
+      "log": "live_20260813_1410.log"
+    },
+    {
+      "launch_to_first_beat_s": 47.4,
+      "log": "live_20260813_1743.log"
+    },
+    {
+      "launch_to_first_beat_s": 45.48,
+      "log": "live_20260813_1753.log"
+    },
+    {
+      "launch_to_first_beat_s": 45.54,
+      "log": "live_20260813_2237.log"
+    },
+    {
+      "launch_to_first_beat_s": 43.4,
+      "log": "live_20260813_2343.log"
+    },
+    {
+      "launch_to_first_beat_s": 48.5,
+      "log": "live_20260814_0313.log"
+    },
+    {
+      "launch_to_first_beat_s": 43.23,
+      "log": "live_20260814_0322.log"
+    },
+    {
+      "launch_to_first_beat_s": 48.88,
+      "log": "live_20260814_0933.log"
+    },
+    {
+      "launch_to_first_beat_s": 50.94,
+      "log": "live_20260814_1930.log"
+    },
+    {
+      "launch_to_first_beat_s": 42.58,
+      "log": "live_20260814_2158.log"
+    },
+    {
+      "launch_to_first_beat_s": 44.72,
+      "log": "live_20260814_2327.log"
+    },
+    {
+      "launch_to_first_beat_s": 48.57,
+      "log": "live_20260815_0945.log"
+    },
+    {
+      "launch_to_first_beat_s": 52.17,
+      "log": "live_20260815_1225.log"
+    },
+    {
+      "launch_to_first_beat_s": 51.67,
+      "log": "live_20260815_1552.log"
+    },
+    {
+      "launch_to_first_beat_s": 49.4,
+      "log": "live_20260815_1843.log"
+    },
+    {
+      "launch_to_first_beat_s": 44.6,
+      "log": "live_20260815_2306.log"
+    },
+    {
+      "launch_to_first_beat_s": 39.36,
+      "log": "live_20260816_0145.log"
+    },
+    {
+      "launch_to_first_beat_s": 40.13,
+      "log": "live_20260816_0223.log"
+    },
+    {
+      "launch_to_first_beat_s": 41.94,
+      "log": "live_20260816_0523.log"
+    },
+    {
+      "launch_to_first_beat_s": 41.85,
+      "log": "live_20260816_0549.log"
+    },
+    {
+      "launch_to_first_beat_s": 42.28,
+      "log": "live_20260816_0605.log"
+    },
+    {
+      "launch_to_first_beat_s": 42.75,
+      "log": "live_20260816_0607.log"
+    },
+    {
+      "launch_to_first_beat_s": 41.86,
+      "log": "live_20260816_0623.log"
+    },
+    {
+      "launch_to_first_beat_s": 42.45,
+      "log": "live_20260816_0626.log"
+    },
+    {
+      "launch_to_first_beat_s": 42.0,
+      "log": "live_20260816_0640.log"
+    },
+    {
+      "launch_to_first_beat_s": 42.02,
+      "log": "live_20260816_0643.log"
+    },
+    {
+      "launch_to_first_beat_s": 42.91,
+      "log": "live_20260816_0646.log"
+    },
+    {
+      "launch_to_first_beat_s": 43.16,
+      "log": "live_20260816_0733.log"
+    },
+    {
+      "launch_to_first_beat_s": 42.81,
+      "log": "live_20260816_0748.log"
+    },
+    {
+      "launch_to_first_beat_s": 43.06,
+      "log": "live_20260816_0824.log"
+    },
+    {
+      "launch_to_first_beat_s": 42.67,
+      "log": "live_20260816_0841.log"
+    },
+    {
+      "launch_to_first_beat_s": 42.88,
+      "log": "live_20260816_0858.log"
+    },
+    {
+      "launch_to_first_beat_s": 46.66,
+      "log": "live_20260816_1106.log"
+    },
+    {
+      "launch_to_first_beat_s": 47.35,
+      "log": "live_20260816_1603.log"
+    },
+    {
+      "launch_to_first_beat_s": 37.82,
+      "log": "live_20260816_2034.log"
+    },
+    {
+      "launch_to_first_beat_s": 40.09,
+      "log": "live_20260816_2353.log"
+    },
+    {
+      "launch_to_first_beat_s": 36.81,
+      "log": "live_20260817_0003.log"
+    },
+    {
+      "launch_to_first_beat_s": 43.3,
+      "log": "live_20260817_0627.log"
+    },
+    {
+      "launch_to_first_beat_s": 45.67,
+      "log": "live_20260817_1207.log"
+    },
+    {
+      "launch_to_first_beat_s": 47.15,
+      "log": "live_20260817_1312.log"
+    },
+    {
+      "launch_to_first_beat_s": 47.03,
+      "log": "live_20260817_2339.log"
+    },
+    {
+      "launch_to_first_beat_s": 47.6,
+      "log": "live_20260817_2343.log"
+    },
+    {
+      "launch_to_first_beat_s": 41.89,
+      "log": "live_20260818_0413.log"
+    },
+    {
+      "launch_to_first_beat_s": 41.88,
+      "log": "live_20260818_0421.log"
+    },
+    {
+      "launch_to_first_beat_s": 43.34,
+      "log": "live_20260818_0510.log"
+    },
+    {
+      "launch_to_first_beat_s": 44.46,
+      "log": "live_20260818_0519.log"
+    },
+    {
+      "launch_to_first_beat_s": 49.69,
+      "log": "live_20260820_0347.log"
+    },
+    {
+      "launch_to_first_beat_s": 49.66,
+      "log": "live_20260820_0805.log"
+    },
+    {
+      "launch_to_first_beat_s": 51.11,
+      "log": "live_20260820_0816.log"
+    },
+    {
+      "launch_to_first_beat_s": 53.05,
+      "log": "live_20260820_1105.log"
+    },
+    {
+      "launch_to_first_beat_s": 55.58,
+      "log": "live_20260820_1345.log"
+    },
+    {
+      "launch_to_first_beat_s": 53.34,
+      "log": "live_20260820_1350.log"
+    },
+    {
+      "launch_to_first_beat_s": 53.86,
+      "log": "live_20260820_1400.log"
+    },
+    {
+      "launch_to_first_beat_s": 46.79,
+      "log": "live_20260820_1722.log"
+    },
+    {
+      "launch_to_first_beat_s": 45.75,
+      "log": "live_20260820_1732.log"
     }
   ],
-  "candidate_gate_attempts_max": 2,
-  "candidate_gate_confirm_events": 2611,
-  "candidate_gate_deadline_events": 79,
-  "live_n_positions_last": 71,
+  "candidate_gate_attempts_max": 3,
+  "candidate_gate_confirm_events": 3808,
+  "candidate_gate_deadline_events": 86,
+  "live_n_positions_last": 57,
   "live_n_positions_max": 139,
   "max_same_tick_quarantine": 19,
   "max_same_tick_quarantine_where": "live_20260809_2212.log|2026-08-10T02:43:13",
@@ -708,14 +956,14 @@
     "event": "api_tier_observed",
     "level": "info",
     "metadata_reads_per_s_ceiling": 30.0,
-    "read_capacity": 600,
+    "read_capacity": 900,
     "read_refill_per_s": 300,
-    "ts": "2026-08-13T14:14:55.202654Z",
+    "ts": "2026-08-20T21:32:46.366157Z",
     "usage_tier": "advanced",
-    "write_capacity": 600,
+    "write_capacity": 900,
     "write_refill_per_s": 300
   },
-  "observed_tier_at": "2026-08-13T14:14:55.202654Z",
+  "observed_tier_at": "2026-08-20T21:32:46.366157Z",
   "provenance": {
     "manifest": {
       "live_20260722_relight.log": [
@@ -1447,12 +1695,280 @@
         1786630482.242
       ],
       "live_20260813_1014.log": [
-        1810294453,
-        1786639349.972
+        2144970522,
+        1786641395.333
+      ],
+      "live_20260813_1317.log": [
+        57521693,
+        1786641840.667
+      ],
+      "live_20260813_1324.log": [
+        87188561,
+        1786642467.961
+      ],
+      "live_20260813_1334.log": [
+        50805467,
+        1786642982.716
+      ],
+      "live_20260813_1343.log": [
+        63581163,
+        1786643513.518
+      ],
+      "live_20260813_1352.log": [
+        11148516,
+        1786643669.991
+      ],
+      "live_20260813_1355.log": [
+        98588446,
+        1786644388.632
+      ],
+      "live_20260813_1407.log": [
+        19554641,
+        1786644582.757
+      ],
+      "live_20260813_1410.log": [
+        1866094463,
+        1786657366.156
+      ],
+      "live_20260813_1743.log": [
+        88412137,
+        1786657972.376
+      ],
+      "live_20260813_1753.log": [
+        2771124597,
+        1786675004.112
+      ],
+      "live_20260813_2237.log": [
+        399857290,
+        1786678979.469
+      ],
+      "live_20260813_2343.log": [
+        2770859046,
+        1786691561.877
+      ],
+      "live_20260814_0313.log": [
+        93582180,
+        1786692141.44
+      ],
+      "live_20260814_0322.log": [
+        4170183416,
+        1786711631.347
+      ],
+      "live_20260814_0920.log": [
+        2596,
+        1786713623.602
+      ],
+      "live_20260814_0933.log": [
+        10627313760,
+        1786748107.907
+      ],
+      "live_20260814_1930.log": [
+        1826544215,
+        1786759073.731
+      ],
+      "live_20260814_2158.log": [
+        786723360,
+        1786764410.989
+      ],
+      "live_20260814_2327.log": [
+        8136301449,
+        1786801476.153
+      ],
+      "live_20260815_0945.log": [
+        783919846,
+        1786806774.559
+      ],
+      "live_20260815_1206.log": [
+        2596,
+        1786810006.002
+      ],
+      "live_20260815_1225.log": [
+        1832872256,
+        1786823502.158
+      ],
+      "live_20260815_1552.log": [
+        1494426403,
+        1786833757.161
+      ],
+      "live_20260815_1843.log": [
+        2216502603,
+        1786849555.772
+      ],
+      "live_20260815_2306.log": [
+        2068516972,
+        1786859073.077
+      ],
+      "live_20260816_0145.log": [
+        529703519,
+        1786861389.562
+      ],
+      "live_20260816_0223.log": [
+        2693245392,
+        1786872198.147
+      ],
+      "live_20260816_0523.log": [
+        346527331,
+        1786873753.737
+      ],
+      "live_20260816_0549.log": [
+        181853289,
+        1786874670.607
+      ],
+      "live_20260816_0605.log": [
+        11677042,
+        1786874842.012
+      ],
+      "live_20260816_0607.log": [
+        152631562,
+        1786875745.371
+      ],
+      "live_20260816_0623.log": [
+        18709007,
+        1786875918.764
+      ],
+      "live_20260816_0626.log": [
+        168876463,
+        1786876773.296
+      ],
+      "live_20260816_0640.log": [
+        20528786,
+        1786876950.259
+      ],
+      "live_20260816_0643.log": [
+        24168568,
+        1786877167.089
+      ],
+      "live_20260816_0646.log": [
+        583433556,
+        1786880019.24
+      ],
+      "live_20260816_0733.log": [
+        226089336,
+        1786880848.883
+      ],
+      "live_20260816_0748.log": [
+        700402352,
+        1786883020.843
+      ],
+      "live_20260816_0824.log": [
+        336576365,
+        1786884074.613
+      ],
+      "live_20260816_0841.log": [
+        346357209,
+        1786885077.059
+      ],
+      "live_20260816_0858.log": [
+        1766100761,
+        1786889575.369
+      ],
+      "live_20260816_1106.log": [
+        6224350688,
+        1786910625.15
+      ],
+      "live_20260816_1603.log": [
+        4116755988,
+        1786926835.478
+      ],
+      "live_20260816_2034.log": [
+        2275838695,
+        1786938496.658
+      ],
+      "live_20260816_2348.log": [
+        2596,
+        1786938514.446
+      ],
+      "live_20260816_2349.log": [
+        2596,
+        1786938571.093
+      ],
+      "live_20260816_2353.log": [
+        114948093,
+        1786939349.334
+      ],
+      "live_20260817_0003.log": [
+        5322763478,
+        1786962392.469
+      ],
+      "live_20260817_0627.log": [
+        4483187688,
+        1786982588.265
+      ],
+      "live_20260817_1203.log": [
+        2596,
+        1786982613.766
+      ],
+      "live_20260817_1207.log": [
+        470102052,
+        1786986737.061
+      ],
+      "live_20260817_1312.log": [
+        4035162251,
+        1787024278.388
+      ],
+      "live_20260817_2339.log": [
+        17499023,
+        1787024503.27
+      ],
+      "live_20260817_2343.log": [
+        46565934,
+        1787024926.253
+      ],
+      "live_20260818_0413.log": [
+        76329235,
+        1787041234.308
+      ],
+      "live_20260818_0421.log": [
+        593535691,
+        1787044164.925
+      ],
+      "live_20260818_0510.log": [
+        114842152,
+        1787044792.175
+      ],
+      "live_20260818_0519.log": [
+        19429304582,
+        1787211955.557
+      ],
+      "live_20260820_0347.log": [
+        2435674953,
+        1787227488.32
+      ],
+      "live_20260820_0805.log": [
+        63862846,
+        1787228120.841
+      ],
+      "live_20260820_0816.log": [
+        1247093399,
+        1787238268.846
+      ],
+      "live_20260820_1105.log": [
+        1049956658,
+        1787247860.569
+      ],
+      "live_20260820_1345.log": [
+        17649190,
+        1787248176.924
+      ],
+      "live_20260820_1350.log": [
+        41506569,
+        1787248783.107
+      ],
+      "live_20260820_1400.log": [
+        967624960,
+        1787260876.492
+      ],
+      "live_20260820_1722.log": [
+        40979224,
+        1787261497.533
+      ],
+      "live_20260820_1732.log": [
+        120952875,
+        1787262905.333
       ]
     },
-    "scanned_bytes": 167773059182,
-    "scanned_logs": 183,
+    "scanned_bytes": 271842738143,
+    "scanned_logs": 250,
     "source": "fresh scan"
   }
 }

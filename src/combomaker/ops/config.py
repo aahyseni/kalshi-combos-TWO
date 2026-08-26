@@ -2523,6 +2523,16 @@ class MarkupConfig(StrictModel):
     # 0 = dark (byte-identical).
     ml_parlay_cc: int = 0
     ml_parlay_fair_below_cc: int = 3500
+    # THIN-AUCTION MARGIN BUMP (2026-08-19 auction-competition measurement,
+    # docs/reports/2026-08-19-quoting-pbook-forensics-and-verification.md):
+    # +bonus cc on MLB/soccer combos with fair >= thin_auction_fair_min_cc —
+    # those pools mostly EXPIRE unfilled by ANY maker (35-65c fair: 80% no
+    # print within 30min, winner gap +2.1c median; >=65c: 88% / +1.5c), so
+    # the retained margin costs ~nothing in fill probability. Disjoint from
+    # ml_parlay_cc (that requires fair < 3500); the razor pool (fair < 35c,
+    # 81% clear) is untouched. 0 = dark (byte-identical).
+    thin_auction_bonus_cc: int = 0
+    thin_auction_fair_min_cc: int = 3500
     soccer: SportMarkupConfig = Field(default_factory=SportMarkupConfig)
     mlb: SportMarkupConfig = Field(default_factory=SportMarkupConfig)
     # ESPORTS / RACING (2026-07-26 operator: winners only; "could be a

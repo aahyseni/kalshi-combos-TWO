@@ -263,3 +263,106 @@ def test_ml_parlay_override_dark_by_default() -> None:
     assert p.ml_parlay_cc == 0
     # Byte-identical: the tier still prices the shape.
     assert p.markup_for([ML_A, ML_B], fair_cc=800) == ("mlb", 400)
+
+
+# --- 2026-08-19 thin-auction margin bump (fair >= 35c pools go begging) --------
+
+
+def _thin_cfg(**kw) -> MarkupPolicy:
+    from combomaker.ops.config import MarkupTier
+
+    return MarkupPolicy.from_config(
+        MarkupConfig(
+            enabled=True,
+            thin_auction_bonus_cc=100,
+            mlb=SportMarkupConfig(
+                enabled=True,
+                markup_cc=200,
+                tiers=[MarkupTier(fair_below_cc=1000, markup_cc=400)],
+            ),
+            soccer=SportMarkupConfig(enabled=True, markup_cc=200),
+            esports=SportMarkupConfig(enabled=True, markup_cc=300),
+            **kw,
+        )
+    )
+
+
+SOCCER_LEGS = ["KXWCADVANCE-26JUL19ESPARG-ARG", "KXWCTOTAL-26JUL19ESPARG-3"]
+
+
+def test_thin_auction_bonus_applies_at_and_above_bound() -> None:
+    p = _thin_cfg()
+    # The 35-65c pool (80% expiry) and the >=65c pool (88%) both get +1c.
+    assert p.markup_for([ML_A, ML_B], fair_cc=3500) == ("mlb", 300)
+    assert p.markup_for([ML_A, ML_B], fair_cc=6500) == ("mlb", 300)
+    assert p.markup_for(SOCCER_LEGS, fair_cc=3500) == ("soccer", 300)
+    assert p.markup_for(SOCCER_LEGS, fair_cc=6500) == ("soccer", 300)
+
+
+def test_thin_auction_bonus_not_below_bound() -> None:
+    # The razor/main pools (fair < 35c bound) keep today's markup exactly.
+    p = _thin_cfg()
+    assert p.markup_for([ML_A, ML_B], fair_cc=3499) == ("mlb", 200)
+    assert p.markup_for([ML_A, ML_B], fair_cc=800) == ("mlb", 400)  # tier, no bonus
+    assert p.markup_for(SOCCER_LEGS, fair_cc=150) == ("soccer", 200)
+
+
+def test_thin_auction_bonus_not_for_other_sports() -> None:
+    # Evidence is MLB/soccer auction pools only — esports keeps its base.
+    p = _thin_cfg()
+    assert p.markup_for(["KXLOLGAME-26AUG19T1GEN-T1"], fair_cc=6500) == ("esports", 300)
+
+
+def test_thin_auction_disjoint_from_ml_parlay_override() -> None:
+    # Both configured: the razor override owns fair < 3500, the bonus owns
+    # fair >= 3500 — disjoint by construction (same default bound), pinned.
+    p = _thin_cfg(ml_parlay_cc=100)
+    assert p.ml_parlay_fair_below_cc == p.thin_auction_fair_min_cc == 3500
+    assert p.markup_for([ML_A, ML_B], fair_cc=800) == ("mlb", 100)   # razor untouched
+    assert p.markup_for([ML_A, ML_B], fair_cc=3500) == ("mlb", 300)  # bonus, no razor
+
+
+def test_thin_auction_dark_default_is_byte_identical() -> None:
+    from combomaker.ops.config import MarkupTier
+
+    kw = dict(
+        enabled=True,
+        mlb=SportMarkupConfig(
+            enabled=True,
+            markup_cc=200,
+            tiers=[MarkupTier(fair_below_cc=1000, markup_cc=400)],
+        ),
+        soccer=SportMarkupConfig(enabled=True, markup_cc=200),
+        esports=SportMarkupConfig(enabled=True, markup_cc=300),
+        ml_parlay_cc=100,
+    )
+    unset = MarkupPolicy.from_config(MarkupConfig(**kw))  # type: ignore[arg-type]
+    assert unset.thin_auction_bonus_cc == 0
+    explicit_zero = MarkupPolicy.from_config(
+        MarkupConfig(thin_auction_bonus_cc=0, **kw)  # type: ignore[arg-type]
+    )
+    for legs in ([ML_A, ML_B], SOCCER_LEGS, ["KXLOLGAME-26AUG19T1GEN-T1"], [ML_A]):
+        for fair in (None, 150, 800, 2000, 3499, 3500, 5000, 6500):
+            assert unset.markup_for(legs, fair_cc=fair) == explicit_zero.markup_for(
+                legs, fair_cc=fair
+            )
+
+
+def test_thin_auction_composes_additively_with_tier() -> None:
+    from combomaker.ops.config import MarkupTier
+
+    # A tier whose bound sits ABOVE the thin floor: bonus adds ON TOP of the
+    # selected tier, not just the flat base.
+    p = MarkupPolicy.from_config(
+        MarkupConfig(
+            enabled=True,
+            thin_auction_bonus_cc=100,
+            mlb=SportMarkupConfig(
+                enabled=True,
+                markup_cc=200,
+                tiers=[MarkupTier(fair_below_cc=5000, markup_cc=300)],
+            ),
+        )
+    )
+    assert p.markup_for([ML_A, ML_B], fair_cc=4000) == ("mlb", 400)  # 3c tier + 1c
+    assert p.markup_for([ML_A, ML_B], fair_cc=6500) == ("mlb", 300)  # 2c flat + 1c
