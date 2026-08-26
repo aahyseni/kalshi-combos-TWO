@@ -248,6 +248,27 @@ def test_ml_parlay_override_never_touches_prop_or_same_game_shapes() -> None:
     assert p.markup_for([ML_A], fair_cc=800) == ("mlb", 400)
 
 
+def test_ml_parlay_override_applies_across_all_sports() -> None:
+    # 2026-08-26 operator: "for ML parlays make the markup 0.6c across all
+    # sports" — the MLB/soccer restriction is gone. Esports ML parlays and
+    # cross-sport (mixed) ML parlays ride the razor; dark/unknown legs
+    # still zero out upstream (sport_of / mixed known-sports requirement).
+    p = _ml_cfg(
+        esports=SportMarkupConfig(enabled=True, markup_cc=300),
+        mixed=SportMarkupConfig(enabled=True, markup_cc=300),
+    )
+    esports_a = "KXLOLGAME-26AUG27T1GENG-T1"
+    esports_b = "KXLOLGAME-26AUG27DKKT-DK"
+    assert p.markup_for([esports_a, esports_b], fair_cc=800) == ("esports", 100)
+    # Cross-sport ML parlay (MLB x esports) resolves 'mixed' and rides it.
+    assert p.markup_for([ML_A, esports_a], fair_cc=800) == ("mixed", 100)
+    # A prop leg still keeps the full tier/base (shape guard unchanged).
+    prop = "KXMLBKS-26AUG16SEAHOU-HOULCASTILLO58-6"
+    assert p.markup_for([prop, esports_a], fair_cc=800) == ("mixed", 300)
+    # An unknown-sport leg still zeroes the combo (fail-safe untouched).
+    assert p.markup_for([esports_a, "KXBBLGAME-26SEP20BERBAY-BER"], fair_cc=800)[1] == 0
+
+
 def test_ml_parlay_override_dark_by_default() -> None:
     from combomaker.ops.config import MarkupTier
 

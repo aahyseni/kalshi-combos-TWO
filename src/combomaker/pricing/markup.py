@@ -138,9 +138,14 @@ class MarkupPolicy:
     # at this flat markup instead of the sport's longshot tiers. Evidence:
     # the class is 33.0% of the entire RFQ tape and we filled 0/529 quoted —
     # losing by exactly the tier markup (field clears our-fair +0.05-0.25c
-    # on 1,122 matched auctions). Scope-guarded: only MLB/soccer, only when
-    # EVERY leg is a MONEYLINE on a DISTINCT game (same-game/mutex shapes
-    # and prop-carrying combos keep full tiers — the whale/model-risk bands).
+    # on 1,122 matched auctions). Scope-guarded: only when EVERY leg is a
+    # MONEYLINE on a DISTINCT game (same-game/mutex shapes and prop-carrying
+    # combos keep full tiers — the whale/model-risk bands).
+    # 2026-08-26 (operator, verbatim "for ML parlays make the markup 0.6c
+    # across all sports"): the MLB/soccer-only sport restriction REMOVED —
+    # any ACTIVE sport bucket (incl. the cross-sport 'mixed' resolution,
+    # which already requires every leg to be a KNOWN sport with an active
+    # markup) rides the razor. Dark/unknown legs still zero out upstream.
     # 0 = dark (today's behaviour byte-identical).
     ml_parlay_cc: int = 0
     ml_parlay_fair_below_cc: int = 3500
@@ -256,14 +261,15 @@ class MarkupPolicy:
                 if fair_cc < below:
                     base = cc
                     break
-            # ML-PARLAY OVERRIDE (2026-08-16, see the field's docstring):
-            # replaces the tier for cross-game ML-only MLB/soccer parlays
-            # below the fair bound. Fail-safe: any leg that is not a
-            # MONEYLINE, any repeated game code, or any unparseable ticker
-            # keeps the tier markup untouched.
+            # ML-PARLAY OVERRIDE (2026-08-16; ALL SPORTS since 2026-08-26 —
+            # see the field's docstring): replaces the tier for cross-game
+            # ML-only parlays below the fair bound. base > 0 above already
+            # guarantees an ACTIVE sport bucket (mixed requires every leg
+            # KNOWN + active). Fail-safe: any leg that is not a MONEYLINE,
+            # any repeated game code, or any unparseable ticker keeps the
+            # tier markup untouched.
             if (
                 self.ml_parlay_cc > 0
-                and sport in ("mlb", "soccer")
                 and fair_cc < self.ml_parlay_fair_below_cc
                 and _is_cross_game_ml_parlay(legs)
             ):
