@@ -1,0 +1,110 @@
+2026-08-27 02:08:00 [info     ] dotenv_loaded                  names=['KALSHI_API_KEY_ID', 'KALSHI_PRIVATE_KEY_PATH', 'KALSHI_REQUESTER_API_KEY_ID', 'KALSHI_REQUESTER_PRIVATE_KEY_PATH', 'SPORTSGAMEODDS_API_KEY', 'KALSHI_PROD_API_KEY_ID', 'KALSHI_PROD_PRIVATE_KEY_PATH', 'KALSHI_SUPERVISOR_API_KEY_ID', 'KALSHI_SUPERVISOR_PRIVATE_KEY_PATH'] path=.env
+{"conventions": "tests\\fixtures\\ground_truth\\conventions.json", "env": "prod", "event": "quote_app_starting", "level": "info", "mode": "quote", "ts": "2026-08-27T06:08:01.373163Z"}
+{"event": "api_tier_observed", "level": "info", "metadata_reads_per_s_ceiling": 30.0, "read_capacity": 900, "read_refill_per_s": 300, "ts": "2026-08-27T06:08:01.558613Z", "usage_tier": "advanced", "write_capacity": 900, "write_refill_per_s": 300}
+{"capacity": 900, "critical_reserve_calls": 5, "critical_reserve_tokens": 50, "detail": "settlement resolution spends CRITICAL (may draw the reserve); routine metadata refresh yields at the floor", "event": "read_budget_armed", "level": "info", "per_call_token_cost": 10, "refill_s": 3.0, "routine_capacity": 850, "sustained_tokens_per_s": 300, "ts": "2026-08-27T06:08:01.559266Z"}
+{"event": "metadata_cache_loaded", "events": 628, "level": "info", "markets": 5251, "path": "data\\metadata_cache.json", "ts": "2026-08-27T06:08:01.651069Z"}
+{"aliases": {"KXMENWORLDCUP-26-AR": "KXWCADVANCE-26JUL19ESPARG-ARG", "KXMENWORLDCUP-26-ES": "KXWCADVANCE-26JUL19ESPARG-ESP"}, "event": "pricing_aliases_active", "level": "info", "ts": "2026-08-27T06:08:01.651385Z"}
+{"event": "delta_cap_mode", "event_mode": "frac", "event_value": "1.30", "level": "info", "market_mode": "frac", "market_value": "0.80", "ts": "2026-08-27T06:08:01.651443Z"}
+{"event": "adaptive_caps_slate_count_failed", "exception": "Traceback (most recent call last):\n  File \"C:\\Users\\aahys\\kalshi-combos-TWO\\src\\combomaker\\ops\\quote_app.py\", line 4613, in _count_slate_games\n    payload = await rest.get_markets(**params)\n              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\aahys\\kalshi-combos-TWO\\src\\combomaker\\exchange\\rest.py\", line 421, in get_markets\n    return await self._request(\"GET\", \"/markets\", params=dict(filters), auth=False)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\aahys\\kalshi-combos-TWO\\src\\combomaker\\exchange\\rest.py\", line 389, in _request\n    raise err_cls(resp.status, code, message, details)\ncombomaker.exchange.rest.RateLimitedError: HTTP 429 too_many_requests: too many requests", "level": "warning", "ts": "2026-08-27T06:08:02.085712Z"}
+{"cvar_frac": "12/125", "daily_frac": "9/125", "det_max_frac": "3/20", "directional_frac": "3/20", "drawdown_frac": "12/125", "enforced_slate_before": "13/20", "event": "adaptive_caps_refresh", "expected_games": 15, "g_eff": null, "game_frac": "1/100", "hard_trip_frac": "3/25", "kill_prob_60n": 1.719894887686202e-05, "kill_sigma_multiple": 5.0, "level": "info", "measured": false, "mode": "shadow", "per_combo_frac": "1/100", "provisional": true, "ratchet_held": false, "slate_frac": "3/20", "stable": false, "ts": "2026-08-27T06:08:02.088082Z"}
+{"entries": {"KXMENWORLDCUP-26": "2026-07-19T18:45:00+00:00"}, "event": "pregame_scheduled_starts_active", "level": "info", "ts": "2026-08-27T06:08:02.088154Z"}
+{"event": "worker_kill_job_created", "level": "info", "ts": "2026-08-27T06:08:02.089809Z"}
+{"deadline_s": 2.0, "event": "joint_pool_started", "level": "info", "ts": "2026-08-27T06:08:02.090941Z", "workers": 8}
+{"event": "joint_pool_warm", "level": "info", "ts": "2026-08-27T06:08:03.936083Z", "workers": 8}
+{"event": "worker_kill_job_created", "level": "info", "ts": "2026-08-27T06:08:33.940114Z"}
+{"event": "book_risk_pool_started", "level": "info", "pricing_aliases": 2, "ts": "2026-08-27T06:08:33.940416Z", "workers": 2}
+{"event": "book_risk_pool_warm", "level": "info", "ts": "2026-08-27T06:08:35.092231Z", "workers": 2}
+{"capacity": 200, "event": "write_budget_within_tier", "level": "info", "tier_capacity": 900, "tier_observed": true, "tier_tokens_per_s": 300, "tokens_per_s": 20.0, "ts": "2026-08-27T06:08:35.098460Z", "usage_tier": "advanced"}
+{"detail": "a prior hard halt/supervisor kill requires an exchange reconcile before quoting resumes", "event": "needs_reconcile_marker_present", "level": "warning", "ts": "2026-08-27T06:08:35.098706Z"}
+{"detail": "could not enumerate open quotes \u2014 the book is UNPROVEN; quoting stays blocked", "error": "TimeoutError()", "event": "startup_reconcile_failed", "level": "error", "phase": "enumerate", "ts": "2026-08-27T06:08:45.521264Z"}
+{"detail": "book NOT proven (exchange unreachable, or a leftover quote could not be provably withdrawn \u2014 see the preceding startup_reconcile_failed / startup_reconcile_unproven_quotes event); the bot will refuse to quote (needs_reconcile stays in force)", "event": "startup_reconcile_incomplete", "level": "error", "ts": "2026-08-27T06:08:45.521333Z"}
+Traceback (most recent call last):
+  File "C:\Users\aahys\kalshi-combos-TWO\.venv\Lib\site-packages\aiohttp\connector.py", line 1186, in drop_exception
+    fut.result()
+    ~~~~~~~~~~^^
+  File "C:\Users\aahys\kalshi-combos-TWO\.venv\Lib\site-packages\aiohttp\connector.py", line 1212, in _resolve_host_with_throttle
+    addrs = await self._resolver.resolve(host, port, family=self._family)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\aahys\kalshi-combos-TWO\.venv\Lib\site-packages\aiohttp\resolver.py", line 40, in resolve
+    infos = await self._loop.getaddrinfo(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<5 lines>...
+    )
+    ^
+  File "C:\Users\aahys\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 935, in getaddrinfo
+    return await self.run_in_executor(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        None, getaddr_func, host, port, family, type, proto, flags)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\aahys\AppData\Local\Programs\Python\Python313\Lib\concurrent\futures\thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+  File "C:\Users\aahys\AppData\Local\Programs\Python\Python313\Lib\socket.py", line 975, in getaddrinfo
+    for res in _socket.getaddrinfo(host, port, family, type, proto, flags):
+               ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+socket.gaierror: [Errno 11001] getaddrinfo failed
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\aahys\kalshi-combos-TWO\src\combomaker\ops\cli.py", line 205, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "C:\Users\aahys\kalshi-combos-TWO\src\combomaker\ops\cli.py", line 187, in main
+    asyncio.run(app.run())
+    ~~~~~~~~~~~^^^^^^^^^^^
+  File "C:\Users\aahys\AppData\Local\Programs\Python\Python313\Lib\asyncio\runners.py", line 194, in run
+    return runner.run(main)
+           ~~~~~~~~~~^^^^^^
+  File "C:\Users\aahys\AppData\Local\Programs\Python\Python313\Lib\asyncio\runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "C:\Users\aahys\AppData\Local\Programs\Python\Python313\Lib\asyncio\base_events.py", line 721, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "C:\Users\aahys\kalshi-combos-TWO\src\combomaker\ops\quote_app.py", line 2504, in run
+    await self._rehydrate_exposure_book(
+    ...<6 lines>...
+    )
+  File "C:\Users\aahys\kalshi-combos-TWO\src\combomaker\ops\quote_app.py", line 3413, in _rehydrate_exposure_book
+    payload = await get_positions_paged(rest, subaccount=subaccount)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\aahys\kalshi-combos-TWO\src\combomaker\ops\quote_app.py", line 1251, in get_positions_paged
+    payload = await rest.get_positions(**params)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\aahys\kalshi-combos-TWO\src\combomaker\exchange\rest.py", line 573, in get_positions
+    return await self._request("GET", "/portfolio/positions", params=dict(params))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\aahys\kalshi-combos-TWO\src\combomaker\exchange\rest.py", line 356, in _request
+    async with self._session.request(
+               ~~~~~~~~~~~~~~~~~~~~~^
+        method,
+        ^^^^^^^
+    ...<3 lines>...
+        headers=headers,
+        ^^^^^^^^^^^^^^^^
+    ) as resp:
+    ^
+  File "C:\Users\aahys\kalshi-combos-TWO\.venv\Lib\site-packages\aiohttp\client.py", line 1683, in __aenter__
+    self._resp: _RetType_co = await self._coro
+                              ^^^^^^^^^^^^^^^^
+  File "C:\Users\aahys\kalshi-combos-TWO\.venv\Lib\site-packages\aiohttp\client.py", line 856, in _request
+    resp = await handler(req)
+           ^^^^^^^^^^^^^^^^^^
+  File "C:\Users\aahys\kalshi-combos-TWO\.venv\Lib\site-packages\aiohttp\client.py", line 810, in _connect_and_send_request
+    conn = await self._connector.connect(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        req, traces=traces, timeout=real_timeout
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\aahys\kalshi-combos-TWO\.venv\Lib\site-packages\aiohttp\connector.py", line 657, in connect
+    proto = await self._create_connection(req, traces, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\aahys\kalshi-combos-TWO\.venv\Lib\site-packages\aiohttp\connector.py", line 1242, in _create_connection
+    _, proto = await self._create_direct_connection(req, traces, timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\aahys\kalshi-combos-TWO\.venv\Lib\site-packages\aiohttp\connector.py", line 1577, in _create_direct_connection
+    raise ClientConnectorDNSError(req.connection_key, exc) from exc
+aiohttp.client_exceptions.ClientConnectorDNSError: Cannot connect to host external-api.kalshi.com:443 ssl:default [getaddrinfo failed]

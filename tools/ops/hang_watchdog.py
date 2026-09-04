@@ -45,9 +45,16 @@ ESCALATION (bounded — REFUSES to flap):
   human-KILL refusal). Flap guards, in order:
     1. LIVENESS PROOF (same discriminator start_all.ps1 already uses, no
        invented number): a run that never wrote ``data/heartbeat.txt`` never
-       reached liveness — relighting it is a boot loop (the 2026-07-31 09:00
-       config-validation exit died in <1s, 0 relights is the right number).
-       Latch a halt receipt and stay down LOUD.
+       reached liveness. WHY it died decides what happens next (2026-09-04
+       build — the 8/27 02:13 ET latch that became an 8-day outage): the
+       corpse log is CLASSIFIED (``classify_death``, markers derived from what
+       the live code raises/logs). NETWORK (exchange unreachable, DNS, feed
+       lost) is NOT a boot loop — wait the same derived backoff guard 2 uses,
+       gate on an exchange reach probe, retry forever. CONFIG_CODE (a boot
+       refusal print, a traceback without a network root cause — the
+       2026-07-31 09:00 config-validation exit died in <1s, 0 relights is the
+       right number) and UNKNOWN (no readable cause) latch a halt receipt and
+       stay down LOUD, exactly as before.
     2. SHORT-RUN REPEAT: two CONSECUTIVE relights whose healthy span (last
        observed progress minus relight time) was below one detection window
        mean relighting is not producing a working bot. Latch, stay down loud.
@@ -63,14 +70,16 @@ ESCALATION (bounded — REFUSES to flap):
 
 FIX-ISOLATION: this file lives in tools/ops, imports NOTHING from combomaker,
 and touches the pricing path zero times. Read-only towards the store
-(sqlite ``mode=ro``), read-only towards Kalshi (it never talks to Kalshi at
-all). The only mutations it can perform are the operator's own stop/start
-scripts. Wired in by ``start_all.ps1`` (operator starts only), so it is always
-on after the next operator relight.
+(sqlite ``mode=ro``), read-only towards Kalshi (its ONLY exchange call is the
+unauthenticated ``GET /exchange/status`` reach probe, made only while a
+NETWORK-class boot death keeps the tree down; never an authenticated or
+mutating call). The only mutations it can perform are the operator's own
+stop/start scripts. Wired in by ``start_all.ps1`` (operator starts only), so
+it is always on after the next operator relight.
 
 Test seams (proofs drive the REAL loop against a scratch tree): ``--root``,
-``--probe-cmd``, ``--stop-cmd``, ``--start-cmd``, ``--max-cycles``,
-``--poll-s``. Defaults are the live wiring.
+``--probe-cmd``, ``--stop-cmd``, ``--start-cmd``, ``--reach-cmd``,
+``--max-cycles``, ``--poll-s``. Defaults are the live wiring.
 """
 
 from __future__ import annotations
@@ -81,14 +90,18 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 try:  # EST at the reporting boundary (operator rule); UTC fallback if tz db odd
     from zoneinfo import ZoneInfo
@@ -114,6 +127,21 @@ _SCAN_OVERLAP = 80
 # no override; the YAML itself is never printed (secrets live next to it).
 _DEFAULT_HB_TIMEOUT_S = 15.0
 _DEFAULT_HB_POLL_S = 1.0
+
+# Exchange endpoint + per-request wall bound, MIRRORED (never imported — this
+# file imports nothing from combomaker): ``ops/config.py`` ``_ENDPOINTS``
+# (doc-verified; prod ``.com``, demo ``.co``) and ``exchange/rest.py``
+# ``DEFAULT_REQUEST_TIMEOUT_S`` — in its own words "the per-request wall bound
+# every REST call already runs under ... reuses this one number instead of
+# inventing a second one that can drift away from it". The reach probe runs
+# under that same bound. The YAML's ``env`` / ``endpoints.rest_base_url``
+# select the URL (``_read_exchange_anchors``); nothing here is a new knob.
+_REST_BASE_URLS = {
+    "prod": "https://external-api.kalshi.com/trade-api/v2",
+    "demo": "https://external-api.demo.kalshi.co/trade-api/v2",
+}
+_DEFAULT_REQUEST_TIMEOUT_S = 10.0
+_REACH_STATUS_PATH = "/exchange/status"  # rest.py get_exchange_status, auth=False
 
 # The x2 safety margin used by BOTH threshold terms: act only when the quiet is
 # TWICE as long as the worst the healthy tape (or the internal chain) explains.
@@ -201,6 +229,299 @@ def _read_supervisor_anchors(root: Path) -> tuple[float, float]:
         except Exception:
             continue
     return hb, poll
+
+
+def _read_exchange_anchors(root: Path) -> str:
+    """The REST base URL the bot itself boots against: the LIVE YAML's
+    (``config/*.local.yaml`` — the file start_all.ps1 passes as ``--config``)
+    ``endpoints.rest_base_url`` if set, else the doc-verified default for its
+    ``env`` (mirrors ``ops/config.py`` ``load_config``'s endpoints setdefault).
+    Values only — the file is never echoed. The per-env TEMPLATES
+    (``demo.yaml`` / ``prod.yaml``) are deliberately NOT consulted: each names
+    its own env, so they cannot say which one is live. No live YAML ⇒ prod
+    (start_all.ps1 launches the tree this watchdog supervises ``--env prod``)."""
+    for cfg in sorted(root.glob("config/*.local.yaml")):
+        try:
+            import yaml
+
+            data = yaml.safe_load(cfg.read_text(encoding="utf-8")) or {}
+            endpoints = data.get("endpoints") or {}
+            if isinstance(endpoints, dict) and endpoints.get("rest_base_url"):
+                return str(endpoints["rest_base_url"])
+            env = data.get("env")
+            if isinstance(env, str) and env in _REST_BASE_URLS:
+                return _REST_BASE_URLS[env]
+        except Exception:
+            continue
+    return _REST_BASE_URLS["prod"]
+
+
+# --------------------------------------------------------------------------
+# Boot-death classification (2026-09-04 build — the 8/27 02:13 ET latch)
+# --------------------------------------------------------------------------
+#
+# WHY: 8/27 02:08:45 ET the -Auto relit boot died 45s in on aiohttp
+# ``ClientConnectorDNSError: Cannot connect to host external-api.kalshi.com:443
+# ... [getaddrinfo failed]`` during a Wi-Fi flap (Windows network
+# re-identifications 01:32..06:27 ET). It never wrote heartbeat.txt, so flap
+# guard 1 latched "relighting would boot-loop" — and nothing retried after the
+# network came back: an 8-day outage. A death the NETWORK caused is not a boot
+# loop; it is the 2026-08-06-ruled "if the bot crashes, restart, that's it"
+# class, and the 8/6 rework already retries it when it happens AFTER the
+# heartbeat. This closes the pre-heartbeat gap.
+#
+# CLASSES: NETWORK (exchange unreachable / DNS / feed lost) → wait the derived
+# backoff, gate on a reach probe, retry forever. CONFIG_CODE (a refusal the
+# bot prints at boot, or a Python traceback whose terminal exception is not a
+# transport error) and UNKNOWN (no readable cause) → latch, exactly as before
+# (fail-closed on the genuinely unknown).
+#
+# MARKERS — each derived from what the live code raises/logs, none invented:
+#  * transport exceptions: ``exchange/rest.py`` ``_request`` (l.339-390)
+#    catches ONLY the JSON-decode errors, so every aiohttp connection-layer
+#    exception propagates to the caller verbatim. The names are the installed
+#    aiohttp's (3.14.1) ``ClientConnectionError`` family — enumerated from the
+#    library, plus the stdlib causes they wrap (``socket.gaierror`` /
+#    "getaddrinfo failed", the Connection*Error OSErrors).
+#  * ``TimeoutError`` ON AN EXCHANGE CALL: ``rest.py`` l.314 runs every call
+#    under ``aiohttp.ClientTimeout(total=request_timeout_s)``, which raises the
+#    builtin TimeoutError (``asyncio.TimeoutError`` IS that class on 3.11+).
+#    A bare TimeoutError counts as NETWORK only when it is attributed to an
+#    exchange call — a traceback frame under ``combomaker/exchange/`` or
+#    ``aiohttp/``, or the ``error`` field of an exchange-reach event (next
+#    bullet). A pool / gate timeout elsewhere is CODE.
+#  * exchange-reach events whose ``error=repr(exc)`` is transport/timeout:
+#    ``startup_reconcile_failed`` (quote_app.py l.3238 + l.3267 — "a timeout
+#    or a transport error is exactly the 'exchange unreachable' case"),
+#    ``supervisor_exchange_unreachable`` (supervisor.py l.276),
+#    ``exchange_status_failed`` (quote_app.py l.4886).
+#    ``startup_reconcile_incomplete`` (quote_app.py l.3772) carries no error
+#    of its own — its cause is the preceding startup_reconcile_failed line,
+#    which is what is matched.
+#  * feed loss: ``kill_switch_halt`` (risk/killswitch.py l.64) with
+#    ``reason=halt_data_stale`` (core/reasons.py l.305; tripped by
+#    risk/breakers.py ``detect_data_stale`` l.70 on rx-age None / seq gap).
+#  * boot refusals the CLI prints (ops/cli.py): ``config error:`` (l.171,
+#    any load/validation failure), ``REFUSING TO START:`` (l.168
+#    ProdGuardError; l.184 ConventionsUnverifiedError / RuntimeError),
+#    ``credentials error:`` (l.190), ``REFUSING TO QUOTE:`` (l.197
+#    PreflightError). The last one is NETWORK when its red gate is
+#    ``book_reconciled`` (ops/preflight.py l.71-72) AND a network-caused
+#    startup_reconcile_failed precedes it — that is exactly the 8/27 boot had
+#    it survived rehydrate — otherwise CONFIG_CODE.
+#  * boot boundary: classification is scoped to the newest boot — everything
+#    from the last ``quote_app_starting`` line (quote_app.py l.1884) on — so a
+#    warning from an earlier boot in the same tail can never name the cause.
+
+DEATH_NETWORK = "NETWORK"
+DEATH_CONFIG_CODE = "CONFIG_CODE"
+DEATH_UNKNOWN = "UNKNOWN"
+
+_NETWORK_EXC_NAMES = (
+    # aiohttp.client_exceptions — ClientConnectionError family (3.14.1)
+    "ClientConnectorDNSError",
+    "ClientConnectorCertificateError",
+    "ClientConnectorSSLError",
+    "ClientConnectorError",
+    "ClientProxyConnectionError",
+    "UnixClientConnectorError",
+    "ServerDisconnectedError",
+    "ServerTimeoutError",
+    "ServerConnectionError",
+    "ConnectionTimeoutError",
+    "SocketTimeoutError",
+    "ClientOSError",
+    "ClientConnectionResetError",
+    "ClientConnectionError",
+    # stdlib causes those wrap
+    "gaierror",
+    "getaddrinfo failed",
+    "ConnectionResetError",
+    "ConnectionRefusedError",
+    "ConnectionAbortedError",
+)
+_NETWORK_EXC_RE = re.compile("|".join(re.escape(n) for n in _NETWORK_EXC_NAMES))
+_TIMEOUT_RE = re.compile(r"\bTimeoutError\b")
+_EXCHANGE_FRAME_RE = re.compile(r"combomaker[\\/]exchange[\\/]|[\\/]aiohttp[\\/]")
+_REACH_EVENTS = (
+    "startup_reconcile_failed",
+    "supervisor_exchange_unreachable",
+    "exchange_status_failed",
+)
+_ERROR_FIELD_RE = re.compile(r'"error": "((?:[^"\\]|\\.)*)"')
+_BOOT_MARKER = '"event": "quote_app_starting"'
+_TRACEBACK_HEAD = "Traceback (most recent call last):"
+_CHAIN_LINES = (
+    "The above exception was the direct cause of the following exception:",
+    "During handling of the above exception, another exception occurred:",
+)
+_REFUSAL_PREFIXES = (
+    "config error:",
+    "REFUSING TO START:",
+    "credentials error:",
+    "REFUSING TO QUOTE:",
+)
+# ``traceback.format_exception_only`` shape: ``[module.]Name[: message]`` at
+# column 0. Frames, source echoes and ``~~^^`` carets are indented; JSON log
+# lines start with ``{``; human boot lines start with a digit.
+_EXC_LINE_RE = re.compile(r"^[A-Za-z_][\w.]*(?::\s?.*)?$")
+
+
+def _network_event(line: str) -> str | None:
+    """The NETWORK marker carried by one structured log line, else None."""
+    if '"event": "kill_switch_halt"' in line and '"reason": "halt_data_stale"' in line:
+        return "halt_data_stale"
+    for ev in _REACH_EVENTS:
+        if f'"event": "{ev}"' in line:
+            m = _ERROR_FIELD_RE.search(line)
+            err = m.group(1) if m else ""
+            hit = _NETWORK_EXC_RE.search(err)
+            if hit:
+                return f"{ev}: {hit.group(0)}"
+            if _TIMEOUT_RE.search(err):
+                return f"{ev}: TimeoutError"
+            return None
+    return None
+
+
+def classify_death(tail: str) -> dict[str, object]:
+    """Classify a dead bot's cause of death from its log tail (pure: text in,
+    verdict out). Returns ``{"class", "marker", "line"}``; the marker
+    derivation and precedence are documented in the section header above.
+    Precedence: the terminal exception of a traceback > the CLI's own boot
+    refusal print > an exchange-reach / feed-loss event > UNKNOWN."""
+    boot = tail.rfind(_BOOT_MARKER)
+    if boot >= 0:
+        tail = tail[tail.rfind("\n", 0, boot) + 1 :]
+    lines = tail.splitlines()
+
+    def verdict(cls: str, marker: str | None, line: str) -> dict[str, object]:
+        return {"class": cls, "marker": marker, "line": line.strip()[:240]}
+
+    # 1. A Python traceback: the TERMINAL exception (the last one printed —
+    #    after any "direct cause" chain) is the cause of death.
+    tb_at = -1
+    for i, ln in enumerate(lines):
+        if ln.startswith(_TRACEBACK_HEAD):
+            tb_at = i
+    if tb_at >= 0:
+        body = "\n".join(lines[tb_at:])
+        terminal: str | None = None
+        for ln in lines[tb_at + 1 :]:
+            if not ln.strip() or ln[0].isspace() or ln[0].isdigit() or ln[0] == "{":
+                continue
+            if ln.startswith(_TRACEBACK_HEAD) or ln.strip() in _CHAIN_LINES:
+                continue
+            if _EXC_LINE_RE.match(ln):
+                terminal = ln
+        if terminal is None:
+            hit = _NETWORK_EXC_RE.search(body)
+            if hit:
+                return verdict(DEATH_NETWORK, hit.group(0), body.splitlines()[-1])
+            return verdict(DEATH_CONFIG_CODE, "traceback (terminal line unreadable)", body[-240:])
+        hit = _NETWORK_EXC_RE.search(terminal)
+        if hit:
+            return verdict(DEATH_NETWORK, hit.group(0), terminal)
+        if _TIMEOUT_RE.search(terminal) and _EXCHANGE_FRAME_RE.search(body):
+            return verdict(DEATH_NETWORK, "TimeoutError on exchange call", terminal)
+        return verdict(DEATH_CONFIG_CODE, terminal.split(":", 1)[0].strip(), terminal)
+
+    # 2. The bot's own boot refusal print (ops/cli.py).
+    refusal: str | None = None
+    for ln in lines:
+        if ln.startswith(_REFUSAL_PREFIXES):
+            refusal = ln
+    network_ev = None
+    for ln in reversed(lines):
+        network_ev = _network_event(ln)
+        if network_ev:
+            network_line = ln
+            break
+    if refusal is not None:
+        prefix = refusal.split(":", 1)[0]
+        if (
+            prefix == "REFUSING TO QUOTE"
+            and "book_reconciled" in refusal
+            and network_ev
+            and network_ev.startswith("startup_reconcile_failed")
+        ):
+            return verdict(DEATH_NETWORK, network_ev, refusal)
+        return verdict(DEATH_CONFIG_CODE, prefix, refusal)
+
+    # 3. An exchange-reach failure / feed loss with no traceback and no
+    #    refusal print (the halt_data_stale deaths of 8/27 01:33-02:04 ET).
+    if network_ev:
+        return verdict(DEATH_NETWORK, network_ev, network_line)
+    return verdict(DEATH_UNKNOWN, None, "")
+
+
+def probe_exchange_reach(
+    rest_base_url: str,
+    timeout_s: float,
+    *,
+    resolve: Callable[..., object] = socket.getaddrinfo,
+    opener: Callable[..., object] = urllib.request.urlopen,
+) -> dict[str, object]:
+    """Cheap, unauthenticated reach probe: DNS-resolve the exchange host (the
+    exact call that failed on 8/27 — ``getaddrinfo``), then ``GET
+    /exchange/status`` (the same auth-free endpoint the bot's own status loop
+    polls) under the bot's own per-request wall bound. ``ok`` only on an HTTP
+    200 with a JSON body: a 5xx (exchange maintenance) is "reachable but not
+    serving" and keeps the wait going — the 2026-08-06 maintenance class."""
+    host = urlparse(rest_base_url).hostname or rest_base_url
+    out: dict[str, object] = {"ok": False, "host": host, "stage": "dns"}
+    started = time.monotonic()
+    try:
+        resolve(host, 443)
+    except OSError as exc:  # socket.gaierror is an OSError
+        out["error"] = repr(exc)
+        out["elapsed_s"] = round(time.monotonic() - started, 2)
+        return out
+    out["stage"] = "http"
+    req = urllib.request.Request(
+        rest_base_url.rstrip("/") + _REACH_STATUS_PATH,
+        headers={"User-Agent": "combomaker-hang-watchdog", "Accept": "application/json"},
+    )
+    try:
+        with opener(req, timeout=timeout_s) as resp:  # type: ignore[union-attr]
+            status = int(getattr(resp, "status", None) or resp.getcode())
+            body = resp.read(65536)
+    except urllib.error.HTTPError as exc:
+        out["status"] = exc.code
+        out["error"] = f"HTTP {exc.code}"
+        out["elapsed_s"] = round(time.monotonic() - started, 2)
+        return out
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        out["error"] = repr(exc)
+        out["elapsed_s"] = round(time.monotonic() - started, 2)
+        return out
+    out["status"] = status
+    out["elapsed_s"] = round(time.monotonic() - started, 2)
+    try:
+        payload = json.loads(body.decode("utf-8", errors="replace"))
+    except ValueError:
+        out["error"] = "non-JSON body"
+        return out
+    if isinstance(payload, dict):
+        out["exchange_active"] = payload.get("exchange_active")
+        out["trading_active"] = payload.get("trading_active")
+    out["ok"] = status == 200
+    return out
+
+
+def _reach_via_cmd(cmd: str) -> dict[str, object]:
+    """Test seam (``--reach-cmd``): a shell command whose exit code 0 means
+    "exchange reachable"; stdout is carried as detail."""
+    try:
+        out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+    except Exception as exc:
+        return {"ok": False, "stage": "cmd", "error": repr(exc)}
+    return {
+        "ok": out.returncode == 0,
+        "stage": "cmd",
+        "rc": out.returncode,
+        "detail": (out.stdout or "").strip()[:200],
+    }
 
 
 def derive_threshold(root: Path, data_dir: Path, log: Callable[[str], None]) -> dict[str, object]:
@@ -376,6 +697,9 @@ class Watchdog:
     monotonic: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
     echo: Callable[[str], None] = print
+    # Exchange reach probe consulted before relighting a NETWORK-class boot
+    # death (``probe_exchange_reach``); None ⇒ the live prod probe. Test seam.
+    reach_probe: Callable[[], dict[str, object]] | None = None
 
     _last_log_sig: tuple[str, int, int] | None = None
     _last_store_sig: str | None = None
@@ -394,6 +718,9 @@ class Watchdog:
         self._last_store_advance = now
         self._episode_start = now
         self._load_state()
+        if self.reach_probe is None:
+            url = _REST_BASE_URLS["prod"]
+            self.reach_probe = lambda: probe_exchange_reach(url, _DEFAULT_REQUEST_TIMEOUT_S)
 
     # -- logging ------------------------------------------------------------
     def log(self, level: str, msg: str) -> None:
@@ -437,6 +764,42 @@ class Watchdog:
             pass
 
     # -- escalation ---------------------------------------------------------
+    def _corpse_tail(self) -> str:
+        """The last 256 KB of the corpse's own log — the newest ``live_*.log``
+        by mtime (the pointer file may already have been rewritten by a start
+        path; mtime is what identifies the run that just died). Empty when
+        unreadable. Shared by the human-KILL reader and the death classifier
+        so both read the same receipt."""
+        try:
+            logs = sorted(
+                self.data_dir.glob("live_*.log"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if not logs:
+                return ""
+            with logs[0].open("rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                fh.seek(max(0, size - 262_144))
+                return fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            return ""  # unreadable log ⇒ no receipt
+
+    def _corpse_death_class(self) -> dict[str, object]:
+        """The dead bot's cause-of-death class from its log tail — see
+        ``classify_death`` and the marker derivation above it. No readable
+        log ⇒ UNKNOWN (fail-closed: latches exactly as before this build)."""
+        tail = self._corpse_tail()
+        if not tail:
+            return {
+                "class": DEATH_UNKNOWN,
+                "marker": None,
+                "line": "",
+                "detail": "no readable live log",
+            }
+        return classify_death(tail)
+
     def _corpse_human_kill_reason(self) -> str | None:
         """The dead bot's cause of death, IF it was a human-gated KILL.
 
@@ -450,29 +813,70 @@ class Watchdog:
         must LATCH (the documented "only a human KILL latches" contract,
         finally enforced). An operator START (non -Auto) still purges the
         latch and opens a fresh episode — the human clear path unchanged."""
-        try:
-            logs = sorted(
-                self.data_dir.glob("live_*.log"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            if not logs:
-                return None
-            with logs[0].open("rb") as fh:
-                fh.seek(0, 2)
-                size = fh.tell()
-                fh.seek(max(0, size - 262_144))
-                tail = fh.read().decode("utf-8", errors="replace")
-            last_halt = None
-            for line in tail.splitlines():
-                if '"event": "kill_switch_halt"' in line:
-                    last_halt = line
-            if last_halt and "human-only clear" in last_halt:
-                m = re.search(r'"reason": "([a-z_]+)"', last_halt)
-                return m.group(1) if m else "human_gated_kill"
-        except OSError:
-            pass  # unreadable log ⇒ no receipt ⇒ ordinary relight path
+        tail = self._corpse_tail()  # unreadable ⇒ "" ⇒ ordinary relight path
+        last_halt = None
+        for line in tail.splitlines():
+            if '"event": "kill_switch_halt"' in line:
+                last_halt = line
+        if last_halt and "human-only clear" in last_halt:
+            m = re.search(r'"reason": "([a-z_]+)"', last_halt)
+            return m.group(1) if m else "human_gated_kill"
         return None
+
+    def _probe_reach(self) -> dict[str, object]:
+        """Run the reach probe; a probe that itself CRASHES (a bug, not a
+        network verdict — real failures come back as ``ok: False``) reads as
+        ``ok: None`` and does not hold a healthy network down (the same
+        posture as ``bot_pids`` returning None: never let a broken probe
+        fabricate a verdict)."""
+        try:
+            assert self.reach_probe is not None
+            return dict(self.reach_probe())
+        except Exception as exc:
+            return {"ok": None, "stage": "probe", "error": repr(exc)}
+
+    def _wait_for_exchange_reach(
+        self, death: dict[str, object], streak: int
+    ) -> list[dict[str, object]]:
+        """NETWORK-class boot death: NO latch. Wait the SAME derived backoff
+        flap guard 2 uses (threshold x streak, capped 900s — no new number),
+        then gate the relight on the exchange being reachable; every failed
+        probe extends the streak and waits again. Retry forever (2026-08-06
+        ruling, verbatim: "if bot crashes, restart, thats it"); a human KILL
+        still latches (checked by the caller after this returns)."""
+        waits: list[dict[str, object]] = []
+        while True:
+            n = len(waits) + 1
+            # streak multiplier: at least 1 (this death), plus one per failed
+            # probe — a probe failure IS one more short "run" of the network.
+            mult = max(streak, 1) + len(waits)
+            wait_s = min(self.threshold_s * mult, 900.0)
+            self.log(
+                "WARN",
+                f"boot death class NETWORK ({death.get('marker')}) — no latch; wait #{n}: "
+                f"{wait_s:.0f}s (threshold {self.threshold_s:.0f}s x streak {mult}, "
+                "cap 900s) then probing exchange reach (retry-forever; only a human "
+                "KILL latches)",
+            )
+            self._save_state()
+            time.sleep(wait_s)
+            reach = self._probe_reach()
+            ok = reach.get("ok")
+            self.log(
+                "INFO" if ok else "WARN",
+                f"exchange reach probe after wait #{n}: "
+                + (
+                    "REACHABLE"
+                    if ok
+                    else "probe crashed — relighting anyway"
+                    if ok is None
+                    else "UNREACHABLE"
+                )
+                + f" {json.dumps(reach, default=str)}",
+            )
+            waits.append({"wait_s": wait_s, "reach": reach})
+            if ok is None or ok:
+                return waits
 
     def _latch_halt(self, reason: str, evidence: dict[str, object]) -> None:
         self._halt = {"at": _now_utc().isoformat(), "reason": reason, "evidence": evidence}
@@ -538,13 +942,45 @@ class Watchdog:
             self._latch_halt("stop path could not kill the hung tree — human needed", evidence)
             return "halt_stop_failed"
 
-        # Flap guard 1: liveness proof (start_all.ps1's own discriminator).
+        # Bookkeeping shared by flap guards 1 and 2: was the run that just
+        # died SHORT (healthy span below one detection window), and how long
+        # is the trailing streak of short runs. Marked on the previous relight
+        # record so the streak survives a watchdog restart.
+        short = healthy_span < self.threshold_s
+        if self._relights:
+            self._relights[-1]["short_run"] = short
+        streak = 0
+        for r in reversed(self._relights):
+            if bool(r.get("short_run")):
+                streak += 1
+            else:
+                break
+
+        # Cause of death, read from the corpse log (forensics on EVERY
+        # escalation; decisive only in guard 1 below).
+        death = self._corpse_death_class()
+        evidence["death_class"] = death
+        self.log("INFO", f"corpse death class: {json.dumps(death, default=str)}")
+        waited = False
+
+        # Flap guard 1: liveness proof (start_all.ps1's own discriminator) —
+        # a run that never wrote the heartbeat never reached liveness. WHICH
+        # cause decides what happens next (2026-09-04 build; the 8/27 02:13 ET
+        # latch — see the classification section): a NETWORK death is the
+        # 8/6-ruled "restart, that's it" class and never latches; CONFIG_CODE
+        # and UNKNOWN latch exactly as before (a config-validation exit that
+        # dies in <1s IS a boot loop; a cause we cannot read stays fail-closed).
         if not hb:
-            self._latch_halt(
-                "run never reached liveness (no heartbeat) — relighting would boot-loop",
-                evidence,
-            )
-            return "halt_boot_loop"
+            if death["class"] != DEATH_NETWORK:
+                self._latch_halt(
+                    "run never reached liveness (no heartbeat) — relighting would "
+                    f"boot-loop [death class {death['class']}: {death.get('marker')}]",
+                    evidence,
+                )
+                return "halt_boot_loop"
+            waits = self._wait_for_exchange_reach(death, streak)
+            evidence["reach_waits"] = len(waits)
+            waited = True
 
         # Flap guard 2 — REWORKED 2026-08-06 (operator ruling, verbatim: "if
         # bot crashes, restart, thats it"). The permanent flap LATCH twice kept
@@ -555,17 +991,9 @@ class Watchdog:
         # wait = threshold x streak, capped 900s (the documented ~2h
         # maintenance window is survivable in ~8 capped retries), retrying
         # forever. A HUMAN-gated start refusal still latches (guard below,
-        # unchanged) and boot-loop guard 1 (no heartbeat) is unchanged.
-        short = healthy_span < self.threshold_s
-        if self._relights:
-            self._relights[-1]["short_run"] = short
-        streak = 0
-        for r in reversed(self._relights):
-            if bool(r.get("short_run")):
-                streak += 1
-            else:
-                break
-        if streak >= 2:
+        # unchanged). Guard 1's NETWORK path already waited this same derived
+        # backoff (and more: it gated on the reach probe) — never wait twice.
+        if streak >= 2 and not waited:
             backoff_s = min(self.threshold_s * streak, 900.0)
             self._save_state()
             self.log(
@@ -626,9 +1054,15 @@ class Watchdog:
                 )
                 return "halt_start_refused"
 
-        self._relights.append(
-            {"at": _now_utc().isoformat(), "kind": kind, "healthy_span_s": round(healthy_span, 1)}
-        )
+        record: dict[str, object] = {
+            "at": _now_utc().isoformat(),
+            "kind": kind,
+            "healthy_span_s": round(healthy_span, 1),
+        }
+        if not hb:
+            record["boot_death"] = death["class"]
+            record["reach_waits"] = evidence.get("reach_waits")
+        self._relights.append(record)
         self._save_state()
         now = self.monotonic()
         self._episode_start = now
@@ -753,6 +1187,7 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--probe-cmd", default=None)
             p.add_argument("--stop-cmd", default=None)
             p.add_argument("--start-cmd", default=None)
+            p.add_argument("--reach-cmd", default=None)  # rc 0 = exchange reachable
     args = parser.parse_args(argv)
     if args.cmd is None:
         parser.print_help()
@@ -798,6 +1233,14 @@ def main(argv: list[str] | None = None) -> int:
         f'{ps} "{root / "tools" / "ops" / "start_all.ps1"}" -Auto -CallerPid {me}'
     )
 
+    rest_base_url = _read_exchange_anchors(root)
+    reach_cmd = getattr(args, "reach_cmd", None)
+
+    def reach_probe() -> dict[str, object]:
+        if reach_cmd:
+            return _reach_via_cmd(reach_cmd)
+        return probe_exchange_reach(rest_base_url, _DEFAULT_REQUEST_TIMEOUT_S)
+
     probes = Probes(root=root, data_dir=data_dir, probe_cmd=args.probe_cmd)
     dog = Watchdog(
         root=root,
@@ -807,20 +1250,25 @@ def main(argv: list[str] | None = None) -> int:
         poll_s=poll,
         stop_cmd=stop_cmd,
         start_cmd=start_cmd,
+        reach_probe=reach_probe,
     )
     dog.log(
         "INFO",
         "derivation: "
         + json.dumps(
             {
-                k: derivation[k]
-                for k in (
-                    "threshold_s",
-                    "max_healthy_gap_s",
-                    "max_gap_log",
-                    "internal_chain_floor_s",
-                    "logs_measured",
-                )
+                **{
+                    k: derivation[k]
+                    for k in (
+                        "threshold_s",
+                        "max_healthy_gap_s",
+                        "max_gap_log",
+                        "internal_chain_floor_s",
+                        "logs_measured",
+                    )
+                },
+                "reach_host": urlparse(rest_base_url).hostname,
+                "reach_timeout_s": _DEFAULT_REQUEST_TIMEOUT_S,
             }
         ),
     )
