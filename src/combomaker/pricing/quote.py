@@ -38,6 +38,7 @@ from combomaker.core.reasons import ReasonCode
 from combomaker.marketdata.grid import PriceGrid
 from combomaker.marketdata.orderbook import OrderbookMirror
 from combomaker.pricing.fees import FeeModel, FeeType, FeeUnknownError
+from combomaker.pricing.fit_challenge import StructuralFitRecord
 from combomaker.pricing.joint import JointEstimate
 
 _CAP_PROBE_QTY = CentiContracts(100)  # 1 contract: tightest executable bound
@@ -70,6 +71,10 @@ class QuoteParams:
 class NoQuote:
     reason: ReasonCode
     detail: str
+    # Structural route verdict when the decline happened AFTER a Dixon-Coles
+    # inversion (e.g. the tie x total pickoff guard) — carried so the lifecycle
+    # records the REJECT off the pricing path. None otherwise.
+    fit: StructuralFitRecord | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +86,10 @@ class ConstructedQuote:
     # True only for a FARMED impossible combo (construct_farm_quote): fair is 0,
     # yes_bid is 0, and the position must be watched by the settlement guard.
     farmed: bool = False
+    # Structural route verdict copied from the JointEstimate (build 2026-09-04
+    # item B): ACCEPT / CHALLENGE (priced structurally or hybrid) or REJECT
+    # (priced on the copula fallback). None on every non-Dixon-Coles path.
+    structural_fit: StructuralFitRecord | None = None
 
     @property
     def total_width_cc(self) -> int:

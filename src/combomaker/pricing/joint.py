@@ -29,6 +29,7 @@ from combomaker.pricing.copula import (
     frechet_bounds,
     gaussian_copula_joint_prob,
 )
+from combomaker.pricing.fit_challenge import StructuralFitRecord
 from combomaker.pricing.legs import LegBelief
 
 _MIN_MARGINAL_FOR_GRADIENT = 0.01
@@ -55,6 +56,12 @@ class JointEstimate:
     # an *inconsistent-but-priceable* fit — recorded, and widen-flagged, never a
     # silent accept.
     residual: float = 0.0
+    # The structural route verdict (build 2026-09-04 item B): set by the
+    # Dixon-Coles adapter on every soccer combo that reached it (ACCEPT /
+    # CHALLENGE / REJECT + family + route); None on every other path. Rides
+    # here so it survives the joint memo and the ProcessPool boundary; the
+    # LIFECYCLE persists it off the pricing path (fix isolation).
+    fit: StructuralFitRecord | None = None
 
 
 def _signed_corr(

@@ -194,7 +194,18 @@ _TEAM_LEVEL = (
 
 class StructuralError(ValueError):
     """The scoreline model cannot represent / identify this combo — the
-    caller must fall back to the copula path, never guess."""
+    caller must fall back to the copula path, never guess.
+
+    ``residual``: the inversion's max |model - market| when the failure came
+    from a fit that DID solve (hard-bar reject, a band edge leaving the
+    invertible range); None when no inversion happened (parse / identification
+    failures). Carried so the fallback can be RECORDED with its misfit
+    (fit_challenge.StructuralFitRecord) instead of vanishing into a note string.
+    """
+
+    def __init__(self, message: str, *, residual: float | None = None) -> None:
+        super().__init__(message)
+        self.residual = residual
 
 
 # --- terminal-state enumeration -------------------------------------------------
@@ -638,10 +649,27 @@ def invert(
     resid = np.abs(residuals(np.asarray(fit.x)))
     residual = float(resid.max())
     exactly_identified = len(team_constraints) == 2
-    if exactly_identified and residual > 0.005:
-        # Two constraints should solve to ~0; a real residual means the legs
-        # contradict any Poisson scoreline (e.g. huge favorite + huge BTTS).
-        raise StructuralError(f"inversion residual {residual:.4f} on exact system")
+    # ONE hard bar for every DC system, exact and over-identified alike
+    # (build 2026-09-04 item B; = fit_challenge.REJECT_OVERIDENTIFIED, the
+    # pre-existing over-identified bar — kept as a literal here because
+    # tests/test_fit_challenge pins the mirror by source). The former
+    # exact-system bar (0.005) was a hand-set constant 10x tighter than this
+    # one: it rejected every club btts x over-2.5 pair (a Poisson scoreline
+    # cannot reproduce that market shape to better than ~0.6pp; measured
+    # residuals 0.006-0.018 on the 8/17-8/19 fills) and routed them to the
+    # copula at the stale World-Cup blend, while accepting the SAME game's
+    # 3-leg triple at 0.0195. Whether a below-bar residual is ACCEPT or
+    # CHALLENGE is decided by the caller from the leg books' own resolution
+    # (fit_challenge.classify_fit, resolution mode) — the solver only refuses
+    # a genuine contradiction. Callers without beliefs (the risk sampler,
+    # exposure deltas) get the same one bar, so risk and pricing agree on
+    # which games are structurally representable.
+    if residual > 0.05:
+        raise StructuralError(
+            f"inversion residual {residual:.4f} exceeds the structural hard bar"
+            + (" on exact system" if exactly_identified else ""),
+            residual=residual,
+        )
 
     shares: dict[int, float] = {}
     for i, (spec, target) in enumerate(legs):
@@ -670,6 +698,6 @@ def invert(
 
     notes = (
         f"dc inversion: lam_a={params.lam_a:.3f} lam_b={params.lam_b:.3f}"
-        + (f" residual={residual:.4f}" if not exactly_identified else ""),
+        f" residual={residual:.4f}",
     )
     return InvertedModel(params=params, shares=shares, residual=residual, notes=notes)

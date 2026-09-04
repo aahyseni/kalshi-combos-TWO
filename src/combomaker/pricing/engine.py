@@ -35,6 +35,11 @@ from combomaker.pricing.dnp_scalar import (
     single_player_scope,
 )
 from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
+from combomaker.pricing.fit_challenge import (
+    ROUTE_COPULA,
+    ROUTE_DECLINED,
+    StructuralFitRecord,
+)
 from combomaker.pricing.joint import JointEstimate, price_containment, price_joint_matrices
 from combomaker.pricing.legs import KalshiBookSource, LegBelief, OddsSource, blend_beliefs
 from combomaker.pricing.legtypes import LegType, classify_leg, set_pricing_aliases
@@ -455,6 +460,14 @@ class PricingEngine:
             dnp_ask_floor_cc=dnp_floor_cc,
             params=self._quote_params,
         )
+        if joint.fit is not None:
+            # Carry the structural route verdict out of the engine; the
+            # lifecycle persists + counts it OFF the pricing path.
+            quote = (
+                replace(quote, structural_fit=joint.fit)
+                if isinstance(quote, ConstructedQuote)
+                else replace(quote, fit=joint.fit)
+            )
         return self._enforce_sell_only(quote)
 
     @property
@@ -567,6 +580,7 @@ class PricingEngine:
         band/collapse decline, which is deterministic and safe to cache."""
         joint: JointEstimate | None = None
         fallback_note: str | None = None
+        fallback_fit: StructuralFitRecord | None = None
         if (
             relationship.kind is RelationshipKind.CONTAINMENT
             and relationship.containment is not None
@@ -597,13 +611,14 @@ class PricingEngine:
                 if self._structural is not None and structural_applicable(
                     list(rfq.legs), relationship.same_event_groups
                 ):
-                    joint, reason = self._structural.try_price(
+                    joint, reason, fit = self._structural.try_price_with_fit(
                         list(rfq.legs), beliefs, sides
                     )
                     if joint is None:
                         return NoQuote(
                             ReasonCode.SKIP_CLASSIFIER_UNKNOWN,
                             f"band×neighbour not structural-representable: {reason}",
+                            fit=None if fit is None else replace(fit, route=ROUTE_DECLINED),
                         )
                 else:
                     return NoQuote(
@@ -623,7 +638,9 @@ class PricingEngine:
         elif self._structural is not None and structural_applicable(
             list(rfq.legs), relationship.same_event_groups
         ):
-            joint, reason = self._structural.try_price(list(rfq.legs), beliefs, sides)
+            joint, reason, fit = self._structural.try_price_with_fit(
+                list(rfq.legs), beliefs, sides
+            )
             if joint is None:
                 # PICKOFF GUARD (2026-08-15, operator-confirmed incident): a
                 # same-game TIE×TOTAL pair whose DC inversion rejected must
@@ -643,8 +660,14 @@ class PricingEngine:
                         ReasonCode.SKIP_STRUCTURAL_FALLBACK_TIE_TOTAL,
                         f"same-game tie×total declined on structural "
                         f"fallback (wrong-signed copula rho): {reason}",
+                        fit=None if fit is None else replace(fit, route=ROUTE_DECLINED),
                     )
                 fallback_note = f"structural fallback: {reason}"
+                # The REJECT verdict rides on the copula estimate (route =
+                # copula) so the lifecycle records the fallback — the note
+                # string alone was invisible (structural_fits: 0 rows ever).
+                if fit is not None:
+                    fallback_fit = replace(fit, route=ROUTE_COPULA)
         if joint is None:
             sgp = build_sgp_correlation(
                 list(rfq.legs),
@@ -656,6 +679,8 @@ class PricingEngine:
             joint = price_joint_matrices(
                 beliefs, sides, sgp.corr, sgp.corr_low, sgp.corr_high, extra_notes=notes
             )
+            if fallback_fit is not None:
+                joint = replace(joint, fit=fallback_fit)
         return self._apply_longshot_floor(joint)
 
     def _enforce_sell_only(
@@ -676,7 +701,9 @@ class PricingEngine:
                 # Zeroing YES on a YES-only quote would leave an invalid both-zero
                 # quote — decline cleanly instead of ever emitting (0, 0).
                 return NoQuote(
-                    ReasonCode.SKIP_PRICING_FAILED, "sell-only: only the YES side was quotable"
+                    ReasonCode.SKIP_PRICING_FAILED,
+                    "sell-only: only the YES side was quotable",
+                    fit=quote.structural_fit,
                 )
             return replace(quote, yes_bid_cc=CentiCents(0))
         return quote
