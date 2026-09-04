@@ -9931,11 +9931,12 @@ class QuoteLifecycle:
         # (steer disabled, or the CRN profile cold), EVEN with conc_armed
         # (review fix S1: ``not conc_armed`` alone let an unbacked leg-axis
         # rebate through unbounded whenever the cache was cold).
-        conc_priced = self._skew_params.conc_armed and skew.conc is not None
+        priced_conc = skew.conc if self._skew_params.conc_armed else None
+        conc_priced = priced_conc is not None
         bound = bound_rebate(
             skew.applied_cc,
             value_cc_per_contract=(
-                skew.conc.value_cc_per_contract if conc_priced else None
+                priced_conc.value_cc_per_contract if priced_conc is not None else None
             ),
             family_cc=skew.family_cc,
             entity_cc=skew.entity_cc,
