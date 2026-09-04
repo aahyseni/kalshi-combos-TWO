@@ -397,7 +397,7 @@ async def test_ws_execution_during_verification_single_row(tmp_path: Path) -> No
     PIN CHANGED 2026-09-04 (build item D, phantom executions): a WS
     ``quote_executed`` is a CLAIM the sweep now proves against
     /portfolio/fills by the message's exchange order_id — measured 28 WS
-    executed messages since 2026-07-27 (13 on 08-26) naming orders the tape
+    executed messages since 2026-07-27 (12 on 08-26) naming orders the tape
     never held, two of which halted the 08-26 22:41 ET settlement reconcile.
     The old pin "verification never polled after the WS row" is therefore
     "polled ONCE by exact order_id, VERIFIED, then never again"; the tape
