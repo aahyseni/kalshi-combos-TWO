@@ -282,8 +282,17 @@ def _read_exchange_anchors(root: Path) -> str:
 #    catches ONLY the JSON-decode errors, so every aiohttp connection-layer
 #    exception propagates to the caller verbatim. The names are the installed
 #    aiohttp's (3.14.1) ``ClientConnectionError`` family — enumerated from the
-#    library, plus the stdlib causes they wrap (``socket.gaierror`` /
-#    "getaddrinfo failed", the Connection*Error OSErrors).
+#    library (16 names), plus the stdlib causes they wrap (``socket.gaierror``
+#    / "getaddrinfo failed", the Connection*Error OSErrors). The aiohttp names
+#    and gaierror name the network BY THEMSELVES; a bare stdlib
+#    ``ConnectionResetError`` / ``ConnectionRefusedError`` /
+#    ``ConnectionAbortedError`` does not — on Windows a ``ProcessPoolExecutor``
+#    worker dying at boot (ops/pricing_pool.py l.148 / l.670 — a code bug)
+#    surfaces as ``ConnectionResetError: [WinError 10054]`` on the pool pipe —
+#    so those three count only when attributed to an exchange call: gated on
+#    the same traceback-frame test as TimeoutError (next bullet). Review fix
+#    2026-09-04 (was: any bare Connection*Error read NETWORK → retry forever
+#    on a pool crash).
 #  * ``TimeoutError`` ON AN EXCHANGE CALL: ``rest.py`` l.314 runs every call
 #    under ``aiohttp.ClientTimeout(total=request_timeout_s)``, which raises the
 #    builtin TimeoutError (``asyncio.TimeoutError`` IS that class on 3.11+).
@@ -301,10 +310,29 @@ def _read_exchange_anchors(root: Path) -> str:
 #    which is what is matched.
 #  * exchange 5xx, on a reach event's ``error`` or as a terminal exception:
 #    Kalshi answering "503 Service Temporarily Unavailable" (maintenance) is
-#    the 2026-08-06 03:13/03:16 ET boot-death shape on the tape (both
-#    corpses: startup_reconcile_failed → REFUSING TO QUOTE on
-#    book_reconciled → supervisor_exchange_unreachable, all on the 503).
-#    The live code ITSELF files it as unreachable: supervisor.py l.273-279
+#    the 2026-08-06 03:13/03:16 ET death shape on the tape (both corpses:
+#    startup_reconcile_failed → REFUSING TO QUOTE on book_reconciled →
+#    supervisor_exchange_unreachable, all on the 503). RECORD STRAIGHT
+#    (review 2026-09-04): those two were POST-heartbeat deaths — the
+#    watchdog's own escalations logged ``heartbeat_present: true,
+#    healthy_span_s: 74.8 / 74.7`` (hang_watchdog.log 8/6 03:16:35 and
+#    03:20:05 ET), and the 03:16:45 relight auto-cleared a machine KILL,
+#    which start_all.ps1 only does when the previous run reached liveness
+#    — i.e. flap guard 2's class, which the 8/6 rework already retries;
+#    guard 1 never saw them. Structurally they CANNOT reach guard 1:
+#    quote_app.py run() beats the heartbeat (l.2608) BEFORE launching the
+#    supervisor (l.2617) and running the preflight (l.2621), and every
+#    pre-beat exchange call catches ``KalshiApiError`` (slate count l.4621,
+#    startup reconcile l.3232/3265, risk snapshot l.3731 — all catch
+#    Exception; rehydrate l.3414 catches KalshiApiError ONLY, so a 5xx is
+#    caught there too). So the 5xx, refusal and feed-loss rules below are
+#    FORENSIC (the class is logged on every escalation) and DEFENSIVE (a
+#    future pre-beat call that lets a 5xx escape). On the live code today
+#    the ONLY guard-1-reachable NETWORK class is rule 1 — an uncaught
+#    transport traceback: exactly the 8/27 shape, where rehydrate's
+#    KalshiApiError-only catch let aiohttp's DNS error through (bot-side
+#    fix owed in src/, separate build). The class is still derived, not
+#    invented: the live code ITSELF files a 5xx as unreachable — supervisor.py l.273-279
 #    catches any listing Exception as ``supervisor_exchange_unreachable``
 #    ("cannot reach exchange") and logged ``exchange_reachable: false`` on
 #    that 503; quote_app.py l.3775 calls the reconcile failure it caused
@@ -324,8 +352,16 @@ def _read_exchange_anchors(root: Path) -> str:
 #    ``credentials error:`` (l.190), ``REFUSING TO QUOTE:`` (l.197
 #    PreflightError). The last one is NETWORK when its red gate is
 #    ``book_reconciled`` (ops/preflight.py l.71-72) AND a network-caused
-#    startup_reconcile_failed precedes it — that is exactly the 8/27 boot had
-#    it survived rehydrate — otherwise CONFIG_CODE.
+#    startup_reconcile_failed precedes it — otherwise CONFIG_CODE. (Forensic
+#    only: the preflight runs AFTER the heartbeat beat — quote_app.py l.2621
+#    vs l.2608 — so this print is always a guard-2 death, never guard 1's; a
+#    boot that survives rehydrate has already beaten.) PRECEDENCE (review fix
+#    2026-09-04): a refusal print that appears AFTER the last traceback wins
+#    over it — ops/cli.py prints the refusal as its last word after catching
+#    the exception, so an earlier, non-fatal traceback (asyncio's "Task
+#    exception was never retrieved" carrying a transport error) can never
+#    turn a genuine refusal into a NETWORK retry loop. A traceback AFTER the
+#    refusal is the newer word and still decides.
 #  * boot boundary: classification is scoped to the newest boot — everything
 #    from the last ``quote_app_starting`` line (quote_app.py l.1884) on — so a
 #    warning from an earlier boot in the same tail can never name the cause.
@@ -334,8 +370,8 @@ DEATH_NETWORK = "NETWORK"
 DEATH_CONFIG_CODE = "CONFIG_CODE"
 DEATH_UNKNOWN = "UNKNOWN"
 
-_NETWORK_EXC_NAMES = (
-    # aiohttp.client_exceptions — ClientConnectionError family (3.14.1)
+_AIOHTTP_EXC_NAMES = (
+    # aiohttp.client_exceptions — ClientConnectionError family (3.14.1), all 16
     "ClientConnectorDNSError",
     "ClientConnectorCertificateError",
     "ClientConnectorSSLError",
@@ -352,14 +388,24 @@ _NETWORK_EXC_NAMES = (
     "ClientOSError",
     "ClientConnectionResetError",
     "ClientConnectionError",
-    # stdlib causes those wrap
-    "gaierror",
-    "getaddrinfo failed",
-    "ConnectionResetError",
-    "ConnectionRefusedError",
-    "ConnectionAbortedError",
 )
+# stdlib causes the family wraps: DNS names the network by itself; the bare
+# Connection*Error OSErrors do not (a pool pipe raises them too — see the
+# marker notes) and are frame-gated in the traceback rule.
+_STDLIB_DNS_NAMES = ("gaierror", "getaddrinfo failed")
+_STDLIB_CONN_NAMES = ("ConnectionResetError", "ConnectionRefusedError", "ConnectionAbortedError")
+_NETWORK_EXC_NAMES = _AIOHTTP_EXC_NAMES + _STDLIB_DNS_NAMES + _STDLIB_CONN_NAMES
+# Reach-event ``error`` fields are exchange-call errors by construction (the
+# event is only ever logged around an exchange call): the full list applies.
 _NETWORK_EXC_RE = re.compile("|".join(re.escape(n) for n in _NETWORK_EXC_NAMES))
+# Traceback terminal lines: transport BY NAME (unconditional) vs the bare
+# stdlib Connection*Error, which needs an exchange / aiohttp frame in the
+# traceback body (``\b`` so ``ClientConnectionResetError`` is not re-matched
+# as the bare name).
+_TRANSPORT_EXC_RE = re.compile(
+    "|".join(re.escape(n) for n in _AIOHTTP_EXC_NAMES + _STDLIB_DNS_NAMES)
+)
+_STDLIB_CONN_RE = re.compile(r"\b(?:" + "|".join(_STDLIB_CONN_NAMES) + r")\b")
 _TIMEOUT_RE = re.compile(r"\bTimeoutError\b")
 # rest.py KalshiApiError str: "HTTP {status} {code}: {message}" — 5xx only.
 _EXCHANGE_5XX_RE = re.compile(r"\bHTTP (5\d\d)\b")
@@ -413,8 +459,9 @@ def classify_death(tail: str) -> dict[str, object]:
     """Classify a dead bot's cause of death from its log tail (pure: text in,
     verdict out). Returns ``{"class", "marker", "line"}``; the marker
     derivation and precedence are documented in the section header above.
-    Precedence: the terminal exception of a traceback > the CLI's own boot
-    refusal print > an exchange-reach / feed-loss event > UNKNOWN."""
+    Precedence: whichever of {the terminal exception of the last traceback,
+    the CLI's own boot refusal print} comes LAST in the tail > an
+    exchange-reach / feed-loss event > UNKNOWN."""
     boot = tail.rfind(_BOOT_MARKER)
     if boot >= 0:
         tail = tail[tail.rfind("\n", 0, boot) + 1 :]
@@ -423,13 +470,33 @@ def classify_death(tail: str) -> dict[str, object]:
     def verdict(cls: str, marker: str | None, line: str) -> dict[str, object]:
         return {"class": cls, "marker": marker, "line": line.strip()[:240]}
 
+    def transport_hit(text: str, body: str) -> str | None:
+        """The transport marker in ``text``: aiohttp family / DNS by name; a
+        bare stdlib Connection*Error only with an exchange frame in ``body``."""
+        hit = _TRANSPORT_EXC_RE.search(text)
+        if hit:
+            return hit.group(0)
+        hit = _STDLIB_CONN_RE.search(text)
+        if hit and _EXCHANGE_FRAME_RE.search(body):
+            return f"{hit.group(0)} on exchange call"
+        return None
+
+    # The CLI's own boot refusal print (ops/cli.py): printed AFTER the
+    # exception it caught, so when it follows the last traceback it is the
+    # last word and rule 1 is skipped for that (non-fatal) traceback.
+    refusal_at = -1
+    for i, ln in enumerate(lines):
+        if ln.startswith(_REFUSAL_PREFIXES):
+            refusal_at = i
+    refusal: str | None = lines[refusal_at] if refusal_at >= 0 else None
+
     # 1. A Python traceback: the TERMINAL exception (the last one printed —
     #    after any "direct cause" chain) is the cause of death.
     tb_at = -1
     for i, ln in enumerate(lines):
         if ln.startswith(_TRACEBACK_HEAD):
             tb_at = i
-    if tb_at >= 0:
+    if tb_at >= 0 and tb_at > refusal_at:
         body = "\n".join(lines[tb_at:])
         terminal: str | None = None
         for ln in lines[tb_at + 1 :]:
@@ -440,13 +507,13 @@ def classify_death(tail: str) -> dict[str, object]:
             if _EXC_LINE_RE.match(ln):
                 terminal = ln
         if terminal is None:
-            hit = _NETWORK_EXC_RE.search(body)
-            if hit:
-                return verdict(DEATH_NETWORK, hit.group(0), body.splitlines()[-1])
+            marker = transport_hit(body, body)
+            if marker:
+                return verdict(DEATH_NETWORK, marker, body.splitlines()[-1])
             return verdict(DEATH_CONFIG_CODE, "traceback (terminal line unreadable)", body[-240:])
-        hit = _NETWORK_EXC_RE.search(terminal)
-        if hit:
-            return verdict(DEATH_NETWORK, hit.group(0), terminal)
+        marker = transport_hit(terminal, body)
+        if marker:
+            return verdict(DEATH_NETWORK, marker, terminal)
         if _TIMEOUT_RE.search(terminal) and _EXCHANGE_FRAME_RE.search(body):
             return verdict(DEATH_NETWORK, "TimeoutError on exchange call", terminal)
         if _EXCHANGE_API_EXC in terminal:
@@ -455,11 +522,7 @@ def classify_death(tail: str) -> dict[str, object]:
                 return verdict(DEATH_NETWORK, f"{_EXCHANGE_API_EXC} HTTP {m5.group(1)}", terminal)
         return verdict(DEATH_CONFIG_CODE, terminal.split(":", 1)[0].strip(), terminal)
 
-    # 2. The bot's own boot refusal print (ops/cli.py).
-    refusal: str | None = None
-    for ln in lines:
-        if ln.startswith(_REFUSAL_PREFIXES):
-            refusal = ln
+    # 2. The bot's own boot refusal print (ops/cli.py) — found above.
     # Every exchange-reach / feed-loss event of THIS boot, newest first.
     network_events: list[tuple[str, str]] = []
     for ln in reversed(lines):
@@ -499,9 +562,15 @@ def probe_exchange_reach(
     """Cheap, unauthenticated reach probe: DNS-resolve the exchange host (the
     exact call that failed on 8/27 — ``getaddrinfo``), then ``GET
     /exchange/status`` (the same auth-free endpoint the bot's own status loop
-    polls) under the bot's own per-request wall bound. ``ok`` only on an HTTP
-    200 with a JSON body: a 5xx (exchange maintenance) is "reachable but not
-    serving" and keeps the wait going — the 2026-08-06 maintenance class."""
+    polls) under the bot's own per-request wall bound. ``ok`` on an HTTP 200
+    with a JSON body, or on ANY 4xx (review fix 2026-09-04): a 4xx is the
+    exchange's answer about OUR request — a moved path → 404, a WAF on this
+    UA → 403 — not about the network, and the bot's own boot is the real
+    test (the same posture as a crashed probe); before the fix a 403 held a
+    healthy network down forever (STOP, then waits 242/484/726/900/900…
+    with no START ever issued). A 5xx (exchange maintenance) is "reachable
+    but not serving" and keeps the wait going — the 2026-08-06 maintenance
+    class; a non-JSON 200 (a captive portal's login page) is not ok."""
     host = urlparse(rest_base_url).hostname or rest_base_url
     out: dict[str, object] = {"ok": False, "host": host, "stage": "dns"}
     started = time.monotonic()
@@ -524,6 +593,11 @@ def probe_exchange_reach(
         out["status"] = exc.code
         out["error"] = f"HTTP {exc.code}"
         out["elapsed_s"] = round(time.monotonic() - started, 2)
+        if 400 <= exc.code < 500:
+            # The exchange ANSWERED (see the docstring): reachable. The
+            # relight — the bot's own authenticated boot — is the real test.
+            out["stage"] = "http-4xx"
+            out["ok"] = True
         return out
     except (urllib.error.URLError, OSError, ValueError) as exc:
         out["error"] = repr(exc)
@@ -879,10 +953,13 @@ class Watchdog:
     ) -> list[dict[str, object]]:
         """NETWORK-class boot death: NO latch. Wait the SAME derived backoff
         flap guard 2 uses (threshold x streak, capped 900s — no new number),
-        then gate the relight on the exchange being reachable; every failed
-        probe extends the streak and waits again. Retry forever (2026-08-06
-        ruling, verbatim: "if bot crashes, restart, thats it"); a human KILL
-        still latches (checked by the caller after this returns)."""
+        then gate the relight on the exchange being reachable (DNS + an HTTP
+        answer — 200 JSON or any 4xx; a 5xx / no route / captive portal is
+        not one); every failed probe extends the streak and waits again.
+        Retry forever (2026-08-06 ruling, verbatim: "if bot crashes, restart,
+        thats it"); a human KILL still latches (checked by the caller after
+        this returns). ``time.sleep`` here mirrors guard 2's own wait below
+        (the ``sleep`` seam is the poll cadence, not a backoff)."""
         waits: list[dict[str, object]] = []
         while True:
             n = len(waits) + 1

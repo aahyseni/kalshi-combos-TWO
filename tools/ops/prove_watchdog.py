@@ -35,9 +35,12 @@ live store, or Kalshi.
   P8 network_boot_death — the 2026-08-27 02:13 ET class (real corpse log):
                          DNS death before any heartbeat -> NO latch, backoff
                          x streak, reach probe (fail, fail, ok), relight.
-  P9 maintenance_boot_death — the 2026-08-06 03:13 ET class (real corpse
-                         log): exchange 503s before any heartbeat -> NO
-                         latch, backoff, probe (fail, ok), relight.
+  P9 maintenance_boot_death — the 2026-08-06 03:13 ET corpse (real log)
+                         under a SYNTHETIC pre-heartbeat premise (the real
+                         8/6 deaths had heartbeat_present true — guard 2's
+                         class, retried since the 8/6 rework): exchange
+                         503s -> NO latch, backoff, probe (fail, ok),
+                         relight. The DEFENSIVE guard-1 path, not a replay.
 
 Run:  .venv/Scripts/python.exe -m tools.ops.prove_watchdog
 """
@@ -496,17 +499,21 @@ CORPSE_8_6 = REPO / "tests" / "fixtures" / "watchdog" / "live_20260806_0313_tail
 
 
 def p9_maintenance_boot_death(failures: list[str]) -> None:
-    """2026-09-04 build. THE 8/6 03:13 ET CLASS: Kalshi's maintenance 503s
-    killed the boot before any heartbeat (startup_reconcile_failed on
-    KalshiApiError('HTTP 503 ...') -> REFUSING TO QUOTE on book_reconciled ->
-    supervisor_exchange_unreachable on the same 503). The corpse log is the
-    REAL one (tests/fixtures/watchdog, verbatim). The real watchdog CLI must
-    classify it NETWORK (the live code's own "cannot reach exchange"), NOT
-    latch, wait threshold x streak (5s, 10s), consult the reach probe each
-    time (not serving, then serving) and relight."""
+    """2026-09-04 build. THE 8/6 03:13 ET CORPSE under a SYNTHETIC
+    pre-heartbeat premise: Kalshi's maintenance 503s (startup_reconcile_failed
+    on KalshiApiError('HTTP 503 ...') -> REFUSING TO QUOTE on book_reconciled
+    -> supervisor_exchange_unreachable on the same 503). RECORD STRAIGHT
+    (review 2026-09-04): the real 8/6 deaths had heartbeat_present true —
+    flap guard 2's class (retried since the 8/6 rework) — and cannot reach
+    guard 1 on the live code (the preflight runs after the heartbeat beat).
+    This proof drives the DEFENSIVE guard-1 path with the real corpse log
+    (tests/fixtures/watchdog, verbatim) and no heartbeat: the real watchdog
+    CLI must classify it NETWORK (the live code's own "cannot reach
+    exchange"), NOT latch, wait threshold x streak (5s, 10s), consult the
+    reach probe each time (not serving, then serving) and relight."""
     print(
-        "P9 maintenance_boot_death (8/6 03:13 class: exchange 503 pre-heartbeat -> "
-        "retry, no latch)"
+        "P9 maintenance_boot_death (8/6 03:13 corpse, synthetic pre-heartbeat "
+        "premise: exchange 503 -> retry, no latch)"
     )
     root, data, pid_file, actions, stop_cmd = build_scratch("p9", heartbeat=False, pids=[])
     (data / "live_now.log").write_bytes(CORPSE_8_6.read_bytes())

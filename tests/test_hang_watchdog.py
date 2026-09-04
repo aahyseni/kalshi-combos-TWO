@@ -525,7 +525,7 @@ def test_classify_death_config_and_code_corpses(name: str, tail: str, marker: st
         ),
         (
             "REFUSING TO QUOTE on book_reconciled after a network reconcile failure "
-            "(the 8/27 boot had it survived rehydrate)",
+            "(forensic: the preflight runs after the heartbeat beat — a guard-2 death)",
             '{"event": "quote_app_starting"}\n'
             '{"error": "TimeoutError()", "event": "startup_reconcile_failed", '
             '"level": "error", "phase": "enumerate"}\n'
@@ -867,14 +867,23 @@ def test_exchange_anchor_reads_only_the_live_local_yaml(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------
-# Exchange 5xx at boot (2026-09-04 build, second fixture): the 2026-08-06
-# 03:13/03:16 ET maintenance-window boot deaths. Kalshi answered every call
-# HTTP 503; startup_reconcile_failed carried KalshiApiError('HTTP 503 ...'),
-# the CLI printed REFUSING TO QUOTE on book_reconciled, and the supervisor's
-# own supervisor_exchange_unreachable fired on the same 503 ("cannot reach
+# Exchange 5xx (2026-09-04 build, second fixture): the 2026-08-06 03:13/03:16
+# ET maintenance-window deaths. Kalshi answered every call HTTP 503;
+# startup_reconcile_failed carried KalshiApiError('HTTP 503 ...'), the CLI
+# printed REFUSING TO QUOTE on book_reconciled, and the supervisor's own
+# supervisor_exchange_unreachable fired on the same 503 ("cannot reach
 # exchange", exchange_reachable: false). The live code calls that unreachable;
-# so does the classifier. The fixture is that corpse's log, verbatim (37
-# lines, incl. the raw cp1252 em-dash byte the CLI printed).
+# so does the classifier. RECORD STRAIGHT (review 2026-09-04): both real
+# corpses were POST-heartbeat deaths (hang_watchdog.log escalations 8/6
+# 03:16:35 / 03:20:05 ET: heartbeat_present true, healthy_span_s 74.8 / 74.7)
+# — flap guard 2's class, already retried by the 8/6 rework; they never
+# reached guard 1 and cannot on the live code (quote_app.py run() beats the
+# heartbeat at l.2608 BEFORE the supervisor launch l.2617 and the preflight
+# l.2621; every pre-beat exchange call catches KalshiApiError). The
+# classification is forensic + defensive; the state-machine test below plants
+# the corpse under a SYNTHETIC no-heartbeat escalation. The fixture is that
+# corpse's log, verbatim (37 lines, incl. the raw cp1252 em-dash byte the CLI
+# printed).
 # --------------------------------------------------------------------------
 
 CORPSE_8_6 = Path(__file__).parent / "fixtures" / "watchdog" / "live_20260806_0313_tail.log"
@@ -986,11 +995,13 @@ def test_classify_death_exchange_5xx_is_network_4xx_is_code(
 def test_maintenance_boot_death_waits_through_5xx_then_relights(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The 8/6 03:13 class end-to-end at the state-machine level with the
-    real corpse: the boot died on exchange 503s before any heartbeat -> NOT
-    latched; backoff threshold x streak (100, 200); the probe keeps waiting
-    while the exchange still answers 503 (reachable-but-not-serving is not
-    ok) and the relight fires on the first 200."""
+    """The 8/6 03:13 corpse end-to-end at the state-machine level under a
+    SYNTHETIC pre-heartbeat premise (the real 8/6 deaths had heartbeat_present
+    true — guard 2's class; this proves the DEFENSIVE guard-1 path for a
+    hypothetical pre-beat 5xx, not a replay of 8/6): NOT latched; backoff
+    threshold x streak (100, 200); the probe keeps waiting while the exchange
+    still answers 503 (reachable-but-not-serving is not ok) and the relight
+    fires on the first 200."""
     _plant_corpse(tmp_path, _corpse_8_6_text(), name="live_20260806_0313.log")
     probes, clock = FakeProbes(), Clock()
     probes.heartbeat = False
@@ -1070,3 +1081,225 @@ def test_default_reach_probe_follows_the_live_yaml_anchor(tmp_path: Path) -> Non
         "url": "https://probe.example/trade-api/v2",
         "timeout": hw._DEFAULT_REQUEST_TIMEOUT_S,
     }
+
+
+# --------------------------------------------------------------------------
+# Review fixes (2026-09-04): (a) a bare stdlib Connection*Error names the
+# network only with an exchange / aiohttp frame — on Windows a
+# ProcessPoolExecutor worker dying at boot (ops/pricing_pool.py, a code bug)
+# raises ConnectionResetError [WinError 10054] on the pool pipe and must
+# LATCH; (b) a CLI refusal print AFTER the last traceback is the CLI's last
+# word; (c) a 4xx probe answer means the exchange is reachable.
+# --------------------------------------------------------------------------
+
+_TB_POOL_RESET = (
+    "Traceback (most recent call last):\n"
+    '  File "C:\\x\\src\\combomaker\\ops\\pricing_pool.py", line 148, in start\n'
+    "    self._executor = ProcessPoolExecutor(\n"
+    '  File "C:\\x\\Lib\\multiprocessing\\connection.py", line 312, in _recv_bytes\n'
+    "    ov, err = _winapi.ReadFile(self._handle, 0, True)\n"
+    "ConnectionResetError: [WinError 10054] An existing connection was forcibly closed "
+    "by the remote host\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "tail", "cls", "marker"),
+    [
+        (
+            "bare ConnectionResetError on a pool pipe, no exchange frame -> CODE (latch)",
+            '{"event": "quote_app_starting"}\n' + _TB_POOL_RESET,
+            hw.DEATH_CONFIG_CODE,
+            "ConnectionResetError",
+        ),
+        (
+            "bare ConnectionResetError WITH a rest.py frame -> NETWORK",
+            "Traceback (most recent call last):\n"
+            '  File "C:\\x\\src\\combomaker\\exchange\\rest.py", line 356, in _request\n'
+            "    async with self._session.request(\n"
+            "ConnectionResetError: [WinError 10054] An existing connection was forcibly closed\n",
+            hw.DEATH_NETWORK,
+            "ConnectionResetError on exchange call",
+        ),
+        (
+            "bare ConnectionRefusedError WITH an aiohttp frame -> NETWORK",
+            "Traceback (most recent call last):\n"
+            '  File "C:\\x\\.venv\\Lib\\site-packages\\aiohttp\\connector.py", line 1, in w\n'
+            "    raise\n"
+            "ConnectionRefusedError: [Errno 111] Connection refused\n",
+            hw.DEATH_NETWORK,
+            "ConnectionRefusedError on exchange call",
+        ),
+        (
+            "bare ConnectionAbortedError, no frame -> CODE",
+            "Traceback (most recent call last):\n"
+            '  File "C:\\x\\src\\combomaker\\ops\\process_group.py", line 1, in x\n'
+            "    y()\n"
+            "ConnectionAbortedError: [WinError 10053] software caused connection abort\n",
+            hw.DEATH_CONFIG_CODE,
+            "ConnectionAbortedError",
+        ),
+        (
+            "aiohttp's OWN ClientConnectionResetError needs no frame (transport by name)",
+            "Traceback (most recent call last):\n"
+            '  File "C:\\x\\quote_app.py", line 1, in run\n'
+            "    await x()\n"
+            "aiohttp.client_exceptions.ClientConnectionResetError: Cannot write to closing "
+            "transport\n",
+            hw.DEATH_NETWORK,
+            "ClientConnectionResetError",
+        ),
+        (
+            "gaierror needs no frame (DNS IS the network)",
+            "Traceback (most recent call last):\n"
+            '  File "C:\\x\\quote_app.py", line 1, in run\n'
+            "    await x()\n"
+            "socket.gaierror: [Errno 11001] getaddrinfo failed\n",
+            hw.DEATH_NETWORK,
+            "gaierror",
+        ),
+    ],
+)
+def test_classify_death_bare_connection_errors_need_an_exchange_frame(
+    name: str, tail: str, cls: str, marker: str
+) -> None:
+    verdict = hw.classify_death(tail)
+    assert verdict["class"] == cls, name
+    assert verdict["marker"] == marker, name
+
+
+_TB_TASK_NEVER_RETRIEVED = (
+    "Task exception was never retrieved\n"
+    "future: <Task finished name='status' coro=<...> exception=ClientConnectorDNSError(...)>\n"
+    "Traceback (most recent call last):\n"
+    '  File "C:\\x\\src\\combomaker\\exchange\\rest.py", line 356, in _request\n'
+    "    async with self._session.request(\n"
+    "aiohttp.client_exceptions.ClientConnectorDNSError: Cannot connect to host "
+    "external-api.kalshi.com:443 ssl:default [getaddrinfo failed]\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "tail", "cls", "marker"),
+    [
+        (
+            "non-fatal transport traceback, then 'config error:' -> the refusal is the last word",
+            '{"event": "quote_app_starting"}\n'
+            + _TB_TASK_NEVER_RETRIEVED
+            + "config error: 1 validation error for AppConfig\n",
+            hw.DEATH_CONFIG_CODE,
+            "config error",
+        ),
+        (
+            "non-fatal transport traceback, then REFUSING TO QUOTE on a non-network gate",
+            '{"event": "quote_app_starting"}\n'
+            + _TB_TASK_NEVER_RETRIEVED
+            + "REFUSING TO QUOTE: prod go-live preflight failed \u2014 red gates: "
+            "supervisor_heartbeat_established\n",
+            hw.DEATH_CONFIG_CODE,
+            "REFUSING TO QUOTE",
+        ),
+        (
+            "non-fatal transport traceback, then credentials error:",
+            _TB_TASK_NEVER_RETRIEVED + "credentials error: KALSHI_API_KEY_ID unset\n",
+            hw.DEATH_CONFIG_CODE,
+            "credentials error",
+        ),
+        (
+            "refusal print, then a LATER ImportError traceback -> the traceback is newer",
+            "REFUSING TO START: conventions unverified\n"
+            "Traceback (most recent call last):\n"
+            '  File "cli.py", line 1, in <module>\n'
+            "    import foo\n"
+            "ImportError: cannot import name foo\n",
+            hw.DEATH_CONFIG_CODE,
+            "ImportError",
+        ),
+        (
+            "refusal print, then a LATER transport traceback -> NETWORK (the newer word)",
+            "REFUSING TO QUOTE: prod go-live preflight failed \u2014 red gates: x\n"
+            "Traceback (most recent call last):\n"
+            '  File "rest.py", line 356, in _request\n'
+            "    async with self._session.request(\n"
+            "aiohttp.client_exceptions.ServerDisconnectedError: Server disconnected\n",
+            hw.DEATH_NETWORK,
+            "ServerDisconnectedError",
+        ),
+        (
+            "the 8/6 shape with a non-fatal transport traceback BEFORE the refusal keeps its "
+            "reconcile verdict (refusal rule, not the stale traceback)",
+            '{"event": "quote_app_starting"}\n'
+            '{"error": "KalshiApiError(\'HTTP 503 : <html>\')", '
+            '"event": "startup_reconcile_failed", "level": "error", "phase": "enumerate"}\n'
+            + _TB_TASK_NEVER_RETRIEVED
+            + "REFUSING TO QUOTE: prod go-live preflight failed \u2014 red gates: "
+            "book_reconciled\n",
+            hw.DEATH_NETWORK,
+            "startup_reconcile_failed: HTTP 503",
+        ),
+    ],
+)
+def test_classify_death_refusal_after_a_traceback_is_the_last_word(
+    name: str, tail: str, cls: str, marker: str
+) -> None:
+    verdict = hw.classify_death(tail)
+    assert verdict["class"] == cls, name
+    assert verdict["marker"] == marker, name
+
+
+def test_probe_exchange_reach_4xx_is_an_answer() -> None:
+    """A 4xx (path moved -> 404, WAF on the watchdog UA -> 403) is the
+    exchange ANSWERING about our request, not the network: ok at stage
+    http-4xx, so the relight (the bot's own boot) decides. 5xx stays not ok
+    (reachable but not serving)."""
+    import urllib.error
+
+    url = "https://external-api.kalshi.com/trade-api/v2"
+    for code in (403, 404, 401):
+
+        def answer(req: object, timeout: float, _code: int = code) -> _FakeResponse:
+            raise urllib.error.HTTPError(url, _code, "x", None, None)  # type: ignore[arg-type]
+
+        out = hw.probe_exchange_reach(url, 1.0, resolve=lambda h, p: [], opener=answer)
+        assert out["ok"] is True and out["stage"] == "http-4xx" and out["status"] == code
+
+    def maint(req: object, timeout: float) -> _FakeResponse:
+        raise urllib.error.HTTPError(url, 502, "Bad Gateway", None, None)  # type: ignore[arg-type]
+
+    out = hw.probe_exchange_reach(url, 1.0, resolve=lambda h, p: [], opener=maint)
+    assert out["ok"] is False and out["status"] == 502 and out["stage"] == "http"
+
+
+def test_network_boot_death_relights_on_a_4xx_probe_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end with the REAL probe function (fake opener): the 8/27
+    corpse, DNS back, /exchange/status answering 403 forever. Before the
+    review fix this was STOP-only with an unbounded wait ladder
+    (242/484/726/900/900...) and no START ever issued; now one wait, one
+    probe, relight."""
+    import urllib.error
+
+    _plant_corpse(tmp_path, _corpse_tail_text())
+    probes, clock = FakeProbes(), Clock()
+    probes.heartbeat = False
+    probes.pids = []
+    probes.log = None  # type: ignore[assignment]
+    dog, calls = make_dog(tmp_path, probes, clock, threshold=100.0)
+    url = "https://external-api.kalshi.com/trade-api/v2"
+
+    def forbidden(req: object, timeout: float) -> _FakeResponse:
+        raise urllib.error.HTTPError(url, 403, "Forbidden", None, None)  # type: ignore[arg-type]
+
+    dog.reach_probe = lambda: hw.probe_exchange_reach(
+        url, 1.0, resolve=lambda h, p: [], opener=forbidden
+    )
+    slept = _patched_sleep(monkeypatch)
+    dog.poll_once()
+    assert dog.poll_once() == "relit"
+    assert calls == ["STOP", "START"]
+    assert slept == [100.0]
+    assert dog._halt is None
+    assert not list((tmp_path / "data").glob("WATCHDOG_HALT_*.txt"))
+    log = (tmp_path / "data" / hw.WATCHDOG_LOG).read_text(encoding="utf-8")
+    assert ": REACHABLE {" in log and '"stage": "http-4xx"' in log
