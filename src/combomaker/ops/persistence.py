@@ -114,7 +114,10 @@ CREATE TABLE IF NOT EXISTS fills (
     price_cc INTEGER NOT NULL,
     fee_cc INTEGER,
     expected_edge_cc INTEGER,
-    raw_json TEXT NOT NULL
+    raw_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'booked',   -- booked | verified | phantom (2026-09-04)
+    verified_at TEXT,                         -- /portfolio/fills proof (or void) stamp
+    exchange_fill_id TEXT                     -- matching tape fill_id, or phantom:<reason>
 );
 CREATE INDEX IF NOT EXISTS idx_fills_ref ON fills (fill_ref);
 
@@ -324,6 +327,55 @@ class Store:
                 "UNIQUE index could not be created; record_fill's INSERT-if-"
                 "absent still guards new writes; de-dup the table offline",
             )
+        # PHANTOM-EXECUTION LEDGER STATE (2026-09-04 build, item D). The
+        # exchange emitted ``quote_executed`` (WS AND REST quote status) for 28
+        # orders since 2026-07-27 that never produced a /portfolio/fills row
+        # (12 on 2026-08-26 alone; two of them HALTED settlement reconcile at
+        # 22:41 ET: 66.71 predicted vs 43.47 exchange). A fills row therefore
+        # carries a verification STATE: ``booked`` (written off the executed
+        # message), ``verified`` (its order_id found on /portfolio/fills —
+        # ``exchange_fill_id``/``verified_at`` are the evidence) or ``phantom``
+        # (proven absent after the bounded verification; voided). ADD COLUMN
+        # is idempotent against ``PRAGMA table_info`` so a legacy store opens
+        # unchanged (every existing row reads ``booked``).
+        await cls._ensure_fills_verification_columns(db)
+        # ONE EXCHANGE ORDER = ONE LEDGER ROW (2026-09-04 build, item D): a
+        # partial UNIQUE index on fills.order_id (NULL-keyed rows — poll-
+        # recovered fills whose quote payload exposed no creator_order_id —
+        # are exempt, exactly as the writer's own guard treats them). Same
+        # tolerant pattern as idx_fills_ref_unique: a legacy store that
+        # already holds duplicate order_ids must NOT brick startup — the
+        # duplicates are enumerated in the loud error for the operator and
+        # record_fill's INSERT-if-absent (now order_id-aware) guards every
+        # new write regardless.
+        try:
+            await db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_fills_order_id_unique"
+                " ON fills (order_id) WHERE order_id IS NOT NULL"
+            )
+            await db.commit()
+        except Exception:
+            duplicates: list[tuple[str, int]] = []
+            try:
+                async with db.execute(
+                    "SELECT order_id, COUNT(*) FROM fills WHERE order_id IS NOT NULL"
+                    " GROUP BY order_id HAVING COUNT(*) > 1 LIMIT 50"
+                ) as cursor:
+                    duplicates = [
+                        (str(row[0]), int(row[1])) async for row in cursor
+                    ]
+            except Exception:  # noqa: BLE001 — diagnostics only, never fatal
+                duplicates = []
+            log.exception(
+                "fills_order_id_unique_index_unavailable",
+                n_duplicate_order_ids=len(duplicates),
+                duplicates=duplicates[:20],
+                detail="fills.order_id holds pre-existing duplicate rows (one "
+                "exchange order booked under several fill_refs) — the partial "
+                "UNIQUE index could not be created; record_fill's order_id-aware "
+                "INSERT-if-absent still guards new writes; repair the listed "
+                "rows offline (tools/ops/repair_phantom_fills.py)",
+            )
         # DEDICATED CHECKPOINT CONNECTION (2026-08-19 self-lock fix — see
         # __init__). Only busy_timeout carries over: journal_mode=WAL is a
         # property of the DB FILE (already set above), and this connection
@@ -332,6 +384,54 @@ class Store:
         ckpt_db = await aiosqlite.connect(path)
         await ckpt_db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         return cls(db, clock, ckpt_db=ckpt_db)
+
+    #: fills-ledger verification states (2026-09-04 build, item D).
+    FILL_STATUS_BOOKED = "booked"
+    FILL_STATUS_VERIFIED = "verified"
+    FILL_STATUS_PHANTOM = "phantom"
+    #: position_ledger status of a VOIDED phantom position (never 'open',
+    #: never 'settled' — it was never held on the exchange).
+    POSITION_STATUS_PHANTOM = "phantom"
+
+    @staticmethod
+    async def _ensure_fills_verification_columns(db: aiosqlite.Connection) -> None:
+        """Idempotent schema migration for the fills verification state
+        (2026-09-04 build, item D): ``status`` (booked|verified|phantom),
+        ``verified_at`` (ISO stamp of the /portfolio/fills proof) and
+        ``exchange_fill_id`` (the matching tape row's fill_id — evidence).
+        Reads ``PRAGMA table_info`` first so a store that already carries the
+        columns is untouched; a legacy store gains them with every existing
+        row reading ``booked``. Never raises into ``open``: a failure logs
+        loudly and the store still opens (the ledger writer treats a missing
+        column as "verification state unavailable", never as a crash)."""
+        try:
+            async with db.execute("PRAGMA table_info(fills)") as cursor:
+                present = {str(row[1]) for row in await cursor.fetchall()}
+            added: list[str] = []
+            if "status" not in present:
+                await db.execute(
+                    "ALTER TABLE fills ADD COLUMN status TEXT NOT NULL DEFAULT 'booked'"
+                )
+                added.append("status")
+            if "verified_at" not in present:
+                await db.execute("ALTER TABLE fills ADD COLUMN verified_at TEXT")
+                added.append("verified_at")
+            if "exchange_fill_id" not in present:
+                await db.execute("ALTER TABLE fills ADD COLUMN exchange_fill_id TEXT")
+                added.append("exchange_fill_id")
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fills_status ON fills (status)"
+            )
+            await db.commit()
+            if added:
+                log.info("fills_verification_columns_added", columns=added)
+        except Exception:
+            log.exception(
+                "fills_verification_columns_unavailable",
+                detail="could not add the fills verification columns (status/"
+                "verified_at/exchange_fill_id) — the store opens without them; "
+                "fill verification cannot stamp state until the schema is repaired",
+            )
 
     def start_writer(self) -> None:
         """Enable the off-hot-path background writer (the app calls this; tests
@@ -988,6 +1088,132 @@ class Store:
         ) as cursor:
             return await cursor.fetchone() is not None
 
+    async def fill_ref_for_order_id(self, order_id: str) -> tuple[str, str] | None:
+        """``(fill_ref, status)`` of the fills row recording this exchange
+        ``order_id``, or None (2026-09-04 build, item D). The writer's
+        order-id guard uses this instead of the bare boolean so a REPLAY of
+        the SAME quote (fill_ref equal — the 2026-08-26 run logged 38 false
+        ``fill_order_id_already_in_ledger`` errors, every one a WS+poll race
+        on one quote, zero cross-quote misattributions) is told apart from a
+        genuine second quote claiming an already-booked order."""
+        async with self._db.execute(
+            "SELECT fill_ref, status FROM fills WHERE order_id = ? LIMIT 1",
+            (order_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return str(row[0]), str(row[1])
+
+    async def fill_status(self, fill_ref: str) -> str | None:
+        """Verification state of one fills row (booked|verified|phantom), or
+        None when no row exists."""
+        async with self._db.execute(
+            "SELECT status FROM fills WHERE fill_ref = ? LIMIT 1", (fill_ref,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return None if row is None else str(row[0])
+
+    async def mark_fill_verified(
+        self, fill_ref: str, *, exchange_fill_id: str | None
+    ) -> bool:
+        """Stamp a BOOKED fills row VERIFIED: its exchange order_id was found
+        on /portfolio/fills (2026-09-04 build, item D). Evidence columns:
+        ``exchange_fill_id`` (the tape row's fill_id) + ``verified_at`` (now).
+        Only a ``booked`` row transitions (idempotent re-verification is a
+        no-op; a voided phantom is never resurrected here — a tape fill that
+        appears AFTER a void is the fills-ledger sweep's alarm to raise).
+        Returns True iff a row was stamped."""
+        cursor = await self._db.execute(
+            "UPDATE fills SET status = ?, verified_at = ?, exchange_fill_id = ?"
+            " WHERE fill_ref = ? AND status = ?",
+            (
+                self.FILL_STATUS_VERIFIED,
+                self._now(),
+                exchange_fill_id,
+                fill_ref,
+                self.FILL_STATUS_BOOKED,
+            ),
+        )
+        await self._db.commit()
+        return (cursor.rowcount or 0) > 0
+
+    async def void_phantom_fill(self, fill_ref: str, *, reason: str) -> dict[str, int]:
+        """VOID a phantom execution across the three ledgers (2026-09-04
+        build, item D): the exchange said ``executed`` but /portfolio/fills
+        holds NO row for the order after the bounded verification — the fill
+        never happened, so nothing about it may keep counting.
+
+          * ``fills``: status → ``phantom`` (the row STAYS as the audit trail
+            of what the exchange told us; ``raw_json`` keeps the executed
+            message; ``verified_at`` stamps the void; ``exchange_fill_id``
+            records the reason);
+          * ``position_ledger``: the OPEN row keyed ``position_id == fill_ref``
+            → status ``phantom`` (never 'open' — it can no longer be matched
+            by a settlement — and never 'settled' — it realized nothing);
+          * ``ev_ledger``: expected_edge_cc → 0 and realized_pnl_cc → 0 so the
+            EV grading counts it as exactly nothing on both sides.
+
+        Only a ``booked`` fills row is voided (a VERIFIED row is a real fill by
+        proof; a phantom row is already voided) — the caller decides on
+        evidence, this method enforces the state machine. Synchronous +
+        committed like every other risk-relevant write. Returns the rows
+        touched per table (tests + the log line)."""
+        touched = {"fills": 0, "position_ledger": 0, "ev_ledger": 0}
+        cursor = await self._db.execute(
+            "UPDATE fills SET status = ?, verified_at = ?, exchange_fill_id = ?"
+            " WHERE fill_ref = ? AND status = ?",
+            (
+                self.FILL_STATUS_PHANTOM,
+                self._now(),
+                f"phantom:{reason}",
+                fill_ref,
+                self.FILL_STATUS_BOOKED,
+            ),
+        )
+        touched["fills"] = cursor.rowcount if cursor.rowcount > 0 else 0
+        if touched["fills"] == 0:
+            await self._db.commit()
+            return touched
+        cursor = await self._db.execute(
+            "UPDATE position_ledger SET status = ?, reconciled_at = ?"
+            " WHERE position_id = ? AND status = 'open'",
+            (self.POSITION_STATUS_PHANTOM, self._now(), fill_ref),
+        )
+        touched["position_ledger"] = cursor.rowcount if cursor.rowcount > 0 else 0
+        cursor = await self._db.execute(
+            "UPDATE ev_ledger SET expected_edge_cc = 0, realized_pnl_cc = 0"
+            " WHERE fill_ref = ?",
+            (fill_ref,),
+        )
+        touched["ev_ledger"] = cursor.rowcount if cursor.rowcount > 0 else 0
+        await self._db.commit()
+        return touched
+
+    async def open_ledger_quantity_by_ticker(self) -> dict[str, tuple[str, int, int]]:
+        """``{combo_ticker: (our_side, Σ contracts_centi, n_rows)}`` over every
+        OPEN ``position_ledger`` row — one grouped read for the per-ticker
+        LEDGER-vs-EXCHANGE quantity reconcile (2026-09-04 build, item D;
+        alarm-only). A ticker whose open rows disagree on side is reported
+        under the side of its FIRST row with the summed magnitude — the
+        divergence alarm fires either way."""
+        async with self._db.execute(
+            "SELECT combo_ticker, our_side, SUM(contracts_centi), COUNT(*)"
+            " FROM position_ledger WHERE status='open'"
+            " GROUP BY combo_ticker, our_side ORDER BY combo_ticker, our_side"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        out: dict[str, tuple[str, int, int]] = {}
+        for row in rows:
+            ticker = str(row[0])
+            side, total, n = str(row[1]), int(row[2] or 0), int(row[3] or 0)
+            if ticker in out:
+                prev_side, prev_total, prev_n = out[ticker]
+                out[ticker] = (prev_side, prev_total + total, prev_n + n)
+            else:
+                out[ticker] = (side, total, n)
+        return out
+
     async def day_realized_pnl_cc(self, start_iso: str, end_iso: str) -> int:
         """DAY-ANCHORED realized P&L reconstruction (2026-07-25 operator KPI:
         p_night must roll across restarts — the in-process accumulator resets
@@ -1003,9 +1229,12 @@ class Store:
         ) as cursor:
             row = await cursor.fetchone()
             settled = int(row[0]) if row and row[0] is not None else 0
+        # A VOIDED phantom's fee never left the account (no fill happened) and
+        # the in-process accumulator reversed it at void time — exclude it here
+        # too so the restart-seeded figure matches (2026-09-04 build, item D).
         async with self._db.execute(
             "SELECT COALESCE(SUM(fee_cc), 0) FROM fills"
-            " WHERE fee_cc IS NOT NULL AND at >= ? AND at < ?",
+            " WHERE fee_cc IS NOT NULL AND at >= ? AND at < ? AND status != 'phantom'",
             (start_iso, end_iso),
         ) as cursor:
             row = await cursor.fetchone()
@@ -1017,8 +1246,13 @@ class Store:
         per fills-ledger sweep (2026-07-24 incident-C review: hundreds of
         serial point-reads inside the maintenance tick were a wedge risk; the
         table is small, so one batched SELECT replaces them all)."""
+        # A VOIDED phantom row's order_id is deliberately NOT "in the ledger"
+        # here (2026-09-04 build, item D): if the exchange later shows a fill
+        # for that order, the sweep must alarm it as a MISS (the void was
+        # wrong) rather than treat the voided row as its record.
         async with self._db.execute(
             "SELECT DISTINCT order_id FROM fills WHERE order_id IS NOT NULL"
+            " AND status != 'phantom'"
         ) as cursor:
             rows = await cursor.fetchall()
         return {str(row[0]) for row in rows}
@@ -1031,7 +1265,7 @@ class Store:
         a visible skip, not a permanent false alarm pinning the watermark."""
         async with self._db.execute(
             "SELECT combo_ticker, contracts_centi FROM fills "
-            "WHERE order_id IS NULL"
+            "WHERE order_id IS NULL AND status != 'phantom'"
         ) as cursor:
             rows = await cursor.fetchall()
         return {(str(row[0]), int(row[1])) for row in rows}
@@ -1070,12 +1304,20 @@ class Store:
         ``has_fill`` pre-check before either wrote. The EV-ledger row rides the
         same guard (inserted only when the fills row was). Returns True iff the
         row was inserted (False ⇒ a fill with this ref already existed and
-        NOTHING was written)."""
+        NOTHING was written).
+
+        ONE EXCHANGE ORDER = ONE ROW (2026-09-04 build, item D): the same
+        single-statement guard also refuses a row whose non-NULL ``order_id``
+        is already recorded under ANY fill_ref — the store-level twin of the
+        writer's order-id pre-check and of the partial UNIQUE index, so a
+        race that slips both pre-checks lands as a silent no-op (False),
+        never an IntegrityError into the executed handler."""
         cursor = await self._db.execute(
             "INSERT INTO fills (at, fill_ref, order_id, combo_ticker, our_side,"
-            " contracts_centi, price_cc, fee_cc, expected_edge_cc, raw_json)"
-            " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
-            " WHERE NOT EXISTS (SELECT 1 FROM fills WHERE fill_ref = ?)",
+            " contracts_centi, price_cc, fee_cc, expected_edge_cc, raw_json, status)"
+            " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+            " WHERE NOT EXISTS (SELECT 1 FROM fills WHERE fill_ref = ?)"
+            " AND (? IS NULL OR NOT EXISTS (SELECT 1 FROM fills WHERE order_id = ?))",
             (
                 self._now(),
                 fill_ref,
@@ -1087,7 +1329,10 @@ class Store:
                 fee_cc,
                 expected_edge_cc,
                 json.dumps(raw),
+                self.FILL_STATUS_BOOKED,
                 fill_ref,
+                order_id,
+                order_id,
             ),
         )
         inserted = (cursor.rowcount or 0) > 0
