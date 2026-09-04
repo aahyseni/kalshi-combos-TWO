@@ -391,23 +391,39 @@ async def test_two_concurrent_verifications_one_exchange_fill(
 
 async def test_ws_execution_during_verification_single_row(tmp_path: Path) -> None:
     """The WS quote_executed arriving DURING verification wins cleanly: the
-    row is written once by the WS path, the sweep's loop-top ``fill_recorded``
-    check stops all further verification polling, and the position stays."""
+    row is written once by the WS path, the cancel verification stops, and
+    the position stays.
+
+    PIN CHANGED 2026-09-04 (build item D, phantom executions): a WS
+    ``quote_executed`` is a CLAIM the sweep now proves against
+    /portfolio/fills by the message's exchange order_id — measured 28 WS
+    executed messages since 2026-07-27 (13 on 08-26) naming orders the tape
+    never held, two of which halted the 08-26 22:41 ET settlement reconcile.
+    The old pin "verification never polled after the WS row" is therefore
+    "polled ONCE by exact order_id, VERIFIED, then never again"; the tape
+    below holds the WS order ``o1`` (a real fill)."""
     getter = FakeQuoteGetter()
     fills = FakeFillsGetter()
     rig = await _verify_rig(tmp_path, getter=getter, fills=fills)
-    fills.script(COMBO_TICKER, {"fills": [taker_fill()]})
+    fills.script(COMBO_TICKER, {"fills": [taker_fill(), taker_fill(order_id="o1")]})
     quote_id = await _cancel_reported(rig, getter)
 
     # WS message lands mid-verification (before any fills poll ran).
     await rig.lifecycle.on_quote_executed({"quote_id": quote_id, "order_id": "o1"})
     assert await rig.store.count("fills") == 1
+    assert await rig.store.fill_status(f"fill:{quote_id}") == "booked"
 
     for _ in range(3):
         rig.h.clock.advance(VERIFY_DELAY_S + 0.5)
         await rig.lifecycle.maintenance_tick()
         await rig.lifecycle.drain_diagnostic_sweeps()
-    assert fills.calls == []  # verification never polled after the WS row
+    # ONE exact-key proof read (pre-2026-09-04: none), then terminal.
+    assert len(fills.calls) == 1
+    assert fills.calls[0]["order_id"] == "o1"
+    assert await rig.store.fill_status(f"fill:{quote_id}") == "verified"
+    assert rig.metrics.counter("fill_verify.verified") == 1
+    assert rig.metrics.counter("fill_verify.phantom_voided") == 0
+    assert rig.metrics.counter("fill_recovery.cancelled") == 0
     assert await rig.store.count("fills") == 1  # single row
     assert rig.metrics.counter("fill.count") == 1
     assert f"fill:{quote_id}" in rig.exposure.positions
@@ -1429,12 +1445,22 @@ class TestReviewHardening:
             == 1
         )
         assert rig.metrics.counter("fill_recovery.late_execution") == 0
+        # PIN CHANGED 2026-09-04 (build item D): an executed status is
+        # VERIFIED against /portfolio/fills before its first write (28
+        # phantom executed statuses measured since 07-27), so A's write
+        # attempts start one tick later than the pre-2026-09-04 direct
+        # booking — its second failing retry lands here, the row next tick.
+        await rig.lifecycle.maintenance_tick()
+        await rig.lifecycle.drain_diagnostic_sweeps()
+        assert await rig.store.count("fills") == 0
         # A's next retry lands its own row with its own order id.
         await rig.lifecycle.maintenance_tick()
         await rig.lifecycle.drain_diagnostic_sweeps()
         rows = await _fill_rows(rig.store)
         assert [r[0] for r in rows] == [f"fill:{q_a}"]
         assert rows[0][1] == "ord-shared"
+        assert rig.metrics.counter("fill_recovery.executed_status_verified") == 1
+        assert await rig.store.fill_status(f"fill:{q_a}") == "verified"
 
     async def test_sweep_truncation_is_loud(self, tmp_path: Path) -> None:
         """Review MEDIUM (silent truncation): a fills window exceeding the
