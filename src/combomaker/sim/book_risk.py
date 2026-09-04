@@ -1168,7 +1168,15 @@ def _structural_challenger_bundle(
     the challenger too — never silently dropped from the tail (the copula still
     samples it; it just loses the structural coupling in the challenger run, which
     can only widen or leave the tail, never narrow it below production, because the
-    production ES is folded in via the governing max regardless)."""
+    production ES is folded in via the governing max regardless).
+
+    STRESS MODE (build 2026-09-04 item B): the re-inversion runs with
+    ``contradiction_bar=False`` — the shocked marginals are MEANT to be
+    inconsistent with the production scoreline, so the pricing/production
+    market-consistency bar (``dixon_coles.invert``: residual > 0.05 refuses)
+    must not silently drop the games the stress is meant to fatten; the
+    least-squares scoreline of the shocked targets IS the adverse scenario.
+    Identification / feasibility failures still fail closed as above."""
     if not bands.active:
         return None
     ch_cfg = _challenger_structural_cfg(structural_cfg, bands)
@@ -1181,7 +1189,9 @@ def _structural_challenger_bundle(
         marginals: list[float | None] = [shocked.get(i) for i in range(len(model.legs))]
     else:
         marginals = [leg.p for leg in model.legs]
-    plans, copula_idx = build_game_plans(tickers, events, marginals, ch_cfg)
+    plans, copula_idx = build_game_plans(
+        tickers, events, marginals, ch_cfg, contradiction_bar=False
+    )
     if not plans:
         return None  # nothing re-inverts under the perturbed config ⇒ no challenger
 

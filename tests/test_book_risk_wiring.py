@@ -72,9 +72,11 @@ class TestWithinGameRhoProvider:
         band = prov("KXWCBTTS-X", "KXWCTOTAL-Y")
         assert band is not None
         low, point, high = band
-        # soccer btts|total ships at +0.70 point; the band is the real one, NOT
-        # the flat DEFAULT_FLAT_BAND (-0.20, 0.10, 0.40).
-        assert point == pytest.approx(0.70, abs=1e-6)
+        # soccer btts|total ships at +0.746 point (the club measurement; PIN
+        # CHANGED 2026-09-04 build item B — 0.70 was the World-Cup club+intl
+        # blend, git 470f24b); the band is the real one, NOT the flat
+        # DEFAULT_FLAT_BAND (-0.20, 0.10, 0.40).
+        assert point == pytest.approx(0.746, abs=1e-6)
         assert band != DEFAULT_FLAT_BAND
         assert low < point < high
 
@@ -128,10 +130,14 @@ class TestRealRhoCorrelatedTail:
         flat = build_book_model(book, marginals=lambda t: 0.5)  # DEFAULT_FLAT_BAND
 
         # DIRECT wiring proof: the high-band within-game off-diagonal carries the
-        # PRICER's real btts|total high correlation (+0.82), NOT the flat default
-        # band's high (+0.40). This is the number the MC samples the joint tail on.
-        assert float(real.corr_tail_stress_high[0, 1]) == pytest.approx(0.82, abs=1e-6)
-        assert float(flat.corr_tail_stress_high[0, 1]) == pytest.approx(DEFAULT_FLAT_BAND[2], abs=1e-6)
+        # PRICER's real btts|total high correlation (+0.866 = 0.746 + band 0.12;
+        # PIN CHANGED 2026-09-04 build item B, was 0.82 = 0.70 + 0.12), NOT the
+        # flat default band's high (+0.40). This is the number the MC samples the
+        # joint tail on.
+        assert float(real.corr_tail_stress_high[0, 1]) == pytest.approx(0.866, abs=1e-6)
+        assert float(flat.corr_tail_stress_high[0, 1]) == pytest.approx(
+            DEFAULT_FLAT_BAND[2], abs=1e-6
+        )
         assert float(real.corr_tail_stress_high[0, 1]) > float(flat.corr_tail_stress_high[0, 1])
 
         # TAIL proof: with a rare co-hit (each leg YES prob 0.10 ⇒ we lose a

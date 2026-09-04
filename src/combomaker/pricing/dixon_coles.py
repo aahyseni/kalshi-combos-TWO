@@ -565,6 +565,7 @@ def invert(
     pens_win_a: float = 0.5,
     half_share: float = 0.45,  # first-half goal share h (banded constant, §6)
     warm_start: tuple[float, float] | None = None,  # (lam_a, lam_b) guess
+    contradiction_bar: bool = True,
 ) -> InvertedModel:
     """Solve (lam_a, lam_b) from the team-level legs, then one thinning share
     per player leg. Raises StructuralError when unidentified or infeasible.
@@ -572,6 +573,15 @@ def invert(
     Two team constraints solve exactly; more are least-squares and the
     residual misfit is reported (the caller prices it into width). Player
     constraints are always exactly identified given the lams.
+
+    ``contradiction_bar`` (build 2026-09-04 item B): True (every pricing and
+    production-risk caller) refuses a fit whose residual exceeds the ONE
+    structural hard bar — legs that contradict any coherent scoreline. False
+    is the STRESS mode for the risk MC's structural-parameter challenger
+    (sim/book_risk P1.9), which deliberately shocks the marginals and takes
+    the least-squares scoreline as the adverse scenario: a market-consistency
+    bar must not silently drop the very games the stress is meant to fatten.
+    Identification / feasibility failures still raise in both modes.
     """
     team_constraints = [
         (spec, p) for spec, p in legs if isinstance(spec, _TEAM_LEVEL)
@@ -664,7 +674,7 @@ def invert(
     # a genuine contradiction. Callers without beliefs (the risk sampler,
     # exposure deltas) get the same one bar, so risk and pricing agree on
     # which games are structurally representable.
-    if residual > 0.05:
+    if contradiction_bar and residual > 0.05:
         raise StructuralError(
             f"inversion residual {residual:.4f} exceeds the structural hard bar"
             + (" on exact system" if exactly_identified else ""),

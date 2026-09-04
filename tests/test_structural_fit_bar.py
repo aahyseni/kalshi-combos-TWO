@@ -678,3 +678,48 @@ def test_config_promotes_the_club_measurement_and_keeps_the_band() -> None:
     corr = PricingConfig().correlation
     assert corr.pair_rho_by_sport["soccer"]["btts|total"] == 0.746
     assert corr.pair_rho_uncertainty["soccer:btts|total"] == 0.12
+
+
+# --- 8. stress mode: the risk challenger opts out of the contradiction bar ------
+
+
+def test_stress_mode_returns_the_over_the_bar_fit_instead_of_raising() -> None:
+    from combomaker.pricing.dixon_coles import StructuralError, Team, TeamWin
+
+    legs = [(TeamWin(Team.A), 0.98), (Btts(), 0.95)]   # residual 0.0676 > the bar
+    with pytest.raises(StructuralError, match="hard bar"):
+        invert(legs, dc_rho=0.0, et_factor=1 / 3, match_format=MatchFormat.KNOCKOUT)
+    stressed = invert(
+        legs, dc_rho=0.0, et_factor=1 / 3, match_format=MatchFormat.KNOCKOUT,
+        contradiction_bar=False,
+    )
+    assert stressed.residual > 0.05           # reported, the scenario is the misfit
+    # Identification failures still fail closed in stress mode.
+    with pytest.raises(StructuralError, match="cannot identify"):
+        invert([(Btts(), 0.6)], dc_rho=0.0, et_factor=1 / 3,
+               match_format=MatchFormat.KNOCKOUT, contradiction_bar=False)
+
+
+def test_risk_sampler_keeps_the_bar_and_the_challenger_opts_out() -> None:
+    from combomaker.sim.structural_book import StructuralConfigView, build_game_plans
+
+    # The old challenger fixture: a regulation ML pair summing to 1.0 (zero draw
+    # mass) + a total — unrepresentable (residual 0.156).
+    tickers = ["KXWCGAME-26JUL15AAABBB-AAA", "KXWCGAME-26JUL15AAABBB-BBB",
+               "KXWCTOTAL-26JUL15AAABBB-3"]
+    events = ["KXWCGAME-26JUL15AAABBB"] * 3
+    marginals: list[float | None] = [0.55, 0.45, 0.35]
+    cfg = StructuralConfigView()
+    plans, copula_idx = build_game_plans(tickers, events, marginals, cfg)
+    # production: copula (exact marginals)
+    assert plans == [] and sorted(copula_idx) == [0, 1, 2]
+    plans_s, copula_s = build_game_plans(
+        tickers, events, marginals, cfg, contradiction_bar=False
+    )
+    assert len(plans_s) == 1 and copula_s == []                # stress: the least-squares scoreline
+    # A representable game builds in BOTH modes, identically.
+    plans_ok, _ = build_game_plans(tickers, events, [0.42, 0.30, 0.35], cfg)
+    plans_ok_s, _ = build_game_plans(
+        tickers, events, [0.42, 0.30, 0.35], cfg, contradiction_bar=False
+    )
+    assert len(plans_ok) == 1 and plans_ok[0].params == plans_ok_s[0].params
