@@ -9921,19 +9921,21 @@ class QuoteLifecycle:
             tick_cc=self._combo_tick_cc(rfq, constructed),
         )
         # REBATE BOUND BY MEASURED VALUE (2026-09-04, item 2 — risk/
-        # rebate_bound.py): once the concentration steer is ARMED its rebate
-        # is the measured Cov price and may not exceed it (the shadow steer's
-        # value never touches the wire — tests/test_conc_arming.py); until
-        # then a LEG-AXIS rebate (which enters the price separately only when
-        # that axis is armed and the steer is not) on a direction the book
-        # holds no mirror of is dropped. Widening passes untouched.
-        conc_armed = self._skew_params.conc_armed
+        # rebate_bound.py): once the concentration steer is ARMED and has
+        # PRICED this candidate its rebate is the measured Cov price and may
+        # not exceed it (the shadow steer's value never touches the wire —
+        # tests/test_conc_arming.py); otherwise a LEG-AXIS rebate on a
+        # direction the book holds no mirror of is dropped. Widening passes
+        # untouched. The leg axis is IN the price exactly when skew.py's
+        # pre-lever-#5 composition ran — i.e. whenever ``skew.conc is None``
+        # (steer disabled, or the CRN profile cold), EVEN with conc_armed
+        # (review fix S1: ``not conc_armed`` alone let an unbacked leg-axis
+        # rebate through unbounded whenever the cache was cold).
+        conc_priced = self._skew_params.conc_armed and skew.conc is not None
         bound = bound_rebate(
             skew.applied_cc,
             value_cc_per_contract=(
-                skew.conc.value_cc_per_contract
-                if (conc_armed and skew.conc is not None)
-                else None
+                skew.conc.value_cc_per_contract if conc_priced else None
             ),
             family_cc=skew.family_cc,
             entity_cc=skew.entity_cc,
@@ -9941,7 +9943,7 @@ class QuoteLifecycle:
             candidate_entity_keys={leg_entity_key(leg) for leg in candidate.legs},
             shares_by_family=leg_profile.shares_by_family,
             shares_by_entity=leg_profile.shares_by_entity,
-            leg_axis_armed=self._skew_params.leg_axis_armed and not conc_armed,
+            leg_axis_armed=self._skew_params.leg_axis_armed and not conc_priced,
         )
         applied_skew_cc = bound.rebate_cc
         log.info(

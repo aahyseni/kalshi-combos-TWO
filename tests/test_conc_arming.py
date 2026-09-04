@@ -536,6 +536,51 @@ class TestTheEmittedQuoteIsUnchanged:
         # a test that would pass no matter what.
         assert sent["armed"] != sent["off"], sent["armed"]
 
+    async def test_a_cold_steer_under_the_armed_flag_still_bounds_the_leg_axis(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """REVIEW FIX S1 (2026-09-04). skew.py composes the leg-axis (family /
+        entity) rebate into the price whenever ``conc is None`` — the steer
+        disabled OR its CRN profile cold — even under ``conc_armed``. The
+        rebate bound must therefore key on whether the steer PRICED the
+        candidate, never on the flag alone: with the fail-safe flag pair
+        (conc_enabled=False, conc_armed=True) and the UN-mirrored world (the
+        family −62 + entity −9 cc rebate on M1:yes/M2:no that nothing in the
+        book backs), the unbacked rebate is removed exactly as under SHIPPED,
+        and the wire equals OFF. Before the fix ``leg_axis_armed and not
+        conc_armed`` was False here, so the rebate reached the wire."""
+        import combomaker.rfq.lifecycle as lc
+        from tests.test_lifecycle import rfq
+        from tests.test_quoting_policy import PolicyRig, _harness
+
+        cold_armed = dataclasses.replace(SHIPPED, conc_enabled=False, conc_armed=True)
+        sent = {}
+        shadow = {}
+        for tag, params in (("off", OFF), ("shipped", SHIPPED), ("cold_armed", cold_armed)):
+            seen: list[tuple[str, dict]] = []
+            real_info = lc.log.info
+
+            def _info(event, *a, _seen=seen, _real=real_info, **kw):
+                _seen.append((event, kw))
+                return _real(event, *a, **kw)
+
+            monkeypatch.setattr(lc.log, "info", _info)
+            h = await _harness()
+            store = await Store.open(tmp_path / f"s1-{tag}.sqlite3", h.clock)
+            rig = PolicyRig(h, store, skew_params=params)
+            for pos in build_world()[0].positions.values():
+                rig.exposure.add_position(pos)
+            await rig.lifecycle.handle_rfq(rfq())
+            sent[tag] = dict(rig.sender.created[0])
+            shadow[tag] = [kw for ev, kw in seen if ev == "inventory_skew_shadow"][-1]
+            await store.close()
+        assert sent["cold_armed"] == sent["off"] == sent["shipped"]
+        for tag in ("shipped", "cold_armed"):
+            rec = shadow[tag]
+            assert rec["rebate_bound_rule"] == "exposure_backed", rec
+            assert rec["rebate_unbacked_cc"] > 0 and rec["applied_cc"] == 0, rec
+            assert rec["applied_unbounded_cc"] > rec["applied_cc"], rec
+
 
 class TestMarkupsUnchanged:
     """MARKUPS ARE FROZEN (operator standing decision). The steer reallocates

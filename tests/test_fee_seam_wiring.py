@@ -77,6 +77,24 @@ class FakeFills:
         return {"fills": page, "cursor": nxt}
 
 
+# docs/api-notes/multivariate.md §2: GET /multivariate_event_collections/
+# {collection_ticker} -> GetMultivariateEventCollectionResponse, field
+# ``multivariate_contract`` (singular) = one MultivariateEventCollection,
+# whose ``series_ticker`` is a REQUIRED field (§1 table). This is the exact
+# documented shape the resolver reads (review fix S4 — closes the build
+# report's O2).
+def documented_collection_payload(ticker: str, series: str = "KXMVESERIES") -> JsonDict:
+    return {
+        "multivariate_contract": {
+            "ticker": ticker,
+            "series_ticker": series,
+            "title": "Cross-category combos",
+            "collection_type": "combined",
+            "associated_events": [],
+        }
+    }
+
+
 class FakeSeries:
     def __init__(self, fee_type: str = "quadratic_with_combo_maker_fees") -> None:
         self.fee_type = fee_type
@@ -85,8 +103,7 @@ class FakeSeries:
 
     async def get_multivariate_collection(self, ticker: str) -> JsonDict:
         self.collection_calls.append(ticker)
-        # The API wraps objects in a named key; the resolver looks one level down.
-        return {"multivariate_contract": {"ticker": ticker, "series_ticker": "KXMVESERIES"}}
+        return documented_collection_payload(ticker)
 
     async def get_series(self, ticker: str) -> JsonDict:
         self.series_calls.append(ticker)
@@ -272,6 +289,28 @@ async def test_no_getter_means_no_sweep_and_legacy_resolution(tmp_path: Path) ->
         combo_ticker="KXOVR-1-2", collection=None, default=FeeType.QUADRATIC
     )
     assert forced is FeeType.QUADRATIC_WITH_COMBO_MAKER_FEES
+
+
+def test_series_ticker_is_read_from_the_documented_collection_shape() -> None:
+    """docs/api-notes/multivariate.md §1-2: the single-collection response
+    wraps one MultivariateEventCollection under ``multivariate_contract``
+    and ``series_ticker`` is required on it. The resolver reads exactly
+    that; a payload without it fails closed (None -> observed/default)."""
+    from combomaker.rfq.lifecycle import _series_ticker_from_collection
+
+    assert _series_ticker_from_collection(documented_collection_payload("KXMVESPORTS")) == (
+        "KXMVESERIES"
+    )
+    # A bare object (the §1 list element shape) is read too.
+    assert _series_ticker_from_collection(
+        documented_collection_payload("KXMVESPORTS")["multivariate_contract"]
+    ) == "KXMVESERIES"
+    # Fail closed: missing / empty / wrong-typed series ticker, or no dict.
+    assert _series_ticker_from_collection({"multivariate_contract": {"ticker": "X"}}) is None
+    assert _series_ticker_from_collection({"multivariate_contract": {"series_ticker": ""}}) is None
+    assert _series_ticker_from_collection({"series_ticker": 7}) is None
+    assert _series_ticker_from_collection(["KXMVESERIES"]) is None
+    assert _series_ticker_from_collection(None) is None
 
 
 def test_fee_config_has_no_bare_maker_number() -> None:
