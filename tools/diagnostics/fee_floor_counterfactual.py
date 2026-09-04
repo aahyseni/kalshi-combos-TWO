@@ -22,21 +22,32 @@ never a reimplementation). Three sections:
    the fee at their bid (the floor would have re-priced them).
 
 3. QUOTE REPLAY on >= 50k ``quote_sent`` decisions since the onset (rowid
-   range): fair, width and legs come from ``context_json``; the markup is
+   range, the first rowid at/after the onset found by bisection on ``at``):
+   fair, width and legs come from ``context_json``; the markup is
    re-derived with the live ``MarkupPolicy`` on the live yaml; the applied
    skew is reconstructed as the residual between the recorded bid and
    fair_no − margin (the recorded bid is ground truth for "today"). Each
    quote is re-constructed under {today (fee 0), floor, width} with the
-   measured 0.035 combo maker schedule; per tier: bids moved (count, mean
-   cc), NON-ZERO quote count. With ``--with-cell-floor`` the measured
-   retained-edge floor table is estimated from the settled grade (live
-   estimator on read-only SQL) and applied as well.
+   MEASURED combo maker schedule (fitted from the ground-truth fixture by
+   the live observer — never a typed coefficient) at the SMALLEST post-
+   onset fill size on the tape (the floor is tightest there); per tier:
+   bids moved (count, mean cc), NON-ZERO quote count. With
+   ``--with-cell-floor`` the measured retained-edge floor table is
+   estimated from the settled grade (live estimator on read-only SQL) and
+   applied as well — absent cells resolve through the live
+   ``floor_for_cell`` (sport pool upper bound), and the tool FLAGS, per
+   tier, the quotes whose cell floor makes the rebate cap LOOSER than the
+   8/16 ``margin // 2`` rule ("cap loosened"). That loosening is
+   UNOBSERVABLE in the replay proper — a recorded quote carries no skew, so
+   the residual reconstruction can never exceed the cap that produced it —
+   which is why it is measured with a saturating synthetic rebate through
+   the live ``construct_quote`` instead (review fix M4c).
 
 Usage:
     PYTHONPATH=src .venv/Scripts/python.exe -m tools.diagnostics.fee_floor_counterfactual \
         --config config/prod-live-wc.local.yaml \
         --db "file:D:/kalshi-combos-TWO-data/combomaker-prod-live-wc.sqlite3?mode=ro" \
-        --decisions-from 132892717 --max-quotes 60000 --with-cell-floor
+        --max-quotes 60000 --with-cell-floor
 """
 
 from __future__ import annotations
@@ -48,6 +59,7 @@ import sys
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
+from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -55,13 +67,15 @@ from typing import Any
 from combomaker.core.conventions import Side, load_conventions
 from combomaker.core.money import CC_PER_DOLLAR, CentiCents
 from combomaker.core.quantity import CentiContracts
+from combomaker.exchange.fills import fee_observations_from_fills
 from combomaker.marketdata.grid import PriceGrid
 from combomaker.ops.config import load_config
+from combomaker.pricing.fee_observer import fit_maker_coefficient
 from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
 from combomaker.pricing.joint import JointEstimate
 from combomaker.pricing.markup import MarkupPolicy, _is_cross_game_ml_parlay
 from combomaker.pricing.quote import ConstructedQuote, QuoteParams, construct_quote
-from combomaker.pricing.retained_cell import CellKey, cell_key
+from combomaker.pricing.retained_cell import CellKey, cell_key, floor_for_cell
 from combomaker.rfq.edge import candidate_edge_cc
 from combomaker.risk.exposure import LegRef
 from combomaker.risk.retained_edge_floor import (
@@ -75,9 +89,65 @@ from combomaker.risk.retained_edge_floor import (
 JsonDict = dict[str, Any]
 ONSET_ISO = "2026-08-20T09:07:00"
 COMBO = FeeType.QUADRATIC_WITH_COMBO_MAKER_FEES
-# The measured schedule (tests/fixtures/ground_truth/maker_fee_20260820.json
-# pins 0.035 on 540/540 charged fills); taker 0.07 from the published PDF.
-MEASURED = FeeSchedule(taker_coef=Fraction(7, 100), maker_coef=Fraction(35, 1000))
+GROUND_TRUTH = (
+    Path(__file__).resolve().parents[2]
+    / "tests" / "fixtures" / "ground_truth" / "maker_fee_20260820.json"
+)
+
+
+def measured_schedule(taker_coef: str) -> FeeSchedule:
+    """The maker coefficient FITTED by the live observer from the real
+    charged-fill fixture (review fix S5: the tool can no longer drift from
+    the measurement); the taker coefficient is the config's."""
+    raw = json.loads(GROUND_TRUTH.read_text(encoding="utf-8"))
+    rows = [
+        {
+            "fill_id": r["fill_id"], "created_time": r["created_time"], "ticker": r["ticker"],
+            "count_fp": r["count_fp"], "no_price_dollars": r["no_price_dollars"],
+            "fee_cost": r["fee_cost"], "is_taker": False, "side": "no",
+        }
+        for r in raw["charged_maker_fills"]
+    ]
+    fit = fit_maker_coefficient(fee_observations_from_fills(rows))
+    if fit is None:
+        raise SystemExit("the ground-truth fixture no longer pins a maker coefficient")
+    return FeeSchedule(taker_coef=Fraction(Decimal(taker_coef)), maker_coef=fit)
+
+
+def first_decision_id_at_or_after(con: sqlite3.Connection, iso: str) -> int:
+    """Bisection on rowid over ``decisions.at`` (rowid point reads only —
+    never a scan of the table)."""
+    lo, hi = con.execute("SELECT MIN(id), MAX(id) FROM decisions").fetchone()
+    if lo is None:
+        raise SystemExit("decisions table is empty")
+
+    def at_or_after(rowid: int) -> tuple[int, str] | None:
+        row = con.execute(
+            "SELECT id, at FROM decisions WHERE id >= ? ORDER BY id LIMIT 1", (rowid,)
+        ).fetchone()
+        return None if row is None else (int(row[0]), str(row[1]))
+
+    lo, hi = int(lo), int(hi)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        row = at_or_after(mid)
+        if row is None or str(row[1]) >= iso:
+            hi = mid
+        else:
+            lo = mid + 1
+    row = at_or_after(lo)
+    if row is None or str(row[1]) < iso:
+        raise SystemExit(f"no decision at or after {iso}")
+    return int(row[0])
+
+
+def smallest_post_onset_fill_centi(con: sqlite3.Connection) -> int:
+    """The replay quantity: the SMALLEST post-onset fill size on the tape
+    (the derived floor is tightest at the smallest size, so the quote-
+    ability gate is judged at its hardest)."""
+    first_id = con.execute("SELECT MIN(id) FROM fills WHERE at >= ?", (ONSET_ISO,)).fetchone()[0]
+    q = con.execute("SELECT MIN(contracts_centi) FROM fills WHERE id >= ?", (first_id,)).fetchone()
+    return int(q[0]) if q and q[0] else 100
 # Every combo market this run has quoted sits on a 0.1c grid (store: 5,000/
 # 5,000 sampled quote_sent no_bids and 547/547 fill prices on multiples of
 # 10cc); the live grid is fetched per collection, this is its shape.
@@ -139,6 +209,9 @@ class Tally:
     moved_cell_cc: int = 0
     parity_today: int = 0
     rebate_quotes: int = 0
+    # M4c: quotes whose CELL floor makes the rebate cap looser than margin // 2
+    # (measured with a saturating synthetic rebate; unobservable in replay).
+    cap_loosened: int = 0
 
 
 def build_quote(
@@ -152,13 +225,14 @@ def build_quote(
     params: QuoteParams,
     mode: str,
     retained_floor_cc: int | None = None,
+    qty_centi: int = 1_000,
 ) -> ConstructedQuote | None:
     # width components are re-supplied through a zero-width params + the
     # joint's uncertainty so ``half`` reproduces the recorded width exactly.
     total_width = sum(int(v) for v in width.values())
     p = params.__class__(
         **{
-            **{f: getattr(params, f) for f in params.__slots__},  # type: ignore[attr-defined]
+            **{f: getattr(params, f) for f in params.__slots__},
             "base_width_cc": 0,
             "per_leg_width_cc": 0,
             "size_width_cc_per_100": 0,
@@ -176,7 +250,7 @@ def build_quote(
     q = construct_quote(
         joint=joint,
         n_legs=2,
-        qty=CentiContracts(1_000),
+        qty=CentiContracts(qty_centi),
         grid=GRID,
         fee_model=fee_model,
         fee_type=fee_type,
@@ -308,13 +382,10 @@ def fills_section(
             net_negative_premium += premium
             t["negative"] += 1
             t["negative_premium_cc"] += premium
-        # Would the floor have re-priced this fill? retained per contract at
-        # the bid < the per-contract fee at the bid.
-        retained_per_ct = side_fair - int(price)
-        fee_per_ct = int(
-            fee_model.fee_per_contract_cc(price_cc=CentiCents(int(price)), fee_type=COMBO)
-        )
-        if retained_per_ct < fee_per_ct:
+        # Would the floor have re-priced this fill? The floor IS the confirm
+        # gate's predicate at the fill's own size (review fix M3): the fill
+        # is re-priced when its fee-net edge at its own bid is <= 0.
+        if net <= 0:
             t["repriced_by_floor"] += 1
             t["repriced_premium_cc"] += premium
     print("=" * 78)
@@ -332,7 +403,8 @@ def fills_section(
           f" ({fee_total / max(1, gross_total):.0%} of edge); net {dollars(net_total)}")
     print(f"NEGATIVE after fee: {net_negative} fills / {dollars(net_negative_premium)} premium")
     print()
-    print("2. FILLS THE FLOOR WOULD HAVE RE-PRICED (retained/ct < fee/ct at the bid)")
+    print("2. FILLS THE FLOOR WOULD HAVE RE-PRICED"
+          " (fee-net edge <= 0 at the fill's own bid and size)")
     print(f"{'tier':<22}{'fills':>6}{'premium':>12}{'gross':>10}{'fee':>9}{'neg':>5}"
           f"{'neg $':>11}{'floor':>7}{'floor $':>11}")
     for tier in sorted(by_tier, key=lambda k: -by_tier[k]["premium_cc"]):
@@ -418,7 +490,9 @@ def quotes_section(
     *,
     decisions_from: int,
     max_quotes: int,
-    floor_table: dict[tuple[str, ...], int] | None,
+    floor_table: dict[CellKey, int] | None,
+    pool_floor_cc: dict[str, int] | None = None,
+    qty_centi: int = 1_000,
 ) -> dict[str, Tally]:
     cur = con.execute(
         "SELECT id, context_json FROM decisions WHERE kind = 'quote_sent' AND id >= ?"
@@ -426,8 +500,19 @@ def quotes_section(
         (decisions_from, max_quotes),
     )
     tallies: dict[str, Tally] = defaultdict(Tally)
+    loosened_cells: dict[CellKey, int] = {}
     skipped = 0
     n = 0
+
+    def mk(
+        fair_cc: int, width: dict[str, int], markup_cc: int, skew_cc: int, *, fee_type: FeeType,
+        mode: str, retained_floor_cc: int | None = None,
+    ) -> ConstructedQuote | None:
+        return build_quote(
+            fair_cc=fair_cc, width=width, markup_cc=markup_cc, skew_cc=skew_cc,
+            fee_model=fee_model, fee_type=fee_type, params=params, mode=mode,
+            retained_floor_cc=retained_floor_cc, qty_centi=qty_centi,
+        )
     for _id, ctx in cur:
         d = json.loads(ctx)
         fair = int(d.get("fair_cc", -1))
@@ -452,29 +537,34 @@ def quotes_section(
         t.n += 1
         if skew > 0:
             t.rebate_quotes += 1
-        today = build_quote(
-            fair_cc=fair, width=width, markup_cc=markup, skew_cc=skew, fee_model=fee_model,
-            fee_type=FeeType.QUADRATIC, params=params, mode="width",
-        )
-        floor = build_quote(
-            fair_cc=fair, width=width, markup_cc=markup, skew_cc=skew, fee_model=fee_model,
-            fee_type=COMBO, params=params, mode="floor",
-        )
-        widen = build_quote(
-            fair_cc=fair, width=width, markup_cc=markup, skew_cc=skew, fee_model=fee_model,
-            fee_type=COMBO, params=params, mode="width",
-        )
+        today = mk(fair, width, markup, skew, fee_type=FeeType.QUADRATIC, mode="width")
+        floor = mk(fair, width, markup, skew, fee_type=COMBO, mode="floor")
+        widen = mk(fair, width, markup, skew, fee_type=COMBO, mode="width")
         cell_q = None
         if floor_table is not None:
             leg_refs = [
                 LegRef(market_ticker=tk, event_ticker=tk.rsplit("-", 1)[0], side="yes")
                 for tk in legs
             ]
-            floor_cc = floor_table.get(cell_key(leg_refs))
-            cell_q = build_quote(
-                fair_cc=fair, width=width, markup_cc=markup, skew_cc=skew, fee_model=fee_model,
-                fee_type=COMBO, params=params, mode="floor", retained_floor_cc=floor_cc,
-            )
+            key = cell_key(leg_refs)
+            # The LIVE lookup rule: absent cell -> sport pool upper bound (M2).
+            floor_cc = floor_for_cell(key, floor_table, pool_floor_cc or {})
+            cell_q = mk(fair, width, markup, skew, fee_type=COMBO, mode="floor",
+                        retained_floor_cc=floor_cc)
+            # M4c: is this cell's cap LOOSER than today's margin // 2? Push a
+            # saturating rebate (the whole margin) through both rules; the
+            # replay's residual skew can never show this, so it is measured
+            # here explicitly.
+            sat_today = mk(fair, width, markup, margin, fee_type=FeeType.QUADRATIC, mode="width")
+            sat_cell = mk(fair, width, markup, margin, fee_type=COMBO, mode="floor",
+                          retained_floor_cc=floor_cc)
+            if (
+                sat_today is not None
+                and sat_cell is not None
+                and int(sat_cell.no_bid_cc) > int(sat_today.no_bid_cc)
+            ):
+                t.cap_loosened += 1
+                loosened_cells[key] = floor_cc
         today_bid = int(today.no_bid_cc) if today else 0
         if today_bid == no_bid:
             t.parity_today += 1
@@ -495,12 +585,12 @@ def quotes_section(
                 setattr(t, cc_attr, getattr(t, cc_attr) + (bid - today_bid))
     print("=" * 78)
     print(f"3. QUOTE REPLAY: {n} quote_sent decisions from rowid {decisions_from}"
-          f" (skipped {skipped})")
+          f" (skipped {skipped}); replay qty {qty_centi / 100:.2f} contracts")
     print("=" * 78)
     hdr = (f"{'tier':<20}{'n':>7}{'rebate':>7}{'parity':>8}{'nz today':>9}{'nz floor':>9}"
            f"{'nz width':>9}{'mv floor':>9}{'mean cc':>8}{'mv width':>9}{'mean cc':>8}")
     if floor_table is not None:
-        hdr += f"{'nz cell':>8}{'mv cell':>8}{'mean cc':>8}"
+        hdr += f"{'nz cell':>8}{'mv cell':>8}{'mean cc':>8}{'loosened':>9}"
     print(hdr)
     for tier in sorted(tallies, key=lambda k: -tallies[k].n):
         t = tallies[tier]
@@ -511,11 +601,19 @@ def quotes_section(
                 f"{(t.moved_width_cc / t.moved_width if t.moved_width else 0):>8.1f}")
         if floor_table is not None:
             line += (f"{t.nonzero_cell:>8}{t.moved_cell:>8}"
-                     f"{(t.moved_cell_cc / t.moved_cell if t.moved_cell else 0):>8.1f}")
+                     f"{(t.moved_cell_cc / t.moved_cell if t.moved_cell else 0):>8.1f}"
+                     f"{t.cap_loosened:>9}")
         print(line)
     zero_tiers = [k for k, t in tallies.items() if t.nonzero_floor == 0]
     print()
     print("GATE: tiers with ZERO non-zero quotes under floor:", zero_tiers or "none")
+    if floor_table is not None:
+        total_loosened = sum(t.cap_loosened for t in tallies.values())
+        print(f"CAP LOOSENED (cell floor < margin//2 - fee; UNOBSERVABLE in the replay -"
+              f" measured with a saturating rebate): {total_loosened} quotes on"
+              f" {len(loosened_cells)} cells")
+        for key, floor_cc in sorted(loosened_cells.items()):
+            print(f"  {'|'.join(key):<70} floor {floor_cc:>5}")
     return tallies
 
 
@@ -527,26 +625,47 @@ def main(argv: Iterable[str] | None = None) -> int:
     ap.add_argument(
         "--db", default="file:D:/kalshi-combos-TWO-data/combomaker-prod-live-wc.sqlite3?mode=ro"
     )
-    ap.add_argument("--decisions-from", type=int, default=132892717)
+    ap.add_argument(
+        "--decisions-from", type=int, default=None,
+        help="first decisions rowid to replay (default: the first at/after the onset, bisected)",
+    )
     ap.add_argument("--max-quotes", type=int, default=60_000)
     ap.add_argument("--with-cell-floor", action="store_true")
+    ap.add_argument(
+        "--qty-centi", type=int, default=None,
+        help="replay quantity in centi-contracts (default: the smallest post-onset fill)",
+    )
     args = ap.parse_args(list(argv) if argv is not None else None)
     cfg = load_config(Path(args.config))
     policy = MarkupPolicy.from_config(cfg.pricing.markup)
     conventions = load_conventions()
-    fee_model = FeeModel(MEASURED, conventions)
+    measured = measured_schedule(cfg.pricing.fee.taker_coef)
+    fee_model = FeeModel(measured, conventions)
     params = quote_params(cfg)
     print(f"config {args.config}: fee.mode={cfg.pricing.fee.mode}"
           f" sell_only={params.sell_parlays_only} ml_parlay_cc={policy.ml_parlay_cc}"
-          f" conventions maker_is_taker={conventions.maker_is_taker_on_fill}")
+          f" conventions maker_is_taker={conventions.maker_is_taker_on_fill}"
+          f" measured maker_coef={float(measured.maker_coef):.4f} (observer fit on"
+          f" {GROUND_TRUTH.name}) taker_coef={float(measured.taker_coef):.4f}")
     con = sqlite3.connect(args.db, uri=True)
+    decisions_from = (
+        args.decisions_from
+        if args.decisions_from is not None
+        else first_decision_id_at_or_after(con, ONSET_ISO)
+    )
+    qty_centi = (
+        args.qty_centi if args.qty_centi is not None else smallest_post_onset_fill_centi(con)
+    )
     fills_section(con, policy, fee_model, conventions)
     floor_table = None
+    pool_floor: dict[str, int] | None = None
     if args.with_cell_floor:
-        floor_table, _ = cell_floor_table(con)
+        floor_table, est = cell_floor_table(con)
+        pool_floor = dict(est.pool_floor_cc) if est.published else None
     quotes_section(
         con, policy, fee_model, params,
-        decisions_from=args.decisions_from, max_quotes=args.max_quotes, floor_table=floor_table,
+        decisions_from=decisions_from, max_quotes=args.max_quotes, floor_table=floor_table,
+        pool_floor_cc=pool_floor, qty_centi=qty_centi,
     )
     return 0
 
