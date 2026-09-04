@@ -192,6 +192,7 @@ def estimate_retained_floor(
             )
         else:
             se2 = st.se_cc**2
+            post_se: float | None
             if se2 <= 0.0:
                 # Every cluster agrees exactly: the cell's own data carry the
                 # whole weight (a degenerate but well-defined posterior).
