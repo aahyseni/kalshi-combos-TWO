@@ -3,7 +3,9 @@
 - estimator: contract-weighted, game-clustered SE, empirical-Bayes shrink
   to the sport pool, thin cells (derived n_min: SE² > τ²) take the pool's
   UPPER bound, nothing publishes below the 14-day pooled span, z is the
-  policy daily anchor (3);
+  policy daily anchor (3) applied as its tail probability through
+  Student-t at clusters − 1 df (a 3-cluster pool cannot publish a floor of
+  0 off an SE estimated from two degrees of freedom — review fix pass);
 - rebate bound: es_value caps at the measured Cov price; exposure-backed
   drops a leg-axis rebate whose mirror direction the book does not hold;
   widening passes untouched;
@@ -33,6 +35,7 @@ from combomaker.risk.retained_edge_floor import (
     grade_row_from_store,
     pool_stats,
     summarize,
+    tail_quantile,
 )
 
 MLB_ALL_NO_RFI: CellKey = ("mlb", "rfi|rfi", "all_no", "cross")
@@ -97,15 +100,21 @@ def test_floor_is_the_z_upper_bound_of_adverse_selection() -> None:
     assert est.published and est.z == K_DAILY == 3.0
     by = {c.cell: c for c in est.cells}
     assert not by[MLB_YES_ML].thin and not by[MLB_ALL_NO_RFI].thin
-    # The losing cell's floor covers its measured shortfall plus z·SE.
+    # PIN CHANGED 2026-09-04 (review fix pass): the SE multiplier is the
+    # Student-t quantile of the policy tail probability at the cell's own
+    # clusters − 1 df (120 clusters here → 3.08, not 3.0; → 3.0 as G grows).
     b = by[MLB_ALL_NO_RFI]
+    q = tail_quantile(est.z, b.stats.n_clusters)
+    assert q is not None and b.quantile == q and 3.0 < q < 3.1
     assert b.post_mean_cc < -20.0 and b.post_se_cc is not None
-    assert b.floor_cc == max(0, math.ceil(3.0 * b.post_se_cc - b.post_mean_cc))
+    assert b.floor_cc == max(0, math.ceil(q * b.post_se_cc - b.post_mean_cc))
     assert b.floor_cc >= 20
-    # The outperforming cell floors at max(0, z·SE − mean): its own
+    # The outperforming cell floors at max(0, q·SE − mean): its own
     # performance offsets the uncertainty; never negative.
     g = by[MLB_YES_ML]
-    assert g.floor_cc == max(0, math.ceil(3.0 * (g.post_se_cc or 0.0) - g.post_mean_cc))
+    gq = tail_quantile(est.z, g.stats.n_clusters)
+    assert gq is not None
+    assert g.floor_cc == max(0, math.ceil(gq * (g.post_se_cc or 0.0) - g.post_mean_cc))
     assert g.floor_cc < b.floor_cc
     assert est.table[MLB_ALL_NO_RFI] == b.floor_cc
     summary = summarize(est)
@@ -328,3 +337,34 @@ def test_rows_without_event_tickers_are_their_own_cluster() -> None:
     assert grade_row_from_store(store_row("KXMVE-D", [])) is None
     bad = store_row("KXMVE-E", [{"side": "no"}])
     assert grade_row_from_store(bad) is None
+
+
+# ---------------------------- the tail quantile follows the clusters (fix pass)
+
+
+def test_tail_quantile_is_z_for_many_clusters_and_fails_closed_for_few() -> None:
+    assert tail_quantile(3.0, 1) is None and tail_quantile(3.0, 0) is None
+    assert 19.0 < (tail_quantile(3.0, 3) or 0.0) < 19.5
+    assert 3.8 < (tail_quantile(3.0, 12) or 0.0) < 3.9
+    assert 3.0 < (tail_quantile(3.0, 1_425) or 0.0) < 3.01
+
+
+def test_a_three_row_pool_cannot_publish_a_zero_floor_off_an_outperformance() -> None:
+    """The live cross-sport pool: 3 settled rows in 3 clusters, +27.9c/ct
+    vs the model, SE 4.0c. At z·SE the upper bound is max(0, 12.1 − 27.9)
+    = 0 and every absent cross-sport cell inherited the loosest cap; at the
+    t quantile for 2 df (19.2) the pool floor is ~49c — fail-closed until
+    the pool actually measures something."""
+    mlb = _cell(MLB_YES_ML, [0.0 + (i % 7) - 3 for i in range(200)])
+    other_cell: CellKey = ("other", "btts|moneyline", "all_yes", "cross")
+    other = _cell(other_cell, [27.0, 32.0, 24.6])
+    est = estimate_retained_floor(mlb + other)
+    pool = est.pools["other"]
+    assert pool.n_clusters == 3 and pool.mean_cc > 20.0 and pool.se_cc is not None
+    q = tail_quantile(est.z, 3)
+    assert q is not None
+    assert est.pool_floor_cc["other"] == max(0, math.ceil(q * pool.se_cc - pool.mean_cc)) > 0
+    assert math.ceil(3.0 * pool.se_cc - pool.mean_cc) < 0  # what plain z would have said
+    absent: CellKey = ("other", "rfi|rfi", "all_no", "cross")
+    assert floor_for_cell(absent, est.table, est.pool_floor_cc) == est.pool_floor_cc["other"]
+    assert summarize(est)["pool_quantile_by_sport"]["other"] == round(q, 2)

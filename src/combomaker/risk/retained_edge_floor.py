@@ -28,8 +28,16 @@ A cell whose own data carry less than half the posterior weight (SE_c² >
 falls below the between-cell dispersion) is THIN and takes the sport
 pool's UPPER bound instead (fail-closed: a new shape can never be sold at
 fair). ``z`` is the policy z ladder's daily anchor (risk/cap_family.py
-K_DAILY = 3), not a new number. Nothing publishes until the settled record
-spans the pre-registered pooled-read minimum (``MIN_POOL_DAYS``).
+K_DAILY = 3), not a new number — and it is applied as its TAIL PROBABILITY
+through Student-t at G − 1 degrees of freedom, G the number of clusters
+the SE was estimated from (``tail_quantile``): with 1,400 clusters the
+3σ tail needs 3.0 SEs, with 12 it needs 3.85, with 3 it needs 19.2. The
+SE of a 3-cluster pool is not a known quantity, and treating it as one
+let the cross-sport pool (3 settled rows, +27.9c/ct) publish a floor of 0
+that every absent cross-sport cell then inherited (2026-09-04 review fix
+pass, surfaced by the counterfactual's cap-loosened flag). Nothing
+publishes until the settled record spans the pre-registered pooled-read
+minimum (``MIN_POOL_DAYS``).
 
 This is the RETAINED-margin side only: the widen direction and every cap
 are untouched; the quote path does one dict lookup (``table``).
@@ -43,6 +51,9 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from statistics import NormalDist
+
+from scipy.stats import t as student_t
 
 from combomaker.pricing.grouping import game_key
 from combomaker.pricing.retained_cell import CellKey, cell_key
@@ -94,6 +105,9 @@ class CellEstimate:
     thin: bool
     floor_cc: int
     source: str  # "cell" | "pool"
+    # The SE multiplier actually applied (Student-t at the cell's own
+    # clusters − 1 df for the policy tail probability; None on a pool floor).
+    quantile: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,11 +195,26 @@ def pool_stats(rows: Iterable[GradeRow]) -> PoolStats:
     return PoolStats(len(rows), g, total_w, mean, math.sqrt(var))
 
 
-def _upper_floor_cc(mean_cc: float, se_cc: float | None, z: float) -> int | None:
-    """max(0, z·SE − mean): the z-upper bound of the adverse selection."""
-    if se_cc is None:
+def tail_quantile(z: float, n_clusters: int) -> float | None:
+    """The SE multiplier that reaches the policy anchor's TAIL PROBABILITY
+    Φ(−z) when the SE was estimated from ``n_clusters`` clusters: the
+    Student-t quantile at n_clusters − 1 degrees of freedom. → z as the
+    clusters grow; None (nothing is measured) below two clusters."""
+    if n_clusters < 2:
         return None
-    return max(0, math.ceil(z * se_cc - mean_cc))
+    p = float(NormalDist().cdf(z))
+    return float(student_t.ppf(p, n_clusters - 1))
+
+
+def _upper_floor_cc(
+    mean_cc: float, se_cc: float | None, z: float, n_clusters: int
+) -> tuple[int, float] | None:
+    """(max(0, q·SE − mean), q): the tail-probability upper bound of the
+    adverse selection, q the Student-t quantile for the clusters."""
+    q = tail_quantile(z, n_clusters)
+    if se_cc is None or q is None:
+        return None
+    return max(0, math.ceil(q * se_cc - mean_cc)), q
 
 
 def estimate_retained_floor(
@@ -223,12 +252,12 @@ def estimate_retained_floor(
         tau2[sport] = max(0.0, between - within)
     pool_floor: dict[str, int] = {}
     for sport, pool in pools.items():
-        upper = _upper_floor_cc(pool.mean_cc, pool.se_cc, z)
+        upper = _upper_floor_cc(pool.mean_cc, pool.se_cc, z, pool.n_clusters)
         # A pool with a single cluster has no measured dispersion at all:
         # fail closed on it with the largest floor its own data allow — the
         # whole |mean| plus nothing more cannot be justified, so we take the
         # sport's absolute mean shortfall magnitude as the bound.
-        pool_floor[sport] = upper if upper is not None else max(0, math.ceil(-pool.mean_cc))
+        pool_floor[sport] = upper[0] if upper is not None else max(0, math.ceil(-pool.mean_cc))
     cells: list[CellEstimate] = []
     table: dict[CellKey, int] = {}
     for cell, st in cell_stats.items():
@@ -258,9 +287,17 @@ def estimate_retained_floor(
             if thin:
                 est = CellEstimate(cell, st, post_mean, post_se, w, True, pool_floor[sport], "pool")
             else:
-                own = _upper_floor_cc(post_mean, post_se, z)
-                floor = pool_floor[sport] if own is None else own
-                est = CellEstimate(cell, st, post_mean, post_se, w, False, floor, "cell")
+                # The quantile follows the cell's OWN clusters (the pool's
+                # information enters through the shrunk mean/SE, not the df).
+                own = _upper_floor_cc(post_mean, post_se, z, st.n_clusters)
+                if own is None:
+                    est = CellEstimate(
+                        cell, st, post_mean, post_se, w, False, pool_floor[sport], "pool"
+                    )
+                else:
+                    est = CellEstimate(
+                        cell, st, post_mean, post_se, w, False, own[0], "cell", own[1]
+                    )
         cells.append(est)
         table[cell] = est.floor_cc
     return FloorEstimate(
@@ -284,6 +321,11 @@ def summarize(estimate: FloorEstimate) -> Mapping[str, object]:
         "reason": estimate.reason,
         "span_days": round(estimate.span_days, 1),
         "z": estimate.z,
+        "pool_quantile_by_sport": {
+            s: round(q, 2)
+            for s, p in sorted(estimate.pools.items())
+            if (q := tail_quantile(estimate.z, p.n_clusters)) is not None
+        },
         "n_cells": len(estimate.cells),
         "n_thin": sum(1 for c in estimate.cells if c.thin),
         "floor_cc_min": floors[0] if floors else None,
