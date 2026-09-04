@@ -951,3 +951,331 @@ async def test_repair_tool_apply_matches_store_void_to_the_row(tmp_path: Path) -
         backup_dir=tmp_path / "backups2",
     )
     assert again["touched"] == {"fills": 0, "position_ledger": 0, "ev_ledger": 0}
+
+
+# --------------------------------------------------------------------------- #
+# 9. Review fixes (2026-09-04 adversarial review of item D).                  #
+# --------------------------------------------------------------------------- #
+
+
+async def test_migration_watermark_is_max_id_once(tmp_path: Path) -> None:
+    """The verification watermark is MAX(fills.id) at migration (0 on a fresh
+    store), stamped once and never moved — the boundary between legacy rows
+    (repair-tool territory) and rows the verifying code wrote."""
+    fresh = await Store.open(tmp_path / "fresh.sqlite3", FakeClock())
+    try:
+        wm = await fresh.fills_verification_watermark()
+        assert wm is not None and wm[0] == 0
+        await fresh.record_fill(
+            "fill:n", order_id="o-n", combo_ticker="T", our_side="no", contracts_centi=1,
+            price_cc=1, fee_cc=0, expected_edge_cc=1, raw={},
+        )
+        wm_after = await fresh.fills_verification_watermark()
+        assert wm_after is not None and wm_after[0] == 0
+    finally:
+        await fresh.close()
+    path = tmp_path / "legacy.sqlite3"
+    _legacy_db(path)
+    store = await Store.open(path, FakeClock())
+    try:
+        wm = await store.fills_verification_watermark()
+        assert wm is not None and wm[0] == 4 and wm[1]
+        await store.record_fill(
+            "fill:new", order_id="fresh", combo_ticker="T", our_side="no", contracts_centi=1,
+            price_cc=1, fee_cc=0, expected_edge_cc=1, raw={},
+        )
+        await store.close()
+        store = await Store.open(path, FakeClock())  # re-open: unchanged
+        assert await store.fills_verification_watermark() == wm
+    finally:
+        await store.close()
+
+
+async def test_booked_unverified_fills_scopes_to_post_watermark_keyed_rows(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.sqlite3"
+    _legacy_db(path)
+    store = await Store.open(path, FakeClock())
+    try:
+        wm = await store.fills_verification_watermark()
+        assert wm is not None
+        # Legacy rows (ids 1-4, all 'booked') are NEVER re-armable.
+        assert await store.booked_unverified_fills(after_id=wm[0]) == []
+        for ref, oid in (("fill:k1", "o-k1"), ("fill:k2", "o-k2"), ("fill:nokey", None)):
+            assert await store.record_fill(
+                ref, order_id=oid, combo_ticker="T", our_side="no", contracts_centi=100,
+                price_cc=5000, fee_cc=7, expected_edge_cc=1, raw={},
+            )
+        rows = await store.booked_unverified_fills(after_id=wm[0])
+        assert [r["fill_ref"] for r in rows] == ["fill:k1", "fill:k2"]  # NULL key excluded
+        assert rows[0]["order_id"] == "o-k1" and rows[0]["fee_cc"] == 7
+        assert rows[0]["contracts_centi"] == 100 and rows[0]["at"]
+        # Terminal states leave the set.
+        assert await store.mark_fill_verified("fill:k1", exchange_fill_id="f1")
+        await store.void_phantom_fill("fill:k2", reason="absent_from_portfolio_fills")
+        assert await store.booked_unverified_fills(after_id=wm[0]) == []
+    finally:
+        await store.close()
+
+
+async def test_ev_summary_excludes_voided_phantom_rows(tmp_path: Path) -> None:
+    store = await Store.open(tmp_path / "ev.sqlite3", FakeClock())
+    try:
+        for ref, edge in (("fill:real", 500), ("fill:ph", 1330)):
+            assert await store.record_fill(
+                ref, order_id=f"o-{ref}", combo_ticker="T", our_side="no", contracts_centi=100,
+                price_cc=5000, fee_cc=0, expected_edge_cc=edge, raw={},
+            )
+        before = await store.ev_summary()
+        assert before["fills"] == 2 and before["expected_edge_cc"] == 1830
+        await store.void_phantom_fill("fill:ph", reason="absent_from_portfolio_fills")
+        after = await store.ev_summary()
+        # Not "n=2 at 0/0" — the phantom is not graded at all.
+        assert after["fills"] == 1 and after["expected_edge_cc"] == 500
+    finally:
+        await store.close()
+
+
+async def test_post_insert_tail_failure_still_arms_verification(tmp_path: Path) -> None:
+    """Review: if record_realized_pnl/_track_markout raised AFTER the INSERT,
+    the caller saw inserted=False and the row stayed 'booked' unverified
+    forever (the sweep skips fill_recorded states). The tail is now loud and
+    the insert result stands: verification arms and proves the row."""
+    getter = FakeQuoteGetter()
+    fills = FakeFillsGetter()
+    rig = await _verify_rig(tmp_path, getter=getter, fills=fills)
+    fills.script(COMBO_TICKER, {"fills": [taker_fill(order_id="o1")]})
+    quote_id = await _confirmed_quote(rig)
+    fill_ref = f"fill:{quote_id}"
+
+    def boom(*_a: Any, **_k: Any) -> None:
+        raise RuntimeError("markout tracker exploded")
+
+    rig.lifecycle._track_markout = boom  # type: ignore[method-assign]  # noqa: SLF001
+    with structlog.testing.capture_logs() as cap:
+        await rig.lifecycle.on_quote_executed(ws_executed_msg(quote_id, order_id="o1"))
+    events = [e["event"] for e in cap]
+    assert "fill_ledger_post_insert_failed" in events
+    assert "fill_ledger_write_failed" not in events  # never reported as a failed write
+    assert "fill_verification_started" in events
+    assert rig.metrics.counter("fill_ledger.post_insert_failed") == 1
+    assert rig.metrics.counter("fill_verify.started") == 1
+    assert await rig.store.count("fills") == 1
+    await _tick(rig)
+    assert (await _fill_row(rig.store, fill_ref))["status"] == "verified"
+    assert len(fills.calls) == 1
+
+
+async def test_late_verification_is_a_preregistered_alarm(tmp_path: Path) -> None:
+    """Review evidence gap: the 0.486 s figure is two EXCHANGE stamps, not the
+    REST visibility lag of /portfolio/fills. A real fill that verifies only on
+    a LATER read is therefore a loud, counted signal to revisit the budget
+    (a wrong void is an undercount) — registered before relight."""
+    getter = FakeQuoteGetter()
+    fills = FakeFillsGetter()
+    rig = await _verify_rig(tmp_path, getter=getter, fills=fills)
+    fills.script(COMBO_TICKER, {"fills": []})  # not visible yet on read 1
+    quote_id = await _confirmed_quote(rig)
+    fill_ref = f"fill:{quote_id}"
+    await rig.lifecycle.on_quote_executed(ws_executed_msg(quote_id, order_id="o1"))
+    await _tick(rig)
+    assert len(fills.calls) == 1
+    assert (await _fill_row(rig.store, fill_ref))["status"] == "booked"
+    assert fill_ref in rig.exposure.positions
+    fills.script(COMBO_TICKER, {"fills": [taker_fill(order_id="o1")]})  # visible on read 2
+    rig.h.clock.advance(VERIFY_DELAY_S + 0.5)
+    with structlog.testing.capture_logs() as cap:
+        await _tick(rig)
+    assert (await _fill_row(rig.store, fill_ref))["status"] == "verified"
+    late = [e for e in cap if e["event"] == "fill_verified_late"]
+    assert len(late) == 1 and late[0]["attempts"] == 2 and late[0]["order_id"] == "o1"
+    assert rig.metrics.counter("fill_verify.verified_late") == 1
+    assert rig.metrics.counter("fill_verify.phantom_voided") == 0
+
+
+async def test_executed_status_without_creator_order_id_is_unmatched_not_adopted(
+    tmp_path: Path,
+) -> None:
+    """Review: in executed_status with no creator_order_id the structural
+    fallback could adopt an exact-total same-ticker fill of ANOTHER in-flight
+    quote whose row has not landed. The brief required a POSITIVE match:
+    unkeyed => fill_recovery_unmatched, nothing booked, nothing polled, the
+    confirm-booked position KEPT (fail-safe), terminal."""
+    getter = FakeQuoteGetter()
+    fills = FakeFillsGetter()
+    rig = await _verify_rig(tmp_path, getter=getter, fills=fills)
+    quote_id = await _confirmed_quote(rig)
+    fill_ref = f"fill:{quote_id}"
+    getter.script_status(quote_id, "executed")  # no creator_order_id
+    # A structurally-perfect same-ticker print sits on the tape (someone
+    # else's, or ours — unknowable without the key).
+    fills.script(COMBO_TICKER, {"fills": [taker_fill(order_id="ord-someone")]})
+    rig.h.clock.advance(RECOVERY_AFTER_S + 0.5)
+    with structlog.testing.capture_logs() as cap:
+        await _tick(rig)
+    un = [e for e in cap if e["event"] == "fill_recovery_unmatched"]
+    assert len(un) == 1 and un[0]["quote_id"] == quote_id
+    assert rig.metrics.counter("fill_recovery.unmatched") == 1
+    assert rig.metrics.counter("fill_recovery.executed_status_verifying") == 0
+    assert rig.metrics.counter("fill_recovery.recovered") == 0
+    assert fills.calls == []  # no structural read at all
+    assert await rig.store.count("fills") == 0
+    assert fill_ref in rig.exposure.positions  # KEPT — undercount is the dangerous way
+    assert quote_id not in rig.lifecycle._executed_states  # noqa: SLF001 — terminal
+    for _ in range(3):
+        rig.h.clock.advance(VERIFY_DELAY_S + 0.5)
+        await _tick(rig)
+    assert getter.calls == [quote_id] and fills.calls == []
+    assert fill_ref in rig.exposure.positions
+
+
+async def test_restart_rearms_unproven_booked_claims(tmp_path: Path) -> None:
+    """Review: verification state lived only in memory — a crash inside the
+    window left rows 'booked' forever. PROCESS 1 books two WS executions and
+    dies before proving either; PROCESS 2 (same store) re-arms exactly those
+    rows on the verify cadence: the real one verifies on read 1, the phantom
+    is voided after the bounded budget — durable ledgers identical to the
+    in-process void; no GET quote polls; terminal."""
+    getter1 = FakeQuoteGetter()
+    fills1 = FakeFillsGetter()
+    rig1 = await _verify_rig(tmp_path, getter=getter1, fills=fills1)
+    rig1.lifecycle._fill_fee_cc = lambda *a, **k: 123  # type: ignore[method-assign]  # noqa: SLF001
+    q_real = await _confirmed_quote(rig1, rfq_id="rfq_real")
+    await _drain()
+    await rig1.lifecycle.on_quote_executed(ws_executed_msg(q_real, order_id="o-real"))
+    q_ph = await _confirmed_quote(rig1, rfq_id="rfq_ph")
+    await _drain()
+    await rig1.lifecycle.on_quote_executed(ws_executed_msg(q_ph, order_id=PHANTOM_ORDER_ID))
+    await _drain()
+    assert await rig1.store.count("fills") == 2
+    assert (await _fill_row(rig1.store, f"fill:{q_real}"))["status"] == "booked"
+    assert (await _ledger_row(rig1.store, f"fill:{q_ph}")) == ("open", 1000)
+    assert fills1.calls == []  # the process dies before any verification read
+    await rig1.store.close()
+
+    getter2 = FakeQuoteGetter()
+    fills2 = FakeFillsGetter()
+    rig2 = await _verify_rig(tmp_path, getter=getter2, fills=fills2)
+    fills2.script(COMBO_TICKER, {"fills": [taker_fill(order_id="o-real")]})
+    with structlog.testing.capture_logs() as cap:
+        await _tick(rig2)
+    armed = [e for e in cap if e["event"] == "fill_verify_rearmed"]
+    assert len(armed) == 1 and armed[0]["n"] == 2 and armed[0]["watermark_id"] == 0
+    assert rig2.metrics.counter("fill_verify.rearmed") == 2
+    # Tick 1: both claims read (inside the 3-poll budget); the real one is
+    # proven, the phantom's attempt 1 finds nothing.
+    assert sorted(str(c["order_id"]) for c in fills2.calls) == sorted(
+        ["o-real", PHANTOM_ORDER_ID]
+    )
+    assert (await _fill_row(rig2.store, f"fill:{q_real}"))["status"] == "verified"
+    assert (await _fill_row(rig2.store, f"fill:{q_ph}"))["status"] == "booked"
+    assert rig2.metrics.counter("fill_verify.rearm_verified") == 1
+    rig2.h.clock.advance(VERIFY_DELAY_S + 0.5)
+    await _tick(rig2)
+    assert len(fills2.calls) == 3
+    rig2.h.clock.advance(VERIFY_DELAY_S + 0.5)
+    with structlog.testing.capture_logs() as cap:
+        await _tick(rig2)
+    assert len(fills2.calls) == 4
+    voided = [e for e in cap if e["event"] == "fill_phantom_execution_voided"]
+    assert len(voided) == 1 and voided[0]["rearmed"] is True
+    assert voided[0]["order_id"] == PHANTOM_ORDER_ID and voided[0]["contracts_centi"] == 1000
+    assert voided[0]["touched"] == {"fills": 1, "position_ledger": 1, "ev_ledger": 1}
+    # Same-day row => the boot seed carried its fee => reversed in-process.
+    assert voided[0]["fee_reversed_cc"] == 123
+    assert rig2.lifecycle._realized_pnl_cc == 123  # noqa: SLF001 (the seed would hold -123)
+    row = await _fill_row(rig2.store, f"fill:{q_ph}")
+    assert row["status"] == "phantom"
+    assert row["exchange_fill_id"] == "phantom:absent_from_portfolio_fills"
+    assert (await _ledger_row(rig2.store, f"fill:{q_ph}")) == ("phantom", 1000)
+    assert (await _ev_row(rig2.store, f"fill:{q_ph}")) == (0, 0)
+    assert PHANTOM_ORDER_ID not in await rig2.store.fill_order_ids()
+    assert rig2.metrics.counter("fill_verify.rearm_voided") == 1
+    assert rig2.metrics.counter("fill_verify.phantom_voided") == 1
+    assert getter2.calls == []  # never a GET quote for a re-armed claim
+    # Terminal: nothing polls again; a third boot finds nothing to re-arm.
+    rig2.h.clock.advance(VERIFY_DELAY_S + 0.5)
+    await _tick(rig2)
+    assert len(fills2.calls) == 4
+    await rig2.store.close()
+    rig3 = await _verify_rig(tmp_path, getter=FakeQuoteGetter(), fills=FakeFillsGetter())
+    with structlog.testing.capture_logs() as cap:
+        await _tick(rig3)
+    assert [e for e in cap if e["event"] == "fill_verify_rearmed"][0]["n"] == 0
+    await rig3.store.close()
+
+
+async def test_restart_rearm_never_touches_legacy_rows(tmp_path: Path) -> None:
+    """Rows at/below the watermark (the 2026-07-18 truncated-id rows among
+    them) are never re-armed: an exact order_id read would wrongly void a
+    real fill. Their proof is the settlement-corroborated repair tool."""
+    _legacy_db(tmp_path / "recovery.sqlite3")
+    getter = FakeQuoteGetter()
+    fills = FakeFillsGetter()
+    rig = await _verify_rig(tmp_path, getter=getter, fills=fills)  # migrates: watermark 4
+    with structlog.testing.capture_logs() as cap:
+        await _tick(rig)
+    armed = [e for e in cap if e["event"] == "fill_verify_rearmed"]
+    assert len(armed) == 1 and armed[0]["n"] == 0 and armed[0]["watermark_id"] == 4
+    assert fills.calls == []
+    assert await rig.store.fill_status("fill:a") == "booked"
+    assert rig.metrics.counter("fill_verify.rearm_polls") == 0
+
+
+async def test_rearm_fee_reversal_only_for_current_realized_day(tmp_path: Path) -> None:
+    getter = FakeQuoteGetter()
+    rig = await _verify_rig(tmp_path, getter=getter, fills=FakeFillsGetter())
+    today = rig.h.clock.now().isoformat()
+    assert rig.lifecycle._booked_in_current_realized_day(today)  # noqa: SLF001
+    assert not rig.lifecycle._booked_in_current_realized_day(  # noqa: SLF001
+        "2020-01-01T12:00:00+00:00"
+    )
+    assert not rig.lifecycle._booked_in_current_realized_day("garbage")  # noqa: SLF001
+
+
+async def test_ledger_quantity_legacy_rows_counted_not_alarmed(tmp_path: Path) -> None:
+    """Review: 434 legacy open rows would fire the alarm every 5 min and bury
+    a NEW phantom. Rows opened before the verification migration are counted
+    as legacy in the same log line; only post-fix tickers are alarmed/metered."""
+    store = await Store.open(tmp_path / "scope.sqlite3", FakeClock())
+    try:
+        for pid, ticker in (("fill:legacy", "T-OLD"), ("fill:new", "T-NEW"), ("fill:mix", "T-MIX")):
+            await store.record_position_open(_ledger_pos(pid, ticker, Side.NO, 300), subaccount="0")
+        await store.record_position_open(
+            _ledger_pos("fill:mix-old", "T-MIX", Side.NO, 200), subaccount="0"
+        )
+        await store._db.execute(  # noqa: SLF001 — backdate to before the migration stamp
+            "UPDATE position_ledger SET opened_at='2025-12-31T00:00:00+00:00'"
+            " WHERE position_id IN ('fill:legacy', 'fill:mix-old')"
+        )
+        await store._db.commit()  # noqa: SLF001
+        metrics = Metrics()
+        with structlog.testing.capture_logs() as cap:
+            out = await ledger_quantity_reconcile_once(store, {}, metrics)
+        # T-NEW (post-fix) and T-MIX (a post-fix row exists => alarmed in full,
+        # legacy row included in its sum); T-OLD is legacy only.
+        assert {m["ticker"] for m in out} == {"T-NEW", "T-MIX"}
+        mix = next(m for m in out if m["ticker"] == "T-MIX")
+        assert mix["ledger_contracts_centi"] == 500 and mix["ledger_rows_post_fix"] == 1
+        ev = [e for e in cap if e["event"] == "ledger_quantity_mismatch"]
+        assert len(ev) == 1
+        assert ev[0]["n"] == 2 and ev[0]["legacy_n"] == 1
+        assert ev[0]["legacy_by_kind"] == {"ledger_only": 1}
+        assert ev[0]["legacy_tickers"] == ["T-OLD"]
+        assert ev[0]["post_fix_since"]
+        assert metrics.counter("ledger_quantity.mismatch") == 2
+        assert metrics.counter("ledger_quantity.legacy") == 1
+        # Only legacy rows => clean event, legacy still counted.
+        await store._db.execute(  # noqa: SLF001
+            "UPDATE position_ledger SET opened_at='2025-12-31T00:00:00+00:00'"
+        )
+        await store._db.commit()  # noqa: SLF001
+        m2 = Metrics()
+        with structlog.testing.capture_logs() as cap2:
+            assert await ledger_quantity_reconcile_once(store, {}, m2) == []
+        assert cap2[0]["event"] == "ledger_quantity_mismatch_clean" and cap2[0]["legacy_n"] == 3
+        assert m2.counter("ledger_quantity.mismatch") == 0
+        assert m2.counter("ledger_quantity.legacy") == 3
+    finally:
+        await store.close()
