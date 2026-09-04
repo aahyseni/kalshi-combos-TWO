@@ -51,7 +51,8 @@ from pathlib import Path
 from combomaker.core.conventions import load_conventions
 from combomaker.core.money import CC_PER_DOLLAR, CentiCents
 from combomaker.ops.config import load_config
-from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
+from combomaker.ops.fee_schedule import load_observed_fee_schedule
+from combomaker.pricing.fees import FeeModel, FeeType
 from combomaker.pricing.markup import MarkupPolicy, sport_of
 
 DB = "file:data/combomaker-prod-live-wc.sqlite3?mode=ro"
@@ -107,8 +108,10 @@ def main() -> None:
 
     cfg = load_config(Path(args.config))
     markup = MarkupPolicy.from_config(cfg.pricing.markup)
+    # The MEASURED schedule (2026-09-04): the persisted observer file under
+    # data_dir, taker-conservative when absent — never a yaml maker number.
     fee_model = FeeModel(
-        FeeSchedule.from_strings(cfg.pricing.fee.taker_coef, cfg.pricing.fee.maker_coef),
+        load_observed_fee_schedule(cfg.pricing.fee, cfg.data_dir),
         load_conventions(),
     )
     fee_type = FeeType.parse(cfg.pricing.fee.default_fee_type)

@@ -343,6 +343,29 @@ class ObservedFeeSchedule:
         # Bumped on every change a reader might cache against.
         self.generation = 0
 
+    @classmethod
+    def from_config_values(
+        cls,
+        *,
+        taker_coef: str,
+        maker_coef_override: str | None,
+        override_prefixes: Iterable[str],
+    ) -> ObservedFeeSchedule:
+        """A COLD schedule from the config's decimal strings (the engine's
+        stand-alone fallback and the loader's seed): taker-conservative until
+        fills are ingested, the override honoured as documented."""
+        return cls(
+            taker_coef=Fraction(Decimal(taker_coef)),
+            maker_coef_override=(
+                None if maker_coef_override is None else Fraction(Decimal(maker_coef_override))
+            ),
+            override_prefixes=tuple(override_prefixes),
+        )
+
+    @property
+    def maker_coef_override(self) -> Fraction | None:
+        return self._override
+
     # ------------------------------------------------------------ schedule
     def current(self) -> FeeSchedule:
         return FeeSchedule(taker_coef=self._taker_coef, maker_coef=self.maker_coef)
@@ -431,10 +454,17 @@ class ObservedFeeSchedule:
         return out
 
     def observed_active(self, combo_ticker: str | None, collection: str | None) -> bool:
+        """A charged maker fee has been OBSERVED on this combo's collection.
+        Matching is on a whole collection prefix (segment-bounded: the
+        observed ``KXMVECROSSCATEGORY-SHARD1`` marks the market
+        ``KXMVECROSSCATEGORY-SHARD1-S2026…`` and the collection
+        ``KXMVECROSSCATEGORY-SHARD1-R``, never the unsharded
+        ``KXMVECROSSCATEGORY-R`` — a different collection is different
+        exchange truth)."""
         for prefix in self._collections_active:
-            if combo_ticker and combo_ticker.startswith(prefix):
-                return True
-            if collection and collection.startswith(prefix):
+            if _collection_matches(combo_ticker, prefix) or _collection_matches(
+                collection, prefix
+            ):
                 return True
         return False
 
@@ -618,6 +648,12 @@ class ObservedFeeSchedule:
                 maker_coef_override=maker_coef_override,
                 override_prefixes=override_prefixes,
             )
+
+
+def _collection_matches(ticker: str | None, prefix: str) -> bool:
+    if not ticker:
+        return False
+    return ticker == prefix or ticker.startswith(prefix + "-")
 
 
 def _frac_str(value: Fraction) -> str:

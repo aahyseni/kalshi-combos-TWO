@@ -43,12 +43,13 @@ from combomaker.marketdata.metadata import MetadataCache
 from combomaker.marketdata.settled import SettledMarginalResolver
 from combomaker.ops.config import load_config
 from combomaker.ops.dotenv import load_dotenv
+from combomaker.ops.fee_schedule import load_observed_fee_schedule
 from combomaker.ops.logging import configure_logging, get_logger
 from combomaker.ops.metrics import Metrics
 from combomaker.ops.persistence import Store
 from combomaker.ops.quote_app import PaperSender, QuoteApp
 from combomaker.pricing.engine import PricingEngine
-from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
+from combomaker.pricing.fees import FeeModel, FeeType
 from combomaker.pricing.grouping import game_key
 from combomaker.pricing.legtypes import set_pricing_aliases
 from combomaker.rfq.filters import RfqFilter
@@ -171,9 +172,9 @@ async def wire(scratch_dir: Path) -> Wired:
         enabled=widen_cfg.enabled, util_threshold=widen_cfg.util_threshold
     )
     fee_cfg = cfg.pricing.fee
-    fee_model = FeeModel(
-        FeeSchedule.from_strings(fee_cfg.taker_coef, fee_cfg.maker_coef), conventions
-    )
+    # The MEASURED schedule (2026-09-04): persisted observer file under
+    # data_dir, taker-conservative when absent — never a yaml maker number.
+    fee_model = FeeModel(load_observed_fee_schedule(fee_cfg, cfg.data_dir), conventions)
     _sc = cfg.pricing.structural
     structural_cfg = StructuralConfigView(
         dc_rho=_sc.dc_rho,
