@@ -163,7 +163,10 @@ CREATE TABLE IF NOT EXISTS structural_fits (
     verdict TEXT NOT NULL,
     reject_bar REAL NOT NULL,
     challenge_bar REAL NOT NULL,
-    tickers_json TEXT NOT NULL
+    tickers_json TEXT NOT NULL,
+    family TEXT NOT NULL DEFAULT '',
+    route TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_structural_fits_verdict ON structural_fits (verdict);
 CREATE INDEX IF NOT EXISTS idx_structural_fits_rfq ON structural_fits (rfq_id);
@@ -301,6 +304,21 @@ class Store:
         # now runs a BOUNDED manual checkpoint every ~5000 writes instead.
         await db.execute("PRAGMA wal_autocheckpoint=0")
         await db.executescript(_DDL)
+        await db.commit()
+        # structural_fits family / route / reason (build 2026-09-04 item B):
+        # idempotent ADD COLUMN for a store created before them (CREATE TABLE
+        # IF NOT EXISTS never alters an existing table; the live table held 0
+        # rows — the recorder was never wired). SQLite ADD COLUMN is a
+        # metadata-only O(1) change; NOT NULL DEFAULT '' keeps old readers valid.
+        existing = {
+            row[1]
+            for row in await db.execute_fetchall("PRAGMA table_info(structural_fits)")
+        }
+        for column in ("family", "route", "reason"):
+            if column not in existing:
+                await db.execute(
+                    f"ALTER TABLE structural_fits ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                )
         await db.commit()
         # FILL-LEDGER IDEMPOTENCY BACKSTOP (2026-07-16 P1): a UNIQUE index on
         # fills.fill_ref, so even a code path that bypasses record_fill's own
@@ -636,15 +654,26 @@ class Store:
         n_legs: int,
         tickers: tuple[str, ...],
         challenge: FitChallenge,
+        family: str = "",
+        route: str = "",
+        reason: str = "",
     ) -> None:
-        """Durably record a structural inversion's misfit + its challenge verdict
-        (P1-4). Synchronous & committed like other risk-relevant records — this
-        is the audit trail for systematic structural misfit against the live
-        market, so it must not be droppable tape."""
-        await self._db.execute(
+        """Record a structural inversion's misfit + verdict (P1-4), with the
+        combo's leg family and the route taken (structural / hybrid / copula /
+        declined) and the inverter's reason on a REJECT — the audit trail for
+        systematic structural misfit against the live market.
+
+        Wired 2026-09-04 (item B) from the lifecycle, ONCE per priced RFQ,
+        through the non-critical ``_write`` tape path: with the background
+        writer running it enqueues (drop-on-overflow) and can never block or
+        delay the hot pricing path (fix isolation); in sync mode (tests) it
+        writes immediately. Before this it was a committed write with no
+        caller (0 rows ever)."""
+        await self._write(
             "INSERT INTO structural_fits (at, rfq_id, model, n_legs,"
             " exactly_identified, residual, verdict, reject_bar, challenge_bar,"
-            " tickers_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " tickers_json, family, route, reason)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 self._now(),
                 rfq_id,
@@ -656,9 +685,11 @@ class Store:
                 float(challenge.reject_bar),
                 float(challenge.challenge_bar),
                 json.dumps(list(tickers)),
+                family,
+                route,
+                reason,
             ),
         )
-        await self._db.commit()
 
     async def record_position_open(
         self,

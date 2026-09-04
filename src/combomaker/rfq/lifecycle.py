@@ -5717,6 +5717,7 @@ class QuoteLifecycle:
                 )
                 return
         result = await self._price_async(rfq)
+        await self._record_structural_fit(rfq, result)
         if isinstance(result, NoQuote):
             await self._record_skip(rfq, [result.reason], {"detail": result.detail})
             return
@@ -10175,6 +10176,35 @@ class QuoteLifecycle:
         self._metrics.inc("rfq.skipped")
         await self._store.record_decision(
             "no_quote", rfq.rfq_id, [str(r) for r in reasons], context
+        )
+
+    async def _record_structural_fit(
+        self, rfq: Rfq, result: ConstructedQuote | NoQuote
+    ) -> None:
+        """STRUCTURAL ROUTE TELEMETRY (build 2026-09-04 item B; measurement
+        only, slow path). Every soccer combo the Dixon-Coles adapter saw
+        carries its fit verdict out of the engine (``ConstructedQuote.
+        structural_fit`` / ``NoQuote.fit``); count it and enqueue ONE
+        ``structural_fits`` row per priced RFQ (the re-skew re-price of the
+        same RFQ is not recorded twice). The store write rides the tape queue
+        (drop-on-overflow, never blocks pricing). Counters:
+        ``structural.fallback.<verdict>`` and ``structural.fallback.<verdict>.
+        <family>`` — the fallback SHARE per pair family is reject / all."""
+        fit = result.structural_fit if isinstance(result, ConstructedQuote) else result.fit
+        if fit is None:
+            return
+        verdict = fit.challenge.verdict.value
+        self._metrics.inc(f"structural.fallback.{verdict}")
+        self._metrics.inc(f"structural.fallback.{verdict}.{fit.family}")
+        await self._store.record_structural_fit(
+            rfq_id=rfq.rfq_id,
+            model=fit.model,
+            n_legs=fit.n_legs,
+            tickers=tuple(rfq.leg_tickers),
+            challenge=fit.challenge,
+            family=fit.family,
+            route=fit.route,
+            reason=fit.reason,
         )
 
     async def _maybe_shadow_inplay(
