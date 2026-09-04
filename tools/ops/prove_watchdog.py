@@ -16,8 +16,9 @@ live store, or Kalshi.
                          (overnight-lull shape) -> zero actions; and a frozen
                          log with LIVE decision flow (store axis) -> zero
                          actions.
-  P4 flap_refusal      — relights that immediately re-hang: exactly two are
-                         attempted, then the flap latch stays down loud.
+  P4 flap_backoff      — relights that immediately re-hang: NO latch (the
+                         2026-08-06 ruling), backoff = threshold x streak,
+                         relights keep coming.
   P5 start_refused_retry — the EXACT 2026-07-31 17:34 ET class: app dead,
                          helper processes alive, the start guard refuses ->
                          the watchdog now does ONE full re-sweep + ONE retry
@@ -31,6 +32,12 @@ live store, or Kalshi.
                          whole stack except the watchdog tree; the -Auto
                          start guard no longer refuses on the watchdog's venv
                          shim; a REAL leftover bot python still refuses.
+  P8 network_boot_death — the 2026-08-27 02:13 ET class (real corpse log):
+                         DNS death before any heartbeat -> NO latch, backoff
+                         x streak, reach probe (fail, fail, ok), relight.
+  P9 maintenance_boot_death — the 2026-08-06 03:13 ET class (real corpse
+                         log): exchange 503s before any heartbeat -> NO
+                         latch, backoff, probe (fail, ok), relight.
 
 Run:  .venv/Scripts/python.exe -m tools.ops.prove_watchdog
 """
@@ -161,7 +168,7 @@ def make_start_cmd(root: Path, data: Path, pid_file: Path, actions: Path, *, hea
     return start_cmd
 
 
-def run_watchdog(root, pid_file, stop_cmd, start_cmd, cycles: int):
+def run_watchdog(root, pid_file, stop_cmd, start_cmd, cycles: int, reach_cmd=None):
     cmd = [
         str(PY),
         str(WATCHDOG),
@@ -179,6 +186,8 @@ def run_watchdog(root, pid_file, stop_cmd, start_cmd, cycles: int):
         "--start-cmd",
         f'cmd /c "{start_cmd}"',
     ]
+    if reach_cmd is not None:
+        cmd += ["--reach-cmd", f'cmd /c "{reach_cmd}"']
     out = subprocess.run(cmd, capture_output=True, text=True, timeout=cycles * 3 + 120)
     return out
 
@@ -232,6 +241,13 @@ def p2_boot_loop(failures: list[str]) -> None:
         "latch reason names the liveness proof",
         failures,
     )
+    # 2026-09-04 build: the latch now names the death CLASS — a config-error
+    # boot is CONFIG_CODE (it still latches; only NETWORK deaths retry, P8).
+    check(
+        "death class CONFIG_CODE: config error" in str(state.get("halt", {}).get("reason", "")),
+        "latch reason names the death class (CONFIG_CODE)",
+        failures,
+    )
     check(len(receipts) == 1, "halt receipt written", failures)
     check("STAYING DOWN" in out.stdout or "HALT LATCHED" in out.stdout, "loud", failures)
 
@@ -266,8 +282,16 @@ def p3_healthy_lull(failures: list[str]) -> None:
     check(acts == [], f"zero actions while the store advances (got {acts})", failures)
 
 
-def p4_flap_refusal(failures: list[str]) -> None:
-    print("P4 flap_refusal (relit runs re-hang immediately: two tries, then down)")
+def p4_flap_backoff(failures: list[str]) -> None:
+    # REWRITTEN 2026-09-04 (build watchdog-network-boot-death): this proof
+    # still pinned the pre-2026-08-06 permanent flap LATCH ("exactly two
+    # relights then a final stop", "two consecutive relights" reason) and had
+    # CRASHED on ``state["halt"] is None`` ever since 79d44ba converted the
+    # flap streak to backoff-and-retry-forever (measured on the unmodified
+    # tree before this build: AttributeError at the old check). It now pins
+    # the SHIPPED 8/6 semantics: no latch, no receipt, backoff = threshold x
+    # streak (5s x 2 = 10s here), relights keep coming.
+    print("P4 flap_backoff (relit runs re-hang immediately: back off x streak, retry forever)")
     root, data, pid_file, actions, stop_cmd = build_scratch("p4", heartbeat=True, pids=[4242])
     start_cmd = make_start_cmd(root, data, pid_file, actions, healthy=False)
     out = run_watchdog(root, pid_file, stop_cmd, start_cmd, cycles=35)
@@ -275,17 +299,22 @@ def p4_flap_refusal(failures: list[str]) -> None:
     state = read_state(data)
     receipts = list(data.glob("WATCHDOG_HALT_*.txt"))
     check(
-        acts == ["stop", "start", "stop", "start", "stop"],
-        f"exactly two relights then a final stop (got {acts})",
+        acts.count("start") >= 3 and acts[:4] == ["stop", "start", "stop", "start"],
+        f"keeps relighting through the flap streak (got {acts})",
+        failures,
+    )
+    check(state.get("halt") is None, "NO flap latch (2026-08-06 ruling)", failures)
+    check(not receipts, "no halt receipt", failures)
+    check(
+        "flap streak 2: backing off 10s" in out.stdout,
+        "backoff = threshold(5s) x streak(2) named in the log",
         failures,
     )
     check(
-        "two consecutive relights" in str(state.get("halt", {}).get("reason", "")),
-        "flap latch reason recorded",
+        all(r.get("short_run") for r in state.get("relights", [])[:-1]),
+        "every completed relight recorded as short_run (the streak input)",
         failures,
     )
-    check(len(receipts) == 1, "halt receipt written", failures)
-    check(out.stdout.count("relight complete") == 2, "two relights logged, not three", failures)
 
 
 def p5_start_refused_retry(failures: list[str]) -> None:
@@ -385,6 +414,158 @@ def p6_kill_still_refuses(failures: list[str]) -> None:
     )
     check(len(receipts) == 1, "halt receipt written", failures)
     check("STAYING DOWN" in out.stdout or "HALT LATCHED" in out.stdout, "loud", failures)
+
+
+CORPSE_8_27 = REPO / "tests" / "fixtures" / "watchdog" / "live_20260827_0207_tail.log"
+
+
+def p8_network_boot_death(failures: list[str]) -> None:
+    """2026-09-04 build. THE 8/27 02:13 ET CLASS: the relit boot died 45s in on
+    ClientConnectorDNSError (Wi-Fi flap), never wrote heartbeat.txt, and flap
+    guard 1 latched — an 8-day outage. The corpse log is the REAL one
+    (tests/fixtures/watchdog, verbatim). The real watchdog CLI must classify
+    it NETWORK, NOT latch, wait threshold x streak (5s, 10s, 15s), consult
+    the reach probe each time (unreachable, unreachable, reachable) and
+    relight once the exchange answers."""
+    print("P8 network_boot_death (8/27 02:13 class: DNS death pre-heartbeat -> retry, no latch)")
+    root, data, pid_file, actions, stop_cmd = build_scratch("p8", heartbeat=False, pids=[])
+    (data / "live_now.log").write_text(CORPSE_8_27.read_text(encoding="utf-8"), encoding="utf-8")
+    start_cmd = make_start_cmd(root, data, pid_file, actions, healthy=True)
+    flag1, flag2 = root / "reach1.flag", root / "reach2.flag"
+    reach_cmd = root / "fake_reach.cmd"
+    # unreachable twice (a counter on disk), reachable from the third probe on
+    reach_cmd.write_text(
+        "\r\n".join(
+            [
+                "@echo off",
+                f'if exist "{flag2}" (',
+                "  echo reachable",
+                f'  echo reach_ok >> "{actions}"',
+                "  exit /b 0",
+                ")",
+                f'if exist "{flag1}" (',
+                f'  echo. > "{flag2}"',
+                ") else (",
+                f'  echo. > "{flag1}"',
+                ")",
+                "echo unreachable",
+                f'echo reach_fail >> "{actions}"',
+                "exit /b 1",
+            ]
+        )
+        + "\r\n",
+        encoding="ascii",
+    )
+    out = run_watchdog(root, pid_file, stop_cmd, start_cmd, cycles=10, reach_cmd=reach_cmd)
+    acts = actions_list(actions)
+    state = read_state(data)
+    check(
+        acts == ["stop", "reach_fail", "reach_fail", "reach_ok", "start"],
+        f"stop -> probe x3 (fail, fail, ok) -> relight (got {acts})",
+        failures,
+    )
+    check(state.get("halt") is None, "NO latch on a NETWORK boot death", failures)
+    check(not list(data.glob("WATCHDOG_HALT_*.txt")), "no halt receipt", failures)
+    relights = state.get("relights", [])
+    check(
+        len(relights) == 1
+        and relights[0].get("boot_death") == "NETWORK"
+        and relights[0].get("reach_waits") == 3,
+        f"relight record names the class + 3 reach waits (got {relights})",
+        failures,
+    )
+    check(
+        "boot death class NETWORK (ClientConnectorDNSError)" in out.stdout,
+        "the corpse's DNS death named in the log",
+        failures,
+    )
+    check(
+        all(f"wait #{i}: {5 * i}s" in out.stdout for i in (1, 2, 3)),
+        "waits = threshold(5s) x streak 1, 2, 3",
+        failures,
+    )
+    check(
+        out.stdout.count("UNREACHABLE") == 2 and ": REACHABLE {" in out.stdout,
+        "every probe result logged (2 unreachable, then reachable)",
+        failures,
+    )
+    check("relight complete" in out.stdout, "relight completion logged", failures)
+
+
+CORPSE_8_6 = REPO / "tests" / "fixtures" / "watchdog" / "live_20260806_0313_tail.log"
+
+
+def p9_maintenance_boot_death(failures: list[str]) -> None:
+    """2026-09-04 build. THE 8/6 03:13 ET CLASS: Kalshi's maintenance 503s
+    killed the boot before any heartbeat (startup_reconcile_failed on
+    KalshiApiError('HTTP 503 ...') -> REFUSING TO QUOTE on book_reconciled ->
+    supervisor_exchange_unreachable on the same 503). The corpse log is the
+    REAL one (tests/fixtures/watchdog, verbatim). The real watchdog CLI must
+    classify it NETWORK (the live code's own "cannot reach exchange"), NOT
+    latch, wait threshold x streak (5s, 10s), consult the reach probe each
+    time (not serving, then serving) and relight."""
+    print(
+        "P9 maintenance_boot_death (8/6 03:13 class: exchange 503 pre-heartbeat -> "
+        "retry, no latch)"
+    )
+    root, data, pid_file, actions, stop_cmd = build_scratch("p9", heartbeat=False, pids=[])
+    (data / "live_now.log").write_bytes(CORPSE_8_6.read_bytes())
+    start_cmd = make_start_cmd(root, data, pid_file, actions, healthy=True)
+    flag1 = root / "reach1.flag"
+    reach_cmd = root / "fake_reach.cmd"
+    # not serving once (a marker on disk), serving from the second probe on
+    reach_cmd.write_text(
+        "\r\n".join(
+            [
+                "@echo off",
+                f'if exist "{flag1}" (',
+                "  echo reachable",
+                f'  echo reach_ok >> "{actions}"',
+                "  exit /b 0",
+                ")",
+                f'echo. > "{flag1}"',
+                "echo HTTP 503",
+                f'echo reach_fail >> "{actions}"',
+                "exit /b 1",
+            ]
+        )
+        + "\r\n",
+        encoding="ascii",
+    )
+    out = run_watchdog(root, pid_file, stop_cmd, start_cmd, cycles=10, reach_cmd=reach_cmd)
+    acts = actions_list(actions)
+    state = read_state(data)
+    check(
+        acts == ["stop", "reach_fail", "reach_ok", "start"],
+        f"stop -> probe x2 (not serving, ok) -> relight (got {acts})",
+        failures,
+    )
+    check(state.get("halt") is None, "NO latch on the maintenance boot death", failures)
+    check(not list(data.glob("WATCHDOG_HALT_*.txt")), "no halt receipt", failures)
+    relights = state.get("relights", [])
+    check(
+        len(relights) == 1
+        and relights[0].get("boot_death") == "NETWORK"
+        and relights[0].get("reach_waits") == 2,
+        f"relight record names the class + 2 reach waits (got {relights})",
+        failures,
+    )
+    check(
+        "boot death class NETWORK (startup_reconcile_failed: HTTP 503)" in out.stdout,
+        "the corpse's 503 reconcile death named in the log",
+        failures,
+    )
+    check(
+        all(f"wait #{i}: {5 * i}s" in out.stdout for i in (1, 2)),
+        "waits = threshold(5s) x streak 1, 2",
+        failures,
+    )
+    check(
+        out.stdout.count("UNREACHABLE") == 1 and ": REACHABLE {" in out.stdout,
+        "every probe result logged (1 not serving, then reachable)",
+        failures,
+    )
+    check("relight complete" in out.stdout, "relight completion logged", failures)
 
 
 # The 2026-07-31 17:34 ET process table, verbatim from the watchdog log +
@@ -591,10 +772,12 @@ def main() -> int:
         p1_frozen_log_hang,
         p2_boot_loop,
         p3_healthy_lull,
-        p4_flap_refusal,
+        p4_flap_backoff,
         p5_start_refused_retry,
         p6_kill_still_refuses,
         p7_ps1_guard_parity,
+        p8_network_boot_death,
+        p9_maintenance_boot_death,
     ):
         proof(failures)
     took = time.monotonic() - started
