@@ -1036,6 +1036,52 @@ class Store:
             rows = await cursor.fetchall()
         return {(str(row[0]), int(row[1])) for row in rows}
 
+    async def settled_grade_rows(self) -> list[JsonDict]:
+        """The SETTLED grade per combo ticker for the measured retained-edge
+        floor (risk/retained_edge_floor.py, 2026-09-04): every settled
+        ``position_ledger`` ticker with its contracts, realized P&L (net of
+        the exchange settlement fee), the fee columns, one leg set, and the
+        fills' recorded expected edge + booked fee summed over the ticker.
+        ONE batched read of two small tables (a few thousand rows) on the
+        slow loop — never per-row point reads, never the pricing path."""
+        ledger_q = (
+            "SELECT combo_ticker, SUM(contracts_centi), SUM(realized_pnl_cc),"
+            " SUM(COALESCE(settlement_fee_cc, 0)), MIN(opened_at),"
+            " MAX(COALESCE(reconciled_at, opened_at)), MAX(legs_json)"
+            " FROM position_ledger WHERE status = 'settled'"
+            " AND realized_pnl_cc IS NOT NULL GROUP BY combo_ticker"
+        )
+        fills_q = (
+            "SELECT combo_ticker, SUM(contracts_centi), SUM(expected_edge_cc),"
+            " SUM(COALESCE(fee_cc, 0)), SUM(expected_edge_cc IS NULL)"
+            " FROM fills GROUP BY combo_ticker"
+        )
+        async with self._db.execute(fills_q) as cursor:
+            fill_rows = await cursor.fetchall()
+        fills = {str(r[0]): r for r in fill_rows}
+        out: list[JsonDict] = []
+        async with self._db.execute(ledger_q) as cursor:
+            ledger_rows = await cursor.fetchall()
+        for ticker, ctr, realized, settle_fee, opened_at, settled_at, legs_json in ledger_rows:
+            f = fills.get(str(ticker))
+            if f is None or f[2] is None or int(f[4] or 0) > 0 or not int(f[1] or 0):
+                continue  # no recorded model edge for this ticker: cannot grade it
+            out.append(
+                {
+                    "combo_ticker": str(ticker),
+                    "ledger_contracts_centi": int(ctr),
+                    "realized_pnl_cc": int(realized),
+                    "settlement_fee_cc": int(settle_fee or 0),
+                    "opened_at": str(opened_at),
+                    "settled_at": str(settled_at),
+                    "legs_json": str(legs_json or "[]"),
+                    "fill_contracts_centi": int(f[1]),
+                    "expected_edge_cc": int(f[2]),
+                    "fill_fee_cc": int(f[3] or 0),
+                }
+            )
+        return out
+
     async def has_fill_for_ticker(self, combo_ticker: str) -> bool:
         """True iff ANY fills row exists for this combo ticker. Used by the
         periodic position-reconcile net (2026-07-18): an exchange position the

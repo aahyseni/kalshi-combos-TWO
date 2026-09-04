@@ -24,6 +24,7 @@ any resync (feed ordering guarantees that).
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
 from collections import Counter
@@ -85,6 +86,7 @@ from combomaker.pricing.fee_observer import (
 from combomaker.pricing.fees import FeeModel, FeeType, FeeUnknownError
 from combomaker.pricing.grouping import game_key
 from combomaker.pricing.quote import ConstructedQuote, NoQuote
+from combomaker.pricing.retained_cell import cell_key
 from combomaker.rfq.edge import candidate_edge_cc
 from combomaker.rfq.eviction_value import (
     AcceptanceCounters,
@@ -118,6 +120,8 @@ from combomaker.risk.exposure import (
     OpenQuoteRisk,
     SettledFactProvider,
     concentration_live_legs,
+    leg_entity_key,
+    leg_family_key,
     stable_ledger_key,
 )
 from combomaker.risk.fill_velocity import FillVelocityTracker
@@ -144,7 +148,15 @@ from combomaker.risk.limits import (
     threshold_cc,
 )
 from combomaker.risk.markouts import MarkoutSubject, MarkoutTracker
+from combomaker.risk.rebate_bound import bound_rebate
 from combomaker.risk.reservation import ReserveResult, RiskReservationService
+from combomaker.risk.retained_edge_floor import (
+    GradeRow,
+    estimate_retained_floor,
+)
+from combomaker.risk.retained_edge_floor import (
+    summarize as summarize_floor,
+)
 from combomaker.risk.skew import (
     ConcentrationProfile,
     GameSkewCache,
@@ -1617,6 +1629,9 @@ class QuoteLifecycle:
         self._fee_sweep_cursor: str | None = None
         self._collections_seen: set[str] = set()
         self._series_lookup_failed_ns: dict[str, int] = {}
+        # MEASURED RETAINED-EDGE FLOOR sweep (item 2): cadence stamp (None =
+        # the first tick runs it) and the last published summary.
+        self._floor_sweep_last_mono_ns: int | None = None
         # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): the GET-capable REST slice
         # the sweep polls. None (paper/backtests/minimal rigs) ⇒ no sweep — the
         # ledger is never patched from a guess (fail-closed).
@@ -7763,6 +7778,14 @@ class QuoteLifecycle:
             self._sweep_fee_observer,
             _FEE_OBSERVER_SWEEP_TIMEOUT_S,
         )
+        # MEASURED RETAINED-EDGE FLOOR (2026-09-04, item 2): re-estimate the
+        # per-cell floor from the settled grade and publish the dict the
+        # quote path looks up. Store read only; never the pricing path.
+        self._launch_diagnostic_sweep(
+            "retained_floor",
+            self._sweep_retained_floor,
+            _LEDGER_DIVERGENCE_SWEEP_TIMEOUT_S,
+        )
 
     def _launch_diagnostic_sweep(
         self,
@@ -8017,6 +8040,84 @@ class QuoteLifecycle:
         await asyncio.to_thread(sched.save, path)
         self._fee_schedule_saved_generation = generation
         self._metrics.inc("fee_observer.persisted")
+
+    # ------------------------------ measured retained-edge floor (item 2)
+
+    async def _sweep_retained_floor(self) -> None:
+        """Estimate the per-cell retained-edge floor from the store's settled
+        grade (risk/retained_edge_floor.py) and publish it to the engine.
+
+        CADENCE: the first maintenance tick, then every
+        ``fills_ledger_sweep_interval_s`` (the settlement-side cadence the
+        other slow-loop reads share). ONE batched store read of two small
+        tables, O(rows) arithmetic, one dict publish. The quote path never
+        waits on it (a stale table is still a measured table; a cold boot
+        keeps the fee-only floor). Errors log + retry (fix isolation)."""
+        interval_s = self._config.fills_ledger_sweep_interval_s
+        if not (interval_s > 0.0):
+            return
+        now = self._clock.monotonic_ns()
+        last = self._floor_sweep_last_mono_ns
+        if last is not None and now - last < int(interval_s * 1e9):
+            return
+        self._floor_sweep_last_mono_ns = now
+        publish = getattr(self._engine, "publish_retained_floor", None)
+        if publish is None:
+            return
+        raw = await asyncio.wait_for(self._store.settled_grade_rows(), STORE_OP_TIMEOUT_S)
+        rows: list[GradeRow] = []
+        skipped = 0
+        for r in raw:
+            try:
+                legs = [
+                    LegRef(
+                        market_ticker=str(leg["market_ticker"]),
+                        event_ticker=leg.get("event_ticker"),
+                        side=str(leg["side"]),
+                    )
+                    for leg in json.loads(r["legs_json"])
+                ]
+            except (ValueError, KeyError, TypeError):
+                skipped += 1
+                continue
+            if not legs:
+                skipped += 1
+                continue
+            ledger_ct = int(r["ledger_contracts_centi"])
+            fill_ct = int(r["fill_contracts_centi"])
+            # Like for like: the model's edge net of the fee ACTUALLY charged
+            # (booked fee added back, the settlement echo of the exchange fee
+            # taken out), scaled to the ledger's contracts when the fills
+            # and the ledger disagree on size (partial recoveries).
+            modeled = int(r["expected_edge_cc"]) + int(r["fill_fee_cc"])
+            if fill_ct != ledger_ct and fill_ct > 0:
+                modeled = modeled * ledger_ct // fill_ct
+            modeled -= int(r["settlement_fee_cc"])
+            rows.append(
+                GradeRow(
+                    cell=cell_key(legs),
+                    contracts_centi=ledger_ct,
+                    realized_cc=int(r["realized_pnl_cc"]),
+                    modeled_cc=modeled,
+                    games=frozenset(
+                        game_key(leg.event_ticker) for leg in legs if leg.event_ticker
+                    ),
+                    settled_at=str(r["settled_at"]),
+                )
+            )
+        estimate = estimate_retained_floor(rows)
+        self._metrics.inc("retained_floor.ran")
+        if estimate.published:
+            publish(dict(estimate.table))
+            self._metrics.inc("retained_floor.published")
+        else:
+            publish(None)
+        log.info(
+            "retained_floor_estimate",
+            rows=len(rows),
+            skipped=skipped,
+            **summarize_floor(estimate),
+        )
 
     # -------------------------------- position-ledger divergence invariant
 
@@ -9792,6 +9893,7 @@ class QuoteLifecycle:
             mass_acceptance=True,
             settled_facts=self._skew_settled_facts(),
         )
+        leg_profile = self._leg_axis_profile_from(snap)
         skew = compute_inventory_skew(
             candidate,
             snap,
@@ -9827,7 +9929,7 @@ class QuoteLifecycle:
             # LEG-DIRECTION AXIS (2026-07-25): built from THIS quote-time
             # snapshot (no staleness window); p_book only when the cached MC
             # profile is generation-fresh (None ⇒ the component is neutral).
-            leg_axis_profile=self._leg_axis_profile_from(snap),
+            leg_axis_profile=leg_profile,
             # LEVER #5 (operator directive 2026-07-27): the AND-BOUND
             # dollar-Herfindahl marginal (zero SE) priced by
             # Cov(candidate payoff, book P&L) off the already-paid-for CRN
@@ -9849,11 +9951,39 @@ class QuoteLifecycle:
             margin_cc=constructed.total_width_cc,
             tick_cc=self._combo_tick_cc(rfq, constructed),
         )
+        # REBATE BOUND BY MEASURED VALUE (2026-09-04, item 2 — risk/
+        # rebate_bound.py): once the concentration steer is ARMED its rebate
+        # is the measured Cov price and may not exceed it (the shadow steer's
+        # value never touches the wire — tests/test_conc_arming.py); until
+        # then a LEG-AXIS rebate (which enters the price separately only when
+        # that axis is armed and the steer is not) on a direction the book
+        # holds no mirror of is dropped. Widening passes untouched.
+        conc_armed = self._skew_params.conc_armed
+        bound = bound_rebate(
+            skew.applied_cc,
+            value_cc_per_contract=(
+                skew.conc.value_cc_per_contract
+                if (conc_armed and skew.conc is not None)
+                else None
+            ),
+            family_cc=skew.family_cc,
+            entity_cc=skew.entity_cc,
+            candidate_family_keys={leg_family_key(leg) for leg in candidate.legs},
+            candidate_entity_keys={leg_entity_key(leg) for leg in candidate.legs},
+            shares_by_family=leg_profile.shares_by_family,
+            shares_by_entity=leg_profile.shares_by_entity,
+            leg_axis_armed=self._skew_params.leg_axis_armed and not conc_armed,
+        )
+        applied_skew_cc = bound.rebate_cc
         log.info(
             "inventory_skew_shadow",
             rfq_id=rfq.rfq_id,
             skew_cc=skew.skew_cc,                        # honest classifier sign
-            applied_cc=skew.applied_cc,                  # 0 while dark
+            applied_cc=applied_skew_cc,                  # 0 while dark; rebate-bounded
+            applied_unbounded_cc=skew.applied_cc,
+            rebate_bound_rule=bound.rule,
+            rebate_bound_cap_cc=bound.cap_cc,
+            rebate_unbacked_cc=bound.unbacked_cc,
             shadow_applied_cc=skew.shadow_applied_cc,    # pricer-frame, dark-independent
             concentration_cc=skew.concentration_cc,
             offset_cc=skew.offset_cc,
@@ -9992,7 +10122,7 @@ class QuoteLifecycle:
                     reason=widen.reason,
                 )
             widen_declines = widen.applied
-        return skew.applied_cc, widen_declines
+        return applied_skew_cc, widen_declines
 
     def _combo_tick_cc(self, rfq: Rfq, constructed: ConstructedQuote) -> int:
         """The combo's OWN grid step at the quoted bid (LEVER #5).

@@ -506,6 +506,27 @@ class TestTheEmittedQuoteIsUnchanged:
             rig = PolicyRig(h, store, skew_params=params)
             for pos in build_world()[0].positions.values():
                 rig.exposure.add_position(pos)
+            # PIN CHANGED 2026-09-04 (build A item 2, risk/rebate_bound.py):
+            # a LEG-AXIS rebate on a direction the book holds no mirror of no
+            # longer reaches the wire (measured: the 8/12 "nobody homers"
+            # ticket earned −26cc family + −8cc entity rebate on an EMPTY
+            # cell). This world's ONLY price mover under OFF/SHADOW was
+            # exactly that rebate (family −62 + entity −9 on M1:yes/M2:no,
+            # which the 38 KXMLB* tickets never hold), so hold the mirror
+            # directions: the rebate is then exposure-backed, survives, and
+            # the guard below keeps testing the STEER's visibility on the
+            # wire rather than the removed rebate.
+            rig.exposure.add_position(
+                OpenPosition(
+                    position_id="mirror",
+                    combo_ticker="COMBO-mirror",
+                    collection=None,
+                    our_side=Side.NO,
+                    contracts=CentiContracts(1_000),
+                    entry_price_cc=CentiCents(5_000),
+                    legs=(LegRef("M1", "E1", "no"), LegRef("M2", "E2", "yes")),
+                )
+            )
             await rig.lifecycle.handle_rfq(rfq())
             sent[tag] = dict(rig.sender.created[0])
             await store.close()
