@@ -35,10 +35,13 @@ THE FIX these pin:
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
 import structlog
 
 from combomaker.core.clock import FakeClock
@@ -575,6 +578,33 @@ def _legacy_db(path: Path) -> None:
     conn.close()
 
 
+def _legacy_ledgers(path: Path) -> None:
+    """The live store's other two repair targets on the legacy shape (the
+    real DDL columns the tool touches; one open position row for fill:c)."""
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE position_ledger (
+            position_id TEXT PRIMARY KEY, opened_at TEXT NOT NULL, combo_ticker TEXT NOT NULL,
+            collection_ticker TEXT, subaccount TEXT NOT NULL, our_side TEXT NOT NULL,
+            contracts_centi INTEGER NOT NULL, entry_price_cc INTEGER NOT NULL,
+            cost_cc INTEGER NOT NULL, fees_cc INTEGER NOT NULL, leg_set_hash TEXT NOT NULL,
+            legs_json TEXT NOT NULL, status TEXT NOT NULL, settled_value REAL,
+            realized_pnl_cc INTEGER, settlement_fee_cc INTEGER, reconciled_at TEXT
+        );
+        INSERT INTO position_ledger VALUES ('fill:c','2026-08-26T20:38:00','T',NULL,'0','no',
+            300,6820,2046,0,'h','[]','open',NULL,NULL,NULL,NULL);
+        CREATE TABLE ev_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, fill_ref TEXT NOT NULL,
+            expected_edge_cc INTEGER NOT NULL, realized_pnl_cc INTEGER
+        );
+        INSERT INTO ev_ledger VALUES (1,'2026-08-26T20:38:00','fill:c',1,NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
 async def test_migration_on_legacy_duplicates_opens_and_logs(tmp_path: Path) -> None:
     path = tmp_path / "legacy.sqlite3"
     _legacy_db(path)
@@ -812,6 +842,10 @@ def _exists(path: str) -> bool:
     return Path(path).exists()
 
 
+def _read_text(path: str) -> str:
+    return Path(path).read_text(encoding="utf-8")
+
+
 def _load_repair_tool() -> Any:
     import importlib.util
 
@@ -911,9 +945,13 @@ async def test_repair_tool_apply_matches_store_void_to_the_row(tmp_path: Path) -
         [{"fill_ref": "fill:ph", "_reason": "settlement_equals_matched_rows"}],
         migrate=False,
         backup_dir=tmp_path / "backups",
+        liveness_window_s_=15.0,
     )
     assert outcome["touched"] == {"fills": 1, "position_ledger": 1, "ev_ledger": 1}
-    assert _exists(outcome["backup"])
+    assert _exists(outcome["backup"]) and _exists(outcome["restore_sql"])
+    # ROW-LEVEL backup (review fix: never a 213 GB whole-store copy): the
+    # affected rows only, complete pre-state, plus the exact reversing SQL.
+    assert outcome["rows_backed_up"] == {"fills": 1, "position_ledger": 1, "ev_ledger": 1}
 
     def snapshot(path: Path) -> list[tuple[Any, ...]]:
         conn = sqlite3.connect(path)
@@ -935,22 +973,34 @@ async def test_repair_tool_apply_matches_store_void_to_the_row(tmp_path: Path) -
             conn.close()
 
     assert snapshot(tmp_path / "live.sqlite3") == snapshot(tmp_path / "offline.sqlite3")
-    # The backup is the PRE-void state.
-    conn = sqlite3.connect(outcome["backup"])
-    try:
-        assert conn.execute(
-            "SELECT status FROM fills WHERE fill_ref='fill:ph'"
-        ).fetchone()[0] == "booked"
-    finally:
-        conn.close()
+    # The backup is the PRE-void state (row-level JSON: every column).
+    backup = json.loads(_read_text(outcome["backup"]))
+    assert backup["fill_refs"] == ["fill:ph"]
+    (fill_row,) = backup["rows"]["fills"]
+    assert fill_row["fill_ref"] == "fill:ph" and fill_row["status"] == "booked"
+    assert fill_row["exchange_fill_id"] is None and fill_row["contracts_centi"] == 1400
+    (pos_row,) = backup["rows"]["position_ledger"]
+    assert pos_row["position_id"] == "fill:ph" and pos_row["status"] == "open"
+    (ev_row,) = backup["rows"]["ev_ledger"]
+    assert ev_row["expected_edge_cc"] == 1330 and ev_row["realized_pnl_cc"] is None
     # Idempotent: a second apply touches nothing.
     again = tool.apply_void(
         str(tmp_path / "offline.sqlite3"),
         [{"fill_ref": "fill:ph", "_reason": "x"}],
         migrate=False,
         backup_dir=tmp_path / "backups2",
+        liveness_window_s_=15.0,
     )
     assert again["touched"] == {"fills": 0, "position_ledger": 0, "ev_ledger": 0}
+    # restore.sql puts the offline store back to EXACTLY the pre-void seed.
+    pristine = await seed(tmp_path / "pristine.sqlite3")
+    await pristine.close()
+    conn = sqlite3.connect(tmp_path / "offline.sqlite3")
+    try:
+        conn.executescript(_read_text(outcome["restore_sql"]))
+    finally:
+        conn.close()
+    assert snapshot(tmp_path / "offline.sqlite3") == snapshot(tmp_path / "pristine.sqlite3")
 
 
 # --------------------------------------------------------------------------- #
@@ -1277,5 +1327,169 @@ async def test_ledger_quantity_legacy_rows_counted_not_alarmed(tmp_path: Path) -
         assert cap2[0]["event"] == "ledger_quantity_mismatch_clean" and cap2[0]["legacy_n"] == 3
         assert m2.counter("ledger_quantity.mismatch") == 0
         assert m2.counter("ledger_quantity.legacy") == 3
+    finally:
+        await store.close()
+
+
+# --------------------------------------------------------------------------- #
+# 10. Repair tool review fixes: real liveness refusal, derived window,        #
+#     row-level backup, --migrate parity with the Store's watermark.          #
+# --------------------------------------------------------------------------- #
+
+
+async def _seed_repair_store(path: Path) -> None:
+    store = await Store.open(path, FakeClock())
+    try:
+        await store.record_position_open(_ledger_pos("fill:ph", "T", Side.NO, 1400), subaccount="0")
+        assert await store.record_fill(
+            "fill:ph", order_id="o-ph", combo_ticker="T", our_side="no", contracts_centi=1400,
+            price_cc=6820, fee_cc=0, expected_edge_cc=1330, raw={},
+        )
+    finally:
+        await store.close()
+
+
+def _fill_status_raw(path: Path, fill_ref: str) -> str:
+    conn = sqlite3.connect(path)
+    try:
+        return str(conn.execute(
+            "SELECT status FROM fills WHERE fill_ref=?", (fill_ref,)
+        ).fetchone()[0])
+    finally:
+        conn.close()
+
+
+async def test_repair_tool_refuses_apply_while_bot_may_be_alive(tmp_path: Path) -> None:
+    """MUST-FIX: the first version checked heartbeat.json/heartbeat/liveness.json
+    — files the bot never writes — so --apply would have run against a LIVE
+    store. The refusal now reads the bot's REAL signals (heartbeat.txt,
+    supervisor_heartbeat.txt, loop_progress.json) with the bot's own readers,
+    BEFORE any backup or store write."""
+    tool = _load_repair_tool()
+    data_dir = tmp_path / "data"
+    store_path = data_dir / "store.sqlite3"
+    await _seed_repair_store(store_path)
+    rows = [{"fill_ref": "fill:ph", "_reason": "settlement_equals_matched_rows"}]
+    backups = tmp_path / "backups"
+
+    def attempt() -> None:
+        with pytest.raises(SystemExit, match="REFUSED: the bot may be ALIVE"):
+            tool.apply_void(
+                str(store_path), rows, migrate=False, backup_dir=backups,
+                liveness_window_s_=60.0,
+            )
+        # NOTHING written: no backup dir, row still booked.
+        assert not backups.exists()
+        assert _fill_status_raw(store_path, "fill:ph") == "booked"
+
+    now = datetime.now(UTC)
+    # 1. A fresh bot heartbeat (the dedicated liveness task's file).
+    (data_dir / "heartbeat.txt").write_text(now.isoformat(), encoding="utf-8")
+    attempt()
+    # 2. A fresh SUPERVISOR heartbeat alone.
+    (data_dir / "heartbeat.txt").unlink()
+    (data_dir / "supervisor_heartbeat.txt").write_text(now.isoformat(), encoding="utf-8")
+    attempt()
+    # 3. A fresh loop_progress.json alone (bound = max(window, stall_after_s)).
+    (data_dir / "supervisor_heartbeat.txt").unlink()
+    (data_dir / "loop_progress.json").write_text(
+        json.dumps({"written_at": now.isoformat(), "loops": {"maintenance": {
+            "age_s": 0.4, "stall_after_s": 60.5}}}),
+        encoding="utf-8",
+    )
+    attempt()
+    # 4. A CORRUPT heartbeat is refused too (fail-closed, like the supervisor).
+    (data_dir / "loop_progress.json").unlink()
+    (data_dir / "heartbeat.txt").write_text("not a timestamp", encoding="utf-8")
+    attempt()
+    # 5. STALE signals (older than the window) are not evidence: apply proceeds.
+    stale = (now - timedelta(seconds=600)).isoformat()
+    (data_dir / "heartbeat.txt").write_text(stale, encoding="utf-8")
+    (data_dir / "supervisor_heartbeat.txt").write_text(stale, encoding="utf-8")
+    (data_dir / "loop_progress.json").write_text(
+        json.dumps({"written_at": stale, "loops": {"maintenance": {
+            "age_s": 0.4, "stall_after_s": 60.5}}}),
+        encoding="utf-8",
+    )
+    outcome = tool.apply_void(
+        str(store_path), rows, migrate=False, backup_dir=backups, liveness_window_s_=60.0
+    )
+    assert outcome["touched"]["fills"] == 1
+    assert _fill_status_raw(store_path, "fill:ph") == "phantom"
+    assert outcome["liveness_window_s"] == 60.0
+
+
+def test_repair_tool_liveness_evidence_reads_real_files(tmp_path: Path) -> None:
+    tool = _load_repair_tool()
+    store_path = tmp_path / "d" / "s.sqlite3"
+    store_path.parent.mkdir()
+    assert tool.bot_liveness_evidence(str(store_path), window_s=15.0) == []  # absent = none
+    (store_path.parent / "heartbeat.txt").write_text(
+        datetime.now(UTC).isoformat(), encoding="utf-8"
+    )
+    ev = tool.bot_liveness_evidence(str(store_path), window_s=15.0)
+    assert len(ev) == 1 and ev[0].startswith("heartbeat.txt: beaten")
+    # The dead filenames of the first version are NOT evidence of anything.
+    (store_path.parent / "heartbeat.txt").unlink()
+    for dead in ("heartbeat.json", "heartbeat", "liveness.json"):
+        (store_path.parent / dead).write_text(datetime.now(UTC).isoformat(), encoding="utf-8")
+    assert tool.bot_liveness_evidence(str(store_path), window_s=15.0) == []
+
+
+def test_repair_tool_liveness_window_derives_from_supervisor_config(tmp_path: Path) -> None:
+    """No number of the tool's own: the window is supervisor.heartbeat_timeout_s
+    from the launch YAML (the live file says 60.0), else the SupervisorConfig
+    default (15.0)."""
+    tool = _load_repair_tool()
+    from combomaker.ops.config import SupervisorConfig
+
+    default = float(SupervisorConfig().heartbeat_timeout_s)
+    assert tool.liveness_window_s(None) == default
+    assert tool.liveness_window_s(tmp_path / "missing.yaml") == default
+    cfg = tmp_path / "prod-live.local.yaml"
+    cfg.write_text("supervisor:\n  heartbeat_timeout_s: 60.0\n  poll_interval_s: 1.0\n",
+                   encoding="utf-8")
+    assert tool.liveness_window_s(cfg) == 60.0
+    (tmp_path / "nosup.yaml").write_text("risk:\n  x: 1\n", encoding="utf-8")
+    assert tool.liveness_window_s(tmp_path / "nosup.yaml") == default
+
+
+async def test_repair_tool_migrate_stamps_watermark_like_store(tmp_path: Path) -> None:
+    """--migrate on a legacy store must leave EXACTLY what Store.open leaves:
+    the three columns, idx_fills_status, and the once-only store_meta
+    watermark (MAX(id)) — so the bot's first open after the repair changes
+    nothing and the restart re-arm scopes identically."""
+    tool = _load_repair_tool()
+    path = tmp_path / "legacy.sqlite3"
+    _legacy_db(path)
+    _legacy_ledgers(path)
+    with pytest.raises(SystemExit, match="requires --migrate|rerun with --migrate"):
+        tool.apply_void(
+            str(path), [{"fill_ref": "fill:c", "_reason": "no_settlement_no_tape_fill"}],
+            migrate=False, backup_dir=tmp_path / "b0", liveness_window_s_=15.0,
+        )
+    outcome = tool.apply_void(
+        str(path), [{"fill_ref": "fill:c", "_reason": "no_settlement_no_tape_fill"}],
+        migrate=True, backup_dir=tmp_path / "b1", liveness_window_s_=15.0,
+    )
+    assert outcome["touched"] == {"fills": 1, "position_ledger": 1, "ev_ledger": 1}
+    assert outcome["rows_backed_up"] == {"fills": 1, "position_ledger": 1, "ev_ledger": 1}
+    conn = sqlite3.connect(path)
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM store_meta").fetchall())
+    finally:
+        conn.close()
+    assert meta["fills_verification_watermark_id"] == "4"
+    assert meta["fills_verification_migrated_at"]
+    # The Store's own open finds the columns present and the watermark taken.
+    with structlog.testing.capture_logs() as cap:
+        store = await Store.open(path, FakeClock())
+    try:
+        assert not [e for e in cap if e["event"] == "fills_verification_columns_added"]
+        assert await store.fills_verification_watermark() == (
+            4, meta["fills_verification_migrated_at"]
+        )
+        assert await store.fill_status("fill:c") == "phantom"
+        assert await store.booked_unverified_fills(after_id=4) == []
     finally:
         await store.close()

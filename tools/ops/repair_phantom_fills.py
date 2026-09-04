@@ -21,16 +21,34 @@ and, separately, the tape fills with NO local row (writer-path misses — the
 opposite direction, listed only, never written: one-writer rule).
 
 ``--dry-run`` (default) prints every class with evidence and writes a JSON
-summary. ``--apply`` first copies the store to ``data/backups/<stamp>-
-<name>`` (timestamped, never overwritten) and then marks each PHANTOM row
-across the three ledgers exactly as the live ``Store.void_phantom_fill``
-does: ``fills.status='phantom'`` (+ ``verified_at`` stamp,
-``exchange_fill_id='phantom:repair_tool:<reason>'``), the OPEN
-``position_ledger`` row → ``phantom``, ``ev_ledger`` expected/realized → 0.
-Rows are never deleted (audit trail). Refuses to apply while a bot heartbeat
-is fresh (never touch a live store) and refuses on a store that lacks the
-verification columns unless ``--migrate`` is given (adds them exactly like
-``Store._ensure_fills_verification_columns``).
+summary. ``--apply``:
+
+  1. REFUSES while the bot may be alive (review fix 2026-09-04: the first
+     version looked for files the bot never writes). Liveness evidence is the
+     bot's own signals in the store's data_dir — ``heartbeat.txt`` (the
+     dedicated liveness task), ``supervisor_heartbeat.txt`` (the watchdog) and
+     ``loop_progress.json`` (per-loop progress) — read with the SAME readers
+     the supervisor uses; the freshness window is the supervisor's own
+     ``supervisor.heartbeat_timeout_s`` from the live YAML (values only, the
+     file is never echoed), else the ``SupervisorConfig`` default. A present
+     but unreadable/corrupt signal is refused too (fail-closed). The check
+     runs BEFORE any backup or store connection.
+  2. Writes a ROW-LEVEL backup under ``data/backups/`` (review fix: the live
+     store is 213 GB — a whole-file copy for a 28-row repair is wrong):
+     ``<stamp>-phantom_rows_backup.json`` with the complete pre-state of every
+     affected fills / position_ledger / ev_ledger row, and
+     ``<stamp>-restore.sql`` with the exact UPDATEs that put them back.
+  3. Marks each PHANTOM row across the three ledgers exactly as the live
+     ``Store.void_phantom_fill`` does: ``fills.status='phantom'`` (+
+     ``verified_at`` stamp, ``exchange_fill_id='phantom:repair_tool:<reason>'``),
+     the OPEN ``position_ledger`` row → ``phantom``, ``ev_ledger`` expected/
+     realized → 0. Rows are never deleted (audit trail).
+
+A store that lacks the verification columns (the live store today) is
+refused unless ``--migrate`` is given, which adds them exactly like
+``Store._ensure_fills_verification_columns`` — including the once-only
+``store_meta`` watermark (MAX(fills.id) + stamp) the restart re-arm and the
+ledger-quantity alarm scope on.
 
 Usage (worktree root, bot DOWN):
 
@@ -39,7 +57,7 @@ Usage (worktree root, bot DOWN):
       --exchange-json <alltime_exchange.json> --dry-run --out phantom_dryrun.json
 
   ... --pull --env prod          # fresh read-only exchange pull instead of JSON
-  ... --apply                    # after reading the dry-run; backup is automatic
+  ... --apply --migrate          # after reading the dry-run; backup is automatic
 """
 
 from __future__ import annotations
@@ -47,7 +65,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import shutil
 import sqlite3
 import sys
 import time
@@ -64,9 +81,21 @@ KALSHI_PROD = "https://external-api.kalshi.com/trade-api/v2"
 #: first two dash-groups; 13 hex+dash chars ≈ 2^44 keyspace — no collisions
 #: on a 4k-row tape).
 PREFIX_MIN_LEN = 13
-HEARTBEAT_FRESH_S = 120.0
+#: The bot's liveness signals, by filename in the store's data_dir (the
+#: writers: ops/quote_app.py ``Heartbeat(... data_dir / "heartbeat.txt")``,
+#: ops/supervisor.py ``SUPERVISOR_HEARTBEAT_FILENAME``, risk/progress.py
+#: ``PROGRESS_FILENAME``).
+BOT_HEARTBEAT_FILENAME = "heartbeat.txt"
+SUPERVISOR_HEARTBEAT_FILENAME = "supervisor_heartbeat.txt"
+PROGRESS_FILENAME = "loop_progress.json"
 
 JsonDict = dict[str, Any]
+
+
+def _src_on_path() -> None:
+    src = str(REPO / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
 
 
 # ----------------------------------------------------------------- exchange
@@ -74,7 +103,7 @@ JsonDict = dict[str, Any]
 
 async def pull_exchange(env: str) -> JsonDict:
     """READ-ONLY all-time pull of fills + settlements (paginated)."""
-    sys.path.insert(0, str(REPO / "src"))
+    _src_on_path()
     from combomaker.core.clock import SystemClock
     from combomaker.exchange.auth import Credentials, RequestSigner
     from combomaker.exchange.rest import KalshiRestClient
@@ -151,17 +180,17 @@ def classify(store_rows: list[JsonDict], exchange: JsonDict) -> JsonDict:
 
     # Pass 1: exact / prefix.
     for row in store_rows:
-        oid = row.get("order_id")
+        row_oid = row.get("order_id")
         row["_class"] = None
         row["_tape_order_id"] = None
-        if not oid:
+        if not row_oid:
             row["_class"] = "null_order_id"
             continue
-        if oid in by_order:
+        if row_oid in by_order:
             row["_class"] = "matched"
-            row["_tape_order_id"] = oid
+            row["_tape_order_id"] = row_oid
             continue
-        pm = prefix_match(str(oid))
+        pm = prefix_match(str(row_oid))
         if pm is not None:
             row["_class"] = "legacy_prefix_match"
             row["_tape_order_id"] = pm
@@ -305,14 +334,171 @@ def _read_store_rows(path: str, *, read_only: bool) -> tuple[list[JsonDict], boo
         conn.close()
 
 
-def _heartbeat_fresh(store_path: str) -> bool:
-    """True if a bot heartbeat next to the store was written recently."""
-    data_dir = Path(store_path).parent
-    for name in ("heartbeat.json", "heartbeat", "liveness.json"):
-        p = data_dir / name
-        if p.exists() and time.time() - p.stat().st_mtime < HEARTBEAT_FRESH_S:
-            return True
-    return False
+# --------------------------------------------------------------- liveness
+
+
+def liveness_window_s(config_path: Path | None) -> float:
+    """The freshness window for the bot's liveness signals = the supervisor's
+    own wedge anchor ``supervisor.heartbeat_timeout_s`` (the live YAML when
+    given/found — values only, the file is never echoed: it sits next to
+    secrets), else the ``SupervisorConfig`` code default. No number of this
+    tool's own."""
+    _src_on_path()
+    from combomaker.ops.config import SupervisorConfig
+
+    default = float(SupervisorConfig().heartbeat_timeout_s)
+    if config_path is None or not config_path.exists():
+        return default
+    try:
+        import yaml
+
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001 — an unreadable config falls back to the anchor default
+        return default
+    sup = data.get("supervisor") if isinstance(data, dict) else None
+    if isinstance(sup, dict) and "heartbeat_timeout_s" in sup:
+        try:
+            return float(sup["heartbeat_timeout_s"])
+        except (TypeError, ValueError):
+            return default
+    return default
+
+
+def default_config_path() -> Path | None:
+    """The bot's launch config: the gitignored local override first (what
+    tools/ops/start_all.ps1 launches with), then the base per-env files."""
+    candidates = sorted(REPO.glob("config/*.local.yaml")) + sorted(REPO.glob("config/*.yaml"))
+    return candidates[0] if candidates else None
+
+
+def bot_liveness_evidence(store_path: str, *, window_s: float) -> list[str]:
+    """Every reason to believe a bot is ALIVE on this store's data_dir, as
+    strings (empty ⇒ no evidence). Read with the bot's own readers
+    (``HeartbeatReader`` / ``ProgressReader`` parsing) against the real clock:
+
+      * ``heartbeat.txt`` / ``supervisor_heartbeat.txt``: age ≤ window ⇒ alive;
+        present but unparseable / implausibly future ⇒ REFUSED too (the
+        reader's fail-closed None);
+      * ``loop_progress.json``: ``written_at`` age ≤ the larger of the window
+        and every loop's own derived ``stall_after_s`` ⇒ alive; present but
+        unreadable ⇒ refused.
+
+    An ABSENT file is no evidence (the relaunch purge deletes them; the live
+    data_dir today holds none of the three)."""
+    _src_on_path()
+    from combomaker.core.clock import SystemClock
+    from combomaker.risk.heartbeat import HeartbeatReader
+    from combomaker.risk.progress import ProgressReader
+
+    clock = SystemClock()
+    data_dir = Path(store_path).resolve().parent
+    evidence: list[str] = []
+    for name in (BOT_HEARTBEAT_FILENAME, SUPERVISOR_HEARTBEAT_FILENAME):
+        path = data_dir / name
+        if not path.exists():
+            continue
+        age = HeartbeatReader(clock, path).read_age_s(retries=1)
+        if age is None:
+            evidence.append(f"{name}: present but unreadable/implausible (fail-closed)")
+        elif age <= window_s:
+            evidence.append(f"{name}: beaten {age:.1f}s ago (window {window_s:.1f}s)")
+    progress = data_dir / PROGRESS_FILENAME
+    if progress.exists():
+        reader = ProgressReader(clock, progress)
+        payload = reader._read(retries=1)  # noqa: SLF001 — the bot's own parser
+        if payload is None:
+            evidence.append(f"{PROGRESS_FILENAME}: present but unreadable (fail-closed)")
+        else:
+            age = reader.file_age_s(payload)
+            bound = window_s
+            loops = payload.get("loops")
+            if isinstance(loops, dict):
+                for state in loops.values():
+                    if isinstance(state, dict):
+                        try:
+                            bound = max(bound, float(state.get("stall_after_s", 0.0)))
+                        except (TypeError, ValueError):
+                            pass
+            if age is None:
+                evidence.append(f"{PROGRESS_FILENAME}: present but unreadable (fail-closed)")
+            elif age <= bound:
+                evidence.append(
+                    f"{PROGRESS_FILENAME}: written {age:.1f}s ago (bound {bound:.1f}s)"
+                )
+    return evidence
+
+
+# ------------------------------------------------------------------ apply
+
+
+_BACKUP_TABLES: dict[str, tuple[str, tuple[str, ...]]] = {
+    # table: (key column, columns the repair changes — the restore.sql scope)
+    "fills": ("fill_ref", ("status", "verified_at", "exchange_fill_id")),
+    "position_ledger": ("position_id", ("status", "reconciled_at")),
+    "ev_ledger": ("fill_ref", ("expected_edge_cc", "realized_pnl_cc")),
+}
+
+
+def _sql_literal(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, int | float):
+        return repr(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _row_level_backup(
+    conn: sqlite3.Connection, fill_refs: list[str], *, backups: Path, stamp: str, store: str
+) -> JsonDict:
+    """Dump the complete PRE-state of every affected row (all columns) to
+    ``<stamp>-phantom_rows_backup.json`` and the exact reversing UPDATEs to
+    ``<stamp>-restore.sql``. Both are written and flushed BEFORE any write
+    to the store; a failure here aborts the apply."""
+    dump: dict[str, list[JsonDict]] = {}
+    restore: list[str] = ["BEGIN;"]
+    for table, (key_col, changed_cols) in _BACKUP_TABLES.items():
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+        if not cols:
+            dump[table] = []
+            continue
+        rows: list[JsonDict] = []
+        for ref in fill_refs:
+            for rec in conn.execute(
+                f"SELECT {', '.join(cols)} FROM {table} WHERE {key_col} = ?", (ref,)
+            ):
+                row = dict(zip(cols, rec, strict=True))
+                rows.append(row)
+                sets = [
+                    f"{c} = {_sql_literal(row[c])}" for c in changed_cols if c in row
+                ]
+                if sets:
+                    where = f"{key_col} = {_sql_literal(ref)}"
+                    if "id" in row:
+                        where += f" AND id = {_sql_literal(row['id'])}"
+                    restore.append(f"UPDATE {table} SET {', '.join(sets)} WHERE {where};")
+        dump[table] = rows
+    restore.append("COMMIT;")
+    backups.mkdir(parents=True, exist_ok=True)
+    json_path = backups / f"{stamp}-phantom_rows_backup.json"
+    sql_path = backups / f"{stamp}-restore.sql"
+    if json_path.exists() or sql_path.exists():
+        raise SystemExit(f"REFUSED: backup target exists: {json_path}")
+    json_path.write_text(
+        json.dumps(
+            {"store": store, "stamp": stamp, "fill_refs": fill_refs, "rows": dump},
+            indent=1,
+            default=str,
+        ),
+        encoding="utf-8",
+    )
+    sql_path.write_text("\n".join(restore) + "\n", encoding="utf-8")
+    return {
+        "backup": str(json_path),
+        "restore_sql": str(sql_path),
+        "rows_backed_up": {t: len(r) for t, r in dump.items()},
+    }
 
 
 def apply_void(
@@ -321,24 +507,32 @@ def apply_void(
     *,
     migrate: bool,
     backup_dir: Path | None = None,
+    liveness_window_s_: float | None = None,
+    config_path: Path | None = None,
 ) -> JsonDict:
     """Mark the given rows phantom across the three ledgers (mirrors
-    Store.void_phantom_fill — parity-tested against it), after a timestamped
-    backup under ``backup_dir`` (default ``data/backups/``)."""
-    if _heartbeat_fresh(store_path):
-        raise SystemExit("REFUSED: a fresh bot heartbeat sits next to the store — bot must be DOWN")
+    Store.void_phantom_fill — parity-tested against it), after (1) the
+    liveness refusal and (2) a row-level backup under ``backup_dir``
+    (default ``data/backups/``). ``liveness_window_s_`` overrides the config-
+    derived window (tests); otherwise it derives from ``config_path`` (or the
+    default config search) per ``liveness_window_s``."""
+    # (1) NEVER touch a live store — before any backup, before any connection.
+    window = (
+        liveness_window_s_
+        if liveness_window_s_ is not None
+        else liveness_window_s(config_path or default_config_path())
+    )
+    evidence = bot_liveness_evidence(store_path, window_s=window)
+    if evidence:
+        raise SystemExit(
+            "REFUSED: the bot may be ALIVE on this store's data_dir — "
+            + "; ".join(evidence)
+            + " — stop it (and its supervisor) before --apply"
+        )
     src = Path(store_path)
     backups = backup_dir if backup_dir is not None else REPO / "data" / "backups"
-    backups.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    dest = backups / f"{stamp}-{src.name}"
-    if dest.exists():
-        raise SystemExit(f"REFUSED: backup target exists: {dest}")
-    shutil.copy2(src, dest)
-    for sidecar in ("-wal", "-shm"):
-        side = Path(str(src) + sidecar)
-        if side.exists():
-            shutil.copy2(side, Path(str(dest) + sidecar))
+    fill_refs = [str(row["fill_ref"]) for row in phantom_rows]
     conn = sqlite3.connect(store_path)
     try:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(fills)")]
@@ -348,10 +542,32 @@ def apply_void(
                     "REFUSED: fills has no verification columns; rerun with --migrate "
                     "(adds status/verified_at/exchange_fill_id exactly like Store.open)"
                 )
+            now_iso = datetime.now(UTC).isoformat()
             conn.execute("ALTER TABLE fills ADD COLUMN status TEXT NOT NULL DEFAULT 'booked'")
             conn.execute("ALTER TABLE fills ADD COLUMN verified_at TEXT")
             conn.execute("ALTER TABLE fills ADD COLUMN exchange_fill_id TEXT")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_fills_status ON fills (status)")
+            # The once-only watermark, exactly as Store._ensure_fills_
+            # verification_columns stamps it (parity-tested).
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS store_meta (key TEXT PRIMARY KEY,"
+                " value TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO store_meta (key, value)"
+                " SELECT 'fills_verification_watermark_id',"
+                " CAST(COALESCE(MAX(id), 0) AS TEXT) FROM fills"
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO store_meta (key, value)"
+                " VALUES ('fills_verification_migrated_at', ?)",
+                (now_iso,),
+            )
+            conn.commit()
+        # (2) Row-level backup of the PRE-state, flushed before any write.
+        backup = _row_level_backup(
+            conn, fill_refs, backups=backups, stamp=stamp, store=str(src)
+        )
         now = datetime.now(UTC).isoformat()
         touched = {"fills": 0, "position_ledger": 0, "ev_ledger": 0}
         for row in phantom_rows:
@@ -378,7 +594,7 @@ def apply_void(
         conn.commit()
     finally:
         conn.close()
-    return {"backup": str(dest), "touched": touched}
+    return {**backup, "touched": touched, "liveness_window_s": window}
 
 
 # -------------------------------------------------------------------- main
@@ -403,12 +619,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--exchange-json", help="saved all-time pull (fills + settlements)")
     ap.add_argument("--pull", action="store_true", help="fresh READ-ONLY exchange pull")
     ap.add_argument("--env", default="prod")
+    ap.add_argument(
+        "--config",
+        help="bot launch YAML the liveness window derives from "
+        "(default: config/*.local.yaml, then config/*.yaml)",
+    )
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", default=True)
     mode.add_argument("--apply", action="store_true")
     ap.add_argument(
         "--migrate", action="store_true",
-        help="--apply: add the verification columns if missing",
+        help="--apply: add the verification columns (+ store_meta watermark) if missing",
     )
     ap.add_argument("--out", help="JSON summary path")
     args = ap.parse_args(argv)
@@ -425,12 +646,16 @@ def main(argv: list[str] | None = None) -> int:
     result["store"] = args.store
     result["store_has_verification_columns"] = has_status
     result["mode"] = "apply" if args.apply else "dry-run"
+    if not has_status:
+        result["apply_requires_migrate"] = True
 
     print(
         f"store rows {result['n_store_rows']}  tape fills {result['n_tape_fills']}"
         f" (orders {result['n_tape_orders']})  settlements {result['n_settlements']}"
     )
     print("by class:", result["by_class"])
+    if not has_status:
+        print("store has NO verification columns: --apply requires --migrate")
     cols = ["at", "fill_ref", "order_id", "combo_ticker", "our_side", "contracts_centi", "price_cc",
             "status", "provenance", "_reason", "_settlement_cc", "_matched_store_cc"]
     _print_table("PHANTOM (no tape fill; settlement corroborates)", result["phantom"], cols)
@@ -452,7 +677,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.apply:
         phantom_rows = [r for r in rows if r.get("_class") == "phantom"]
-        outcome = apply_void(args.store, phantom_rows, migrate=args.migrate)
+        outcome = apply_void(
+            args.store,
+            phantom_rows,
+            migrate=args.migrate,
+            config_path=Path(args.config) if args.config else None,
+        )
         result["apply"] = outcome
         print("\nAPPLIED:", outcome)
     if args.out:
