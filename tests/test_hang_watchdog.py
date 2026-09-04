@@ -864,3 +864,209 @@ def test_exchange_anchor_reads_only_the_live_local_yaml(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert hw._read_exchange_anchors(tmp_path) == "https://x.example/trade-api/v2"
+
+
+# --------------------------------------------------------------------------
+# Exchange 5xx at boot (2026-09-04 build, second fixture): the 2026-08-06
+# 03:13/03:16 ET maintenance-window boot deaths. Kalshi answered every call
+# HTTP 503; startup_reconcile_failed carried KalshiApiError('HTTP 503 ...'),
+# the CLI printed REFUSING TO QUOTE on book_reconciled, and the supervisor's
+# own supervisor_exchange_unreachable fired on the same 503 ("cannot reach
+# exchange", exchange_reachable: false). The live code calls that unreachable;
+# so does the classifier. The fixture is that corpse's log, verbatim (37
+# lines, incl. the raw cp1252 em-dash byte the CLI printed).
+# --------------------------------------------------------------------------
+
+CORPSE_8_6 = Path(__file__).parent / "fixtures" / "watchdog" / "live_20260806_0313_tail.log"
+
+
+def _corpse_8_6_text() -> str:
+    return CORPSE_8_6.read_text(encoding="utf-8", errors="replace")
+
+
+def test_classify_death_the_8_6_maintenance_corpse_is_network() -> None:
+    verdict = hw.classify_death(_corpse_8_6_text())
+    assert verdict["class"] == hw.DEATH_NETWORK
+    assert verdict["marker"] == "startup_reconcile_failed: HTTP 503"
+    assert str(verdict["line"]).startswith("REFUSING TO QUOTE")
+    assert "book_reconciled" in str(verdict["line"])
+
+
+_TB_REST_RAISE = (
+    "Traceback (most recent call last):\n"
+    '  File "C:\\x\\src\\combomaker\\exchange\\rest.py", line 389, in _request\n'
+    "    raise err_cls(resp.status, code, message, details)\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "tail", "cls", "marker"),
+    [
+        (
+            "supervisor_exchange_unreachable on an exchange 503 (the 8/6 03:14 shape)",
+            '{"event": "quote_app_starting"}\n'
+            '{"detail": "cannot reach exchange \\u2014 writing KILL anyway (fail-closed)", '
+            '"error": "KalshiApiError(\'HTTP 503 : <html>503 Service Temporarily '
+            "Unavailable</html>')\", "
+            '"event": "supervisor_exchange_unreachable", "level": "error"}\n',
+            hw.DEATH_NETWORK,
+            "supervisor_exchange_unreachable: HTTP 503",
+        ),
+        (
+            "terminal KalshiApiError 5xx traceback (rest.py l.389 raise)",
+            _TB_REST_RAISE + "combomaker.exchange.rest.KalshiApiError: HTTP 502 : bad gateway\n",
+            hw.DEATH_NETWORK,
+            "KalshiApiError HTTP 502",
+        ),
+        (
+            "terminal KalshiApiError 503 whose HTML body spills over lines (the real str)",
+            _TB_REST_RAISE + "combomaker.exchange.rest.KalshiApiError: HTTP 503 : <html>\n"
+            "<head><title>503 Service Temporarily Unavailable</title></head>\n"
+            "<body>\n"
+            "<center><h1>503 Service Temporarily Unavailable</h1></center>\n"
+            "</body>\n"
+            "</html>\n",
+            hw.DEATH_NETWORK,
+            "KalshiApiError HTTP 503",
+        ),
+        (
+            "terminal KalshiApiError 4xx traceback (OUR request is wrong: CODE)",
+            _TB_REST_RAISE
+            + "combomaker.exchange.rest.KalshiApiError: HTTP 400 bad_request: invalid subaccount\n",
+            hw.DEATH_CONFIG_CODE,
+            "combomaker.exchange.rest.KalshiApiError",
+        ),
+        (
+            "terminal RateLimitedError 429 (ambiguous: stays fail-closed, CODE)",
+            _TB_REST_RAISE
+            + "combomaker.exchange.rest.RateLimitedError: HTTP 429 too_many_requests: too many\n",
+            hw.DEATH_CONFIG_CODE,
+            "combomaker.exchange.rest.RateLimitedError",
+        ),
+        (
+            "REFUSING TO QUOTE on book_reconciled after a 401 reconcile failure (creds: CODE)",
+            '{"event": "quote_app_starting"}\n'
+            '{"error": "KalshiApiError(\'HTTP 401 unauthorized: bad signature\')", '
+            '"event": "startup_reconcile_failed", "level": "error", "phase": "enumerate"}\n'
+            "REFUSING TO QUOTE: prod go-live preflight failed \u2014 red gates: book_reconciled\n",
+            hw.DEATH_CONFIG_CODE,
+            "REFUSING TO QUOTE",
+        ),
+        (
+            "REFUSING TO QUOTE on book_reconciled: 503 reconcile failure, then a LATER supervisor "
+            "503 (the real 8/6 ordering) — the reconcile cause is still the verdict",
+            '{"event": "quote_app_starting"}\n'
+            '{"error": "KalshiApiError(\'HTTP 503 : <html>\')", '
+            '"event": "startup_reconcile_failed", '
+            '"level": "error", "phase": "enumerate"}\n'
+            "REFUSING TO QUOTE: prod go-live preflight failed \u2014 red gates: book_reconciled\n"
+            '{"error": "KalshiApiError(\'HTTP 503 : <html>\')", '
+            '"event": "supervisor_exchange_unreachable", "level": "error"}\n',
+            hw.DEATH_NETWORK,
+            "startup_reconcile_failed: HTTP 503",
+        ),
+        (
+            "exchange_status_failed on a 5xx from an EARLIER boot never names this boot",
+            '{"error": "KalshiApiError(\'HTTP 503 : x\')", "event": "exchange_status_failed"}\n'
+            '{"event": "quote_app_starting"}\n'
+            '{"event": "pricing_stats"}\n',
+            hw.DEATH_UNKNOWN,
+            None,
+        ),
+    ],
+)
+def test_classify_death_exchange_5xx_is_network_4xx_is_code(
+    name: str, tail: str, cls: str, marker: str | None
+) -> None:
+    verdict = hw.classify_death(tail)
+    assert verdict["class"] == cls, name
+    assert verdict["marker"] == marker, name
+
+
+def test_maintenance_boot_death_waits_through_5xx_then_relights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 8/6 03:13 class end-to-end at the state-machine level with the
+    real corpse: the boot died on exchange 503s before any heartbeat -> NOT
+    latched; backoff threshold x streak (100, 200); the probe keeps waiting
+    while the exchange still answers 503 (reachable-but-not-serving is not
+    ok) and the relight fires on the first 200."""
+    _plant_corpse(tmp_path, _corpse_8_6_text(), name="live_20260806_0313.log")
+    probes, clock = FakeProbes(), Clock()
+    probes.heartbeat = False
+    probes.pids = []
+    probes.log = None  # type: ignore[assignment]
+    dog, calls = make_dog(tmp_path, probes, clock, threshold=100.0)
+    reach = ReachScript(
+        [
+            {"ok": False, "stage": "http", "status": 503, "error": "HTTP 503"},
+            {"ok": True, "stage": "http", "status": 200, "exchange_active": True},
+        ]
+    )
+    dog.reach_probe = reach
+    slept = _patched_sleep(monkeypatch)
+    dog.poll_once()
+    assert dog.poll_once() == "relit"
+    assert calls == ["STOP", "START"]
+    assert reach.calls == 2
+    assert slept == [100.0, 200.0]
+    assert dog._halt is None
+    assert not list((tmp_path / "data").glob("WATCHDOG_HALT_*.txt"))
+    state = json.loads((tmp_path / "data" / hw.STATE_FILE).read_text(encoding="utf-8"))
+    assert state["relights"][-1]["boot_death"] == hw.DEATH_NETWORK
+    assert state["relights"][-1]["reach_waits"] == 2
+    log = (tmp_path / "data" / hw.WATCHDOG_LOG).read_text(encoding="utf-8")
+    assert "boot death class NETWORK (startup_reconcile_failed: HTTP 503)" in log
+    assert log.count("UNREACHABLE") == 1 and ": REACHABLE {" in log
+
+
+def test_corpse_tail_reads_the_newest_log_name_on_an_mtime_tie(tmp_path: Path) -> None:
+    """Windows stamps file times off the system tick (~15.6 ms), so logs
+    written in one burst can share an mtime; on a tie the corpse is the
+    newest NAME (live_YYYYMMDD_HHMM.log names sort chronologically) — never
+    a stale tape. Pinned after prove_watchdog P2 read a synthetic tape
+    instead of the corpse on the unmodified tree (2026-09-04)."""
+    import os
+
+    data = tmp_path / "data"
+    data.mkdir()
+    old, new = data / "live_20260730_0400.log", data / "live_20260904_1200.log"
+    old.write_text('{"event": "x"}\n', encoding="utf-8")
+    new.write_text("config error: 1 validation error for AppConfig\n", encoding="utf-8")
+    stamp = old.stat().st_mtime_ns
+    os.utime(old, ns=(stamp, stamp))
+    os.utime(new, ns=(stamp, stamp))
+    assert old.stat().st_mtime_ns == new.stat().st_mtime_ns
+    probes, clock = FakeProbes(), Clock()
+    dog, _calls = make_dog(tmp_path, probes, clock, threshold=100.0)
+    assert dog._corpse_tail().startswith("config error:")
+    assert dog._corpse_death_class()["class"] == hw.DEATH_CONFIG_CODE
+
+
+def test_default_reach_probe_follows_the_live_yaml_anchor(tmp_path: Path) -> None:
+    """Watchdog() without an injected probe must aim at the same host the
+    CLI derives (live local yaml -> env), never a hard-coded one."""
+    import unittest.mock as um
+
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "prod-live.local.yaml").write_text(
+        "env: prod\nendpoints:\n  rest_base_url: https://probe.example/trade-api/v2\n",
+        encoding="utf-8",
+    )
+    seen: dict[str, object] = {}
+
+    def fake_probe(url: str, timeout_s: float, **kw: object) -> dict[str, object]:
+        seen["url"] = url
+        seen["timeout"] = timeout_s
+        return {"ok": True}
+
+    with um.patch.object(hw, "probe_exchange_reach", fake_probe):
+        probes, clock = FakeProbes(), Clock()
+        dog, _calls = make_dog(tmp_path, probes, clock, threshold=100.0)
+        assert dog.reach_probe is not None
+        dog.reach_probe()
+    assert seen == {
+        "url": "https://probe.example/trade-api/v2",
+        "timeout": hw._DEFAULT_REQUEST_TIMEOUT_S,
+    }

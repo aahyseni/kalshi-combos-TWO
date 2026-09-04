@@ -48,8 +48,9 @@ ESCALATION (bounded — REFUSES to flap):
        reached liveness. WHY it died decides what happens next (2026-09-04
        build — the 8/27 02:13 ET latch that became an 8-day outage): the
        corpse log is CLASSIFIED (``classify_death``, markers derived from what
-       the live code raises/logs). NETWORK (exchange unreachable, DNS, feed
-       lost) is NOT a boot loop — wait the same derived backoff guard 2 uses,
+       the live code raises/logs). NETWORK (exchange unreachable, DNS, an
+       exchange 5xx, feed lost) is NOT a boot loop — wait the same derived
+       backoff guard 2 uses,
        gate on an exchange reach probe, retry forever. CONFIG_CODE (a boot
        refusal print, a traceback without a network root cause — the
        2026-07-31 09:00 config-validation exit died in <1s, 0 relights is the
@@ -270,8 +271,8 @@ def _read_exchange_anchors(root: Path) -> str:
 # class, and the 8/6 rework already retries it when it happens AFTER the
 # heartbeat. This closes the pre-heartbeat gap.
 #
-# CLASSES: NETWORK (exchange unreachable / DNS / feed lost) → wait the derived
-# backoff, gate on a reach probe, retry forever. CONFIG_CODE (a refusal the
+# CLASSES: NETWORK (exchange unreachable / DNS / exchange 5xx / feed lost) →
+# wait the derived backoff, gate on a reach probe, retry forever. CONFIG_CODE (a refusal the
 # bot prints at boot, or a Python traceback whose terminal exception is not a
 # transport error) and UNKNOWN (no readable cause) → latch, exactly as before
 # (fail-closed on the genuinely unknown).
@@ -298,6 +299,22 @@ def _read_exchange_anchors(root: Path) -> str:
 #    ``startup_reconcile_incomplete`` (quote_app.py l.3772) carries no error
 #    of its own — its cause is the preceding startup_reconcile_failed line,
 #    which is what is matched.
+#  * exchange 5xx, on a reach event's ``error`` or as a terminal exception:
+#    Kalshi answering "503 Service Temporarily Unavailable" (maintenance) is
+#    the 2026-08-06 03:13/03:16 ET boot-death shape on the tape (both
+#    corpses: startup_reconcile_failed → REFUSING TO QUOTE on
+#    book_reconciled → supervisor_exchange_unreachable, all on the 503).
+#    The live code ITSELF files it as unreachable: supervisor.py l.273-279
+#    catches any listing Exception as ``supervisor_exchange_unreachable``
+#    ("cannot reach exchange") and logged ``exchange_reachable: false`` on
+#    that 503; quote_app.py l.3775 calls the reconcile failure it caused
+#    "exchange unreachable". ``rest.py`` l.37-40 renders every non-2xx as
+#    ``KalshiApiError`` str "HTTP {status} {code}: {message}" (raised at
+#    l.388-389; 429 → ``RateLimitedError``), so the marker is the STATUS
+#    CLASS: 5xx only. A 4xx is OUR request (credentials, a bad parameter)
+#    → CODE; a 429 at boot is ambiguous (throttled after rapid relights vs
+#    our own budget misconfig) and stays CODE — fail-closed. The reach
+#    probe already reads a 5xx as "reachable but not serving" and waits.
 #  * feed loss: ``kill_switch_halt`` (risk/killswitch.py l.64) with
 #    ``reason=halt_data_stale`` (core/reasons.py l.305; tripped by
 #    risk/breakers.py ``detect_data_stale`` l.70 on rx-age None / seq gap).
@@ -322,6 +339,8 @@ _NETWORK_EXC_NAMES = (
     "ClientConnectorDNSError",
     "ClientConnectorCertificateError",
     "ClientConnectorSSLError",
+    "ClientSSLError",
+    "ServerFingerprintMismatch",
     "ClientConnectorError",
     "ClientProxyConnectionError",
     "UnixClientConnectorError",
@@ -342,6 +361,9 @@ _NETWORK_EXC_NAMES = (
 )
 _NETWORK_EXC_RE = re.compile("|".join(re.escape(n) for n in _NETWORK_EXC_NAMES))
 _TIMEOUT_RE = re.compile(r"\bTimeoutError\b")
+# rest.py KalshiApiError str: "HTTP {status} {code}: {message}" — 5xx only.
+_EXCHANGE_5XX_RE = re.compile(r"\bHTTP (5\d\d)\b")
+_EXCHANGE_API_EXC = "KalshiApiError"
 _EXCHANGE_FRAME_RE = re.compile(r"combomaker[\\/]exchange[\\/]|[\\/]aiohttp[\\/]")
 _REACH_EVENTS = (
     "startup_reconcile_failed",
@@ -380,6 +402,9 @@ def _network_event(line: str) -> str | None:
                 return f"{ev}: {hit.group(0)}"
             if _TIMEOUT_RE.search(err):
                 return f"{ev}: TimeoutError"
+            m5 = _EXCHANGE_5XX_RE.search(err)
+            if m5:
+                return f"{ev}: HTTP {m5.group(1)}"
             return None
     return None
 
@@ -424,6 +449,10 @@ def classify_death(tail: str) -> dict[str, object]:
             return verdict(DEATH_NETWORK, hit.group(0), terminal)
         if _TIMEOUT_RE.search(terminal) and _EXCHANGE_FRAME_RE.search(body):
             return verdict(DEATH_NETWORK, "TimeoutError on exchange call", terminal)
+        if _EXCHANGE_API_EXC in terminal:
+            m5 = _EXCHANGE_5XX_RE.search(terminal)
+            if m5:
+                return verdict(DEATH_NETWORK, f"{_EXCHANGE_API_EXC} HTTP {m5.group(1)}", terminal)
         return verdict(DEATH_CONFIG_CODE, terminal.split(":", 1)[0].strip(), terminal)
 
     # 2. The bot's own boot refusal print (ops/cli.py).
@@ -431,27 +460,32 @@ def classify_death(tail: str) -> dict[str, object]:
     for ln in lines:
         if ln.startswith(_REFUSAL_PREFIXES):
             refusal = ln
-    network_ev = None
+    # Every exchange-reach / feed-loss event of THIS boot, newest first.
+    network_events: list[tuple[str, str]] = []
     for ln in reversed(lines):
-        network_ev = _network_event(ln)
-        if network_ev:
-            network_line = ln
-            break
+        ev = _network_event(ln)
+        if ev:
+            network_events.append((ev, ln))
     if refusal is not None:
         prefix = refusal.split(":", 1)[0]
-        if (
-            prefix == "REFUSING TO QUOTE"
-            and "book_reconciled" in refusal
-            and network_ev
-            and network_ev.startswith("startup_reconcile_failed")
-        ):
-            return verdict(DEATH_NETWORK, network_ev, refusal)
+        if prefix == "REFUSING TO QUOTE" and "book_reconciled" in refusal:
+            # The gate went red because the startup reconcile could not
+            # reach the exchange — ANY such reconcile failure in this boot,
+            # not only the newest network event (on 8/6 03:14 the
+            # supervisor's own 503 event came AFTER the refusal print).
+            reconcile = next(
+                (m for m, _ln in network_events if m.startswith("startup_reconcile_failed")),
+                None,
+            )
+            if reconcile:
+                return verdict(DEATH_NETWORK, reconcile, refusal)
         return verdict(DEATH_CONFIG_CODE, prefix, refusal)
 
     # 3. An exchange-reach failure / feed loss with no traceback and no
     #    refusal print (the halt_data_stale deaths of 8/27 01:33-02:04 ET).
-    if network_ev:
-        return verdict(DEATH_NETWORK, network_ev, network_line)
+    if network_events:
+        marker, line = network_events[0]
+        return verdict(DEATH_NETWORK, marker, line)
     return verdict(DEATH_UNKNOWN, None, "")
 
 
@@ -719,7 +753,9 @@ class Watchdog:
         self._episode_start = now
         self._load_state()
         if self.reach_probe is None:
-            url = _REST_BASE_URLS["prod"]
+            # Same anchor the CLI passes: the LIVE yaml's env / endpoints,
+            # prod when the tree has no local yaml (never a per-env template).
+            url = _read_exchange_anchors(self.root)
             self.reach_probe = lambda: probe_exchange_reach(url, _DEFAULT_REQUEST_TIMEOUT_S)
 
     # -- logging ------------------------------------------------------------
@@ -767,13 +803,16 @@ class Watchdog:
     def _corpse_tail(self) -> str:
         """The last 256 KB of the corpse's own log — the newest ``live_*.log``
         by mtime (the pointer file may already have been rewritten by a start
-        path; mtime is what identifies the run that just died). Empty when
-        unreadable. Shared by the human-KILL reader and the death classifier
-        so both read the same receipt."""
+        path; mtime is what identifies the run that just died), ties broken
+        by name (Windows stamps file times off the ~15.6 ms system tick, so
+        logs written in one burst can share an mtime; live_YYYYMMDD_HHMM
+        names sort chronologically). Empty when unreadable. Shared by the
+        human-KILL reader and the death classifier so both read the same
+        receipt."""
         try:
             logs = sorted(
                 self.data_dir.glob("live_*.log"),
-                key=lambda p: p.stat().st_mtime,
+                key=lambda p: (p.stat().st_mtime, p.name),
                 reverse=True,
             )
             if not logs:
