@@ -217,10 +217,19 @@ class TestInversion:
             )
 
     def test_contradictory_exact_system_refuses(self) -> None:
-        # A 95% favorite in a game where both teams score 90% of the time is
-        # not representable by any Poisson scoreline.
-        with pytest.raises(StructuralError):
-            knockout_invert([(TeamWin(Team.A), 0.95), (Btts(), 0.90)])
+        # A 98% favorite in a game where both teams score 95% of the time is
+        # not representable by any Poisson scoreline (residual 0.0676 > the
+        # ONE structural hard bar 0.05). PIN CHANGED 2026-09-04 (build item B):
+        # the former 0.95/0.90 pair measures residual 0.0272 — under the hard
+        # bar that replaced the hand-set 0.005 exact-system bar — so it now
+        # solves (to the nearest scoreline, misfit priced into width) and its
+        # accept/challenge label is derived by the caller from the leg books.
+        with pytest.raises(StructuralError, match="hard bar") as info:
+            knockout_invert([(TeamWin(Team.A), 0.98), (Btts(), 0.95)])
+        assert info.value.residual is not None and info.value.residual > 0.05
+        # The 0.95/0.90 pair: solved, residual reported (no longer refused).
+        soft = knockout_invert([(TeamWin(Team.A), 0.95), (Btts(), 0.90)])
+        assert 0.005 < soft.residual <= 0.05
 
     def test_infeasible_player_marginal_refuses(self) -> None:
         # Player scores more often than his team plausibly could.
@@ -231,9 +240,23 @@ class TestInversion:
 
     def test_overidentified_system_reports_residual(self) -> None:
         # Third constraint deliberately inconsistent with the first two.
-        legs = [(TeamWin(Team.A), 0.65), (Btts(), 0.55), (TotalOver(3), 0.80)]
+        # PIN CHANGED 2026-09-04 (build item B): TotalOver(3) 0.80 measures
+        # residual 0.0797, which the ONE structural hard bar (0.05 — now
+        # enforced for over-identified DC systems too; before this build an
+        # over-identified DC fit was never rejected at any residual) refuses;
+        # 0.66 (residual 0.0174) keeps the test's intent: a below-bar
+        # over-identified misfit is REPORTED, not hidden.
+        legs = [(TeamWin(Team.A), 0.65), (Btts(), 0.55), (TotalOver(3), 0.66)]
         model = knockout_invert(legs)
-        assert model.residual > 0.005
+        assert 0.005 < model.residual <= 0.05
+        assert any("residual=" in n for n in model.notes)
+
+    def test_overidentified_system_over_hard_bar_refuses(self) -> None:
+        # Build 2026-09-04 item B: the same hard bar applies to every system.
+        legs = [(TeamWin(Team.A), 0.65), (Btts(), 0.55), (TotalOver(3), 0.80)]
+        with pytest.raises(StructuralError, match="hard bar") as info:
+            knockout_invert(legs)
+        assert info.value.residual is not None and info.value.residual > 0.05
 
     def test_marginal_out_of_range_refuses(self) -> None:
         with pytest.raises(StructuralError, match="out of invertible range"):

@@ -1,0 +1,1246 @@
+{
+ "note": "26 recorded fill contexts (decisions.context_json leg mids, rfqs legs); expectations from tools/proto_structural_fit_bar.py (build 2026-09-04)",
+ "uncertainty": 0.005,
+ "btts_total_old": 0.7,
+ "btts_total_new": 0.746,
+ "contexts": [
+  {
+   "rfq_id": "8cd961a1-1b93-4867-9f60-092cd6aa61ed",
+   "market_ticker": "KXMVECROSSCATEGORY-SHARD1-S202604CBE7D3F5E-E2886D1145F",
+   "quote_at": "2026-08-27T05:47:47.383466+00:00",
+   "target_cost_cc": 50000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXLIGAMXBTTS-26AUG28NCXCRA-BTTS",
+     "event_ticker": "KXLIGAMXBTTS-26AUG28NCXCRA",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXLIGAMXTOTAL-26AUG28NCXCRA-4",
+     "event_ticker": "KXLIGAMXTOTAL-26AUG28NCXCRA",
+     "side": "no"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXLIGAMXBTTS-26AUG28NCXCRA-BTTS": 5800,
+    "KXLIGAMXTOTAL-26AUG28NCXCRA-4": 3461
+   },
+   "recorded_fair_cc": 2733,
+   "recorded_no_bid_cc": 7110,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "structural",
+   "old_p": 0.27328234946741087,
+   "promoted_p": 0.27328234946741087,
+   "new_route": "hybrid",
+   "new_p": 0.2732823494678202,
+   "verdict": {
+    "verdict": "accept",
+    "residual": 5.551115123125783e-17,
+    "accept_bar": 0.025,
+    "hard_bar": 0.05,
+    "rho": 0.7078519030795745,
+    "lam_a": 1.1628189192039857,
+    "lam_b": 1.8074170048145068,
+    "uncertainty": 0.009565341213107537
+   }
+  },
+  {
+   "rfq_id": "9e425a54-3eaf-49b1-b397-23b501973080",
+   "market_ticker": "KXMVECROSSCATEGORY-SHARD1-S2026691144F5581-53799E34042",
+   "quote_at": "2026-08-19T04:09:55.606574+00:00",
+   "target_cost_cc": 50000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXLALIGAGAME-26AUG19ATMMCF-ATM",
+     "event_ticker": "KXLALIGAGAME-26AUG19ATMMCF",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXLALIGATOTAL-26AUG19ATMMCF-2",
+     "event_ticker": "KXLALIGATOTAL-26AUG19ATMMCF",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXMLSTOTAL-26AUG19LAGSJ-2",
+     "event_ticker": "KXMLSTOTAL-26AUG19LAGSJ",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXMLSTOTAL-26AUG19ORLCHI-2",
+     "event_ticker": "KXMLSTOTAL-26AUG19ORLCHI",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXMLSTOTAL-26AUG19PORSD-2",
+     "event_ticker": "KXMLSTOTAL-26AUG19PORSD",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXUCLBTTS-26AUG19NIJBOG-BTTS",
+     "event_ticker": "KXUCLBTTS-26AUG19NIJBOG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXUCLTOTAL-26AUG19CELASK-1",
+     "event_ticker": "KXUCLTOTAL-26AUG19CELASK",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXUCLTOTAL-26AUG19NIJBOG-3",
+     "event_ticker": "KXUCLTOTAL-26AUG19NIJBOG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXUCLTOTAL-26AUG19SLOCEL-1",
+     "event_ticker": "KXUCLTOTAL-26AUG19SLOCEL",
+     "side": "yes"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXLALIGAGAME-26AUG19ATMMCF-ATM": 7323,
+    "KXLALIGATOTAL-26AUG19ATMMCF-2": 7782,
+    "KXMLSTOTAL-26AUG19LAGSJ-2": 8580,
+    "KXMLSTOTAL-26AUG19ORLCHI-2": 8756,
+    "KXMLSTOTAL-26AUG19PORSD-2": 8814,
+    "KXUCLBTTS-26AUG19NIJBOG-BTTS": 6969,
+    "KXUCLTOTAL-26AUG19CELASK-1": 9441,
+    "KXUCLTOTAL-26AUG19NIJBOG-3": 6788,
+    "KXUCLTOTAL-26AUG19SLOCEL-1": 9418
+   },
+   "recorded_fair_cc": 2034,
+   "recorded_no_bid_cc": 7790,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "copula",
+   "old_p": 0.2032739621779822,
+   "promoted_p": 0.2065218129932043,
+   "new_route": "copula",
+   "new_p": 0.2065218129932043,
+   "verdict": null
+  },
+  {
+   "rfq_id": "10d9eaca-77e2-4c29-8f01-9f1f9066108a",
+   "market_ticker": "KXMVECROSSCATEGORY-SHARD1-S2026BAAD05077EE-F76C9FCC742",
+   "quote_at": "2026-08-19T21:01:03.155658+00:00",
+   "target_cost_cc": 100000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXMLSBTTS-26AUG19ORLCHI-BTTS",
+     "event_ticker": "KXMLSBTTS-26AUG19ORLCHI",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXMLSGAME-26AUG19PHIMIA-PHI",
+     "event_ticker": "KXMLSGAME-26AUG19PHIMIA",
+     "side": "no"
+    },
+    {
+     "market_ticker": "KXMLSTOTAL-26AUG19PHIMIA-2",
+     "event_ticker": "KXMLSTOTAL-26AUG19PHIMIA",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXMLSTOTAL-26AUG19SKCSTL-1",
+     "event_ticker": "KXMLSTOTAL-26AUG19SKCSTL",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXMLSTOTAL-26AUG19TORCLT-1",
+     "event_ticker": "KXMLSTOTAL-26AUG19TORCLT",
+     "side": "yes"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXMLSBTTS-26AUG19ORLCHI-BTTS": 7091,
+    "KXMLSGAME-26AUG19PHIMIA-PHI": 4182,
+    "KXMLSTOTAL-26AUG19PHIMIA-2": 8879,
+    "KXMLSTOTAL-26AUG19SKCSTL-1": 9534,
+    "KXMLSTOTAL-26AUG19TORCLT-1": 9499
+   },
+   "recorded_fair_cc": 3189,
+   "recorded_no_bid_cc": 6640,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": false,
+   "old_route": "copula",
+   "old_p": 0.3189309481962559,
+   "promoted_p": 0.3189309481962559,
+   "new_route": "copula",
+   "new_p": 0.3189309481962559,
+   "verdict": null
+  },
+  {
+   "rfq_id": "9f694b39-8a94-40cc-b03e-5359eedaf549",
+   "market_ticker": "KXMVECROSSCATEGORY-SHARD1-S2026BBEEBB9367A-07FBE39976B",
+   "quote_at": "2026-08-19T03:54:54.132975+00:00",
+   "target_cost_cc": 400000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXUCLBTTS-26AUG19NIJBOG-BTTS",
+     "event_ticker": "KXUCLBTTS-26AUG19NIJBOG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXUCLTOTAL-26AUG19NIJBOG-3",
+     "event_ticker": "KXUCLTOTAL-26AUG19NIJBOG",
+     "side": "yes"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXUCLBTTS-26AUG19NIJBOG-BTTS": 6971,
+    "KXUCLTOTAL-26AUG19NIJBOG-3": 6791
+   },
+   "recorded_fair_cc": 5765,
+   "recorded_no_bid_cc": 4130,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "copula(fallback: inversion residual 0.0062 on exact system)",
+   "old_p": 0.5763971899069629,
+   "promoted_p": 0.585598565781811,
+   "new_route": "hybrid",
+   "new_p": 0.5954431009842186,
+   "verdict": {
+    "verdict": "accept",
+    "residual": 0.006218383908423775,
+    "accept_bar": 0.025,
+    "hard_bar": 0.05,
+    "rho": 0.79140669264029,
+    "lam_a": 1.7628065751040245,
+    "lam_b": 1.7628065229957328,
+    "uncertainty": 0.01589253500848009
+   }
+  },
+  {
+   "rfq_id": "7fdb3c32-af17-4139-a41d-db9f61da6658",
+   "market_ticker": "KXMVECROSSCATEGORY-SHARD1-S2026F9DE302B8F6-1571BB5870A",
+   "quote_at": "2026-08-18T08:52:41.359488+00:00",
+   "target_cost_cc": 50000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXUCLBTTS-26AUG18LEVAEK-BTTS",
+     "event_ticker": "KXUCLBTTS-26AUG18LEVAEK",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXUCLGAME-26AUG18LEVAEK-AEK",
+     "event_ticker": "KXUCLGAME-26AUG18LEVAEK",
+     "side": "no"
+    },
+    {
+     "market_ticker": "KXUCLTOTAL-26AUG18LEVAEK-4",
+     "event_ticker": "KXUCLTOTAL-26AUG18LEVAEK",
+     "side": "no"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXUCLBTTS-26AUG18LEVAEK-BTTS": 4824,
+    "KXUCLGAME-26AUG18LEVAEK-AEK": 4041,
+    "KXUCLTOTAL-26AUG18LEVAEK-4": 1920
+   },
+   "recorded_fair_cc": 2072,
+   "recorded_no_bid_cc": 7820,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "structural",
+   "old_p": 0.20717812968605703,
+   "promoted_p": 0.20717812968605703,
+   "new_route": "structural",
+   "new_p": 0.20717812968605703,
+   "verdict": {
+    "verdict": "accept",
+    "residual": 0.010703119006700013,
+    "accept_bar": 0.025,
+    "hard_bar": 0.05,
+    "rho": null,
+    "lam_a": 1.053550803945087,
+    "lam_b": 1.2565179033240572,
+    "uncertainty": 0.020210597525964852
+   }
+  },
+  {
+   "rfq_id": "32114271-a5f9-4b89-b999-d0dfdeeaf880",
+   "market_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026835DA8ECF17-15656E866DA",
+   "quote_at": "2026-08-17T16:20:25.330833+00:00",
+   "target_cost_cc": 15000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXLIGAMXBTTS-26AUG17NCXLEO-BTTS",
+     "event_ticker": "KXLIGAMXBTTS-26AUG17NCXLEO",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXLIGAMXBTTS-26AUG17PACPUE-BTTS",
+     "event_ticker": "KXLIGAMXBTTS-26AUG17PACPUE",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXLIGAMXTOTAL-26AUG17NCXLEO-3",
+     "event_ticker": "KXLIGAMXTOTAL-26AUG17NCXLEO",
+     "side": "yes"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXLIGAMXBTTS-26AUG17NCXLEO-BTTS": 5905,
+    "KXLIGAMXBTTS-26AUG17PACPUE-BTTS": 5244,
+    "KXLIGAMXTOTAL-26AUG17NCXLEO-3": 5301
+   },
+   "recorded_fair_cc": 2271,
+   "recorded_no_bid_cc": 7570,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "copula",
+   "old_p": 0.22709214924250723,
+   "promoted_p": 0.23246399341877977,
+   "new_route": "copula",
+   "new_p": 0.23246399341877977,
+   "verdict": null
+  },
+  {
+   "rfq_id": "06e11b30-200d-43dd-b98b-a1594e222d6c",
+   "market_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026E3ACDC4B111-637F0C7A343",
+   "quote_at": "2026-08-17T16:29:20.011808+00:00",
+   "target_cost_cc": 99000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXEFLCHAMPIONSHIPTOTAL-26AUG17CARWRE-2",
+     "event_ticker": "KXEFLCHAMPIONSHIPTOTAL-26AUG17CARWRE",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXLALIGATOTAL-26AUG17DEPELC-2",
+     "event_ticker": "KXLALIGATOTAL-26AUG17DEPELC",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXLIGAMXBTTS-26AUG17NCXLEO-BTTS",
+     "event_ticker": "KXLIGAMXBTTS-26AUG17NCXLEO",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXLIGAMXTOTAL-26AUG17NCXLEO-3",
+     "event_ticker": "KXLIGAMXTOTAL-26AUG17NCXLEO",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXLIGAMXTOTAL-26AUG17PACPUE-2",
+     "event_ticker": "KXLIGAMXTOTAL-26AUG17PACPUE",
+     "side": "yes"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXEFLCHAMPIONSHIPTOTAL-26AUG17CARWRE-2": 7882,
+    "KXLALIGATOTAL-26AUG17DEPELC-2": 6832,
+    "KXLIGAMXBTTS-26AUG17NCXLEO-BTTS": 5905,
+    "KXLIGAMXTOTAL-26AUG17NCXLEO-3": 5301,
+    "KXLIGAMXTOTAL-26AUG17PACPUE-2": 7892
+   },
+   "recorded_fair_cc": 1841,
+   "recorded_no_bid_cc": 7970,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "copula",
+   "old_p": 0.1840393880256072,
+   "promoted_p": 0.18839282841760768,
+   "new_route": "copula",
+   "new_p": 0.18839282841760768,
+   "verdict": null
+  },
+  {
+   "rfq_id": "21408a5e-eff5-4a37-b14d-a8053046c58a",
+   "market_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S20266D083131EEB-EF85B65866C",
+   "quote_at": "2026-08-17T04:38:55.761912+00:00",
+   "target_cost_cc": 10000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXLIGAMXBTTS-26AUG17NCXLEO-BTTS",
+     "event_ticker": "KXLIGAMXBTTS-26AUG17NCXLEO",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXLIGAMXGAME-26AUG17NCXLEO-TIE",
+     "event_ticker": "KXLIGAMXGAME-26AUG17NCXLEO",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXLIGAMXGAME-26AUG17PACPUE-PAC",
+     "event_ticker": "KXLIGAMXGAME-26AUG17PACPUE",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXLIGAMXTOTAL-26AUG17PACPUE-2",
+     "event_ticker": "KXLIGAMXTOTAL-26AUG17PACPUE",
+     "side": "yes"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXLIGAMXBTTS-26AUG17NCXLEO-BTTS": 6101,
+    "KXLIGAMXGAME-26AUG17NCXLEO-TIE": 2518,
+    "KXLIGAMXGAME-26AUG17PACPUE-PAC": 6452,
+    "KXLIGAMXTOTAL-26AUG17PACPUE-2": 7924
+   },
+   "recorded_fair_cc": 770,
+   "recorded_no_bid_cc": 8940,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": false,
+   "old_route": "copula",
+   "old_p": 0.07698331590614406,
+   "promoted_p": 0.07698331590614406,
+   "new_route": "copula",
+   "new_p": 0.07698331590614406,
+   "verdict": null
+  },
+  {
+   "rfq_id": "5ba6b0ca-2daf-4110-b191-61d9427a7a6d",
+   "market_ticker": "KXMVECROSSCATEGORY-SHARD1-S2026E3ED5ED6064-1D6E4C2568D",
+   "quote_at": "2026-08-17T21:28:01.526827+00:00",
+   "target_cost_cc": 200000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXLIGAMXBTTS-26AUG17NCXLEO-BTTS",
+     "event_ticker": "KXLIGAMXBTTS-26AUG17NCXLEO",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXLIGAMXTOTAL-26AUG17NCXLEO-3",
+     "event_ticker": "KXLIGAMXTOTAL-26AUG17NCXLEO",
+     "side": "yes"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXLIGAMXBTTS-26AUG17NCXLEO-BTTS": 5916,
+    "KXLIGAMXTOTAL-26AUG17NCXLEO-3": 5378
+   },
+   "recorded_fair_cc": 4382,
+   "recorded_no_bid_cc": 5450,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "copula(fallback: inversion residual 0.0078 on exact system)",
+   "old_p": 0.4381316986297942,
+   "promoted_p": 0.44839920732289035,
+   "new_route": "hybrid",
+   "new_p": 0.46065660829356836,
+   "verdict": {
+    "verdict": "accept",
+    "residual": 0.007801102541766247,
+    "accept_bar": 0.025,
+    "hard_bar": 0.05,
+    "rho": 0.7967171782599406,
+    "lam_a": 1.4280392592074183,
+    "lam_b": 1.4280391926732345,
+    "uncertainty": 0.01726711410840792
+   }
+  },
+  {
+   "rfq_id": "4d6e72d1-04c2-46e5-9c55-537a32544025",
+   "market_ticker": "KXMVECROSSCATEGORY-SHARD1-S2026E3ED5ED6064-1D6E4C2568D",
+   "quote_at": "2026-08-17T21:47:00.169307+00:00",
+   "target_cost_cc": 100000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXLIGAMXBTTS-26AUG17NCXLEO-BTTS",
+     "event_ticker": "KXLIGAMXBTTS-26AUG17NCXLEO",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXLIGAMXTOTAL-26AUG17NCXLEO-3",
+     "event_ticker": "KXLIGAMXTOTAL-26AUG17NCXLEO",
+     "side": "yes"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXLIGAMXBTTS-26AUG17NCXLEO-BTTS": 5944,
+    "KXLIGAMXTOTAL-26AUG17NCXLEO-3": 5365
+   },
+   "recorded_fair_cc": 4387,
+   "recorded_no_bid_cc": 5420,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "copula(fallback: inversion residual 0.0102 on exact system)",
+   "old_p": 0.4386478598256565,
+   "promoted_p": 0.448883863013003,
+   "new_route": "hybrid",
+   "new_p": 0.461091816643057,
+   "verdict": {
+    "verdict": "accept",
+    "residual": 0.010187978408285558,
+    "accept_bar": 0.025,
+    "hard_bar": 0.05,
+    "rho": 0.7966978226319984,
+    "lam_a": 1.4291838513085118,
+    "lam_b": 1.4291839452765613,
+    "uncertainty": 0.01963882360512481
+   }
+  },
+  {
+   "rfq_id": "901b171e-bbf3-422f-8962-7bbc226d198f",
+   "market_ticker": "KXMVECROSSCATEGORY-SHARD1-S2026C6A2EB7F7EE-0F3C31273DE",
+   "quote_at": "2026-08-17T17:41:59.251902+00:00",
+   "target_cost_cc": 20000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXEFLCHAMPIONSHIPBTTS-26AUG17CARWRE-BTTS",
+     "event_ticker": "KXEFLCHAMPIONSHIPBTTS-26AUG17CARWRE",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXEFLCHAMPIONSHIPGAME-26AUG17CARWRE-TIE",
+     "event_ticker": "KXEFLCHAMPIONSHIPGAME-26AUG17CARWRE",
+     "side": "no"
+    },
+    {
+     "market_ticker": "KXEFLCHAMPIONSHIPTOTAL-26AUG17CARWRE-4",
+     "event_ticker": "KXEFLCHAMPIONSHIPTOTAL-26AUG17CARWRE",
+     "side": "no"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXEFLCHAMPIONSHIPBTTS-26AUG17CARWRE-BTTS": 6256,
+    "KXEFLCHAMPIONSHIPGAME-26AUG17CARWRE-TIE": 2722,
+    "KXEFLCHAMPIONSHIPTOTAL-26AUG17CARWRE-4": 3376
+   },
+   "recorded_fair_cc": 1680,
+   "recorded_no_bid_cc": 8140,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "structural",
+   "old_p": 0.1680225124393988,
+   "promoted_p": 0.1680225124393988,
+   "new_route": "structural",
+   "new_p": 0.1680225124393988,
+   "verdict": {
+    "verdict": "accept",
+    "residual": 0.019523610982589035,
+    "accept_bar": 0.025,
+    "hard_bar": 0.05,
+    "rho": null,
+    "lam_a": 1.491131206798985,
+    "lam_b": 1.491131168736924,
+    "uncertainty": 0.01956880464513122
+   }
+  },
+  {
+   "rfq_id": "6999a6b6-5a18-49ed-bac8-84522933e840",
+   "market_ticker": "KXMVECROSSCATEGORY-SHARD1-S2026847AB36096C-8BCC9563E2C",
+   "quote_at": "2026-08-17T18:11:26.621945+00:00",
+   "target_cost_cc": 107800,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXEFLCHAMPIONSHIPBTTS-26AUG17CARWRE-BTTS",
+     "event_ticker": "KXEFLCHAMPIONSHIPBTTS-26AUG17CARWRE",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXEFLCHAMPIONSHIPTOTAL-26AUG17CARWRE-3",
+     "event_ticker": "KXEFLCHAMPIONSHIPTOTAL-26AUG17CARWRE",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXLALIGATOTAL-26AUG17DEPELC-3",
+     "event_ticker": "KXLALIGATOTAL-26AUG17DEPELC",
+     "side": "no"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXEFLCHAMPIONSHIPBTTS-26AUG17CARWRE-BTTS": 6260,
+    "KXEFLCHAMPIONSHIPTOTAL-26AUG17CARWRE-3": 5723,
+    "KXLALIGATOTAL-26AUG17DEPELC-3": 4048
+   },
+   "recorded_fair_cc": 2827,
+   "recorded_no_bid_cc": 6970,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "copula",
+   "old_p": 0.28268900431876437,
+   "promoted_p": 0.2886679716934176,
+   "new_route": "copula",
+   "new_p": 0.2886679716934176,
+   "verdict": null
+  },
+  {
+   "rfq_id": "1fae2897-663e-4aed-a232-75ac3193fc54",
+   "market_ticker": "KXMVECROSSCATEGORY-SHARD1-S2026F46265E0663-D069EE4FFEE",
+   "quote_at": "2026-08-17T18:37:38.090858+00:00",
+   "target_cost_cc": 50000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXEFLCHAMPIONSHIPBTTS-26AUG17CARWRE-BTTS",
+     "event_ticker": "KXEFLCHAMPIONSHIPBTTS-26AUG17CARWRE",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXEFLCHAMPIONSHIPTOTAL-26AUG17CARWRE-3",
+     "event_ticker": "KXEFLCHAMPIONSHIPTOTAL-26AUG17CARWRE",
+     "side": "yes"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXEFLCHAMPIONSHIPBTTS-26AUG17CARWRE-BTTS": 6323,
+    "KXEFLCHAMPIONSHIPTOTAL-26AUG17CARWRE-3": 5732
+   },
+   "recorded_fair_cc": 4785,
+   "recorded_no_bid_cc": 5000,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "copula(fallback: inversion residual 0.0164 on exact system)",
+   "old_p": 0.4784810638792333,
+   "promoted_p": 0.488459981512398,
+   "new_route": "hybrid",
+   "new_p": 0.49999393978850987,
+   "verdict": {
+    "verdict": "accept",
+    "residual": 0.016363820576828503,
+    "accept_bar": 0.025,
+    "hard_bar": 0.05,
+    "rho": 0.7951898147698968,
+    "lam_a": 1.519997563300948,
+    "lam_b": 1.519997586663741,
+    "uncertainty": 0.02589149083600706
+   }
+  },
+  {
+   "rfq_id": "56f8275c-30f6-476d-b6ce-c1b5cd37c509",
+   "market_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026167E4B0F288-44A6BB85964",
+   "quote_at": "2026-08-15T11:34:25.656816+00:00",
+   "target_cost_cc": 80000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXMLSBTTS-26AUG15NSHMIA-BTTS",
+     "event_ticker": "KXMLSBTTS-26AUG15NSHMIA",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXMLSTOTAL-26AUG15LAFCSD-2",
+     "event_ticker": "KXMLSTOTAL-26AUG15LAFCSD",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXMLSTOTAL-26AUG15MTLDCU-3",
+     "event_ticker": "KXMLSTOTAL-26AUG15MTLDCU",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXMLSTOTAL-26AUG15NSHMIA-3",
+     "event_ticker": "KXMLSTOTAL-26AUG15NSHMIA",
+     "side": "yes"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXMLSBTTS-26AUG15NSHMIA-BTTS": 6748,
+    "KXMLSTOTAL-26AUG15LAFCSD-2": 8514,
+    "KXMLSTOTAL-26AUG15MTLDCU-3": 5637,
+    "KXMLSTOTAL-26AUG15NSHMIA-3": 6487
+   },
+   "recorded_fair_cc": 2620,
+   "recorded_no_bid_cc": 7230,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "copula",
+   "old_p": 0.2619683683287128,
+   "promoted_p": 0.26654751398699145,
+   "new_route": "copula",
+   "new_p": 0.26654751398699145,
+   "verdict": null
+  },
+  {
+   "rfq_id": "b8966cdd-096e-43b9-8aa1-6d5c7c60e503",
+   "market_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S202619C3E003D61-1836234B74A",
+   "quote_at": "2026-08-15T10:52:23.963698+00:00",
+   "target_cost_cc": 47500,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXMLSBTTS-26AUG15NSHMIA-BTTS",
+     "event_ticker": "KXMLSBTTS-26AUG15NSHMIA",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXMLSTOTAL-26AUG15ORLCIN-3",
+     "event_ticker": "KXMLSTOTAL-26AUG15ORLCIN",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXMLSTOTAL-26AUG15TORNE-2",
+     "event_ticker": "KXMLSTOTAL-26AUG15TORNE",
+     "side": "yes"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXMLSBTTS-26AUG15NSHMIA-BTTS": 6711,
+    "KXMLSTOTAL-26AUG15ORLCIN-3": 7606,
+    "KXMLSTOTAL-26AUG15TORNE-2": 8017
+   },
+   "recorded_fair_cc": 4093,
+   "recorded_no_bid_cc": 5860,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": false,
+   "old_route": "copula",
+   "old_p": 0.409218673722,
+   "promoted_p": 0.409218673722,
+   "new_route": "copula",
+   "new_p": 0.409218673722,
+   "verdict": null
+  },
+  {
+   "rfq_id": "bf7b217d-3470-4760-b8ea-c0e9b63e3632",
+   "market_ticker": "KXMVECROSSCATEGORY-S20264C8E1563778-8059CCF10B6",
+   "quote_at": "2026-07-16T16:44:45.869706+00:00",
+   "target_cost_cc": 50000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXWCBTTS-26JUL18FRAENG-BTTS",
+     "event_ticker": "KXWCBTTS-26JUL18FRAENG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCBTTS-26JUL19ESPARG-BTTS",
+     "event_ticker": "KXWCBTTS-26JUL19ESPARG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCTOTAL-26JUL18FRAENG-4",
+     "event_ticker": "KXWCTOTAL-26JUL18FRAENG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCTOTAL-26JUL19ESPARG-3",
+     "event_ticker": "KXWCTOTAL-26JUL19ESPARG",
+     "side": "yes"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXWCBTTS-26JUL18FRAENG-BTTS": 6847,
+    "KXWCBTTS-26JUL19ESPARG-BTTS": 5110,
+    "KXWCTOTAL-26JUL18FRAENG-4": 4494,
+    "KXWCTOTAL-26JUL19ESPARG-3": 4206
+   },
+   "recorded_fair_cc": 1374,
+   "recorded_no_bid_cc": 8450,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "copula",
+   "old_p": 0.13732781671201963,
+   "promoted_p": 0.14403022812471716,
+   "new_route": "copula",
+   "new_p": 0.14403022812471716,
+   "verdict": null
+  },
+  {
+   "rfq_id": "7912d826-a7aa-4c3c-93af-1be6eb7c6c3e",
+   "market_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S202624628103551-82176C7F551",
+   "quote_at": "2026-07-17T02:54:50.465141+00:00",
+   "target_cost_cc": 10000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXWCBTTS-26JUL18FRAENG-BTTS",
+     "event_ticker": "KXWCBTTS-26JUL18FRAENG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCBTTS-26JUL19ESPARG-BTTS",
+     "event_ticker": "KXWCBTTS-26JUL19ESPARG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCTOTAL-26JUL19ESPARG-3",
+     "event_ticker": "KXWCTOTAL-26JUL19ESPARG",
+     "side": "yes"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXWCBTTS-26JUL18FRAENG-BTTS": 6917,
+    "KXWCBTTS-26JUL19ESPARG-BTTS": 5124,
+    "KXWCTOTAL-26JUL19ESPARG-3": 4230
+   },
+   "recorded_fair_cc": 2331,
+   "recorded_no_bid_cc": 7460,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "copula",
+   "old_p": 0.2329651632435977,
+   "promoted_p": 0.239944597220643,
+   "new_route": "copula",
+   "new_p": 0.239944597220643,
+   "verdict": null
+  },
+  {
+   "rfq_id": "183d9ee6-2c3b-4f73-9c45-d1dc66208e4a",
+   "market_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026D313ECCECAA-359628F9CBD",
+   "quote_at": "2026-07-18T18:09:53.328003+00:00",
+   "target_cost_cc": 100000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXWCBTTS-26JUL18FRAENG-BTTS",
+     "event_ticker": "KXWCBTTS-26JUL18FRAENG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCBTTS-26JUL19ESPARG-BTTS",
+     "event_ticker": "KXWCBTTS-26JUL19ESPARG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCTOTAL-26JUL18FRAENG-3",
+     "event_ticker": "KXWCTOTAL-26JUL18FRAENG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCTOTAL-26JUL19ESPARG-3",
+     "event_ticker": "KXWCTOTAL-26JUL19ESPARG",
+     "side": "yes"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXWCBTTS-26JUL18FRAENG-BTTS": 6903,
+    "KXWCBTTS-26JUL19ESPARG-BTTS": 5130,
+    "KXWCTOTAL-26JUL18FRAENG-3": 6798,
+    "KXWCTOTAL-26JUL19ESPARG-3": 4142
+   },
+   "recorded_fair_cc": 1902,
+   "recorded_no_bid_cc": 7880,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "copula",
+   "old_p": 0.19010278152521468,
+   "promoted_p": 0.19898395332237429,
+   "new_route": "copula",
+   "new_p": 0.19898395332237429,
+   "verdict": null
+  },
+  {
+   "rfq_id": "d549a996-52d9-495d-a8dd-e0877d3b9426",
+   "market_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S20261580FF41099-53B00F32B42",
+   "quote_at": "2026-07-18T07:45:15.777081+00:00",
+   "target_cost_cc": 55900,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXWCADVANCE-26JUL18FRAENG-FRA",
+     "event_ticker": "KXWCADVANCE-26JUL18FRAENG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCBTTS-26JUL18FRAENG-BTTS",
+     "event_ticker": "KXWCBTTS-26JUL18FRAENG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCTOTAL-26JUL18FRAENG-5",
+     "event_ticker": "KXWCTOTAL-26JUL18FRAENG",
+     "side": "no"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXWCADVANCE-26JUL18FRAENG-FRA": 6620,
+    "KXWCBTTS-26JUL18FRAENG-BTTS": 6831,
+    "KXWCTOTAL-26JUL18FRAENG-5": 2510
+   },
+   "recorded_fair_cc": 2500,
+   "recorded_no_bid_cc": 7140,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "structural",
+   "old_p": 0.2499609228109684,
+   "promoted_p": 0.2499609228109684,
+   "new_route": "structural",
+   "new_p": 0.2499609228109684,
+   "verdict": {
+    "verdict": "accept",
+    "residual": 0.02192030609425666,
+    "accept_bar": 0.025,
+    "hard_bar": 0.05,
+    "rho": null,
+    "lam_a": 2.0774673590879202,
+    "lam_b": 1.3890859537966624,
+    "uncertainty": 0.03332898778327864
+   }
+  },
+  {
+   "rfq_id": "1956f82c-cc99-4798-89df-cf74c5304af0",
+   "market_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S20261580FF41099-53B00F32B42",
+   "quote_at": "2026-07-18T08:35:54.066497+00:00",
+   "target_cost_cc": 25300,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXWCADVANCE-26JUL18FRAENG-FRA",
+     "event_ticker": "KXWCADVANCE-26JUL18FRAENG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCBTTS-26JUL18FRAENG-BTTS",
+     "event_ticker": "KXWCBTTS-26JUL18FRAENG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCTOTAL-26JUL18FRAENG-5",
+     "event_ticker": "KXWCTOTAL-26JUL18FRAENG",
+     "side": "no"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXWCADVANCE-26JUL18FRAENG-FRA": 6620,
+    "KXWCBTTS-26JUL18FRAENG-BTTS": 6832,
+    "KXWCTOTAL-26JUL18FRAENG-5": 2544
+   },
+   "recorded_fair_cc": 2498,
+   "recorded_no_bid_cc": 7150,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "structural",
+   "old_p": 0.24978609809193275,
+   "promoted_p": 0.24978609809193275,
+   "new_route": "structural",
+   "new_p": 0.24978609809193275,
+   "verdict": {
+    "verdict": "accept",
+    "residual": 0.020453614112140084,
+    "accept_bar": 0.025,
+    "hard_bar": 0.05,
+    "rho": null,
+    "lam_a": 2.0847326150522214,
+    "lam_b": 1.3932553392083455,
+    "uncertainty": 0.031849557460677996
+   }
+  },
+  {
+   "rfq_id": "800a9b4b-d6ec-4b13-a5ab-b5d1e6a9f426",
+   "market_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S202666E6B85E941-A7EFC037CE5",
+   "quote_at": "2026-07-16T17:50:36.684762+00:00",
+   "target_cost_cc": 47300,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXWCADVANCE-26JUL18FRAENG-FRA",
+     "event_ticker": "KXWCADVANCE-26JUL18FRAENG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCBTTS-26JUL18FRAENG-BTTS",
+     "event_ticker": "KXWCBTTS-26JUL18FRAENG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCBTTS-26JUL19ESPARG-BTTS",
+     "event_ticker": "KXWCBTTS-26JUL19ESPARG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCTOTAL-26JUL18FRAENG-5",
+     "event_ticker": "KXWCTOTAL-26JUL18FRAENG",
+     "side": "no"
+    },
+    {
+     "market_ticker": "KXWCTOTAL-26JUL19ESPARG-5",
+     "event_ticker": "KXWCTOTAL-26JUL19ESPARG",
+     "side": "no"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXWCADVANCE-26JUL18FRAENG-FRA": 6237,
+    "KXWCBTTS-26JUL18FRAENG-BTTS": 6859,
+    "KXWCBTTS-26JUL19ESPARG-BTTS": 5110,
+    "KXWCTOTAL-26JUL18FRAENG-5": 2499,
+    "KXWCTOTAL-26JUL19ESPARG-5": 1006
+   },
+   "recorded_fair_cc": 1064,
+   "recorded_no_bid_cc": 8730,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "copula",
+   "old_p": 0.1063731994944003,
+   "promoted_p": 0.10491562777702661,
+   "new_route": "copula",
+   "new_p": 0.10491562777702661,
+   "verdict": null
+  },
+  {
+   "rfq_id": "8b3da03e-cde7-4ff6-8245-0eba57004244",
+   "market_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026D09331EAFB3-4587CB6ABAC",
+   "quote_at": "2026-07-18T14:55:20.676726+00:00",
+   "target_cost_cc": 10000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXWCBTTS-26JUL18FRAENG-BTTS",
+     "event_ticker": "KXWCBTTS-26JUL18FRAENG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCSPREAD-26JUL18FRAENG-FRA3",
+     "event_ticker": "KXWCSPREAD-26JUL18FRAENG",
+     "side": "no"
+    },
+    {
+     "market_ticker": "KXWCTOTAL-26JUL18FRAENG-5",
+     "event_ticker": "KXWCTOTAL-26JUL18FRAENG",
+     "side": "no"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXWCBTTS-26JUL18FRAENG-BTTS": 6860,
+    "KXWCSPREAD-26JUL18FRAENG-FRA3": 1357,
+    "KXWCTOTAL-26JUL18FRAENG-5": 2589
+   },
+   "recorded_fair_cc": 4179,
+   "recorded_no_bid_cc": 5620,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "structural",
+   "old_p": 0.4178866964654385,
+   "promoted_p": 0.4178866964654385,
+   "new_route": "structural",
+   "new_p": 0.4178866964654385,
+   "verdict": {
+    "verdict": "accept",
+    "residual": 0.01238716696340214,
+    "accept_bar": 0.025,
+    "hard_bar": 0.05,
+    "rho": null,
+    "lam_a": 1.9711940231998744,
+    "lam_b": 1.5018846488986677,
+    "uncertainty": 0.02188752085718526
+   }
+  },
+  {
+   "rfq_id": "e2b8ad40-8f71-444c-8796-ec0b0161c383",
+   "market_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026D09331EAFB3-AA3BCD223DC",
+   "quote_at": "2026-07-18T18:08:22.076264+00:00",
+   "target_cost_cc": 10000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXWCBTTS-26JUL18FRAENG-BTTS",
+     "event_ticker": "KXWCBTTS-26JUL18FRAENG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCSPREAD-26JUL18FRAENG-FRA2",
+     "event_ticker": "KXWCSPREAD-26JUL18FRAENG",
+     "side": "no"
+    },
+    {
+     "market_ticker": "KXWCTOTAL-26JUL18FRAENG-4",
+     "event_ticker": "KXWCTOTAL-26JUL18FRAENG",
+     "side": "no"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXWCBTTS-26JUL18FRAENG-BTTS": 6903,
+    "KXWCSPREAD-26JUL18FRAENG-FRA2": 3040,
+    "KXWCTOTAL-26JUL18FRAENG-4": 4496
+   },
+   "recorded_fair_cc": 2519,
+   "recorded_no_bid_cc": 7280,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "structural",
+   "old_p": 0.2519051124843539,
+   "promoted_p": 0.2519051124843539,
+   "new_route": "structural",
+   "new_p": 0.2519051124843539,
+   "verdict": {
+    "verdict": "accept",
+    "residual": 0.018268413745290646,
+    "accept_bar": 0.025,
+    "hard_bar": 0.05,
+    "rho": null,
+    "lam_a": 2.0399175215955445,
+    "lam_b": 1.4580592556737046,
+    "uncertainty": 0.02839686891199128
+   }
+  },
+  {
+   "rfq_id": "9a2f54ca-c754-4680-b8f1-1730809451a5",
+   "market_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S20263DBFE0524C7-B4FC7E00A59",
+   "quote_at": "2026-07-16T17:44:12.512995+00:00",
+   "target_cost_cc": 10000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXWC1HTOTAL-26JUL18FRAENG-3",
+     "event_ticker": "KXWC1HTOTAL-26JUL18FRAENG",
+     "side": "no"
+    },
+    {
+     "market_ticker": "KXWC1HTOTAL-26JUL19ESPARG-3",
+     "event_ticker": "KXWC1HTOTAL-26JUL19ESPARG",
+     "side": "no"
+    },
+    {
+     "market_ticker": "KXWCBTTS-26JUL18FRAENG-BTTS",
+     "event_ticker": "KXWCBTTS-26JUL18FRAENG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCBTTS-26JUL19ESPARG-BTTS",
+     "event_ticker": "KXWCBTTS-26JUL19ESPARG",
+     "side": "yes"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXWC1HTOTAL-26JUL18FRAENG-3": 1897,
+    "KXWC1HTOTAL-26JUL19ESPARG-3": 824,
+    "KXWCBTTS-26JUL18FRAENG-BTTS": 6859,
+    "KXWCBTTS-26JUL19ESPARG-BTTS": 5110
+   },
+   "recorded_fair_cc": 2233,
+   "recorded_no_bid_cc": 7560,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": false,
+   "old_route": "copula",
+   "old_p": 0.2232776841609203,
+   "promoted_p": 0.2232776841609203,
+   "new_route": "copula",
+   "new_p": 0.2232776841609203,
+   "verdict": null
+  },
+  {
+   "rfq_id": "d9b2376d-a78c-4e46-ab65-8f8635929534",
+   "market_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S20265533C781C56-9B8374333A9",
+   "quote_at": "2026-07-15T16:48:31.122918+00:00",
+   "target_cost_cc": 10000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXWCADVANCE-26JUL15ENGARG-ARG",
+     "event_ticker": "KXWCADVANCE-26JUL15ENGARG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCBTTS-26JUL15ENGARG-BTTS",
+     "event_ticker": "KXWCBTTS-26JUL15ENGARG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCCORNERS-26JUL15ENGARG-7",
+     "event_ticker": "KXWCCORNERS-26JUL15ENGARG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCGOAL-26JUL15ENGARG-ARGLMESSI10-1",
+     "event_ticker": "KXWCGOAL-26JUL15ENGARG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCGOAL-26JUL15ENGARG-ENGJBELLI5-1",
+     "event_ticker": "KXWCGOAL-26JUL15ENGARG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCTOTAL-26JUL15ENGARG-6",
+     "event_ticker": "KXWCTOTAL-26JUL15ENGARG",
+     "side": "no"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXWCADVANCE-26JUL15ENGARG-ARG": 4609,
+    "KXWCBTTS-26JUL15ENGARG-BTTS": 5301,
+    "KXWCCORNERS-26JUL15ENGARG-7": 7703,
+    "KXWCGOAL-26JUL15ENGARG-ARGLMESSI10-1": 4002,
+    "KXWCGOAL-26JUL15ENGARG-ENGJBELLI5-1": 2601,
+    "KXWCTOTAL-26JUL15ENGARG-6": 396
+   },
+   "recorded_fair_cc": 229,
+   "recorded_no_bid_cc": 9620,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "unknown",
+   "same_game_btts_total": false,
+   "old_route": "unpriceable",
+   "old_p": null,
+   "promoted_p": null,
+   "new_route": "unpriceable",
+   "new_p": null,
+   "verdict": null
+  },
+  {
+   "rfq_id": "0297ee65-1965-4721-82f8-857bf8fb63b2",
+   "market_ticker": "KXMVESPORTSMULTIGAMEEXTENDED-S2026C047ADB2787-239A9875DC9",
+   "quote_at": "2026-07-15T17:37:00.461219+00:00",
+   "target_cost_cc": 100000,
+   "contracts_centi": null,
+   "legs": [
+    {
+     "market_ticker": "KXWCADVANCE-26JUL15ENGARG-ENG",
+     "event_ticker": "KXWCADVANCE-26JUL15ENGARG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCBTTS-26JUL15ENGARG-BTTS",
+     "event_ticker": "KXWCBTTS-26JUL15ENGARG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCCORNERS-26JUL15ENGARG-8",
+     "event_ticker": "KXWCCORNERS-26JUL15ENGARG",
+     "side": "yes"
+    },
+    {
+     "market_ticker": "KXWCTOTAL-26JUL15ENGARG-5",
+     "event_ticker": "KXWCTOTAL-26JUL15ENGARG",
+     "side": "no"
+    }
+   ],
+   "leg_mids_cc": {
+    "KXWCADVANCE-26JUL15ENGARG-ENG": 5306,
+    "KXWCBTTS-26JUL15ENGARG-BTTS": 5302,
+    "KXWCCORNERS-26JUL15ENGARG-8": 6727,
+    "KXWCTOTAL-26JUL15ENGARG-5": 925
+   },
+   "recorded_fair_cc": 1444,
+   "recorded_no_bid_cc": 8370,
+   "recorded_yes_bid_cc": 0,
+   "relationship": "ok",
+   "same_game_btts_total": true,
+   "old_route": "copula(fallback: KXWCCORNERS-26JUL15ENGARG-8: leg type corners not representable in the scoreline model)",
+   "old_p": 0.14437092422971456,
+   "promoted_p": 0.1436754693129999,
+   "new_route": "copula(reject: KXWCCORNERS-26JUL15ENGARG-8: leg type corners not representable in the scoreline model)",
+   "new_p": 0.1436754693129999,
+   "verdict": {
+    "verdict": "reject",
+    "reason": "KXWCCORNERS-26JUL15ENGARG-8: leg type corners not representable in the scoreline model"
+   }
+  }
+ ]
+}

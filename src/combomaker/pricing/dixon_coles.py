@@ -39,6 +39,8 @@ from numpy.typing import NDArray
 from scipy.optimize import brentq, least_squares
 from scipy.stats import binom, poisson
 
+from combomaker.pricing.fit_challenge import REJECT_OVERIDENTIFIED
+
 _FloatArray = NDArray[np.float64]
 
 _LAM_MIN, _LAM_MAX = 0.05, 6.0
@@ -194,7 +196,18 @@ _TEAM_LEVEL = (
 
 class StructuralError(ValueError):
     """The scoreline model cannot represent / identify this combo — the
-    caller must fall back to the copula path, never guess."""
+    caller must fall back to the copula path, never guess.
+
+    ``residual``: the inversion's max |model - market| when the failure came
+    from a fit that DID solve (hard-bar reject, a band edge leaving the
+    invertible range); None when no inversion happened (parse / identification
+    failures). Carried so the fallback can be RECORDED with its misfit
+    (fit_challenge.StructuralFitRecord) instead of vanishing into a note string.
+    """
+
+    def __init__(self, message: str, *, residual: float | None = None) -> None:
+        super().__init__(message)
+        self.residual = residual
 
 
 # --- terminal-state enumeration -------------------------------------------------
@@ -554,6 +567,7 @@ def invert(
     pens_win_a: float = 0.5,
     half_share: float = 0.45,  # first-half goal share h (banded constant, §6)
     warm_start: tuple[float, float] | None = None,  # (lam_a, lam_b) guess
+    contradiction_bar: bool = True,
 ) -> InvertedModel:
     """Solve (lam_a, lam_b) from the team-level legs, then one thinning share
     per player leg. Raises StructuralError when unidentified or infeasible.
@@ -561,6 +575,15 @@ def invert(
     Two team constraints solve exactly; more are least-squares and the
     residual misfit is reported (the caller prices it into width). Player
     constraints are always exactly identified given the lams.
+
+    ``contradiction_bar`` (build 2026-09-04 item B): True (every pricing and
+    production-risk caller) refuses a fit whose residual exceeds the ONE
+    structural hard bar — legs that contradict any coherent scoreline. False
+    is the STRESS mode for the risk MC's structural-parameter challenger
+    (sim/book_risk P1.9), which deliberately shocks the marginals and takes
+    the least-squares scoreline as the adverse scenario: a market-consistency
+    bar must not silently drop the very games the stress is meant to fatten.
+    Identification / feasibility failures still raise in both modes.
     """
     team_constraints = [
         (spec, p) for spec, p in legs if isinstance(spec, _TEAM_LEVEL)
@@ -638,10 +661,28 @@ def invert(
     resid = np.abs(residuals(np.asarray(fit.x)))
     residual = float(resid.max())
     exactly_identified = len(team_constraints) == 2
-    if exactly_identified and residual > 0.005:
-        # Two constraints should solve to ~0; a real residual means the legs
-        # contradict any Poisson scoreline (e.g. huge favorite + huge BTTS).
-        raise StructuralError(f"inversion residual {residual:.4f} on exact system")
+    # ONE hard bar for every DC system, exact and over-identified alike
+    # (build 2026-09-04 item B): fit_challenge.REJECT_OVERIDENTIFIED, the
+    # pre-existing over-identified bar, bound by import so the classifier and
+    # the inverter cannot drift (review fix: the value is pinned, not the
+    # source text). The former
+    # exact-system bar (0.005) was a hand-set constant 10x tighter than this
+    # one: it rejected every club btts x over-2.5 pair (a Poisson scoreline
+    # cannot reproduce that market shape to better than ~0.6pp; measured
+    # residuals 0.006-0.018 on the 8/17-8/19 fills) and routed them to the
+    # copula at the stale World-Cup blend, while accepting the SAME game's
+    # 3-leg triple at 0.0195. Whether a below-bar residual is ACCEPT or
+    # CHALLENGE is decided by the caller from the leg books' own resolution
+    # (fit_challenge.classify_fit, resolution mode) — the solver only refuses
+    # a genuine contradiction. Callers without beliefs (the risk sampler,
+    # exposure deltas) get the same one bar, so risk and pricing agree on
+    # which games are structurally representable.
+    if contradiction_bar and residual > REJECT_OVERIDENTIFIED:
+        raise StructuralError(
+            f"inversion residual {residual:.4f} exceeds the structural hard bar"
+            + (" on exact system" if exactly_identified else ""),
+            residual=residual,
+        )
 
     shares: dict[int, float] = {}
     for i, (spec, target) in enumerate(legs):
@@ -670,6 +711,6 @@ def invert(
 
     notes = (
         f"dc inversion: lam_a={params.lam_a:.3f} lam_b={params.lam_b:.3f}"
-        + (f" residual={residual:.4f}" if not exactly_identified else ""),
+        f" residual={residual:.4f}",
     )
     return InvertedModel(params=params, shares=shares, residual=residual, notes=notes)

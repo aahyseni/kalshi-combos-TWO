@@ -22,7 +22,30 @@ keeps hitting the (perturbed) market marginals:
   - each leg's marginal band  -> re-invert at p +/- unc, sum |d joint|
   - model form (DC rho, ET intensity) -> re-invert at the band edges
   - shootout probability (Advance legs only) -> re-invert at 0.5 +/- band
-  - over-identification residual -> misfit scaled straight into width
+  - inversion residual -> misfit scaled straight into width (every fit)
+
+Fit verdict (build 2026-09-04 item B; ``fit_challenge``): the solver refuses
+only a genuine contradiction (ONE hard bar for every system). Below it the
+fit is ACCEPT when its residual is within the identifying leg books' own
+summed uncertainty (floored at the over-identified accept boundary) and
+CHALLENGE above that — priced either way, the residual already in the width,
+and the verdict RECORDED on the estimate (``JointEstimate.fit``) for the
+lifecycle to persist off the pricing path.
+
+SYMMETRIC btts x total pair (no orienting leg): a Poisson scoreline cannot
+reproduce the club market's BTTS at a given total to better than ~0.6-1.8pp
+(the least-squares fit lands on balanced lambdas and misses BOTH marginals),
+so pricing the best-fit cell would quote a joint inconsistent with the leg
+books. Instead the pair prices MARGINAL-CONSISTENTLY: derive the pair's latent
+rho from the DC best-fit (the Gaussian-copula rho reproducing the DC cell at
+the fitted lambdas — a per-match number, 0.67-0.80, self-adapting to
+lopsided vs balanced games; its held-out mean 0.748 reproduces the pooled
+club measurement 0.746) and price the MARKET marginals through the copula at
+that rho. At residual 0 this IS the DC cell (to 1e-10); on the recorded club
+fills the two differ by <= 0.06c. Width: the same re-inversion perturbations
+(each re-fit re-derives the rho) + misfit. Prototyped and validated in
+tools/proto_structural_fit_bar.py (rule 8; parity fixture
+tests/fixtures/structural_fit_bar_contexts26.json).
 
 Ticker shapes handled (grounded in observed KXWC/KXUCL/KXEPL series):
   KXWCGAME-26JUL06ENGNOR-ENG        moneyline (suffix = team code, or TIE)
@@ -33,12 +56,20 @@ Ticker shapes handled (grounded in observed KXWC/KXUCL/KXEPL series):
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import numpy as np
+from scipy.optimize import brentq
+
 from combomaker.ops.config import MarginTotalConfig, MlbRunsConfig, StructuralConfig
-from combomaker.pricing.copula import clamp_to_frechet, frechet_bounds
+from combomaker.pricing.copula import (
+    clamp_to_frechet,
+    frechet_bounds,
+    gaussian_copula_joint_prob,
+)
 from combomaker.pricing.dixon_coles import (
     Advance,
     Btts,
@@ -60,6 +91,14 @@ from combomaker.pricing.dixon_coles import (
     TotalOver,
     invert,
     joint_probability,
+    marginal_probability,
+)
+from combomaker.pricing.fit_challenge import (
+    ROUTE_HYBRID,
+    ROUTE_REJECT,
+    ROUTE_STRUCTURAL,
+    StructuralFitRecord,
+    classify_fit,
 )
 from combomaker.pricing.joint import JointEstimate
 from combomaker.pricing.legs import LegBelief
@@ -108,6 +147,53 @@ _MODELED_FIRST_HALF = frozenset(
 _DEFERRED_FIRST_HALF = frozenset(
     {LegType.FIRST_HALF_MONEYLINE, LegType.FIRST_HALF_SPREAD}
 )
+
+_DC_MODEL = "dixon_coles"
+
+
+def leg_family(legs: Sequence[RfqLeg]) -> str:
+    """The combo's leg-type family key: sorted, '|'-joined (``'btts|total'``,
+    ``'btts|moneyline|total'``) — the key the structural-fit telemetry is
+    bucketed by. Order-independent like ``legtypes.pair_key``."""
+    return "|".join(sorted(str(classify_leg(leg.market_ticker)) for leg in legs))
+
+
+def is_symmetric_btts_total(specs: Sequence[LegSpec]) -> bool:
+    """A bare BTTS x TOTAL pair: team-symmetric (no orienting leg), exactly
+    identified, and the one shape whose DC best-fit is systematically
+    marginal-inconsistent on club books (module docstring)."""
+    return len(specs) == 2 and {type(s) for s in specs} == {Btts, TotalOver}
+
+
+def implied_pair_rho(params: ModelParams, a: LegSpec, b: LegSpec) -> float:
+    """The Gaussian-copula rho reproducing the DC cell P(a & b) at the MODEL's
+    own marginals — the pair's structural-implied latent correlation. Solved
+    by bracketing on the copula's monotone rho -> joint map; a cell at or
+    beyond the copula's range clamps to the bracket edge (Frechet-bound
+    cases)."""
+    ma, mb = marginal_probability(params, a), marginal_probability(params, b)
+    cell = joint_probability(params, [(a, True), (b, True)], {})
+    lo, hi = -0.999, 0.999
+
+    def f(rho: float) -> float:
+        corr = np.array([[1.0, rho], [rho, 1.0]])
+        return gaussian_copula_joint_prob([ma, mb], corr) - cell
+
+    if f(lo) >= 0.0:
+        return lo
+    if f(hi) <= 0.0:
+        return hi
+    return float(brentq(f, lo, hi, xtol=1e-10))
+
+
+def hybrid_joint(rho: float, marginals: Sequence[float], yes: Sequence[bool]) -> float:
+    """P(selected sides) through the 2-D Gaussian copula at latent ``rho`` on
+    the given YES-side marginals (a NO side flips its marginal and the sign
+    of the pair correlation), Frechet-clamped."""
+    m = [p if y else 1.0 - p for p, y in zip(marginals, yes, strict=True)]
+    s = np.array([1.0 if y else -1.0 for y in yes])
+    corr = np.array([[1.0, rho], [rho, 1.0]]) * np.outer(s, s)
+    return clamp_to_frechet(gaussian_copula_joint_prob(m, corr), m)
 
 
 def _is_modeled_first_half(ticker: str) -> bool:
@@ -307,6 +393,23 @@ class StructuralPricer:
         sides: list[str],
     ) -> tuple[JointEstimate | None, str | None]:
         """(estimate, None) on success; (None, reason) -> copula fallback."""
+        estimate, reason, _fit = self.try_price_with_fit(legs, beliefs, sides)
+        return estimate, reason
+
+    def try_price_with_fit(
+        self,
+        legs: list[RfqLeg],
+        beliefs: list[LegBelief],
+        sides: list[str],
+    ) -> tuple[JointEstimate | None, str | None, StructuralFitRecord | None]:
+        """``try_price`` plus the structural route verdict: ``record`` is set
+        for EVERY soccer combo that reached this adapter — the fit verdict on
+        success, or a REJECT (with the inverter's residual when a fit solved,
+        -1.0 when the combo never inverted: parse / period / identification /
+        disabled) on failure — so the engine can carry it to the lifecycle
+        and the fallback becomes a recorded, counted event instead of a note
+        string. None for the other sports' pricers (unchanged)."""
+        is_soccer = all(classify_sport(leg.market_ticker) is Sport.SOCCER for leg in legs)
         try:
             # Period legs (1H/2H/quarter) rejoin the same-game copula group
             # (relationships._game_key), which makes this path REACHABLE for a
@@ -337,18 +440,47 @@ class StructuralPricer:
             if sport is Sport.SOCCER:
                 if not self._cfg.enabled:
                     raise StructuralError("soccer structural pricer disabled")
-                return self._price(legs, beliefs, sides), None
+                estimate = self._price(legs, beliefs, sides)
+                return estimate, None, estimate.fit
             if sport in _MT_SPORTS:
                 if str(sport) not in self._mt.enabled_sports:
                     raise StructuralError(f"{sport} margin-total pricer not gated on")
-                return self._price_margin_total(sport, legs, beliefs, sides), None
+                return self._price_margin_total(sport, legs, beliefs, sides), None, None
             if sport is Sport.MLB:
                 if not self._mlb.enabled:
                     raise StructuralError("mlb runs pricer not gated on")
-                return self._price_mlb(legs, beliefs, sides), None
+                return self._price_mlb(legs, beliefs, sides), None, None
             raise StructuralError(f"no structural model for sport {sport}")
         except StructuralError as exc:
-            return None, str(exc)
+            record = self._reject_record(legs, beliefs, exc) if is_soccer else None
+            return None, str(exc), record
+
+    @staticmethod
+    def _reject_record(
+        legs: list[RfqLeg], beliefs: list[LegBelief], exc: StructuralError
+    ) -> StructuralFitRecord:
+        """The REJECT verdict for a soccer combo the Dixon-Coles adapter could
+        not price. Identifying constraints = the non-player legs (by ticker
+        family, since the failure may predate parsing); residual = the fit's
+        when one solved, else the -1.0 'no honest misfit' sentinel
+        ``classify_fit`` fails closed on."""
+        team_idx = [
+            i for i, leg in enumerate(legs)
+            if classify_leg(leg.market_ticker) is not LegType.PLAYER_GOAL
+        ]
+        resolution = math.fsum(beliefs[i].uncertainty for i in team_idx)
+        residual = -1.0 if exc.residual is None else float(exc.residual)
+        challenge = classify_fit(
+            residual, exactly_identified=len(team_idx) == 2, resolution=resolution
+        )
+        return StructuralFitRecord(
+            challenge=challenge,
+            model=_DC_MODEL,
+            family=leg_family(legs),
+            route=ROUTE_REJECT,
+            n_legs=len(legs),
+            reason=str(exc),
+        )
 
     def _price(
         self, legs: list[RfqLeg], beliefs: list[LegBelief], sides: list[str]
@@ -383,6 +515,16 @@ class StructuralPricer:
 
         has_half = any(isinstance(s, _HALF_SPECS) for s in specs)
 
+        # Identifying (team-level) constraints = every non-player leg
+        # (dixon_coles._TEAM_LEVEL). Their books' summed uncertainty — the very
+        # quantity the leg-band perturbation below re-inverts at — is the
+        # derived accept bar's only live input (module docstring).
+        identifying = [i for i, s in enumerate(specs) if not isinstance(s, PlayerScores)]
+        resolution = math.fsum(beliefs[i].uncertainty for i in identifying)
+        exactly_identified = len(identifying) == 2
+        symmetric_pair = is_symmetric_btts_total(specs)
+        yes_flags = [yes for _, yes in selected]
+
         def solve(
             targets: list[tuple[LegSpec, float]],
             *,
@@ -390,7 +532,7 @@ class StructuralPricer:
             et_factor: float | None = None,
             pens: float | None = None,
             half_share: float | None = None,
-        ) -> tuple[InvertedModel, float]:
+        ) -> tuple[InvertedModel, float, float | None]:
             model = invert(
                 targets,
                 dc_rho=cfg.dc_rho if dc_rho is None else dc_rho,
@@ -401,10 +543,28 @@ class StructuralPricer:
                 half_share=cfg.half_share if half_share is None else half_share,
                 warm_start=warm,  # perturbation solves start at the base fit
             )
-            return model, joint_probability(model.params, selected, model.shares)
+            if symmetric_pair:
+                # Marginal-consistent hybrid: the fit's implied latent rho on
+                # the (possibly perturbed) MARKET marginals, so every
+                # perturbation re-derives the rho exactly like the base fit.
+                rho = implied_pair_rho(model.params, specs[0], specs[1])
+                return model, hybrid_joint(rho, [t for _, t in targets], yes_flags), rho
+            return model, joint_probability(model.params, selected, model.shares), None
 
-        base_model, p = solve(constraints)
+        base_model, p, base_rho = solve(constraints)
         warm = (base_model.params.lam_a, base_model.params.lam_b)
+        challenge = classify_fit(
+            base_model.residual,
+            exactly_identified=exactly_identified,
+            resolution=resolution,
+        )
+        if not challenge.priceable:
+            # invert already refused any residual over the hard bar; this is
+            # the fail-closed sentinel path (non-finite residual) — never price.
+            raise StructuralError(
+                f"structural fit rejected: {challenge.note()}",
+                residual=base_model.residual,
+            )
 
         # 1. Leg-marginal bands, propagated by re-inversion (worst side each).
         leg_unc = 0.0
@@ -419,7 +579,8 @@ class StructuralPricer:
                     continue  # a band edge outside the representable range
             if not deltas:
                 raise StructuralError(
-                    f"marginal band of leg {i} leaves the invertible range"
+                    f"marginal band of leg {i} leaves the invertible range",
+                    residual=base_model.residual,
                 )
             leg_unc += max(deltas)
 
@@ -474,6 +635,13 @@ class StructuralPricer:
             for b, (_, yes) in zip(beliefs, selected, strict=True)
         ]
         lo, hi = frechet_bounds(marginals)
+        fit = StructuralFitRecord(
+            challenge=challenge,
+            model=_DC_MODEL,
+            family=leg_family(legs),
+            route=ROUTE_HYBRID if symmetric_pair else ROUTE_STRUCTURAL,
+            n_legs=len(legs),
+        )
         return JointEstimate(
             p=clamp_to_frechet(p, marginals),
             uncertainty=uncertainty,
@@ -485,8 +653,11 @@ class StructuralPricer:
                 f"structural: format={fmt} legs={len(legs)}"
                 + (f" half_share={cfg.half_share}" if has_half else "")
                 + f" unc(leg={leg_unc:.4f} form={form_unc:.4f} "
-                f"pens={pens_unc:.4f} misfit={misfit_unc:.4f})",
+                f"pens={pens_unc:.4f} misfit={misfit_unc:.4f})"
+                + (f" hybrid rho_i={base_rho:.4f}" if base_rho is not None else ""),
+                challenge.note(),
             ),
+            fit=fit,
         )
 
 

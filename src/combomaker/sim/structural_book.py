@@ -165,6 +165,7 @@ def _match_format(ticker: str, knockout_series: Sequence[str]) -> MatchFormat:
 def _try_build_game(
     game: str, idxs: list[int], tickers: Sequence[str],
     marginals: Sequence[float | None], cfg: StructuralConfigView,
+    *, contradiction_bar: bool = True,
 ) -> GamePlan | None:
     """Invert one game's structural legs, or None ⇒ the whole game is copula.
 
@@ -223,6 +224,7 @@ def _try_build_game(
         model = invert(
             targets, dc_rho=cfg.dc_rho, et_factor=cfg.et_factor, match_format=fmt,
             max_goals=cfg.max_goals, pens_win_a=cfg.pens_win_a, half_share=cfg.half_share,
+            contradiction_bar=contradiction_bar,
         )
     except StructuralError:
         return None
@@ -237,6 +239,8 @@ def build_game_plans(
     events: Sequence[str | None],
     marginals: Sequence[float | None],
     cfg: StructuralConfigView,
+    *,
+    contradiction_bar: bool = True,
 ) -> tuple[list[GamePlan], list[int]]:
     """Split the global leg universe into STRUCTURAL game plans + COPULA leg indices.
 
@@ -257,7 +261,9 @@ def build_game_plans(
             by_game[game_key(ev)].append(j)
     plans: list[GamePlan] = []
     for game, idxs in by_game.items():
-        plan = _try_build_game(game, idxs, tickers, marginals, cfg)
+        plan = _try_build_game(
+            game, idxs, tickers, marginals, cfg, contradiction_bar=contradiction_bar
+        )
         if plan is None:
             copula.extend(idxs)
             continue

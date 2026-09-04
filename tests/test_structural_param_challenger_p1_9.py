@@ -92,13 +92,26 @@ def _graded_structural_book() -> BookModel:
     for t in _GRADED_TEAMS:
         ev = f"KXWCGAME-26JUL15{t}"
         a, b = t[:3], t[3:]
+        # PIN CHANGED 2026-09-04 (build item B): the regulation ML pair was
+        # 0.55 / 0.45 — summing to 1.0 leaves NO draw mass, which no Poisson
+        # scoreline can reproduce (over-identified residual 0.156 with the
+        # 0.35 total); before this build an over-identified DC fit was never
+        # refused, so production silently sampled a 15.6pp-misfit scoreline.
+        # 0.42 / 0.30 (draw 0.28) inverts at residual 0.015 — a representable
+        # game — so BOTH production and the challenger are structural and the
+        # tests below compare re-inversions, not a copula fallback.
+        # NOTE (review 2026-09-04): this move is a CHOICE, not a requirement —
+        # all 11 tests here also pass on the old 0.55 / 0.45 fixture under the
+        # new code (production → copula for the game, challenger re-inverts in
+        # stress mode); the representable game is kept because it exercises the
+        # structural-vs-structural comparison the P1.9 challenger is for.
         leg_index[f"KXWCGAME-26JUL15{t}-{a}"] = idx
         event_by_index[idx] = ev
-        legs.append(LegModel(p=0.55))
+        legs.append(LegModel(p=0.42))
         idx += 1
         leg_index[f"KXWCGAME-26JUL15{t}-{b}"] = idx
         event_by_index[idx] = ev
-        legs.append(LegModel(p=0.45))
+        legs.append(LegModel(p=0.30))
         idx += 1
         total_idx = idx
         leg_index[f"KXWCTOTAL-26JUL15{t}-3"] = idx

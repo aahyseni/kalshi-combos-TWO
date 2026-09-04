@@ -567,7 +567,22 @@ class CorrelationConfig(StrictModel):
         # SGP auctions.
         "soccer": {
             "moneyline|total": 0.28,
-            "btts|total": 0.70,
+            # btts|total: the CLUB measurement +0.746 (8,982 top-5-EU matches,
+            # NOTES.md "Multi-sport SGP calibration" club row: +0.75 [.69,.80];
+            # docs/calibration/results_soccer.md "btts×over2.5 +0.746"
+            # reproduced to the digit). It shipped as 0.70 — the World-Cup
+            # club+INTERNATIONAL blend of git 470f24b (intl +0.67 [.62,.71]) —
+            # and was never un-blended when quoting moved to club soccer on
+            # 2026-08-13: held-out both-YES cell realized 43.0% vs 40.5%
+            # predicted at 0.70 (z ~ +2.2; train z ~ +4.3) -> NO bid ~1c too
+            # rich on every club btts x total pair. Re-validated 2026-09-04
+            # (tools/proto_structural_fit_bar.py --backtest): 0.746 beats 0.70
+            # on held-out log-loss (paired bootstrap), and the per-match
+            # DC-implied latent rho (mean 0.748) reproduces it. Band 0.12 stays
+            # (soccer:btts|total below): the measured set is D1/E0/F1/I1/SP1
+            # only; Liga MX / MLS / UCL qualifiers / EFL / Saudi are unmeasured
+            # league-transfer, and the band is their only cover until they are.
+            "btts|total": 0.746,
             # btts|moneyline is now a WIN-PROB CURVE (oriented_curve below), not
             # two flat fav/dog plateaus: the residual btts<->win rho is a monotone
             # function of the ML leg's win-prob (RE-MEASURED 2026-07-07, 8,982
