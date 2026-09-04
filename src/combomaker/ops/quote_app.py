@@ -79,6 +79,7 @@ from combomaker.marketdata.settled import (
     SettledMarginalResolver,
 )
 from combomaker.ops.config import AppConfig, Env, Mode, RiskConfig
+from combomaker.ops.fee_schedule import fee_schedule_path, load_observed_fee_schedule
 from combomaker.ops.logging import configure_logging, get_logger
 from combomaker.ops.metrics import Metrics
 from combomaker.ops.persistence import Store
@@ -105,7 +106,7 @@ from combomaker.ops.supervisor import (
 )
 from combomaker.ops.write_budget import TokenBudget, WriteBudget
 from combomaker.pricing.engine import PricingEngine
-from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
+from combomaker.pricing.fees import FeeModel, FeeType
 from combomaker.pricing.grouping import game_key
 from combomaker.pricing.tripwire import taxonomy_impossible
 from combomaker.rfq.eviction_value import derive_open_quote_capacity
@@ -902,6 +903,24 @@ class RateLimitRecordingSender:
             self._window.record()
             raise
 
+    async def get_series(self, ticker: str) -> JsonDict:
+        """``SeriesGetter`` slice for the fee observer's series fee_type fetch
+        (2026-09-04) — same pass-through + 429 tap."""
+        try:
+            return await self._inner.get_series(ticker)  # type: ignore[attr-defined,no-any-return]
+        except RateLimitedError:
+            self._window.record()
+            raise
+
+    async def get_multivariate_collection(self, ticker: str) -> JsonDict:
+        """``SeriesGetter`` slice: the collection payload the observer reads a
+        combo collection's series ticker from (2026-09-04)."""
+        try:
+            return await self._inner.get_multivariate_collection(ticker)  # type: ignore[attr-defined,no-any-return]
+        except RateLimitedError:
+            self._window.record()
+            raise
+
 
 class CashGateSender:
     """A thin ``QuoteSender`` decorator (2026-08-15, operator lever 4 — the
@@ -1005,6 +1024,12 @@ class CashGateSender:
 
     async def get_fills(self, **params: str | int) -> JsonDict:
         return await self._inner.get_fills(**params)
+
+    async def get_series(self, ticker: str) -> JsonDict:
+        return await self._inner.get_series(ticker)
+
+    async def get_multivariate_collection(self, ticker: str) -> JsonDict:
+        return await self._inner.get_multivariate_collection(ticker)
 
 
 class WholeBookBalanceSource:
@@ -2163,6 +2188,11 @@ class QuoteApp:
             # stamps). Corrupt/missing file ⇒ cold boot, never an error.
             self._metadata_cache = metadata
             metadata.load_persisted(self._metadata_cache_path)
+            # THE ONE MEASURED FEE SCHEDULE (2026-09-04 fee-seam repair):
+            # loaded from data_dir before the engine exists and shared by
+            # the pricer, the lifecycle ledger/waiver and the observer sweep
+            # that refits it in place from charged exchange fills.
+            fee_schedule = load_observed_fee_schedule(config.pricing.fee, config.data_dir)
             engine = PricingEngine(
                 feed,
                 metadata,
@@ -2171,6 +2201,7 @@ class QuoteApp:
                 extra_sources=(
                     [(external[0], config.pricing.external_odds.weight)] if external else []
                 ),
+                fee_schedule=fee_schedule,
             )
             if config.pricing.leg_pricing_aliases:
                 # Loud install record (review 2026-07-16): a mistyped alias
@@ -2365,13 +2396,10 @@ class QuoteApp:
                 )
                 quote_getter = rate_tapped
             # Real fee model for the fill fee the ledger books at execution
-            # (defense #3): $0 for our combo maker quadratic fills, correct for a
-            # nonzero-fee series. Built from the SAME config the engine uses.
+            # (defense #3) — the SAME live schedule object the engine prices
+            # on, so ledger, waiver and quote can never disagree on the fee.
             fee_cfg = config.pricing.fee
-            fee_model = FeeModel(
-                FeeSchedule.from_strings(fee_cfg.taker_coef, fee_cfg.maker_coef),
-                conventions,
-            )
+            fee_model = FeeModel(fee_schedule, conventions)
             fee_type = FeeType.parse(fee_cfg.default_fee_type)
             fee_multiplier = Fraction(Decimal(fee_cfg.default_multiplier))
             # The PRICER's real within-game rho, built ONCE from the engine's
@@ -2513,10 +2541,17 @@ class QuoteApp:
                 fee_model=fee_model,
                 fee_type=fee_type,
                 fee_multiplier=fee_multiplier,
-                # MAKER-FEE LIST (2026-07-16, eat-the-fee doctrine): prefixes on
-                # which OUR maker fills pay the maker fee — accounted in the
-                # ledger/edge/waiver, never added to the quoted price.
+                # MAKER-FEE LIST (2026-07-16; an OVERRIDE since 2026-09-04):
+                # prefixes that force the maker fee type regardless of
+                # observation. The live mechanism is ``fee_schedule``.
                 maker_fee_active_prefixes=tuple(fee_cfg.maker_fee_active_prefixes),
+                # MEASURED FEE SCHEDULE (2026-09-04): the shared observed
+                # schedule + its persistence path; the lifecycle's observer
+                # sweep ingests /portfolio/fills (same GET handle the
+                # recovery sweep polls), refits, alarms on drift, persists.
+                fee_schedule=fee_schedule,
+                fee_schedule_path=fee_schedule_path(config.data_dir),
+                series_getter=quote_getter,
                 joint_pool=joint_pool,
                 book_risk_pool=book_risk_pool,
                 # FILL-RECORD RECOVERY (2026-07-16 P1): REST GET handle for the

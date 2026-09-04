@@ -25,10 +25,11 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from fractions import Fraction
 from typing import Any, Protocol
@@ -44,6 +45,7 @@ from combomaker.core.money import (
 )
 from combomaker.core.quantity import CentiContracts, qty_from_fp_str
 from combomaker.core.reasons import ReasonCode
+from combomaker.exchange.fills import fee_observations_from_fills
 from combomaker.exchange.quote_query import (
     QuoteLister,
     list_open_quotes,
@@ -75,9 +77,15 @@ from combomaker.ops.pricing_pool import (
 from combomaker.ops.write_budget import TokenBudget, WriteBudget
 from combomaker.pricing import dnp_scalar
 from combomaker.pricing.engine import PricingEngine
+from combomaker.pricing.fee_observer import (
+    FeeRefit,
+    FeeScheduleSummary,
+    ObservedFeeSchedule,
+)
 from combomaker.pricing.fees import FeeModel, FeeType, FeeUnknownError
 from combomaker.pricing.grouping import game_key
 from combomaker.pricing.quote import ConstructedQuote, NoQuote
+from combomaker.rfq.edge import candidate_edge_cc
 from combomaker.rfq.eviction_value import (
     AcceptanceCounters,
     allocate_des99_cc,
@@ -110,6 +118,8 @@ from combomaker.risk.exposure import (
     OpenQuoteRisk,
     SettledFactProvider,
     concentration_live_legs,
+    leg_entity_key,
+    leg_family_key,
     stable_ledger_key,
 )
 from combomaker.risk.fill_velocity import FillVelocityTracker
@@ -136,7 +146,16 @@ from combomaker.risk.limits import (
     threshold_cc,
 )
 from combomaker.risk.markouts import MarkoutSubject, MarkoutTracker
+from combomaker.risk.rebate_bound import bound_rebate
 from combomaker.risk.reservation import ReserveResult, RiskReservationService
+from combomaker.risk.retained_edge_floor import (
+    GradeRow,
+    estimate_retained_floor,
+    grade_row_from_store,
+)
+from combomaker.risk.retained_edge_floor import (
+    summarize as summarize_floor,
+)
 from combomaker.risk.skew import (
     ConcentrationProfile,
     GameSkewCache,
@@ -330,6 +349,19 @@ class FillsGetter(Protocol):
     async def get_fills(self, **params: str | int) -> JsonDict: ...
 
 
+class SeriesGetter(Protocol):
+    """GET slice for the FEE OBSERVER's series fee_type resolution
+    (2026-09-04): a combo collection's payload (to learn its series ticker)
+    and the series itself (``fee_type`` + ``fee_multiplier``, index-scan
+    §series). Public, unauthenticated reads on the slow loop only; None
+    (paper/backtests/minimal rigs) ⇒ fee types come from observed charged
+    fills and the configured default alone."""
+
+    async def get_series(self, ticker: str) -> JsonDict: ...
+
+    async def get_multivariate_collection(self, ticker: str) -> JsonDict: ...
+
+
 # FILL-RECORD RECOVERY SWEEP bounds (2026-07-16 P1). Rate-bound the REST polls
 # per maintenance tick (the tick beats every 0.5s; recovery is not latency-
 # critical) and bound the per-quote attempts: after the budget is exhausted the
@@ -375,6 +407,9 @@ _LEDGER_DIVERGENCE_SWEEP_TIMEOUT_S = STORE_OP_TIMEOUT_S
 _FILLS_LEDGER_SWEEP_TIMEOUT_S = (
     2 * STORE_OP_TIMEOUT_S + _FILLS_SWEEP_MAX_PAGES * _MAINTENANCE_POLL_TIMEOUT_S
 )
+# Fee observer (2026-09-04): N fill pages + at most N collections resolved
+# per sweep, each resolution ≤ 2 public GETs ⇒ 3·N·poll timeout.
+_FEE_OBSERVER_SWEEP_TIMEOUT_S = 3 * _FILLS_SWEEP_MAX_PAGES * _MAINTENANCE_POLL_TIMEOUT_S
 
 # ── BOUNDED QUOTE WITHDRAWAL (2026-07-26, the 20:12:54Z false kill) ──────────
 # A lifecycle wave at the END OF EVERY GAME quarantines many markets in the same
@@ -533,6 +568,23 @@ def _rate_limited(exc: BaseException) -> bool:
 # a HISTORICAL fill and double-count it).
 _CANCEL_VERIFY_MAX_ROUNDS = 3
 _CANCEL_VERIFY_MIN_TS_SLACK_S = 60
+
+
+def _series_ticker_from_collection(payload: object) -> str | None:
+    """The series ticker a multivariate collection payload names, if any —
+    top-level ``series_ticker`` or one level down (the API wraps objects in
+    a named key). None when absent: the caller fails closed."""
+    if not isinstance(payload, dict):
+        return None
+    direct = payload.get("series_ticker")
+    if isinstance(direct, str) and direct:
+        return direct
+    for value in payload.values():
+        if isinstance(value, dict):
+            nested = value.get("series_ticker")
+            if isinstance(nested, str) and nested:
+                return nested
+    return None
 
 
 def _parse_epoch_s(raw: object) -> int | None:
@@ -1372,6 +1424,9 @@ class QuoteLifecycle:
         fee_type: FeeType = FeeType.QUADRATIC,
         fee_multiplier: Fraction = Fraction(1),
         maker_fee_active_prefixes: tuple[str, ...] = (),
+        fee_schedule: ObservedFeeSchedule | None = None,
+        fee_schedule_path: str | os.PathLike[str] | None = None,
+        series_getter: SeriesGetter | None = None,
         joint_pool: JointPool | None = None,
         book_risk_pool: BookRiskPool | None = None,
         quote_getter: QuoteGetter | None = None,
@@ -1622,6 +1677,31 @@ class QuoteLifecycle:
         # _effective_fee_type) in the fills ledger, realized P&L, expected edge,
         # and the waiver candidate. Empty (default) ⇒ bit-identical behaviour.
         self._maker_fee_active_prefixes = maker_fee_active_prefixes
+        # MEASURED FEE SCHEDULE (2026-09-04 fee-seam repair): the ONE observed
+        # schedule shared with the engine's FeeModel (quote_app builds both
+        # from it). When wired, the per-combo fee type resolves from it
+        # (override prefix > observed charged fee > series fee_type > the
+        # configured default) and the observer sweep below refits it in
+        # place from /portfolio/fills. None (older rigs/tests) ⇒ the legacy
+        # prefix-list resolution, bit-identical.
+        self._fee_schedule = fee_schedule
+        self._fee_schedule_path = fee_schedule_path
+        self._fee_schedule_saved_generation: int | None = (
+            fee_schedule.generation if fee_schedule is not None else None
+        )
+        self._series_getter = series_getter
+        # Observer sweep state: cadence stamp (None = never run — the FIRST
+        # tick runs it), the exchange cursor when a history walk spans
+        # sweeps, the collections this run has quoted (their series fee
+        # types are resolved on the slow loop), and a retry stamp per
+        # collection whose series could not be resolved.
+        self._fee_sweep_last_mono_ns: int | None = None
+        self._fee_sweep_cursor: str | None = None
+        self._collections_seen: set[str] = set()
+        self._series_lookup_failed_ns: dict[str, int] = {}
+        # MEASURED RETAINED-EDGE FLOOR sweep (item 2): cadence stamp (None =
+        # the first tick runs it) and the last published summary.
+        self._floor_sweep_last_mono_ns: int | None = None
         # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): the GET-capable REST slice
         # the sweep polls. None (paper/backtests/minimal rigs) ⇒ no sweep — the
         # ledger is never patched from a guess (fail-closed).
@@ -3235,23 +3315,44 @@ class QuoteLifecycle:
         }
 
     def _candidate_edge_cc(
-        self, fair_cc: int, bid_cc: int, qty: CentiContracts, our_side: Side
+        self,
+        fair_cc: int,
+        bid_cc: int,
+        qty: CentiContracts,
+        our_side: Side,
+        *,
+        combo_ticker: str | None = None,
+        collection: str | None = None,
+        fee_cc: int | None = None,
     ) -> int | None:
         """Expected edge (candidate EV) of taking ``our_side`` at ``bid_cc`` on a
-        combo whose YES fair is ``fair_cc``, for ``qty`` centi-contracts, in int cc.
+        combo whose YES fair is ``fair_cc``, for ``qty`` centi-contracts, in int
+        cc — NET OF THE FEE THIS FILL PAYS (2026-09-04 fee-seam repair;
+        rfq/edge.py holds the arithmetic).
 
-        YES side: (fair − bid)·contracts. NO side: settles on the COMPLEMENT, so the
-        side-fair is $1 − fair — but ONLY when ``combo_no_pays_complement`` is
-        verified True; unverified ⇒ None (the NO payout is UNKNOWN and is never an
-        assumed complement, defense #5 / hard rule 6). Mirrors the fill ledger's
-        ``expected_edge_cc`` so the audited EV equals the recorded EV to the cent."""
-        contracts = int(qty)
-        if our_side is Side.YES:
-            return (int(fair_cc) - int(bid_cc)) * contracts // 100
-        if self._conventions.combo_no_pays_complement:
-            side_fair = CC_PER_DOLLAR - int(fair_cc)
-            return (side_fair - int(bid_cc)) * contracts // 100
-        return None
+        The fee is the measured schedule's fee at the bid for this combo's
+        fee type (``_fill_fee_cc``: 0 on a plain quadratic series, the
+        measured maker fee on a maker-fee series) unless the caller supplies
+        ``fee_cc`` (the fill ledger passes the fee it BOOKS — the exchange-
+        reported one on a recovery replay — so the recorded edge and the
+        booked fee can never disagree, and the fee enters exactly once).
+        No fee model / UNKNOWN fee ⇒ the gross figure (prior behaviour).
+
+        Every EV the bot judges derives from this one number: the confirm-
+        time admission EV, the quote-time candidate EV and eviction key, the
+        KILL-marginal input and the fill ledger's ``expected_edge_cc``."""
+        if fee_cc is None:
+            fee_cc = self._fill_fee_cc(
+                CentiCents(int(bid_cc)), qty, combo_ticker=combo_ticker, collection=collection
+            )
+        return candidate_edge_cc(
+            fair_cc=int(fair_cc),
+            bid_cc=int(bid_cc),
+            qty_centi=int(qty),
+            our_side=our_side,
+            complement_verified=self._conventions.combo_no_pays_complement,
+            fee_cc=fee_cc,
+        )
 
     def _gate_pricing_edge(self, state: OpenQuoteState) -> float | None:
         """``_pricing_edge_cc`` gated on the arming flag, with the FALLBACK
@@ -3301,28 +3402,44 @@ class QuoteLifecycle:
             int(bid),
             qty,
             self._conventions.maker_position_side(accepted_side),
+            combo_ticker=state.rfq.market_ticker,
+            collection=state.rfq.mve_collection_ticker,
         )
         return None if edge is None else float(edge)
 
     def _quote_candidate_ev_cc(
-        self, result: ConstructedQuote, qty: CentiContracts
+        self,
+        result: ConstructedQuote,
+        qty: CentiContracts,
+        *,
+        combo_ticker: str | None = None,
+        collection: str | None = None,
     ) -> int | None:
         """Candidate EV for a QUOTE (before any accept): the edge of the
         BETTER-priced quoted side — the side whose cheaper bid buys the most
         contracts on a target-cost accept and is the likelier take. Skips a declined
         (0-bid) side; None when neither side is priced (nothing to quote) or the NO
-        side's payout is UNKNOWN (unverified complement — never assumed)."""
+        side's payout is UNKNOWN (unverified complement — never assumed).
+        Fee-net (2026-09-04): ``combo_ticker``/``collection`` select the
+        combo's fee type on the measured schedule."""
         yes_bid = int(result.yes_bid_cc)
         no_bid = int(result.no_bid_cc)
         fair = int(result.fair_cc)
         candidates: list[int] = []
         if yes_bid > 0:
-            ev = self._candidate_edge_cc(fair, yes_bid, qty, Side.YES)
+            ev = self._candidate_edge_cc(
+                fair, yes_bid, qty, Side.YES, combo_ticker=combo_ticker, collection=collection
+            )
             if ev is not None:
                 candidates.append(ev)
         if no_bid > 0:
             ev = self._candidate_edge_cc(
-                fair, no_bid, qty, self._conventions.maker_position_side(Side.NO)
+                fair,
+                no_bid,
+                qty,
+                self._conventions.maker_position_side(Side.NO),
+                combo_ticker=combo_ticker,
+                collection=collection,
             )
             if ev is not None:
                 candidates.append(ev)
@@ -3344,7 +3461,10 @@ class QuoteLifecycle:
             rfq_id=rfq.rfq_id,
             reason=binding_cap or str(ReasonCode.QUOTE_SENT),
             **self._risk_audit_fields(
-                candidate_ev_cc=self._quote_candidate_ev_cc(result, qty),
+                candidate_ev_cc=self._quote_candidate_ev_cc(
+                    result, qty,
+                    combo_ticker=rfq.market_ticker, collection=rfq.mve_collection_ticker,
+                ),
                 binding_cap=binding_cap,
                 fallback_reason="",
             ),
@@ -4884,9 +5004,10 @@ class QuoteLifecycle:
         # direction is unaffected because a real fee only ever ADDS loss).
         candidate_fee_cc = 0
         pending = state.pending_fill
-        if pending is not None and self._maker_fee_active(
-            state.rfq.market_ticker, state.rfq.mve_collection_ticker
-        ):
+        if pending is not None:
+            # 2026-09-04: the MEASURED schedule decides (0 on a plain
+            # quadratic series — bit-identical; the measured maker fee on a
+            # maker-fee series, no prefix list required).
             predicted = self._fill_fee_cc(
                 pending[1],
                 pending[2],
@@ -5293,7 +5414,10 @@ class QuoteLifecycle:
             or limits.ruin_gate_marginal
         ):
             return None
-        ev_cc = self._quote_candidate_ev_cc(result, risk_qty)
+        ev_cc = self._quote_candidate_ev_cc(
+            result, risk_qty,
+            combo_ticker=quote_risk.combo_ticker, collection=quote_risk.collection,
+        )
         if ev_cc is None:
             return None
         det_cc = self._quote_det_consumed_cc(quote_risk)
@@ -5317,7 +5441,10 @@ class QuoteLifecycle:
             if state.pending_fill is not None
             else state.risk_qty
         )
-        return self._quote_candidate_ev_cc(state.constructed, qty)
+        return self._quote_candidate_ev_cc(
+            state.constructed, qty,
+            combo_ticker=state.rfq.market_ticker, collection=state.rfq.mve_collection_ticker,
+        )
 
     def _kill_marginal_for_fill(
         self, candidate: OpenPosition, ev_cc: int | None
@@ -5503,7 +5630,10 @@ class QuoteLifecycle:
         ranking key ("slot" = raw EV, "det_max" = EV per consumed det-max);
         ``mode`` is "on" (evict) or "shadow" (log the would-be eviction and
         return the breaches untouched)."""
-        cand_ev = self._quote_candidate_ev_cc(result, risk_qty)
+        cand_ev = self._quote_candidate_ev_cc(
+            result, risk_qty,
+            combo_ticker=quote_risk.combo_ticker, collection=quote_risk.collection,
+        )
         if cand_ev is None:
             return raw_breaches
         cand_det = 0
@@ -5751,6 +5881,10 @@ class QuoteLifecycle:
         if self._rfq_gone(rfq):
             await self._skip_dead_rfq(rfq, "pre_price")
             return
+        if rfq.mve_collection_ticker:
+            # Fee observer (2026-09-04): the collections we quote, so the slow
+            # loop can resolve their series fee_type. One set add.
+            self._collections_seen.add(rfq.mve_collection_ticker)
         # BOOT-WARMUP QUOTE GATE (2026-07-31): hold quote SENDING until the
         # first usable book-risk verdict (the confirm gate's own predicate,
         # reused). BEFORE filter/pricing — no work is spent on a quote that
@@ -6861,22 +6995,10 @@ class QuoteLifecycle:
         assert state.pending_fill is not None  # caller verified
         accepted_side, bid, qty = state.pending_fill
         our_side = self._conventions.maker_position_side(accepted_side)
-        expected_edge_cc: int | None
-        if our_side is Side.YES:
-            expected_edge_cc = (int(state.constructed.fair_cc) - int(bid)) * int(qty) // 100
-        elif self._conventions.combo_no_pays_complement:
-            side_fair = CC_PER_DOLLAR - int(state.constructed.fair_cc)
-            expected_edge_cc = (side_fair - int(bid)) * int(qty) // 100
-        else:
-            # NO payout semantics unverified — an honest ledger records
-            # UNKNOWN, never an assumed complement (defense #5).
-            expected_edge_cc = None
-        # Real fill fee from the fee model (defense #3): $0 for our combo maker
-        # quadratic fills, the real maker fee once this combo's series is on
-        # Kalshi's maker-fee list (maker_fee_active_prefixes — eat-the-fee
-        # doctrine: the price was NOT widened, so the fee must be accounted
-        # here). None only when no fee model is wired (pre-Phase-6 behaviour)
-        # or the fee is UNKNOWN.
+        # Real fill fee from the fee model (defense #3): $0 on a plain
+        # quadratic series, the MEASURED maker fee on a maker-fee series
+        # (the shared observed schedule — 2026-09-04). None only when no fee
+        # model is wired (pre-Phase-6 behaviour) or the fee is UNKNOWN.
         fill_fee_cc = self._fill_fee_cc(
             bid,
             qty,
@@ -6896,24 +7018,24 @@ class QuoteLifecycle:
         if isinstance(exchange_fee, int) and not isinstance(exchange_fee, bool):
             exchange_fee_reported = True
             fill_fee_cc = int(exchange_fee)
-        # EAT-THE-FEE accounting in the EV ledger: on a maker-fee-active series
-        # the predicted fee is a known cash cost of this fill, so the recorded
-        # expected edge is net of it (grading expected vs realized stays
-        # apples-to-apples). Gated on the prefix list so an EMPTY list is
-        # bit-identical to prior behaviour on every ledger row. An
-        # EXCHANGE-REPORTED fee (late-execution recovery) is a real cash cost
-        # regardless of the maker-fee list, so it nets the edge the same way.
-        if (
-            expected_edge_cc is not None
-            and fill_fee_cc is not None
-            and (
-                exchange_fee_reported
-                or self._maker_fee_active(
-                    state.rfq.market_ticker, state.rfq.mve_collection_ticker
-                )
-            )
-        ):
-            expected_edge_cc -= int(fill_fee_cc)
+        # THE RECORDED EDGE IS THE SAME NUMBER THE GATES JUDGED (2026-09-04):
+        # ``_candidate_edge_cc`` with the fee this row BOOKS — the exchange-
+        # reported fee on a recovery replay, else the measured model fee —
+        # so it is net of that fee exactly once (idempotent by construction:
+        # the fee never enters anywhere else). A plain quadratic series
+        # books fee 0 and records the gross figure, bit-identical to before;
+        # an unverified NO complement records UNKNOWN (None), never an
+        # assumed complement (defense #5).
+        expected_edge_cc = self._candidate_edge_cc(
+            int(state.constructed.fair_cc),
+            int(bid),
+            qty,
+            our_side,
+            combo_ticker=state.rfq.market_ticker,
+            collection=state.rfq.mve_collection_ticker,
+            fee_cc=fill_fee_cc,
+        )
+        _ = exchange_fee_reported  # evidence only: the booked fee already carries it
         inserted = await self._store.record_fill(
             fill_ref,
             order_id=str(msg.get("order_id")) if msg.get("order_id") else None,
@@ -6975,6 +7097,10 @@ class QuoteLifecycle:
         tickers embed the collection blob, but matching both keeps either
         spelling honest). Empty list (the default) ⇒ False everywhere —
         bit-identical prior behaviour."""
+        if self._fee_schedule is not None:
+            # 2026-09-04: the observed schedule resolves it (override prefix >
+            # observed charged fee > series fee_type > configured default).
+            return self._effective_fee_type(combo_ticker, collection).charges_maker
         if not self._maker_fee_active_prefixes:
             return False
         for prefix in self._maker_fee_active_prefixes:
@@ -6993,6 +7119,12 @@ class QuoteLifecycle:
         the verified maker coefficient. Non-quadratic configured types pass
         through untouched (FLAT/UNKNOWN still raise FeeUnknownError inside the
         model — fail-closed, never a guessed coefficient)."""
+        if self._fee_schedule is not None:
+            # MEASURED (2026-09-04): the shared observed schedule — the same
+            # resolution the engine's quote used for this combo.
+            return self._fee_schedule.fee_type_for(
+                combo_ticker=combo_ticker, collection=collection, default=self._fee_type
+            )
         if self._fee_type is FeeType.QUADRATIC and self._maker_fee_active(
             combo_ticker, collection
         ):
@@ -8686,6 +8818,22 @@ class QuoteLifecycle:
             self._sweep_fills_ledger_diff,
             _FILLS_LEDGER_SWEEP_TIMEOUT_S,
         )
+        # FEE OBSERVER (2026-09-04): ingest charged exchange fills, refit the
+        # shared measured schedule in place, alarm on drift, persist. The
+        # quote path only ever READS the schedule's attributes.
+        self._launch_diagnostic_sweep(
+            "fee_observer",
+            self._sweep_fee_observer,
+            _FEE_OBSERVER_SWEEP_TIMEOUT_S,
+        )
+        # MEASURED RETAINED-EDGE FLOOR (2026-09-04, item 2): re-estimate the
+        # per-cell floor from the settled grade and publish the dict the
+        # quote path looks up. Store read only; never the pricing path.
+        self._launch_diagnostic_sweep(
+            "retained_floor",
+            self._sweep_retained_floor,
+            _LEDGER_DIVERGENCE_SWEEP_TIMEOUT_S,
+        )
 
     def _launch_diagnostic_sweep(
         self,
@@ -8738,6 +8886,256 @@ class QuoteLifecycle:
         tasks = [t for t in self._diag_tasks.values() if not t.done()]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    # ------------------------------------------ fee observer (2026-09-04)
+
+    async def _sweep_fee_observer(self) -> None:
+        """MEASURE THE FEE SCHEDULE from the exchange's own fills.
+
+        Polls ``GET /portfolio/fills`` (the same GET handle the recovery sweep
+        and the ledger diff use), parses every row into a ``FeeObservation``
+        (exchange/fills.py — fail-closed), ingests into the shared
+        ``ObservedFeeSchedule`` (dedup by fill id; refit; drift verdict),
+        resolves the series fee_type of every collection this run has quoted
+        (``SeriesGetter``), and persists the schedule whenever it changed.
+
+        CADENCE: the FIRST maintenance tick runs it (a cold schedule must
+        measure before the bot has quoted for long — it prices taker-
+        conservative until then, never under); afterwards every
+        ``fills_ledger_sweep_interval_s``, EXCEPT that an unfinished history
+        walk (exchange cursor pending) continues on the very next tick. A
+        warm schedule fetches NEW fills only (``min_ts`` = its last fill).
+
+        BOUNDED: ≤ ``_FILLS_SWEEP_MAX_PAGES`` pages and ≤ that many
+        collection resolutions per sweep, each REST call under the house
+        poll timeout; the launcher wall-bounds the whole sweep. ALARM-ONLY
+        and off the pricing path: a drift is an ERROR log + metric — the
+        schedule refits and quoting continues on the measured value; nothing
+        here halts, refuses, or awaits on the tick (fix isolation)."""
+        sched = self._fee_schedule
+        if sched is None or self._fills_getter is None:
+            return
+        interval_s = self._config.fills_ledger_sweep_interval_s
+        if not (interval_s > 0.0):
+            return
+        now = self._clock.monotonic_ns()
+        last = self._fee_sweep_last_mono_ns
+        if (
+            last is not None
+            and self._fee_sweep_cursor is None
+            and now - last < int(interval_s * 1e9)
+        ):
+            return
+        self._fee_sweep_last_mono_ns = now
+        rows: list[JsonDict] = []
+        cursor = self._fee_sweep_cursor or ""
+        min_ts: int | None = None
+        if not cursor and sched.last_fill_time is not None:
+            # Warm: new fills only. The fill AT the watermark second is
+            # re-read and deduplicated by fill id.
+            min_ts = _parse_epoch_s(sched.last_fill_time)
+        for _ in range(_FILLS_SWEEP_MAX_PAGES):
+            params: dict[str, str | int] = {"limit": 1000}
+            if min_ts is not None:
+                params["min_ts"] = min_ts
+            if self._fills_subaccount is not None:
+                params["subaccount"] = self._fills_subaccount
+            if cursor:
+                params["cursor"] = cursor
+            self._beat()
+            payload = await asyncio.wait_for(
+                self._fills_getter.get_fills(**params),
+                timeout=_MAINTENANCE_POLL_TIMEOUT_S,
+            )
+            page = payload.get("fills") or []
+            if isinstance(page, list):
+                rows.extend(r for r in page if isinstance(r, dict))
+            cursor = str(payload.get("cursor") or "")
+            if not cursor:
+                break
+        self._fee_sweep_cursor = cursor or None
+        self._metrics.inc("fee_observer.ran")
+        refit = sched.ingest(fee_observations_from_fills(rows))
+        self._log_fee_refit(refit, sched, n_rows=len(rows))
+        await self._resolve_series_fee_types(sched)
+        await self._persist_fee_schedule(sched)
+
+    def _log_fee_refit(self, refit: FeeRefit, sched: ObservedFeeSchedule, *, n_rows: int) -> None:
+        summary = asdict(FeeScheduleSummary.of(sched))
+        if refit.drifted:
+            # THE alarm this seam lacked: the exchange moved the coefficient
+            # and every EV the bot judges just moved with it. ERROR, no halt
+            # — the schedule already refit to the measured value.
+            self._metrics.inc("fee_schedule.drift")
+            log.error(
+                "fee_schedule_drift",
+                previous=None if refit.previous is None else float(refit.previous),
+                fitted=None if refit.fitted is None else float(refit.fitted),
+                least_squares=(
+                    None if refit.least_squares is None else round(float(refit.least_squares), 6)
+                ),
+                new_charged=refit.new_charged,
+                mismatches_on_history=len(refit.mismatches),
+                detail="the maker fee coefficient MEASURED from charged fills moved by "
+                ">= one publication quantum — every fee-net EV now uses the new "
+                "value; older-regime fills show as mismatches",
+                **summary,
+            )
+        elif refit.mismatches:
+            self._metrics.inc("fee_schedule.mismatch", len(refit.mismatches))
+            log.warning(
+                "fee_schedule_mismatch",
+                n_mismatch=len(refit.mismatches),
+                sample=[
+                    (m.fill_id, m.model_cc, m.charged_cc) for m in refit.mismatches[:3]
+                ],
+                detail="charged fee off the measured model by > 1 cc (defense #3 "
+                "reconciliation of trade fees) — a multiplier or formula change?",
+                **summary,
+            )
+        if refit.new_charged or refit.collections_newly_active or refit.drifted:
+            log.info(
+                "fee_schedule_refit",
+                rows_polled=n_rows,
+                new_fills=refit.new_fills,
+                new_charged=refit.new_charged,
+                collections_newly_active=list(refit.collections_newly_active),
+                least_squares=(
+                    None if refit.least_squares is None else round(float(refit.least_squares), 6)
+                ),
+                **summary,
+            )
+
+    async def _resolve_series_fee_types(self, sched: ObservedFeeSchedule) -> None:
+        """Series fee_type for the collections this run has quoted, cached
+        on the schedule (persisted with it). Two public GETs per unresolved
+        collection, ≤ ``_FILLS_SWEEP_MAX_PAGES`` collections per sweep; a
+        collection whose series cannot be learned is retried one interval
+        later, never every tick."""
+        getter = self._series_getter
+        if getter is None:
+            return
+        now = self._clock.monotonic_ns()
+        retry_ns = int(self._config.fills_ledger_sweep_interval_s * 1e9)
+        budget = _FILLS_SWEEP_MAX_PAGES
+        for coll in sched.collections_needing_series(sorted(self._collections_seen)):
+            if budget <= 0:
+                break
+            failed_at = self._series_lookup_failed_ns.get(coll)
+            if failed_at is not None and now - failed_at < retry_ns:
+                continue
+            budget -= 1
+            series = sched.series_for(coll)
+            if series is None:
+                self._beat()
+                payload = await asyncio.wait_for(
+                    getter.get_multivariate_collection(coll),
+                    timeout=_MAINTENANCE_POLL_TIMEOUT_S,
+                )
+                series = _series_ticker_from_collection(payload)
+                if series is None:
+                    self._series_lookup_failed_ns[coll] = now
+                    self._metrics.inc("fee_observer.series_unresolved")
+                    log.warning(
+                        "fee_series_unresolved",
+                        collection=coll,
+                        keys=sorted(payload.keys())[:12] if isinstance(payload, dict) else None,
+                        detail="collection payload carries no series ticker — fee type "
+                        "for this collection stays observed/default (fail-closed)",
+                    )
+                    continue
+                sched.set_collection_series(coll, series)
+            if sched.series_fee_type(series) is None:
+                self._beat()
+                payload = await asyncio.wait_for(
+                    getter.get_series(series), timeout=_MAINTENANCE_POLL_TIMEOUT_S
+                )
+                body = payload.get("series") if isinstance(payload.get("series"), dict) else payload
+                raw_type = body.get("fee_type") if isinstance(body, dict) else None
+                if not isinstance(raw_type, str) or not raw_type:
+                    self._series_lookup_failed_ns[coll] = now
+                    self._metrics.inc("fee_observer.series_unresolved")
+                    log.warning("fee_series_fee_type_missing", collection=coll, series=series)
+                    continue
+                sched.set_series_fee_type(series, raw_type)
+                multiplier = body.get("fee_multiplier") if isinstance(body, dict) else None
+                log.info(
+                    "fee_series_fee_type",
+                    collection=coll,
+                    series=series,
+                    fee_type=raw_type,
+                    parsed=str(FeeType.parse(raw_type)),
+                    fee_multiplier=multiplier,
+                )
+                if multiplier is not None and float(multiplier) != float(self._fee_multiplier):
+                    log.warning(
+                        "fee_series_multiplier_differs",
+                        series=series,
+                        exchange_multiplier=multiplier,
+                        configured_multiplier=float(self._fee_multiplier),
+                        detail="the series reports a fee multiplier the configured "
+                        "default does not match — the observer's fitted coefficient "
+                        "already absorbs it on charged fills; uncharged collections "
+                        "would be mis-modeled",
+                    )
+
+    async def _persist_fee_schedule(self, sched: ObservedFeeSchedule) -> None:
+        path = self._fee_schedule_path
+        if path is None or sched.generation == self._fee_schedule_saved_generation:
+            return
+        generation = sched.generation
+        # Snapshot on the loop (small dicts), write off-loop (tmp + replace).
+        await asyncio.to_thread(sched.save, path)
+        self._fee_schedule_saved_generation = generation
+        self._metrics.inc("fee_observer.persisted")
+
+    # ------------------------------ measured retained-edge floor (item 2)
+
+    async def _sweep_retained_floor(self) -> None:
+        """Estimate the per-cell retained-edge floor from the store's settled
+        grade (risk/retained_edge_floor.py) and publish it to the engine.
+
+        CADENCE: the first maintenance tick, then every
+        ``fills_ledger_sweep_interval_s`` (the settlement-side cadence the
+        other slow-loop reads share). ONE batched store read of two small
+        tables, O(rows) arithmetic, one dict publish. The quote path never
+        waits on it (a stale table is still a measured table; a cold boot
+        keeps the fee-only floor). Errors log + retry (fix isolation)."""
+        interval_s = self._config.fills_ledger_sweep_interval_s
+        if not (interval_s > 0.0):
+            return
+        now = self._clock.monotonic_ns()
+        last = self._floor_sweep_last_mono_ns
+        if last is not None and now - last < int(interval_s * 1e9):
+            return
+        self._floor_sweep_last_mono_ns = now
+        publish = getattr(self._engine, "publish_retained_floor", None)
+        if publish is None:
+            return
+        raw = await asyncio.wait_for(self._store.settled_grade_rows(), STORE_OP_TIMEOUT_S)
+        rows: list[GradeRow] = []
+        skipped = 0
+        for r in raw:
+            row = grade_row_from_store(r)
+            if row is None:
+                skipped += 1
+                continue
+            rows.append(row)
+        estimate = estimate_retained_floor(rows)
+        self._metrics.inc("retained_floor.ran")
+        if estimate.published:
+            # The pool upper bounds travel with the table: a cell with no
+            # settled record resolves to its sport pool (review fix M2).
+            publish(dict(estimate.table), dict(estimate.pool_floor_cc))
+            self._metrics.inc("retained_floor.published")
+        else:
+            publish(None)
+        log.info(
+            "retained_floor_estimate",
+            rows=len(rows),
+            skipped=skipped,
+            **summarize_floor(estimate),
+        )
 
     # -------------------------------- position-ledger divergence invariant
 
@@ -10513,6 +10911,7 @@ class QuoteLifecycle:
             mass_acceptance=True,
             settled_facts=self._skew_settled_facts(),
         )
+        leg_profile = self._leg_axis_profile_from(snap)
         skew = compute_inventory_skew(
             candidate,
             snap,
@@ -10548,7 +10947,7 @@ class QuoteLifecycle:
             # LEG-DIRECTION AXIS (2026-07-25): built from THIS quote-time
             # snapshot (no staleness window); p_book only when the cached MC
             # profile is generation-fresh (None ⇒ the component is neutral).
-            leg_axis_profile=self._leg_axis_profile_from(snap),
+            leg_axis_profile=leg_profile,
             # LEVER #5 (operator directive 2026-07-27): the AND-BOUND
             # dollar-Herfindahl marginal (zero SE) priced by
             # Cov(candidate payoff, book P&L) off the already-paid-for CRN
@@ -10570,11 +10969,42 @@ class QuoteLifecycle:
             margin_cc=constructed.total_width_cc,
             tick_cc=self._combo_tick_cc(rfq, constructed),
         )
+        # REBATE BOUND BY MEASURED VALUE (2026-09-04, item 2 — risk/
+        # rebate_bound.py): once the concentration steer is ARMED and has
+        # PRICED this candidate its rebate is the measured Cov price and may
+        # not exceed it (the shadow steer's value never touches the wire —
+        # tests/test_conc_arming.py); otherwise a LEG-AXIS rebate on a
+        # direction the book holds no mirror of is dropped. Widening passes
+        # untouched. The leg axis is IN the price exactly when skew.py's
+        # pre-lever-#5 composition ran — i.e. whenever ``skew.conc is None``
+        # (steer disabled, or the CRN profile cold), EVEN with conc_armed
+        # (review fix S1: ``not conc_armed`` alone let an unbacked leg-axis
+        # rebate through unbounded whenever the cache was cold).
+        priced_conc = skew.conc if self._skew_params.conc_armed else None
+        conc_priced = priced_conc is not None
+        bound = bound_rebate(
+            skew.applied_cc,
+            value_cc_per_contract=(
+                priced_conc.value_cc_per_contract if priced_conc is not None else None
+            ),
+            family_cc=skew.family_cc,
+            entity_cc=skew.entity_cc,
+            candidate_family_keys={leg_family_key(leg) for leg in candidate.legs},
+            candidate_entity_keys={leg_entity_key(leg) for leg in candidate.legs},
+            shares_by_family=leg_profile.shares_by_family,
+            shares_by_entity=leg_profile.shares_by_entity,
+            leg_axis_armed=self._skew_params.leg_axis_armed and not conc_priced,
+        )
+        applied_skew_cc = bound.rebate_cc
         log.info(
             "inventory_skew_shadow",
             rfq_id=rfq.rfq_id,
             skew_cc=skew.skew_cc,                        # honest classifier sign
-            applied_cc=skew.applied_cc,                  # 0 while dark
+            applied_cc=applied_skew_cc,                  # 0 while dark; rebate-bounded
+            applied_unbounded_cc=skew.applied_cc,
+            rebate_bound_rule=bound.rule,
+            rebate_bound_cap_cc=bound.cap_cc,
+            rebate_unbacked_cc=bound.unbacked_cc,
             shadow_applied_cc=skew.shadow_applied_cc,    # pricer-frame, dark-independent
             concentration_cc=skew.concentration_cc,
             offset_cc=skew.offset_cc,
@@ -10713,7 +11143,7 @@ class QuoteLifecycle:
                     reason=widen.reason,
                 )
             widen_declines = widen.applied
-        return skew.applied_cc, widen_declines
+        return applied_skew_cc, widen_declines
 
     def _combo_tick_cc(self, rfq: Rfq, constructed: ConstructedQuote) -> int:
         """The combo's OWN grid step at the quoted bid (LEVER #5).
@@ -10927,7 +11357,10 @@ class QuoteLifecycle:
             legs=self._leg_refs(rfq),
             # Quote-time expected edge for EV-based slot eviction (2026-07-25):
             # refreshed on every reprice (a reprice re-builds this record).
-            expected_edge_cc=self._quote_candidate_ev_cc(constructed, qty),
+            expected_edge_cc=self._quote_candidate_ev_cc(
+                constructed, qty,
+                combo_ticker=rfq.market_ticker, collection=rfq.mve_collection_ticker,
+            ),
         )
 
     def _accepted_qty(
@@ -11038,7 +11471,11 @@ class QuoteLifecycle:
                 # disarmed / under budget ⇒ byte-identical.
                 kill_marginal=self._kill_marginal_for_fill(
                     candidate,
-                    self._quote_candidate_ev_cc(state.constructed, qty),
+                    self._quote_candidate_ev_cc(
+                        state.constructed, qty,
+                        combo_ticker=state.rfq.market_ticker,
+                        collection=state.rfq.mve_collection_ticker,
+                    ),
                 ),
             )
         )
@@ -11372,6 +11809,8 @@ class QuoteLifecycle:
                 int(bid),
                 qty,
                 self._conventions.maker_position_side(accepted_side),
+                combo_ticker=state.rfq.market_ticker,
+                collection=state.rfq.mve_collection_ticker,
             )
         # LAST-LOOK MC WAIVER observability: every confirm/decline audit line
         # carries the waiver axes (attempted/granted/worst-case/games — honest

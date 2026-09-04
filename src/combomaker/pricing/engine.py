@@ -16,7 +16,7 @@ UNVERIFIED (Phase 2.5 list); the estimate here feeds only the size-width adder
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from fractions import Fraction
@@ -34,7 +34,8 @@ from combomaker.pricing.dnp_scalar import (
     baseline_hazards,
     single_player_scope,
 )
-from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
+from combomaker.pricing.fee_observer import ObservedFeeSchedule
+from combomaker.pricing.fees import FeeModel, FeeScheduleSource, FeeType
 from combomaker.pricing.joint import JointEstimate, price_containment, price_joint_matrices
 from combomaker.pricing.legs import KalshiBookSource, LegBelief, OddsSource, blend_beliefs
 from combomaker.pricing.legtypes import LegType, classify_leg, set_pricing_aliases
@@ -48,6 +49,7 @@ from combomaker.pricing.quote import (
     free_money_caps,
 )
 from combomaker.pricing.relationships import Relationship, RelationshipKind, classify_legs
+from combomaker.pricing.retained_cell import CellKey, cell_key, floor_for_cell
 from combomaker.pricing.sgp import SgpParams, build_sgp_correlation
 from combomaker.pricing.structural import StructuralPricer, structural_applicable
 from combomaker.rfq.models import Rfq, RfqLeg
@@ -162,6 +164,7 @@ class PricingEngine:
         *,
         extra_sources: list[tuple[OddsSource, float]] | None = None,
         joint_memo_maxsize: int = _DEFAULT_JOINT_MEMO_MAXSIZE,
+        fee_schedule: FeeScheduleSource | None = None,
     ) -> None:
         self._feed = feed
         self._metadata = metadata
@@ -188,12 +191,34 @@ class PricingEngine:
         # against the Kalshi book at weight 1.0. A source returning None just
         # drops out; sources DISAGREEING beyond threshold is a no-quote.
         self._extra_sources = list(extra_sources or [])
-        self._fee_model = FeeModel(
-            FeeSchedule.from_strings(config.fee.taker_coef, config.fee.maker_coef),
-            conventions,
-        )
+        # THE FEE SCHEDULE IS SHARED AND MEASURED (2026-09-04 fee-seam repair):
+        # quote_app hands the ONE ObservedFeeSchedule the lifecycle ledger/
+        # waiver also hold, refit in place from charged exchange fills. With
+        # none injected (tests, backtests, stand-alone tools) a COLD schedule
+        # is built from the config strings — taker-conservative until fills
+        # are ingested, never a guessed coefficient.
+        if fee_schedule is None:
+            fee_schedule = ObservedFeeSchedule.from_config_values(
+                taker_coef=config.fee.taker_coef,
+                maker_coef_override=getattr(config.fee, "maker_coef_override", None),
+                override_prefixes=tuple(getattr(config.fee, "maker_fee_active_prefixes", ())),
+            )
+        self._fee_schedule = fee_schedule
+        self._fee_model = FeeModel(fee_schedule, conventions)
         self._fee_type = FeeType.parse(config.fee.default_fee_type)
         self._fee_multiplier = Fraction(Decimal(config.fee.default_multiplier))
+        # HOW THE FEE SHAPES THE QUOTE (FeeConfig.mode, 2026-09-04): "floor"
+        # floors the retained margin at the measured fee and caps the rebate
+        # at margin − fee (bids whose markup clears the fee are byte-
+        # identical); "width" subtracts it. getattr: duck-typed configs.
+        self._fee_mode = str(getattr(config.fee, "mode", "floor"))
+        # MEASURED RETAINED-EDGE FLOOR table (item 2, risk/retained_edge_floor
+        # .py): cell -> adverse-selection floor cc, published by the slow
+        # loop; the quote path does one dict lookup. None until published.
+        self._retained_floor: Mapping[CellKey, int] | None = None
+        # The per-sport pool upper bounds published with the table: the
+        # floor of a cell with NO settled record (review fix M2, fail-closed).
+        self._retained_pool_floor: Mapping[str, int] = {}
         self._sgp_params = SgpParams(
             pair_rho=dict(config.correlation.pair_rho),
             default_rho=config.correlation.same_event_rho,
@@ -442,7 +467,7 @@ class PricingEngine:
             qty=qty,
             grid=combo_meta.grid,
             fee_model=self._fee_model,
-            fee_type=self._fee_type,
+            fee_type=self.fee_type_for(rfq),
             fee_multiplier=self._fee_multiplier,
             time_to_close_s=time_to_close_s,
             in_play=in_play,
@@ -454,6 +479,8 @@ class PricingEngine:
             basket_extra_applies=is_single_family_no_basket(list(rfq.legs), sides),
             dnp_ask_floor_cc=dnp_floor_cc,
             params=self._quote_params,
+            fee_mode=self._fee_mode,
+            retained_floor_cc=self._retained_floor_for(rfq),
         )
         return self._enforce_sell_only(quote)
 
@@ -541,6 +568,56 @@ class PricingEngine:
         self._joint_cache[key] = result
         if len(self._joint_cache) > self._joint_memo_maxsize:
             self._joint_cache.popitem(last=False)
+
+    @property
+    def fee_schedule(self) -> FeeScheduleSource:
+        return self._fee_schedule
+
+    @property
+    def fee_mode(self) -> str:
+        return self._fee_mode
+
+    def publish_retained_floor(
+        self,
+        table: Mapping[CellKey, int] | None,
+        pool_floor_cc: Mapping[str, int] | None = None,
+    ) -> None:
+        """Install the slow loop's measured per-cell retained-edge floor
+        table (cell key -> cc, EXCLUDING the fee) together with the per-
+        sport pool upper bounds (``FloorEstimate.pool_floor_cc``) that a cell
+        ABSENT from the table resolves to (review fix M2). None clears both
+        (the quote path then keeps the fee-only floor)."""
+        self._retained_floor = table
+        self._retained_pool_floor = dict(pool_floor_cc or {}) if table is not None else {}
+
+    @property
+    def retained_pool_floor(self) -> Mapping[str, int]:
+        return self._retained_pool_floor
+
+    def _retained_floor_for(self, rfq: Rfq) -> int | None:
+        """One or two dict lookups on the quote path (O(legs) to build the
+        key). While a table is published this NEVER returns None: an
+        unseen cell is fail-closed to its sport pool's upper bound
+        (``floor_for_cell``)."""
+        table = self._retained_floor
+        if table is None:
+            return None
+        return floor_for_cell(cell_key(rfq.legs), table, self._retained_pool_floor)
+
+    def fee_type_for(self, rfq: Rfq) -> FeeType:
+        """The fee type THIS combo's fill is charged under, resolved by the
+        shared observed schedule (override prefix > observed charged fee on
+        the collection > series fee_type > configured default). A frozen
+        schedule (tests) keeps the configured default. O(active
+        collections): a few string prefix compares per quote."""
+        sched = self._fee_schedule
+        if isinstance(sched, ObservedFeeSchedule):
+            return sched.fee_type_for(
+                combo_ticker=rfq.market_ticker,
+                collection=rfq.mve_collection_ticker,
+                default=self._fee_type,
+            )
+        return self._fee_type
 
     def compute_joint(
         self,

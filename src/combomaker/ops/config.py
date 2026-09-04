@@ -11,7 +11,7 @@ from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from fractions import Fraction
 from pathlib import Path
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Literal, Self
 
 import yaml
 from pydantic import (
@@ -434,29 +434,47 @@ class FiltersConfig(StrictModel):
 
 
 class FeeConfig(StrictModel):
-    """Coefficients as decimal strings (exact Fractions downstream). VERIFIED
-    against the official Kalshi fee-schedule PDF (effective 2026-06-29): taker
-    0.07, maker 0.0175, quadratic. Maker fee applies only on markets in Kalshi's
-    maker-fee list (quadratic combo series charge $0 maker); monitor changes via
-    GET /series/fee_changes, and still reconcile vs real fills (defense #3)."""
+    """Fee seam (2026-09-04 repair — build A). The TAKER coefficient is the
+    published schedule constant (0.07, VERIFIED against the official Kalshi
+    fee-schedule PDF effective 2026-06-29). The MAKER coefficient is NOT a
+    config number any more: it is MEASURED from charged exchange fills by
+    ``pricing/fee_observer.py`` (0.035 on combo maker fills since 2026-08-20,
+    exact on 540/540 charged fills) and persisted under ``data_dir``. Until a
+    charged maker fill has ever been observed the schedule reports the TAKER
+    coefficient as the maker coefficient (fail-safe: over-estimating a cost
+    widens, never under-prices). ``maker_coef_override`` exists only as an
+    explicit, LOGGED operator override (tech debt to dissolve) — it never
+    outranks a measurement, only the bootstrap."""
 
     taker_coef: str = "0.07"
-    maker_coef: str = "0.0175"
-    # fee_type per combo series until fetched from GET /series: conservative
-    # default; overrides keyed by series/collection ticker prefix.
+    # OPERATOR OVERRIDE of the measured maker coefficient — a decimal string
+    # or None (the default). Logged as ``fee_schedule_override`` at boot. A
+    # fitted measurement always beats it; it only replaces the taker-
+    # conservative bootstrap while no charged maker fill has been observed.
+    maker_coef_override: str | None = None
+    # fee_type per combo when neither an observed charged fee nor the series'
+    # own fee_type (GET /series/{ticker}, cached by the observer) is known:
+    # conservative default; the observer's resolution order is
+    # override-prefix > observed-charged > series fee_type > this default.
     default_fee_type: str = "quadratic"
     default_multiplier: str = "1.0"
-    # MAKER-FEE LIST (operator directive 2026-07-16 — Kalshi is adding maker
-    # fees for combos). Series/collection-ticker PREFIXES on which OUR maker
-    # fills pay the maker fee (0.0175, verified vs the official schedule). The
-    # operator flips this in the local YAML when Kalshi's maker-fee list changes
-    # (monitor GET /series/fee_changes; defense #3 still reconciles predicted vs
-    # actual to the cent on real fills). DOCTRINE = EAT THE FEE: quoted prices
-    # stay unchanged/competitive — the fee is never added to the quote width; it
-    # is ACCOUNTED everywhere downstream instead (the fills ledger fee_cc,
-    # realized P&L, expected_edge_cc at fill recording, and the Problem-A waiver
-    # candidate's per-state P&L). Empty (the default) ⇒ bit-identical behaviour:
-    # quadratic combo maker fills keep computing $0.
+    # HOW THE FEE SHAPES THE QUOTE (pricing/quote.py construct_quote):
+    #   "floor" — the fee is NOT subtracted from the bid; the retained margin
+    #             is FLOORED at the fee (margin = max(markup, fee)) and the
+    #             inventory rebate may never give back more than margin - fee.
+    #             Every bid whose markup already clears the fee is BYTE-
+    #             IDENTICAL to the fee-blind price; only sub-fee tiers move.
+    #   "width" — the fee is subtracted from every bid (the pre-existing
+    #             arithmetic; honest EV, but moves competitive mains bids).
+    # Enum, not a number; the fee itself is measured. Default "floor".
+    mode: Literal["floor", "width"] = "floor"
+    # MAKER-FEE LIST OVERRIDE (operator directive 2026-07-16; since 2026-09-04
+    # an OVERRIDE only). Series/collection-ticker PREFIXES on which OUR maker
+    # fills pay the maker fee regardless of what the observer has seen. The
+    # live mechanism is the observer: a charged maker fee OBSERVED on a
+    # collection marks it active (sticky), and the series' fee_type from
+    # GET /series is consulted for collections never filled. Empty (the
+    # default) => the observer alone decides.
     maker_fee_active_prefixes: tuple[str, ...] = ()
 
     @field_validator("maker_fee_active_prefixes")
@@ -475,6 +493,19 @@ class FeeConfig(StrictModel):
                     "(non-empty, uppercase, no surrounding whitespace) — an empty "
                     "entry fees EVERY series, a non-canonical one fees none"
                 )
+        return v
+
+    @field_validator("maker_coef_override")
+    @classmethod
+    def _validate_maker_coef_override(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        try:
+            value = Decimal(v)
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError(f"maker_coef_override {v!r} is not a decimal string") from exc
+        if not 0 <= value <= 1:
+            raise ValueError(f"maker_coef_override {v!r} must lie in [0, 1]")
         return v
 
 
