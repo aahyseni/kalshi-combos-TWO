@@ -4,7 +4,10 @@ fee = ceil_to_centicent(coef × multiplier × C × P × (1−P))   [dollars]
 
 with C = contracts, P = price. Coefficients VERIFIED against the official Kalshi
 fee-schedule PDF (effective 2026-06-29, operator-provided): general/taker 0.07,
-maker 0.0175 (= 7/100, 7/400), quadratic C·P·(1−P), rounded UP to a centi-cent
+single-market maker 0.0175 (= 7/100, 7/400), quadratic C·P·(1−P), rounded UP to
+a centi-cent. COMBO maker fills have been charged 0.035 since 2026-08-20 05:07
+ET (measured on 540 charged fills, pricing/fee_observer.py — the live maker
+coefficient is OBSERVED from fills, never pinned here)
 (the PDF's "fee + positionCost rounded up to a centi-cent" is equivalent since
 positionCost — whole cents × whole contracts — is always a whole centi-cent).
 S&P/NASDAQ series use 0.035 (not sports; absent here). Maker fees apply ONLY to
@@ -30,6 +33,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
 from fractions import Fraction
+from typing import Protocol
 
 from combomaker.core.conventions import Conventions
 from combomaker.core.money import CC_PER_DOLLAR, CentiCents
@@ -39,8 +43,27 @@ from combomaker.core.quantity import CentiContracts
 class FeeType(StrEnum):
     QUADRATIC = "quadratic"
     QUADRATIC_WITH_MAKER_FEES = "quadratic_with_maker_fees"
+    # Kalshi's LIVE string for combo series since the 2026-08-20 maker-fee
+    # onset (GET /series reports it; every charged maker fill since sits on a
+    # series carrying it). Before this entry ``parse`` mapped it to UNKNOWN,
+    # which is a NO-QUOTE — setting the live string in config would have
+    # bricked quoting instead of arming the fee (2026-09-04 fee-seam trace).
+    # Routed to the MAKER branch of ``_pricing_coef`` exactly like
+    # QUADRATIC_WITH_MAKER_FEES; the coefficient itself is MEASURED from
+    # charged fills (pricing/fee_observer.py), never assumed equal to the
+    # single-market maker schedule (it is not: 0.035 vs 0.0175).
+    QUADRATIC_WITH_COMBO_MAKER_FEES = "quadratic_with_combo_maker_fees"
     FLAT = "flat"
     UNKNOWN = "unknown"
+
+    @property
+    def charges_maker(self) -> bool:
+        """True for the fee types under which OUR resting maker fill pays a
+        quadratic maker fee (the exchange's two maker-fee spellings)."""
+        return self in (
+            FeeType.QUADRATIC_WITH_MAKER_FEES,
+            FeeType.QUADRATIC_WITH_COMBO_MAKER_FEES,
+        )
 
     @classmethod
     def parse(cls, raw: object) -> FeeType:
@@ -70,10 +93,30 @@ class FeeSchedule:
         return cls(taker_coef=_coef_fraction(taker), maker_coef=_coef_fraction(maker))
 
 
+class FeeScheduleSource(Protocol):
+    """A LIVE schedule provider (pricing/fee_observer.py ``ObservedFeeSchedule``):
+    ``current()`` is read on every fee evaluation, so a refit from newly
+    charged fills reaches every FeeModel holding the same source at once —
+    the engine's, the lifecycle ledger's and the waiver's — without rebuilding
+    any of them (2026-09-04: the two builders held two frozen copies of a
+    yaml number the exchange had already changed)."""
+
+    def current(self) -> FeeSchedule: ...
+
+
 class FeeModel:
-    def __init__(self, schedule: FeeSchedule, conventions: Conventions) -> None:
+    def __init__(
+        self, schedule: FeeSchedule | FeeScheduleSource, conventions: Conventions
+    ) -> None:
         self._schedule = schedule
         self._conventions = conventions
+
+    def schedule(self) -> FeeSchedule:
+        """The schedule in force NOW (a frozen ``FeeSchedule`` is its own
+        source; a live source is asked each time)."""
+        if isinstance(self._schedule, FeeSchedule):
+            return self._schedule
+        return self._schedule.current()
 
     def _pricing_coef(self, fee_type: FeeType) -> Fraction:
         """Coefficient for OUR side of an RFQ fill, fail-safe on unknowns."""
@@ -81,12 +124,15 @@ class FeeModel:
             # Flat-fee series need their per-series constant from the schedule
             # PDF; without it any number is a guess.
             raise FeeUnknownError(f"cannot price fees for fee_type={fee_type}")
+        schedule = self.schedule()
         charged_as_taker = self._conventions.maker_is_taker_on_fill
         if charged_as_taker is None or charged_as_taker:
-            return self._schedule.taker_coef  # conservative default
+            return schedule.taker_coef  # conservative default
         if fee_type is FeeType.QUADRATIC:
             return Fraction(0)  # quadratic series charge no maker fee
-        return self._schedule.maker_coef
+        # QUADRATIC_WITH_MAKER_FEES / QUADRATIC_WITH_COMBO_MAKER_FEES: the
+        # maker coefficient — measured live, taker-conservative until measured.
+        return schedule.maker_coef
 
     def trade_fee_cc(
         self,
