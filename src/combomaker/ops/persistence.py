@@ -200,6 +200,18 @@ CREATE TABLE IF NOT EXISTS position_ledger (
 CREATE INDEX IF NOT EXISTS idx_position_ledger_ticker ON position_ledger (combo_ticker);
 CREATE INDEX IF NOT EXISTS idx_position_ledger_status ON position_ledger (status);
 CREATE INDEX IF NOT EXISTS idx_position_ledger_leghash ON position_ledger (leg_set_hash);
+
+-- STORE METADATA (2026-09-04 review fixes, item D): tiny key/value table for
+-- facts about the store ITSELF that no ledger row carries — today the fills
+-- verification WATERMARK: the highest fills.id (and the wall stamp) at the
+-- moment the verification columns were added. Rows at or below it predate
+-- execution verification (their proof is tools/ops/repair_phantom_fills.py,
+-- settlement-corroborated); rows above it were booked by code that verifies
+-- every claim, so a restart re-arms exactly those still 'booked'.
+CREATE TABLE IF NOT EXISTS store_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 # SQLite's own lock-wait tolerance for this connection (``PRAGMA busy_timeout``).
@@ -272,6 +284,9 @@ class Store:
         # report them alongside dropped writes.
         self.checkpoint_failures = 0
         self.checkpoint_passive_fallbacks = 0
+        # Cached fills verification watermark (2026-09-04 review fixes) —
+        # read once from store_meta by ``fills_verification_watermark``.
+        self._fills_verification_watermark: tuple[int, str] | None = None
 
     @classmethod
     async def open(cls, path: Path, clock: Clock) -> Self:
@@ -338,7 +353,9 @@ class Store:
         # (proven absent after the bounded verification; voided). ADD COLUMN
         # is idempotent against ``PRAGMA table_info`` so a legacy store opens
         # unchanged (every existing row reads ``booked``).
-        await cls._ensure_fills_verification_columns(db)
+        await cls._ensure_fills_verification_columns(
+            db, now_iso=clock.now().isoformat()
+        )
         # ONE EXCHANGE ORDER = ONE LEDGER ROW (2026-09-04 build, item D): a
         # partial UNIQUE index on fills.order_id (NULL-keyed rows — poll-
         # recovered fills whose quote payload exposed no creator_order_id —
@@ -393,8 +410,16 @@ class Store:
     #: never 'settled' — it was never held on the exchange).
     POSITION_STATUS_PHANTOM = "phantom"
 
+    #: store_meta keys of the fills verification WATERMARK (2026-09-04 review
+    #: fixes): the highest fills.id and the wall stamp when the verification
+    #: columns were added to THIS store. Written once (INSERT OR IGNORE).
+    META_FILLS_VERIFICATION_WATERMARK_ID = "fills_verification_watermark_id"
+    META_FILLS_VERIFICATION_MIGRATED_AT = "fills_verification_migrated_at"
+
     @staticmethod
-    async def _ensure_fills_verification_columns(db: aiosqlite.Connection) -> None:
+    async def _ensure_fills_verification_columns(
+        db: aiosqlite.Connection, *, now_iso: str
+    ) -> None:
         """Idempotent schema migration for the fills verification state
         (2026-09-04 build, item D): ``status`` (booked|verified|phantom),
         ``verified_at`` (ISO stamp of the /portfolio/fills proof) and
@@ -403,7 +428,13 @@ class Store:
         columns is untouched; a legacy store gains them with every existing
         row reading ``booked``. Never raises into ``open``: a failure logs
         loudly and the store still opens (the ledger writer treats a missing
-        column as "verification state unavailable", never as a crash)."""
+        column as "verification state unavailable", never as a crash).
+
+        WATERMARK (review fixes): the first time this runs on a store it
+        records ``MAX(fills.id)`` (0 on a fresh store) and ``now_iso`` in
+        ``store_meta`` — once, never overwritten. Everything the restart
+        re-arm and the ledger-quantity alarm scope to "after the fix" derives
+        from these two facts; nothing is hand-set."""
         try:
             async with db.execute("PRAGMA table_info(fills)") as cursor:
                 present = {str(row[1]) for row in await cursor.fetchall()}
@@ -421,6 +452,15 @@ class Store:
                 added.append("exchange_fill_id")
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_fills_status ON fills (status)"
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO store_meta (key, value)"
+                " SELECT ?, CAST(COALESCE(MAX(id), 0) AS TEXT) FROM fills",
+                (Store.META_FILLS_VERIFICATION_WATERMARK_ID,),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO store_meta (key, value) VALUES (?, ?)",
+                (Store.META_FILLS_VERIFICATION_MIGRATED_AT, now_iso),
             )
             await db.commit()
             if added:
@@ -1190,28 +1230,98 @@ class Store:
         await self._db.commit()
         return touched
 
-    async def open_ledger_quantity_by_ticker(self) -> dict[str, tuple[str, int, int]]:
-        """``{combo_ticker: (our_side, Σ contracts_centi, n_rows)}`` over every
-        OPEN ``position_ledger`` row — one grouped read for the per-ticker
-        LEDGER-vs-EXCHANGE quantity reconcile (2026-09-04 build, item D;
-        alarm-only). A ticker whose open rows disagree on side is reported
-        under the side of its FIRST row with the summed magnitude — the
-        divergence alarm fires either way."""
+    async def fills_verification_watermark(self) -> tuple[int, str] | None:
+        """``(max_fills_id_at_migration, migrated_at_iso)`` — the once-written
+        store_meta facts from ``_ensure_fills_verification_columns`` (2026-09-04
+        review fixes), or None when the migration never completed (a store
+        opened while the columns could not be added). Cached after the first
+        successful read: the value never changes for the life of a store."""
+        cached = self._fills_verification_watermark
+        if cached is not None:
+            return cached
         async with self._db.execute(
-            "SELECT combo_ticker, our_side, SUM(contracts_centi), COUNT(*)"
-            " FROM position_ledger WHERE status='open'"
-            " GROUP BY combo_ticker, our_side ORDER BY combo_ticker, our_side"
+            "SELECT key, value FROM store_meta WHERE key IN (?, ?)",
+            (
+                self.META_FILLS_VERIFICATION_WATERMARK_ID,
+                self.META_FILLS_VERIFICATION_MIGRATED_AT,
+            ),
+        ) as cursor:
+            rows = {str(row[0]): str(row[1]) for row in await cursor.fetchall()}
+        wm_raw = rows.get(self.META_FILLS_VERIFICATION_WATERMARK_ID)
+        at = rows.get(self.META_FILLS_VERIFICATION_MIGRATED_AT)
+        if wm_raw is None or at is None:
+            return None
+        try:
+            watermark = (int(wm_raw), at)
+        except ValueError:
+            return None
+        self._fills_verification_watermark = watermark
+        return watermark
+
+    async def booked_unverified_fills(self, *, after_id: int) -> list[JsonDict]:
+        """Every fills row STILL ``booked`` (never verified nor voided) that
+        carries an exchange ``order_id`` and was written AFTER the verification
+        watermark (``id > after_id``) — the claims a crashed process left
+        unproven (2026-09-04 review fixes: three multi-day outages this month;
+        8/26 had 16 boots, so a ~30-180 s in-memory verification window is
+        routinely cut short). The restart re-arm verifies exactly these on the
+        same cadence. Rows at or below the watermark are legacy (their proof is
+        the settlement-corroborated repair tool — an exact order_id lookup
+        would wrongly void the three 2026-07-18 truncated-id rows). Ordered
+        oldest-first; the caller bounds the work per tick."""
+        async with self._db.execute(
+            "SELECT id, at, fill_ref, order_id, combo_ticker, our_side,"
+            " contracts_centi, fee_cc FROM fills"
+            " WHERE status = ? AND order_id IS NOT NULL AND id > ? ORDER BY id",
+            (self.FILL_STATUS_BOOKED, int(after_id)),
         ) as cursor:
             rows = await cursor.fetchall()
-        out: dict[str, tuple[str, int, int]] = {}
+        return [
+            {
+                "id": int(row[0]),
+                "at": str(row[1]),
+                "fill_ref": str(row[2]),
+                "order_id": str(row[3]),
+                "combo_ticker": str(row[4]),
+                "our_side": str(row[5]),
+                "contracts_centi": int(row[6]),
+                "fee_cc": None if row[7] is None else int(row[7]),
+            }
+            for row in rows
+        ]
+
+    async def open_ledger_quantity_by_ticker(
+        self, *, post_fix_since: str | None = None
+    ) -> dict[str, tuple[str, int, int, int]]:
+        """``{combo_ticker: (our_side, Σ contracts_centi, n_rows, n_post_fix)}``
+        over every OPEN ``position_ledger`` row — one grouped read for the
+        per-ticker LEDGER-vs-EXCHANGE quantity reconcile (2026-09-04 build,
+        item D; alarm-only). ``n_post_fix`` counts the rows opened at or after
+        ``post_fix_since`` (the verification migration stamp — review fixes:
+        the live store carries 434 legacy stale open rows that would otherwise
+        bury a NEW phantom in the alarm every 5 min); None ⇒ every row counts
+        as post-fix. A ticker whose open rows disagree on side is reported
+        under the side of its FIRST row with the summed magnitude — the
+        divergence alarm fires either way."""
+        since = post_fix_since if post_fix_since is not None else ""
+        async with self._db.execute(
+            "SELECT combo_ticker, our_side, SUM(contracts_centi), COUNT(*),"
+            " SUM(CASE WHEN opened_at >= ? THEN 1 ELSE 0 END)"
+            " FROM position_ledger WHERE status='open'"
+            " GROUP BY combo_ticker, our_side ORDER BY combo_ticker, our_side",
+            (since,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        out: dict[str, tuple[str, int, int, int]] = {}
         for row in rows:
             ticker = str(row[0])
             side, total, n = str(row[1]), int(row[2] or 0), int(row[3] or 0)
+            n_post = int(row[4] or 0)
             if ticker in out:
-                prev_side, prev_total, prev_n = out[ticker]
-                out[ticker] = (prev_side, prev_total + total, prev_n + n)
+                prev_side, prev_total, prev_n, prev_post = out[ticker]
+                out[ticker] = (prev_side, prev_total + total, prev_n + n, prev_post + n_post)
             else:
-                out[ticker] = (side, total, n)
+                out[ticker] = (side, total, n, n_post)
         return out
 
     async def day_realized_pnl_cc(self, start_iso: str, end_iso: str) -> int:
@@ -1250,6 +1360,13 @@ class Store:
         # here (2026-09-04 build, item D): if the exchange later shows a fill
         # for that order, the sweep must alarm it as a MISS (the void was
         # wrong) rather than treat the voided row as its record.
+        # ASYMMETRY, on purpose (2026-09-04 review fixes): ``has_fill_for_
+        # order_id`` above still COUNTS a phantom row, so the same late print
+        # is ``already_in_ledger`` to ``_adopt_exchange_fill`` and can never be
+        # re-adopted for another quote — the voided row keeps its order_id
+        # claim (one exchange order = one row) while this read keeps the miss
+        # LOUD. Automatic un-void is not built; the alarm is the operator's cue
+        # to un-void by hand (the row and its raw_json are intact).
         async with self._db.execute(
             "SELECT DISTINCT order_id FROM fills WHERE order_id IS NOT NULL"
             " AND status != 'phantom'"
@@ -1612,9 +1729,15 @@ class Store:
         return counts
 
     async def ev_summary(self) -> dict[str, object]:
+        """Aggregate EV grading over the ev_ledger. A VOIDED phantom's row is
+        EXCLUDED (2026-09-04 review fixes): ``void_phantom_fill`` zeroes its
+        expected/realized, but a 0/0 row still counted as n+1 in a row-based
+        grade — a fill that never happened must not be graded at all."""
         async with self._db.execute(
-            "SELECT COUNT(*), COALESCE(SUM(expected_edge_cc), 0),"
-            " COUNT(realized_pnl_cc), COALESCE(SUM(realized_pnl_cc), 0) FROM ev_ledger"
+            "SELECT COUNT(*), COALESCE(SUM(e.expected_edge_cc), 0),"
+            " COUNT(e.realized_pnl_cc), COALESCE(SUM(e.realized_pnl_cc), 0)"
+            " FROM ev_ledger e WHERE NOT EXISTS ("
+            "SELECT 1 FROM fills f WHERE f.fill_ref = e.fill_ref AND f.status = 'phantom')"
         ) as cursor:
             row = await cursor.fetchone()
         assert row is not None
