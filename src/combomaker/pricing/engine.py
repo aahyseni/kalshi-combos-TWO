@@ -16,7 +16,7 @@ UNVERIFIED (Phase 2.5 list); the estimate here feeds only the size-width adder
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from fractions import Fraction
@@ -49,6 +49,7 @@ from combomaker.pricing.quote import (
     free_money_caps,
 )
 from combomaker.pricing.relationships import Relationship, RelationshipKind, classify_legs
+from combomaker.pricing.retained_cell import cell_key
 from combomaker.pricing.sgp import SgpParams, build_sgp_correlation
 from combomaker.pricing.structural import StructuralPricer, structural_applicable
 from combomaker.rfq.models import Rfq, RfqLeg
@@ -206,6 +207,15 @@ class PricingEngine:
         self._fee_model = FeeModel(fee_schedule, conventions)
         self._fee_type = FeeType.parse(config.fee.default_fee_type)
         self._fee_multiplier = Fraction(Decimal(config.fee.default_multiplier))
+        # HOW THE FEE SHAPES THE QUOTE (FeeConfig.mode, 2026-09-04): "floor"
+        # floors the retained margin at the measured fee and caps the rebate
+        # at margin − fee (bids whose markup clears the fee are byte-
+        # identical); "width" subtracts it. getattr: duck-typed configs.
+        self._fee_mode = str(getattr(config.fee, "mode", "floor"))
+        # MEASURED RETAINED-EDGE FLOOR table (item 2, risk/retained_edge_floor
+        # .py): cell -> adverse-selection floor cc, published by the slow
+        # loop; the quote path does one dict lookup. None until published.
+        self._retained_floor: Mapping[tuple[str, ...], int] | None = None
         self._sgp_params = SgpParams(
             pair_rho=dict(config.correlation.pair_rho),
             default_rho=config.correlation.same_event_rho,
@@ -466,6 +476,8 @@ class PricingEngine:
             basket_extra_applies=is_single_family_no_basket(list(rfq.legs), sides),
             dnp_ask_floor_cc=dnp_floor_cc,
             params=self._quote_params,
+            fee_mode=self._fee_mode,
+            retained_floor_cc=self._retained_floor_for(rfq),
         )
         return self._enforce_sell_only(quote)
 
@@ -557,6 +569,23 @@ class PricingEngine:
     @property
     def fee_schedule(self) -> FeeScheduleSource:
         return self._fee_schedule
+
+    @property
+    def fee_mode(self) -> str:
+        return self._fee_mode
+
+    def publish_retained_floor(self, table: Mapping[tuple[str, ...], int] | None) -> None:
+        """Install the slow loop's measured per-cell retained-edge floor
+        table (cell key -> cc, EXCLUDING the fee). None clears it (the
+        quote path then keeps the fee-only floor)."""
+        self._retained_floor = table
+
+    def _retained_floor_for(self, rfq: Rfq) -> int | None:
+        """One dict lookup on the quote path (O(legs) to build the key)."""
+        table = self._retained_floor
+        if table is None:
+            return None
+        return table.get(cell_key(rfq.legs))
 
     def fee_type_for(self, rfq: Rfq) -> FeeType:
         """The fee type THIS combo's fill is charged under, resolved by the

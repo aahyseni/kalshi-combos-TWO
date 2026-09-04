@@ -10,8 +10,13 @@ Invariants (property-tested):
   − margin (combo NO is dominated by the complement basket). Caps are
   computed at small size — top-of-book is the tightest, safest bound.
 - yes_bid + no_bid ≤ $1 − min_capture, always.
-- Fees are subtracted from each bid (fail-safe taker attribution until ground
-  truth), so quotes are profitable net of fees.
+- Fees (the MEASURED schedule — pricing/fee_observer.py) shape the quote in
+  one of two modes (``fee_mode``, FeeConfig.mode, 2026-09-04 fee-seam repair):
+  "width" subtracts the fee from each bid (the pre-existing arithmetic);
+  "floor" keeps the bid at fair − margin but FLOORS the retained margin at
+  the fee and caps the inventory rebate at margin − fee, so a fill can never
+  retain less than its fee — every bid whose markup already clears the fee
+  is byte-identical to the fee-blind price (see ``construct_quote``).
 - Sell-parlays-only (``QuoteParams.sell_parlays_only``): force ``yes_bid = 0`` so
   we can only ever end up LONG NO (sell the parlay), never LONG YES (the fade
   side that accepting our yes_bid would hand us — settlement backtest −14¢/ct).
@@ -131,7 +136,31 @@ def construct_quote(
     basket_extra_applies: bool = False,
     dnp_ask_floor_cc: int | None = None,
     params: QuoteParams | None = None,
+    fee_mode: str = "width",
+    retained_floor_cc: int | None = None,
 ) -> ConstructedQuote | NoQuote:
+    """``fee_mode`` (2026-09-04 fee-seam repair; FeeConfig.mode):
+
+    * ``"width"`` — the fee at the plausible fill range is SUBTRACTED from
+      each bid (the pre-existing arithmetic, byte-identical).
+    * ``"floor"`` — the fee is NOT subtracted. Instead the retained margin is
+      floored at the fee (``margin = max(margin, fee)``) and the inventory
+      REBATE may give back at most ``margin − fee`` (replacing the fee-blind
+      ``margin // 2`` cap when a measured cell floor is supplied, otherwise
+      the tighter of the two). Every bid whose markup already clears the fee
+      is BYTE-IDENTICAL to the fee-blind price at zero skew; only sub-fee
+      tiers (the ML-parlay razor) move, to fair − fee exactly. The fee that
+      floors is the MAX over the widest plausible bid range (probe margin =
+      max(margin, peak fee)), so the floor can never under-cover the fee at
+      the bid actually posted.
+
+    ``retained_floor_cc`` (item 2 — risk/retained_edge_floor.py): the
+    combo's cell's MEASURED adverse-selection floor EXCLUDING the fee; the
+    fee at the bid is added here, so the minimum retained margin after the
+    rebate is ``fee + retained_floor_cc``. Only ever tightens the rebate.
+    """
+    if fee_mode not in ("floor", "width"):
+        raise ValueError(f"fee_mode must be 'floor' or 'width', got {fee_mode!r}")
     p = params or QuoteParams()
     fair_cc = cc_from_prob(joint.p)
 
@@ -184,26 +213,22 @@ def construct_quote(
     # from the live margin (a structural fraction, not a new knob); the
     # WIDEN direction is untouched — making a combo dearer is always safe —
     # and the free-money clamp still applies below.
-    if inventory_skew_cc > margin // 2:
-        inventory_skew_cc = margin // 2
+    # In "floor" mode with a MEASURED cell floor supplied, that floor REPLACES
+    # the hand fraction below (item 2); every other path keeps it.
+    if fee_mode == "width" or retained_floor_cc is None:
+        if inventory_skew_cc > margin // 2:
+            inventory_skew_cc = margin // 2
 
     # The fill happens at the BID, not at fair, and the quadratic fee peaks at
     # $0.50 — computing it at fair under-charges the side whose bid sits
     # nearer $0.50. Take the max fee over the plausible fill range instead.
-    def side_fee(side_fair_cc: int) -> int:
+    def side_fee(side_fair_cc: int, probe_margin: int, fee_below_bid: int) -> int:
         fee_at_fair = int(
             fee_model.fee_per_contract_cc(
                 price_cc=CentiCents(side_fair_cc), fee_type=fee_type, multiplier=fee_multiplier
             )
         )
-        fee_peak = int(
-            fee_model.fee_per_contract_cc(
-                price_cc=CentiCents(CC_PER_DOLLAR // 2),
-                fee_type=fee_type,
-                multiplier=fee_multiplier,
-            )
-        )
-        lower = max(0, side_fair_cc - margin - abs(inventory_skew_cc) - fee_peak)
+        lower = max(0, side_fair_cc - probe_margin - abs(inventory_skew_cc) - fee_below_bid)
         nearest_to_peak = min(max(CC_PER_DOLLAR // 2, lower), side_fair_cc)
         fee_in_range = int(
             fee_model.fee_per_contract_cc(
@@ -213,10 +238,45 @@ def construct_quote(
         return max(fee_at_fair, fee_in_range)
 
     try:
-        fee_yes = side_fee(int(fair_cc))
-        fee_no = side_fee(CC_PER_DOLLAR - int(fair_cc))
+        fee_peak = int(
+            fee_model.fee_per_contract_cc(
+                price_cc=CentiCents(CC_PER_DOLLAR // 2),
+                fee_type=fee_type,
+                multiplier=fee_multiplier,
+            )
+        )
+        # "width": today's probe — the bid sits a further fee (<= fee_peak)
+        # below fair − margin. "floor": the fee is NOT subtracted from the
+        # bid, and the final margin is at most max(margin, fee) <= max(margin,
+        # fee_peak), so probing [side_fair − max(margin, fee_peak) − |skew|,
+        # side_fair] bounds the fee at any bid we could post — no tighter, so
+        # the floor bid is never below the width bid (property-tested).
+        if fee_mode == "floor":
+            probe_margin, fee_below_bid = max(margin, fee_peak), 0
+        else:
+            probe_margin, fee_below_bid = margin, fee_peak
+        fee_yes = side_fee(int(fair_cc), probe_margin, fee_below_bid)
+        fee_no = side_fee(CC_PER_DOLLAR - int(fair_cc), probe_margin, fee_below_bid)
     except FeeUnknownError as exc:
         return NoQuote(ReasonCode.SKIP_CLASSIFIER_UNKNOWN, f"fee model: {exc}")
+
+    if fee_mode == "floor":
+        # FEE-AWARE RETAINED-MARGIN FLOOR (2026-09-04). The fee is a cost of
+        # the fill, not a width: the bid stays at fair − margin, the margin
+        # is floored at the fee (a tier below the fee cannot exist — the
+        # razor dissolves into max(razor, measured fee)), and the rebate may
+        # never give back what the fee then takes. With a measured cell
+        # floor (item 2) the post-rebate margin is at least fee + floor.
+        fee_floor = fee_no if p.sell_parlays_only else max(fee_yes, fee_no)
+        if margin < fee_floor:
+            margin = fee_floor
+        rebate_cap = margin - fee_floor
+        if retained_floor_cc is not None:
+            rebate_cap = min(rebate_cap, max(0, margin - fee_floor - retained_floor_cc))
+        if inventory_skew_cc > rebate_cap:
+            inventory_skew_cc = rebate_cap
+        fee_yes = 0
+        fee_no = 0
 
     # Inventory skew: positive = we are long the joint event, so bid less for
     # YES and more for NO (attract the flow that flattens us).
