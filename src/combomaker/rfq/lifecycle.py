@@ -1266,6 +1266,77 @@ class OpenQuoteState:
     cancel_verify_ambiguous: bool = False
     # The cancel report's cancellation_reason, kept for the resolution log.
     cancel_reported_reason: str | None = None
+    # EXECUTION VERIFICATION (2026-09-04 build, item D — the phantom-execution
+    # class). Which verdict table the shared /portfolio/fills verification
+    # (``cancel_verify_*`` fields above, ``_cancel_verification_step``) is
+    # running under for this quote:
+    #   "cancel"          — REST status CANCELLED on a confirmed quote
+    #                       (2026-07-18 verify-before-discard; unchanged);
+    #   "executed"        — a fills row was BOOKED off an executed message
+    #                       (WS or synthesized) and must be PROVEN on the tape
+    #                       by its exchange order_id: found ⇒ row VERIFIED;
+    #                       absent after the bounded budget ⇒ VOIDED (the
+    #                       exchange emitted quote_executed for 28 orders since
+    #                       2026-07-27 that never filled — 12 on 2026-08-26);
+    #   "executed_status" — the recovery sweep's REST GET quote said EXECUTED
+    #                       with no WS message: nothing is booked from the
+    #                       status alone; a POSITIVE tape match (order_id /
+    #                       structural, ambiguity-guarded) books the row via
+    #                       the late-execution replay, absence voids the
+    #                       confirm-booked position.
+    verify_mode: str | None = None
+    # The FIRST executed message this quote received (WS or synthesized). The
+    # recovery sweep replays it through on_quote_executed when its ledger
+    # write FAILED — it never REST-polls "did the WS message arrive?" for a
+    # message it is holding (the 2026-08-26 run logged 75 false
+    # ``fill_record_recovered_via_poll`` "never arrived" recoveries and 38
+    # false order-id conflicts: every one a WS handler stalled on a saturated
+    # store, not a lost message).
+    executed_msg: JsonDict | None = None
+    # True while ``_record_executed_fill`` is executing for this quote (store
+    # reads + the INSERT pending). The sweep skips such a state: an in-flight
+    # write is neither a lost message nor a failed write.
+    fill_write_inflight: bool = False
+    # The trade fee booked into realized P&L when the fills row was written
+    # (0 when none) — reversed exactly if the fill is later VOIDED as phantom.
+    fill_fee_booked_cc: int = 0
+    # Terminal verification verdicts for verify_mode "executed".
+    exec_verified: bool = False
+    exec_voided: bool = False
+    # Monotonic ns at which the CURRENT in-flight ledger write started (the
+    # stall-alarm anchor; None when no write is in flight) and whether the
+    # once-per-state "write stalled" warning already fired.
+    fill_write_started_mono_ns: int | None = None
+    fill_write_stall_alarmed: bool = False
+
+
+@dataclass
+class OrphanClaim:
+    """A ``booked`` fills row a PREVIOUS process left unproven (2026-09-04
+    review fixes — execution verification lived only in ``_executed_states``,
+    so a crash inside the verification window left the row 'booked' forever;
+    three multi-day outages this month, 16 boots on 8/26). Loaded once per
+    process from ``Store.booked_unverified_fills`` (rows above the fills
+    verification watermark) and verified on the SAME cadence, budget and
+    verdict table as an in-process claim (``_orphan_verification_step``)."""
+
+    fill_ref: str
+    order_id: str
+    combo_ticker: str
+    our_side: str
+    contracts_centi: int
+    fee_cc: int | None
+    booked_at: str
+    booked_wall_ts: int | None
+    started_mono_ns: int
+    attempts: int = 0
+    ok_reads: int = 0
+    rounds: int = 0
+    done: bool = False
+
+    @property
+    def quote_id(self) -> str:
+        return self.fill_ref.removeprefix("fill:")
 
 
 class QuoteLifecycle:
@@ -1693,6 +1764,11 @@ class QuoteLifecycle:
         self._reprice_resume_after: str | None = None
         self._by_rfq: dict[str, str] = {}                # rfq_id → quote_id
         self._executed_states: dict[str, OpenQuoteState] = {}
+        # RESTART RE-ARM of execution verification (2026-09-04 review fixes):
+        # None until the first recovery sweep loads the 'booked' rows a prior
+        # process left unproven; then keyed by fill_ref (see OrphanClaim).
+        self._orphan_claims: dict[str, OrphanClaim] | None = None
+        self._orphan_load_failed_logged = False
         self._realized_pnl_cc = 0
         # ET calendar date the realized accumulator belongs to (day-rollover
         # reset — see _roll_realized_day). None until the first mark.
@@ -6529,6 +6605,16 @@ class QuoteLifecycle:
         if state.pending_fill is None:
             log.warning("execution_without_pending_fill", quote_id=quote_id)
             return
+        # HELD EXECUTED MESSAGE (2026-09-04 build, item D). The FIRST executed
+        # message this quote received is kept on the state: if the ledger
+        # write below fails, the recovery sweep replays THIS message — it never
+        # REST-polls "did the WS message arrive?" for a message it is holding.
+        # The 2026-08-26 15:21 run logged 75 ``fill_record_recovered_via_poll``
+        # "never arrived" recoveries: every one had its ``quote_executed_msg``
+        # 8-10 s EARLIER in the same log — the handler was stalled in the
+        # store write (rows landed ~19 s after the message), not message-less.
+        if state.executed_msg is None:
+            state.executed_msg = dict(msg)
         # Book the fill. With a reservation service, execution CONFIRMS the fill
         # landed — commit the reservation (converts a still-outstanding
         # reservation, e.g. one whose confirm timed out and was marked
@@ -6573,8 +6659,14 @@ class QuoteLifecycle:
         # recovery sweep re-polls and replays this same path (bounded attempts,
         # loud exhaustion); the /portfolio/fills verification net applies if
         # the quote status comes back cancelled.
+        # IN-FLIGHT MARKER (2026-09-04 build, item D): while the store reads +
+        # INSERT below are pending, the recovery sweep must treat this quote as
+        # "being written" — neither a lost message nor a failed write.
+        state.fill_write_inflight = True
+        state.fill_write_started_mono_ns = self._clock.monotonic_ns()
+        inserted = False
         try:
-            await self._record_executed_fill(quote_id, state, msg, fill_ref)
+            inserted = await self._record_executed_fill(quote_id, state, msg, fill_ref)
             # CLAIM RELEASE (2026-07-24 review): once the row exists (or the
             # writer terminally refused it) the ledger's own order_id guard
             # owns dedupe — release any transient claim held for this order
@@ -6594,12 +6686,124 @@ class QuoteLifecycle:
                 fill_ref=fill_ref,
                 detail="in-memory book holds this committed fill but the "
                 "fills-ledger write failed — row NOT written yet; the recovery "
-                "sweep will retry (bounded, loud on exhaustion)",
+                "sweep will replay the held executed message (bounded, loud on "
+                "exhaustion)",
             )
+        finally:
+            state.fill_write_inflight = False
+            state.fill_write_started_mono_ns = None
+        if inserted:
+            # Outside the write's try/except on purpose: the row EXISTS; what
+            # follows only stamps/starts its verification and must never be
+            # reported as a failed write (which would be retried into a
+            # conflict).
+            await self._on_fill_row_written(quote_id, state, msg, fill_ref)
+
+    async def _on_fill_row_written(
+        self, quote_id: str, state: OpenQuoteState, msg: JsonDict, fill_ref: str
+    ) -> None:
+        """A fills row was JUST written for this quote. EXECUTION VERIFICATION
+        (2026-09-04 build, item D — the phantom-execution class): the
+        exchange's ``quote_executed`` (WS) and ``status: executed`` (REST) are
+        CLAIMS, not fills. Measured on the all-time tape (4,228 fills): 28
+        executed messages since 2026-07-27 (12 on 2026-08-26) named orders
+        that never appeared on /portfolio/fills and never became positions
+        (settlement counts = the tape fills exactly) — two of them halted the
+        22:41 ET settlement reconcile (66.71 ledger vs 43.47 exchange).
+
+          * a row written FROM a /portfolio/fills match (``exchange_fill`` on
+            the message: the 2026-07-18 late-execution replay, or the new
+            executed-status recovery) is tape-proven by construction ⇒ stamped
+            VERIFIED immediately, no further read;
+          * otherwise the row starts as ``booked`` and the sweep polls
+            /portfolio/fills by the message's exchange ``order_id`` on the
+            EXISTING verify cadence (``fill_cancel_verify_attempts`` ×
+            ``fill_cancel_verify_delay_s`` — no new knob; measured tape latency
+            for real fills is p99 0.061 s / max 0.486 s over 4,053 matched
+            rows, so a real fill absent on the first read has a base rate of
+            0/4,053): found ⇒ ``verified``; absent after the budget ⇒
+            ``phantom`` and VOIDED (see ``_void_phantom_execution``);
+          * no fills getter / verification disabled ⇒ the row stays
+            ``booked`` (paper/minimal rigs — live always wires the getter);
+          * no exchange order_id on the message ⇒ no exact key exists: the row
+            stays ``booked`` and is alarmed once (the fills-ledger sweep and
+            the settlement reconcile remain its backstops)."""
+        exchange_fill = msg.get("exchange_fill")
+        if isinstance(exchange_fill, dict):
+            fill_id_raw = exchange_fill.get("fill_id") or exchange_fill.get("trade_id")
+            fill_id = str(fill_id_raw) if fill_id_raw else None
+            stamped = False
+            try:
+                stamped = await self._store.mark_fill_verified(
+                    fill_ref, exchange_fill_id=fill_id
+                )
+            except Exception:  # noqa: BLE001 — the row exists; the stamp is evidence
+                log.exception("fill_verified_stamp_failed", quote_id=quote_id)
+            state.verify_mode = "executed"
+            state.exec_verified = True
+            self._metrics.inc("fill_verify.verified_at_write")
+            log.info(
+                "fill_verified_at_write",
+                quote_id=quote_id,
+                fill_ref=fill_ref,
+                order_id=msg.get("order_id"),
+                exchange_fill_id=fill_id,
+                stamped=stamped,
+                detail="row written from a /portfolio/fills match — tape-proven "
+                "by construction",
+            )
+            return
+        if self._fills_getter is None or self._config.fill_cancel_verify_attempts <= 0:
+            return
+        order_id_raw = msg.get("order_id")
+        if not order_id_raw:
+            self._metrics.inc("fill_verify.unkeyed")
+            log.warning(
+                "fill_verification_unkeyed",
+                quote_id=quote_id,
+                fill_ref=fill_ref,
+                detail="executed message carried no exchange order_id — the row "
+                "cannot be verified by exact key and stays 'booked'; the "
+                "fills-ledger sweep + settlement reconcile are its backstops",
+            )
+            return
+        self._start_execution_verification(quote_id, state, str(order_id_raw))
+
+    def _start_execution_verification(
+        self, quote_id: str, state: OpenQuoteState, order_id: str
+    ) -> None:
+        """Arm verify_mode ``executed`` for a just-booked row: the sweep's
+        ``_execution_verification_step`` polls /portfolio/fills by this exact
+        ``order_id`` on the shared cancel-verify cadence (attempt 1 is due on
+        the very next tick). The shared ``cancel_verify_*`` counters are reset
+        so a quote that was mid cancel-verification when its WS execution
+        landed starts a clean budget."""
+        state.verify_mode = "executed"
+        state.cancel_expected_order_id = order_id
+        state.cancel_verify_started_mono_ns = self._clock.monotonic_ns()
+        state.cancel_verify_attempts = 0
+        state.cancel_verify_ok_reads = 0
+        state.cancel_verify_rounds = 0
+        state.cancel_verify_ambiguous = False
+        state.cancel_verified_fill = None
+        state.exec_verified = False
+        state.exec_voided = False
+        if state.fill_confirmed_wall_ts is None:
+            state.fill_confirmed_wall_ts = int(self._clock.now().timestamp())
+        self._executed_states.setdefault(quote_id, state)
+        self._metrics.inc("fill_verify.started")
+        log.info(
+            "fill_verification_started",
+            quote_id=quote_id,
+            order_id=order_id,
+            combo_ticker=state.rfq.market_ticker,
+            attempts=self._config.fill_cancel_verify_attempts,
+            delay_s=self._config.fill_cancel_verify_delay_s,
+        )
 
     async def _record_executed_fill(
         self, quote_id: str, state: OpenQuoteState, msg: JsonDict, fill_ref: str
-    ) -> None:
+    ) -> bool:
         """The fills-ledger tail of ``on_quote_executed`` — the ONE writer of
         fills rows (2026-07-16 P1). Split out so the caller can make any
         failure here a loud ERROR with a retry (2026-07-18 requirement 2)
@@ -6613,29 +6817,47 @@ class QuoteLifecycle:
         if state.fill_recorded or await self._store.has_fill(fill_ref):
             state.fill_recorded = True
             log.info("fill_replay_skipped", quote_id=quote_id, fill_ref=fill_ref)
-            return
+            return False
         # ORDER-ID UNIQUENESS (2026-07-24 review): one exchange order must
         # never produce two ledger rows — fill_ref dedupes per QUOTE, not per
         # exchange order, so a cross-quote misattribution upstream (another
         # quote adopted this order's fill) would otherwise double-write it.
         # Terminal + LOUD; never a second row.
+        # SAME-QUOTE vs CROSS-QUOTE (2026-09-04 build, item D): the 2026-08-26
+        # run logged this as "under ANOTHER fill_ref" 38 times — every one was
+        # THIS quote's own row, written by the other racer (WS handler vs poll
+        # replay) between the has_fill read above and this read. A same-ref
+        # hit is a replay skip (info); only a DIFFERENT fill_ref is the
+        # cross-quote conflict (error). Neither ever books a second row.
         order_id_raw = msg.get("order_id")
-        if order_id_raw and await self._store.has_fill_for_order_id(
-            str(order_id_raw)
-        ):
-            state.fill_recorded = True
-            self._metrics.inc("fill_ledger.order_id_conflict")
-            log.error(
-                "fill_order_id_already_in_ledger",
-                quote_id=quote_id,
-                fill_ref=fill_ref,
-                order_id=str(order_id_raw),
-                detail="a fills row for this exchange order already exists "
-                "under ANOTHER fill_ref — refusing a second row (one "
-                "exchange order = one ledger row); this signals a cross-"
-                "quote misattribution upstream: reconcile by hand",
-            )
-            return
+        if order_id_raw:
+            existing = await self._store.fill_ref_for_order_id(str(order_id_raw))
+            if existing is not None:
+                existing_ref, existing_status = existing
+                state.fill_recorded = True
+                if existing_ref == fill_ref:
+                    log.info(
+                        "fill_replay_skipped",
+                        quote_id=quote_id,
+                        fill_ref=fill_ref,
+                        order_id=str(order_id_raw),
+                        via="order_id",
+                    )
+                    return False
+                self._metrics.inc("fill_ledger.order_id_conflict")
+                log.error(
+                    "fill_order_id_already_in_ledger",
+                    quote_id=quote_id,
+                    fill_ref=fill_ref,
+                    order_id=str(order_id_raw),
+                    existing_fill_ref=existing_ref,
+                    existing_status=existing_status,
+                    detail="a fills row for this exchange order already exists "
+                    "under ANOTHER fill_ref — refusing a second row (one "
+                    "exchange order = one ledger row); this signals a cross-"
+                    "quote misattribution upstream: reconcile by hand",
+                )
+                return False
         assert state.pending_fill is not None  # caller verified
         accepted_side, bid, qty = state.pending_fill
         our_side = self._conventions.maker_position_side(accepted_side)
@@ -6709,19 +6931,39 @@ class QuoteLifecycle:
             # past the has_fill pre-check (both racers read before either
             # wrote): exactly one row exists; this racer books nothing more.
             log.info("fill_replay_skipped", quote_id=quote_id, fill_ref=fill_ref)
-            return
-        # The trade fee is a real cash cost AT FILL — it must enter the realized
-        # ledger the ENFORCED daily-loss cap reads, not only the settlement fee
-        # (else, on a nonzero-fee series, realized P&L understates costs by the
-        # trade fee and the cap sees a rosier figure than reality). $0 today for
-        # our quadratic maker fills, so no behaviour change now; correct for any
-        # nonzero-fee series. A None (no fee model / UNKNOWN) fee is NOT booked as
-        # a convenient 0 (defense #2) — the live balance poll remains the backstop
-        # that captures the actual cash movement.
-        if fill_fee_cc is not None and fill_fee_cc != 0:
-            self.record_realized_pnl(-int(fill_fee_cc))
-        self._metrics.inc("fill.count")
-        self._track_markout(f"fill:{quote_id}", state)
+            return False
+        # POST-INSERT TAIL IS NOT THE INSERT (2026-09-04 review fixes): the row
+        # EXISTS from here on, so a failure in the fee/metric/markout tail must
+        # never make the caller believe nothing was written — that would leave
+        # the row 'booked' with verification never armed (the sweep skips a
+        # fill_recorded state). Loud, counted, and the insert result stands.
+        try:
+            # The trade fee is a real cash cost AT FILL — it must enter the
+            # realized ledger the ENFORCED daily-loss cap reads, not only the
+            # settlement fee (else, on a nonzero-fee series, realized P&L
+            # understates costs by the trade fee and the cap sees a rosier
+            # figure than reality). $0 today for our quadratic maker fills, so
+            # no behaviour change now; correct for any nonzero-fee series. A
+            # None (no fee model / UNKNOWN) fee is NOT booked as a convenient 0
+            # (defense #2) — the live balance poll remains the backstop that
+            # captures the actual cash movement.
+            if fill_fee_cc is not None and fill_fee_cc != 0:
+                self.record_realized_pnl(-int(fill_fee_cc))
+                # Remembered so a later phantom VOID reverses exactly this figure.
+                state.fill_fee_booked_cc = int(fill_fee_cc)
+            self._metrics.inc("fill.count")
+            self._track_markout(f"fill:{quote_id}", state)
+        except Exception:  # noqa: BLE001 — the row is written; verification must still arm
+            self._metrics.inc("fill_ledger.post_insert_failed")
+            log.exception(
+                "fill_ledger_post_insert_failed",
+                quote_id=quote_id,
+                fill_ref=fill_ref,
+                detail="the fills row was INSERTED but the fee/metric/markout "
+                "tail raised — reported here, never as a failed write; the row "
+                "proceeds to execution verification like any other",
+            )
+        return True
 
     def _maker_fee_active(
         self, combo_ticker: str | None, collection: str | None
@@ -6848,7 +7090,18 @@ class QuoteLifecycle:
         for quote_id, state in list(self._executed_states.items()):
             if polls >= _FILL_RECOVERY_MAX_POLLS_PER_TICK:
                 break
-            if state.fill_recorded or state.pending_fill is None:
+            if state.pending_fill is None:
+                continue
+            if state.verify_mode == "executed":
+                # EXECUTION VERIFICATION (2026-09-04 build, item D): a BOOKED
+                # row being proven (or voided) against /portfolio/fills. Own
+                # cadence + bounds; terminal verdicts are skipped for free.
+                if not (state.exec_verified or state.exec_voided):
+                    polls += await self._execution_verification_step(
+                        quote_id, state, now
+                    )
+                continue
+            if state.fill_recorded:
                 continue
             if state.cancel_verify_started_mono_ns is not None:
                 # CANCEL-REPORT VERIFICATION in progress (2026-07-18): the
@@ -6864,6 +7117,50 @@ class QuoteLifecycle:
                 continue
             if now - state.fill_confirmed_mono_ns < after_ns:
                 continue  # the WS message may still arrive — too early to poll
+            if state.executed_msg is not None:
+                # THE MESSAGE ARRIVED (2026-09-04 build, item D). Never a REST
+                # poll for a message we hold: an in-flight write is left alone
+                # (alarmed once if it outlives the recovery delay — the 8/26
+                # store saturation shape); a FAILED write is replayed from the
+                # held message through the same on_quote_executed path,
+                # bounded by the sweep's attempt budget, loud on exhaustion.
+                if state.fill_write_inflight:
+                    started = state.fill_write_started_mono_ns
+                    if (
+                        started is not None
+                        and now - started >= after_ns
+                        and not state.fill_write_stall_alarmed
+                    ):
+                        state.fill_write_stall_alarmed = True
+                        self._metrics.inc("fill_ledger.write_stalled")
+                        log.warning(
+                            "fill_ledger_write_stalled",
+                            quote_id=quote_id,
+                            age_s=round((now - started) / 1e9, 1),
+                            detail="the fills-ledger write for a received executed "
+                            "message has been in flight longer than the recovery "
+                            "delay — a saturated store, not a lost message; no "
+                            "REST poll (the row lands when the store yields)",
+                        )
+                    continue
+                if state.fill_recovery_attempts >= _FILL_RECOVERY_MAX_ATTEMPTS:
+                    continue  # exhausted — already reported loudly
+                state.fill_recovery_attempts += 1
+                self._beat()
+                self._metrics.inc("fill_recovery.held_message_replayed")
+                log.warning(
+                    "fill_record_replayed_from_held_message",
+                    quote_id=quote_id,
+                    order_id=state.executed_msg.get("order_id"),
+                    attempt=state.fill_recovery_attempts,
+                    detail="the executed message WAS received; its ledger write "
+                    "failed — replaying the held message through "
+                    "on_quote_executed (no REST poll)",
+                )
+                await self.on_quote_executed(dict(state.executed_msg))
+                if not state.fill_recorded:
+                    self._note_fill_recovery_exhausted(quote_id, state)
+                continue
             if state.fill_recovery_attempts >= _FILL_RECOVERY_MAX_ATTEMPTS:
                 continue  # exhausted — already reported loudly below
             polls += 1
@@ -6897,30 +7194,111 @@ class QuoteLifecycle:
                 else ""
             )
             if status == "executed":
-                msg: JsonDict = {"quote_id": quote_id, "recovered_via_poll": True}
                 order_id = (
                     quote.get("creator_order_id") or quote.get("order_id")
                     if isinstance(quote, dict)
                     else None
                 )
+                if (
+                    self._fills_getter is None
+                    or self._config.fill_cancel_verify_attempts <= 0
+                ):
+                    # NO TAPE ACCESS (paper/minimal rigs — live always wires
+                    # the fills getter): the pre-2026-09-04 direct booking,
+                    # now explicitly UNVERIFIED in the log.
+                    msg: JsonDict = {"quote_id": quote_id, "recovered_via_poll": True}
+                    if order_id:
+                        msg["order_id"] = str(order_id)
+                        # CLAIM (2026-07-24 review): while this recovery is in
+                        # flight, a concurrently-verifying quote on the same
+                        # ticker must not adopt this order's fill (the cross-
+                        # quote-steal hole); released once the row lands.
+                        self._claimed_exchange_order_ids.add(str(order_id))
+                    self._metrics.inc("fill_recovery.recovered")
+                    log.warning(
+                        "fill_record_recovered_via_poll",
+                        quote_id=quote_id,
+                        order_id=msg.get("order_id"),
+                        attempts=state.fill_recovery_attempts,
+                        detail="quote_executed WS message never arrived; fill "
+                        "recorded from the REST quote status via the SAME "
+                        "on_quote_executed path (UNVERIFIED — no /portfolio/"
+                        "fills getter wired)",
+                    )
+                    await self.on_quote_executed(msg)
+                    continue
+                # VERIFY BEFORE BOOKING (2026-09-04 build, item D). A REST
+                # ``executed`` status is the SAME claim as the WS message and
+                # was false for the same 28 orders (the poll confirmed every
+                # 8/26 phantom). Nothing is booked from the status: the
+                # existing verify-before-discard machinery polls /portfolio/
+                # fills keyed on the quote payload's ``creator_order_id`` (the
+                # documented exact join; structural fallback only when the
+                # payload omits it, ambiguity-guarded) — a POSITIVE match books
+                # the row through ``_replay_verified_fill`` exactly once
+                # (tape-proven ⇒ verified at write); verified absence removes
+                # the confirm-booked position and writes no row. The position
+                # stays in the risk book meanwhile (fail-safe: counted until
+                # disproven). Attempt 1 is due on the next tick.
+                if not order_id:
+                    # UNKEYED EXECUTED STATUS (2026-09-04 review fixes): the
+                    # payload names NO ``creator_order_id`` (doc: present after
+                    # any execution; measured 0/75 on 8/26), so no POSITIVE
+                    # match to THIS quote is possible. Structural adoption
+                    # (ticker/side/count ≤ pending) is REFUSED here — an
+                    # exact-total same-ticker fill of another in-flight quote
+                    # whose row has not landed would be adoptable — and so
+                    # is discarding: nothing is booked, nothing is removed,
+                    # the confirm-booked position is KEPT (fail-safe) and
+                    # the case is loud + terminal; the next-restart exchange
+                    # reconcile and the fills-ledger sweep own it from here.
+                    self._metrics.inc("fill_recovery.unmatched")
+                    log.error(
+                        "fill_recovery_unmatched",
+                        quote_id=quote_id,
+                        combo_ticker=state.rfq.market_ticker,
+                        poll_attempts=state.fill_recovery_attempts,
+                        detail="REST quote status says EXECUTED with no WS "
+                        "message and NO creator_order_id — no exact key to "
+                        "match this quote on /portfolio/fills; structural "
+                        "adoption refused (could attribute another quote's "
+                        "fill); nothing booked, position KEPT in the risk "
+                        "book (fail-safe); the next-restart exchange reconcile "
+                        "is the backstop",
+                    )
+                    self._executed_states.pop(quote_id, None)
+                    continue
+                state.verify_mode = "executed_status"
+                state.cancel_expected_order_id = str(order_id)
+                state.cancel_reported_reason = None
+                state.cancel_verify_started_mono_ns = now
+                state.cancel_verify_attempts = 0
+                state.cancel_verify_ok_reads = 0
+                state.cancel_verify_rounds = 0
+                state.cancel_verify_ambiguous = False
                 if order_id:
-                    msg["order_id"] = str(order_id)
-                    # CLAIM (2026-07-24 review): while this recovery is in
-                    # flight, a concurrently-verifying quote on the same
-                    # ticker must not adopt this order's fill (the cross-
-                    # quote-steal hole); released once the row lands.
+                    # CLAIM (2026-07-24 review, kept): the exchange named THIS
+                    # quote's order — a concurrently-verifying same-ticker
+                    # quote must not adopt its fill structurally while this
+                    # verification is in flight. The exact-key owner passes
+                    # its own claim in ``_adopt_exchange_fill``; released on
+                    # the row landing or on discard/give-up.
                     self._claimed_exchange_order_ids.add(str(order_id))
-                self._metrics.inc("fill_recovery.recovered")
+                self._metrics.inc("fill_recovery.executed_status_verifying")
                 log.warning(
-                    "fill_record_recovered_via_poll",
+                    "fill_recovery_executed_status_verifying",
                     quote_id=quote_id,
-                    order_id=msg.get("order_id"),
-                    attempts=state.fill_recovery_attempts,
-                    detail="quote_executed WS message never arrived; fill "
-                    "recorded from the REST quote status via the SAME "
-                    "on_quote_executed path",
+                    expected_order_id=state.cancel_expected_order_id,
+                    attempts=self._config.fill_cancel_verify_attempts,
+                    delay_s=self._config.fill_cancel_verify_delay_s,
+                    poll_attempts=state.fill_recovery_attempts,
+                    detail="quote_executed WS message never arrived and REST "
+                    "says EXECUTED — NOT booked from the status (28 phantom "
+                    "executed statuses measured since 2026-07-27); the "
+                    "position stays booked while /portfolio/fills is checked "
+                    "for the order; a tape match writes the row, verified "
+                    "absence removes the position",
                 )
-                await self.on_quote_executed(msg)
             elif status == "cancelled":
                 self._recover_cancelled_fill(quote_id, state, quote)
             elif status in ("open", "accepted", "confirmed"):
@@ -6940,6 +7318,9 @@ class QuoteLifecycle:
                     attempt=state.fill_recovery_attempts,
                 )
                 self._note_fill_recovery_exhausted(quote_id, state)
+        # RESTART RE-ARM (2026-09-04 review fixes): claims a PRIOR process
+        # booked but never proved, on whatever poll budget this tick has left.
+        await self._verify_orphan_claims(now, polls)
 
     def _recover_cancelled_fill(
         self, quote_id: str, state: OpenQuoteState, quote: Any
@@ -7036,28 +7417,52 @@ class QuoteLifecycle:
                 "— refused (a recorded fill is a real position)",
             )
             return
-        self._metrics.inc("fill_recovery.cancelled")
-        log.warning(
-            "fill_recovery_quote_cancelled",
-            quote_id=quote_id,
-            cancellation_reason=cancellation_reason,
-            verify_attempts=verify_attempts,
-            verify_ok_reads=verify_ok_reads,
-            detail=detail,
-        )
-        if self._reservation is not None:
-            self._reservation.release(f"fill:{quote_id}")
-        self._exposure.remove_position(f"fill:{quote_id}")
-        # A phantom position may have accrued a settlement RECEIVABLE while it
-        # sat in the book through game end (the fact sweep notes any held
-        # position with graded legs) — cash that will never arrive, because
-        # there was no fill. Cancel it with the position (2026-07-21 review
-        # F6), else it shields the give-back halts for the full TTL.
-        if self._balance is not None:
-            self._balance.cancel_receivable(f"fill:{quote_id}")
+        if state.verify_mode == "executed_status":
+            # EXECUTED-STATUS PHANTOM (2026-09-04 build, item D): REST said
+            # executed, the tape never showed the order — the same class as
+            # the WS phantoms, caught BEFORE any row was written.
+            self._metrics.inc("fill_recovery.executed_status_phantom")
+            log.error(
+                "fill_recovery_executed_status_phantom",
+                quote_id=quote_id,
+                combo_ticker=state.rfq.market_ticker,
+                expected_order_id=state.cancel_expected_order_id,
+                verify_attempts=verify_attempts,
+                verify_ok_reads=verify_ok_reads,
+                detail=detail,
+            )
+        else:
+            self._metrics.inc("fill_recovery.cancelled")
+            log.warning(
+                "fill_recovery_quote_cancelled",
+                quote_id=quote_id,
+                cancellation_reason=cancellation_reason,
+                verify_attempts=verify_attempts,
+                verify_ok_reads=verify_ok_reads,
+                detail=detail,
+            )
+        self._unbook_position(quote_id)
         self._executed_states.pop(quote_id, None)
         state.pending_fill = None
         self._drop_quote(quote_id)
+
+    def _unbook_position(self, quote_id: str) -> None:
+        """Remove a position that was never (or is no longer) held on the
+        exchange from every in-memory book: release any straggler reservation
+        (idempotent — a committed one is no longer outstanding), drop the
+        position from the exposure book (the settlement seam's own removal —
+        bumps the position generation so stale snapshots invalidate) and
+        cancel its settlement receivable. A phantom position may have accrued
+        a RECEIVABLE while it sat in the book through game end (the fact sweep
+        notes any held position with graded legs) — cash that will never
+        arrive, because there was no fill; cancelling it with the position
+        (2026-07-21 review F6) keeps it from shielding the give-back halts.
+        Shared by the verified-absent discard and the phantom VOID."""
+        if self._reservation is not None:
+            self._reservation.release(f"fill:{quote_id}")
+        self._exposure.remove_position(f"fill:{quote_id}")
+        if self._balance is not None:
+            self._balance.cancel_receivable(f"fill:{quote_id}")
 
     # ------------------------------------ cancel-report /portfolio/fills verify
 
@@ -7138,21 +7543,40 @@ class QuoteLifecycle:
         match = await self._adopt_exchange_fill(quote_id, state, payload)
         if match is not None:
             state.cancel_verified_fill = dict(match)
-            self._metrics.inc("fill_recovery.late_execution")
-            log.warning(
-                "fill_recovery_late_execution",
-                quote_id=quote_id,
-                combo_ticker=state.rfq.market_ticker,
-                order_id=match.get("order_id"),
-                aggregate=match.get("_aggregate"),
-                is_taker=match.get("is_taker"),
-                created_time=match.get("created_time"),
-                attempts=state.cancel_verify_attempts,
-                detail="quote status said CANCELLED but /portfolio/fills shows "
-                "the execution (late/taker-style/partial) — position KEPT in "
-                "the risk book; fills row now written via the normal "
-                "on_quote_executed writer",
-            )
+            if state.verify_mode == "executed_status":
+                # EXECUTED STATUS CONFIRMED BY THE TAPE (2026-09-04 build,
+                # item D): the genuine missed-WS-message case — recovered
+                # exactly once, through the normal writer, tape-proven.
+                self._metrics.inc("fill_recovery.executed_status_verified")
+                log.warning(
+                    "fill_recovery_executed_status_verified",
+                    quote_id=quote_id,
+                    combo_ticker=state.rfq.market_ticker,
+                    order_id=match.get("order_id"),
+                    aggregate=match.get("_aggregate"),
+                    created_time=match.get("created_time"),
+                    attempts=state.cancel_verify_attempts,
+                    detail="quote_executed WS message never arrived; REST said "
+                    "EXECUTED and /portfolio/fills holds the order — fills row "
+                    "now written via the normal on_quote_executed writer "
+                    "(verified at write)",
+                )
+            else:
+                self._metrics.inc("fill_recovery.late_execution")
+                log.warning(
+                    "fill_recovery_late_execution",
+                    quote_id=quote_id,
+                    combo_ticker=state.rfq.market_ticker,
+                    order_id=match.get("order_id"),
+                    aggregate=match.get("_aggregate"),
+                    is_taker=match.get("is_taker"),
+                    created_time=match.get("created_time"),
+                    attempts=state.cancel_verify_attempts,
+                    detail="quote status said CANCELLED but /portfolio/fills shows "
+                    "the execution (late/taker-style/partial) — position KEPT in "
+                    "the risk book; fills row now written via the normal "
+                    "on_quote_executed writer",
+                )
             await self._replay_verified_fill(quote_id, state)
             if state.fill_recorded:
                 self._release_fill_claim(state)
@@ -7160,6 +7584,612 @@ class QuoteLifecycle:
         if final:
             self._resolve_cancel_verification(quote_id, state, now)
         return 1
+
+    # ------------------------------ execution verification (item D, 2026-09-04)
+
+    async def _execution_verification_step(
+        self, quote_id: str, state: OpenQuoteState, now: int
+    ) -> int:
+        """One maintenance-tick step of EXECUTION VERIFICATION for a quote
+        whose fills row is BOOKED off an executed message (verify_mode
+        ``executed``). Returns the REST polls spent (0 or 1) — the sweep's
+        per-tick budget covers these too.
+
+        Attempt n is due at start + n·delay on the injectable clock (attempt 1
+        immediately). Each attempt reads /portfolio/fills for THIS combo
+        ticker filtered by the exact exchange ``order_id`` (time-scoped from
+        the confirm wall-time, like the cancel path). A print with that
+        order_id ⇒ VERIFIED (terminal, ``mark_fill_verified``). Budget spent
+        with ≥1 successful read and no print ⇒ VOID (``_void_phantom_
+        execution``). Every read errored ⇒ the whole round is retried on the
+        same cadence up to ``_CANCEL_VERIFY_MAX_ROUNDS`` (a 429 storm must not
+        void a real fill), then a loud unresolved give-up that KEEPS the row
+        and the position (fail-safe: risk we could not disprove stays
+        counted)."""
+        assert state.cancel_verify_started_mono_ns is not None
+        if state.cancel_verify_rounds >= _CANCEL_VERIFY_MAX_ROUNDS:
+            return 0  # unresolved — already reported loudly; terminal
+        delay_ns = self._cancel_verify_delay_ns()
+        max_attempts = self._config.fill_cancel_verify_attempts
+        due_ns = (
+            state.cancel_verify_started_mono_ns
+            + state.cancel_verify_attempts * delay_ns
+        )
+        if now < due_ns:
+            return 0
+        if state.cancel_verify_attempts >= max_attempts:
+            await self._resolve_execution_verification(quote_id, state, now)
+            return 0
+        state.cancel_verify_attempts += 1
+        final = state.cancel_verify_attempts >= max_attempts
+        self._beat()  # a REST poll is progress, not a wedge
+        self._metrics.inc("fill_verify.polls")
+        min_ts: int | None = None
+        if state.fill_confirmed_wall_ts is not None:
+            min_ts = max(0, state.fill_confirmed_wall_ts - _CANCEL_VERIFY_MIN_TS_SLACK_S)
+        expected = state.cancel_expected_order_id
+        try:
+            payload = await asyncio.wait_for(
+                self._get_portfolio_fills(
+                    state.rfq.market_ticker, min_ts=min_ts, order_id=expected
+                ),
+                timeout=_MAINTENANCE_POLL_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001 — any poll error retries on cadence
+            self._metrics.inc("fill_verify.errors")
+            log.warning(
+                "fill_verify_poll_failed",
+                quote_id=quote_id,
+                order_id=expected,
+                attempt=state.cancel_verify_attempts,
+                error=repr(exc),
+            )
+            if final:
+                await self._resolve_execution_verification(quote_id, state, now)
+            return 1
+        state.cancel_verify_ok_reads += 1
+        prints = self._tape_prints_for_order(payload, expected)
+        if prints:
+            await self._mark_execution_verified(quote_id, state, prints)
+            return 1
+        if final:
+            await self._resolve_execution_verification(quote_id, state, now)
+        return 1
+
+    @staticmethod
+    def _tape_prints_for_order(payload: JsonDict, order_id: str | None) -> list[JsonDict]:
+        """Every /portfolio/fills print whose ``order_id`` equals the expected
+        exchange order id — the documented exact join (Quote.creator_order_id
+        == Fill.order_id; the tape carries no client_order_id: 0/4,228 rows).
+        Never a structural (ticker/side/count) match: a booked row is only
+        ever proven by ITS order."""
+        if not order_id:
+            return []
+        rows = payload.get("fills") or []
+        if not isinstance(rows, list):
+            return []
+        return [
+            row
+            for row in rows
+            if isinstance(row, dict) and str(row.get("order_id") or "") == order_id
+        ]
+
+    async def _mark_execution_verified(
+        self, quote_id: str, state: OpenQuoteState, prints: list[JsonDict]
+    ) -> None:
+        fill_ref = f"fill:{quote_id}"
+        first = prints[0]
+        fill_id_raw = first.get("fill_id") or first.get("trade_id")
+        fill_id = str(fill_id_raw) if fill_id_raw else None
+        tape_cc = self._tape_count_cc(prints)
+        booked_cc = int(state.pending_fill[2]) if state.pending_fill is not None else None
+        stamped = False
+        try:
+            stamped = await self._store.mark_fill_verified(fill_ref, exchange_fill_id=fill_id)
+        except Exception:  # noqa: BLE001 — the verdict stands; the stamp is evidence
+            log.exception("fill_verified_stamp_failed", quote_id=quote_id)
+        state.exec_verified = True
+        self._metrics.inc("fill_verify.verified")
+        log.info(
+            "fill_verified_on_tape",
+            quote_id=quote_id,
+            fill_ref=fill_ref,
+            order_id=state.cancel_expected_order_id,
+            combo_ticker=state.rfq.market_ticker,
+            exchange_fill_id=fill_id,
+            n_prints=len(prints),
+            booked_cc=booked_cc,
+            tape_cc=tape_cc,
+            attempts=state.cancel_verify_attempts,
+            stamped=stamped,
+        )
+        self._note_late_verification(
+            quote_id, fill_ref, state.cancel_expected_order_id, state.cancel_verify_attempts
+        )
+        self._note_verified_count_mismatch(
+            quote_id,
+            state.cancel_expected_order_id,
+            state.rfq.market_ticker,
+            booked_cc=booked_cc,
+            tape_cc=tape_cc,
+        )
+
+    @staticmethod
+    def _tape_count_cc(prints: list[JsonDict]) -> int | None:
+        """Σ count over a group of tape prints in centi-contracts, or None when
+        ANY print's count is unreadable (an honest UNKNOWN, never a partial
+        sum compared as complete)."""
+        tape_cc: int | None = 0
+        for row in prints:
+            raw_count = row.get("count_fp") or row.get("count")
+            try:
+                tape_cc = (
+                    tape_cc + int(qty_from_fp_str(str(raw_count)))
+                    if raw_count is not None and tape_cc is not None
+                    else None
+                )
+            except ValueError:
+                tape_cc = None
+        return tape_cc
+
+    def _note_late_verification(
+        self, quote_id: str, fill_ref: str, order_id: str | None, attempts: int
+    ) -> None:
+        """PRE-REGISTERED BUDGET ALARM (2026-09-04 review fixes). The measured
+        0.486 s max is ``created_time − executed_ts`` — two EXCHANGE stamps —
+        not the REST visibility lag of /portfolio/fills, which has not been
+        measured. The void budget is anchored on the pre-existing 2026-07-18
+        verify-before-discard cadence; a wrong void is an UNDERCOUNT (the
+        dangerous direction). So every real fill that needed MORE than one
+        read to verify is a loud, counted signal to revisit the budget — the
+        alarm is registered before relight, not after a loss."""
+        if attempts <= 1:
+            return
+        self._metrics.inc("fill_verify.verified_late")
+        log.warning(
+            "fill_verified_late",
+            quote_id=quote_id,
+            fill_ref=fill_ref,
+            order_id=order_id,
+            attempts=attempts,
+            delay_s=self._config.fill_cancel_verify_delay_s,
+            budget_attempts=self._config.fill_cancel_verify_attempts,
+            detail="a REAL fill was absent from /portfolio/fills on its first "
+            "verification read and appeared later — the tape's REST visibility "
+            "lag exceeded one verify delay; revisit the void budget before it "
+            "voids a real fill (undercount)",
+        )
+
+    def _note_verified_count_mismatch(
+        self,
+        quote_id: str,
+        order_id: str | None,
+        combo_ticker: str,
+        *,
+        booked_cc: int | None,
+        tape_cc: int | None,
+    ) -> None:
+        if tape_cc is not None and booked_cc is not None and tape_cc != booked_cc:
+            self._metrics.inc("fill_verify.count_mismatch")
+            log.warning(
+                "fill_verified_count_mismatch",
+                quote_id=quote_id,
+                order_id=order_id,
+                combo_ticker=combo_ticker,
+                booked_cc=booked_cc,
+                tape_cc=tape_cc,
+                detail="the tape's count for this order differs from the booked "
+                "size — alarm-only here; the per-ticker ledger_quantity_mismatch "
+                "reconcile and the settlement reconcile own the correction",
+            )
+
+    async def _resolve_execution_verification(
+        self, quote_id: str, state: OpenQuoteState, now: int
+    ) -> None:
+        """Verdict once an execution-verification ROUND's poll budget is spent
+        without a print: ≥1 successful read ⇒ the order is GENUINELY absent
+        from the tape ⇒ VOID the phantom; every read errored ⇒ retry a whole
+        round (bounded), then keep row + position and say so loudly."""
+        if state.cancel_verify_ok_reads > 0:
+            await self._void_phantom_execution(quote_id, state, now)
+            return
+        state.cancel_verify_rounds += 1
+        if state.cancel_verify_rounds < _CANCEL_VERIFY_MAX_ROUNDS:
+            state.cancel_verify_attempts = 0
+            state.cancel_verify_started_mono_ns = now + self._cancel_verify_delay_ns()
+            self._metrics.inc("fill_verify.round_failed")
+            log.warning(
+                "fill_verify_round_failed",
+                quote_id=quote_id,
+                combo_ticker=state.rfq.market_ticker,
+                round=state.cancel_verify_rounds,
+                max_rounds=_CANCEL_VERIFY_MAX_ROUNDS,
+                detail="every /portfolio/fills read in this verification round "
+                "failed — row stays booked, position stays; retrying a full round",
+            )
+            return
+        self._metrics.inc("fill_verify.unresolved")
+        log.error(
+            "fill_verify_unresolved",
+            quote_id=quote_id,
+            order_id=state.cancel_expected_order_id,
+            combo_ticker=state.rfq.market_ticker,
+            verify_rounds=state.cancel_verify_rounds,
+            detail="booked fill could NOT be verified against /portfolio/fills "
+            "(every read failed across all retry rounds) — row stays 'booked' "
+            "and the position stays in the risk book (fail-safe); the "
+            "fills-ledger sweep + settlement reconcile are the backstops",
+        )
+
+    async def _void_phantom_execution(
+        self, quote_id: str, state: OpenQuoteState, now: int
+    ) -> None:
+        """VOID a booked fill the tape has disproven (2026-09-04 build, item
+        D): the exchange said executed, /portfolio/fills never held the order
+        after the bounded verification, so nothing about it may keep counting
+        — durable ledgers (``Store.void_phantom_fill``: fills → phantom,
+        position_ledger → phantom, ev_ledger → 0/0), the booked trade fee
+        (reversed to the cent), and the in-memory position/reservation/
+        receivable. Attempts land at +0 / +delay / +2·delay with the void on
+        the final one, so a phantom is voided ≈ 2·fill_cancel_verify_delay_s
+        after booking: ~3 min at the 90 s default, ~30 s at the live 15 s
+        setting (config/prod-live-wc.local.yaml, 2026-07-25). The 8/26
+        phantoms would have been voided within a minute of booking; the 22:41
+        ET halt (66.71 ledger vs 43.47 exchange) could not have happened. A
+        store failure here is one failed ROUND (retried on cadence, then the
+        loud unresolved give-up) — never a silent skip."""
+        fill_ref = f"fill:{quote_id}"
+        try:
+            touched = await self._store.void_phantom_fill(
+                fill_ref, reason="absent_from_portfolio_fills"
+            )
+        except Exception as exc:  # noqa: BLE001 — retried as a failed round
+            self._metrics.inc("fill_verify.void_failed")
+            log.exception("fill_phantom_void_failed", quote_id=quote_id, error=repr(exc))
+            state.cancel_verify_ok_reads = 0  # the verdict must be re-earned
+            await self._resolve_execution_verification(quote_id, state, now)
+            return
+        if touched["fills"] == 0:
+            # No 'booked' row to void (already verified/voided by another
+            # path, or never written) — nothing else may be reversed.
+            self._metrics.inc("fill_verify.void_noop")
+            log.warning(
+                "fill_phantom_void_noop",
+                quote_id=quote_id,
+                fill_ref=fill_ref,
+                detail="no 'booked' fills row exists for this fill_ref — void "
+                "skipped; the row's current status stands",
+            )
+            state.exec_voided = True
+            return
+        if state.fill_fee_booked_cc:
+            self.record_realized_pnl(int(state.fill_fee_booked_cc))
+        pending = state.pending_fill
+        our_side = (
+            str(self._conventions.maker_position_side(pending[0])) if pending else None
+        )
+        self._unbook_position(quote_id)
+        state.exec_voided = True
+        self._metrics.inc("fill_verify.phantom_voided")
+        log.error(
+            "fill_phantom_execution_voided",
+            quote_id=quote_id,
+            fill_ref=fill_ref,
+            order_id=state.cancel_expected_order_id,
+            combo_ticker=state.rfq.market_ticker,
+            our_side=our_side,
+            contracts_centi=int(pending[2]) if pending else None,
+            price_cc=int(pending[1]) if pending else None,
+            fee_reversed_cc=int(state.fill_fee_booked_cc),
+            verify_attempts=state.cancel_verify_attempts,
+            verify_ok_reads=state.cancel_verify_ok_reads,
+            touched=touched,
+            detail="exchange reported this quote EXECUTED but /portfolio/fills "
+            "never held its order after bounded verification — PHANTOM "
+            "EXECUTION: fills/position_ledger/ev_ledger voided, fee reversed, "
+            "position + reservation + receivable removed (the 2026-08-26 class: "
+            "28 since 07-27, two halted the settlement reconcile)",
+        )
+        self._executed_states.pop(quote_id, None)
+        state.pending_fill = None
+        self._drop_quote(quote_id)
+
+    # ------------------------------- restart re-arm of execution verification
+
+    async def _verify_orphan_claims(self, now: int, polls_used: int) -> None:
+        """Verify the ``booked`` rows a PRIOR process left unproven (2026-09-04
+        review fixes). Loaded ONCE per process (a single indexed store read,
+        wall-bounded, retried next tick on failure — cached after) from the
+        rows above the fills verification watermark; each claim then steps on
+        the same cadence as ``_execution_verification_step`` inside the SAME
+        per-tick poll budget the in-process states share (``polls_used``
+        already spent). A claim whose quote is alive in this process is the
+        in-process path's to prove — skipped here. No fills getter / verify
+        disabled ⇒ nothing (paper/minimal rigs)."""
+        if self._fills_getter is None or self._config.fill_cancel_verify_attempts <= 0:
+            return
+        if self._orphan_claims is None:
+            loaded = await self._load_orphan_claims(now)
+            if loaded is None:
+                return
+            self._orphan_claims = loaded
+        polls = polls_used
+        for claim in list(self._orphan_claims.values()):
+            if polls >= _FILL_RECOVERY_MAX_POLLS_PER_TICK:
+                break
+            if claim.done:
+                continue
+            if claim.quote_id in self._executed_states or claim.quote_id in self._open:
+                claim.done = True  # this process owns that quote's proof
+                continue
+            polls += await self._orphan_verification_step(claim, now)
+
+    async def _load_orphan_claims(self, now: int) -> dict[str, OrphanClaim] | None:
+        """One store read: every ``booked`` row with an exchange order_id above
+        the verification watermark. None ⇒ the read failed (retry next tick,
+        logged once per process). A store whose migration never stamped a
+        watermark has nothing re-armable — logged, then an empty set."""
+        try:
+            watermark = await asyncio.wait_for(
+                self._store.fills_verification_watermark(), timeout=STORE_OP_TIMEOUT_S
+            )
+            if watermark is None:
+                log.warning(
+                    "fill_verify_rearm_unavailable",
+                    detail="the store carries no fills verification watermark "
+                    "(migration incomplete) — no prior-process claims can be "
+                    "re-armed; the repair tool is the backstop",
+                )
+                return {}
+            rows = await asyncio.wait_for(
+                self._store.booked_unverified_fills(after_id=watermark[0]),
+                timeout=STORE_OP_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001 — retried next tick, never into the tick
+            if not self._orphan_load_failed_logged:
+                self._orphan_load_failed_logged = True
+                log.warning("fill_verify_rearm_load_failed", error=repr(exc))
+            return None
+        claims: dict[str, OrphanClaim] = {}
+        for row in rows:
+            booked_wall_ts: int | None
+            try:
+                stamp = datetime.fromisoformat(str(row["at"]))
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=UTC)
+                booked_wall_ts = int(stamp.timestamp())
+            except ValueError:
+                booked_wall_ts = None
+            claims[str(row["fill_ref"])] = OrphanClaim(
+                fill_ref=str(row["fill_ref"]),
+                order_id=str(row["order_id"]),
+                combo_ticker=str(row["combo_ticker"]),
+                our_side=str(row["our_side"]),
+                contracts_centi=int(row["contracts_centi"]),
+                fee_cc=None if row["fee_cc"] is None else int(row["fee_cc"]),
+                booked_at=str(row["at"]),
+                booked_wall_ts=booked_wall_ts,
+                started_mono_ns=now,
+            )
+        self._metrics.inc("fill_verify.rearmed", by=len(claims))
+        log.info(
+            "fill_verify_rearmed",
+            n=len(claims),
+            watermark_id=watermark[0],
+            migrated_at=watermark[1],
+            fill_refs=sorted(claims)[:20],
+            attempts=self._config.fill_cancel_verify_attempts,
+            delay_s=self._config.fill_cancel_verify_delay_s,
+            detail="booked fills rows a prior process never verified — proven "
+            "or voided against /portfolio/fills on the verify cadence",
+        )
+        return claims
+
+    async def _orphan_verification_step(self, claim: OrphanClaim, now: int) -> int:
+        """One tick of verification for a re-armed claim — the same attempt/
+        round arithmetic and verdicts as ``_execution_verification_step``,
+        keyed on the row's exact exchange order_id. Returns polls spent."""
+        if claim.rounds >= _CANCEL_VERIFY_MAX_ROUNDS:
+            claim.done = True
+            return 0
+        delay_ns = self._cancel_verify_delay_ns()
+        max_attempts = self._config.fill_cancel_verify_attempts
+        if now < claim.started_mono_ns + claim.attempts * delay_ns:
+            return 0
+        if claim.attempts >= max_attempts:
+            await self._resolve_orphan_verification(claim, now)
+            return 0
+        claim.attempts += 1
+        final = claim.attempts >= max_attempts
+        self._beat()
+        self._metrics.inc("fill_verify.polls")
+        self._metrics.inc("fill_verify.rearm_polls")
+        min_ts: int | None = None
+        if claim.booked_wall_ts is not None:
+            min_ts = max(0, claim.booked_wall_ts - _CANCEL_VERIFY_MIN_TS_SLACK_S)
+        try:
+            payload = await asyncio.wait_for(
+                self._get_portfolio_fills(
+                    claim.combo_ticker, min_ts=min_ts, order_id=claim.order_id
+                ),
+                timeout=_MAINTENANCE_POLL_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001 — any poll error retries on cadence
+            self._metrics.inc("fill_verify.errors")
+            log.warning(
+                "fill_verify_poll_failed",
+                quote_id=claim.quote_id,
+                order_id=claim.order_id,
+                attempt=claim.attempts,
+                rearmed=True,
+                error=repr(exc),
+            )
+            if final:
+                await self._resolve_orphan_verification(claim, now)
+            return 1
+        claim.ok_reads += 1
+        prints = self._tape_prints_for_order(payload, claim.order_id)
+        if prints:
+            await self._mark_orphan_verified(claim, prints)
+            return 1
+        if final:
+            await self._resolve_orphan_verification(claim, now)
+        return 1
+
+    async def _mark_orphan_verified(
+        self, claim: OrphanClaim, prints: list[JsonDict]
+    ) -> None:
+        first = prints[0]
+        fill_id_raw = first.get("fill_id") or first.get("trade_id")
+        fill_id = str(fill_id_raw) if fill_id_raw else None
+        tape_cc = self._tape_count_cc(prints)
+        stamped = False
+        try:
+            stamped = await self._store.mark_fill_verified(
+                claim.fill_ref, exchange_fill_id=fill_id
+            )
+        except Exception:  # noqa: BLE001 — the verdict stands; the stamp is evidence
+            log.exception("fill_verified_stamp_failed", quote_id=claim.quote_id)
+        claim.done = True
+        self._metrics.inc("fill_verify.verified")
+        self._metrics.inc("fill_verify.rearm_verified")
+        log.info(
+            "fill_verified_on_tape",
+            quote_id=claim.quote_id,
+            fill_ref=claim.fill_ref,
+            order_id=claim.order_id,
+            combo_ticker=claim.combo_ticker,
+            exchange_fill_id=fill_id,
+            n_prints=len(prints),
+            booked_cc=claim.contracts_centi,
+            tape_cc=tape_cc,
+            attempts=claim.attempts,
+            stamped=stamped,
+            rearmed=True,
+        )
+        self._note_late_verification(
+            claim.quote_id, claim.fill_ref, claim.order_id, claim.attempts
+        )
+        self._note_verified_count_mismatch(
+            claim.quote_id,
+            claim.order_id,
+            claim.combo_ticker,
+            booked_cc=claim.contracts_centi,
+            tape_cc=tape_cc,
+        )
+
+    async def _resolve_orphan_verification(self, claim: OrphanClaim, now: int) -> None:
+        """Same verdict table as ``_resolve_execution_verification``: ≥1 clean
+        read with the order absent through the budget ⇒ VOID; every read
+        errored ⇒ retry a whole round (bounded), then keep the row, loudly."""
+        if claim.ok_reads > 0:
+            await self._void_orphan_claim(claim, now)
+            return
+        claim.rounds += 1
+        if claim.rounds < _CANCEL_VERIFY_MAX_ROUNDS:
+            claim.attempts = 0
+            claim.started_mono_ns = now + self._cancel_verify_delay_ns()
+            self._metrics.inc("fill_verify.round_failed")
+            log.warning(
+                "fill_verify_round_failed",
+                quote_id=claim.quote_id,
+                combo_ticker=claim.combo_ticker,
+                round=claim.rounds,
+                max_rounds=_CANCEL_VERIFY_MAX_ROUNDS,
+                rearmed=True,
+                detail="every /portfolio/fills read in this verification round "
+                "failed — row stays booked; retrying a full round",
+            )
+            return
+        claim.done = True
+        self._metrics.inc("fill_verify.unresolved")
+        log.error(
+            "fill_verify_unresolved",
+            quote_id=claim.quote_id,
+            order_id=claim.order_id,
+            combo_ticker=claim.combo_ticker,
+            verify_rounds=claim.rounds,
+            rearmed=True,
+            detail="re-armed booked fill could NOT be verified against "
+            "/portfolio/fills (every read failed across all retry rounds) — "
+            "row stays 'booked' (fail-safe); the fills-ledger sweep + "
+            "settlement reconcile are the backstops",
+        )
+
+    async def _void_orphan_claim(self, claim: OrphanClaim, now: int) -> None:
+        """VOID a re-armed claim the tape has disproven — the durable ledgers
+        exactly as ``_void_phantom_execution`` (``Store.void_phantom_fill``).
+        In-memory: the exposure book was rehydrated EXCHANGE-FIRST at boot,
+        so a position the exchange never held is not in it — the ledger-keyed
+        unbook below is an idempotent no-op by construction, kept for the
+        general case. The booked fee is reversed in-process ONLY when the
+        boot seed counted it: ``day_realized_pnl_cc`` seeds today's ET window
+        from fills that were 'booked' at boot, so a same-day row's fee was
+        subtracted and must come back; an earlier day's was never seeded."""
+        try:
+            touched = await self._store.void_phantom_fill(
+                claim.fill_ref, reason="absent_from_portfolio_fills"
+            )
+        except Exception as exc:  # noqa: BLE001 — retried as a failed round
+            self._metrics.inc("fill_verify.void_failed")
+            log.exception(
+                "fill_phantom_void_failed", quote_id=claim.quote_id, error=repr(exc)
+            )
+            claim.ok_reads = 0  # the verdict must be re-earned
+            await self._resolve_orphan_verification(claim, now)
+            return
+        claim.done = True
+        if touched["fills"] == 0:
+            self._metrics.inc("fill_verify.void_noop")
+            log.warning(
+                "fill_phantom_void_noop",
+                quote_id=claim.quote_id,
+                fill_ref=claim.fill_ref,
+                rearmed=True,
+                detail="no 'booked' fills row exists for this fill_ref — void "
+                "skipped; the row's current status stands",
+            )
+            return
+        fee_reversed_cc = 0
+        if claim.fee_cc and self._booked_in_current_realized_day(claim.booked_at):
+            fee_reversed_cc = int(claim.fee_cc)
+            self.record_realized_pnl(fee_reversed_cc)
+        self._unbook_position(claim.quote_id)
+        self._metrics.inc("fill_verify.phantom_voided")
+        self._metrics.inc("fill_verify.rearm_voided")
+        log.error(
+            "fill_phantom_execution_voided",
+            quote_id=claim.quote_id,
+            fill_ref=claim.fill_ref,
+            order_id=claim.order_id,
+            combo_ticker=claim.combo_ticker,
+            our_side=claim.our_side,
+            contracts_centi=claim.contracts_centi,
+            booked_at=claim.booked_at,
+            fee_booked_cc=claim.fee_cc,
+            fee_reversed_cc=fee_reversed_cc,
+            verify_attempts=claim.attempts,
+            verify_ok_reads=claim.ok_reads,
+            touched=touched,
+            rearmed=True,
+            detail="a PRIOR process booked this fill off an executed message and "
+            "never proved it; /portfolio/fills never held its order after "
+            "bounded verification — PHANTOM EXECUTION: fills/position_ledger/"
+            "ev_ledger voided (the exchange-first rehydrated book never "
+            "carried it)",
+        )
+
+    def _booked_in_current_realized_day(self, booked_at_iso: str) -> bool:
+        """True iff ``booked_at_iso`` falls on the ET calendar day the realized
+        accumulator currently belongs to (the seed's window)."""
+        self._roll_realized_day()
+        try:
+            stamp = datetime.fromisoformat(booked_at_iso)
+        except ValueError:
+            return False
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=UTC)
+        return stamp.astimezone(_SLATE_TZ).date().isoformat() == self._realized_day
 
     def _cancel_verify_delay_ns(self) -> int:
         """The verification poll spacing in monotonic ns. NaN/negative delay ⇒
@@ -7219,13 +8249,24 @@ class QuoteLifecycle:
             return
         if state.cancel_verify_ok_reads > 0:
             self._release_fill_claim(state)  # defensive — no adoption happened
+            if state.verify_mode == "executed_status":
+                detail = (
+                    "REST quote status said EXECUTED (no WS message) but "
+                    "/portfolio/fills shows NO fill for the order after bounded "
+                    "verification — phantom execution: confirm-booked position "
+                    "removed, no fills row written"
+                )
+            else:
+                detail = (
+                    "confirmed quote came back CANCELLED from REST and "
+                    "/portfolio/fills shows NO matching execution after bounded "
+                    "verification — phantom position removed, no fills row written"
+                )
             self._discard_phantom_position(
                 quote_id,
                 state,
                 cancellation_reason=state.cancel_reported_reason,
-                detail="confirmed quote came back CANCELLED from REST and "
-                "/portfolio/fills shows NO matching execution after bounded "
-                "verification — phantom position removed, no fills row written",
+                detail=detail,
                 verify_attempts=state.cancel_verify_attempts,
                 verify_ok_reads=state.cancel_verify_ok_reads,
             )
@@ -7311,7 +8352,12 @@ class QuoteLifecycle:
             order_id = group["order_id"]
             if not order_id:
                 reason = "order_id_missing"
-            elif order_id in self._claimed_exchange_order_ids:
+            elif (
+                order_id in self._claimed_exchange_order_ids
+                and order_id != state.cancel_expected_order_id
+            ):
+                # A claim on THIS quote's own exact key (placed at executed-
+                # status discovery, 2026-09-04) is not another quote's claim.
                 reason = "already_claimed"
             elif await self._store.has_fill_for_order_id(order_id):
                 reason = "already_in_ledger"
@@ -7364,6 +8410,9 @@ class QuoteLifecycle:
         """Release this state's claimed exchange order_id (once the ledger row
         exists the ledger's own order_id guard takes over; on discard/terminal
         paths the release is defensive — no adoption reaches them)."""
+        if state.verify_mode == "executed_status" and state.cancel_expected_order_id:
+            # The discovery-time exact-key claim (2026-09-04) goes with it.
+            self._claimed_exchange_order_ids.discard(state.cancel_expected_order_id)
         fill = state.cancel_verified_fill
         if not fill:
             return

@@ -130,6 +130,7 @@ from combomaker.risk.limits import LimitChecker, StarvationWatchdog
 from combomaker.risk.progress import ProgressLedger, progress_path
 from combomaker.risk.quarantine import MarketQuarantine
 from combomaker.risk.reservation import (
+    ExchangePosition,
     RiskReservationService,
     open_combo_positions_from_positions,
     open_combo_tickers_from_positions,
@@ -1542,6 +1543,15 @@ async def position_reconcile_unmodeled_once(
                 "startup rehydrate reconciles quantities fail-safe LARGER)",
             )
 
+    # DURABLE-LEDGER QUANTITY reconcile (2026-09-04 build, item D): the
+    # in-memory net above proved itself on 8/26 (it alarmed
+    # ``position_reconcile_quantity_divergence`` on AC104B1B2E5 at
+    # 20:37:08Z — 31 s after the first phantom execution — and every 5 min
+    # after), but nothing checks the DURABLE ``position_ledger`` the
+    # settlement reconcile grades against. Same exchange payload, one grouped
+    # SELECT, alarm-only.
+    await ledger_quantity_reconcile_once(store, exch_by_ticker, metrics)
+
     known = {pos.combo_ticker for pos in exposure.positions.values()}
     unmodeled = sorted(t for t in exch_by_ticker if t not in known)
     if not unmodeled:
@@ -1637,6 +1647,139 @@ async def position_reconcile_unmodeled_once(
         "alarm-only now",
     )
     return unmodeled
+
+
+async def ledger_quantity_reconcile_once(
+    store: Store,
+    exch_by_ticker: dict[str, ExchangePosition],
+    metrics: Metrics,
+) -> list[dict[str, Any]]:
+    """PER-TICKER LEDGER QUANTITY vs EXCHANGE (2026-09-04 build, item D;
+    ALARM-ONLY). Compare every combo ticker's OPEN ``position_ledger`` rows
+    (side + Σ contracts_centi) against the exchange's authoritative
+    ``/portfolio/positions`` row for that ticker (the payload the caller has
+    already fetched — no second GET). Kinds:
+
+      * ``quantity`` — same side, different count (the 8/26 shape: ledger
+        66.71 vs exchange 43.47 on AC104B1B2E5 — 23.24 of phantom rows);
+      * ``side``     — the ledger's open rows sit on the other side;
+      * ``ledger_only``   — open rows on a ticker the exchange does not hold
+        (a phantom execution, or a settled position whose settled write
+        never landed — the 9/1 stale-row item);
+      * ``exchange_only`` — an exchange holding with no open ledger row (a
+        writer-path miss; the fills-ledger sweep owns the tape side).
+
+    Never a writer, never a risk input: a mismatch is a loud WARNING + a
+    counted metric; corrections belong to the execution verification path
+    (``fill_phantom_execution_voided``), the settlement seam, or
+    ``tools/ops/repair_phantom_fills.py``. Bounded output (20 rows) — a
+    legacy store with hundreds of stale open rows must not flood the log.
+
+    LEGACY SCOPING (2026-09-04 review fixes): the live store carries 434
+    open rows that predate execution verification (settled positions whose
+    settled write never landed — the 9/1 stale-row item — plus the 28
+    corroborated phantoms awaiting the repair tool). Alarming all of them
+    every 5 min would bury a NEW phantom in noise. A mismatch whose ticker
+    has NO open row opened at/after the verification migration stamp
+    (``Store.fills_verification_watermark``) is LEGACY: counted and named in
+    the same log line (``legacy_n`` / ``legacy_by_kind`` / a bounded ticker
+    list), never in the alarmed list or the mismatch metric. A ticker with
+    any post-fix open row is alarmed in full, legacy rows included."""
+    try:
+        watermark = await store.fills_verification_watermark()
+        since = watermark[1] if watermark is not None else None
+        ledger = await store.open_ledger_quantity_by_ticker(post_fix_since=since)
+    except Exception as exc:  # noqa: BLE001 — alarm-only; never into the loop
+        metrics.inc("ledger_quantity.read_failed")
+        log.warning("ledger_quantity_reconcile_read_failed", error=repr(exc))
+        return []
+    mismatches: list[dict[str, Any]] = []
+    legacy: list[dict[str, Any]] = []
+    for ticker in sorted(ledger):
+        side, total_cc, n_rows, n_post_fix = ledger[ticker]
+        exch = exch_by_ticker.get(ticker)
+        if exch is None:
+            kind = "ledger_only"
+            exch_side: str | None = None
+            exch_cc = 0
+        else:
+            exch_side = exch.side.value
+            exch_cc = exch.contracts_centi
+            if exch.side.value != side:
+                kind = "side"
+            elif exch.contracts_centi != total_cc:
+                kind = "quantity"
+            else:
+                continue
+        row = {
+            "ticker": ticker,
+            "kind": kind,
+            "ledger_side": side,
+            "ledger_contracts_centi": total_cc,
+            "ledger_rows": n_rows,
+            "ledger_rows_post_fix": n_post_fix,
+            "exchange_side": exch_side,
+            "exchange_contracts_centi": exch_cc,
+        }
+        (mismatches if n_post_fix > 0 else legacy).append(row)
+    for ticker in sorted(exch_by_ticker):
+        if ticker in ledger:
+            continue
+        exch = exch_by_ticker[ticker]
+        mismatches.append(
+            {
+                "ticker": ticker,
+                "kind": "exchange_only",
+                "ledger_side": None,
+                "ledger_contracts_centi": 0,
+                "ledger_rows": 0,
+                "ledger_rows_post_fix": 0,
+                "exchange_side": exch.side.value,
+                "exchange_contracts_centi": exch.contracts_centi,
+            }
+        )
+    metrics.inc("ledger_quantity.checks")
+    legacy_by_kind: dict[str, int] = {}
+    for row in legacy:
+        legacy_by_kind[str(row["kind"])] = legacy_by_kind.get(str(row["kind"]), 0) + 1
+    if legacy:
+        metrics.inc("ledger_quantity.legacy", by=len(legacy))
+    if not mismatches:
+        log.info(
+            "ledger_quantity_mismatch_clean",
+            tickers=len(ledger),
+            exchange_tickers=len(exch_by_ticker),
+            legacy_n=len(legacy),
+            legacy_by_kind=legacy_by_kind,
+            post_fix_since=since,
+        )
+        return []
+    by_kind: dict[str, int] = {}
+    for row in mismatches:
+        by_kind[str(row["kind"])] = by_kind.get(str(row["kind"]), 0) + 1
+    metrics.inc("ledger_quantity.mismatch", by=len(mismatches))
+    for kind, n in by_kind.items():
+        metrics.inc(f"ledger_quantity.mismatch.{kind}", by=n)
+    log.warning(
+        "ledger_quantity_mismatch",
+        n=len(mismatches),
+        by_kind=by_kind,
+        ledger_tickers=len(ledger),
+        exchange_tickers=len(exch_by_ticker),
+        mismatches=mismatches[:20],
+        legacy_n=len(legacy),
+        legacy_by_kind=legacy_by_kind,
+        legacy_tickers=[str(r["ticker"]) for r in legacy[:20]],
+        post_fix_since=since,
+        detail="per-ticker OPEN position_ledger quantity disagrees with "
+        "/portfolio/positions — alarm-only, no risk effect; a phantom "
+        "execution shows here as ledger_only/quantity (the 8/26 class), a "
+        "settled row that never closed as ledger_only; rows that predate "
+        "execution verification are counted as legacy_* (not alarmed); "
+        "corrections belong to the execution verification path, the "
+        "settlement seam, or tools/ops/repair_phantom_fills.py",
+    )
+    return mismatches
 
 
 class _StoreSettlementLedger:
