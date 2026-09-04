@@ -630,12 +630,16 @@ class TestPeriodGuard:
         assert est is None and reason is not None and "period leg" in reason
 
     def test_inconsistent_first_half_marginal_fails_closed(self) -> None:
-        # 1H-over-1.5 at 0.40 contradicts FT-over-2.5 at 0.55 under the Poisson
-        # half split (the implied 1H rate can't support both) -> exact-system
-        # residual decline -> copula, never a guessed joint.
+        # 1H-over-1.5 at 0.50 contradicts FT-over-2.5 at 0.55 under the Poisson
+        # half split (the implied 1H rate can't support both) -> residual over
+        # the structural hard bar -> decline -> copula, never a guessed joint.
+        # PIN CHANGED 2026-09-04 (build item B): the former 0.40/0.55 pair has
+        # residual 0.0188 — below the ONE hard bar (0.05) that replaced the
+        # hand-set 0.005 exact-system bar — so it now PRICES (misfit widened);
+        # 0.50/0.55 measures 0.0844 and stays a genuine contradiction.
         est, reason = pricer(dc_rho=0.0).try_price(
             [leg(f"KXWC1HTOTAL-{GAME}-2"), leg(TOTAL)],
-            [belief(0.40), belief(0.55)],
+            [belief(0.50), belief(0.55)],
             ["yes", "yes"],
         )
         assert est is None and reason is not None and "residual" in reason

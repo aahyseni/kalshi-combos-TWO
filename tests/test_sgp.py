@@ -284,13 +284,18 @@ def test_typed_no_prior_fallthrough_low_spans_zero() -> None:
 
 def test_calibrated_pair_band_is_unchanged_and_tight() -> None:
     # (3) A CALIBRATED pair keeps its own tight band -- the widening touches ONLY
-    # the default_rho fall-through. Soccer btts|total = 0.70 with band 0.12
+    # the default_rho fall-through. Soccer btts|total = 0.746 with band 0.12
     # (soccer:btts|total): corr_low stays STRICTLY POSITIVE.
+    # PIN CHANGED 2026-09-04 (build item B): 0.70 was the World-Cup club+intl
+    # blend (git 470f24b); the CLUB measurement is +0.746 (8,982 matches,
+    # NOTES.md / results_soccer.md) and we quote club soccer — re-validated on
+    # the held-out season (0.746 beats 0.70 on log-loss, both-cell z +1.3 vs
+    # +2.2). Band 0.12 unchanged (unmeasured leagues are its only cover).
     legs = (leg(BTTS_TICKER, "EV"), leg(TOTAL_TICKER, "EV"))
     out = build_sgp_correlation(legs, [(0, 1)], soccer_params())
-    assert out.corr[0, 1] == pytest.approx(0.70)
-    assert out.corr_low[0, 1] == pytest.approx(0.58)  # 0.70 - 0.12, tight
-    assert out.corr_high[0, 1] == pytest.approx(0.82)  # 0.70 + 0.12
+    assert out.corr[0, 1] == pytest.approx(0.746)
+    assert out.corr_low[0, 1] == pytest.approx(0.626)  # 0.746 - 0.12, tight
+    assert out.corr_high[0, 1] == pytest.approx(0.866)  # 0.746 + 0.12
     assert out.corr_low[0, 1] > 0.0  # calibrated pair does NOT widen to zero
     assert out.typed_pairs == 1 and out.untyped_pairs == 0
 
@@ -305,8 +310,9 @@ def test_property_fallthrough_widens_calibrated_does_not() -> None:
     for j in (1, 2):
         assert out.corr[0, j] == pytest.approx(soccer_params().default_rho)
         assert out.corr_low[0, j] <= 0.0
-    # Calibrated btts|total pair (legs 1,2): unchanged tight positive band.
-    assert out.corr[1, 2] == pytest.approx(0.70)
+    # Calibrated btts|total pair (legs 1,2): unchanged tight positive band
+    # (0.746 = the club measurement; pin moved 2026-09-04, see the test above).
+    assert out.corr[1, 2] == pytest.approx(0.746)
     assert out.corr_low[1, 2] > 0.0
     assert out.untyped_pairs == 2 and out.typed_pairs == 1
 

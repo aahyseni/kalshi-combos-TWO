@@ -34,7 +34,6 @@ from combomaker.pricing.fit_challenge import (
 )
 from combomaker.pricing.joint import JointEstimate
 
-
 # --- 1. classify_fit verdicts -------------------------------------------------
 
 def test_clean_fit_accepts() -> None:
@@ -91,9 +90,20 @@ def test_challenge_bar_is_fraction_of_reject_bar() -> None:
 
 def test_thresholds_mirror_live_inverter_constants() -> None:
     """The classifier duplicates the reject bars; assert they equal the literals
-    the pristine inverters enforce, so the two cannot drift silently."""
+    the pristine inverters enforce, so the two cannot drift silently.
+
+    PIN CHANGED 2026-09-04 (build item B, docs/reports/2026-09-04-build-
+    soccer-btts-total-fit-bar.md): dixon_coles.invert now enforces ONE hard
+    bar for every system — REJECT_OVERIDENTIFIED — and NO exact-system 0.005
+    bar. Measured reason: the 0.005 bar rejected 4/4 recorded club btts x
+    over-2.5 pairs (residuals 0.0062 / 0.0078 / 0.0102 / 0.0164 — a Poisson
+    scoreline cannot reproduce that market shape) while the SAME game's
+    triple passed at 0.0195; the accept/challenge split is now derived from
+    the leg books (classify_fit, resolution mode). margin_total / mlb_runs
+    keep their legacy bars (out of scope) and are still mirrored below."""
     dc_src = inspect.getsource(invert)
-    assert f"residual > {REJECT_EXACT}" in dc_src
+    assert f"residual > {REJECT_OVERIDENTIFIED}" in dc_src
+    assert f"residual > {REJECT_EXACT}" not in dc_src
 
     from combomaker.pricing import margin_total, mlb_runs
 

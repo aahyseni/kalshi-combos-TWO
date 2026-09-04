@@ -49,9 +49,23 @@ Validation performed here (read-only, no live module edited):
     copula 0.746, DC exact and the hybrid, with a paired game-level bootstrap.
 
 Usage (from the repo root, PYTHONPATH=src):
-  python tools/proto_structural_fit_bar.py --contexts tmp/contexts26_raw.json \
-      --pairs <m3_pairs_fills.json> --write-fixture tests/fixtures/...json
-  python tools/proto_structural_fit_bar.py --backtest [--history data/history]
+  python tools/proto_structural_fit_bar.py \
+      --contexts tests/fixtures/structural_fit_bar_contexts26_raw.json \
+      --write-fixture tests/fixtures/structural_fit_bar_contexts26.json
+  python tools/proto_structural_fit_bar.py \
+      --fixture tests/fixtures/structural_fit_bar_contexts26.json
+  python tools/proto_structural_fit_bar.py --backtest [--history data/history] [--out s.json]
+
+The raw contexts fixture was pulled READ-ONLY from the live store (mode=ro):
+rfqs by rfq_id (legs_json, target_cost_cc, contracts_centi) joined to the
+decisions row of kind 'quote_sent' (context_json: leg_mids_cc, fair_cc, bids)
+for the 26 filled RFQs whose quote context survived the 8/19 store collapse.
+NOTE: after the port (build 2026-09-04) the 'old' columns this script prints
+come from the CURRENT live modules (== new); the committed fixture was written
+PRE-port and is the parity oracle tests/test_structural_fit_bar.py asserts.
+Keep proto_invert / derived_verdict / implied_pair_rho / hybrid_price in sync
+with dixon_coles.invert / fit_challenge.classify_fit / structural.* (rule 8c;
+the fixture parity test is the drift guard).
 """
 
 from __future__ import annotations
