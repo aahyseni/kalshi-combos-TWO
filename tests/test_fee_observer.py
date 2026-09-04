@@ -7,7 +7,12 @@ fees (2026-08-20 09:07Z), pulled from GET /portfolio/fills. Pins:
 - ``FeeType.parse`` of Kalshi's LIVE string routes to the MAKER branch (the
   old parser mapped it to UNKNOWN = a no-quote brick);
 - the model at 0.035 reproduces EVERY charged fee to the centi-cent (the
-  exchange's own cost-rounding residue included), 0.0175 reproduces NONE;
+  exchange's own cost-rounding residue accounted for), 0.0175 reproduces NONE;
+- the residue ALONE is not a fee (review fix M1): every pre-onset maker fill
+  of the whole real tape (``exchange_fills_uncharged_20260827.json``, 3,582
+  maker + 106 taker rows) parses as UNCHARGED, so ingesting the entire
+  4,228-row history is silent — zero mismatches, only the sharded collection
+  marked — and a schema-1 persisted file self-heals on load;
 - the observer FITS 0.0350 from the tape, quantised to the publication
   quantum, and the fill count that pins it is DERIVED from the fills;
 - a synthetic 0.0175 regime arriving later flips the fit and raises the
@@ -28,16 +33,23 @@ from typing import Any
 import pytest
 
 from combomaker.core.conventions import Conventions, Side
-from combomaker.core.money import CentiCents, fee_cc_from_dollars_str
+from combomaker.core.money import CentiCents
 from combomaker.core.quantity import CentiContracts
-from combomaker.exchange.fills import fee_observation_from_fill, fee_observations_from_fills
+from combomaker.exchange.fills import (
+    charged_fee_cc,
+    fee_observation_from_fill,
+    fee_observations_from_fills,
+)
 from combomaker.pricing.fee_observer import (
+    CEIL_SLACK_CC,
     COEF_QUANTUM,
+    SCHEMA_VERSION,
     FeeObservation,
     FeeScheduleSummary,
     ObservedFeeSchedule,
     charged_maker,
     collection_prefix_of,
+    cost_residue_cc,
     feasible_bounds,
     fit_maker_coefficient,
     least_squares_coefficient,
@@ -51,6 +63,9 @@ from combomaker.pricing.fee_observer import (
 from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType, FeeUnknownError
 
 FIXTURE = Path(__file__).parent / "fixtures" / "ground_truth" / "maker_fee_20260820.json"
+UNCHARGED_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "ground_truth" / "exchange_fills_uncharged_20260827.json"
+)
 TAKER = Fraction(7, 100)
 COMBO_MAKER = Fraction(35, 1000)     # measured 2026-08-20+
 SINGLE_MAKER = Fraction(175, 10_000)  # the 6/29 PDF single-market maker schedule
@@ -95,6 +110,16 @@ def observations(fixture: JsonDict) -> list[FeeObservation]:
     obs = fee_observations_from_fills(_rows_as_fills(fixture["charged_maker_fills"]))
     assert len(obs) == len(fixture["charged_maker_fills"]) >= 500
     return obs
+
+
+@pytest.fixture(scope="module")
+def whole_tape(fixture: JsonDict) -> list[JsonDict]:
+    """Every exchange fill ever (4,228 wire rows): the 3,688 uncharged rows
+    of the companion fixture + the 540 charged ones."""
+    raw = json.loads(UNCHARGED_FIXTURE.read_text(encoding="utf-8"))
+    rows = [dict(zip(raw["columns"], r, strict=True)) for r in raw["rows"]]
+    assert len(rows) == raw["provenance"]["n_rows"] == 3_688
+    return rows + _rows_as_fills(fixture["charged_maker_fills"])
 
 
 # --------------------------------------------------------------- enum / routing
@@ -194,7 +219,9 @@ def test_pinning_count_is_derived_from_the_fills(observations: list[FeeObservati
     ls = least_squares_coefficient(chrono)
     assert ls is not None and quantise(ls) == COMBO_MAKER
     # A single 10-contract fill at 50c pins alone: X = 25,000 cc/unit, so the
-    # interval (873/25000, 875/25000] holds exactly 0.0350.
+    # interval (874/25000, 875/25000] holds exactly 0.0350 (one ceiling: the
+    # parser strips the cost residue exactly, review fix M1).
+    assert CEIL_SLACK_CC == 1
     one = FeeObservation("x", "2026-09-01T00:00:00Z", "C", 1_000, 5_000, 875, True)
     assert pinning_count([one]) == 1 and fit_maker_coefficient([one]) == COMBO_MAKER
     # Too small to pin alone => None (never a coefficient from too little data)
@@ -368,16 +395,141 @@ def test_fill_parser_is_fail_closed() -> None:
     obs = fee_observation_from_fill(good)
     assert obs is not None
     assert obs.contracts_centi == 2_224 and obs.price_cc == 7_870 and obs.maker
-    assert obs.fee_cc == int(fee_cc_from_dollars_str("0.130520"))
+    # PIN CHANGED 2026-09-04 (review fix M1): the parsed fee is the reported
+    # fee_cost MINUS the exchange's position-cost rounding residue (cost
+    # 22.24 x 0.7870 = 175,028.8 cc -> residue 0.2 cc), so 1305.2 - 0.2 =
+    # 1305 = ceil(0.035 x 22.24 x 0.787 x 0.213 x 10^4) exactly - no longer
+    # the ceiling of the raw fee_cost (1306).
+    assert cost_residue_cc(2_224, 7_870) == Fraction(1, 5)
+    exact = COMBO_MAKER * Fraction(2_224, 100) * Fraction(7_870, 10_000) * Fraction(2_130, 10_000)
+    assert obs.fee_cc == 1_305 == math.ceil(exact * 10_000)
     assert obs.collection_prefix == "KXMVECROSSCATEGORY-SHARD1"
     assert collection_prefix_of("KXA-B") == "KXA-B"
     for missing in ("fill_id", "created_time", "ticker", "is_taker"):
         bad = dict(good)
         bad.pop(missing)
         assert fee_observation_from_fill(bad) is None, missing
+    # order_id is NOT a fill id (partials of one order share it): fail closed.
+    assert fee_observation_from_fill({**good, "fill_id": None, "order_id": "o1"}) is None
+    trade = fee_observation_from_fill({**good, "fill_id": None, "trade_id": "t1"})
+    assert trade is not None and trade.fill_id == "t1"
     assert fee_observation_from_fill({**good, "is_taker": "false"}) is None
     assert fee_observation_from_fill({**good, "count_fp": "0.00"}) is None
     assert fee_observation_from_fill({**good, "no_price_dollars": "1.5"}) is None
     taker = fee_observation_from_fill({**good, "is_taker": True})
     assert taker is not None and not taker.maker
     assert fee_observations_from_fills([good, "junk", {}]) == [obs]  # type: ignore[list-item]
+
+
+# ------------------------------------------------ the residue is not a fee (M1)
+
+
+def test_pre_onset_residue_fill_is_not_charged() -> None:
+    """A REAL maker fill from 2026-08-20T09:04:50Z - two minutes before the
+    onset - reports fee_cost $0.000040 = 0.4 cc. That is exactly the cost
+    residue ceil_cc(9.08 x 0.5770) - 9.08 x 0.5770 = 0.4 cc: no maker fee
+    was charged. The old parser ceiled it to 1 cc and called it charged."""
+    row: JsonDict = {
+        "fill_id": "072067c3-9611-9f75-c866-b98976191eda",
+        "created_time": "2026-08-20T09:04:50.585879Z",
+        "ticker": "KXMVECROSSCATEGORY-SHARD1-S2026FC7CD963ECA-668D16CEADE",
+        "count_fp": "9.08",
+        "no_price_dollars": "0.5770",
+        "yes_price_dollars": "0.4230",
+        "fee_cost": "0.000040",
+        "is_taker": False,
+        "side": "no",
+    }
+    assert cost_residue_cc(908, 5_770) == Fraction(2, 5)
+    assert charged_fee_cc("0.000040", contracts_centi=908, price_cc=5_770) == 0
+    obs = fee_observation_from_fill(row)
+    assert obs is not None and obs.maker and obs.fee_cc == 0 and not obs.charged
+    # A residue-only row never marks its collection as maker-fee-observed.
+    sched = ObservedFeeSchedule(taker_coef=TAKER)
+    sched.ingest([obs])
+    assert sched.collections_active == frozenset() and sched.fitted is None
+
+
+def test_whole_history_ingest_is_silent(whole_tape: list[JsonDict]) -> None:
+    """The defense-#3 alarm must be SILENT on the real history: every one of
+    the 4,228 fills parses, exactly the 540 post-onset fills are charged,
+    the fit is 0.0350 with ZERO mismatches over the whole tape, and only the
+    sharded collection is marked (the unsharded KXMVECROSSCATEGORY and
+    KXMVESPORTSMULTIGAMEEXTENDED rows carried residue only)."""
+    obs = fee_observations_from_fills(whole_tape)
+    assert len(obs) == len(whole_tape) == 4_228
+    charged = charged_maker(obs)
+    assert len(charged) == 540
+    assert all(o.created_time >= "2026-08-20T09:07" for o in charged)
+    assert all(not o.charged for o in obs if o.maker and o.created_time < "2026-08-20T09:07")
+    assert sum(1 for o in obs if not o.maker) == 106  # takers pay taker fees, out of scope
+    assert {o.collection_prefix for o in obs} == {
+        "KXMVECROSSCATEGORY", "KXMVECROSSCATEGORY-SHARD1", "KXMVESPORTSMULTIGAMEEXTENDED",
+    }
+    sched = ObservedFeeSchedule(taker_coef=TAKER)
+    refit = sched.ingest(obs)
+    assert refit.fitted == COMBO_MAKER and not refit.drifted
+    assert refit.mismatches == () and sched.mismatches == ()
+    assert sched.n_fills == 4_228 and sched.n_charged == 540
+    assert sched.collections_active == {"KXMVECROSSCATEGORY-SHARD1"}
+    assert not sched.observed_active("KXMVECROSSCATEGORY-S1-M", "KXMVECROSSCATEGORY-R")
+    # Persisting keeps only the 540 charged rows (the residue rows are not
+    # observations of a fee).
+    assert len(sched.to_json()["observations"]) == 540
+    assert sched.to_json()["version"] == SCHEMA_VERSION == 2
+    # Ingesting the same tape again is a no-op.
+    again = sched.ingest(obs)
+    assert again.new_fills == 0 and not again.drifted and again.mismatches == ()
+
+
+def test_schema_v1_persisted_file_self_heals(
+    tmp_path: Path, observations: list[FeeObservation]
+) -> None:
+    """A file written by the pre-M1 parser carries residue rows at fee_cc=1
+    and every charged row with residue > 0 one cc high (ceil(fee + r) =
+    fee + 1). Loading it undoes the indicator exactly, drops the residue rows
+    and re-derives the observed collections - no manual file deletion."""
+    v1_obs: list[JsonDict] = []
+    n_high = 0
+    for o in observations:
+        r = cost_residue_cc(o.contracts_centi, o.price_cc)
+        bump = 1 if r > 0 else 0
+        n_high += bump
+        v1_obs.append({**o.to_json(), "fee_cc": o.fee_cc + bump})
+    assert 0 < n_high < len(observations)  # both residue classes are present
+    # Residue-only rows on two OTHER collections (fee_cc = 1 under the old
+    # parser) - the real pre-onset shape.
+    for i, coll in enumerate(("KXMVECROSSCATEGORY", "KXMVESPORTSMULTIGAMEEXTENDED")):
+        v1_obs.append({
+            "fill_id": f"residue{i}", "created_time": "2026-08-19T00:00:00Z",
+            "collection_prefix": coll, "contracts_centi": 908, "price_cc": 5_770,
+            "fee_cc": 1, "maker": True,
+        })
+    raw = {
+        "version": 1,
+        "taker_coef": "0.07",
+        "maker_coef_fitted": "0.0350",
+        "n_fills": len(v1_obs),
+        "n_charged": len(v1_obs),
+        "last_fill_time": max(o["created_time"] for o in v1_obs),
+        "collections_active": [
+            "KXMVECROSSCATEGORY", "KXMVECROSSCATEGORY-SHARD1", "KXMVESPORTSMULTIGAMEEXTENDED",
+        ],
+        "series_fee_types": {},
+        "collection_series": {},
+        "observations": v1_obs,
+    }
+    path = tmp_path / "fee_schedule_observed.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    healed = ObservedFeeSchedule.load(path, taker_coef=TAKER)
+    assert healed.n_charged == len(observations)
+    assert healed.collections_active == {"KXMVECROSSCATEGORY-SHARD1"}
+    assert healed.maker_coef == COMBO_MAKER and healed.mismatches == ()
+    by_id = {o.fill_id: o for o in healed.observations()}
+    for o in observations:
+        assert by_id[o.fill_id].fee_cc == o.fee_cc
+    # A v2 file round-trips untouched (no double heal).
+    healed.save(path)
+    again = ObservedFeeSchedule.load(path, taker_coef=TAKER)
+    assert [o.fee_cc for o in again.observations()] == [o.fee_cc for o in healed.observations()]
+    assert again.mismatches == () and again.collections_active == {"KXMVECROSSCATEGORY-SHARD1"}

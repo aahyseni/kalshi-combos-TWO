@@ -8,18 +8,23 @@ nothing watched the exchange, so every EV the bot judged stayed gross of a
 fee that ate 44% of the modeled edge (547 fills / $106.41). A number a human
 must move is a bug in the adaptation — so this module MEASURES it:
 
-    exchange  the REPORTED fee on a fill is (540/540 charged fills, exact):
-                fee = ceil_cc(coef · C · P · (1−P)) + (ceil_cc(C · P) − C · P)
+    exchange  the REPORTED fee on a fill is (4,122/4,122 maker fills, exact):
+                fee_cost = ceil_cc(coef · C · P · (1−P)) + (ceil_cc(C · P) − C · P)
               i.e. the exchange debits the position cost AND the fee each
               rounded UP to a centi-cent and reports the whole excess over the
               exact cost as "fee". The second term is pure cost rounding
-              (< 1 cc, coefficient-free); the pin's slack absorbs it.
+              (< 1 cc, coefficient-free, present on UNCHARGED fills too);
+              ``exchange/fills.py`` removes it EXACTLY, so ``fee_cc`` here is
+              the exchange's own integer ceiling of the fee — 0 on an
+              uncharged fill (2026-09-04 review fix M1: ceiling the raw
+              fee_cost had booked a 1 cc "fee" on 1,763 uncharged pre-onset
+              fills, a permanent mismatch alarm + two collections marked
+              maker-fee-observed off a rounding residue).
     fit    coef = Σ X·Y / Σ X²  (least squares through the origin) over charged
            maker fills, X = C·P·(1−P) in cc-per-unit-coefficient, Y = charged cc
-    pin    EXACT, from the ceilings themselves: the exchange CEILs the fee and
-           the parser CEILs the reported fee_cost (which carries the < 1 cc
-           cost residue), so every charged fill i constrains
-               coef · X_i ∈ (charged_i − 2, charged_i]      (``CEIL_SLACK_CC``)
+    pin    EXACT, from the ceiling itself: charged = ceil(coef · X), so every
+           charged fill i constrains
+               coef · X_i ∈ (charged_i − 1, charged_i]      (``CEIL_SLACK_CC``)
            and the FEASIBLE SET is the intersection of those intervals. The
            coefficient is PINNED once exactly ONE multiple of the publication
            quantum (1e-4 — 0.07, 0.035, 0.0175 are all multiples) lies inside.
@@ -75,15 +80,20 @@ JsonDict = dict[str, Any]
 # all whole multiples of 1e-4) — the quantum the fit is pinned to and the
 # threshold a coefficient move must clear to count as drift.
 COEF_QUANTUM = Fraction(1, 10_000)
-# Two ceilings sit between coef·X and the parsed charged fee: the exchange
-# ceils the fee itself to a centi-cent, and ``fee_cc_from_dollars_str`` ceils
-# the reported fee_cost (which carries the < 1 cc position-cost residue —
-# exact on 540/540 charged fills, tests/test_fee_observer.py). Each is
-# strictly under one cc, so coef·X > charged − 2. A protocol fact, not a
-# tolerance knob.
-CEIL_SLACK_CC = 2
+# ONE ceiling sits between coef·X and the charged fee: the exchange ceils the
+# fee itself to a centi-cent (``exchange/fills.py`` strips the position-cost
+# residue exactly, so nothing else is rounded — exact on 540/540 charged and
+# 3,582/3,582 uncharged real maker fills, tests/test_fee_observer.py). A
+# ceiling is strictly under one cc, so coef·X > charged − 1. A protocol fact,
+# not a tolerance knob (was 2 while the parser still ceiled the residue —
+# 2026-09-04 review fix M1).
+CEIL_SLACK_CC = 1
 
-SCHEMA_VERSION = 1
+# 2: observations carry the residue-free fee (M1). A version-1 file's rows
+# were parsed with the raw fee_cost ceiled, i.e. fee_cc = ceil(fee + r) =
+# fee + [r > 0] with r the cost residue — ``from_json`` undoes that exactly
+# and drops what is then uncharged, so an already-persisted file self-heals.
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -588,11 +598,20 @@ class ObservedFeeSchedule:
             maker_coef_override=maker_coef_override,
             override_prefixes=override_prefixes,
         )
+        version = int(raw.get("version") or 1)
         for item in raw.get("observations") or []:
             obs = FeeObservation.from_json(item)
+            if version < SCHEMA_VERSION:
+                obs = _heal_v1_observation(obs)
+            if not (obs.maker and obs.charged):
+                continue  # a residue row is not an observation of a fee
             sched._observations[obs.fill_id] = obs
-        for coll in raw.get("collections_active") or []:
-            sched._collections_active.add(str(coll))
+        # The observed-collection flags are RE-DERIVED from the (healed)
+        # charged observations, never trusted from the file: a residue row
+        # persisted by the old parser must not keep a collection marked.
+        for obs in sched._observations.values():
+            if obs.maker and obs.charged:
+                sched._collections_active.add(obs.collection_prefix)
         for series, fee_type in (raw.get("series_fee_types") or {}).items():
             sched._series_fee_types[str(series)] = str(fee_type)
         for coll, series in (raw.get("collection_series") or {}).items():
@@ -648,6 +667,31 @@ class ObservedFeeSchedule:
                 maker_coef_override=maker_coef_override,
                 override_prefixes=override_prefixes,
             )
+
+
+def cost_residue_cc(contracts_centi: int, price_cc: int) -> Fraction:
+    """``ceil_cc(C·P) − C·P``: the exchange's position-cost rounding on a
+    fill, in cc (a Fraction in [0, 1)); zero whenever the exact cost is a
+    whole cc. Pure arithmetic on the fill's own size and price — the wire
+    parser (exchange/fills.py) subtracts it from the reported fee_cost."""
+    cost_cc = Fraction(contracts_centi * price_cc, 100)
+    return math.ceil(cost_cc) - cost_cc
+
+
+def _heal_v1_observation(obs: FeeObservation) -> FeeObservation:
+    """A schema-1 row was parsed as ``ceil(fee + r)`` = ``fee + [r > 0]``
+    (r = the cost residue, fee a whole cc); undo the indicator exactly."""
+    if obs.fee_cc > 0 and cost_residue_cc(obs.contracts_centi, obs.price_cc) > 0:
+        return FeeObservation(
+            fill_id=obs.fill_id,
+            created_time=obs.created_time,
+            collection_prefix=obs.collection_prefix,
+            contracts_centi=obs.contracts_centi,
+            price_cc=obs.price_cc,
+            fee_cc=obs.fee_cc - 1,
+            maker=obs.maker,
+        )
+    return obs
 
 
 def _collection_matches(ticker: str | None, prefix: str) -> bool:
