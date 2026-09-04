@@ -85,6 +85,7 @@ from combomaker.pricing.fee_observer import (
 from combomaker.pricing.fees import FeeModel, FeeType, FeeUnknownError
 from combomaker.pricing.grouping import game_key
 from combomaker.pricing.quote import ConstructedQuote, NoQuote
+from combomaker.rfq.edge import candidate_edge_cc
 from combomaker.rfq.eviction_value import (
     AcceptanceCounters,
     allocate_des99_cc,
@@ -3224,23 +3225,44 @@ class QuoteLifecycle:
         }
 
     def _candidate_edge_cc(
-        self, fair_cc: int, bid_cc: int, qty: CentiContracts, our_side: Side
+        self,
+        fair_cc: int,
+        bid_cc: int,
+        qty: CentiContracts,
+        our_side: Side,
+        *,
+        combo_ticker: str | None = None,
+        collection: str | None = None,
+        fee_cc: int | None = None,
     ) -> int | None:
         """Expected edge (candidate EV) of taking ``our_side`` at ``bid_cc`` on a
-        combo whose YES fair is ``fair_cc``, for ``qty`` centi-contracts, in int cc.
+        combo whose YES fair is ``fair_cc``, for ``qty`` centi-contracts, in int
+        cc — NET OF THE FEE THIS FILL PAYS (2026-09-04 fee-seam repair;
+        rfq/edge.py holds the arithmetic).
 
-        YES side: (fair − bid)·contracts. NO side: settles on the COMPLEMENT, so the
-        side-fair is $1 − fair — but ONLY when ``combo_no_pays_complement`` is
-        verified True; unverified ⇒ None (the NO payout is UNKNOWN and is never an
-        assumed complement, defense #5 / hard rule 6). Mirrors the fill ledger's
-        ``expected_edge_cc`` so the audited EV equals the recorded EV to the cent."""
-        contracts = int(qty)
-        if our_side is Side.YES:
-            return (int(fair_cc) - int(bid_cc)) * contracts // 100
-        if self._conventions.combo_no_pays_complement:
-            side_fair = CC_PER_DOLLAR - int(fair_cc)
-            return (side_fair - int(bid_cc)) * contracts // 100
-        return None
+        The fee is the measured schedule's fee at the bid for this combo's
+        fee type (``_fill_fee_cc``: 0 on a plain quadratic series, the
+        measured maker fee on a maker-fee series) unless the caller supplies
+        ``fee_cc`` (the fill ledger passes the fee it BOOKS — the exchange-
+        reported one on a recovery replay — so the recorded edge and the
+        booked fee can never disagree, and the fee enters exactly once).
+        No fee model / UNKNOWN fee ⇒ the gross figure (prior behaviour).
+
+        Every EV the bot judges derives from this one number: the confirm-
+        time admission EV, the quote-time candidate EV and eviction key, the
+        KILL-marginal input and the fill ledger's ``expected_edge_cc``."""
+        if fee_cc is None:
+            fee_cc = self._fill_fee_cc(
+                CentiCents(int(bid_cc)), qty, combo_ticker=combo_ticker, collection=collection
+            )
+        return candidate_edge_cc(
+            fair_cc=int(fair_cc),
+            bid_cc=int(bid_cc),
+            qty_centi=int(qty),
+            our_side=our_side,
+            complement_verified=self._conventions.combo_no_pays_complement,
+            fee_cc=fee_cc,
+        )
 
     def _gate_pricing_edge(self, state: OpenQuoteState) -> float | None:
         """``_pricing_edge_cc`` gated on the arming flag, with the FALLBACK
@@ -3290,28 +3312,44 @@ class QuoteLifecycle:
             int(bid),
             qty,
             self._conventions.maker_position_side(accepted_side),
+            combo_ticker=state.rfq.market_ticker,
+            collection=state.rfq.mve_collection_ticker,
         )
         return None if edge is None else float(edge)
 
     def _quote_candidate_ev_cc(
-        self, result: ConstructedQuote, qty: CentiContracts
+        self,
+        result: ConstructedQuote,
+        qty: CentiContracts,
+        *,
+        combo_ticker: str | None = None,
+        collection: str | None = None,
     ) -> int | None:
         """Candidate EV for a QUOTE (before any accept): the edge of the
         BETTER-priced quoted side — the side whose cheaper bid buys the most
         contracts on a target-cost accept and is the likelier take. Skips a declined
         (0-bid) side; None when neither side is priced (nothing to quote) or the NO
-        side's payout is UNKNOWN (unverified complement — never assumed)."""
+        side's payout is UNKNOWN (unverified complement — never assumed).
+        Fee-net (2026-09-04): ``combo_ticker``/``collection`` select the
+        combo's fee type on the measured schedule."""
         yes_bid = int(result.yes_bid_cc)
         no_bid = int(result.no_bid_cc)
         fair = int(result.fair_cc)
         candidates: list[int] = []
         if yes_bid > 0:
-            ev = self._candidate_edge_cc(fair, yes_bid, qty, Side.YES)
+            ev = self._candidate_edge_cc(
+                fair, yes_bid, qty, Side.YES, combo_ticker=combo_ticker, collection=collection
+            )
             if ev is not None:
                 candidates.append(ev)
         if no_bid > 0:
             ev = self._candidate_edge_cc(
-                fair, no_bid, qty, self._conventions.maker_position_side(Side.NO)
+                fair,
+                no_bid,
+                qty,
+                self._conventions.maker_position_side(Side.NO),
+                combo_ticker=combo_ticker,
+                collection=collection,
             )
             if ev is not None:
                 candidates.append(ev)
@@ -3333,7 +3371,10 @@ class QuoteLifecycle:
             rfq_id=rfq.rfq_id,
             reason=binding_cap or str(ReasonCode.QUOTE_SENT),
             **self._risk_audit_fields(
-                candidate_ev_cc=self._quote_candidate_ev_cc(result, qty),
+                candidate_ev_cc=self._quote_candidate_ev_cc(
+                    result, qty,
+                    combo_ticker=rfq.market_ticker, collection=rfq.mve_collection_ticker,
+                ),
                 binding_cap=binding_cap,
                 fallback_reason="",
             ),
@@ -4873,9 +4914,10 @@ class QuoteLifecycle:
         # direction is unaffected because a real fee only ever ADDS loss).
         candidate_fee_cc = 0
         pending = state.pending_fill
-        if pending is not None and self._maker_fee_active(
-            state.rfq.market_ticker, state.rfq.mve_collection_ticker
-        ):
+        if pending is not None:
+            # 2026-09-04: the MEASURED schedule decides (0 on a plain
+            # quadratic series — bit-identical; the measured maker fee on a
+            # maker-fee series, no prefix list required).
             predicted = self._fill_fee_cc(
                 pending[1],
                 pending[2],
@@ -5282,7 +5324,10 @@ class QuoteLifecycle:
             or limits.ruin_gate_marginal
         ):
             return None
-        ev_cc = self._quote_candidate_ev_cc(result, risk_qty)
+        ev_cc = self._quote_candidate_ev_cc(
+            result, risk_qty,
+            combo_ticker=quote_risk.combo_ticker, collection=quote_risk.collection,
+        )
         if ev_cc is None:
             return None
         det_cc = self._quote_det_consumed_cc(quote_risk)
@@ -5306,7 +5351,10 @@ class QuoteLifecycle:
             if state.pending_fill is not None
             else state.risk_qty
         )
-        return self._quote_candidate_ev_cc(state.constructed, qty)
+        return self._quote_candidate_ev_cc(
+            state.constructed, qty,
+            combo_ticker=state.rfq.market_ticker, collection=state.rfq.mve_collection_ticker,
+        )
 
     def _kill_marginal_for_fill(
         self, candidate: OpenPosition, ev_cc: int | None
@@ -5492,7 +5540,10 @@ class QuoteLifecycle:
         ranking key ("slot" = raw EV, "det_max" = EV per consumed det-max);
         ``mode`` is "on" (evict) or "shadow" (log the would-be eviction and
         return the breaches untouched)."""
-        cand_ev = self._quote_candidate_ev_cc(result, risk_qty)
+        cand_ev = self._quote_candidate_ev_cc(
+            result, risk_qty,
+            combo_ticker=quote_risk.combo_ticker, collection=quote_risk.collection,
+        )
         if cand_ev is None:
             return raw_breaches
         cand_det = 0
@@ -6708,22 +6759,10 @@ class QuoteLifecycle:
         assert state.pending_fill is not None  # caller verified
         accepted_side, bid, qty = state.pending_fill
         our_side = self._conventions.maker_position_side(accepted_side)
-        expected_edge_cc: int | None
-        if our_side is Side.YES:
-            expected_edge_cc = (int(state.constructed.fair_cc) - int(bid)) * int(qty) // 100
-        elif self._conventions.combo_no_pays_complement:
-            side_fair = CC_PER_DOLLAR - int(state.constructed.fair_cc)
-            expected_edge_cc = (side_fair - int(bid)) * int(qty) // 100
-        else:
-            # NO payout semantics unverified — an honest ledger records
-            # UNKNOWN, never an assumed complement (defense #5).
-            expected_edge_cc = None
-        # Real fill fee from the fee model (defense #3): $0 for our combo maker
-        # quadratic fills, the real maker fee once this combo's series is on
-        # Kalshi's maker-fee list (maker_fee_active_prefixes — eat-the-fee
-        # doctrine: the price was NOT widened, so the fee must be accounted
-        # here). None only when no fee model is wired (pre-Phase-6 behaviour)
-        # or the fee is UNKNOWN.
+        # Real fill fee from the fee model (defense #3): $0 on a plain
+        # quadratic series, the MEASURED maker fee on a maker-fee series
+        # (the shared observed schedule — 2026-09-04). None only when no fee
+        # model is wired (pre-Phase-6 behaviour) or the fee is UNKNOWN.
         fill_fee_cc = self._fill_fee_cc(
             bid,
             qty,
@@ -6743,24 +6782,24 @@ class QuoteLifecycle:
         if isinstance(exchange_fee, int) and not isinstance(exchange_fee, bool):
             exchange_fee_reported = True
             fill_fee_cc = int(exchange_fee)
-        # EAT-THE-FEE accounting in the EV ledger: on a maker-fee-active series
-        # the predicted fee is a known cash cost of this fill, so the recorded
-        # expected edge is net of it (grading expected vs realized stays
-        # apples-to-apples). Gated on the prefix list so an EMPTY list is
-        # bit-identical to prior behaviour on every ledger row. An
-        # EXCHANGE-REPORTED fee (late-execution recovery) is a real cash cost
-        # regardless of the maker-fee list, so it nets the edge the same way.
-        if (
-            expected_edge_cc is not None
-            and fill_fee_cc is not None
-            and (
-                exchange_fee_reported
-                or self._maker_fee_active(
-                    state.rfq.market_ticker, state.rfq.mve_collection_ticker
-                )
-            )
-        ):
-            expected_edge_cc -= int(fill_fee_cc)
+        # THE RECORDED EDGE IS THE SAME NUMBER THE GATES JUDGED (2026-09-04):
+        # ``_candidate_edge_cc`` with the fee this row BOOKS — the exchange-
+        # reported fee on a recovery replay, else the measured model fee —
+        # so it is net of that fee exactly once (idempotent by construction:
+        # the fee never enters anywhere else). A plain quadratic series
+        # books fee 0 and records the gross figure, bit-identical to before;
+        # an unverified NO complement records UNKNOWN (None), never an
+        # assumed complement (defense #5).
+        expected_edge_cc = self._candidate_edge_cc(
+            int(state.constructed.fair_cc),
+            int(bid),
+            qty,
+            our_side,
+            combo_ticker=state.rfq.market_ticker,
+            collection=state.rfq.mve_collection_ticker,
+            fee_cc=fill_fee_cc,
+        )
+        _ = exchange_fee_reported  # evidence only: the booked fee already carries it
         inserted = await self._store.record_fill(
             fill_ref,
             order_id=str(msg.get("order_id")) if msg.get("order_id") else None,
@@ -10167,7 +10206,10 @@ class QuoteLifecycle:
             legs=self._leg_refs(rfq),
             # Quote-time expected edge for EV-based slot eviction (2026-07-25):
             # refreshed on every reprice (a reprice re-builds this record).
-            expected_edge_cc=self._quote_candidate_ev_cc(constructed, qty),
+            expected_edge_cc=self._quote_candidate_ev_cc(
+                constructed, qty,
+                combo_ticker=rfq.market_ticker, collection=rfq.mve_collection_ticker,
+            ),
         )
 
     def _accepted_qty(
@@ -10278,7 +10320,11 @@ class QuoteLifecycle:
                 # disarmed / under budget ⇒ byte-identical.
                 kill_marginal=self._kill_marginal_for_fill(
                     candidate,
-                    self._quote_candidate_ev_cc(state.constructed, qty),
+                    self._quote_candidate_ev_cc(
+                        state.constructed, qty,
+                        combo_ticker=state.rfq.market_ticker,
+                        collection=state.rfq.mve_collection_ticker,
+                    ),
                 ),
             )
         )
@@ -10612,6 +10658,8 @@ class QuoteLifecycle:
                 int(bid),
                 qty,
                 self._conventions.maker_position_side(accepted_side),
+                combo_ticker=state.rfq.market_ticker,
+                collection=state.rfq.mve_collection_ticker,
             )
         # LAST-LOOK MC WAIVER observability: every confirm/decline audit line
         # carries the waiver axes (attempted/granted/worst-case/games — honest
