@@ -7,11 +7,21 @@ maker schedule:
   subtracted; rebate <= margin // 2);
 - "floor" on a mains tier (markup clears the fee) at zero skew is BYTE-
   IDENTICAL to the fee-blind price (today's live output, fee 0);
-- "floor" on the razor (markup below the fee) posts EXACTLY fair − fee (the
-  razor dissolves into max(razor, measured fee));
-- the rebate is capped at margin − fee; with a measured cell floor the cap
-  becomes margin − fee − floor and REPLACES the margin // 2 hand fraction;
-- the fee-blind bid >= floor bid >= width bid on every input (property);
+- "floor" on the razor (markup below the fee) posts EXACTLY fair − m_min,
+  where m_min is DERIVED from the confirm gate's predicate at the quote's
+  own quantity (review fix M3: ⌈(F + 1)·100/qty⌉, F the whole-fill fee over
+  the plausible bid range) — the razor dissolves into max(razor, m_min);
+- EVERY floor-mode bid clears the confirm gate: candidate_edge_cc with the
+  whole-fill fee at the posted bid is > 0 over the razor fair grid × several
+  centi-quantities (the reviewer's probe found 266/7,500 at <= 0 under a
+  per-contract floor);
+- the rebate is capped at margin − m_min; with a measured cell floor the cap
+  becomes margin − m_min − floor and REPLACES the margin // 2 hand fraction —
+  and a floor-0 cell therefore LOOSENS the cap beyond margin // 2 (review
+  fix M4: pinned so the operator ratifies the real rule);
+- the fee-blind bid >= floor bid on every input, and floor bid >= width bid
+  except on sub-floor tiers, where the gate's extra cc can snap the floor
+  one grid step under the width bid (property);
 - an UNKNOWN fee type still cannot quote in either mode;
 - a bad mode string is refused.
 """
@@ -32,6 +42,7 @@ from combomaker.core.reasons import ReasonCode
 from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
 from combomaker.pricing.quote import ConstructedQuote, NoQuote, QuoteParams, construct_quote
 from combomaker.pricing.retained_cell import cell_key
+from combomaker.rfq.edge import candidate_edge_cc
 from tests.test_quote import deci_grid, make_joint
 
 VERIFIED_MAKER = Conventions(
@@ -57,12 +68,12 @@ PARAMS = QuoteParams(
 
 def quote(
     *, fair: float, markup: int, skew: int = 0, mode: str, fee_type: FeeType = COMBO,
-    retained_floor: int | None = None, params: QuoteParams = PARAMS,
+    retained_floor: int | None = None, params: QuoteParams = PARAMS, qty: int = 1_000,
 ) -> ConstructedQuote | NoQuote:
     return construct_quote(
         joint=make_joint(fair),
         n_legs=2,
-        qty=CentiContracts(1_000),
+        qty=CentiContracts(qty),
         grid=deci_grid(),
         fee_model=MEASURED,
         fee_type=fee_type,
@@ -81,6 +92,42 @@ def quote(
 
 def fee_cc(price_cc: int) -> int:
     return int(MEASURED.fee_per_contract_cc(price_cc=CentiCents(price_cc), fee_type=COMBO))
+
+
+def fee_total_cc(price_cc: int, qty: int) -> int:
+    """The exchange's whole-fill fee (one ceiling per fill)."""
+    return int(
+        MEASURED.trade_fee_cc(
+            price_cc=CentiCents(price_cc), qty=CentiContracts(qty), fee_type=COMBO
+        )
+    )
+
+
+def m_min(fee_total: int, qty: int) -> int:
+    """⌈(F + 1)·100/qty⌉: the smallest retained margin whose floor-divided
+    gross edge exceeds the whole-fill fee by >= 1 cc (the gate's > 0)."""
+    return -(-(fee_total + 1) * 100 // qty)
+
+
+def derived_floor(no_fair: int, markup: int, skew: int, qty: int = 1_000) -> int:
+    """The floor construct_quote derives (re-stated here as the pin's
+    oracle): F over [no_fair − max(markup, m_min(F_peak)) − |skew|, no_fair]."""
+    probe = max(markup, m_min(fee_total_cc(5_000, qty), qty))
+    lower = max(0, no_fair - probe - abs(skew))
+    nearest = min(max(5_000, lower), no_fair)
+    return m_min(max(fee_total_cc(no_fair, qty), fee_total_cc(nearest, qty)), qty)
+
+
+def confirm_edge_cc(fair_cc: int, bid: int, qty: int) -> int:
+    """What sim/book_risk's admission gate judges (via rfq/edge.py): the
+    gross edge floor-divided over centi-contracts minus the whole-fill fee
+    at the posted bid."""
+    edge = candidate_edge_cc(
+        fair_cc=fair_cc, bid_cc=bid, qty_centi=qty, our_side=Side.NO,
+        complement_verified=True, fee_cc=fee_total_cc(bid, qty),
+    )
+    assert edge is not None
+    return edge
 
 
 def no_bid(q: ConstructedQuote | NoQuote) -> int:
@@ -137,18 +184,25 @@ def test_floor_mode_mains_at_zero_skew_is_byte_identical_to_today(fair: float, m
 
 
 def test_floor_mode_razor_posts_exactly_fair_minus_fee() -> None:
-    """ML-parlay razor 0.6c on a 30c fair (NO fair 70c): the fee over the
-    plausible bid range is 75cc > 60cc, so the margin floors at 75 and the
-    bid is fair_no − 75 = 6925 → 6920 on the 0.1c grid. Today posts 6940
-    (retaining 0.60c against a 0.74c fee — the measured negative-EV razor)."""
+    """ML-parlay razor 0.6c on a 30c fair (NO fair 70c), 10 contracts: the
+    whole-fill fee over the plausible bid range is 748cc (at 69.12c), so
+    m_min = ⌈749·100/1000⌉ = 75 > 60, the margin floors at 75 and the bid is
+    fair_no − 75 = 6925 → 6920 on the 0.1c grid. Today posts 6940 (retaining
+    0.60c against a 0.74c fee — the measured negative-EV razor)."""
     q = quote(fair=0.30, markup=60, mode="floor")
     no_fair = 7_000
-    peak = fee_cc(5_000)
-    lower = no_fair - max(60, peak)
-    floor_fee = max(fee_cc(no_fair), fee_cc(lower))
-    assert floor_fee == 75 and fee_cc(no_fair) == 74
-    assert no_bid(q) == snap_down(no_fair - floor_fee) == 6_920
+    assert fee_cc(no_fair) == 74 and fee_total_cc(no_fair, 1_000) == 735
+    assert derived_floor(no_fair, 60, 0) == m_min(748, 1_000) == 75
+    assert no_bid(q) == snap_down(no_fair - 75) == 6_920
     assert today_fee_blind(0.30, 60, 0) == 6_940
+    assert confirm_edge_cc(3_000, 6_920, 1_000) == 80 * 10 - fee_total_cc(6_920, 1_000) > 0
+    # PIN (review fix M3): at ONE contract the same razor fair needs one more
+    # cc of margin than the per-contract fee — the reviewer's fair 2090 case
+    # (bid 7850 × 1.00 ct had confirm edge exactly 0; now 7840, edge +10).
+    one = quote(fair=0.209, markup=60, mode="floor", qty=100)
+    assert derived_floor(7_910, 60, 0, qty=100) == 61 and fee_cc(7_910) == 58
+    assert no_bid(one) == 7_840 and confirm_edge_cc(2_090, 7_840, 100) == 10
+    assert confirm_edge_cc(2_090, 7_850, 100) == 0  # the old per-contract floor's bid
     # On an 80c NO fair the range fee is exactly the razor: margin unchanged,
     # bid == today's — the floor never moves a bid it does not need to.
     q80 = quote(fair=0.20, markup=60, mode="floor")
@@ -157,8 +211,8 @@ def test_floor_mode_razor_posts_exactly_fair_minus_fee() -> None:
 
 def test_floor_caps_the_rebate_at_margin_minus_fee() -> None:
     fair, markup = 0.50, 100
-    fee_no = fee_cc(5_000)  # 88 at the peak
-    assert fee_no == 88
+    fee_no = derived_floor(5_000, markup, 300)  # 88 at the peak (10 contracts)
+    assert fee_no == 88 == fee_cc(5_000)
     # A 300cc rebate: today caps at margin // 2 = 50; the floor caps at 12.
     assert no_bid(quote(fair=fair, markup=markup, skew=300, mode="floor")) == snap_down(
         5_000 - 100 + (100 - fee_no)
@@ -177,11 +231,9 @@ def test_floor_caps_the_rebate_at_margin_minus_fee() -> None:
 def test_measured_cell_floor_replaces_the_half_margin_fraction() -> None:
     fair, markup, skew = 0.41, 300, 400
     no_fair = CC_PER_DOLLAR - 4_100
-    # Determine the floor fee the same way construct_quote does.
-    peak = fee_cc(5_000)
-    lower = max(0, no_fair - max(markup, peak) - skew)
-    nearest = min(max(5_000, lower), no_fair)
-    floor_fee = max(fee_cc(no_fair), fee_cc(nearest))
+    # Determine the floor the same way construct_quote does.
+    floor_fee = derived_floor(no_fair, markup, skew)
+    assert floor_fee == 88
     # No cell floor: rebate <= min(margin // 2, margin − fee).
     assert no_bid(quote(fair=fair, markup=markup, skew=skew, mode="floor")) == snap_down(
         no_fair - markup + min(markup // 2, markup - floor_fee)
@@ -195,6 +247,51 @@ def test_measured_cell_floor_replaces_the_half_margin_fraction() -> None:
     assert no_bid(
         quote(fair=fair, markup=markup, skew=skew, mode="floor", retained_floor=5_000)
     ) == snap_down(no_fair - markup)
+
+
+def test_a_floor_zero_cell_loosens_the_cap_beyond_half_margin() -> None:
+    """REVIEW FIX M4 — the rule the operator ratifies, stated plainly: with a
+    measured cell floor the rebate cap is margin − fee − floor. On a cell
+    whose settled record justifies NO adverse-selection floor (floor 0 —
+    the live table holds such cells, e.g. mlb 4×HRR all-YES same-game) the
+    cap is margin − fee, which is LOOSER than the 8/16 hand fraction
+    margin // 2 whenever fee < margin / 2. The counterfactual replay cannot
+    observe this (quote_sent context carries no skew), so it is pinned here:
+    300cc margin, 88cc fee, 400cc rebate → today 150, floor-0 cell 212."""
+    fair, markup, skew = 0.41, 300, 400
+    no_fair = CC_PER_DOLLAR - 4_100
+    fee = derived_floor(no_fair, markup, skew)
+    assert fee == 88 and fee < markup // 2
+    today = today_fee_blind(fair, markup, skew)
+    assert today == snap_down(no_fair - markup + markup // 2)
+    zero_cell = quote(fair=fair, markup=markup, skew=skew, mode="floor", retained_floor=0)
+    assert no_bid(zero_cell) == snap_down(no_fair - markup + (markup - fee))
+    assert no_bid(zero_cell) > today  # the cap LOOSENED: 212 > 150 of rebate
+    # A cell floor of exactly margin//2 − fee reproduces today's cap; anything
+    # below it loosens, anything above it tightens.
+    pivot = markup // 2 - fee
+    at_pivot = quote(fair=fair, markup=markup, skew=skew, mode="floor", retained_floor=pivot)
+    above = quote(fair=fair, markup=markup, skew=skew, mode="floor", retained_floor=pivot + 30)
+    assert no_bid(at_pivot) == today and no_bid(above) < today
+    # Even at the loosest (floor 0) the fill still clears the confirm gate.
+    assert confirm_edge_cc(4_100, no_bid(zero_cell), 1_000) > 0
+
+
+@pytest.mark.parametrize("qty", [100, 120, 250, 1_000])
+def test_every_floor_bid_clears_the_confirm_gate_on_the_razor_grid(qty: int) -> None:
+    """REVIEW FIX M3: every razor-tier floor bid over fair 10.00-34.99c, at
+    1.00 / 1.20 / 2.50 / 10 contracts, has a STRICTLY positive confirm edge
+    (sim/book_risk refuses admission_ev <= 0). The per-contract floor left
+    244 zeros and 22 −1cc cases on this grid; the derived m_min leaves none,
+    and never over-covers by more than the two roundings allow."""
+    worst = None
+    for fair_cc in range(1_000, 3_500):
+        q = quote(fair=fair_cc / CC_PER_DOLLAR, markup=60, mode="floor", qty=qty)
+        assert isinstance(q, ConstructedQuote), fair_cc
+        edge = confirm_edge_cc(fair_cc, no_bid(q), qty)
+        assert edge > 0, (fair_cc, qty, no_bid(q), edge)
+        worst = edge if worst is None else min(worst, edge)
+    assert worst is not None and worst >= 1
 
 
 def test_unknown_fee_type_cannot_quote_in_either_mode() -> None:
@@ -213,19 +310,33 @@ def test_bad_mode_is_refused() -> None:
     fair=st.floats(0.05, 0.95),
     markup=st.integers(0, 400),
     skew=st.integers(-600, 600),
+    qty=st.sampled_from([100, 120, 250, 1_000, 5_000]),
 )
-def test_fee_blind_geq_floor_geq_width(fair: float, markup: int, skew: int) -> None:
-    blind = quote(fair=fair, markup=markup, skew=skew, mode="width", fee_type=FeeType.QUADRATIC)
-    floor = quote(fair=fair, markup=markup, skew=skew, mode="floor")
-    width = quote(fair=fair, markup=markup, skew=skew, mode="width")
+def test_fee_blind_geq_floor_geq_width(fair: float, markup: int, skew: int, qty: int) -> None:
+    blind = quote(
+        fair=fair, markup=markup, skew=skew, mode="width", fee_type=FeeType.QUADRATIC, qty=qty
+    )
+    floor = quote(fair=fair, markup=markup, skew=skew, mode="floor", qty=qty)
+    width = quote(fair=fair, markup=markup, skew=skew, mode="width", qty=qty)
     b = no_bid(blind) if isinstance(blind, ConstructedQuote) else 0
     f = no_bid(floor) if isinstance(floor, ConstructedQuote) else 0
     w = no_bid(width) if isinstance(width, ConstructedQuote) else 0
-    assert b >= f >= w
-    # And the floor never retains less than the fee at its own bid.
+    assert b >= f
+    if f < w:
+        # PIN CHANGED 2026-09-04 (review fix M3): the floor may sit BELOW the
+        # width bid only on a sub-floor tier (markup < m_min), where the width
+        # bid retains just the per-contract fee — a confirm edge of exactly 0
+        # at one contract — and the floor demands the gate's extra cc; the
+        # grid snap turns that into at most one 0.1c step.
+        no_fair = CC_PER_DOLLAR - int(round(fair * CC_PER_DOLLAR))
+        assert markup < derived_floor(no_fair, markup, skew, qty)
+        assert w - f <= 10
     if isinstance(floor, ConstructedQuote):
+        # The floor never retains less than the fee at its own bid...
         retained = (CC_PER_DOLLAR - int(floor.fair_cc)) - f
         assert retained >= fee_cc(f)
+        # ...and the fill it wins clears the confirm gate (M3).
+        assert confirm_edge_cc(int(floor.fair_cc), f, qty) > 0
 
 
 # ------------------------------------------------ the engine + the cell key
