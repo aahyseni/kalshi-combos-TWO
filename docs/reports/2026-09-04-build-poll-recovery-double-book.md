@@ -47,7 +47,7 @@ Measured base rates that size the fix (no hand-set numbers):
 | Measurement | Value |
 |---|---|
 | Real fills: tape `created_time − executed_ts` (4,053 matched rows) | min 0.005 s · p50 0.014 s · p90 0.031 s · p99 0.061 s · **max 0.486 s**; 0 rows > 10 s |
-| Verification budget reused (existing `fill_cancel_verify_attempts=3 × fill_cancel_verify_delay_s=90 s`) | 3 tape reads over ≥180 s ⇒ ≥ 370× the max observed latency; a real fill absent on the FIRST read has a measured base rate of 0/4,053 |
+| Verification budget reused (existing `fill_cancel_verify_attempts=3` × `fill_cancel_verify_delay_s`; code default 90 s, **live YAML 15 s** — corrected in the review-fix pass) | 3 tape reads, the last at +2·delay: +30 s live (≥ 61× the max observed exchange-stamp latency), +180 s at the default (≥ 370×); a real fill absent on the FIRST read has a measured base rate of 0/4,053 — but see the REST-visibility caveat under Counterfactual and the pre-registered `fill_verified_late` alarm |
 | Phantom `quote_executed` claims since 7/27 | 28 (27 WS-delivered, 1 other); 12 on 8/26 (364.79 contracts); premium claimed Σ contracts×price = $831.35 of positions never held |
 | Store duplicate order_ids / fill_refs | 0 / 0 |
 | Tape fills carrying `client_order_id` | 0 / 4,228 ⇒ the exact join key is `Fill.order_id == Quote.creator_order_id`; `client_order_id` (WS only) is evidence, not a key |
