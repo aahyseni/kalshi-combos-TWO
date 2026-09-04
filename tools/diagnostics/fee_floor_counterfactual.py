@@ -58,16 +58,17 @@ from combomaker.core.quantity import CentiContracts
 from combomaker.marketdata.grid import PriceGrid
 from combomaker.ops.config import load_config
 from combomaker.pricing.fees import FeeModel, FeeSchedule, FeeType
-from combomaker.pricing.grouping import game_key
 from combomaker.pricing.joint import JointEstimate
 from combomaker.pricing.markup import MarkupPolicy, _is_cross_game_ml_parlay
 from combomaker.pricing.quote import ConstructedQuote, QuoteParams, construct_quote
-from combomaker.pricing.retained_cell import cell_key
+from combomaker.pricing.retained_cell import CellKey, cell_key
 from combomaker.rfq.edge import candidate_edge_cc
 from combomaker.risk.exposure import LegRef
 from combomaker.risk.retained_edge_floor import (
+    FloorEstimate,
     GradeRow,
     estimate_retained_floor,
+    grade_row_from_store,
     summarize,
 )
 
@@ -352,8 +353,10 @@ def fills_section(
 # ------------------------------------------------------------ cell floor
 
 
-def cell_floor_table(con: sqlite3.Connection) -> tuple[dict[tuple[str, ...], int] | None, Any]:
-    # keep in sync with ops/persistence.py Store.settled_grade_rows (read-only copy)
+def cell_floor_table(con: sqlite3.Connection) -> tuple[dict[CellKey, int] | None, FloorEstimate]:
+    # keep in sync with ops/persistence.py Store.settled_grade_rows (read-only
+    # copy of the two SELECTs; the row -> GradeRow conversion is the LIVE
+    # grade_row_from_store, never a copy)
     ledger = con.execute(
         "SELECT combo_ticker, SUM(contracts_centi), SUM(realized_pnl_cc),"
         " SUM(COALESCE(settlement_fee_cc, 0)), MIN(opened_at),"
@@ -370,30 +373,24 @@ def cell_floor_table(con: sqlite3.Connection) -> tuple[dict[tuple[str, ...], int
         ).fetchall()
     }
     rows: list[GradeRow] = []
-    for ticker, ctr, realized, settle_fee, _opened, settled_at, legs_json in ledger:
+    for ticker, ctr, realized, settle_fee, opened_at, settled_at, legs_json in ledger:
         f = fills.get(str(ticker))
         if f is None or f[2] is None or int(f[4] or 0) > 0 or not int(f[1] or 0):
             continue
-        try:
-            legs = legs_from_json(legs_json or "[]")
-        except (ValueError, KeyError, TypeError):
-            continue
-        if not legs:
-            continue
-        modeled = int(f[2]) + int(f[3] or 0)
-        if int(f[1]) != int(ctr) and int(f[1]) > 0:
-            modeled = modeled * int(ctr) // int(f[1])
-        modeled -= int(settle_fee or 0)
-        rows.append(
-            GradeRow(
-                cell=cell_key(legs),
-                contracts_centi=int(ctr),
-                realized_cc=int(realized),
-                modeled_cc=modeled,
-                games=frozenset(game_key(leg.event_ticker) for leg in legs if leg.event_ticker),
-                settled_at=str(settled_at),
-            )
-        )
+        row = grade_row_from_store({
+            "combo_ticker": str(ticker),
+            "ledger_contracts_centi": int(ctr),
+            "realized_pnl_cc": int(realized),
+            "settlement_fee_cc": int(settle_fee or 0),
+            "opened_at": str(opened_at),
+            "settled_at": str(settled_at),
+            "legs_json": str(legs_json or "[]"),
+            "fill_contracts_centi": int(f[1]),
+            "expected_edge_cc": int(f[2]),
+            "fill_fee_cc": int(f[3] or 0),
+        })
+        if row is not None:
+            rows.append(row)
     est = estimate_retained_floor(rows)
     print("=" * 78)
     print("CELL FLOOR (risk/retained_edge_floor.py on the settled grade, read-only)")

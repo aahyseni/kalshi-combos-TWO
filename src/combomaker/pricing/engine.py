@@ -49,7 +49,7 @@ from combomaker.pricing.quote import (
     free_money_caps,
 )
 from combomaker.pricing.relationships import Relationship, RelationshipKind, classify_legs
-from combomaker.pricing.retained_cell import cell_key
+from combomaker.pricing.retained_cell import CellKey, cell_key, floor_for_cell
 from combomaker.pricing.sgp import SgpParams, build_sgp_correlation
 from combomaker.pricing.structural import StructuralPricer, structural_applicable
 from combomaker.rfq.models import Rfq, RfqLeg
@@ -215,7 +215,10 @@ class PricingEngine:
         # MEASURED RETAINED-EDGE FLOOR table (item 2, risk/retained_edge_floor
         # .py): cell -> adverse-selection floor cc, published by the slow
         # loop; the quote path does one dict lookup. None until published.
-        self._retained_floor: Mapping[tuple[str, ...], int] | None = None
+        self._retained_floor: Mapping[CellKey, int] | None = None
+        # The per-sport pool upper bounds published with the table: the
+        # floor of a cell with NO settled record (review fix M2, fail-closed).
+        self._retained_pool_floor: Mapping[str, int] = {}
         self._sgp_params = SgpParams(
             pair_rho=dict(config.correlation.pair_rho),
             default_rho=config.correlation.same_event_rho,
@@ -574,18 +577,32 @@ class PricingEngine:
     def fee_mode(self) -> str:
         return self._fee_mode
 
-    def publish_retained_floor(self, table: Mapping[tuple[str, ...], int] | None) -> None:
+    def publish_retained_floor(
+        self,
+        table: Mapping[CellKey, int] | None,
+        pool_floor_cc: Mapping[str, int] | None = None,
+    ) -> None:
         """Install the slow loop's measured per-cell retained-edge floor
-        table (cell key -> cc, EXCLUDING the fee). None clears it (the
-        quote path then keeps the fee-only floor)."""
+        table (cell key -> cc, EXCLUDING the fee) together with the per-
+        sport pool upper bounds (``FloorEstimate.pool_floor_cc``) that a cell
+        ABSENT from the table resolves to (review fix M2). None clears both
+        (the quote path then keeps the fee-only floor)."""
         self._retained_floor = table
+        self._retained_pool_floor = dict(pool_floor_cc or {}) if table is not None else {}
+
+    @property
+    def retained_pool_floor(self) -> Mapping[str, int]:
+        return self._retained_pool_floor
 
     def _retained_floor_for(self, rfq: Rfq) -> int | None:
-        """One dict lookup on the quote path (O(legs) to build the key)."""
+        """One or two dict lookups on the quote path (O(legs) to build the
+        key). While a table is published this NEVER returns None: an
+        unseen cell is fail-closed to its sport pool's upper bound
+        (``floor_for_cell``)."""
         table = self._retained_floor
         if table is None:
             return None
-        return table.get(cell_key(rfq.legs))
+        return floor_for_cell(cell_key(rfq.legs), table, self._retained_pool_floor)
 
     def fee_type_for(self, rfq: Rfq) -> FeeType:
         """The fee type THIS combo's fill is charged under, resolved by the

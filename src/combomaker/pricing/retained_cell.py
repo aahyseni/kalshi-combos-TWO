@@ -17,7 +17,7 @@ quote path then does one dict lookup keyed on the tuple.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Protocol
 
 from combomaker.pricing.grouping import game_key
@@ -68,3 +68,27 @@ def cell_key(legs: Iterable[_LegLike]) -> CellKey:
 
 def sport_of_cell(key: CellKey) -> str:
     return key[0]
+
+
+def floor_for_cell(
+    key: CellKey,
+    table: Mapping[CellKey, int],
+    pool_floor_cc: Mapping[str, int],
+) -> int:
+    """The published retained-edge floor for a cell, FAIL-CLOSED (2026-09-04
+    review fix M2): a cell in the table takes its own measured floor; a cell
+    ABSENT from the table (no settled record at all — the never-sold shape)
+    takes its sport pool's upper bound, exactly like a thin cell; a sport
+    with no pool at all takes the LARGEST published pool floor (and, if no
+    pool was published, the largest cell floor). Absent never resolves to
+    the loosest cap in the system. One or two dict lookups on the quote
+    path. Shared by the engine and the replay tool (never reimplemented)."""
+    own = table.get(key)
+    if own is not None:
+        return own
+    pool = pool_floor_cc.get(sport_of_cell(key))
+    if pool is not None:
+        return pool
+    if pool_floor_cc:
+        return max(pool_floor_cc.values())
+    return max(table.values(), default=0)

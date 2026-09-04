@@ -8,7 +8,13 @@
   drops a leg-axis rebate whose mirror direction the book does not hold;
   widening passes untouched;
 - store read + lifecycle sweep: settled rows -> cells -> published table on
-  the engine (one dict lookup on the quote path).
+  the engine (one dict lookup on the quote path);
+- FAIL-CLOSED lookup (review fix M2): a cell ABSENT from the published
+  table resolves to its sport pool's upper bound, an unknown sport to the
+  largest published pool floor — never to None (= the loosest cap) while a
+  table is published;
+- cluster key (review fix S8): a settled row whose legs carry no event
+  ticker is its own cluster, keyed on the combo ticker.
 """
 
 from __future__ import annotations
@@ -17,13 +23,14 @@ import json
 import math
 from pathlib import Path
 
-from combomaker.pricing.retained_cell import CellKey
+from combomaker.pricing.retained_cell import CellKey, cell_key, floor_for_cell
 from combomaker.risk.cap_family import K_DAILY
 from combomaker.risk.rebate_bound import bound_rebate, mirror_key
 from combomaker.risk.retained_edge_floor import (
     MIN_POOL_DAYS,
     GradeRow,
     estimate_retained_floor,
+    grade_row_from_store,
     pool_stats,
     summarize,
 )
@@ -181,6 +188,8 @@ def test_rebate_bound_rules() -> None:
 async def test_sweep_publishes_a_floor_table_from_the_settled_grade(tmp_path: Path) -> None:
     from combomaker.ops.persistence import Store
     from tests.test_fee_seam_wiring import _rig, _tick
+    from tests.test_lifecycle import rfq
+    from tests.test_pricing_engine import combo
 
     rig = await _rig(tmp_path, fills=None, series=None)
     store: Store = rig.store
@@ -230,6 +239,92 @@ async def test_sweep_publishes_a_floor_table_from_the_settled_grade(tmp_path: Pa
     rfi = table[("mlb", "rfi|rfi", "all_no", "cross")]
     ml = table[("mlb", "moneyline|moneyline", "all_yes", "cross")]
     assert rfi > ml and rfi >= 20  # the losing shape floors far above the winner
+    # REVIEW FIX M2: the pool upper bounds travel with the table, and an RFQ
+    # whose cell was never settled resolves to its sport's pool floor —
+    # never None (the margin // 2 cap) while a table is published.
+    est = estimate_retained_floor([r for r in map(grade_row_from_store, rows) if r])
+    assert rig.engine.retained_pool_floor == est.pool_floor_cc and "mlb" in est.pool_floor_cc
+    unseen_mlb = combo([
+        {"market_ticker": "KXMLBHR-26AUG262105MINATH-MINRLEWIS23-1",
+         "event_ticker": "KXMLBHR-26AUG262105MINATH", "side": "no"},
+        {"market_ticker": "KXMLBHR-26AUG262105MINATH-ATHBROOKER-1",
+         "event_ticker": "KXMLBHR-26AUG262105MINATH", "side": "no"},
+    ])
+    assert cell_key(unseen_mlb.legs) not in table
+    assert rig.engine._retained_floor_for(unseen_mlb) == est.pool_floor_cc["mlb"]  # noqa: SLF001
+    # An unknown sport (the harness's M1/M2 legs key to "other", which has
+    # no pool) takes the LARGEST published pool floor.
+    other = rfq()
+    assert cell_key(other.legs)[0] not in est.pool_floor_cc
+    assert rig.engine._retained_floor_for(other) == max(est.pool_floor_cc.values())  # noqa: SLF001
     # Inside the cadence nothing re-runs; the table stays.
     await _tick(rig)
     assert rig.metrics.counter("retained_floor.ran") == 1
+    # Clearing the table clears the pools with it.
+    rig.engine.publish_retained_floor(None)
+    assert rig.engine._retained_floor_for(other) is None  # noqa: SLF001
+    assert rig.engine.retained_pool_floor == {}
+
+
+# --------------------------------------------- fail-closed lookup (review M2)
+
+
+def test_absent_cell_resolves_to_its_pool_never_to_none() -> None:
+    """The reviewer's demonstration: on a 300cc margin / 88cc fee, a cell
+    ABSENT from the table used to get margin // 2 = 150cc of rebate (the
+    loosest cap in the system) while a THIN cell got 0 and a floor-0 cell
+    210. The lookup now fails closed exactly like a thin cell."""
+    table = {MLB_ALL_NO_RFI: 448, MLB_YES_ML: 0}
+    pools = {"mlb": 590, "soccer": 1_128}
+    assert floor_for_cell(MLB_ALL_NO_RFI, table, pools) == 448
+    assert floor_for_cell(MLB_YES_ML, table, pools) == 0
+    # never settled, known sport -> that sport's pool upper bound
+    assert floor_for_cell(("mlb", "rfi|rfi", "all_no", "same"), table, pools) == 590
+    assert floor_for_cell(("soccer", "btts|total", "all_no", "same"), table, pools) == 1_128
+    # unknown sport ('other', 'esports' with no pool) -> the largest pool
+    other_cell: CellKey = ("other", "moneyline|moneyline", "all_yes", "cross")
+    assert floor_for_cell(other_cell, table, pools) == 1_128
+    # a table published without pools (a rig) -> the largest cell floor
+    assert floor_for_cell(("other", "x", "all_yes", "cross"), table, {}) == 448
+    assert floor_for_cell(("other", "x", "all_yes", "cross"), {}, {}) == 0
+
+
+# ---------------------------------------------------- cluster key (review S8)
+
+
+def test_rows_without_event_tickers_are_their_own_cluster() -> None:
+    def store_row(ticker: str, legs: list[dict[str, object]]) -> dict[str, object]:
+        return {
+            "combo_ticker": ticker,
+            "ledger_contracts_centi": 1_000,
+            "realized_pnl_cc": -500,
+            "settlement_fee_cc": 0,
+            "opened_at": "2026-08-01T10:00:00+00:00",
+            "settled_at": "2026-08-02T03:00:00+00:00",
+            "legs_json": json.dumps(legs),
+            "fill_contracts_centi": 1_000,
+            "expected_edge_cc": 200,
+            "fill_fee_cc": 30,
+        }
+
+    with_events = grade_row_from_store(store_row("KXMVE-A", [
+        {"market_ticker": "KXMLBRFI-26AUG01SFCLE", "event_ticker": "KXMLBRFI-26AUG01SFCLE",
+         "side": "no"},
+    ]))
+    a = grade_row_from_store(store_row("KXMVE-B", [
+        {"market_ticker": "KXMLBRFI-26AUG01TEXCWS", "side": "no"},
+    ]))
+    b = grade_row_from_store(store_row("KXMVE-C", [
+        {"market_ticker": "KXMLBRFI-26AUG01NYYBOS", "side": "no"},
+    ]))
+    assert with_events is not None and a is not None and b is not None
+    assert with_events.games == frozenset({"26AUG01SFCLE"})
+    assert a.games == frozenset({"combo:KXMVE-B"}) and b.games == frozenset({"combo:KXMVE-C"})
+    assert a.games != b.games  # two rows, two clusters (not one shared empty set)
+    assert pool_stats([a, b]).n_clusters == 2
+    # modeled = expected_edge + booked fee − settlement fee; realized as booked
+    assert a.modeled_cc == 230 and a.realized_cc == -500
+    # unreadable legs -> None (skipped, never a guessed row)
+    assert grade_row_from_store(store_row("KXMVE-D", [])) is None
+    bad = store_row("KXMVE-E", [{"side": "no"}])
+    assert grade_row_from_store(bad) is None

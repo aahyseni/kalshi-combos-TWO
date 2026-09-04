@@ -24,7 +24,6 @@ any resync (feed ordering guarantees that).
 from __future__ import annotations
 
 import asyncio
-import json
 import math
 import os
 from collections import Counter
@@ -86,7 +85,6 @@ from combomaker.pricing.fee_observer import (
 from combomaker.pricing.fees import FeeModel, FeeType, FeeUnknownError
 from combomaker.pricing.grouping import game_key
 from combomaker.pricing.quote import ConstructedQuote, NoQuote
-from combomaker.pricing.retained_cell import cell_key
 from combomaker.rfq.edge import candidate_edge_cc
 from combomaker.rfq.eviction_value import (
     AcceptanceCounters,
@@ -153,6 +151,7 @@ from combomaker.risk.reservation import ReserveResult, RiskReservationService
 from combomaker.risk.retained_edge_floor import (
     GradeRow,
     estimate_retained_floor,
+    grade_row_from_store,
 )
 from combomaker.risk.retained_edge_floor import (
     summarize as summarize_floor,
@@ -8068,47 +8067,17 @@ class QuoteLifecycle:
         rows: list[GradeRow] = []
         skipped = 0
         for r in raw:
-            try:
-                legs = [
-                    LegRef(
-                        market_ticker=str(leg["market_ticker"]),
-                        event_ticker=leg.get("event_ticker"),
-                        side=str(leg["side"]),
-                    )
-                    for leg in json.loads(r["legs_json"])
-                ]
-            except (ValueError, KeyError, TypeError):
+            row = grade_row_from_store(r)
+            if row is None:
                 skipped += 1
                 continue
-            if not legs:
-                skipped += 1
-                continue
-            ledger_ct = int(r["ledger_contracts_centi"])
-            fill_ct = int(r["fill_contracts_centi"])
-            # Like for like: the model's edge net of the fee ACTUALLY charged
-            # (booked fee added back, the settlement echo of the exchange fee
-            # taken out), scaled to the ledger's contracts when the fills
-            # and the ledger disagree on size (partial recoveries).
-            modeled = int(r["expected_edge_cc"]) + int(r["fill_fee_cc"])
-            if fill_ct != ledger_ct and fill_ct > 0:
-                modeled = modeled * ledger_ct // fill_ct
-            modeled -= int(r["settlement_fee_cc"])
-            rows.append(
-                GradeRow(
-                    cell=cell_key(legs),
-                    contracts_centi=ledger_ct,
-                    realized_cc=int(r["realized_pnl_cc"]),
-                    modeled_cc=modeled,
-                    games=frozenset(
-                        game_key(leg.event_ticker) for leg in legs if leg.event_ticker
-                    ),
-                    settled_at=str(r["settled_at"]),
-                )
-            )
+            rows.append(row)
         estimate = estimate_retained_floor(rows)
         self._metrics.inc("retained_floor.ran")
         if estimate.published:
-            publish(dict(estimate.table))
+            # The pool upper bounds travel with the table: a cell with no
+            # settled record resolves to its sport pool (review fix M2).
+            publish(dict(estimate.table), dict(estimate.pool_floor_cc))
             self._metrics.inc("retained_floor.published")
         else:
             publish(None)

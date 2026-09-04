@@ -37,14 +37,17 @@ are untouched; the quote path does one dict lookup (``table``).
 
 from __future__ import annotations
 
+import json
 import math
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from combomaker.pricing.retained_cell import CellKey
+from combomaker.pricing.grouping import game_key
+from combomaker.pricing.retained_cell import CellKey, cell_key
 from combomaker.risk.cap_family import K_DAILY
+from combomaker.risk.exposure import LegRef
 
 # The pre-registered pooled-read horizon (feedback_no_refit_on_pnl: alarms
 # and reads are multi-week, never a P&L window; the deep-dive spec fixed
@@ -104,6 +107,52 @@ class FloorEstimate:
     pools: dict[str, PoolStats] = field(default_factory=dict)
     tau2_by_sport: dict[str, float] = field(default_factory=dict)
     pool_floor_cc: dict[str, int] = field(default_factory=dict)
+
+
+def grade_row_from_store(row: Mapping[str, object]) -> GradeRow | None:
+    """One ``Store.settled_grade_rows`` row → its GradeRow; None when the
+    legs cannot be read (skipped, counted by the caller).
+
+    Like for like: the model's edge net of the fee ACTUALLY charged (booked
+    fee added back, the settlement echo of the exchange fee taken out),
+    scaled to the ledger's contracts when the fills and the ledger disagree
+    on size (partial recoveries). CLUSTER: the combo's game set; a row whose
+    legs carry no event ticker is its OWN cluster, keyed on the combo
+    ticker (2026-09-04 review fix S8 — such rows used to share one empty
+    frozenset, collapsing every one of them into a single cluster).
+
+    Pure; the lifecycle sweep and the read-only replay tool both call it
+    (rule 8: one conversion, never a copy)."""
+    try:
+        legs = [
+            LegRef(
+                market_ticker=str(leg["market_ticker"]),
+                event_ticker=leg.get("event_ticker"),
+                side=str(leg["side"]),
+            )
+            for leg in json.loads(str(row["legs_json"]))
+        ]
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not legs:
+        return None
+    ledger_ct = int(row["ledger_contracts_centi"])  # type: ignore[call-overload]
+    fill_ct = int(row["fill_contracts_centi"])  # type: ignore[call-overload]
+    modeled = int(row["expected_edge_cc"]) + int(row["fill_fee_cc"])  # type: ignore[call-overload]
+    if fill_ct != ledger_ct and fill_ct > 0:
+        modeled = modeled * ledger_ct // fill_ct
+    modeled -= int(row["settlement_fee_cc"])  # type: ignore[call-overload]
+    games = frozenset(game_key(leg.event_ticker) for leg in legs if leg.event_ticker)
+    if not games:
+        games = frozenset({f"combo:{row['combo_ticker']}"})
+    return GradeRow(
+        cell=cell_key(legs),
+        contracts_centi=ledger_ct,
+        realized_cc=int(row["realized_pnl_cc"]),  # type: ignore[call-overload]
+        modeled_cc=modeled,
+        games=games,
+        settled_at=str(row["settled_at"]),
+    )
 
 
 def _parse_iso(text: str) -> datetime | None:
