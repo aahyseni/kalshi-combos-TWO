@@ -668,7 +668,14 @@ class Store:
         writer running it enqueues (drop-on-overflow) and can never block or
         delay the hot pricing path (fix isolation); in sync mode (tests) it
         writes immediately. Before this it was a committed write with no
-        caller (0 rows ever)."""
+        caller (0 rows ever).
+
+        CONTRACT (review note 2026-09-04): these rows are DROPPABLE tape —
+        under a queue burst they are lost like any other ``_write`` row
+        (``store_writer_stats.dropped_writes`` counts them). The LOSS-FREE
+        count of verdicts is the ``structural.fallback.<verdict>[.<family>]``
+        metrics counters; any tool computing a fallback SHARE from this table
+        must treat it as a sample, not a census."""
         await self._write(
             "INSERT INTO structural_fits (at, rfq_id, model, n_legs,"
             " exactly_identified, residual, verdict, reject_bar, challenge_bar,"

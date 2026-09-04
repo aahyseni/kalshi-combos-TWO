@@ -10189,23 +10189,36 @@ class QuoteLifecycle:
         same RFQ is not recorded twice). The store write rides the tape queue
         (drop-on-overflow, never blocks pricing). Counters:
         ``structural.fallback.<verdict>`` and ``structural.fallback.<verdict>.
-        <family>`` — the fallback SHARE per pair family is reject / all."""
-        fit = result.structural_fit if isinstance(result, ConstructedQuote) else result.fit
-        if fit is None:
-            return
-        verdict = fit.challenge.verdict.value
-        self._metrics.inc(f"structural.fallback.{verdict}")
-        self._metrics.inc(f"structural.fallback.{verdict}.{fit.family}")
-        await self._store.record_structural_fit(
-            rfq_id=rfq.rfq_id,
-            model=fit.model,
-            n_legs=fit.n_legs,
-            tickers=tuple(rfq.leg_tickers),
-            challenge=fit.challenge,
-            family=fit.family,
-            route=fit.route,
-            reason=fit.reason,
-        )
+        <family>`` — the fallback SHARE per pair family is reject / all.
+
+        FAILURE ISOLATION (review fix 2026-09-04): this sits ON the RFQ
+        pricing path (awaited before the NoQuote branch / risk snapshots /
+        POST), so the whole body is exception-proof — a store or signature
+        error drops ONE telemetry row (counted ``structural.telemetry.errored``
+        + logged), never the quote. Same pattern as ``_maybe_shadow_inplay``."""
+        try:
+            fit = result.structural_fit if isinstance(result, ConstructedQuote) else result.fit
+            if fit is None:
+                return
+            verdict = fit.challenge.verdict.value
+            self._metrics.inc(f"structural.fallback.{verdict}")
+            self._metrics.inc(f"structural.fallback.{verdict}.{fit.family}")
+            await self._store.record_structural_fit(
+                rfq_id=rfq.rfq_id,
+                model=fit.model,
+                n_legs=fit.n_legs,
+                tickers=tuple(rfq.leg_tickers),
+                challenge=fit.challenge,
+                family=fit.family,
+                route=fit.route,
+                reason=fit.reason,
+            )
+        except Exception:  # telemetry must never propagate
+            try:
+                self._metrics.inc("structural.telemetry.errored")
+            except Exception:  # pragma: no cover - counter itself unavailable
+                pass
+            log.exception("structural_fit_telemetry_errored", rfq_id=rfq.rfq_id)
 
     async def _maybe_shadow_inplay(
         self, rfq: Rfq, reasons: list[ReasonCode]

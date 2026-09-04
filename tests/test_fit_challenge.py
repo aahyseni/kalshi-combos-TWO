@@ -14,6 +14,7 @@ Covers the three pieces of the item:
 from __future__ import annotations
 
 import inspect
+import re
 from pathlib import Path
 
 from combomaker.core.clock import FakeClock
@@ -100,10 +101,17 @@ def test_thresholds_mirror_live_inverter_constants() -> None:
     scoreline cannot reproduce that market shape) while the SAME game's
     triple passed at 0.0195; the accept/challenge split is now derived from
     the leg books (classify_fit, resolution mode). margin_total / mlb_runs
-    keep their legacy bars (out of scope) and are still mirrored below."""
+    keep their legacy bars (out of scope) and are still mirrored below.
+
+    Review fix 2026-09-04: dixon_coles binds the bar BY IMPORT from this
+    module, so the DC half asserts the bound value (and that no float literal
+    bar remains in the inverter), not a source-text match."""
+    from combomaker.pricing import dixon_coles
+
+    assert dixon_coles.REJECT_OVERIDENTIFIED is REJECT_OVERIDENTIFIED
     dc_src = inspect.getsource(invert)
-    assert f"residual > {REJECT_OVERIDENTIFIED}" in dc_src
-    assert f"residual > {REJECT_EXACT}" not in dc_src
+    assert "residual > REJECT_OVERIDENTIFIED" in dc_src
+    assert re.search(r"residual > 0\.\d+", dc_src) is None
 
     from combomaker.pricing import margin_total, mlb_runs
 

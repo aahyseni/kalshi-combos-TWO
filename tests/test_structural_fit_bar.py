@@ -643,6 +643,77 @@ async def test_lifecycle_recorder_counts_by_verdict_and_family_and_enqueues_once
     assert self3._metrics.counters == {} and self3._store.calls == []
 
 
+class _RaisingStore:
+    async def record_structural_fit(self, **kwargs: Any) -> None:
+        raise RuntimeError("store boom")
+
+
+async def test_lifecycle_recorder_swallows_a_raising_store_and_counts_it() -> None:
+    """Review fix 2026-09-04: the recorder sits ON the RFQ pricing path, so a
+    store/signature error must drop ONE telemetry row (counted), never raise."""
+    legs, beliefs, sides = pair(0.5916, 0.5378)
+    _est, _reason, fit = pricer().try_price_with_fit(legs, beliefs, sides)
+    quote = ConstructedQuote(yes_bid_cc=0, no_bid_cc=5000, fair_cc=4600,  # type: ignore[arg-type]
+                             width_components_cc={}, structural_fit=fit)
+    rfq = _combo([(BTTS_T, "yes"), (OVER_T, "yes")])
+    self = SimpleNamespace(_metrics=_Metrics(), _store=_RaisingStore())
+    await QuoteLifecycle._record_structural_fit(self, rfq, quote)  # type: ignore[arg-type]
+    assert self._metrics.counters["structural.fallback.accept"] == 1
+    assert self._metrics.counters["structural.telemetry.errored"] == 1
+    # A record whose shape the recorder cannot read (a future signature drift)
+    # is swallowed the same way — the error is inside the guarded body.
+    broken = ConstructedQuote(yes_bid_cc=0, no_bid_cc=5000, fair_cc=4600,  # type: ignore[arg-type]
+                              width_components_cc={}, structural_fit=object())  # type: ignore[arg-type]
+    self2 = SimpleNamespace(_metrics=_Metrics(), _store=_FakeStore())
+    await QuoteLifecycle._record_structural_fit(self2, rfq, broken)  # type: ignore[arg-type]
+    assert self2._metrics.counters == {"structural.telemetry.errored": 1}
+    assert self2._store.calls == []
+
+
+async def test_lifecycle_still_sends_the_quote_when_the_telemetry_store_raises(
+    tmp_path: Path,
+) -> None:
+    """End to end through QuoteLifecycle.handle_rfq: a club btts x total RFQ
+    whose structural-fit telemetry write RAISES still reaches the sender with
+    a non-zero NO bid, and the decision tape is unaffected."""
+    from tests.test_lifecycle import Rig
+
+    h = Harness()
+    h.with_meta("KXMVE-C1")
+    h.with_meta(BTTS_T)
+    h.with_meta(OVER_T)
+    await _with_priced_books(h, {BTTS_T: 0.595, OVER_T: 0.535})
+    store = await Store.open(tmp_path / "t.sqlite3", h.clock)
+
+    async def boom(**kwargs: Any) -> None:
+        raise RuntimeError("store boom")
+
+    store.record_structural_fit = boom  # type: ignore[method-assign]
+    rig = Rig(h, store)
+    rfq = _combo([(BTTS_T, "yes"), (OVER_T, "yes")], target_cost_dollars="20.00",
+                 contracts_fp="0.00")
+    await rig.lifecycle.handle_rfq(rfq)
+    assert len(rig.sender.created) == 1, rig.sender.created
+    assert rig.sender.created[0]["no"] > 0
+    assert rig.lifecycle.open_quote_count == 1
+    assert rig.metrics.counter("structural.telemetry.errored") == 1
+    assert rig.metrics.counter("structural.fallback.accept.btts|total") == 1
+    # Control: with the store healthy the same RFQ quotes identically and the row lands.
+    h2 = Harness()
+    h2.with_meta("KXMVE-C1")
+    h2.with_meta(BTTS_T)
+    h2.with_meta(OVER_T)
+    await _with_priced_books(h2, {BTTS_T: 0.595, OVER_T: 0.535})
+    store2 = await Store.open(tmp_path / "t2.sqlite3", h2.clock)
+    rig2 = Rig(h2, store2)
+    await rig2.lifecycle.handle_rfq(rfq)
+    assert rig2.sender.created[0]["no"] == rig.sender.created[0]["no"]
+    assert rig2.metrics.counter("structural.telemetry.errored") == 0
+    with sqlite3.connect(tmp_path / "t2.sqlite3") as db:
+        rows = db.execute("SELECT rfq_id, verdict, family, route FROM structural_fits").fetchall()
+    assert rows == [("rfq_x", "accept", "btts|total", ROUTE_HYBRID)]
+
+
 # --- 7. quote-ability: every club btts x total shape in the fixture quotes ----
 
 

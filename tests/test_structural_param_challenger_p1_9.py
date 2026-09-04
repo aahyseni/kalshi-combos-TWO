@@ -100,6 +100,11 @@ def _graded_structural_book() -> BookModel:
         # 0.42 / 0.30 (draw 0.28) inverts at residual 0.015 — a representable
         # game — so BOTH production and the challenger are structural and the
         # tests below compare re-inversions, not a copula fallback.
+        # NOTE (review 2026-09-04): this move is a CHOICE, not a requirement —
+        # all 11 tests here also pass on the old 0.55 / 0.45 fixture under the
+        # new code (production → copula for the game, challenger re-inverts in
+        # stress mode); the representable game is kept because it exercises the
+        # structural-vs-structural comparison the P1.9 challenger is for.
         leg_index[f"KXWCGAME-26JUL15{t}-{a}"] = idx
         event_by_index[idx] = ev
         legs.append(LegModel(p=0.42))

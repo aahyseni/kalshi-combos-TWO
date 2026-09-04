@@ -39,6 +39,8 @@ from numpy.typing import NDArray
 from scipy.optimize import brentq, least_squares
 from scipy.stats import binom, poisson
 
+from combomaker.pricing.fit_challenge import REJECT_OVERIDENTIFIED
+
 _FloatArray = NDArray[np.float64]
 
 _LAM_MIN, _LAM_MAX = 0.05, 6.0
@@ -660,9 +662,10 @@ def invert(
     residual = float(resid.max())
     exactly_identified = len(team_constraints) == 2
     # ONE hard bar for every DC system, exact and over-identified alike
-    # (build 2026-09-04 item B; = fit_challenge.REJECT_OVERIDENTIFIED, the
-    # pre-existing over-identified bar — kept as a literal here because
-    # tests/test_fit_challenge pins the mirror by source). The former
+    # (build 2026-09-04 item B): fit_challenge.REJECT_OVERIDENTIFIED, the
+    # pre-existing over-identified bar, bound by import so the classifier and
+    # the inverter cannot drift (review fix: the value is pinned, not the
+    # source text). The former
     # exact-system bar (0.005) was a hand-set constant 10x tighter than this
     # one: it rejected every club btts x over-2.5 pair (a Poisson scoreline
     # cannot reproduce that market shape to better than ~0.6pp; measured
@@ -674,7 +677,7 @@ def invert(
     # a genuine contradiction. Callers without beliefs (the risk sampler,
     # exposure deltas) get the same one bar, so risk and pricing agree on
     # which games are structurally representable.
-    if contradiction_bar and residual > 0.05:
+    if contradiction_bar and residual > REJECT_OVERIDENTIFIED:
         raise StructuralError(
             f"inversion residual {residual:.4f} exceeds the structural hard bar"
             + (" on exact system" if exactly_identified else ""),
