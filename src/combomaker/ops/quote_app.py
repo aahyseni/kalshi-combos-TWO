@@ -105,8 +105,8 @@ from combomaker.ops.supervisor import (
     supervisor_heartbeat_path,
     supervisor_heartbeat_reachable,
 )
-from combomaker.ops.telemetry_sampling import SAMPLER as SHADOW_TELEMETRY_SAMPLER
 from combomaker.ops.tape_retention import TapeRetentionStep
+from combomaker.ops.telemetry_sampling import SAMPLER as SHADOW_TELEMETRY_SAMPLER
 from combomaker.ops.write_budget import TokenBudget, WriteBudget
 from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.fees import FeeModel, FeeType
