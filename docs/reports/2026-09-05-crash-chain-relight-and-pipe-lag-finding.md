@@ -70,6 +70,42 @@ the reader (drops tracked agent load) and one agent ran `Stop-Process`; the
 16:02 ET whole-stack death (watchdog died mid-relight) is still unexplained.
 Tonight's fleet runs at low priority with the bot filling nothing anyway.
 
+## FOUND WHILE WAITING: the risk denominator DOUBLE-COUNTED shard 1's portfolio value (repaired `f750924`)
+
+The open item "bot standing $7,308 vs exchange $4,969" resolved in one
+same-minute read (22:22Z):
+
+| Read | cash | portfolio value | equity |
+|---|---|---|---|
+| Bot `account_standing` 22:00Z | $3,510.10 | **$3,155.72** | **$6,665.82** |
+| Exchange base `/portfolio/balance` | $3,510.10 | $1,550.55 | $5,060.65 |
+| Exchange per shard | idx0 $0.00 · idx1 $1,551.38 · idx2/3 $0 | $1,551.38 | $5,061.48 |
+
+`WholeBookBalanceSource` (the 8/17 "shards = one book" merge) assumed the
+base call's `portfolio_value` was shard 0's and added every other shard's on
+top. The base call already carries the WHOLE book, so shard 1 (where every
+position lives since the 8/17 transfer) was counted twice. The 8/17
+verification (idx0 $1,264.23 vs idx1 $4.06) could not tell "base = shard 0"
+from "base = total" because shard 1 was a sliver then.
+
+Consequence: `risk_bankroll_cc = cash + haircut·PV` with `portfolio_haircut
+1.0` was inflated by the full shard-1 PV — **+$1,550 (+31%) tonight, ≈+$3.5k
+(+70%) at the 9/5 morning peak book**, and the start-of-day equity anchor /
+KILL line with it (`kill_line_cc` $6,612.70 tonight against a true equity
+of $5,061). Every cap that scales from the denominator (per-combo, structure,
+entity, CVaR, det-max backstop) was that much looser, and it fed back: more
+positions → more PV → a larger double count → larger caps. The 9/5 $3.5k peak
+book was partly this. The ruin basis (cash + cost, per P1-3) was unaffected.
+
+Repair (mechanism, no number): merged PV = Σ per-shard scoped reads over
+EVERY index in `balance_breakdown` (index 0 included); the base PV is never
+added, only logged beside the sum (`whole_book_pv_merge`) so a Kalshi
+semantics change surfaces as a divergence. Tests re-pinned to the live
+payloads (6/6; test_balance + 3 referencing suites 156/156); ruff clean;
+vitals fast 8/8 from the snapshot. Rides the sharding relight (the live boot
+still runs the inflated denominator until then; fills ≈ 0 so the exposure to
+the loose caps is small — if the fleet runs long, relight earlier).
+
 ## NEXT STEPS
 
 - Fleet: build → adversarial review → fix → merge → gates (suite, vitals fast
