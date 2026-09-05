@@ -546,9 +546,18 @@ class TestTheEmittedQuoteIsUnchanged:
         candidate, never on the flag alone: with the fail-safe flag pair
         (conc_enabled=False, conc_armed=True) and the UN-mirrored world (the
         family −62 + entity −9 cc rebate on M1:yes/M2:no that nothing in the
-        book backs), the unbacked rebate is removed exactly as under SHIPPED,
-        and the wire equals OFF. Before the fix ``leg_axis_armed and not
-        conc_armed`` was False here, so the rebate reached the wire."""
+        book backs), the cold-armed path must price EXACTLY as SHIPPED — the
+        S1 point is that the flag alone never changes the wire. Before the fix
+        ``leg_axis_armed and not conc_armed`` was False here, so the two
+        differed.
+
+        PIN CHANGED 2026-09-04 night: build A's exposure_backed rule removed
+        the unbacked leg-axis rebate here (wire == OFF). It was RETIRED the
+        same night — on the 9/4 tape it stripped the rebate from 77% of sends
+        (0.3–0.5c on the wire) against the diversity-via-pricing doctrine —
+        so the rebate now reaches the wire under both SHIPPED and cold-armed
+        (bounded at quote time by the measured per-cell floor), the rule
+        reads ``measured_floor`` and ``rebate_unbacked_cc`` is telemetry."""
         import combomaker.rfq.lifecycle as lc
         from tests.test_lifecycle import rfq
         from tests.test_quoting_policy import PolicyRig, _harness
@@ -574,12 +583,17 @@ class TestTheEmittedQuoteIsUnchanged:
             sent[tag] = dict(rig.sender.created[0])
             shadow[tag] = [kw for ev, kw in seen if ev == "inventory_skew_shadow"][-1]
             await store.close()
-        assert sent["cold_armed"] == sent["off"] == sent["shipped"]
+        # The S1 invariant: the flag alone never changes the wire.
+        assert sent["cold_armed"] == sent["shipped"]
         for tag in ("shipped", "cold_armed"):
             rec = shadow[tag]
-            assert rec["rebate_bound_rule"] == "exposure_backed", rec
-            assert rec["rebate_unbacked_cc"] > 0 and rec["applied_cc"] == 0, rec
-            assert rec["applied_unbounded_cc"] > rec["applied_cc"], rec
+            assert rec["rebate_bound_rule"] == "measured_floor", rec
+            # Telemetry still names the un-mirrored leg-axis rebate; the rebate
+            # itself passes through whole (bounded by the measured floor in
+            # construct_quote, not here).
+            assert rec["rebate_unbacked_cc"] > 0, rec
+            assert rec["applied_cc"] == rec["applied_unbounded_cc"], rec
+            assert rec["applied_cc"] > 0, rec
 
 
 class TestMarkupsUnchanged:

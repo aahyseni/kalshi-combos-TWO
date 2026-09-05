@@ -313,20 +313,27 @@ def test_rebate_bound_rules() -> None:
     assert (b.rebate_cc, b.rule, b.cap_cc) == (13, "es_value", 13)
     assert bound_rebate(184, value_cc_per_contract=-4.0, **common).rebate_cc == 0  # type: ignore[arg-type]
     assert bound_rebate(10, value_cc_per_contract=40.0, **common).rebate_cc == 10  # type: ignore[arg-type]
-    # exposure_backed: the HR:no family and entity rebates on a book holding
-    # NO HR:yes exposure are unbacked and removed (the 8/12 $137 ticket).
+    # measured_floor (2026-09-04 night, pin CHANGED with the rule): the
+    # build-A exposure_backed rule removed the HR:no family/entity rebates on
+    # a book holding no HR:yes exposure (184 -> 150). Measured on the 9/4 tape
+    # it stripped the rebate from 77% of sends (0.3-0.5c on the wire, the
+    # margin auctions are won by) and contradicted the diversity-via-pricing
+    # doctrine, so it was RETIRED: the rebate passes through here and the
+    # measured per-cell floor bounds it in construct_quote. ``unbacked_cc``
+    # is telemetry only (what the retired rule would have removed).
     b = bound_rebate(184, value_cc_per_contract=None, **common)  # type: ignore[arg-type]
-    assert (b.rebate_cc, b.rule, b.unbacked_cc) == (184 - 34, "exposure_backed", 34)
-    # ...but backed once the book holds the mirror direction.
+    assert (b.rebate_cc, b.rule, b.unbacked_cc) == (184, "measured_floor", 34)
+    # Telemetry still distinguishes a mirror the book holds (family backed,
+    # entity not) — the rebate itself is unchanged either way.
     held = dict(common, shares_by_family={"KXMLBHR:yes": 0.4, "KXMLBKS:yes": 0.6})
     b = bound_rebate(184, value_cc_per_contract=None, **held)  # type: ignore[arg-type]
-    assert b.unbacked_cc == 8 and b.rebate_cc == 176  # entity still unbacked
-    # Leg axis unarmed: nothing to remove (it never entered the price).
+    assert b.unbacked_cc == 8 and b.rebate_cc == 184
+    # Leg axis unarmed: nothing to report (it never entered the price).
     b = bound_rebate(184, value_cc_per_contract=None, **dict(common, leg_axis_armed=False))  # type: ignore[arg-type]
     assert b.rebate_cc == 184 and b.unbacked_cc == 0
-    # Never below zero.
+    # A rebate smaller than the telemetry figure is still passed through whole.
     b = bound_rebate(20, value_cc_per_contract=None, **common)  # type: ignore[arg-type]
-    assert b.rebate_cc == 0
+    assert b.rebate_cc == 20 and b.unbacked_cc == 34
 
 
 # ------------------------------------------------ store read + lifecycle sweep

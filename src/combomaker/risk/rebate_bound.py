@@ -11,14 +11,19 @@ in order of what is measured:
    exceed that value; a candidate that reduces no ES (value <= 0) earns no
    rebate.
 
-2. ``exposure_backed`` — when no CRN value exists (cache cold/stale, steer
-   disabled), the rebate may only carry components backed by HELD exposure
-   they offset: the directional offset (skew.py requires a non-zero net in
-   the opposite direction) and the peak-miss rebate (the cached committed
-   peak profile) are; a LEG-AXIS rebate on a family/entity whose MIRROR
-   direction the book does not hold is NOT — "diversifying into a family we
-   hold nothing of" reduces no ES (the 8/12 ``KXMLBHR:no leg_diversifying
-   −26cc`` on an empty cell) — so that axis's rebate component is removed.
+2. ``measured_floor`` — when no CRN value exists (cache cold/stale, steer
+   disabled), the rebate passes through here UNCHANGED and is bounded at
+   quote time by the MEASURED per-cell retained-edge floor
+   (risk/retained_edge_floor.py, applied in pricing/quote.py: rebate <=
+   margin − fee − the cell's shrunk measured adverse selection). The record
+   of what each shape cost us is the bound, so losing shapes (rfi×rfi, HR
+   baskets) still earn nothing beyond their measured loss.
+
+   RETIRED 2026-09-04 night: the build-A ``exposure_backed`` rule (strip every
+   leg-axis rebate on a family/entity whose mirror the book does not hold).
+   On the 9/4 tape it removed the rebate from 77% of sends (0.3–0.5c on the
+   wire, the margin auctions are won by) and contradicted the operator's
+   diversity-via-pricing doctrine. ``unbacked_cc`` remains as telemetry.
 
 Widening is never touched: the bound only ever LOWERS a rebate.
 """
@@ -54,9 +59,10 @@ def _axis_backed(keys: Iterable[str], shares: Mapping[str, float]) -> bool:
 @dataclass(frozen=True, slots=True)
 class RebateBound:
     rebate_cc: int          # the bounded pricer-frame rebate (>= 0)
-    rule: str               # "none" | "es_value" | "exposure_backed"
+    rule: str               # "none" | "es_value" | "measured_floor"
     cap_cc: int | None      # the es_value cap when that rule applied
-    unbacked_cc: int        # leg-axis rebate removed under exposure_backed
+    unbacked_cc: int        # TELEMETRY: what the RETIRED exposure_backed rule
+                            # would have removed (never subtracted since 9/4)
 
 
 def bound_rebate(
@@ -80,10 +86,25 @@ def bound_rebate(
     if value_cc_per_contract is not None:
         cap = max(0, math.ceil(value_cc_per_contract))
         return RebateBound(min(rebate_cc, cap), "es_value", cap, 0)
+    # RETIRED 2026-09-04 night (operator: "I'd also like to fill more
+    # quantity, to have a more diverse book"): the exposure_backed rule that
+    # removed every leg-axis rebate on a family/entity whose mirror the book
+    # did not hold. Measured on the 9/4 tape it stripped the skew rebate from
+    # 77% of sends (17,119 of 22,151; median 0.55c, 0.3-0.5c on the wire) —
+    # the margin we win auctions by (field clears our fair +0.05-0.25c, 8/16)
+    # — and it contradicted the diversity-via-pricing doctrine: the leg-axis
+    # rebate exists precisely for families we do NOT hold. The ES argument
+    # ("reduces no ES") is the concentration steer's job and applies only when
+    # that steer has PRICED the candidate (rule 1). The rebate passes through
+    # here and is bounded at quote time by the MEASURED per-cell retained-edge
+    # floor (risk/retained_edge_floor.py via pricing/quote.py: rebate <=
+    # margin - fee - measured adverse selection of the cell), so losing shapes
+    # (rfi x rfi, HR baskets) still earn nothing beyond their measured loss.
+    # ``unbacked`` is computed for telemetry only.
     unbacked = 0
     if leg_axis_armed:
         if family_cc < 0 and not _axis_backed(candidate_family_keys, shares_by_family):
             unbacked += -family_cc
         if entity_cc < 0 and not _axis_backed(candidate_entity_keys, shares_by_entity):
             unbacked += -entity_cc
-    return RebateBound(max(0, rebate_cc - unbacked), "exposure_backed", None, unbacked)
+    return RebateBound(rebate_cc, "measured_floor", None, unbacked)
