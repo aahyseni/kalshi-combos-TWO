@@ -648,6 +648,13 @@ class Store:
         )
         return False
 
+    def writer_queue_depth(self) -> int:
+        """Rows waiting for the background tape writer (0 when the writer is
+        not running or idle). A plain length read — safe from a worker thread
+        (``ops/tape_retention.py`` gates each prune batch on it)."""
+        q = self._write_q
+        return 0 if q is None else q.qsize()
+
     def _emit_writer_stats(self) -> None:
         """Writer observability on the checkpoint cadence (2026-08-19):
         cumulative dropped tape writes, the delta since the last emit, and

@@ -1,0 +1,452 @@
+# 2026-09-05 — DESIGN + TOOLS: quiesced STORE ROTATION (item 7) + the dark TAPE-RETENTION prune — `tools/ops/rotate_store.py`, `tools/ops/prune_tape.py`, `ops/tape_retention.py`
+
+**Status: BUILT + GATED + REVIEW FIXES APPLIED (see "Review fixes" below), DRY-RUN of the FINAL tool
+EXECUTED READ-ONLY against the live store with the bot DOWN, `--apply` NOT run.**
+Branch `build/store-rotation-tool` (worktree `C:/Users/aahys/kct-rotation`). Bot LIVE on `main`
+during the build (the fix pass ran with the bot DOWN since 16:02 ET — see the review-fixes section); nothing under the data dir was written (every read `mode=ro`, every heavy step at LOW
+priority). **Blast radius of this commit:** two tools (`tools/ops/rotate_store.py`,
+`tools/ops/prune_tape.py`), one new module (`src/combomaker/ops/tape_retention.py`), two test files,
+and three ADDITIVE live-module edits that are inert until a flag is set: `ops/config.py`
+(`observe.tape_retention_enabled: bool = False`), `ops/persistence.py` (`Store.writer_queue_depth()`,
+a read accessor), `ops/quote_app.py` (a guarded `if self._tape_retention is not None:` step on the
+~60 s slow cadence + construction in `run()` under the flag + close at shutdown). No pricing, risk,
+rfq or sim module touched (rule 8); default config = byte-identical behaviour.
+
+## WRONG / FIXED / OPEN (scannable)
+
+| | Item | State |
+|---|---|---|
+| FINDING | The live store is **213.68 GB** (52,168,228 × 4 KB pages, WAL mode): `rfqs` 66.4M ids + `decisions` 134.3M ids + `would_quotes_inplay` 3.25M rows = the recorder TAPE; every table the bot actually needs to run is **≤ 22,636 rows** (fills 4,343 / position_ledger 4,110 / ev_ledger 4,338 / markouts 22,636 / structural_fits 763 / store_meta 2 / daily_ruin_anchors 2) | measured by a read-only probe (399 s at LOW priority — itself a symptom) |
+| FINDING | **Writer collapse per boot, measured from `store_writer_stats`:** 00:52 boot 1,862,536 dropped rows, queue 198–200k; 09:05 boot 31,354 dropped in 36 min; 09:42 boot 1,314,521 dropped in 2 h (queue 200,000 at its 15:40:52Z halt); 11:40 boot 0 dropped / queue 30,260 at 15:47Z (6 min in); **12:13 boot: last `store_writer_stats` at 16:19:02Z (queue 6,326) and last `decisions` row `at` = 16:18:16Z — no tape row landed for the following ~60 min** (0 `store_writer_batch_failed`, 0 lock errors: the writer starved, not crashed). The 12:13 boot's acceptance seed scanned only **7,426 quote_sent rows for 24 h** (`acceptance_tape_seed_result`, 12.5 s) vs the 8/13 live table of 238k — the seed is reading a tape that is 97% holes | evidence for the design; the fix IS the rotation |
+| FINDING | **HARD-LINK HAZARD:** the store inode has **3 names** — `D:\kalshi-combos-TWO-data\combomaker-prod-live-wc.sqlite3` (live), `D:\kct-vdata\combomaker-prod-live-wc.sqlite3` (the 8/1 frozen-tape snapshot dir, with its own `-wal` of 23,484,032 B dated Aug 1 + `-shm` Aug 6) and `D:\kalshi-combos-TWO-data\vitals_snapshot\combomaker-prod-live-wc.sqlite3` (dir created 9/4 20:36, **with its own `-wal` of 201,912 B written 08:22–09:04 ET TODAY and a 294,912 B `-shm`**). SQLite forbids two WALs on one file: frames committed through another name are invisible to the live connection, and any open through that name REPLAYS that WAL's pages onto the current file. The tool enumerates these (`fsutil hardlink list`), parses each stray WAL header, and **refuses `--apply` while a foreign WAL holds frames — and (review must-fix #1) while the inode has ANY other name at all, from `os.stat().st_nlink`, so the refusal cannot fail open when `fsutil` cannot enumerate** | OPEN — operator: inspect and move aside `vitals_snapshot\*-wal/-shm` and `kct-vdata\*-wal/-shm`, then delete the two extra links (`tools/vitals/snapshot.py` makes a 3.9 MB COPY; a hard link was never a snapshot); the tool enforces both |
+| BUILT | `tools/ops/rotate_store.py` — `--dry-run` (default, read-only plan + boot-reader audit + measured throughput + the retention alternative's plan + refusals-now), `--apply` (refuse-first / checkpoint / rename / build at a temp name **through the real `Store.open`** / column-wise copy / verify / swap / manifest **with the exact START_BOT sequence**; rollback on any failure), `--verify --manifest` (post-relight read-only check) | 17 tests on a synthetic store built by the REAL `Store` (`tests/test_rotate_store.py`) |
+| BUILT (DARK) | **The ALTERNATIVE: `src/combomaker/ops/tape_retention.py`** — a nightly, bounded prune of `rfqs`/`decisions`/`would_quotes*` rows older than a **DERIVED** window (`SEED_WINDOW_S` + the pass cadence + the tape's MEASURED time disorder — no number of its own), never a protected leg-provenance row, only against an idle tape writer, off-loop on a second connection; wired into `quote_app`'s slow loop behind `observe.tape_retention_enabled` (**default False**); CLI face `tools/ops/prune_tape.py` (dry-run / refuse-if-alive apply) | 13 tests (`tests/test_tape_retention.py`): derivation pins, bisection plan, pass deletes only older rows and splits around protected ids, every bound, boot-reader parity (seed + `held_positions`) before/after, scheduler (due / single-flight / writer-idle / re-arm), dark-flag source pin, CLI refusals |
+| GATES | Build commit: suite **4,075/0** (baseline 4,045 + 30 new) at LOW priority; vitals fast **8/8 GREEN** from a rebuilt read-only snapshot (`tools.vitals.snapshot` 16:26 ET); `ruff check` clean on every touched file; `mypy --strict` clean on the four touched `src` modules (the full `mypy` run reports 6 PRE-EXISTING errors in `pricing/ising_amm.py` + `pricing/engine.py`, files this branch never touches — same on `main`). **Fix pass (final tree): suite **4085/0** (3 deselected, 320.28 s, exit 0) = baseline 4,045 + 40 (30 build + 10 review-fix tests); vitals fast **8/8 GREEN (GATE PASS, 104.8 s)** from the same snapshot (current: its `position_ledger` 4,112 rows = the live count; the store has not changed since 16:01 ET); `ruff check` clean; `mypy --strict` clean on `ops/tape_retention.py`** | at each commit |
+| OPEN | `--apply` execution: operator-gated (STOP_BOT → move the two foreign WALs aside → apply → START_BOT), ~3–5 min of downtime by the measured estimate (the copy itself ≈ seconds; STOP/START/boot dominate); best window = a settled, quote-quiet hour | decision owed |
+| OPEN | Arming the prune: `observe.tape_retention_enabled: true` AFTER one rotation (on the 213 GB store the first batch would outlast the writer's lock tolerance and the pass would stop by design — measured below) | decision owed, after the rotation's first window |
+
+## 1. Why a rotation and not a bigger queue / faster disk
+
+The single writer thread commits 1,000-row batches into `rfqs` (3 secondary indexes: `rfq_id`,
+`collection_ticker`, `market_ticker` — random-key inserts) and `decisions` (`kind` index). At 213 GB
+those B-trees are far outside any page cache, so each index insert is a random 4 KB read on the same
+disk the bot's log (3.37 GB for the 00:52 boot alone) and the exchange feed's metadata cache are
+hammering. The queue is bounded at 200,000 (`Store.start_writer`) and drops on overflow by design
+(hot path never blocks) — the drops are the *correct* behaviour of a writer that cannot keep up; the
+store size is what makes it unable to keep up. The 8/19 collapse (150 GB, writer 2h35m behind, 75–80%
+of tape dropped) was the same mechanism one size earlier. The WS `communications_channel_lost:
+Subscription buffer overflow` drops (59 in 55 min on the 12:13 boot) share the box's I/O and the event
+loop's scheduling with the aiosqlite thread; the retained-floor sweep's 5 s `wait_for` timeouts
+(`retained_floor_sweep_timeout` 17:14:49Z) are the same saturation seen from the read side.
+
+A rotation gives the writer a store whose indexes fit in RAM (the carried tape is < 0.1% of the
+archive). Nothing else on the box changes. The prune (section 6) then keeps it there.
+
+## 2. The rotation, step by step (what `--apply` does)
+
+```
+ operator                    rotate_store.py --apply                         disk
+ --------                    ----------------------                          ----
+ STOP_BOT.bat  ───────►  (1) REFUSE if alive: heartbeat.txt / supervisor_heartbeat.txt /
+                             loop_progress.json (repair_phantom_fills' readers + window)
+                             + ours_predicate.ps1 process probe
+                         (2) plan() read-only; REFUSE if the inode has ANY other name (st_nlink != 1,
+                             never fail-open) or any other hard link has a WAL with frames
+                         (3) PRAGMA wal_checkpoint(TRUNCATE); REFUSE unless busy=0 and -wal == 0 bytes
+                             (frames folded = the header read BEFORE the pragma: a successful
+                             TRUNCATE reports (0, 0) for its counters)                store + wal
+                         (4) BUILD FIRST — remove any stale .rotating-* leftovers, then
+                             build store.rotating-<stamp> from the LIVE name:         temp file
+                               Store.open(temp) + close  = the LIVE DDL, every idempotent
+                                 ADD COLUMN migration, every index, WAL mode (its own thread
+                                 + event loop; never a hand-written or copied schema)
+                               + archive DDL for tables the bot's DDL does not know
+                                 (daily_ruin_anchors, daily_realized_events — vitals-owned)
+                               column parity: archive cols ⊆ fresh cols, else REFUSE
+                               ATTACH the quiesced LIVE store ro; BEGIN;
+                               INSERT INTO t (cols) SELECT cols  — every LIVE table whole
+                                 (store_meta REPLACES the fresh open's 0/now watermark);
+                               decisions WHERE kind IN (quote_sent,confirm,decline) AND id>=first_id;
+                               rfqs WHERE id>=first_id; rfqs IN (one id per leg set per
+                               fills ticker the ledger cannot resolve);
+                               sqlite_sequence := archive's; COMMIT;
+                               quick_check; COUNT(*) == rowcount per table (+ archive count)
+                             any exception ⇒ delete temp; the live store was never touched
+                         (5) SWAP: os.rename(store -> store.archive-YYYYMMDD) (+ -wal/-shm)  ── atomic;
+                                   fails outright if anyone holds the file (the mechanical backstop)
+                                   os.replace(temp -> live name) (+ -wal/-shm)
+                             the live name is absent for these few syscalls ONLY; a failed second
+                             rename puts the archive straight back                  ── rollback
+                         (6) manifest -> data/backups/<stamp>-rotate_store_manifest.json (+ next_steps)
+ START_BOT.bat ───────►  bot opens the fresh store (Store.open: idempotent DDL/migrations)
+ rotate_store.py --verify --manifest <json>   (read-only post-check)
+```
+
+Design choices worth stating:
+
+* **Rename, never copy, the 213 GB.** The archive is the old file under a new name (same inode);
+  the rotation copies ~120k rows (≈ 21 MB of row text; 126 MB by the whole-store average) — measured
+  below. A rename is atomic on NTFS and fails with a sharing violation while any process has the file
+  open — a second, mechanical liveness guard under the evidence-based one.
+* **Build FIRST, rename LAST (review must-fix #2).** The fresh store is built and verified at a temp
+  name from the quiesced live store over a read-only ATTACH; only then are the two renames done. The
+  first cut renamed first, which left the live name ABSENT for the whole build (unbounded on a
+  saturated disk): a hard kill or power loss there would have let the next START_BOT create an EMPTY
+  store at the live name and boot with zero ledger — §4's "catastrophic for risk truth", silent, past
+  every gate. Now that window is two syscalls, and a kill during the build leaves the live store
+  untouched plus a stray `.rotating-*` temp the next `--apply` removes and names in its manifest.
+* **Schema = the live `Store.open`**, exactly as the next boot creates it (task requirement; the
+  first cut copied the archive's `sqlite_master` DDL, which would have frozen the archive's column
+  ORDER into the fresh store). Rows are copied BY COLUMN NAME: a fresh-only column (an archive that
+  predates a migration) takes its DDL default — tested by dropping `fills.exchange_fill_id` from a
+  synthetic archive; an archive column the live code no longer creates is a REFUSAL + rollback (data
+  is never silently dropped) — tested. The manifest names `archive_only_tables`,
+  `archive_only_indexes` and `columns_defaulted`.
+* **`store_meta` is carried whole and REPLACES** the watermark the fresh open stamps, so the fills
+  verification WATERMARK stays `(4186, 2026-09-04T22:44:44Z)`. Without it
+  `_ensure_fills_verification_columns` would leave watermark = 0/now in the fresh store, silently
+  re-classifying every booked-but-unverified row as "legacy" (the re-arm would never verify them) —
+  this is the single most important row in the copy (tested: `fills_verification_watermark()`
+  identical before/after through the real `Store`).
+* **`sqlite_sequence` is carried for every AUTOINCREMENT table**, carried or not: fresh ids
+  continue above the archive's `sqlite_sequence` at rotation time (`fills` → 4345+, `decisions` → one past the archive's last id). No id ever names two
+  rows across the boundary; `fills.id > watermark` keeps its meaning; analysis tools that key on
+  `rowid` ranges (tonight's `>= 134238260`) stay unambiguous across archive + fresh store.
+* **The tape carry is defined by the readers, not by a retention number.** The acceptance seed reads
+  `SEED_WINDOW_S` (24 h — the anchor's own horizon, a measurement partition) of `quote_sent` /
+  `confirm` / `decline` decisions and joins `rfqs` by `rfq_id`; the tool imports `SEED_WINDOW_S` and
+  pins the kind literals to the seed's source with a test. `held_positions` falls back to the tape
+  for a fills ticker with no ledger row → one real `rfqs` row per distinct leg set for exactly
+  those tickers (an ambiguous ticker stays ambiguous: fail-closed parity, tested). **The same
+  protected set is what the prune never deletes** — one function, `tape_retention.protected_rfq_ids`.
+* **Verify before swap**: `quick_check`, and every copied table's `COUNT(*)` must equal the
+  `INSERT…SELECT` rowcount (LIVE tables also against the archive's count). A failed verify never
+  reaches the live name.
+* **The exact next step is printed and written**: `--apply` ends with `START_BOT.bat` (repo root),
+  the first-window checks, the `--verify` command with its manifest path, and where the history now
+  lives (the archive) — also in the manifest as `next_steps`.
+* **Nothing hand-set**: the liveness window is the supervisor's `heartbeat_timeout_s` (live YAML,
+  60 s), the busy wait is the store's `BUSY_TIMEOUT_MS`, the carry windows are the readers' own
+  constants, the archive suffix is the date.
+
+## 3. Boot-time reader audit (what reads store history, and whether the rotation carries it)
+
+Grep of every `Store.` reader outside `persistence.py` plus the two direct `sqlite3` users;
+printed by `--dry-run` (`BOOT_READERS`).
+
+| Reader (module → method) | Tables | Carried? |
+|---|---|---|
+| `Store.open` — DDL, ADD COLUMNs, unique indexes, `_ensure_fills_verification_columns` | store_meta, fills | **yes** — store_meta whole ⇒ watermark preserved |
+| `quote_app` startup rehydrate → `held_positions` | fills, position_ledger, rfqs (fallback) | yes — ledgers whole + one rfqs row per leg set for unresolved fills tickers |
+| `quote_app` position reconcile → `has_fill_for_ticker`, `held_positions`, `ledger_quantity_reconcile_once` (`fills_verification_watermark`, `open_ledger_quantity_by_ticker`) | fills, position_ledger, store_meta | yes |
+| `quote_app` day-anchored realized seed → `day_realized_pnl_cc` | position_ledger.reconciled_at, fills.at/fee_cc/status | yes |
+| `ops/acceptance_seed.seed_counts_from_store` (2nd ro connection, off-thread) | decisions (quote_sent/confirm/decline), rfqs by rfq_id | yes — seed window, bisected on the PK exactly as the seed does |
+| `lifecycle` fill-verification re-arm → `fills_verification_watermark`, `booked_unverified_fills` | store_meta, fills | yes |
+| `lifecycle` retained-floor sweep → `settled_grade_rows` | position_ledger (settled), fills | yes |
+| `lifecycle` ledger-divergence sweep → `open_ledger_identities` | position_ledger (open) | yes |
+| `lifecycle` fills-ledger sweep → `fill_order_ids`, `fill_null_order_id_keys` | fills | yes |
+| `risk/settlement` orphan reconcile → `open_ledger_tickers`, `open_ledger_rows_for_ticker`, `record_position_settled`, `settle_ev_entry` | position_ledger, ev_ledger | yes |
+| `tools/ops/hang_watchdog.store_sig` (last `decisions.at` of the newest `*.sqlite3`) | decisions | window only; the fresh store is the newest `*.sqlite3`, the archive name does not match the glob |
+| `tools/vitals/derive.risk_bankroll_cc` / `live_open_positions` (`combomaker*.sqlite3` glob) | daily_ruin_anchors, position_ledger | yes — `daily_ruin_anchors` is written by NO live module (2 rows, latest 2026-07-16 = $2,050.41, the stale anchor the gate already reads); carried from the archive's DDL so the gate keeps an anchor |
+| `ops/report.build_report` (CLI `report`) | rfqs, decisions, would_quotes, ev_ledger, markouts, fills | ledgers yes; tape counts restart — `report --db <archive>` for history |
+| data_dir FILES: `fee_schedule_observed.json`, `metadata_cache.json`, `watchdog_tape.json`, `fill_prober_watermark.txt`, heartbeat/progress files | — | untouched (the rotation renames one file) |
+| `would_quotes_inplay` (in-play shadow, measurement only) | would_quotes_inplay | **no** — 3.25M rows, no boot reader; the archive keeps the study |
+| `fee_schedule` | — | **there is no such table**: the fee observer persists to `data/fee_schedule_observed.json` (179,699 B, rewritten 12:29 ET) — unaffected |
+| `daily_realized_events` | 0 rows, no reader in `src/` | carried (empty) |
+
+Parity proof in `tests/test_rotate_store.py::test_fresh_store_opens_with_the_real_store_and_boot_readers_agree`:
+before/after rotation through the real `Store.open`, `fills_verification_watermark`, `held_positions`
+(ledger-first, tape-fallback, conflicting-set rejection), `settled_grade_rows`, `fill_order_ids`,
+`open_ledger_identities`, `day_realized_pnl_cc`, `booked_unverified_fills` return identical values,
+and the next `record_fill` takes the next id above the archive's.
+
+## 4. Risk list — what breaks if a small table is NOT carried
+
+| Not carried | Consequence |
+|---|---|
+| `position_ledger` | The settlement poller cannot close open rows from exchange truth (orphan reconcile finds nothing); `day_realized_pnl_cc` seeds 0 → p_night degrades to p_book; the retained-edge floor has no settled grade rows → fee-only floor everywhere; the ledger-divergence and quantity alarms fire on every position; rehydration loses its durable leg provenance (only the tape fallback remains). **Catastrophic for risk truth.** |
+| `fills` | `held_positions` returns nothing → every exchange position is "unmodeled" and RESERVED from exchange figures (never zero, but no legs → no clustering/mutex); `fill_order_ids` empty → the fills-ledger sweep alarms every historical exchange fill as a MISS; `has_fill_for_ticker` false everywhere; the re-arm has no claims; the day seed loses fee reversal. |
+| `store_meta` | Watermark re-stamped at rotation → every unverified booked row becomes "legacy" and is never re-armed for verification; the ledger-quantity alarm's post-fix scope shifts. Silent. |
+| `ev_ledger` | `settle_ev_entry` UPDATEs hit no row → realized EV grading stops for pre-rotation fills; `ev_summary` restarts. |
+| `markouts` | Only the CLI report's `markout_summary` loses history (recorder keeps writing). |
+| `structural_fits` | Telemetry history lost (the 9/4 build's 763 ACCEPT/CHALLENGE rows); no reader at boot. |
+| `daily_ruin_anchors` | `tools.vitals.gate` "refuses to invent a bankroll" if no `combomaker*.sqlite3` under data/ has an anchor — the demo/old stores there might; a stale anchor either way (vitals owner's item). |
+| seed-window `decisions`/`rfqs` | The 8/1 brick: acceptance tape empty at boot → CP-lower P(accept) = 0 in every bucket → only dES99 ≤ 0 diversifiers admitted until the live tape refills (~hours). |
+| leg-provenance `rfqs` rows | A held ticker with fills but no ledger row (pre-P1.10 legacy) rehydrates from EXCHANGE figures instead of its legs (deterministic max loss preserved, clustering blind). The dry-run counts exactly how many such tickers exist today (below). |
+| `sqlite_sequence` | ids restart at 1 in the fresh store: `fills.id > watermark(4186)` would be FALSE for every new fill until id 4187 → the verification re-arm blind to the first 4,186 post-rotation fills; archive/fresh rowid collisions for every analysis tool. |
+
+## 5. Dry-run against the live store (READ-ONLY, LOW priority, bot up)
+
+Command (worktree, `PYTHONPATH=src`, `start /LOW /B /WAIT`):
+`python tools/ops/rotate_store.py --dry-run --out <scratch>/plan_live.json` — the first run, 13:37–13:52 ET (942 s at LOW priority, bot UP), on the earlier cut of the tool (its output below; the plan/estimate code is unchanged since). The second run launched 16:37 ET never produced output (its stdout file is 0 bytes — killed with the session). **The FINAL tool (after the review fixes) ran 17:23–17:28 ET with the bot DOWN: 256.5 s, its RETENTION section and refusals are in §5b below.**
+
+```
+== STORE D:\kalshi-combos-TWO-data\combomaker-prod-live-wc.sqlite3
+   199.0 GB  pages 52,168,612 x 4096  freelist 0  journal wal  hard links 3
+   WAL: 20.2 MB / 5139 frames   SHM: 128.0 KB
+   OTHER NAME D:\kct-vdata\combomaker-prod-live-wc.sqlite3  wal=23484032 B / 5700 frames  shm=65536
+   OTHER NAME D:\kalshi-combos-TWO-data\vitals_snapshot\combomaker-prod-live-wc.sqlite3  wal=201912 B / 49 frames  shm=294912
+
+== TABLES (LIVE = carried whole; TAPE = seed window only)
+   LIVE combo_trades           0 rows
+   LIVE daily_realized_events  0 rows
+   LIVE daily_ruin_anchors     2 rows
+   TAPE decisions              ids [1, 134304442]  ~134,304,442 rows  2026-07-13T20:14:18.209645+00:00 .. 2026-09-05T16:18:24.946780+00:00
+   LIVE ev_ledger              4,338 rows
+   LIVE fills                  4,343 rows
+   LIVE markouts               22,636 rows
+   LIVE position_ledger        4,110 rows
+   TAPE rfq_deletions          ids [None, None]  ~0 rows   .. 
+   TAPE rfqs                   ids [1, 66371473]  ~66,371,473 rows  2026-07-13T20:14:17.832279+00:00 .. 2026-09-05T16:18:24.946626+00:00
+   LIVE store_meta             2 rows
+   LIVE structural_fits        763 rows
+   TAPE would_quotes           ids [None, None]  ~0 rows   .. 
+   TAPE would_quotes_inplay    ids [1, 3253727]  ~3,253,727 rows  2026-07-26T00:07:26.952217+00:00 .. 2026-09-05T16:18:13.584070+00:00
+   sqlite_sequence: [['rfqs', 66371473], ['decisions', 134304442], ['fills', 4344], ['ev_ledger', 4338], ['markouts', 22636], ['would_quotes_inplay', 3253727], ['structural_fits', 763]]
+
+== SEED WINDOW 86400 s  (cutoff 2026-09-04T17:36:57.846635+00:00)
+   decisions: {"first_id": 134174705, "max_id": 134304442, "kinds": ["quote_sent", "confirm", "decline"], "rows_by_kind": {"quote_sent": 8663, "confirm": 5, "decline": 0}, "rows": 8668, "window_rows_all_kinds_estimate": 129738}
+   rfqs: {"first_id": 66295870, "max_id": 66371473, "rows_estimate": 75604}
+
+== LEG PROVENANCE: 166 fills tickers without a ledger row -> 134 rfqs rows carried; conflicting 0; unresolvable 32
+
+== MEASURED (this box, now): {"live_rows": 36198, "live_bytes_text": 8841521, "live_s": 0.481, "live_rows_per_s": 75218.7, "tape_probe_rows": 2000, "tape_probe_bytes_text": 498016, "tape_probe_s": 0.017, "tape_bytes_per_s": 28784557, "tape_bytes_per_row": 249}
+
+== ESTIMATE: {"live_rows": 36194, "tape_rows": 84406, "avg_bytes_per_row_whole_store": 1048, "carry_bytes_estimate": 126345305, "not_carried_rows_estimate": 203845236, "carry_text_bytes_estimate": 21017094, "copy_time_s_estimate_read_x3": 2, "live_copy_s_measured_in_memory": 0.481}
+
+== BOOT-TIME READERS OF STORE HISTORY
+   (15 entries — section 3 of this report)
+
+== REFUSALS THAT WOULD FIRE NOW
+   ! D:\kct-vdata\combomaker-prod-live-wc.sqlite3: hard link of the store with its OWN WAL of 5700 frames (23484032 bytes, checkpoint_seq 8) — frames written through that name are invisible to the live connection and an open through it would replay them onto whatever the file holds then; move that -wal/-shm aside (and drop the extra link) before rotating
+   ! D:\kalshi-combos-TWO-data\vitals_snapshot\combomaker-prod-live-wc.sqlite3: hard link of the store with its OWN WAL of 49 frames (201912 bytes, checkpoint_seq 1) — frames written through that name are invisible to the live connection and an open through it would replay them onto whatever the file holds then; move that -wal/-shm aside (and drop the extra link) before rotating
+   ! live WAL holds 5139 frames — expected while the bot is up; --apply checkpoints it (TRUNCATE) and refuses if that cannot complete
+
+plan computed in 942.4 s
+   ! --apply would REFUSE now: heartbeat.txt: beaten 0.6s ago (window 60.0s)
+   ! --apply would REFUSE now: supervisor_heartbeat.txt: beaten 0.8s ago (window 60.0s)
+   ! --apply would REFUSE now: loop_progress.json: written 0.6s ago (bound 63.5s)
+   ! --apply would REFUSE now: our process alive: 6968 "C:\Windows\system32\cmd.exe" /k title HANG WATCHDOG && echo Watching WORK (log + store advance). Output tees to data\hang_watchdog.log && .venv\Scripts\py
+   ! --apply would REFUSE now: our process alive: 16744 .venv\Scripts\python.exe  tools\ops\hang_watchdog.py run
+   ! --apply would REFUSE now: our process alive: 15460 .venv\Scripts\python.exe  tools\ops\hang_watchdog.py run
+   ! --apply would REFUSE now: our process alive: 26848 "C:\Windows\system32\cmd.exe" /k title BOT (quote mode) && echo Bot running. This window is quiet BY DESIGN - all output goes to data\live_20260905_1213.l
+   ! --apply would REFUSE now: our process alive: 34140 "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoExit -ExecutionPolicy Bypass -File tools\ops\watch_main.ps1 -Log data\live_20260905_1213.lo
+   ! --apply would REFUSE now: our process alive: 2360 "C:\Windows\system32\cmd.exe" /k title FILL PROBER && .venv\Scripts\python.exe tools\diagnostics\fill_prober.py > data\fill_prober_20260905_1213.log 2>&1
+   ! --apply would REFUSE now: our process alive: 7504 "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoExit -ExecutionPolicy Bypass -File tools\ops\watch_prober.ps1 -Log data\fill_prober_20260905
+   ! --apply would REFUSE now: our process alive: 22432 .venv\Scripts\python.exe  -m combomaker.ops.cli run --env prod --mode quote --confirm-live --config config\prod-live-wc.local.yaml
+   ! --apply would REFUSE now: our process alive: 30820 .venv\Scripts\python.exe  -m combomaker.ops.cli run --env prod --mode quote --confirm-live --config config\prod-live-wc.local.yaml
+   ! --apply would REFUSE now: our process alive: 10872 .venv\Scripts\python.exe  tools\diagnostics\fill_prober.py
+   ! --apply would REFUSE now: our process alive: 4392 .venv\Scripts\python.exe  tools\diagnostics\fill_prober.py
+```
+
+Reading the dry-run:
+
+* **The writer is crawling, quantified.** Read-only probe at ~17:15Z: `MAX(decisions.id)` =
+  134,303,838, last `at` = 16:18:16Z. First dry-run at ~17:52Z: 134,304,442, last `at` = 16:18:24Z
+  (**+604 rows in ~37 min ≈ 0.27 rows/s, enqueue stamps spanning 8 s** — draining a queue enqueued
+  at 16:18Z, an hour and a half behind, three orders of magnitude below intake). **Final-tool dry-run at
+  21:24Z (store quiesced since 20:01Z, three more boots at 18:07Z/19:00Z/20:02Z in between): `MAX(decisions.id)` = 134,355,540, last `at` = 19:06:46Z; `rfqs` 66,405,321, last `seen_at` 19:06:46Z — +51,098 decisions / +33,848 rfqs rows since the 17:52Z run, and the last row landed at 15:06 ET on the 15:00 ET boot: the following 55 min of that boot and the 16:02 boot (died 3 s in) left NO tape at all.** The 12:13 boot's `store_writer_stats` went silent
+  because the emit rides the write count (5,000 writes per emit) — a starved writer cannot report
+  starvation.
+* **The 24 h seed window** holds **8,663 `quote_sent` + 5 `confirm` + 0 `decline` rows** (of ~129,738 rows all kinds in the window; 75,604 `rfqs`) against ~400k real sends/day — the tape is ~98%
+  holes, exactly the `acceptance_tape_seed_result` the 12:13 boot logged (7,426 rows scanned). The
+  seed the fresh store boots on is therefore thin either way; what the rotation buys is that the
+  NEXT 24 h are recorded.
+* **Leg provenance:** **166 fills tickers have no `position_ledger` row** (pre-P1.10 legacy, all settled long ago on the exchange) → **134 representative `rfqs` rows carried** (0 conflicting); **32 tickers have no tape row at all** — those unresolvable tickers are reserved from exchange
+  figures today already and will be after (no change).
+* **Carry ≈ 36,194 LIVE rows + ~84,406 tape rows ≈ 120,600 rows / ~21 MB of row text (126 MB by the whole-store average of 1,048 B/row, an upper bound).** Measured on this saturated box: LIVE tables copied into memory in 0.481 s (75,219 rows/s), tape read at 28.8 MB/s (249 B/row) → `copy_time_s_estimate_read_x3` = 2 s; the whole read-only plan took 942 s on the saturated box → **copy estimate ≈
+  seconds (read × 3)**; the index builds on ~120k rows are sub-second. The rotation's own wall time
+  is seconds; the downtime is STOP_BOT + START_BOT + the bot's boot (~2–3 min per the 8/26 and 9/4
+  relights). **≈ 3–5 min end to end.** Not carried: ~203.8M tape rows (the archive).
+* **The retention alternative on THIS store (read-only plan, §5b):** window **172,812.056 s** = reader 86,400 + cadence 86,400 + **measured disorder 12.056 s** (the largest backward `seen_at` step over the newest 25,000 `rfqs` rows; `decisions` and `would_quotes_inplay` measure 0.000 s — their `at` is stamped at record time). Cutoff 2026-09-03T21:23:45Z. Rows older than the window: **`rfqs` 66,295,869 (ids 1..66,295,869), `decisions` 134,174,704, `would_quotes_inplay` 3,252,990**; `rfq_deletions`/`would_quotes` empty. **Protected: 134 `rfqs` rows for 166 fills tickers (0 conflicting, 32 unresolvable) — exactly the set the rotation carries** (one function). One pass: 25,000-id batches, ≤ 17,280 per pass, interrupted at 5.0 s. The measured
+  disorder is the term that makes the window derived rather than set: `rfqs.seen_at` is stamped at
+  worker pickup and recorded after dispatch, so consecutive ids can carry time stamps a few
+  seconds out of order — the bisection's boundary error, measured on the newest 25k rows of each
+  table and added to the window.
+* **Refusals that fire now** (all correct): the three liveness files beaten < 1 s ago, our
+  processes by the launch-site predicate (bot, watchdog, prober, monitors), the live WAL's frames
+  (expected; `--apply` checkpoints it), and the **two foreign WALs**: `D:\kct-vdata\…-wal` 5,700
+  frames / checkpoint_seq 8 (Aug 1) and `…\vitals_snapshot\…-wal` 49 frames / checkpoint_seq 1
+  (written today 08:22–09:04 ET). Whoever opened the store through `vitals_snapshot\` today wrote
+  49 frames the live bot has never seen; they are not in the main file (its WAL checkpoint_seq is
+  far past 1, so replaying them later would be wrong either way). Operator action before `--apply`:
+  move both `-wal`/`-shm` pairs aside (keep them for forensics), delete the two extra hard links.
+* `would_quotes` and `rfq_deletions` are empty on the live store (the recorders are not wired).
+
+### 5b. Final-tool dry-run (READ-ONLY, LOW priority, bot DOWN) — 17:23–17:28 ET, 256.5 s
+
+```
+== STORE D:\kalshi-combos-TWO-data\combomaker-prod-live-wc.sqlite3
+   199.1 GiB  pages 52,201,741 x 4096  freelist 0  journal wal  hard links 3
+   WAL: 0 B / 0 frames   SHM: 32.0 KiB
+   OTHER NAME D:\kct-vdata\combomaker-prod-live-wc.sqlite3  wal=23484032 B / 5700 frames  shm=65536
+   OTHER NAME D:\kalshi-combos-TWO-data\vitals_snapshot\combomaker-prod-live-wc.sqlite3  wal=201912 B / 49 frames  shm=294912
+   LIVE fills 4,345 / position_ledger 4,112 / ev_ledger 4,340 / markouts 22,645 / structural_fits 959 / store_meta 2 / daily_ruin_anchors 2
+   TAPE decisions ids [1, 134355540] .. 2026-09-05T19:06:46Z   rfqs ids [1, 66405321] .. 19:06:46Z   would_quotes_inplay [1, 3253837]
+== SEED WINDOW 86400 s (cutoff 2026-09-04T21:23:57Z): decisions first_id 134174705 quote_sent 13,362 / confirm 5 / decline 0
+   (of ~180,836 all kinds); rfqs first_id 66295870 ~109,452 rows
+== LEG PROVENANCE: 166 fills tickers without a ledger row -> 134 rfqs rows carried; conflicting 0; unresolvable 32
+== MEASURED: live 36,405 rows in 0.341 s (106,903 rows/s); tape 25.3 MB/s, 249 B/row
+== ESTIMATE: live 36,405 + tape 122,953 rows; ~30.6 MB row text (167 MB by the whole-store average); copy ≈ 4 s (read x3)
+== RETENTION ALTERNATIVE (dark): window 172812 s = reader 86400 s + cadence 86400 s + measured disorder 12.056 s
+   (cutoff 2026-09-03T21:23:45Z; batch 25,000 ids, <= 17,280 batches/pass, batch bound 5.0 s)
+   rfqs                 prune_below_id 66295870   ~66,295,869 rows older than the window  (disorder 12.056 s)
+   decisions            prune_below_id 134174705  ~134,174,704 rows                        (disorder 0.000 s)
+   would_quotes_inplay  prune_below_id 3252991    ~3,252,990 rows                          (disorder 0.000 s)
+   protected rfqs rows (leg provenance): 134
+== REFUSALS THAT WOULD FIRE NOW
+   ! D:\kct-vdata\...: hard link of the store with its OWN WAL of 5700 frames (checkpoint_seq 8)
+   ! D:\kalshi-combos-TWO-data\vitals_snapshot\...: hard link of the store with its OWN WAL of 49 frames (checkpoint_seq 1)
+   ! store has 3 hard link(s) (expected exactly 1) — other names [kct-vdata, vitals_snapshot]; after the
+     rename every other name would silently point at the ARCHIVE; delete the extra links before rotating
+plan computed in 256.5 s          (liveness refusals: NONE — the bot is down; no heartbeat, no process)
+```
+
+Reading it: with the bot down the three liveness signals are absent and the process probe finds nothing,
+so **only the file refusals stand between the operator and the rename** — the hard-link COUNT refusal
+(must-fix #1) is the one that matters today, not the foreign-WAL one. The seed window now holds 13,362
+`quote_sent` rows (8,663 at 13:52 ET) — the 14:07/15:00 boots' tape — still ~97% holes against real sends.
+The live WAL is 0 bytes (clean close at 16:01 ET), so the TRUNCATE step would fold 0 frames.
+
+## Review fixes (2026-09-05 evening fix pass — verdict SHIP_WITH_FIXES, all applied)
+
+| # | Finding (reviewer) | Fix | Proof |
+|---|---|---|---|
+| must-fix 1 | `--apply` refused only on a foreign WAL with frames; `hard_link_names()` degrades to a NOTE with `other_names=[]` when `fsutil` fails, so a 3-name inode passed silently (fail-open). After the rename the other names become names of the ARCHIVE. | `hard_link_refusals()`: refuse unless `st_nlink == 1` (from `os.stat`, independent of `fsutil`; 0 = stat failed = refuse). Wired into `rotate()` step 2 AND the dry-run's `refusals_now` (the live run above prints it). | `test_refuses_any_other_hard_link_even_without_a_foreign_wal` (real `os.link`, no WAL), `test_hard_link_refusal_never_fails_open_when_names_cannot_be_enumerated` (fsutil failure simulated: the old gate passes, the new one refuses; 0 refuses; 1 passes) |
+| must-fix 2 | Rename-FIRST left the live name absent for the whole build; a hard kill there ⇒ the next START_BOT's `Store.open` creates an EMPTY store at the live name and boots with zero ledger — silent, past every gate. | Reordered: refuse → checkpoint → **build from the LIVE name over a read-only ATTACH at a temp name → verify → `os.rename(store, archive)` → `os.replace(temp, store)`**. The live name is absent for two syscalls; a failed first rename (open handle, WinError 32) moves nothing; a failed second rename renames the archive straight back; a build failure removes the temp and touches nothing. Stale `.rotating-*` temps from a killed run are removed and named in the manifest. | `test_build_reads_the_live_name_and_a_failed_swap_renames_the_archive_back` (spy: the build sees the live name present and no archive; `os.replace` failure ⇒ archive back, FAILED manifest with ROLLED BACK; then a clean run's manifest orders build < rename < swap), `test_failed_build_leaves_the_live_store_untouched_and_never_renamed`, `test_a_temp_left_by_a_killed_earlier_run_is_removed_before_building` |
+| should-fix 1 | The batch time bound was POST-HOC: a slow batch held the write lock for its whole duration before the check; the bot's synchronous confirm-path `record_fill`/`record_position_open` (BUSY_TIMEOUT 5 s) would fail 'database is locked' ⇒ a confirmed fill without a ledger row. | `_arm_batch_deadline()`: SQLite's progress handler (polled every 10,000 VM ops — a granularity, not a bound) interrupts the DELETE the moment the clock passes `tb + STORE_OP_TIMEOUT_S`; SQLite rolls the ENTIRE transaction back on an interrupted DML statement (documented; the guard is `con.in_transaction`), so an interrupted batch has no partial effect; the pass stops with `stopped_reason = "batch interrupted at STORE_OP_TIMEOUT_S …"`, `batches` counts the attempt, `rows_deleted` does not. The post-hoc check stays as a second line. | `test_batch_deadline_interrupts_a_running_delete_and_frees_the_lock` (200k-row DELETE with the deadline already past ⇒ `OperationalError: interrupted`, `not con.in_transaction`, another writer gets `BEGIN IMMEDIATE` at once, 200k rows intact), `test_pass_interrupts_a_slow_batch_at_the_bound_and_rolls_it_back` (a REAL interrupt through `run_prune_pass`, polled every op; nothing deleted; lock free; the same pass completes with the real bound) |
+| should-fix 2 | `connect_rw` auto-checkpointed (PASSIVE after any commit growing the WAL past 1000 pages — every 25k-row batch) inside the measured batch time and against the writer's cadence; the doc's "never checkpoints in-process" was false. | `PRAGMA wal_autocheckpoint=0` on the prune connection; docs corrected. Consequence handled: `prune_tape.py --apply` (bot DOWN, nobody else checkpoints) now checkpoints PASSIVE after EVERY pass, not once at the end — the WAL is bounded by one pass. | `test_connect_rw_never_auto_checkpoints` (a 60k-row commit leaves a WAL > 1000 pages), CLI test asserts one checkpoint per pass |
+| should-fix 3 | `protected_rfq_ids` excluded any ticker with ANY ledger row, but `Store._ledger_legsets` skips rows whose `legs_json` is empty and consults the tape — those tape rows were neither carried nor protected. | Predicate parity: `NOT IN (SELECT combo_ticker FROM position_ledger WHERE legs_json IS NOT NULL AND legs_json != '')` (the DDL is `NOT NULL`, so only `''` can occur). Docstring states the MIN(id)-row `collection_ticker` vs `MAX(collection_ticker)` equivalence (one collection per market_ticker). | `test_ledger_row_with_empty_legs_json_keeps_tape_provenance_through_rotation` (`held_positions` answers `rfqs_tape` before AND after, the 3-day-old row id 1 carried), `test_protected_set_mirrors_the_ledger_readers_empty_legs_json_predicate` (protected + survives a full prune) |
+| should-fix 4 | `match="checkpointed\|ALIVE\|REFUSED"` accepted any refusal; no positive-path test with frames in the WAL. | `match="could not be fully checkpointed"`; new hard-kill test: db + wal snapshotted while the writer is open (main file pre-commit, WAL holds the commit), rotated: busy 0, `frames_before` > 0, WAL 0 bytes after, the WAL-only row carried into the fresh store. **Found on the way:** a successful `wal_checkpoint(TRUNCATE)` reports `(0, 0, 0)` however many frames it folded (the counters are read after the header reset — the reviewer's "631 frames → log 0" probe and mine agree), so the tool's `checkpointed != wal_frames` clause was vacuous on success; `checkpoint_truncate` now records `frames_before` from the WAL header read before the pragma and the manifest step says how many frames were folded. | `test_checkpoint_folds_a_hard_killed_wal_and_the_rotation_carries_its_rows` |
+| should-fix 5 | `connect_ro(timeout_s=5.0)` literal; `next_steps` printed `REPO / 'START_BOT.bat'` = the checkout the TOOL ran from (a worktree has no `.venv`). | `connect_ro` waits `BUSY_TIMEOUT_MS / 1000` (the store's own tolerance); step 1 names "START_BOT.bat at the root of the LIVE checkout — the repo whose .venv launched the bot (this tool ran from …; a worktree is NOT the live checkout)". | existing next_steps test |
+| should-fix 6 | Live RETENTION numbers still "owed"; README claimed the dry-run printed the prune's plan. | The FINAL tool's dry-run executed (bot down, 256.5 s): §5b above, §5/§6 placeholders filled; README row corrected. Hard-link facts independently re-verified this pass by `ls -la`: link count 3; `kct-vdata` -wal 23,484,032 B (Aug 1); `vitals_snapshot` -wal 201,912 B (09:04 ET today); live -wal 0 B since 16:01 ET. | this section |
+
+Blast radius of the fix pass: `tools/ops/rotate_store.py`, `tools/ops/prune_tape.py`, `src/combomaker/ops/tape_retention.py`
+(dark module; no live caller without the flag), the two test files, this report + README. No pricing / risk / rfq / sim
+/ quote_app / persistence edit (rule 8 untouched). Gates on the final tree: suite **4085/0** (3 deselected, 320.28 s, exit 0); vitals fast **8/8 GREEN (GATE PASS, 104.8 s)**;
+`ruff check` clean on every touched file; `mypy --strict` clean on `ops/tape_retention.py`.
+
+Operational fact from the pass (not a branch defect): **the bot has been DOWN since 16:02 ET** — `live_20260905_1602.log`
+ends at 16:02:08 ET two lines after an `adaptive_caps_slate_count_failed` traceback (`rest.get_markets`), the watchdog's
+last line is 16:02:11, no combomaker / watchdog / prober process exists, the three liveness files are absent, the store's
+-wal has been 0 bytes since 16:01. Nothing is relighting. The relight decision is owed to the operator; with the bot
+already down, the rotation needs no STOP_BOT step — only the two foreign WAL/SHM pairs moved aside and the two extra
+hard links deleted (the tool refuses on both).
+
+## 6. The ALTERNATIVE — BUILT DARK: cap the recorder tables by a DERIVED retention window + nightly prune
+
+**What it is.** `src/combomaker/ops/tape_retention.py` + `tools/ops/prune_tape.py` +
+`observe.tape_retention_enabled` (default `false`).
+
+```
+ retention_s = max(reader windows)   SEED_WINDOW_S (86,400) — the longest boot-time tape reader
+             + PRUNE_CADENCE_S       86,400 — one pass per NIGHT (the anchors are per-night
+                                     quantities; the seed window is the night); a pass may land
+                                     anywhere in its period, so the row a reader needs at the END
+                                     of the period was window+cadence old when the pass at its
+                                     START ran
+             + measured disorder     the largest BACKWARD step of the time column over the newest
+                                     25k rows of each tape table (rfqs.seen_at is a pickup stamp
+                                     recorded after dispatch) — the bisection's boundary error
+                                     = 172,812.056 s on the live store today (17:23 ET run: rfqs 12.056 s,
+                                       decisions 0.000 s, would_quotes_inplay 0.000 s over 25k rows each)
+
+ protected  = one real rfqs row per distinct (market_ticker, legs_json) for every fills ticker
+              without a position_ledger row — Store.held_positions' tape fallback; the SAME
+              function the rotation carries (134 rows today)
+
+ pass       = plan read-only on a SECOND stdlib connection (never the aiosqlite writer thread)
+              for each tape table: start at the first UNPROTECTED id, delete [lo, lo+25k) at a
+              time (acceptance_seed._CHUNK_IDS — the seed's own chunk), each batch its own
+              BEGIN IMMEDIATE / COMMIT, split around protected ids; stop when
+                * should_continue() is false  (the app passes "writer queue empty"),
+                * a batch REACHES STORE_OP_TIMEOUT_S (5 s — the writer's own lock tolerance):
+                  SQLite's progress handler interrupts the DELETE at the bound, SQLite rolls the
+                  whole transaction back, the pass stops ⇒ "store too slow to prune live" — the
+                  lock is never held past the bound (review should-fix #1; the first cut checked
+                  the time only AFTER the batch had held the lock for its whole duration),
+                * PRUNE_CADENCE_S / STORE_OP_TIMEOUT_S = 17,280 batches (a pass never outlasts
+                  its own period, so passes never overlap)
+ scheduler  = TapeRetentionStep: DUE when no pass has COMPLETED within the cadence (an
+              incomplete pass re-arms next minute — bounded leftover, keeps trying against an
+              idle writer); SINGLE-FLIGHT; launched only while Store.writer_queue_depth() == 0;
+              asyncio.to_thread; errors log + retry; called from quote_app._maintenance_loop
+              every 120 ticks (~60 s, the metadata-flush / capacity-probe cadence) ONLY when
+              self._tape_retention is not None (constructed under the flag in run()).
+```
+
+**What it does NOT do.** `DELETE` returns pages to the freelist: the FILE does not shrink — that is
+the rotation's job, once. It stops the store growing past ~2 days of tape (≈ 7–8 GB at today's
+flow), so the B-trees the writer inserts into stay small forever and no further rotation is needed.
+Never `VACUUM` the live store (a rotation-sized outage with none of the rotation's safety).
+
+**Why it is the SECOND step, never the first (and why the mechanism enforces that):** on the
+213 GB store a 25k-id `DELETE` touches ~25k random leaf pages across four indexes on a saturated
+disk — far over the 5 s batch bound — so the first batch is interrupted at the bound and ends the pass with
+`stopped_reason = "batch interrupted at STORE_OP_TIMEOUT_S 5.0s …"` (nothing deleted, nothing held) and the scheduler retries next minute (each
+retry one bounded batch, only while the writer is idle, which on the collapsed store it never is).
+Arming the flag today would therefore do (almost) nothing, by construction; after the rotation the
+same pass deletes a night's tape in ~150 batches of milliseconds. No knob changes between the two:
+the store's own timeout is the judge.
+
+**Tests (`tests/test_tape_retention.py`, 13):** the window pins (`= SEED_WINDOW_S + PRUNE_CADENCE_S
++ disorder`, negative disorder cannot shrink it; batch = `_CHUNK_IDS`; cap = cadence / timeout); the
+disorder measurement on a crafted out-of-order tape (9 s against the running max; 0 for monotone;
+empty table); the plan's bisection on a 3-day hourly synthetic tape (48 h window ⇒ exactly the
+oldest 24 h below the bound; empty tables never error; protected ids all inside the prune range);
+a full pass deletes exactly the older rows, keeps every protected row, preserves ids, leaves the
+ledgers untouched, and **the acceptance seed and `held_positions` (through the real `Store`) answer
+identically before and after**; a second pass finds nothing; the bounds (predicate false ⇒ 0
+batches; `max_batches=2` ⇒ 2 and resumable; a batch over the time bound ⇒ stop with the reason;
+small batches ⇒ completes, starting past the protected prefix); `_delete_range` splits one batch
+around protected ids; the scheduler (writer busy ⇒ no launch; launched ⇒ in_flight ⇒ not_due until
+the cadence; an incomplete pass re-arms; a raising pass logs and re-arms; close cancels);
+`Store.writer_queue_depth()`; the dark default + a source pin that `QuoteApp.run` constructs the
+step only under `config.observe.tape_retention_enabled` and `_maintenance_loop` only ever calls
+`maybe_launch()` behind `is not None` and never awaits it; the CLI dry-run is read-only and `--apply`
+refuses a live heartbeat; `--apply` prunes to completion when the bot is down.
+
+**A third option considered and rejected:** moving `rfqs`/`decisions` to a second database file
+(ATTACH) so the ledgers live in a small file — it changes `Store` (rule 8 port + parity, a live
+pricing-path module's dependency), and the tape writer would still bloat the second file: same
+problem, one file over.
+
+## 7. What was NOT done / limits
+
+* `--apply` was not run (operator-gated by the task); `prune_tape.py --apply` was not run either
+  (it refuses while the bot is alive, and the live store is the wrong place to start it).
+* The tool does not stop/start the bot or the watchdog; STOP_BOT/START_BOT remain the operator's
+  buttons (the watchdog must die first — STOP_BOT does that; a watchdog alive during the rotation
+  would relight into a renamed store).
+* `would_quotes_inplay` is not carried (no boot reader); the in-play study continues in the fresh
+  store from zero, the archive holds the 3.25M rows. The prune treats it as tape (pruned).
+* The prune is DARK and untested live; its first arming should be watched for one night
+  (`tape_retention_pass` log line: `complete`, `batches`, `rows_deleted`, `slowest_batch_s`,
+  `stopped_reason`).
+* Analysis tools with `DEFAULT_STORE = D:/…/combomaker-prod-live-wc.sqlite3` hard-coded (38 files
+  under `tools/`) will read the FRESH store after rotation and must be pointed at the archive with
+  their `--store`/`--db` flags for history.
+
+## NEXT STEPS
+
+* **Operator (decision owed):** approve the rotation window — and the RELIGHT (the bot is DOWN since
+  16:02 ET). Sequence: (`STOP_BOT.bat` only if it was relit meanwhile) → move
+  aside the two foreign `-wal/-shm` pairs (`D:\kalshi-combos-TWO-data\vitals_snapshot\`,
+  `D:\kct-vdata\`) and delete those two extra hard links (the tool REFUSES on the link count and on
+  a foreign WAL — both must be gone) → `PYTHONPATH=src python
+  tools/ops/rotate_store.py --apply` (main after merge) → follow the printed NEXT STEPS
+  (`START_BOT.bat` → first-window verify: sends/min in the 300–460 band, `store_writer_stats` queue
+  near 0 / dropped 0, `acceptance_tape_seed_result` rows_scanned in the hundreds of thousands,
+  `retained_floor_sweep_timeout` gone → `rotate_store.py --verify --manifest
+  data/backups/<stamp>-rotate_store_manifest.json`).
+* **Operator (after one clean rotation window):** arm the prune with ONE yaml line under `observe:`
+  — `tape_retention_enabled: true` — at the next restart; watch the first `tape_retention_pass`.
+* **Builder (after merge):** a `store_writer_stats` emit on a TIME cadence as well as the write
+  cadence (the 12:13 boot's writer went silent for an hour with no emit because emits ride the
+  write count — a starved writer cannot report that it is starved).
+* **Vitals owner:** `daily_ruin_anchors` is written by nothing since 7/16; the gate's bankroll is
+  stale ($2,050.41 vs ~$7.3k equity) — either wire the anchor writer or read `balance.py`'s
+  anchor.
+* **Orchestrator:** merge `build/store-rotation-tool`; the report index row is in
+  `docs/reports/README.md`; yaml for main: `observe:` / `  tape_retention_enabled: false`
+  (documenting the dark default — optional, the code default is already false).

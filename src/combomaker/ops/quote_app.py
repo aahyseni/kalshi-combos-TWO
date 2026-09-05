@@ -106,6 +106,7 @@ from combomaker.ops.supervisor import (
     supervisor_heartbeat_reachable,
 )
 from combomaker.ops.telemetry_sampling import SAMPLER as SHADOW_TELEMETRY_SAMPLER
+from combomaker.ops.tape_retention import TapeRetentionStep
 from combomaker.ops.write_budget import TokenBudget, WriteBudget
 from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.fees import FeeModel, FeeType
@@ -1988,6 +1989,11 @@ class QuoteApp:
         self._capacity_probe_ticks = 0
         self._capacity_probe_prev: tuple[int, int] | None = None
         self._limit_checker: LimitChecker | None = None
+        # TAPE RETENTION (2026-09-05, dark): the nightly prune scheduler,
+        # constructed in run() ONLY when ``observe.tape_retention_enabled``;
+        # None = the maintenance loop never touches it (byte-identical).
+        self._tape_retention: TapeRetentionStep | None = None
+        self._tape_retention_ticks = 0
         self._stop = asyncio.Event()
         # OBSERVED rate-limit tier + the READ bucket derived from it (2026-07-26).
         # Both start at the fail-safe FLOOR so any code path that reads them
@@ -2140,6 +2146,15 @@ class QuoteApp:
         # checkpoint on the ~2GB DB was freezing the whole event loop 34s+ during
         # RFQ bursts (2026-07-14 pipeline audit). Fills stay synchronous & durable.
         store.start_writer()
+        if config.observe.tape_retention_enabled:
+            # DARK by default. Off-loop nightly prune of the recorder tape to
+            # the derived reader window (ops/tape_retention.py); gated on an
+            # idle tape writer; errors log and retry — never the quote path.
+            self._tape_retention = TapeRetentionStep(
+                config.data_dir / config.observe.db_name_for(config.env),
+                clock=self._clock,
+                writer_queue_depth=store.writer_queue_depth,
+            )
         ws = WsManager(config.endpoints.ws_url, signer, self._clock, self._metrics)
         # CONFIRM PRIORITY (2026-07-31 double halt): accept/execute frames jump
         # the comms dispatch backlog, and while a confirm is in flight all NEW
@@ -3258,6 +3273,8 @@ class QuoteApp:
                 seed_task = getattr(self, "_acceptance_seed_task", None)
                 if seed_task is not None:
                     seed_task.cancel()
+                if self._tape_retention is not None:
+                    await self._tape_retention.close()
                 for task in tasks:
                     task.cancel()
                 # BOUNDED SHUTDOWN (2026-07-27). Ordered, NAMED stages handed to
@@ -4688,6 +4705,20 @@ class QuoteApp:
                 self._stall_wall_ticks = 0
                 await self._refresh_stall_wall(reason="refresh")
                 await self._refresh_expired_baseline(reason="refresh")
+            # TAPE RETENTION (2026-09-05, dark): on the same ~60s slow cadence,
+            # ask the scheduler whether its nightly pass is due; it launches a
+            # single-flight worker thread only against an idle tape writer.
+            # None (flag off) ⇒ nothing here runs. Errors log and retry.
+            if self._tape_retention is not None:
+                self._tape_retention_ticks += 1
+                if self._tape_retention_ticks >= 120:
+                    self._tape_retention_ticks = 0
+                    try:
+                        outcome = self._tape_retention.maybe_launch()
+                        if outcome == "launched":
+                            log.info("tape_retention_pass_launched")
+                    except Exception:
+                        log.exception("tape_retention_launch_errored")
 
     async def _refresh_stall_wall(self, *, reason: str) -> None:
         """Derive the maintenance loop's stall wall from the MEASURED completed

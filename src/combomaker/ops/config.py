@@ -3657,6 +3657,17 @@ class ObserveConfig(StrictModel):
     rfq_poll_s: float = 30.0          # REST reconciliation cadence (no seq on WS)
     would_quote_width_cc: int = 600   # stub half-spread total ($0.06) for logging only
     db_filename: str = ""             # "" = auto: combomaker-{env}.sqlite3
+    # TAPE RETENTION (2026-09-05, store-rotation design item 7 — the
+    # alternative to rotating). True ⇒ quote_app runs ONE bounded prune pass
+    # per night (``ops/tape_retention.py``) deleting ``rfqs``/``decisions``/
+    # ``would_quotes*`` rows older than the DERIVED window (longest boot-time
+    # reader window + the pass cadence + the tape's measured time disorder),
+    # never a protected leg-provenance row, only against an idle tape writer,
+    # off-loop on a second connection. False (default) = byte-identical: no
+    # connection, no read, no thread. Arm on a store that has been rotated
+    # small (the pass refuses to press on when a batch outlasts the writer's
+    # lock tolerance — on the 213 GB store it would stop at the first batch).
+    tape_retention_enabled: bool = False
 
     def db_name_for(self, env: Env) -> str:
         # Demo and prod data must never share a store — shadow analytics on
