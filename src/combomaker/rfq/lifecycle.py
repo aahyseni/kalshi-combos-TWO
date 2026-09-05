@@ -32,7 +32,7 @@ from collections.abc import Set as AbstractSet
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from fractions import Fraction
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 from combomaker.core.clock import Clock
 from combomaker.core.conventions import Conventions, Side
@@ -104,6 +104,7 @@ from combomaker.risk.concentration_steer import (
     SteerCenter,
     build_loss_event_book,
 )
+from combomaker.risk.confirm_expired_rate import judge_expired_rate
 from combomaker.risk.deploy_scale import FAILSAFE as DEPLOY_SCALE_FAILSAFE
 from combomaker.risk.deploy_scale import (
     DeployScaleResult,
@@ -378,6 +379,138 @@ _FILL_RECOVERY_MAX_ATTEMPTS = 10
 _MAINTENANCE_POLL_TIMEOUT_S = 2.5
 # Pages the fills-ledger diff walks per sweep.
 _FILLS_SWEEP_MAX_PAGES = 3
+
+# ── CONFIRM-FAILURE CLASSES (2026-09-05 build, item A) ────────────────────────
+# ``halt_confirm_timeouts`` fired EIGHT times on 2026-09-05 (04:50Z on the 2103
+# boot, 13:04Z, 13:41Z, 15:40Z, 16:11Z, 18:45Z, 18:59Z, 20:00Z) and both
+# 2026-07-31 halts — every one on ``KalshiApiError('HTTP 400 expired:
+# expired')``: the exchange reporting that the TAKER's accept window lapsed
+# before our confirm landed. In 25/25 cases today the reservation reconcile
+# then RELEASED the headroom (no position on the exchange), so an
+# exchange-expired accept is a LOST AUCTION, not a failure of ours to confirm
+# and never an unknown-committed position. It is classified apart (metric
+# ``confirm.expired_by_exchange`` + a WARNING carrying the in-handler and
+# round-trip timings) and is NEVER counted toward the halt. NOTE (review
+# 2026-09-05): the live ``quote_accepted`` frame carries NO exchange timestamp,
+# so "the accept reached us late" is inferred from our own WS receive stamp —
+# ``dispatch_delay_ms`` measures only the part AFTER that stamp. The RATE of
+# expired accepts is therefore still judged (``_judge_confirm_expired_rate``,
+# risk/confirm_expired_rate.py) as a fact about our own delivery path.
+#
+# The halt counts only OUR failures — a timeout (the outcome is unknown), a
+# connection error, an HTTP 5xx, or any other refusal (a 4xx that is not
+# ``expired`` is a definitive answer about OUR request: 401/403/429/insufficient
+# balance — kept on the strict side because no such population has ever been
+# taped) — and counts them CONSECUTIVELY: a successful confirm resets the
+# counter (the 7/31 addendum measured the old counter as cumulative-per-run —
+# three "consecutive" failures 3h10m apart with clean confirms between them).
+# An exchange-expired accept neither counts nor resets: it is orthogonal to
+# whether we can confirm.
+CONFIRM_EXPIRED_BY_EXCHANGE = "expired_by_exchange"
+CONFIRM_FAILURE_TIMEOUT = "timeout"
+CONFIRM_FAILURE_CONNECTION = "connection_error"
+CONFIRM_FAILURE_SERVER = "server_error"
+CONFIRM_FAILURE_REFUSED = "refused"
+CONFIRM_FAILURE_OTHER = "other"
+# The exchange's error code on a confirm that arrives after the taker's accept
+# window closed — the exact string in every live 400 body since 2026-07-31.
+EXCHANGE_EXPIRED_CODE = "expired"
+# Consecutive OWN failures that halt (the rule's existing count, now named).
+CONFIRM_HALT_CONSECUTIVE = 3
+
+
+def classify_confirm_failure(exc: BaseException) -> str:
+    """Name what a failed ``confirm_quote`` round trip actually was.
+
+    Exactly one class is exonerated from the halt: ``HTTP 400 expired`` —
+    status 400 AND code ``expired`` (both; a different 400 is a refusal of OUR
+    request). Every other exception is ours: unknown outcome (timeout),
+    unreachable (connection), exchange fault (5xx) or a definitive refusal
+    (any other ``KalshiApiError``). Unknown exception types are ``other`` and
+    COUNT — the strict side."""
+    if isinstance(exc, KalshiApiError):
+        if exc.status == 400 and exc.code == EXCHANGE_EXPIRED_CODE:
+            return CONFIRM_EXPIRED_BY_EXCHANGE
+        if exc.status >= 500:
+            return CONFIRM_FAILURE_SERVER
+        return CONFIRM_FAILURE_REFUSED
+    if isinstance(exc, TimeoutError):
+        return CONFIRM_FAILURE_TIMEOUT
+    if isinstance(exc, ConnectionError | OSError):
+        return CONFIRM_FAILURE_CONNECTION
+    return CONFIRM_FAILURE_OTHER
+
+
+def confirm_failure_counts_toward_halt(kind: str) -> bool:
+    return kind != CONFIRM_EXPIRED_BY_EXCHANGE
+
+
+_T = TypeVar("_T")
+
+
+class _TickLaps:
+    """Per-sub-step timing + progress for one maintenance tick (2026-09-05).
+
+    ``lap(name)`` records the wall time since the previous lap into
+    ``maintenance.step_ms.<name>`` and MARKS PROGRESS (the loop's beat), so
+    the supervisor sees the loop advance BETWEEN sub-steps, not only at the
+    top of the tick. ``finish`` records the whole tick and logs
+    ``maintenance_tick_slow`` — with the step breakdown — when the tick
+    outlived the measured healthy sub-step bound (the same quantile the store
+    awaits are bounded by), so the next slow-pass diagnosis names its step
+    instead of inferring it from silence."""
+
+    __slots__ = ("_beat", "_clock", "_last_ns", "_metrics", "_start_ns", "steps")
+
+    def __init__(self, clock: Clock, metrics: Metrics, beat: Callable[[], None]) -> None:
+        self._clock = clock
+        self._metrics = metrics
+        self._beat = beat
+        self._start_ns = clock.monotonic_ns()
+        self._last_ns = self._start_ns
+        self.steps: list[tuple[str, float]] = []
+
+    def __call__(self, name: str) -> None:
+        now = self._clock.monotonic_ns()
+        ms = (now - self._last_ns) / 1e6
+        self._last_ns = now
+        self.steps.append((name, ms))
+        self._metrics.observe_ms(f"maintenance.step_ms.{name}", ms)
+        self._beat()
+
+    def finish(self, slow_after_s: float, wall_s: float | None = None) -> float:
+        """Record the whole pass. ``slow_after_s`` is the sub-step bound (the
+        pass is SLOW past it); ``wall_s`` is the supervisor's APPLIED wall —
+        a pass over THAT is ``maintenance.tick_over_wall`` (review should-fix
+        #4): because progress is marked between sub-steps, the supervisor no
+        longer bounds the pass as a whole (a 5 × 60 s tick with every sub-step
+        under the wall reads healthy to it), so the tick counts it here and
+        the tape shows it."""
+        total_ms = (self._clock.monotonic_ns() - self._start_ns) / 1e6
+        self._metrics.observe_ms("maintenance.tick_ms", total_ms)
+        over_wall = wall_s is not None and total_ms > wall_s * 1000.0
+        if over_wall:
+            self._metrics.inc("maintenance.tick_over_wall")
+        if total_ms > slow_after_s * 1000.0 or over_wall:
+            self._metrics.inc("maintenance.tick_slow")
+            log.warning(
+                "maintenance_tick_slow",
+                tick_ms=round(total_ms, 1),
+                slow_after_s=round(slow_after_s, 3),
+                wall_s=None if wall_s is None else round(wall_s, 3),
+                over_wall=over_wall,
+                steps={name: round(ms, 1) for name, ms in self.steps},
+                detail="a maintenance pass outlived the measured healthy sub-step "
+                "bound — the step breakdown names where the time went"
+                + (
+                    "; the WHOLE pass also outlived the supervisor's wall, which "
+                    "no longer bounds a pass whose sub-steps each mark progress"
+                    if over_wall
+                    else ""
+                ),
+            )
+        return total_ms
+
 
 # ── OFF-LOOP ALARM-ONLY SWEEPS (2026-07-26, the 20:12:24Z maintenance stall) ──
 # The maintenance loop owns TTL expiry, the enforced limit/halt check and the
@@ -1360,6 +1493,14 @@ class OpenQuoteState:
     # once-per-state "write stalled" warning already fired.
     fill_write_started_mono_ns: int | None = None
     fill_write_stall_alarmed: bool = False
+    # LATE LANDING (review fix 2026-09-05, should-fix #3): the ``record_fill``
+    # INSERT for this quote outlived its bound (``store.await_timeout.
+    # record_fill``). The cancelled statement may still LAND on the connection
+    # thread, so the next replay that finds the row present treats it as THIS
+    # state's row landing late — runs the post-insert tail (fee / fill.count /
+    # markout) and starts execution verification — instead of a replay skip
+    # that would leave the row unverified until the fills-ledger diff.
+    fill_record_timed_out: bool = False
 
 
 @dataclass
@@ -1438,6 +1579,10 @@ class QuoteLifecycle:
         withdraw_budget: WriteBudget | None = None,
         quote_lister: QuoteLister | None = None,
         read_budget: TokenBudget | None = None,
+        sub_step_bound_s: Callable[[], float | None] | None = None,
+        taint_progress_gap: Callable[[], None] | None = None,
+        stall_wall_s: Callable[[], float | None] | None = None,
+        confirm_expired_baseline: Callable[[], tuple[int, int, int] | None] | None = None,
     ) -> None:
         self._clock = clock
         self._sender = sender
@@ -1745,6 +1890,27 @@ class QuoteLifecycle:
         # event-loop wedge still cannot beat (the fail-closed signal survives).
         # None (tests/backtests) ⇒ no-op.
         self._beat_cb = beat
+        # BOUNDED STORE AWAITS (2026-09-05, item 6): the per-sub-step bound for
+        # every direct store await on the maintenance path, DERIVED by
+        # quote_app from the same measured gap distribution as the supervisor's
+        # stall wall (``wall / MARGIN``). None / no derivation yet ⇒ the
+        # store's own one-op primitive (``STORE_OP_TIMEOUT_S``).
+        self._sub_step_bound_s_cb = sub_step_bound_s
+        # TAINT (review fix 2026-09-05, must-fix #1): tells the progress
+        # ledger that the maintenance loop's gap IN PROGRESS contained a
+        # timed-out store await, so that gap is never recorded as a healthy
+        # completed gap (it "completed" only because the bound expired — the
+        # positive-feedback path from the bound into the wall). None ⇒ no-op.
+        self._taint_progress_cb = taint_progress_gap
+        # The APPLIED stall wall (the supervisor's kill bound for the
+        # maintenance loop) for ``maintenance.tick_over_wall`` (should-fix
+        # #4): with progress marked between sub-steps the supervisor no
+        # longer bounds the whole pass, so the tick counts it itself.
+        self._stall_wall_s_cb = stall_wall_s
+        # EXPIRED-ACCEPT RATE baseline (should-fix #5): pooled (expired,
+        # confirmed, boots) of the retained prior boots, from quote_app's
+        # tape. None ⇒ the rate is never judged (no baseline, no verdict).
+        self._confirm_expired_baseline_cb = confirm_expired_baseline
         # F2 MID-PIPELINE LIVENESS (throughput synthesis 2026-07-16): "is this
         # RFQ still open on the exchange stream?" — wired to the intake's
         # liveness view (``intake.rfq_alive``: open registry + disconnect-
@@ -6195,7 +6361,12 @@ class QuoteLifecycle:
             raise
 
     async def _on_quote_accepted(self, msg: JsonDict) -> None:
-        t0 = self._clock.monotonic_ns()
+        # Handler entry, kept apart from ``t0`` (which the honest anchor below
+        # may move back to the WS receive stamp) so a failed confirm can report
+        # the DISPATCH delay (receive → handler) and the whole accept → confirm
+        # latency as two numbers (2026-09-05 item A: loop stalls visible).
+        handler_entry_ns = self._clock.monotonic_ns()
+        t0 = handler_entry_ns
         # HONEST DEADLINE ANCHOR (2026-07-31 double confirm-expiry halt). The
         # exchange's confirm window (EXCHANGE_CONFIRM_WINDOW_NS, a protocol
         # fact) opens at the taker's accept — BEFORE this frame crossed the
@@ -6474,6 +6645,13 @@ class QuoteLifecycle:
                     "confirm.rtt_ms", (self._clock.monotonic_ns() - rtt0) / 1e6
                 )
                 self._metrics.inc("confirm.sent")
+                # CONSECUTIVE IN FACT (2026-09-05, item A): a successful confirm
+                # resets the halt counter. Before this line the counter was
+                # cumulative per run — the 7/31 addendum measured three
+                # "consecutive" failures 3h10m apart with clean confirms
+                # between them, and today's 00:52 boot halted on its 3rd
+                # exchange-expired accept after 104 clean confirms.
+                self._confirm_failures = 0
                 # Once confirmed neither party can withdraw: the position is
                 # REAL now — book it immediately, not at quote_executed
                 # (execution is ~1s later and the channel has no replay).
@@ -6512,19 +6690,73 @@ class QuoteLifecycle:
                 # check inside that window and can evict an innocent same-game
                 # resting quote on a transient breach (2026-07-17 finding).
             except Exception as exc:
-                self._metrics.inc("confirm.failed")
-                self._confirm_failures += 1
-                log.error("confirm_failed", quote_id=quote_id, error=repr(exc))
-                # Confirm TIMED OUT: unknown-committed. ASSUME COMMITTED — keep the
-                # reserved headroom held (mark_unconfirmed) so a possibly-real
-                # position keeps counting against the caps until reconciled against
-                # the exchange. Never release on a lost ack.
+                # CLASSIFY BEFORE COUNTING (2026-09-05, item A — see the
+                # CONFIRM-FAILURE CLASSES block). An exchange-expired accept is
+                # a lost auction, logged with its timings and never counted;
+                # everything else is ours and counts consecutively.
+                kind = classify_confirm_failure(exc)
+                now_ns = self._clock.monotonic_ns()
+                # ``t0`` is the WS receive stamp when the frame carried one
+                # (else handler entry), so this is the whole in-process
+                # accept → confirm-answer latency; ``dispatch_delay_ms`` is
+                # the part spent BEFORE the handler ran (receive → entry: the
+                # event-loop / dispatch-queue stall this build makes visible;
+                # 0 when the frame carried no stamp); the exchange's window
+                # is the protocol fact the two are judged against.
+                accept_to_confirm_ms = (now_ns - t0) / 1e6
+                dispatch_delay_ms = (handler_entry_ns - t0) / 1e6
+                confirm_rtt_ms = (now_ns - rtt0) / 1e6
+                timing: dict[str, float] = {
+                    "accept_to_confirm_ms": round(accept_to_confirm_ms, 1),
+                    "dispatch_delay_ms": round(dispatch_delay_ms, 1),
+                    "confirm_rtt_ms": round(confirm_rtt_ms, 1),
+                    "exchange_window_ms": EXCHANGE_CONFIRM_WINDOW_S * 1e3,
+                }
+                if not confirm_failure_counts_toward_halt(kind):
+                    self._metrics.inc("confirm.expired_by_exchange")
+                    self._metrics.observe_ms(
+                        "confirm.expired_by_exchange.accept_to_confirm_ms",
+                        accept_to_confirm_ms,
+                    )
+                    log.warning(
+                        "confirm_expired_by_exchange",
+                        quote_id=quote_id,
+                        error=repr(exc),
+                        **timing,
+                        detail="the taker's accept lapsed before our confirm landed "
+                        "(exchange HTTP 400 expired) — a lost auction, not a confirm "
+                        "failure of ours; never counted toward halt_confirm_timeouts. "
+                        "accept_to_confirm_ms well inside exchange_window_ms means the "
+                        "accept reached this process late (upstream of the WS stamp). "
+                        "The reservation stays held until the exchange reconcile "
+                        "proves the position absent",
+                    )
+                    self._judge_confirm_expired_rate(quote_id)
+                else:
+                    self._metrics.inc("confirm.failed")
+                    self._confirm_failures += 1
+                    log.error(
+                        "confirm_failed",
+                        quote_id=quote_id,
+                        error=repr(exc),
+                        kind=kind,
+                        consecutive=self._confirm_failures,
+                        **timing,
+                    )
+                # UNKNOWN-COMMITTED posture, unchanged for EVERY class: ASSUME
+                # COMMITTED — keep the reserved headroom held (mark_unconfirmed)
+                # so a possibly-real position keeps counting against the caps
+                # until reconciled against the exchange. Never release on a lost
+                # ack: the reconcile is the prover, not the error code.
                 if self._reservation is not None:
                     self._reservation.mark_unconfirmed(reservation_id)
-                if self._confirm_failures >= 3:
+                if self._confirm_failures >= CONFIRM_HALT_CONSECUTIVE:
                     await self._killswitch.halt(
                         ReasonCode.HALT_CONFIRM_TIMEOUTS,
-                        f"{self._confirm_failures} consecutive confirm failures",
+                        f"{self._confirm_failures} consecutive confirm failures of "
+                        "ours (timeouts / connection errors / HTTP 5xx / refusals; "
+                        "exchange-expired accepts are classified apart and never "
+                        "counted)",
                     )
         else:
             self._metrics.inc(f"confirm.declined.{decision.reason}")
@@ -6869,8 +7101,9 @@ class QuoteLifecycle:
             fill_id = str(fill_id_raw) if fill_id_raw else None
             stamped = False
             try:
-                stamped = await self._store.mark_fill_verified(
-                    fill_ref, exchange_fill_id=fill_id
+                stamped = await self._bounded_store(
+                    "mark_fill_verified",
+                    self._store.mark_fill_verified(fill_ref, exchange_fill_id=fill_id),
                 )
             except Exception:  # noqa: BLE001 — the row exists; the stamp is evidence
                 log.exception("fill_verified_stamp_failed", quote_id=quote_id)
@@ -6949,8 +7182,15 @@ class QuoteLifecycle:
         # ledger — nor double-book the fee into realized P&L / double-count
         # fill.count / markouts. The position booking above stays (idempotent by
         # id); everything from here down runs at most once per fill_ref.
-        if state.fill_recorded or await self._store.has_fill(fill_ref):
+        if state.fill_recorded:
+            log.info("fill_replay_skipped", quote_id=quote_id, fill_ref=fill_ref)
+            return False
+        if await self._bounded_store("has_fill", self._store.has_fill(fill_ref)):
             state.fill_recorded = True
+            if state.fill_record_timed_out:
+                # The row is THIS state's earlier INSERT landing late (review
+                # fix, should-fix #3) — not a replay of a completed write.
+                return self._adopt_late_landed_fill(quote_id, state, msg, fill_ref, via="has_fill")
             log.info("fill_replay_skipped", quote_id=quote_id, fill_ref=fill_ref)
             return False
         # ORDER-ID UNIQUENESS (2026-07-24 review): one exchange order must
@@ -6966,11 +7206,18 @@ class QuoteLifecycle:
         # cross-quote conflict (error). Neither ever books a second row.
         order_id_raw = msg.get("order_id")
         if order_id_raw:
-            existing = await self._store.fill_ref_for_order_id(str(order_id_raw))
+            existing = await self._bounded_store(
+                "fill_ref_for_order_id",
+                self._store.fill_ref_for_order_id(str(order_id_raw)),
+            )
             if existing is not None:
                 existing_ref, existing_status = existing
                 state.fill_recorded = True
                 if existing_ref == fill_ref:
+                    if state.fill_record_timed_out:
+                        return self._adopt_late_landed_fill(
+                            quote_id, state, msg, fill_ref, via="order_id"
+                        )
                     log.info(
                         "fill_replay_skipped",
                         quote_id=quote_id,
@@ -6996,29 +7243,9 @@ class QuoteLifecycle:
         assert state.pending_fill is not None  # caller verified
         accepted_side, bid, qty = state.pending_fill
         our_side = self._conventions.maker_position_side(accepted_side)
-        # Real fill fee from the fee model (defense #3): $0 on a plain
-        # quadratic series, the MEASURED maker fee on a maker-fee series
-        # (the shared observed schedule — 2026-09-04). None only when no fee
-        # model is wired (pre-Phase-6 behaviour) or the fee is UNKNOWN.
-        fill_fee_cc = self._fill_fee_cc(
-            bid,
-            qty,
-            combo_ticker=state.rfq.market_ticker,
-            collection=state.rfq.mve_collection_ticker,
-        )
-        # EXCHANGE-REPORTED FEE OVERRIDE (2026-07-18 verify-before-discard): a
-        # late/taker-style execution recovered off /portfolio/fills carries the
-        # REAL charged fee (both incidents: is_taker=true, nonzero fee_cost) —
-        # the model's maker-quadratic $0 would understate a cash cost we
-        # actually paid. The recovery replay passes it as ``exchange_fee_cc``
-        # (int cc, parsed fail-closed by _exchange_fill_fee_cc); it beats the
-        # model figure. Absent on every normal WS/poll message ⇒ bit-identical
-        # prior behaviour.
-        exchange_fee = msg.get("exchange_fee_cc")
-        exchange_fee_reported = False
-        if isinstance(exchange_fee, int) and not isinstance(exchange_fee, bool):
-            exchange_fee_reported = True
-            fill_fee_cc = int(exchange_fee)
+        # The fee this row BOOKS (model fee, or the exchange-reported fee on a
+        # recovery replay) — see ``_booked_fill_fee_cc``.
+        fill_fee_cc = self._booked_fill_fee_cc(state, msg)
         # THE RECORDED EDGE IS THE SAME NUMBER THE GATES JUDGED (2026-09-04):
         # ``_candidate_edge_cc`` with the fee this row BOOKS — the exchange-
         # reported fee on a recovery replay, else the measured model fee —
@@ -7036,30 +7263,112 @@ class QuoteLifecycle:
             collection=state.rfq.mve_collection_ticker,
             fee_cc=fill_fee_cc,
         )
-        _ = exchange_fee_reported  # evidence only: the booked fee already carries it
-        inserted = await self._store.record_fill(
-            fill_ref,
-            order_id=str(msg.get("order_id")) if msg.get("order_id") else None,
-            combo_ticker=state.rfq.market_ticker,
-            our_side=str(our_side),
-            contracts_centi=int(qty),
-            price_cc=int(bid),
-            fee_cc=fill_fee_cc,
-            expected_edge_cc=expected_edge_cc,
-            raw=msg,
-        )
+        try:
+            inserted = await self._bounded_store(
+                "record_fill",
+                self._store.record_fill(
+                    fill_ref,
+                    order_id=str(msg.get("order_id")) if msg.get("order_id") else None,
+                    combo_ticker=state.rfq.market_ticker,
+                    our_side=str(our_side),
+                    contracts_centi=int(qty),
+                    price_cc=int(bid),
+                    fee_cc=fill_fee_cc,
+                    expected_edge_cc=expected_edge_cc,
+                    raw=msg,
+                ),
+            )
+        except TimeoutError:
+            # LATE LANDING (review fix 2026-09-05, should-fix #3): the bound
+            # expired but the INSERT may still land on the connection thread.
+            # Remember it so the recovery replay that finds the row present
+            # adopts it as ours (post-insert tail + verification) instead of
+            # skipping it as an already-completed write.
+            state.fill_record_timed_out = True
+            raise
         state.fill_recorded = True
         if not inserted:
+            if state.fill_record_timed_out:
+                # The absent-row read raced our own late-landing INSERT.
+                return self._adopt_late_landed_fill(
+                    quote_id, state, msg, fill_ref, via="insert_if_absent"
+                )
             # Store-level INSERT-if-absent caught a WS+poll race that slipped
             # past the has_fill pre-check (both racers read before either
             # wrote): exactly one row exists; this racer books nothing more.
             log.info("fill_replay_skipped", quote_id=quote_id, fill_ref=fill_ref)
             return False
-        # POST-INSERT TAIL IS NOT THE INSERT (2026-09-04 review fixes): the row
-        # EXISTS from here on, so a failure in the fee/metric/markout tail must
-        # never make the caller believe nothing was written — that would leave
-        # the row 'booked' with verification never armed (the sweep skips a
-        # fill_recorded state). Loud, counted, and the insert result stands.
+        state.fill_record_timed_out = False
+        self._post_insert_tail(quote_id, state, fill_ref, fill_fee_cc)
+        return True
+
+    def _booked_fill_fee_cc(self, state: OpenQuoteState, msg: JsonDict) -> int | None:
+        """The fee a fills row for this state BOOKS. Real fill fee from the
+        fee model (defense #3): $0 on a plain quadratic series, the MEASURED
+        maker fee on a maker-fee series (the shared observed schedule —
+        2026-09-04); None only when no fee model is wired (pre-Phase-6
+        behaviour) or the fee is UNKNOWN. EXCHANGE-REPORTED FEE OVERRIDE
+        (2026-07-18 verify-before-discard): a late/taker-style execution
+        recovered off /portfolio/fills carries the REAL charged fee (both
+        incidents: is_taker=true, nonzero fee_cost) — the model's
+        maker-quadratic $0 would understate a cash cost we actually paid. The
+        recovery replay passes it as ``exchange_fee_cc`` (int cc, parsed
+        fail-closed by _exchange_fill_fee_cc); it beats the model figure.
+        Absent on every normal WS/poll message ⇒ the model figure."""
+        assert state.pending_fill is not None  # caller verified
+        _accepted_side, bid, qty = state.pending_fill
+        fill_fee_cc = self._fill_fee_cc(
+            bid,
+            qty,
+            combo_ticker=state.rfq.market_ticker,
+            collection=state.rfq.mve_collection_ticker,
+        )
+        exchange_fee = msg.get("exchange_fee_cc")
+        if isinstance(exchange_fee, int) and not isinstance(exchange_fee, bool):
+            fill_fee_cc = int(exchange_fee)
+        return fill_fee_cc
+
+    def _adopt_late_landed_fill(
+        self,
+        quote_id: str,
+        state: OpenQuoteState,
+        msg: JsonDict,
+        fill_ref: str,
+        *,
+        via: str,
+    ) -> bool:
+        """A fills row is present for a state whose own ``record_fill`` had
+        TIMED OUT (review fix 2026-09-05, should-fix #3): the cancelled INSERT
+        landed late. On ``main`` a slow write simply completed and the caller
+        continued; here the timeout returned early, so the fee / fill.count /
+        markout tail never ran and verification was never armed. Adopt the
+        row exactly once (the flag is consumed synchronously on the event
+        loop, so two racers cannot both adopt), run the tail, and return True
+        so ``on_quote_executed`` starts execution verification."""
+        state.fill_record_timed_out = False
+        state.fill_recorded = True
+        self._metrics.inc("fill_ledger.late_landing_adopted")
+        log.warning(
+            "fill_record_landed_late",
+            quote_id=quote_id,
+            fill_ref=fill_ref,
+            via=via,
+            detail="the fills row is present after this quote's own record_fill "
+            "outlived its bound — the INSERT landed late; adopting it (fee / "
+            "fill.count / markout booked once, execution verification armed) "
+            "instead of skipping it as a replay",
+        )
+        self._post_insert_tail(quote_id, state, fill_ref, self._booked_fill_fee_cc(state, msg))
+        return True
+
+    def _post_insert_tail(
+        self, quote_id: str, state: OpenQuoteState, fill_ref: str, fill_fee_cc: int | None
+    ) -> None:
+        """Everything that follows a fills row EXISTING (2026-09-04 review
+        fixes): the row is there, so a failure in the fee/metric/markout tail
+        must never make the caller believe nothing was written — that would
+        leave the row 'booked' with verification never armed (the sweep skips
+        a fill_recorded state). Loud, counted, and the insert result stands."""
         try:
             # The trade fee is a real cash cost AT FILL — it must enter the
             # realized ledger the ENFORCED daily-loss cap reads, not only the
@@ -7086,7 +7395,6 @@ class QuoteLifecycle:
                 "tail raised — reported here, never as a failed write; the row "
                 "proceeds to execution verification like any other",
             )
-        return True
 
     def _maker_fee_active(
         self, combo_ticker: str | None, collection: str | None
@@ -7162,6 +7470,45 @@ class QuoteLifecycle:
         except FeeUnknownError:
             return None
 
+    def _judge_confirm_expired_rate(self, quote_id: str) -> None:
+        """EXPIRED-ACCEPT RATE alarm (review should-fix #5,
+        risk/confirm_expired_rate.py) — the derived replacement for the halt
+        class the classifier removed. This boot's expired share
+        (``confirm.expired_by_exchange`` / (expired + ``confirm.sent``)) is
+        judged against the pooled measured rate of the retained prior boots
+        as an exact binomial tail at the ladder's daily z; anomalous ⇒
+        ``confirm_expired_rate_anomalous`` WARNING + metric. Alarm only —
+        whether it halts is the operator ruling the build report lists as
+        owed. No baseline (first boot) ⇒ unjudged. Never raises into the
+        confirm path."""
+        cb = self._confirm_expired_baseline_cb
+        if cb is None:
+            return
+        try:
+            verdict = judge_expired_rate(
+                boot_expired=self._metrics.counter("confirm.expired_by_exchange"),
+                boot_confirmed=self._metrics.counter("confirm.sent"),
+                baseline=cb(),
+            )
+        except Exception:  # noqa: BLE001 — an alarm must never reach the confirm path
+            log.warning("confirm_expired_rate_judge_failed", quote_id=quote_id, exc_info=True)
+            return
+        if verdict is None:
+            return
+        self._metrics.inc("confirm.expired_rate_judged")
+        if verdict.anomalous:
+            self._metrics.inc("confirm.expired_rate_anomalous")
+            log.warning(
+                "confirm_expired_rate_anomalous",
+                quote_id=quote_id,
+                **verdict.as_log(),
+                detail="this boot's share of exchange-expired accepts is beyond "
+                "the ladder's daily tail of the pooled measured rate — a "
+                "systemic own-side delivery/latency failure (accepts reaching "
+                "this process late), not one lost auction; alarm only, the "
+                "halt is an operator ruling",
+            )
+
     def _beat(self) -> None:
         """Beat the external-supervisor heartbeat mid-loop (2026-07-16 wedge
         fix). A beat-write failure is logged, never raised — the file going
@@ -7173,6 +7520,63 @@ class QuoteLifecycle:
             self._beat_cb()
         except Exception:  # noqa: BLE001 — see docstring
             log.warning("heartbeat_beat_failed_midloop", exc_info=True)
+
+    def _store_bound_s(self) -> float:
+        """The current bound for ONE store await on the maintenance path (see
+        ``_bounded_store``). Falls back to ``STORE_OP_TIMEOUT_S`` when no
+        derivation exists or the callable misbehaves — never unbounded."""
+        cb = self._sub_step_bound_s_cb
+        if cb is not None:
+            try:
+                value = cb()
+            except Exception:  # noqa: BLE001 — a broken provider must not unbound the await
+                value = None
+            if value is not None and value > 0.0 and math.isfinite(value):
+                return float(value)
+        return STORE_OP_TIMEOUT_S
+
+    async def _bounded_store(self, op: str, coro: Awaitable[_T]) -> _T:
+        """Await ONE store operation under the derived sub-step bound.
+
+        WHY (2026-09-05, item 6 deep dive): twelve direct ``await self._store``
+        calls on the maintenance path had no ``asyncio.wait_for`` — only the
+        divergence sweep was bounded — so a saturated aiosqlite connection
+        (queue depth pinned at 200k today) could hold a sub-step for as long as
+        it liked and the supervisor would read the silence as a wedge. The
+        bound is the measured healthy upper quantile of the loop's own
+        completed gaps (``wall / MARGIN``, risk/stall_wall.py): a sub-step
+        that outlives the longest gap the loop has EVER completed is outside
+        the healthy distribution by definition. On expiry: metric + WARNING,
+        then the ``TimeoutError`` propagates to the caller's existing
+        failure branch (every site already treats a store failure as a
+        retried round / a replayed write / evidence-only), and the loop
+        advances. The cancelled statement may still land on the connection
+        thread — every write here is INSERT-if-absent / idempotent by id, so
+        a late landing is a replay skip, never a second row."""
+        bound_s = self._store_bound_s()
+        try:
+            return await asyncio.wait_for(coro, bound_s)
+        except TimeoutError:
+            self._metrics.inc("store.await_timeout")
+            self._metrics.inc(f"store.await_timeout.{op}")
+            # TAINT the maintenance loop's gap in progress (review fix
+            # 2026-09-05, must-fix #1): this gap is about to "complete" only
+            # because the bound expired — it must never enter the healthy
+            # distribution the wall (and this very bound) is derived from.
+            if self._taint_progress_cb is not None:
+                try:
+                    self._taint_progress_cb()
+                except Exception:  # noqa: BLE001 — a taint failure must not mask the timeout
+                    log.warning("progress_taint_failed", op=op, exc_info=True)
+            log.warning(
+                "store_await_timeout",
+                op=op,
+                bound_s=round(bound_s, 3),
+                detail="a maintenance-path store await outlived the measured healthy "
+                "sub-step bound — yielded (logged, counted); the caller's failure "
+                "branch retries/replays and the loop advances",
+            )
+            raise
 
     # ---------------------------------------------- fill-record recovery sweep
 
@@ -7672,8 +8076,26 @@ class QuoteLifecycle:
             if final:
                 self._resolve_cancel_verification(quote_id, state, now)
             return 1
+        try:
+            match = await self._adopt_exchange_fill(quote_id, state, payload)
+        except TimeoutError as exc:
+            # BOUNDED STORE AWAIT inside adoption expired (2026-09-05, item 6):
+            # the exchange READ succeeded but the ledger lookup did not, so
+            # this is NOT an ok read — counting it would let a final round
+            # VOID a real fill the tape holds and the ledger could not be
+            # asked about. One failed round, retried on cadence, like a poll
+            # error; the rest of the tick proceeds.
+            self._metrics.inc("fill_recovery.verify_errors")
+            log.warning(
+                "fill_recovery_verify_store_timeout",
+                quote_id=quote_id,
+                attempt=state.cancel_verify_attempts,
+                error=repr(exc),
+            )
+            if final:
+                self._resolve_cancel_verification(quote_id, state, now)
+            return 1
         state.cancel_verify_ok_reads += 1
-        match = await self._adopt_exchange_fill(quote_id, state, payload)
         if match is not None:
             state.cancel_verified_fill = dict(match)
             if state.verify_mode == "executed_status":
@@ -7818,7 +8240,10 @@ class QuoteLifecycle:
         booked_cc = int(state.pending_fill[2]) if state.pending_fill is not None else None
         stamped = False
         try:
-            stamped = await self._store.mark_fill_verified(fill_ref, exchange_fill_id=fill_id)
+            stamped = await self._bounded_store(
+                "mark_fill_verified",
+                self._store.mark_fill_verified(fill_ref, exchange_fill_id=fill_id),
+            )
         except Exception:  # noqa: BLE001 — the verdict stands; the stamp is evidence
             log.exception("fill_verified_stamp_failed", quote_id=quote_id)
         state.exec_verified = True
@@ -7973,8 +8398,11 @@ class QuoteLifecycle:
         loud unresolved give-up) — never a silent skip."""
         fill_ref = f"fill:{quote_id}"
         try:
-            touched = await self._store.void_phantom_fill(
-                fill_ref, reason="absent_from_portfolio_fills"
+            touched = await self._bounded_store(
+                "void_phantom_fill",
+                self._store.void_phantom_fill(
+                    fill_ref, reason="absent_from_portfolio_fills"
+                ),
             )
         except Exception as exc:  # noqa: BLE001 — retried as a failed round
             self._metrics.inc("fill_verify.void_failed")
@@ -8178,8 +8606,9 @@ class QuoteLifecycle:
         tape_cc = self._tape_count_cc(prints)
         stamped = False
         try:
-            stamped = await self._store.mark_fill_verified(
-                claim.fill_ref, exchange_fill_id=fill_id
+            stamped = await self._bounded_store(
+                "mark_fill_verified",
+                self._store.mark_fill_verified(claim.fill_ref, exchange_fill_id=fill_id),
             )
         except Exception:  # noqa: BLE001 — the verdict stands; the stamp is evidence
             log.exception("fill_verified_stamp_failed", quote_id=claim.quote_id)
@@ -8260,8 +8689,11 @@ class QuoteLifecycle:
         from fills that were 'booked' at boot, so a same-day row's fee was
         subtracted and must come back; an earlier day's was never seeded."""
         try:
-            touched = await self._store.void_phantom_fill(
-                claim.fill_ref, reason="absent_from_portfolio_fills"
+            touched = await self._bounded_store(
+                "void_phantom_fill",
+                self._store.void_phantom_fill(
+                    claim.fill_ref, reason="absent_from_portfolio_fills"
+                ),
             )
         except Exception as exc:  # noqa: BLE001 — retried as a failed round
             self._metrics.inc("fill_verify.void_failed")
@@ -8492,7 +8924,9 @@ class QuoteLifecycle:
                 # A claim on THIS quote's own exact key (placed at executed-
                 # status discovery, 2026-09-04) is not another quote's claim.
                 reason = "already_claimed"
-            elif await self._store.has_fill_for_order_id(order_id):
+            elif await self._bounded_store(
+                "has_fill_for_order_id", self._store.has_fill_for_order_id(order_id)
+            ):
                 reason = "already_in_ledger"
             else:
                 self._claimed_exchange_order_ids.add(order_id)
@@ -9172,7 +9606,9 @@ class QuoteLifecycle:
         if last is not None and now - last < int(interval_s * 1e9):
             return
         self._ledger_divergence_last_mono_ns = now
-        open_rows = await self._store.open_ledger_identities()
+        open_rows = await self._bounded_store(
+            "open_ledger_identities", self._store.open_ledger_identities()
+        )
         # Multiset: two identical open positions on one combo need TWO rows.
         available: Counter[tuple[str, str, str]] = Counter(open_rows)
         positions = list(self._exposure.positions.values())
@@ -9285,8 +9721,10 @@ class QuoteLifecycle:
             if not s.fill_recorded
             and s.fill_recovery_attempts < _FILL_RECOVERY_MAX_ATTEMPTS
         }
-        ledger_ids = await self._store.fill_order_ids()
-        null_keys = await self._store.fill_null_order_id_keys()
+        ledger_ids = await self._bounded_store("fill_order_ids", self._store.fill_order_ids())
+        null_keys = await self._bounded_store(
+            "fill_null_order_id_keys", self._store.fill_null_order_id_keys()
+        )
         rows: list[JsonDict] = []
         cursor = ""
         truncated = False
@@ -9890,7 +10328,37 @@ class QuoteLifecycle:
             log.warning("dnp_hazard_refresh_failed", error=repr(exc))
 
     async def maintenance_tick(self) -> None:
-        """TTL expiry + reprice + P&L mark + daily-loss halt. Every few 100ms."""
+        """TTL expiry + reprice + P&L mark + daily-loss halt. Every few 100ms.
+
+        MEASURED + PROGRESSING BETWEEN SUB-STEPS (2026-09-05, item 6): each
+        sub-step is timed into ``maintenance.step_ms.<step>`` and marks
+        progress when it completes, so the supervisor sees the loop advance
+        inside a pass; the whole pass lands in ``maintenance.tick_ms`` and a
+        pass that outlives the measured healthy sub-step bound logs its step
+        breakdown (``maintenance_tick_slow``). Nothing here changes what any
+        sub-step decides."""
+        laps = _TickLaps(self._clock, self._metrics, self._beat)
+        try:
+            await self._maintenance_tick_body(laps)
+        finally:
+            laps.finish(self._store_bound_s(), self._applied_stall_wall_s())
+
+    def _applied_stall_wall_s(self) -> float | None:
+        """The supervisor's APPLIED wall for the maintenance loop (from
+        quote_app's ledger), or None when unwired / misbehaving — then the
+        tick is judged against its sub-step bound only."""
+        cb = self._stall_wall_s_cb
+        if cb is None:
+            return None
+        try:
+            value = cb()
+        except Exception:  # noqa: BLE001 — a broken provider must not break the tick
+            return None
+        if value is not None and value > 0.0 and math.isfinite(value):
+            return float(value)
+        return None
+
+    async def _maintenance_tick_body(self, lap: _TickLaps) -> None:
         self._refresh_daily_pnl()
         # Arm/refresh the portfolio-CVaR book-risk snapshot (throttled, off the hot
         # path) BEFORE the check below reads it, so the maintenance-driven halt
@@ -9934,11 +10402,13 @@ class QuoteLifecycle:
         # halts from the settlement-cascade equity trough. After the resolver
         # pass above so a fact fetched this tick notes its receivable this tick.
         self._refresh_settlement_receivables()
+        lap("prelude")
         # FILL-RECORD RECOVERY SWEEP (2026-07-16 P1): repair a confirmed fill
         # whose quote_executed WS message was lost, BEFORE the limit check so a
         # recovered position counts against the caps this same tick. Runs even
         # when halted — recording exchange truth is reconciliation, not quoting.
         await self._sweep_unrecorded_fills()
+        lap("unrecorded_fills")
         # ALARM-ONLY SWEEPS — LAUNCHED, NEVER AWAITED (2026-07-26, the
         # 20:12:24Z stall). The fills-ledger diff (incident C's account-wide
         # backstop) and the position-ledger divergence invariant are pure
@@ -9991,6 +10461,7 @@ class QuoteLifecycle:
             if fv_verdict == "decline" and self._open:
                 log.warning("fill_velocity_cancel_all", detail=fv_detail)
                 await self.cancel_all(ReasonCode.DECLINE_FILL_VELOCITY)
+        lap("limits")
         # REPRICE SWEEP — WEDGE-HARDENED (2026-07-16, the 18:13Z heartbeat kill).
         # Under a frozen joint pool (abandoned 5-8s cold-tail futures keep every
         # worker busy) this loop used to serially burn one full pool deadline PER
@@ -10016,6 +10487,7 @@ class QuoteLifecycle:
         # business it used to be in. Returns instantly when nothing is pending
         # (the steady state), so the tick's cost is unchanged.
         await self._resolve_withdraw_pending()
+        lap("withdraw_pending")
         now = self._clock.monotonic_ns()
         sweep_start_ns = now
         budget_ns = int(_REPRICE_SWEEP_BUDGET_S * 1e9)
@@ -10137,6 +10609,7 @@ class QuoteLifecycle:
                     )
             if quote_id in self._open:
                 prev_handled = quote_id
+        lap("reprice")
 
     async def _spend_withdraw_tokens(
         self,

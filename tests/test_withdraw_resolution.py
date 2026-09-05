@@ -307,16 +307,22 @@ def test_the_reprice_sweep_is_no_longer_a_write_driver() -> None:
     """DEFECT 2, AMPLIFIER. The sweep must not re-drive pending withdrawals: it
     is O(open) per 0.5 s tick, which is what made the storm self-sustaining. Its
     pending branch must contain NO await at all — no write, no read, no wait."""
-    src = textwrap.dedent(
-        inspect.getsource(lifecycle_mod.QuoteLifecycle.maintenance_tick)
-    )
-    tree = ast.parse(src)
-    branches = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.If)
-        and "withdraw_pending_reason" in ast.dump(node.test)
-    ]
+    # The tick is a timing/progress wrapper around ``_maintenance_tick_body``
+    # since 2026-09-05 (derived stall wall); the sweep lives in the body. Both
+    # are parsed so the invariant covers the tick's whole code, wherever the
+    # sweep sits.
+    branches: list[ast.If] = []
+    for fn in (
+        lifecycle_mod.QuoteLifecycle.maintenance_tick,
+        lifecycle_mod.QuoteLifecycle._maintenance_tick_body,  # noqa: SLF001
+    ):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        branches.extend(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and "withdraw_pending_reason" in ast.dump(node.test)
+        )
     assert len(branches) == 1, "one pending branch in the sweep"
     awaits = [n for n in ast.walk(branches[0]) if isinstance(n, ast.Await)]
     assert awaits == [], "the reprice sweep is not a withdrawal driver any more"
