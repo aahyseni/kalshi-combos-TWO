@@ -12,8 +12,10 @@ policy split by frame class (WsManager.mark_sheddable):
      queue and the socket stays connected. NEVER a disconnect.
   2. ORDER-INTEGRITY frames (the priority lane) are NEVER shed, and the
      priority lane's own overflow still fails closed (disconnect).
-  3. Control frames (subscribed acks, errors) are NEVER shed — displaced to
-     the carry lane and dispatched ahead of the queue.
+  3. Control frames (subscribed acks, errors) are NEVER shed — they ride
+     their own CONTROL lane, drained ahead of market frames (2026-09-05: the
+     carry deque became an explicit lane when the reader moved to its own
+     thread; same reordering, applied uniformly).
   4. A full queue with nothing sheddable is the original genuine-runaway
      signal => same fail-closed disconnect as before.
   5. Unmarked managers (the book socket) are byte-identical to the old
@@ -36,7 +38,7 @@ import aiohttp
 import pytest
 
 from combomaker.core.clock import FakeClock, SystemClock
-from combomaker.exchange.ws import WsManager
+from combomaker.exchange.ws import Lane, WsManager
 from combomaker.ops.metrics import Metrics
 from combomaker.rfq.intake import RfqIntake
 
@@ -74,8 +76,20 @@ def _manager(maxsize: int | None = None) -> tuple[WsManager, Metrics]:
     metrics = Metrics()
     m = WsManager("wss://example/ws", object(), SystemClock(), metrics, name="test")  # type: ignore[arg-type]
     if maxsize is not None:
-        m._msg_queue = asyncio.Queue(maxsize=maxsize)
+        m._lanes.capacity = maxsize  # per-lane bound (was the normal queue's maxsize)
     return m, metrics
+
+
+async def _settled(m: WsManager, within_s: float = 1.0) -> None:
+    """Lane analogue of ``Queue.join``: the dispatcher clears ``wake_pending``
+    only after a drain observed every lane empty, i.e. the last handler
+    returned (2026-09-05 lanes port)."""
+
+    async def _wait() -> None:
+        while any(m.lane_depths().values()) or m._lanes.wake_pending:  # noqa: ASYNC110
+            await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(_wait(), timeout=within_s)
 
 
 async def _run_dispatcher(m: WsManager, body) -> None:
@@ -102,8 +116,9 @@ async def test_market_overflow_sheds_oldest_never_disconnects() -> None:
     await m._read_loop(ws)  # type: ignore[arg-type]
     assert ws.close_calls == 0  # NEVER disconnect for market-data overflow
     # Oldest shed, newest kept (drop-oldest), FIFO preserved on survivors.
-    kept = [m._msg_queue.get_nowait()["n"] for _ in range(m._msg_queue.qsize())]
+    kept = [frame["n"] for frame in m._lanes.market]
     assert kept == [7, 8, 9]
+    m._flush_reader_metrics()  # reader-side counts fold in on the main loop
     assert metrics.counter("test.shed_market_frames") == 7
     assert metrics.counter("test.shed.rfq_created") == 7
     assert metrics.counter("test.dispatch_queue_overflow") == 0
@@ -123,7 +138,7 @@ async def test_shed_survivors_still_dispatch_in_order() -> None:
     )
 
     async def body() -> None:
-        await asyncio.wait_for(m._msg_queue.join(), timeout=1.0)
+        await _settled(m)
 
     await _run_dispatcher(m, body)
     assert seen == [3, 4]
@@ -146,7 +161,8 @@ async def test_order_class_frames_are_never_shed() -> None:
     ws = _IterWs(frames)
     await m._read_loop(ws)  # type: ignore[arg-type]
     assert ws.close_calls == 0
-    assert m._priority_queue.qsize() == 1  # the accept, intact
+    assert len(m._lanes.priority) == 1  # the accept, intact
+    m._flush_reader_metrics()
     assert metrics.counter("test.shed.quote_accepted") == 0
     assert metrics.counter("test.priority_frame") == 1
 
@@ -155,7 +171,7 @@ async def test_priority_lane_overflow_still_fails_closed() -> None:
     m, _ = _manager()
     m.mark_priority("quote_accepted")
     m.mark_sheddable("rfq_created")
-    m._priority_queue = asyncio.Queue(maxsize=1)  # no dispatcher draining
+    m._lanes.capacity = 1  # no dispatcher draining
     ws = _IterWs([_Frame({"type": "quote_accepted", "n": i}) for i in (1, 2)])
     await m._read_loop(ws)  # type: ignore[arg-type]
     assert ws.close_calls == 1  # order-integrity overflow => fail-closed
@@ -189,15 +205,15 @@ async def test_full_queue_no_longer_disconnects_on_accept_wake() -> None:
     )
     await m._read_loop(ws)  # type: ignore[arg-type]
     assert ws.close_calls == 0
-    assert m._priority_queue.qsize() == 1
+    assert len(m._lanes.priority) == 1
 
 
 # --------------------------------------------------------------------------- #
-# 3. Control frames: displaced to carry, dispatched ahead, never lost
+# 3. Control frames: their own lane, dispatched ahead, never lost
 # --------------------------------------------------------------------------- #
 
 
-async def test_control_frames_survive_shedding_via_carry() -> None:
+async def test_control_frames_survive_shedding_in_control_lane() -> None:
     m, metrics = _manager(maxsize=3)
     m.mark_sheddable("rfq_created")
     seen: list[str] = []
@@ -214,10 +230,11 @@ async def test_control_frames_survive_shedding_via_carry() -> None:
     ws = _IterWs(frames)
     await m._read_loop(ws)  # type: ignore[arg-type]
     assert ws.close_calls == 0
+    m._flush_reader_metrics()
     assert metrics.counter("test.shed.subscribed") == 0
 
     async def body() -> None:
-        await asyncio.wait_for(m._msg_queue.join(), timeout=1.0)
+        await _settled(m)
 
     await _run_dispatcher(m, body)
     assert "subscribed:7" in seen  # the ack survived the shed storm
@@ -230,8 +247,7 @@ async def test_nothing_sheddable_still_fails_closed() -> None:
     genuine-runaway signal — disconnect, exactly as before."""
     m, _ = _manager(maxsize=2)
     m.mark_sheddable("rfq_created")
-    # Simulate control runaway with a tiny carry bound (instance shadows class).
-    m._QUEUE_MAX = 2  # type: ignore[misc]
+    # Control runaway: six acks against a 2-deep control lane.
     ws = _IterWs([_Frame({"type": "subscribed", "id": i}) for i in range(6)])
     await m._read_loop(ws)  # type: ignore[arg-type]
     assert ws.close_calls == 1
@@ -245,20 +261,20 @@ async def test_unmarked_manager_is_byte_identical_fail_closed() -> None:
     ws = _IterWs([_Frame({"type": "orderbook_delta", "n": i}) for i in range(3)])
     await m._read_loop(ws)  # type: ignore[arg-type]
     assert ws.close_calls == 1
+    m._flush_reader_metrics()
     assert metrics.counter("test.dispatch_queue_overflow") == 1
     assert metrics.counter("test.shed_market_frames") == 0
 
 
-async def test_discard_queued_clears_carry_too() -> None:
+async def test_discard_queued_clears_every_lane() -> None:
     m, _ = _manager(maxsize=2)
     m.mark_sheddable("rfq_created")
     frames = [_Frame({"type": "subscribed", "id": 1})]
     frames += [_Frame({"type": "rfq_created", "n": i}) for i in range(4)]
     await m._read_loop(_IterWs(frames))  # type: ignore[arg-type]
-    assert len(m._carry) == 1
+    assert m.lane_depths() == {"priority": 0, "control": 1, "market": 2}
     m._discard_queued()
-    assert not m._carry
-    assert m._msg_queue.qsize() == 0
+    assert m.lane_depths() == {"priority": 0, "control": 0, "market": 0}
 
 
 # --------------------------------------------------------------------------- #
@@ -271,7 +287,8 @@ async def test_every_frame_carries_the_wire_stamp() -> None:
     await m._read_loop(  # type: ignore[arg-type]
         _IterWs([_Frame({"type": "rfq_created", "n": 1})])
     )
-    frame = m._msg_queue.get_nowait()
+    frame = m._lanes.pop(Lane.CONTROL)
+    assert frame is not None
     assert isinstance(frame.get("_recv_mono_ns"), int)
 
 

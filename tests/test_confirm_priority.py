@@ -71,6 +71,18 @@ def _manager() -> WsManager:
     return WsManager("wss://example/ws", object(), SystemClock(), name="test")  # type: ignore[arg-type]
 
 
+async def _settled(m: WsManager, within_s: float = 1.0) -> None:
+    """Lane analogue of ``Queue.join``: the dispatcher clears ``wake_pending``
+    only after a drain observed every lane empty, i.e. the last handler
+    returned (2026-09-05 lanes port)."""
+
+    async def _wait() -> None:
+        while any(m.lane_depths().values()) or m._lanes.wake_pending:  # noqa: ASYNC110
+            await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(_wait(), timeout=within_s)
+
+
 async def _run_dispatcher(m: WsManager, body) -> None:
     m._dispatch_task = asyncio.create_task(m._dispatch_loop())
     try:
@@ -99,8 +111,7 @@ async def test_priority_frame_dispatches_before_queued_backlog() -> None:
     await m._read_loop(_IterWs(frames))  # type: ignore[arg-type]
 
     async def body() -> None:
-        await asyncio.wait_for(m._msg_queue.join(), timeout=1.0)
-        await asyncio.wait_for(m._priority_queue.join(), timeout=1.0)
+        await _settled(m)
 
     await _run_dispatcher(m, body)
     # The accept arrived LAST but dispatches FIRST (drained before any normal
@@ -152,7 +163,7 @@ async def test_unmarked_types_keep_plain_fifo() -> None:
     )
 
     async def body() -> None:
-        await asyncio.wait_for(m._msg_queue.join(), timeout=1.0)
+        await _settled(m)
 
     await _run_dispatcher(m, body)
     assert order == [1, 2, 3]
@@ -161,7 +172,7 @@ async def test_unmarked_types_keep_plain_fifo() -> None:
 async def test_priority_overflow_fails_closed() -> None:
     m = _manager()
     m.mark_priority("quote_accepted")
-    m._priority_queue = asyncio.Queue(maxsize=1)  # no dispatcher draining
+    m._lanes.capacity = 1  # no dispatcher draining
     ws = _IterWs([_Frame({"type": "quote_accepted", "n": i}) for i in (1, 2)])
     await m._read_loop(ws)  # type: ignore[arg-type]
     assert ws.close_calls == 1  # overflow ⇒ close ⇒ reconnect (fail-closed)
@@ -178,11 +189,11 @@ async def test_discard_queued_drains_both_lanes() -> None:
             ]
         )
     )
-    assert m._msg_queue.qsize() == 2  # normal frame + wake sentinel
-    assert m._priority_queue.qsize() == 1
+    # (2026-09-05 lanes port: the wake SENTINEL is gone — wakeups are
+    # coalesced cross-thread — so the normal side holds exactly the frame.)
+    assert m.lane_depths() == {"priority": 1, "control": 1, "market": 0}
     m._discard_queued()
-    assert m._msg_queue.qsize() == 0
-    assert m._priority_queue.qsize() == 0
+    assert m.lane_depths() == {"priority": 0, "control": 0, "market": 0}
 
 
 # --------------------------------------------------------------------------- #

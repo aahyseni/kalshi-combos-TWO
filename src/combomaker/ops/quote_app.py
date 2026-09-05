@@ -81,6 +81,7 @@ from combomaker.marketdata.settled import (
 from combomaker.ops.config import AppConfig, Env, Mode, RiskConfig
 from combomaker.ops.fee_schedule import fee_schedule_path, load_observed_fee_schedule
 from combomaker.ops.logging import configure_logging, get_logger
+from combomaker.ops.loop_lag import LoopLagProbe, SlowCallbackRecorder
 from combomaker.ops.metrics import Metrics
 from combomaker.ops.persistence import Store
 from combomaker.ops.preflight import (
@@ -104,6 +105,7 @@ from combomaker.ops.supervisor import (
     supervisor_heartbeat_path,
     supervisor_heartbeat_reachable,
 )
+from combomaker.ops.telemetry_sampling import SAMPLER as SHADOW_TELEMETRY_SAMPLER
 from combomaker.ops.write_budget import TokenBudget, WriteBudget
 from combomaker.pricing.engine import PricingEngine
 from combomaker.pricing.fees import FeeModel, FeeType
@@ -2081,6 +2083,39 @@ class QuoteApp:
         configure_logging(
             json_output=config.logging.json_output, level=config.logging.level
         )
+        # LOOP-LAG INSTRUMENTATION (2026-09-05 reader isolation; derivations in
+        # ops/loop_lag.py). The recorder times every synchronous callback run
+        # on THIS loop from here on (installed before any task exists, so the
+        # boot sequence is measured too); the probe task is launched with the
+        # other loops below. The shadow-telemetry sampler reads the probe's
+        # behind-ratio; unbound it would be inert. period = the finest cadence
+        # any loop here declares; window = the existing status cadence.
+        self._slow_callbacks = SlowCallbackRecorder(self._clock, self._metrics)
+        self._slow_callbacks.install()
+        self._lag_probe = LoopLagProbe(
+            self._clock,
+            self._metrics,
+            period_s=MAINTENANCE_TICK_INTERVAL_S,
+            window_s=STATUS_TICK_INTERVAL_S,
+            recorder=self._slow_callbacks,
+        )
+        SHADOW_TELEMETRY_SAMPLER.bind(self._lag_probe.behind_ratio)
+        try:
+            await self._run_instrumented()
+        finally:
+            # OUTER safety net (review 2026-09-05): the inner finally around
+            # ``_stop.wait()`` unhooks before the shutdown stages, but a boot
+            # exception BEFORE that point would leave ``Handle._run`` patched
+            # process-wide and the sampler bound to a dead probe (harmless
+            # live, cross-test contamination in the suite). Both idempotent.
+            SHADOW_TELEMETRY_SAMPLER.unbind()
+            self._slow_callbacks.uninstall()
+
+    async def _run_instrumented(self) -> None:
+        """``run()`` proper — everything after logging and the loop
+        instrumentation are up. Split out so the recorder's install/uninstall
+        pair brackets the WHOLE boot, not only the steady-state wait."""
+        config = self._config
         conventions = self._conventions
         log.info(
             "quote_app_starting",
@@ -2125,7 +2160,14 @@ class QuoteApp:
         # The book socket below is deliberately NOT marked: orderbook deltas
         # are seq-dependent — shedding one corrupts the mirror silently;
         # reconnect+resnapshot is the only sound recovery there.
-        ws.mark_sheddable("rfq_created", "rfq_deleted")
+        # 2026-09-05: the reader now lives on its own thread, so the MARKET
+        # lane is where a main-loop stall shows up. ``rfq_created`` frames
+        # older than the worker-side dwell horizon at dequeue are dropped by
+        # the transport (the intake's pre-parse gate refuses the same frames;
+        # this saves it the dispatch). Deletions are ageless: mirror
+        # consistency is cheap and a late delete is still a delete.
+        ws.mark_sheddable("rfq_created", stale_after_s=RFQ_MAX_QUEUE_DWELL_S)
+        ws.mark_sheddable("rfq_deleted")
         accept_gate = AcceptPriorityGate(self._clock, EXCHANGE_CONFIRM_WINDOW_S)
         # DEDICATED order-book socket (2026-07-14 fix). The communications firehose
         # (~650 msg/s exchange-wide RFQ stream on `ws`) and the orderbook_delta feed
@@ -3141,6 +3183,9 @@ class QuoteApp:
                 # DEDICATED LIVENESS first: nothing this task does can be
                 # delayed by the bot's work, which is the whole point.
                 asyncio.create_task(self._liveness_loop(), name="liveness"),
+                # LOOP-LAG PROBE (2026-09-05): the loop's own late-timer
+                # measurement + the per-window slow-callback ranking.
+                asyncio.create_task(self._lag_probe.run(), name="loop-lag-probe"),
                 asyncio.create_task(retry_pending(), name="rfq-retry"),
                 asyncio.create_task(quote_event_worker(), name="quote-event-worker"),
                 *[
@@ -3205,6 +3250,11 @@ class QuoteApp:
             try:
                 await self._stop.wait()
             finally:
+                # Measurement is over: stop sampling telemetry and unhook the
+                # callback timer before the shutdown stages (their lines must
+                # never be sampled; the hook has nothing left to attribute).
+                SHADOW_TELEMETRY_SAMPLER.unbind()
+                self._slow_callbacks.uninstall()
                 seed_task = getattr(self, "_acceptance_seed_task", None)
                 if seed_task is not None:
                     seed_task.cancel()

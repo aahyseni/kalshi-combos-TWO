@@ -27,6 +27,9 @@ LOGS = [
 
 TS_RE = re.compile(r'"ts": "([^"]+)"')
 EVENT_RE = re.compile(r'"event": "([^"]+)"')
+# 2026-09-05 loop-lag sampling: a shadow line kept under lag carries
+# ``sampled_1_in`` = N and stands for N lines; absent = 1.
+SAMPLED_RE = re.compile(r'"sampled_1_in": (\d+)')
 
 
 def parse_ts(s: str) -> datetime:
@@ -49,6 +52,7 @@ def analyze(path: Path) -> None:
     watchdog = 0
     skew_per_sec: Counter[str] = Counter()   # second bucket -> priced RFQs (post-filter+price)
     audit_per_sec: Counter[str] = Counter()
+    sampled_lines = 0  # inventory_skew_shadow lines that carried sampled_1_in
     first_ts = last_ts = None
     prev_ts = None
     max_gaps: list[tuple[float, str, str]] = []  # (gap_s, at, prev_line_event)
@@ -91,7 +95,13 @@ def analyze(path: Path) -> None:
             elif event == "risk_starvation_watchdog":
                 watchdog += 1
             elif event == "inventory_skew_shadow":
-                skew_per_sec[m.group(1)[:19]] += 1
+                # weight by sampled_1_in: this counter IS the priced-RFQ
+                # throughput below, and it under-counts after any behind window
+                ms = SAMPLED_RE.search(line)
+                w = int(ms.group(1)) if ms else 1
+                if w > 1:
+                    sampled_lines += 1
+                skew_per_sec[m.group(1)[:19]] += w
             elif event == "risk_audit":
                 audit_per_sec[m.group(1)[:19]] += 1
 
@@ -174,7 +184,9 @@ def analyze(path: Path) -> None:
         vals = sorted(skew_per_sec.values())
         print(f"inventory_skew_shadow lines/sec (RFQs that PRICED): "
               f"peak={vals[-1]} p99={pct(vals,0.99)} p50={pct(vals,0.5)} "
-              f"active_secs={len(vals)}")
+              f"active_secs={len(vals)}"
+              + (f"  [{sampled_lines} kept lines carried sampled_1_in — re-weighted]"
+                 if sampled_lines else ""))
 
     # ---- WS churn ----
     if ws_events:

@@ -12,6 +12,8 @@ import sys
 
 import structlog
 
+from combomaker.ops.telemetry_sampling import SAMPLER
+
 
 def configure_logging(*, json_output: bool = True, level: str = "INFO") -> None:
     logging.basicConfig(stream=sys.stdout, level=level.upper(), format="%(message)s")
@@ -24,6 +26,12 @@ def configure_logging(*, json_output: bool = True, level: str = "INFO") -> None:
 
     structlog.configure(
         processors=[
+            # FIRST: shadow-telemetry sampling under loop lag (derivation in
+            # ops/telemetry_sampling.py). A dropped line exits here before any
+            # timestamp/render work; a pass-through costs one set lookup.
+            # Unbound (no lag probe) it is inert, so every other entry point
+            # (observe mode, tools, tests) logs byte-identically.
+            SAMPLER,
             structlog.contextvars.merge_contextvars,
             structlog.processors.add_log_level,
             structlog.processors.TimeStamper(fmt="iso", utc=True, key="ts"),

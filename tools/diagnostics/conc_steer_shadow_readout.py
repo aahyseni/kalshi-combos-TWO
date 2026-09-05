@@ -69,6 +69,7 @@ def main() -> None:
 
     rows: list[dict] = []
     armed_seen = 0
+    sampled_lines = 0  # kept lines that carried ``sampled_1_in`` (loop was behind)
     with open(a.log, encoding="utf-8", errors="replace") as f:
         for line in f:
             if "inventory_skew_shadow" not in line:
@@ -84,9 +85,17 @@ def main() -> None:
                 continue
             if d.get("conc_reason") is None:
                 continue        # steer not computed on this quote
+            # SAMPLED TAPE (2026-09-05 loop-lag sampling): while the loop is
+            # behind, shadow lines are kept 1-in-N and each kept line carries
+            # ``sampled_1_in`` = N. A kept line stands for N quotes — weight
+            # it N times so every count and quantile below estimates the
+            # population, not the surviving lines. Absent = 1 (unsampled).
+            weight = int(d.get("sampled_1_in") or 1)
+            if weight > 1:
+                sampled_lines += 1
             if d.get("conc_armed"):
-                armed_seen += 1
-            rows.append(d)
+                armed_seen += weight
+            rows.extend([d] * weight)
 
     if not rows:
         print("no inventory_skew_shadow rows with a computed steer in that window")
@@ -107,6 +116,9 @@ def main() -> None:
 
     print("=" * 78)
     print(f"LEVER #5 SHADOW READ-OUT — {len(rows):,} quotes with a computed steer")
+    if sampled_lines:
+        print(f"  {sampled_lines:,} kept lines carried sampled_1_in (loop behind): "
+              f"re-weighted — {len(rows):,} is the population estimate, not a line count")
     if armed_seen:
         print(f"  !! {armed_seen:,} of these were ALREADY ARMED (conc_armed=true) — "
               f"for those rows 'would' IS what shipped")
