@@ -337,7 +337,11 @@ async def test_store_exposes_writer_queue_depth(tmp_path: Path, clock: _Clock) -
 
 def test_flag_defaults_off_and_the_app_hook_is_guarded_by_it() -> None:
     assert ObserveConfig().tape_retention_enabled is False
-    run_src = inspect.getsource(QuoteApp.run)
+    # 2026-09-05 merge: build/ws-reader-isolation wrapped the former ``run()``
+    # body in ``_run_instrumented()`` (``run()`` now installs the loop-lag
+    # probe + slow-callback recorder around it). The dark-flag guard and the
+    # construction live in that body; inspect it, not the thin ``run``.
+    run_src = inspect.getsource(QuoteApp._run_instrumented)  # noqa: SLF001
     assert "if config.observe.tape_retention_enabled:" in run_src
     assert "TapeRetentionStep(" in run_src
     loop_src = inspect.getsource(QuoteApp._maintenance_loop)  # noqa: SLF001
