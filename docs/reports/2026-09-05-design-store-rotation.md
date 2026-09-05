@@ -1,6 +1,6 @@
 # 2026-09-05 — DESIGN + TOOLS: quiesced STORE ROTATION (item 7) + the dark TAPE-RETENTION prune — `tools/ops/rotate_store.py`, `tools/ops/prune_tape.py`, `ops/tape_retention.py`
 
-**Status: BUILT + GATED, DRY-RUN EXECUTED READ-ONLY against the live store (twice), `--apply` NOT run.**
+**Status: BUILT + GATED, DRY-RUN EXECUTED READ-ONLY against the live store, `--apply` NOT run.**
 Branch `build/store-rotation-tool` (worktree `C:/Users/aahys/kct-rotation`). Bot LIVE on `main`
 throughout; nothing under the data dir was written (every read `mode=ro`, every heavy step at LOW
 priority). **Blast radius of this commit:** two tools (`tools/ops/rotate_store.py`,
@@ -165,12 +165,65 @@ and the next `record_fill` takes the next id above the archive's.
 ## 5. Dry-run against the live store (READ-ONLY, LOW priority, bot up)
 
 Command (worktree, `PYTHONPATH=src`, `start /LOW /B /WAIT`):
-`python tools/ops/rotate_store.py --dry-run --out <scratch>/plan_live2.json` — the FINAL tool, run
-16:27–<<DRYRUN2_END>> ET with the suite and the vitals gate running beside it (the first run, 13:37–13:52 ET
-on the earlier cut, took 942 s; its numbers are quoted where they differ).
+`python tools/ops/rotate_store.py --dry-run --out <scratch>/plan_live2.json` — the first run, 13:37–13:52 ET (942 s at LOW priority, bot up), on the earlier cut of the tool — the dry-run's plan/estimate code is unchanged since; the FINAL tool's second run (adds the retention section) was launched 16:37 ET and had not finished at commit time (`plan_live2.json` owed).
 
 ```
-<<DRYRUN2>>
+== STORE D:\kalshi-combos-TWO-data\combomaker-prod-live-wc.sqlite3
+   199.0 GB  pages 52,168,612 x 4096  freelist 0  journal wal  hard links 3
+   WAL: 20.2 MB / 5139 frames   SHM: 128.0 KB
+   OTHER NAME D:\kct-vdata\combomaker-prod-live-wc.sqlite3  wal=23484032 B / 5700 frames  shm=65536
+   OTHER NAME D:\kalshi-combos-TWO-data\vitals_snapshot\combomaker-prod-live-wc.sqlite3  wal=201912 B / 49 frames  shm=294912
+
+== TABLES (LIVE = carried whole; TAPE = seed window only)
+   LIVE combo_trades           0 rows
+   LIVE daily_realized_events  0 rows
+   LIVE daily_ruin_anchors     2 rows
+   TAPE decisions              ids [1, 134304442]  ~134,304,442 rows  2026-07-13T20:14:18.209645+00:00 .. 2026-09-05T16:18:24.946780+00:00
+   LIVE ev_ledger              4,338 rows
+   LIVE fills                  4,343 rows
+   LIVE markouts               22,636 rows
+   LIVE position_ledger        4,110 rows
+   TAPE rfq_deletions          ids [None, None]  ~0 rows   .. 
+   TAPE rfqs                   ids [1, 66371473]  ~66,371,473 rows  2026-07-13T20:14:17.832279+00:00 .. 2026-09-05T16:18:24.946626+00:00
+   LIVE store_meta             2 rows
+   LIVE structural_fits        763 rows
+   TAPE would_quotes           ids [None, None]  ~0 rows   .. 
+   TAPE would_quotes_inplay    ids [1, 3253727]  ~3,253,727 rows  2026-07-26T00:07:26.952217+00:00 .. 2026-09-05T16:18:13.584070+00:00
+   sqlite_sequence: [['rfqs', 66371473], ['decisions', 134304442], ['fills', 4344], ['ev_ledger', 4338], ['markouts', 22636], ['would_quotes_inplay', 3253727], ['structural_fits', 763]]
+
+== SEED WINDOW 86400 s  (cutoff 2026-09-04T17:36:57.846635+00:00)
+   decisions: {"first_id": 134174705, "max_id": 134304442, "kinds": ["quote_sent", "confirm", "decline"], "rows_by_kind": {"quote_sent": 8663, "confirm": 5, "decline": 0}, "rows": 8668, "window_rows_all_kinds_estimate": 129738}
+   rfqs: {"first_id": 66295870, "max_id": 66371473, "rows_estimate": 75604}
+
+== LEG PROVENANCE: 166 fills tickers without a ledger row -> 134 rfqs rows carried; conflicting 0; unresolvable 32
+
+== MEASURED (this box, now): {"live_rows": 36198, "live_bytes_text": 8841521, "live_s": 0.481, "live_rows_per_s": 75218.7, "tape_probe_rows": 2000, "tape_probe_bytes_text": 498016, "tape_probe_s": 0.017, "tape_bytes_per_s": 28784557, "tape_bytes_per_row": 249}
+
+== ESTIMATE: {"live_rows": 36194, "tape_rows": 84406, "avg_bytes_per_row_whole_store": 1048, "carry_bytes_estimate": 126345305, "not_carried_rows_estimate": 203845236, "carry_text_bytes_estimate": 21017094, "copy_time_s_estimate_read_x3": 2, "live_copy_s_measured_in_memory": 0.481}
+
+== BOOT-TIME READERS OF STORE HISTORY
+   (15 entries — section 3 of this report)
+
+== REFUSALS THAT WOULD FIRE NOW
+   ! D:\kct-vdata\combomaker-prod-live-wc.sqlite3: hard link of the store with its OWN WAL of 5700 frames (23484032 bytes, checkpoint_seq 8) — frames written through that name are invisible to the live connection and an open through it would replay them onto whatever the file holds then; move that -wal/-shm aside (and drop the extra link) before rotating
+   ! D:\kalshi-combos-TWO-data\vitals_snapshot\combomaker-prod-live-wc.sqlite3: hard link of the store with its OWN WAL of 49 frames (201912 bytes, checkpoint_seq 1) — frames written through that name are invisible to the live connection and an open through it would replay them onto whatever the file holds then; move that -wal/-shm aside (and drop the extra link) before rotating
+   ! live WAL holds 5139 frames — expected while the bot is up; --apply checkpoints it (TRUNCATE) and refuses if that cannot complete
+
+plan computed in 942.4 s
+   ! --apply would REFUSE now: heartbeat.txt: beaten 0.6s ago (window 60.0s)
+   ! --apply would REFUSE now: supervisor_heartbeat.txt: beaten 0.8s ago (window 60.0s)
+   ! --apply would REFUSE now: loop_progress.json: written 0.6s ago (bound 63.5s)
+   ! --apply would REFUSE now: our process alive: 6968 "C:\Windows\system32\cmd.exe" /k title HANG WATCHDOG && echo Watching WORK (log + store advance). Output tees to data\hang_watchdog.log && .venv\Scripts\py
+   ! --apply would REFUSE now: our process alive: 16744 .venv\Scripts\python.exe  tools\ops\hang_watchdog.py run
+   ! --apply would REFUSE now: our process alive: 15460 .venv\Scripts\python.exe  tools\ops\hang_watchdog.py run
+   ! --apply would REFUSE now: our process alive: 26848 "C:\Windows\system32\cmd.exe" /k title BOT (quote mode) && echo Bot running. This window is quiet BY DESIGN - all output goes to data\live_20260905_1213.l
+   ! --apply would REFUSE now: our process alive: 34140 "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoExit -ExecutionPolicy Bypass -File tools\ops\watch_main.ps1 -Log data\live_20260905_1213.lo
+   ! --apply would REFUSE now: our process alive: 2360 "C:\Windows\system32\cmd.exe" /k title FILL PROBER && .venv\Scripts\python.exe tools\diagnostics\fill_prober.py > data\fill_prober_20260905_1213.log 2>&1
+   ! --apply would REFUSE now: our process alive: 7504 "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoExit -ExecutionPolicy Bypass -File tools\ops\watch_prober.ps1 -Log data\fill_prober_20260905
+   ! --apply would REFUSE now: our process alive: 22432 .venv\Scripts\python.exe  -m combomaker.ops.cli run --env prod --mode quote --confirm-live --config config\prod-live-wc.local.yaml
+   ! --apply would REFUSE now: our process alive: 30820 .venv\Scripts\python.exe  -m combomaker.ops.cli run --env prod --mode quote --confirm-live --config config\prod-live-wc.local.yaml
+   ! --apply would REFUSE now: our process alive: 10872 .venv\Scripts\python.exe  tools\diagnostics\fill_prober.py
+   ! --apply would REFUSE now: our process alive: 4392 .venv\Scripts\python.exe  tools\diagnostics\fill_prober.py
 ```
 
 Reading the dry-run:
@@ -179,20 +232,20 @@ Reading the dry-run:
   134,303,838, last `at` = 16:18:16Z. First dry-run at ~17:52Z: 134,304,442, last `at` = 16:18:24Z
   (**+604 rows in ~37 min ≈ 0.27 rows/s, enqueue stamps spanning 8 s** — draining a queue enqueued
   at 16:18Z, an hour and a half behind, three orders of magnitude below intake). Second dry-run
-  (this section, ~20:30Z): <<WRITER_PROGRESS>>. The 12:13 boot's `store_writer_stats` went silent
+  (this section, ~20:30Z): the second dry-run (the FINAL tool, launched 16:37 ET at LOW priority) had not finished when this branch was committed — its `plan_live2.json` is the owed follow-up; the first run's numbers stand. The 12:13 boot's `store_writer_stats` went silent
   because the emit rides the write count (5,000 writes per emit) — a starved writer cannot report
   starvation.
-* **The 24 h seed window** holds <<SEED_ROWS>> against ~400k real sends/day — the tape is ~98%
+* **The 24 h seed window** holds **8,663 `quote_sent` + 5 `confirm` + 0 `decline` rows** (of ~129,738 rows all kinds in the window; 75,604 `rfqs`) against ~400k real sends/day — the tape is ~98%
   holes, exactly the `acceptance_tape_seed_result` the 12:13 boot logged (7,426 rows scanned). The
   seed the fresh store boots on is therefore thin either way; what the rotation buys is that the
   NEXT 24 h are recorded.
-* **Leg provenance:** <<PROVENANCE>> — those unresolvable tickers are reserved from exchange
+* **Leg provenance:** **166 fills tickers have no `position_ledger` row** (pre-P1.10 legacy, all settled long ago on the exchange) → **134 representative `rfqs` rows carried** (0 conflicting); **32 tickers have no tape row at all** — those unresolvable tickers are reserved from exchange
   figures today already and will be after (no change).
-* **Carry ≈ <<CARRY>>.** Measured on this saturated box: <<MEASURED>> → **copy estimate ≈
+* **Carry ≈ 36,194 LIVE rows + ~84,406 tape rows ≈ 120,600 rows / ~21 MB of row text (126 MB by the whole-store average of 1,048 B/row, an upper bound).** Measured on this saturated box: LIVE tables copied into memory in 0.481 s (75,219 rows/s), tape read at 28.8 MB/s (249 B/row) → `copy_time_s_estimate_read_x3` = 2 s; the whole read-only plan took 942 s on the saturated box → **copy estimate ≈
   seconds (read × 3)**; the index builds on ~120k rows are sub-second. The rotation's own wall time
   is seconds; the downtime is STOP_BOT + START_BOT + the bot's boot (~2–3 min per the 8/26 and 9/4
   relights). **≈ 3–5 min end to end.** Not carried: ~203.8M tape rows (the archive).
-* **The retention alternative on THIS store (read-only plan):** <<RETENTION>>. The measured
+* **The retention alternative on THIS store (read-only plan):** NOT YET MEASURED on the live store — the retention section was added to the dry-run after the first run, and the second run was still in flight at commit time. On the synthetic 3-day store the plan derives 172,800 s (+0 disorder) and the pass deletes exactly the oldest day (tests). The live numbers to read from `plan_live2.json` when it lands: `retention.disorder` per table, `retention.tables.*.rows_estimate` (expected: everything older than ~48 h of the 66.4M/134.3M ids), and `retention.protected.rfq_ids` (expected 134, the same set the rotation carries). The measured
   disorder is the term that makes the window derived rather than set: `rfqs.seen_at` is stamped at
   worker pickup and recorded after dispatch, so consecutive ids can carry time stamps a few
   seconds out of order — the bisection's boundary error, measured on the newest 25k rows of each
@@ -222,7 +275,7 @@ Reading the dry-run:
              + measured disorder     the largest BACKWARD step of the time column over the newest
                                      25k rows of each tape table (rfqs.seen_at is a pickup stamp
                                      recorded after dispatch) — the bisection's boundary error
-                                     = 172,800 s + <<DISORDER>> on the live store today
+                                     = 172,800 s + the measured term (owed from the second dry-run) on the live store today
 
  protected  = one real rfqs row per distinct (market_ticker, legs_json) for every fills ticker
               without a position_ledger row — Store.held_positions' tape fallback; the SAME
