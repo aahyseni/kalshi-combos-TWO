@@ -35,19 +35,33 @@ never a reimplementation). Three sections:
    ``--with-cell-floor`` the measured retained-edge floor table is
    estimated from the settled grade (live estimator on read-only SQL) and
    applied as well — absent cells resolve through the live
-   ``floor_for_cell`` (sport pool upper bound), and the tool FLAGS, per
-   tier, the quotes whose cell floor makes the rebate cap LOOSER than the
-   8/16 ``margin // 2`` rule ("cap loosened"). That loosening is
-   UNOBSERVABLE in the replay proper — a recorded quote carries no skew, so
-   the residual reconstruction can never exceed the cap that produced it —
-   which is why it is measured with a saturating synthetic rebate through
-   the live ``construct_quote`` instead (review fix M4c).
+   ``floor_for_cell`` (sport pool point) — under THREE rules side by side:
+   ``floor`` (fee-only), ``upper`` (build A's t_{G−1}(Φ(−3))·SE upper
+   bound = what the wire priced from the 22:45:44Z relight, reproduced by
+   ``tools/proto_floor_point.py``) and ``point`` (the live estimator since
+   build "floor-point-estimate": the shrunk point shortfall). The rebate
+   CAP each rule leaves is UNOBSERVABLE in the replay proper — a recorded
+   quote carries no skew, so the residual reconstruction can never exceed
+   the cap that produced it — so it is measured with a saturating synthetic
+   rebate (the whole margin) through the live ``construct_quote`` (review
+   fix M4c): per tier, the mean cap in cc and the share of quotes with ANY
+   rebate room under each rule, plus the cells that allow no rebate on any
+   replayed quote under the point rule with their measured shortfall (the
+   genuinely losing shapes). PARITY (rule 8): the prototype's point table
+   through ``construct_quote`` must post the same bid as the live
+   estimator's on every replayed quote.
+
+   ``--tape-mode floor`` (a tape recorded AFTER the fee seam went live,
+   e.g. tonight's rowid range): the applied skew is the residual against
+   the floor-mode zero-skew bid (the razor's m_min is already in the
+   recorded bid); ``fee_blind`` (default) is the pre-seam tape.
 
 Usage:
     PYTHONPATH=src .venv/Scripts/python.exe -m tools.diagnostics.fee_floor_counterfactual \
         --config config/prod-live-wc.local.yaml \
         --db "file:D:/kalshi-combos-TWO-data/combomaker-prod-live-wc.sqlite3?mode=ro" \
         --max-quotes 60000 --with-cell-floor
+    ... --since 2026-09-04T22:45 --tape-mode floor --max-quotes 20000   (tonight's range)
 """
 
 from __future__ import annotations
@@ -201,17 +215,33 @@ class Tally:
     nonzero_floor: int = 0
     nonzero_width: int = 0
     nonzero_cell: int = 0
+    nonzero_upper: int = 0
     moved_floor: int = 0
     moved_floor_cc: int = 0
     moved_width: int = 0
     moved_width_cc: int = 0
     moved_cell: int = 0
     moved_cell_cc: int = 0
+    # the point rule vs the two references: fee-only ("floor") and the live
+    # wire ("upper", build A) — counts and mean cc of the bid difference
+    moved_cell_vs_floor: int = 0
+    moved_cell_vs_floor_cc: int = 0
+    moved_cell_vs_upper: int = 0
+    moved_cell_vs_upper_cc: int = 0
     parity_today: int = 0
+    parity_proto: int = 0
     rebate_quotes: int = 0
     # M4c: quotes whose CELL floor makes the rebate cap looser than margin // 2
     # (measured with a saturating synthetic rebate; unobservable in replay).
     cap_loosened: int = 0
+    # The rebate CAP (cc) a saturating rebate is allowed under each rule:
+    # sum over quotes and the count of quotes with ANY room (cap > 0).
+    cap_floor_cc: int = 0
+    cap_floor_open: int = 0
+    cap_upper_cc: int = 0
+    cap_upper_open: int = 0
+    cap_point_cc: int = 0
+    cap_point_open: int = 0
 
 
 def build_quote(
@@ -425,7 +455,9 @@ def fills_section(
 # ------------------------------------------------------------ cell floor
 
 
-def cell_floor_table(con: sqlite3.Connection) -> tuple[dict[CellKey, int] | None, FloorEstimate]:
+def grade_rows_ro(con: sqlite3.Connection) -> list[GradeRow]:
+    """The settled grade off a READ-ONLY connection (two small tables, one
+    batched read each). Shared with ``tools/proto_floor_point.py``."""
     # keep in sync with ops/persistence.py Store.settled_grade_rows (read-only
     # copy of the two SELECTs; the row -> GradeRow conversion is the LIVE
     # grade_row_from_store, never a copy)
@@ -463,20 +495,51 @@ def cell_floor_table(con: sqlite3.Connection) -> tuple[dict[CellKey, int] | None
         })
         if row is not None:
             rows.append(row)
+    return rows
+
+
+@dataclass
+class CellTables:
+    """The three floor rules on the same settled grade."""
+
+    est: FloorEstimate                       # live estimator (point rule)
+    point: dict[CellKey, int]                # == est.table
+    pool_point: dict[str, int]               # == est.pool_floor_cc
+    upper: dict[CellKey, int]                # build A rule (the wire since 22:45:44Z)
+    pool_upper: dict[str, int]
+    proto_point: dict[CellKey, int]          # the prototype's point table (parity)
+    proto_pool_point: dict[str, int]
+
+
+def cell_floor_table(con: sqlite3.Connection) -> CellTables | None:
+    from tools.proto_floor_point import proto_tables
+
+    rows = grade_rows_ro(con)
     est = estimate_retained_floor(rows)
     print("=" * 78)
     print("CELL FLOOR (risk/retained_edge_floor.py on the settled grade, read-only)")
     print("=" * 78)
     print(f"grade rows: {len(rows)}; {json.dumps(summarize(est), default=str)}")
-    if est.published:
-        print(f"{'cell':<70}{'n':>5}{'G':>5}{'mean':>8}{'se':>7}{'w':>6}{'floor':>7} src")
-        for c in sorted(est.cells, key=lambda c: -c.stats.contracts_centi)[:40]:
-            se = "-" if c.stats.se_cc is None else f"{c.stats.se_cc:.1f}"
-            print(f"{'|'.join(c.cell):<70}{c.stats.n_rows:>5}{c.stats.n_clusters:>5}"
-                  f"{c.stats.mean_cc:>8.1f}{se:>7}{c.weight_on_cell:>6.2f}{c.floor_cc:>7}"
-                  f" {c.source}")
+    if not est.published:
+        print()
+        return None
+    p_point, p_pool_point, upper, pool_upper, _detail = proto_tables(rows)
+    table_parity = sum(1 for c in est.table if p_point.get(c) == est.table[c])
+    print(f"PARITY prototype point table == live estimator: {table_parity}/{len(est.table)} cells;"
+          f" pools {'equal' if p_pool_point == dict(est.pool_floor_cc) else 'DIFFER'}")
+    print(f"pool floors — point (live now): {dict(sorted(est.pool_floor_cc.items()))};"
+          f" upper (build A, the wire since 22:45:44Z): {dict(sorted(pool_upper.items()))}")
+    print(f"{'cell':<70}{'n':>5}{'G':>5}{'mean':>8}{'se':>7}{'w':>6}{'point':>7}{'upper':>7} src")
+    for c in sorted(est.cells, key=lambda c: -c.stats.contracts_centi)[:40]:
+        se = "-" if c.stats.se_cc is None else f"{c.stats.se_cc:.1f}"
+        print(f"{'|'.join(c.cell):<70}{c.stats.n_rows:>5}{c.stats.n_clusters:>5}"
+              f"{c.stats.mean_cc:>8.1f}{se:>7}{c.weight_on_cell:>6.2f}{c.floor_cc:>7}"
+              f"{upper.get(c.cell, 0):>7} {c.source}")
     print()
-    return (dict(est.table) if est.published else None), est
+    return CellTables(
+        est=est, point=dict(est.table), pool_point=dict(est.pool_floor_cc), upper=upper,
+        pool_upper=pool_upper, proto_point=p_point, proto_pool_point=p_pool_point,
+    )
 
 
 # ---------------------------------------------------------------- section 3
@@ -490,9 +553,9 @@ def quotes_section(
     *,
     decisions_from: int,
     max_quotes: int,
-    floor_table: dict[CellKey, int] | None,
-    pool_floor_cc: dict[str, int] | None = None,
+    tables: CellTables | None,
     qty_centi: int = 1_000,
+    tape_mode: str = "fee_blind",
 ) -> dict[str, Tally]:
     cur = con.execute(
         "SELECT id, context_json FROM decisions WHERE kind = 'quote_sent' AND id >= ?"
@@ -501,6 +564,9 @@ def quotes_section(
     )
     tallies: dict[str, Tally] = defaultdict(Tally)
     loosened_cells: dict[CellKey, int] = {}
+    # per cell under the POINT rule: quotes replayed, quotes with NO rebate room
+    cell_quotes: dict[CellKey, int] = defaultdict(int)
+    cell_closed: dict[CellKey, int] = defaultdict(int)
     skipped = 0
     n = 0
 
@@ -530,8 +596,14 @@ def quotes_section(
         # The recorded bid is ground truth for "today": the applied skew is
         # the residual (rebate > 0 raises the bid; widen < 0 lowers it). The
         # grid snap-down residue (< 10cc) rides inside it identically across
-        # modes, so per-mode DIFFERENCES are exact.
-        skew = no_bid - (no_fair - margin)
+        # modes, so per-mode DIFFERENCES are exact. On a tape recorded in
+        # floor mode the zero-skew reference is the floor-mode bid (the
+        # razor's m_min is already inside the recorded bid).
+        if tape_mode == "floor":
+            base = mk(fair, width, markup, 0, fee_type=COMBO, mode="floor")
+            skew = no_bid - (int(base.no_bid_cc) if base else no_fair - margin)
+        else:
+            skew = no_bid - (no_fair - margin)
         n += 1
         t = tallies[tier]
         t.n += 1
@@ -540,17 +612,28 @@ def quotes_section(
         today = mk(fair, width, markup, skew, fee_type=FeeType.QUADRATIC, mode="width")
         floor = mk(fair, width, markup, skew, fee_type=COMBO, mode="floor")
         widen = mk(fair, width, markup, skew, fee_type=COMBO, mode="width")
-        cell_q = None
-        if floor_table is not None:
+        cell_q = upper_q = None
+        if tables is not None:
             leg_refs = [
                 LegRef(market_ticker=tk, event_ticker=tk.rsplit("-", 1)[0], side="yes")
                 for tk in legs
             ]
             key = cell_key(leg_refs)
-            # The LIVE lookup rule: absent cell -> sport pool upper bound (M2).
-            floor_cc = floor_for_cell(key, floor_table, pool_floor_cc or {})
+            # The LIVE lookup rule: absent cell -> sport pool (M2), under
+            # each of the three tables.
+            floor_cc = floor_for_cell(key, tables.point, tables.pool_point)
+            upper_cc = floor_for_cell(key, tables.upper, tables.pool_upper)
+            proto_cc = floor_for_cell(key, tables.proto_point, tables.proto_pool_point)
             cell_q = mk(fair, width, markup, skew, fee_type=COMBO, mode="floor",
                         retained_floor_cc=floor_cc)
+            upper_q = mk(fair, width, markup, skew, fee_type=COMBO, mode="floor",
+                         retained_floor_cc=upper_cc)
+            proto_q = mk(fair, width, markup, skew, fee_type=COMBO, mode="floor",
+                         retained_floor_cc=proto_cc)
+            if (cell_q is None) == (proto_q is None) and (
+                cell_q is None or int(cell_q.no_bid_cc) == int(proto_q.no_bid_cc)  # type: ignore[union-attr]
+            ):
+                t.parity_proto += 1
             # M4c: is this cell's cap LOOSER than today's margin // 2? Push a
             # saturating rebate (the whole margin) through both rules; the
             # replay's residual skew can never show this, so it is measured
@@ -565,6 +648,27 @@ def quotes_section(
             ):
                 t.cap_loosened += 1
                 loosened_cells[key] = floor_cc
+            # THE REBATE CAP under each rule: the saturating rebate's bid
+            # minus the zero-skew floor-mode bid (both through the live
+            # pricer; the grid residue cancels).
+            base0 = mk(fair, width, markup, 0, fee_type=COMBO, mode="floor")
+            sat_floor = mk(fair, width, markup, margin, fee_type=COMBO, mode="floor")
+            sat_upper = mk(fair, width, markup, margin, fee_type=COMBO, mode="floor",
+                           retained_floor_cc=upper_cc)
+            if base0 is not None:
+                b0 = int(base0.no_bid_cc)
+                for sat, cc_attr, open_attr in (
+                    (sat_floor, "cap_floor_cc", "cap_floor_open"),
+                    (sat_upper, "cap_upper_cc", "cap_upper_open"),
+                    (sat_cell, "cap_point_cc", "cap_point_open"),
+                ):
+                    cap = max(0, int(sat.no_bid_cc) - b0) if sat is not None else 0
+                    setattr(t, cc_attr, getattr(t, cc_attr) + cap)
+                    if cap > 0:
+                        setattr(t, open_attr, getattr(t, open_attr) + 1)
+                cell_quotes[key] += 1
+                if sat_cell is None or int(sat_cell.no_bid_cc) - b0 <= 0:
+                    cell_closed[key] += 1
         today_bid = int(today.no_bid_cc) if today else 0
         if today_bid == no_bid:
             t.parity_today += 1
@@ -574,22 +678,34 @@ def quotes_section(
             (floor, "moved_floor", "moved_floor_cc", "nonzero_floor"),
             (widen, "moved_width", "moved_width_cc", "nonzero_width"),
             (cell_q, "moved_cell", "moved_cell_cc", "nonzero_cell"),
+            (upper_q, "_", "_", "nonzero_upper"),
         ):
             if q is None:
                 continue
             bid = int(q.no_bid_cc)
             if bid > 0:
                 setattr(t, nz_attr, getattr(t, nz_attr) + 1)
-            if bid != today_bid:
+            if moved_attr != "_" and bid != today_bid:
                 setattr(t, moved_attr, getattr(t, moved_attr) + 1)
                 setattr(t, cc_attr, getattr(t, cc_attr) + (bid - today_bid))
+        if cell_q is not None:
+            cb = int(cell_q.no_bid_cc)
+            fb = int(floor.no_bid_cc) if floor is not None else 0
+            ub = int(upper_q.no_bid_cc) if upper_q is not None else 0
+            if cb != fb:
+                t.moved_cell_vs_floor += 1
+                t.moved_cell_vs_floor_cc += cb - fb
+            if cb != ub:
+                t.moved_cell_vs_upper += 1
+                t.moved_cell_vs_upper_cc += cb - ub
     print("=" * 78)
     print(f"3. QUOTE REPLAY: {n} quote_sent decisions from rowid {decisions_from}"
-          f" (skipped {skipped}); replay qty {qty_centi / 100:.2f} contracts")
+          f" (skipped {skipped}); replay qty {qty_centi / 100:.2f} contracts;"
+          f" tape mode {tape_mode}")
     print("=" * 78)
     hdr = (f"{'tier':<20}{'n':>7}{'rebate':>7}{'parity':>8}{'nz today':>9}{'nz floor':>9}"
            f"{'nz width':>9}{'mv floor':>9}{'mean cc':>8}{'mv width':>9}{'mean cc':>8}")
-    if floor_table is not None:
+    if tables is not None:
         hdr += f"{'nz cell':>8}{'mv cell':>8}{'mean cc':>8}{'loosened':>9}"
     print(hdr)
     for tier in sorted(tallies, key=lambda k: -tallies[k].n):
@@ -599,7 +715,7 @@ def quotes_section(
                 f"{(t.moved_floor_cc / t.moved_floor if t.moved_floor else 0):>8.1f}"
                 f"{t.moved_width:>9}"
                 f"{(t.moved_width_cc / t.moved_width if t.moved_width else 0):>8.1f}")
-        if floor_table is not None:
+        if tables is not None:
             line += (f"{t.nonzero_cell:>8}{t.moved_cell:>8}"
                      f"{(t.moved_cell_cc / t.moved_cell if t.moved_cell else 0):>8.1f}"
                      f"{t.cap_loosened:>9}")
@@ -607,13 +723,56 @@ def quotes_section(
     zero_tiers = [k for k, t in tallies.items() if t.nonzero_floor == 0]
     print()
     print("GATE: tiers with ZERO non-zero quotes under floor:", zero_tiers or "none")
-    if floor_table is not None:
+    if tables is not None:
+        zero_cell = [k for k, t in tallies.items() if t.nonzero_cell == 0]
+        print("GATE: tiers with ZERO non-zero quotes under the point cell floor:",
+              zero_cell or "none")
+        total_parity = sum(t.parity_proto for t in tallies.values())
+        print(f"PARITY prototype point floor == live estimator through construct_quote:"
+              f" {total_parity}/{n} replayed quotes")
+        print()
+        print("3b. POINT RULE vs the two references (bid difference, the point bid minus the"
+              " reference; + = the rebate came back) and the REBATE CAP a saturating rebate"
+              " is allowed under each rule (mean cc over the tier; 'open' = quotes with any"
+              " rebate room)")
+        print(f"{'tier':<20}{'n':>7}{'nz upper':>9}{'vs floor':>9}{'mean cc':>8}"
+              f"{'vs upper':>9}{'mean cc':>8}{'cap fee':>8}{'open':>6}{'cap upper':>10}"
+              f"{'open':>6}{'cap point':>10}{'open':>6}")
+        for tier in sorted(tallies, key=lambda k: -tallies[k].n):
+            t = tallies[tier]
+            mf, mu_ = t.moved_cell_vs_floor, t.moved_cell_vs_upper
+            vs_floor = t.moved_cell_vs_floor_cc / mf if mf else 0
+            vs_upper = t.moved_cell_vs_upper_cc / mu_ if mu_ else 0
+            print(f"{tier:<20}{t.n:>7}{t.nonzero_upper:>9}{t.moved_cell_vs_floor:>9}"
+                  f"{vs_floor:>8.1f}{t.moved_cell_vs_upper:>9}{vs_upper:>8.1f}"
+                  f"{t.cap_floor_cc / t.n:>8.1f}{t.cap_floor_open:>6}"
+                  f"{t.cap_upper_cc / t.n:>10.1f}{t.cap_upper_open:>6}"
+                  f"{t.cap_point_cc / t.n:>10.1f}{t.cap_point_open:>6}")
         total_loosened = sum(t.cap_loosened for t in tallies.values())
+        print()
         print(f"CAP LOOSENED (cell floor < margin//2 - fee; UNOBSERVABLE in the replay -"
               f" measured with a saturating rebate): {total_loosened} quotes on"
               f" {len(loosened_cells)} cells")
-        for key, floor_cc in sorted(loosened_cells.items()):
-            print(f"  {'|'.join(key):<70} floor {floor_cc:>5}")
+        # The cells that still allow NO rebate on every replayed quote under
+        # the point rule: the genuinely losing shapes, with their record.
+        by_cell = {c.cell: c for c in tables.est.cells}
+        closed = [k for k in cell_quotes if cell_closed[k] == cell_quotes[k]]
+        print(f"NO-REBATE CELLS under the point rule (cap 0 on every replayed quote):"
+              f" {len(closed)} of {len(cell_quotes)} cells quoted,"
+              f" {sum(cell_quotes[k] for k in closed)} of {n} quotes")
+        print(f"  {'cell':<66}{'quotes':>7}{'floor':>6}{'src':>6}{'n':>5}{'G':>5}"
+              f"{'mean':>8}{'post':>8}{'se':>7}")
+        for k in sorted(closed, key=lambda k: -cell_quotes[k])[:40]:
+            fl = floor_for_cell(k, tables.point, tables.pool_point)
+            c = by_cell.get(k)
+            if c is None:
+                print(f"  {'|'.join(k):<66}{cell_quotes[k]:>7}{fl:>6}{'pool':>6}"
+                      f"{'-':>5}{'-':>5}{'-':>8}{'-':>8}{'-':>7}  (absent: sport pool point)")
+                continue
+            se = "-" if c.stats.se_cc is None else f"{c.stats.se_cc:.1f}"
+            print(f"  {'|'.join(k):<66}{cell_quotes[k]:>7}{fl:>6}{c.source:>6}"
+                  f"{c.stats.n_rows:>5}{c.stats.n_clusters:>5}{c.stats.mean_cc:>8.1f}"
+                  f"{c.post_mean_cc:>8.1f}{se:>7}")
     return tallies
 
 
@@ -635,6 +794,17 @@ def main(argv: Iterable[str] | None = None) -> int:
         "--qty-centi", type=int, default=None,
         help="replay quantity in centi-contracts (default: the smallest post-onset fill)",
     )
+    ap.add_argument(
+        "--since", default=None,
+        help="ISO time: replay from the first decision at/after it (bisected on rowid)"
+        " instead of the onset; e.g. 2026-09-04T22:45 for tonight's range",
+    )
+    ap.add_argument(
+        "--tape-mode", choices=("fee_blind", "floor"), default="fee_blind",
+        help="how the recorded bids were produced: fee_blind (pre-seam tape, default) or"
+        " floor (recorded under fee mode floor: the residual skew is taken against the"
+        " floor-mode zero-skew bid)",
+    )
     args = ap.parse_args(list(argv) if argv is not None else None)
     cfg = load_config(Path(args.config))
     policy = MarkupPolicy.from_config(cfg.pricing.markup)
@@ -651,21 +821,17 @@ def main(argv: Iterable[str] | None = None) -> int:
     decisions_from = (
         args.decisions_from
         if args.decisions_from is not None
-        else first_decision_id_at_or_after(con, ONSET_ISO)
+        else first_decision_id_at_or_after(con, args.since or ONSET_ISO)
     )
     qty_centi = (
         args.qty_centi if args.qty_centi is not None else smallest_post_onset_fill_centi(con)
     )
     fills_section(con, policy, fee_model, conventions)
-    floor_table = None
-    pool_floor: dict[str, int] | None = None
-    if args.with_cell_floor:
-        floor_table, est = cell_floor_table(con)
-        pool_floor = dict(est.pool_floor_cc) if est.published else None
+    tables = cell_floor_table(con) if args.with_cell_floor else None
     quotes_section(
         con, policy, fee_model, params,
-        decisions_from=decisions_from, max_quotes=args.max_quotes, floor_table=floor_table,
-        pool_floor_cc=pool_floor, qty_centi=qty_centi,
+        decisions_from=decisions_from, max_quotes=args.max_quotes, tables=tables,
+        qty_centi=qty_centi, tape_mode=args.tape_mode,
     )
     return 0
 

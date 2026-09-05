@@ -1,22 +1,30 @@
-"""MEASURED retained-edge floor + rebate bound (2026-09-04 build A item 2).
+"""MEASURED retained-edge floor + rebate bound (2026-09-04 build A item 2;
+the POINT rule since build "floor-point-estimate" the same day).
 
 - estimator: contract-weighted, game-clustered SE, empirical-Bayes shrink
-  to the sport pool, thin cells (derived n_min: SE² > τ²) take the pool's
-  UPPER bound, nothing publishes below the 14-day pooled span, z is the
-  policy daily anchor (3) applied as its tail probability through
-  Student-t at clusters − 1 df (a 3-cluster pool cannot publish a floor of
-  0 off an SE estimated from two degrees of freedom — review fix pass);
+  to the sport pool, floor = max(0, −shrunk point shortfall) — NO z·SE term
+  (PIN CHANGED 2026-09-04 build "floor-point-estimate": build A's
+  t_{G−1}(Φ(−3))·SE upper bound published 15-59c floors on populated cells
+  and 5.9-49.5c pool floors against 1-3c tier margins, so the rebate cap
+  margin − fee − floor was <= 0 on essentially every quote — the diversity
+  steer was muted on 100% of populated cells; the z ladder anchors TAIL
+  risk, the floor is a point estimate of a cost); thin cells (derived
+  n_min: SE² > τ²) take the pool's POINT; nothing publishes below the
+  14-day pooled span;
 - rebate bound: es_value caps at the measured Cov price; exposure-backed
   drops a leg-axis rebate whose mirror direction the book does not hold;
   widening passes untouched;
 - store read + lifecycle sweep: settled rows -> cells -> published table on
   the engine (one dict lookup on the quote path);
 - FAIL-CLOSED lookup (review fix M2): a cell ABSENT from the published
-  table resolves to its sport pool's upper bound, an unknown sport to the
-  largest published pool floor — never to None (= the loosest cap) while a
-  table is published;
+  table resolves to its sport pool's point, an unknown sport to the largest
+  published pool point — never to None (= the unmeasured cap) while a table
+  is published;
 - cluster key (review fix S8): a settled row whose legs carry no event
-  ticker is its own cluster, keyed on the combo ticker.
+  ticker is its own cluster, keyed on the combo ticker;
+- property: through construct_quote the post-rebate retained margin never
+  drops below the fee floor, and never below fee + cell floor unless the
+  margin itself is smaller (floor >= fee always).
 """
 
 from __future__ import annotations
@@ -25,17 +33,21 @@ import json
 import math
 from pathlib import Path
 
+from hypothesis import given, settings
+from hypothesis import strategies as st
+
+from combomaker.core.money import CC_PER_DOLLAR
+from combomaker.pricing.quote import ConstructedQuote
 from combomaker.pricing.retained_cell import CellKey, cell_key, floor_for_cell
-from combomaker.risk.cap_family import K_DAILY
 from combomaker.risk.rebate_bound import bound_rebate, mirror_key
 from combomaker.risk.retained_edge_floor import (
     MIN_POOL_DAYS,
     GradeRow,
     estimate_retained_floor,
     grade_row_from_store,
+    point_floor_cc,
     pool_stats,
     summarize,
-    tail_quantile,
 )
 
 MLB_ALL_NO_RFI: CellKey = ("mlb", "rfi|rfi", "all_no", "cross")
@@ -90,38 +102,56 @@ def test_nothing_publishes_below_the_pooled_span() -> None:
     assert MIN_POOL_DAYS == 14.0
 
 
-def test_floor_is_the_z_upper_bound_of_adverse_selection() -> None:
+def test_point_floor_is_the_measured_loss_and_never_negative() -> None:
+    assert point_floor_cc(-1_999.0) == 1_999  # mlb|rfi|rfi|all_no|cross: −20c/ct
+    assert point_floor_cc(-0.4) == 1  # ceil: a loss of a fraction of a cc still floors
+    assert point_floor_cc(0.0) == 0
+    assert point_floor_cc(2_790.0) == 0  # an outperforming cell floors at the fee alone
+    assert point_floor_cc(-0.0) == 0
+
+
+def test_floor_is_the_shrunk_point_shortfall() -> None:
+    """PIN CHANGED 2026-09-04 (build "floor-point-estimate"): build A pinned
+    floor == max(0, q·SE − mean) with q the Student-t quantile of Φ(−3)
+    at the cell's clusters − 1 df; live that floored every populated cell
+    at 15-59c against 1-3c margins (rebate muted on 100% of populated
+    cells). The floor is now the SHRUNK POINT: a losing cell keeps its
+    whole measured shortfall (fee + |shortfall| after construct_quote adds
+    the fee), a cell at or above the model floors at 0 (the fee alone)."""
     # Two well-populated cells: one outperforms the model by ~+5c/ct, one
     # loses ~−30c/ct (the all-NO NRFI×NRFI signature), plus a filler cell.
     good = _cell(MLB_YES_ML, [5.0 + (i % 3) for i in range(120)])
     bad = _cell(MLB_ALL_NO_RFI, [-30.0 + (i % 5) for i in range(120)])
     filler = _cell(MLB_HR_NO, [-2.0 + (i % 4) for i in range(120)])
     est = estimate_retained_floor(good + bad + filler)
-    assert est.published and est.z == K_DAILY == 3.0
+    assert est.published
     by = {c.cell: c for c in est.cells}
     assert not by[MLB_YES_ML].thin and not by[MLB_ALL_NO_RFI].thin
-    # PIN CHANGED 2026-09-04 (review fix pass): the SE multiplier is the
-    # Student-t quantile of the policy tail probability at the cell's own
-    # clusters − 1 df (120 clusters here → 3.08, not 3.0; → 3.0 as G grows).
     b = by[MLB_ALL_NO_RFI]
-    q = tail_quantile(est.z, b.stats.n_clusters)
-    assert q is not None and b.quantile == q and 3.0 < q < 3.1
-    assert b.post_mean_cc < -20.0 and b.post_se_cc is not None
-    assert b.floor_cc == max(0, math.ceil(q * b.post_se_cc - b.post_mean_cc))
-    assert b.floor_cc >= 20
-    # The outperforming cell floors at max(0, q·SE − mean): its own
-    # performance offsets the uncertainty; never negative.
+    assert b.post_mean_cc < -20.0 and b.post_se_cc is not None and b.source == "cell"
+    # NEGATIVE cell: floor = ⌈−post_mean⌉ — the whole measured loss, no SE term.
+    assert b.floor_cc == math.ceil(-b.post_mean_cc) == point_floor_cc(b.post_mean_cc)
+    assert 20 <= b.floor_cc <= 30
+    # What build A would have published on the same cell: strictly more.
+    assert b.floor_cc < math.ceil(3.0 * b.post_se_cc - b.post_mean_cc)
+    # POSITIVE cell: floor 0 — the fee alone; its SE (≈0.5c here) no longer
+    # enters the floor at all.
     g = by[MLB_YES_ML]
-    gq = tail_quantile(est.z, g.stats.n_clusters)
-    assert gq is not None
-    assert g.floor_cc == max(0, math.ceil(gq * (g.post_se_cc or 0.0) - g.post_mean_cc))
-    assert g.floor_cc < b.floor_cc
-    assert est.table[MLB_ALL_NO_RFI] == b.floor_cc
+    assert g.post_mean_cc > 0.0 and g.floor_cc == 0 and g.post_se_cc is not None
+    assert g.post_se_cc > 0.0
+    assert est.table[MLB_ALL_NO_RFI] == b.floor_cc and est.table[MLB_YES_ML] == 0
     summary = summarize(est)
     assert summary["n_cells"] == 3 and summary["published"] is True
+    assert summary["rule"] == "shrunk_point"
+    assert summary["n_populated_losing"] == 2 and summary["n_populated_at_fee"] == 1
+    assert "pool_quantile_by_sport" not in summary and "z" not in summary
 
 
-def test_thin_cell_takes_the_sport_pools_upper_bound() -> None:
+def test_thin_cell_takes_the_sport_pools_point() -> None:
+    """PIN CHANGED 2026-09-04 (build "floor-point-estimate"): a thin cell
+    used to take the pool's t-quantile UPPER bound (5.9c on mlb live); it
+    takes the pool's POINT max(0, −pool mean) — 0 on a pool at or above
+    the model, its measured loss on a losing pool."""
     good = _cell(MLB_YES_ML, [5.0 + (i % 3) for i in range(120)])
     bad = _cell(MLB_ALL_NO_RFI, [-30.0 + (i % 5) for i in range(120)])
     # A brand-new shape with 2 settled games: its SE is far above τ.
@@ -131,11 +161,37 @@ def test_thin_cell_takes_the_sport_pools_upper_bound() -> None:
     by = {c.cell: c for c in est.cells}
     assert by[new_cell].thin and by[new_cell].source == "pool"
     assert by[new_cell].floor_cc == est.pool_floor_cc["mlb"]
+    pool = est.pools["mlb"]
+    assert est.pool_floor_cc["mlb"] == point_floor_cc(pool.mean_cc) == math.ceil(-pool.mean_cc)
+    assert pool.mean_cc < 0.0 and est.pool_floor_cc["mlb"] > 0  # this pool loses on net
+    assert pool.se_cc is not None
+    assert est.pool_floor_cc["mlb"] < math.ceil(3.0 * pool.se_cc - pool.mean_cc)  # not the bound
     # And a single-cluster cell (SE undefined) is thin too.
     one = _cell(("mlb", "total|total", "all_yes", "cross"), [1.0])
     est2 = estimate_retained_floor(good + bad + one)
     lone = {c.cell: c for c in est2.cells}[("mlb", "total|total", "all_yes", "cross")]
     assert lone.thin and lone.floor_cc == est2.pool_floor_cc["mlb"]
+    # A pool at or above the model: its thin cells floor at 0 (fee alone).
+    winning = _cell(("soccer", "btts|total", "all_no", "same"), [3.0 + (i % 5) for i in range(60)])
+    thin_soccer = _cell(("soccer", "moneyline|total", "mixed", "same"), [-50.0, 45.0])
+    est3 = estimate_retained_floor(good + bad + winning + thin_soccer)
+    assert est3.pools["soccer"].mean_cc > 0.0 and est3.pool_floor_cc["soccer"] == 0
+    assert est3.table[("soccer", "moneyline|total", "mixed", "same")] == 0
+
+
+def test_unknown_sport_takes_the_largest_pool_point() -> None:
+    """The fail-closed DIRECTION for a sport with no settled record: the
+    largest pool POINT (never a bound) — through the live lookup."""
+    mlb = _cell(MLB_ALL_NO_RFI, [-30.0 + (i % 5) for i in range(120)])
+    soccer = _cell(("soccer", "btts|total", "all_no", "same"), [3.0 + (i % 5) for i in range(60)])
+    est = estimate_retained_floor(mlb + soccer)
+    assert est.pool_floor_cc["mlb"] > 0 and est.pool_floor_cc["soccer"] == 0
+    nfl: CellKey = ("nfl", "moneyline|moneyline", "all_yes", "cross")
+    assert floor_for_cell(nfl, est.table, est.pool_floor_cc) == est.pool_floor_cc["mlb"]
+    assert floor_for_cell(nfl, est.table, est.pool_floor_cc) == max(est.pool_floor_cc.values())
+    # a known sport, an unseen shape: that sport's point (0 on soccer here)
+    assert floor_for_cell(("soccer", "spread|total", "mixed", "same"), est.table,
+                          est.pool_floor_cc) == 0
 
 
 def test_shrinkage_pulls_a_noisy_cell_toward_its_sport_pool() -> None:
@@ -149,6 +205,66 @@ def test_shrinkage_pulls_a_noisy_cell_toward_its_sport_pool() -> None:
     mu = est.pools["mlb"].mean_cc
     assert min(raw_mean, mu) - 1e-9 <= c.post_mean_cc <= max(raw_mean, mu) + 1e-9
     assert 0.0 <= c.weight_on_cell <= 1.0
+    # A populated cell's floor is exactly the point of its SHRUNK mean.
+    if not c.thin:
+        assert c.floor_cc == point_floor_cc(c.post_mean_cc)
+
+
+@settings(derandomize=True, max_examples=200)
+@given(
+    shortfalls=st.lists(st.floats(-8_000.0, 3_000.0), min_size=2, max_size=40),
+    pool_shortfalls=st.lists(st.floats(-3_000.0, 3_000.0), min_size=30, max_size=60),
+)
+def test_every_published_floor_is_non_negative_and_a_point(
+    shortfalls: list[float], pool_shortfalls: list[float]
+) -> None:
+    rows = _cell(MLB_YES_ML, pool_shortfalls) + _cell(MLB_ALL_NO_RFI, shortfalls)
+    est = estimate_retained_floor(rows)
+    assert est.published
+    for c in est.cells:
+        assert c.floor_cc >= 0
+        if c.thin:
+            assert c.floor_cc == est.pool_floor_cc[c.cell[0]]
+        else:
+            assert c.floor_cc == point_floor_cc(c.post_mean_cc)
+    for sport, pool in est.pools.items():
+        assert est.pool_floor_cc[sport] == point_floor_cc(pool.mean_cc) >= 0
+
+
+# ---------------------------------------- floor >= fee ALWAYS (construct_quote)
+
+
+@settings(derandomize=True, max_examples=300)
+@given(
+    fair=st.floats(0.05, 0.95),
+    markup=st.integers(0, 400),
+    skew=st.integers(0, 800),
+    cell_floor=st.integers(0, 7_000),
+    qty=st.sampled_from([100, 120, 250, 1_000, 5_000]),
+)
+def test_retained_margin_after_the_rebate_never_drops_below_fee_plus_floor(
+    fair: float, markup: int, skew: int, cell_floor: int, qty: int
+) -> None:
+    """floor >= fee ALWAYS: through the live construct_quote (floor mode, the
+    measured combo schedule), the retained margin left after ANY rebate is
+    at least m_min (the confirm gate's fee predicate at this quantity) and
+    at least fee + cell floor unless the tier margin itself is smaller —
+    the cap is margin − m_min − floor and nothing looser; a floor of 0
+    leaves exactly margin − m_min. The grid snap only ever LOWERS the bid
+    (raises the retained margin)."""
+    from tests.test_quote_fee_floor import confirm_edge_cc, derived_floor, quote
+
+    q = quote(fair=fair, markup=markup, skew=skew, mode="floor", retained_floor=cell_floor, qty=qty)
+    if not isinstance(q, ConstructedQuote) or int(q.no_bid_cc) <= 0:
+        return  # declined side: nothing was sold
+    fair_cc = int(round(fair * CC_PER_DOLLAR))
+    no_fair = CC_PER_DOLLAR - fair_cc
+    retained = no_fair - int(q.no_bid_cc)
+    fee_floor = derived_floor(no_fair, markup, skew, qty=qty)
+    margin = max(markup, fee_floor)
+    assert retained >= fee_floor
+    assert retained >= min(margin, fee_floor + cell_floor)
+    assert confirm_edge_cc(fair_cc, int(q.no_bid_cc), qty) > 0
 
 
 # ---------------------------------------------------------------- rebate bound
@@ -247,12 +363,18 @@ async def test_sweep_publishes_a_floor_table_from_the_settled_grade(tmp_path: Pa
     assert table is not None
     rfi = table[("mlb", "rfi|rfi", "all_no", "cross")]
     ml = table[("mlb", "moneyline|moneyline", "all_yes", "cross")]
+    # PIN (build "floor-point-estimate"): the losing shape floors at EXACTLY
+    # its measured loss — (−2300 − 200) cc over 10 contracts = −250 cc/ct —
+    # the winning shape at 0 (fee alone); the mlb pool point is the
+    # contract-weighted mean of the two: (−250·40 + 30·40)/80 = −110 → 110.
+    assert rfi == 250 and ml == 0
     assert rfi > ml and rfi >= 20  # the losing shape floors far above the winner
-    # REVIEW FIX M2: the pool upper bounds travel with the table, and an RFQ
-    # whose cell was never settled resolves to its sport's pool floor —
-    # never None (the margin // 2 cap) while a table is published.
+    # REVIEW FIX M2: the pool points travel with the table, and an RFQ whose
+    # cell was never settled resolves to its sport's pool point — never None
+    # (the margin // 2 cap) while a table is published.
     est = estimate_retained_floor([r for r in map(grade_row_from_store, rows) if r])
     assert rig.engine.retained_pool_floor == est.pool_floor_cc and "mlb" in est.pool_floor_cc
+    assert est.pool_floor_cc["mlb"] == 110
     unseen_mlb = combo([
         {"market_ticker": "KXMLBHR-26AUG262105MINATH-MINRLEWIS23-1",
          "event_ticker": "KXMLBHR-26AUG262105MINATH", "side": "no"},
@@ -262,7 +384,7 @@ async def test_sweep_publishes_a_floor_table_from_the_settled_grade(tmp_path: Pa
     assert cell_key(unseen_mlb.legs) not in table
     assert rig.engine._retained_floor_for(unseen_mlb) == est.pool_floor_cc["mlb"]  # noqa: SLF001
     # An unknown sport (the harness's M1/M2 legs key to "other", which has
-    # no pool) takes the LARGEST published pool floor.
+    # no pool) takes the LARGEST published pool point.
     other = rfq()
     assert cell_key(other.legs)[0] not in est.pool_floor_cc
     assert rig.engine._retained_floor_for(other) == max(est.pool_floor_cc.values())  # noqa: SLF001
@@ -282,12 +404,14 @@ def test_absent_cell_resolves_to_its_pool_never_to_none() -> None:
     """The reviewer's demonstration: on a 300cc margin / 88cc fee, a cell
     ABSENT from the table used to get margin // 2 = 150cc of rebate (the
     loosest cap in the system) while a THIN cell got 0 and a floor-0 cell
-    210. The lookup now fails closed exactly like a thin cell."""
+    210. The lookup fails closed exactly like a thin cell — to the pool's
+    published value (a POINT since build "floor-point-estimate"; the
+    numbers here are the lookup's inputs, not a rule)."""
     table = {MLB_ALL_NO_RFI: 448, MLB_YES_ML: 0}
     pools = {"mlb": 590, "soccer": 1_128}
     assert floor_for_cell(MLB_ALL_NO_RFI, table, pools) == 448
     assert floor_for_cell(MLB_YES_ML, table, pools) == 0
-    # never settled, known sport -> that sport's pool upper bound
+    # never settled, known sport -> that sport's pool value
     assert floor_for_cell(("mlb", "rfi|rfi", "all_no", "same"), table, pools) == 590
     assert floor_for_cell(("soccer", "btts|total", "all_no", "same"), table, pools) == 1_128
     # unknown sport ('other', 'esports' with no pool) -> the largest pool
@@ -339,32 +463,27 @@ def test_rows_without_event_tickers_are_their_own_cluster() -> None:
     assert grade_row_from_store(bad) is None
 
 
-# ---------------------------- the tail quantile follows the clusters (fix pass)
+# ------------------------------------ a small outperforming pool floors at 0
 
 
-def test_tail_quantile_is_z_for_many_clusters_and_fails_closed_for_few() -> None:
-    assert tail_quantile(3.0, 1) is None and tail_quantile(3.0, 0) is None
-    assert 19.0 < (tail_quantile(3.0, 3) or 0.0) < 19.5
-    assert 3.8 < (tail_quantile(3.0, 12) or 0.0) < 3.9
-    assert 3.0 < (tail_quantile(3.0, 1_425) or 0.0) < 3.01
-
-
-def test_a_three_row_pool_cannot_publish_a_zero_floor_off_an_outperformance() -> None:
-    """The live cross-sport pool: 3 settled rows in 3 clusters, +27.9c/ct
-    vs the model, SE 4.0c. At z·SE the upper bound is max(0, 12.1 − 27.9)
-    = 0 and every absent cross-sport cell inherited the loosest cap; at the
-    t quantile for 2 df (19.2) the pool floor is ~49c — fail-closed until
-    the pool actually measures something."""
+def test_an_outperforming_pool_floors_at_zero_by_its_point() -> None:
+    """PIN CHANGED 2026-09-04 (build "floor-point-estimate"). The live
+    cross-sport pool: 3 settled rows in 3 clusters, +27.9c/ct vs the
+    model, SE 4.0c. Build A's fix pass floored it at the 2-df t quantile
+    (19.2·SE − mean ≈ 49.5c) so that every absent cross-sport cell was
+    fail-closed to a BOUND; the point rule floors it at max(0, −27.9c) = 0:
+    the record says the shape wins, so the fee alone is retained and the
+    rebate room is margin − m_min. The direction stays fail-closed where it
+    matters — an UNKNOWN sport takes the largest pool point, never 0 by
+    default (see test_unknown_sport_takes_the_largest_pool_point)."""
     mlb = _cell(MLB_YES_ML, [0.0 + (i % 7) - 3 for i in range(200)])
     other_cell: CellKey = ("other", "btts|moneyline", "all_yes", "cross")
     other = _cell(other_cell, [27.0, 32.0, 24.6])
     est = estimate_retained_floor(mlb + other)
     pool = est.pools["other"]
     assert pool.n_clusters == 3 and pool.mean_cc > 20.0 and pool.se_cc is not None
-    q = tail_quantile(est.z, 3)
-    assert q is not None
-    assert est.pool_floor_cc["other"] == max(0, math.ceil(q * pool.se_cc - pool.mean_cc)) > 0
-    assert math.ceil(3.0 * pool.se_cc - pool.mean_cc) < 0  # what plain z would have said
+    assert est.pool_floor_cc["other"] == 0
+    assert math.ceil(19.2 * pool.se_cc - pool.mean_cc) > 0  # what build A published
     absent: CellKey = ("other", "rfi|rfi", "all_no", "cross")
-    assert floor_for_cell(absent, est.table, est.pool_floor_cc) == est.pool_floor_cc["other"]
-    assert summarize(est)["pool_quantile_by_sport"]["other"] == round(q, 2)
+    assert floor_for_cell(absent, est.table, est.pool_floor_cc) == 0
+    assert summarize(est)["pool_floor_cc"] == {"mlb": est.pool_floor_cc["mlb"], "other": 0}

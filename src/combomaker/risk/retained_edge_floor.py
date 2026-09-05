@@ -1,6 +1,7 @@
 """MEASURED retained-edge floor per combo CELL (2026-09-04 build A item 2 —
 the repair for the rebate-ate-the-margin cells: rfi×rfi cross-game NO pairs
-sold at 0.02-0.25c retained, "nobody homers" HR baskets at 0.09c).
+sold at 0.02-0.25c retained, "nobody homers" HR baskets at 0.09c; REPAIRED
+the same day by build "floor-point-estimate" — see WHY THE POINT below).
 
 The inventory rebate used to be capped by a HAND FRACTION of the margin
 (``margin // 2``, itself the 8/16 tightening of "the whole margin"). The
@@ -8,36 +9,47 @@ constitution wants the cap MEASURED. This module estimates, per cell, how
 much retained margin the cell's own settled record says a fill must keep:
 
     floor_cc(cell) = fee_cc(bid, measured schedule)         ← added in
-                   + AS_upper_cc(cell)                        construct_quote
-
-    AS_upper_cc(cell) = max(0, z·SE(cell) − shortfall(cell))
+                   + max(0, −shortfall_post(cell))            construct_quote
 
 with shortfall = (realized − modeled) per contract on the cell's SETTLED
 positions (the store's grade: ``position_ledger.realized_pnl_cc`` vs the
 fills' ``expected_edge_cc``, both net of the exchange fee — like for like),
 contract-weighted, pooled over the whole settled history (never a P&L
 window), SE GAME-CLUSTERED (a combo's games are one loss event; the
-cluster is its game set), shrunk EMPIRICAL-BAYES toward the sport pool:
+cluster is its game set), and ``shortfall_post`` the EMPIRICAL-BAYES SHRUNK
+POINT estimate toward the sport pool:
 
     τ²_sport = max(0, Var_cells(x̄_c) − mean_c(SE_c²))     (method of moments)
-    w_c      = τ² / (τ² + SE_c²)                            (weight on the cell)
+    w_c      = τ² / (τ² + SE_c²)  = n / (n + n0), n0 = σ²/τ²   (weight on the cell)
     post     = w_c·x̄_c + (1 − w_c)·μ_sport,  post_var = 1/(1/SE_c² + 1/τ²)
 
 A cell whose own data carry less than half the posterior weight (SE_c² >
 τ² — the DERIVED n_min: the count at which a cell's clustered SE first
 falls below the between-cell dispersion) is THIN and takes the sport
-pool's UPPER bound instead (fail-closed: a new shape can never be sold at
-fair). ``z`` is the policy z ladder's daily anchor (risk/cap_family.py
-K_DAILY = 3), not a new number — and it is applied as its TAIL PROBABILITY
-through Student-t at G − 1 degrees of freedom, G the number of clusters
-the SE was estimated from (``tail_quantile``): with 1,400 clusters the
-3σ tail needs 3.0 SEs, with 12 it needs 3.85, with 3 it needs 19.2. The
-SE of a 3-cluster pool is not a known quantity, and treating it as one
-let the cross-sport pool (3 settled rows, +27.9c/ct) publish a floor of 0
-that every absent cross-sport cell then inherited (2026-09-04 review fix
-pass, surfaced by the counterfactual's cap-loosened flag). Nothing
-publishes until the settled record spans the pre-registered pooled-read
-minimum (``MIN_POOL_DAYS``).
+pool's POINT (max(0, −μ_sport)); a sport with no pool takes the LARGEST
+pool point (``pricing/retained_cell.floor_for_cell`` — the fail-closed
+DIRECTION, but a point). A NEGATIVE cell (the record says we lose: e.g.
+mlb|rfi|rfi|all_no|cross at −20c/ct) keeps its whole measured shortfall
+as the floor — that is the mechanism working: no rebate where the record
+says we lose. A cell at or above the model floors at 0: the fee alone.
+Nothing publishes until the settled record spans the pre-registered
+pooled-read minimum (``MIN_POOL_DAYS``).
+
+WHY THE POINT (2026-09-04 build "floor-point-estimate"). Build A published
+``max(0, t_{G−1}(Φ(−3))·SE − shortfall)`` — the policy z ladder's daily
+anchor as a 3σ UPPER bound on the adverse selection. Live at 22:45:44Z it
+published 646 cells (445 thin) with pool floors mlb 5.9c / soccer 11.6c /
+esports 26.7c / cross-sport 49.5c and populated floors of 15-59c: per-
+contract settlement noise on a sell-only book is ~40-50c, so at 30-170
+settled games the clustered SE is 4-15c and THREE of them dwarf every
+1-3c tier margin. The rebate cap ``margin − fee − floor`` was <= 0 on
+essentially every quote — the constitutional diversity steer (the skew
+REBATE for offsetting / diversifying flow) was muted on the whole wire.
+The z ladder anchors TAIL risk (KILL, ruin, the caps); a retained-margin
+floor is the point estimate of a COST, and its uncertainty belongs to the
+quote WIDTH (which already scales with uncertainty), not to the margin.
+The SE is still estimated and reported (``CellEstimate.post_se_cc``) for
+that width seam — see the build report for why it is not fed yet.
 
 This is the RETAINED-margin side only: the widen direction and every cap
 are untouched; the quote path does one dict lookup (``table``).
@@ -51,13 +63,9 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from statistics import NormalDist
-
-from scipy.stats import t as student_t
 
 from combomaker.pricing.grouping import game_key
 from combomaker.pricing.retained_cell import CellKey, cell_key
-from combomaker.risk.cap_family import K_DAILY
 from combomaker.risk.exposure import LegRef
 
 # The pre-registered pooled-read horizon (feedback_no_refit_on_pnl: alarms
@@ -65,7 +73,6 @@ from combomaker.risk.exposure import LegRef
 # the floor's pool at >= 14 days). A cadence anchor, not a pricing number:
 # below it NOTHING is published and the quote path keeps the fee-only floor.
 MIN_POOL_DAYS = 14.0
-Z_FLOOR = K_DAILY
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,9 +112,6 @@ class CellEstimate:
     thin: bool
     floor_cc: int
     source: str  # "cell" | "pool"
-    # The SE multiplier actually applied (Student-t at the cell's own
-    # clusters − 1 df for the policy tail probability; None on a pool floor).
-    quantile: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,11 +119,11 @@ class FloorEstimate:
     published: bool
     reason: str
     span_days: float
-    z: float
     table: dict[CellKey, int] = field(default_factory=dict)
     cells: tuple[CellEstimate, ...] = ()
     pools: dict[str, PoolStats] = field(default_factory=dict)
     tau2_by_sport: dict[str, float] = field(default_factory=dict)
+    # Per sport: max(0, −pool mean) — the POINT a thin or absent cell takes.
     pool_floor_cc: dict[str, int] = field(default_factory=dict)
 
 
@@ -195,40 +199,26 @@ def pool_stats(rows: Iterable[GradeRow]) -> PoolStats:
     return PoolStats(len(rows), g, total_w, mean, math.sqrt(var))
 
 
-def tail_quantile(z: float, n_clusters: int) -> float | None:
-    """The SE multiplier that reaches the policy anchor's TAIL PROBABILITY
-    Φ(−z) when the SE was estimated from ``n_clusters`` clusters: the
-    Student-t quantile at n_clusters − 1 degrees of freedom. → z as the
-    clusters grow; None (nothing is measured) below two clusters."""
-    if n_clusters < 2:
-        return None
-    p = float(NormalDist().cdf(z))
-    return float(student_t.ppf(p, n_clusters - 1))
-
-
-def _upper_floor_cc(
-    mean_cc: float, se_cc: float | None, z: float, n_clusters: int
-) -> tuple[int, float] | None:
-    """(max(0, q·SE − mean), q): the tail-probability upper bound of the
-    adverse selection, q the Student-t quantile for the clusters."""
-    q = tail_quantile(z, n_clusters)
-    if se_cc is None or q is None:
-        return None
-    return max(0, math.ceil(q * se_cc - mean_cc)), q
+def point_floor_cc(mean_cc: float) -> int:
+    """max(0, ⌈−mean⌉): the retained margin (cc, EXCLUDING the fee) a
+    measured mean shortfall says a fill must keep. A cell at or above the
+    model floors at 0 — the fee alone; a losing cell keeps its whole
+    measured loss. Never negative (a rebate is never widened by a floor)."""
+    return max(0, math.ceil(-mean_cc))
 
 
 def estimate_retained_floor(
-    rows: Iterable[GradeRow], *, z: float = Z_FLOOR, min_pool_days: float = MIN_POOL_DAYS
+    rows: Iterable[GradeRow], *, min_pool_days: float = MIN_POOL_DAYS
 ) -> FloorEstimate:
     rows = [r for r in rows if r.contracts_centi > 0]
     if not rows:
-        return FloorEstimate(False, "no_settled_rows", 0.0, z)
+        return FloorEstimate(False, "no_settled_rows", 0.0)
     stamps = [dt for dt in (_parse_iso(r.settled_at) for r in rows) if dt is not None]
     if not stamps:
-        return FloorEstimate(False, "unparseable_settle_times", 0.0, z)
+        return FloorEstimate(False, "unparseable_settle_times", 0.0)
     span_days = (max(stamps) - min(stamps)).total_seconds() / 86_400.0
     if span_days < min_pool_days:
-        return FloorEstimate(False, "pool_span_below_minimum", span_days, z)
+        return FloorEstimate(False, "pool_span_below_minimum", span_days)
     by_cell: dict[CellKey, list[GradeRow]] = defaultdict(list)
     by_sport: dict[str, list[GradeRow]] = defaultdict(list)
     for r in rows:
@@ -250,14 +240,10 @@ def estimate_retained_floor(
         between = math.fsum((st.mean_cc - mu) ** 2 for st in defined) / (len(defined) - 1)
         within = math.fsum(st.se_cc**2 for st in defined if st.se_cc is not None) / len(defined)
         tau2[sport] = max(0.0, between - within)
-    pool_floor: dict[str, int] = {}
-    for sport, pool in pools.items():
-        upper = _upper_floor_cc(pool.mean_cc, pool.se_cc, z, pool.n_clusters)
-        # A pool with a single cluster has no measured dispersion at all:
-        # fail closed on it with the largest floor its own data allow — the
-        # whole |mean| plus nothing more cannot be justified, so we take the
-        # sport's absolute mean shortfall magnitude as the bound.
-        pool_floor[sport] = upper[0] if upper is not None else max(0, math.ceil(-pool.mean_cc))
+    # The sport pool's POINT: what a thin or absent cell of the sport takes.
+    pool_floor: dict[str, int] = {
+        sport: point_floor_cc(pool.mean_cc) for sport, pool in pools.items()
+    }
     cells: list[CellEstimate] = []
     table: dict[CellKey, int] = {}
     for cell, st in cell_stats.items():
@@ -287,24 +273,15 @@ def estimate_retained_floor(
             if thin:
                 est = CellEstimate(cell, st, post_mean, post_se, w, True, pool_floor[sport], "pool")
             else:
-                # The quantile follows the cell's OWN clusters (the pool's
-                # information enters through the shrunk mean/SE, not the df).
-                own = _upper_floor_cc(post_mean, post_se, z, st.n_clusters)
-                if own is None:
-                    est = CellEstimate(
-                        cell, st, post_mean, post_se, w, False, pool_floor[sport], "pool"
-                    )
-                else:
-                    est = CellEstimate(
-                        cell, st, post_mean, post_se, w, False, own[0], "cell", own[1]
-                    )
+                est = CellEstimate(
+                    cell, st, post_mean, post_se, w, False, point_floor_cc(post_mean), "cell"
+                )
         cells.append(est)
         table[cell] = est.floor_cc
     return FloorEstimate(
         published=True,
         reason="ok",
         span_days=span_days,
-        z=z,
         table=table,
         cells=tuple(sorted(cells, key=lambda c: c.cell)),
         pools=pools,
@@ -316,22 +293,29 @@ def estimate_retained_floor(
 def summarize(estimate: FloorEstimate) -> Mapping[str, object]:
     """Log-line view."""
     floors = sorted(c.floor_cc for c in estimate.cells)
+    populated = [c for c in estimate.cells if not c.thin]
     return {
         "published": estimate.published,
         "reason": estimate.reason,
         "span_days": round(estimate.span_days, 1),
-        "z": estimate.z,
-        "pool_quantile_by_sport": {
-            s: round(q, 2)
-            for s, p in sorted(estimate.pools.items())
-            if (q := tail_quantile(estimate.z, p.n_clusters)) is not None
-        },
+        "rule": "shrunk_point",
         "n_cells": len(estimate.cells),
         "n_thin": sum(1 for c in estimate.cells if c.thin),
+        # Populated cells whose record says we lose (floor > 0: no rebate
+        # room beyond margin − fee − loss) vs at/above the model (fee alone).
+        "n_populated_losing": sum(1 for c in populated if c.floor_cc > 0),
+        "n_populated_at_fee": sum(1 for c in populated if c.floor_cc == 0),
         "floor_cc_min": floors[0] if floors else None,
         "floor_cc_median": floors[len(floors) // 2] if floors else None,
         "floor_cc_max": floors[-1] if floors else None,
         "pool_floor_cc": dict(sorted(estimate.pool_floor_cc.items())),
+        "pool_mean_cc_by_sport": {
+            s: round(p.mean_cc, 1) for s, p in sorted(estimate.pools.items())
+        },
+        "pool_se_cc_by_sport": {
+            s: (None if p.se_cc is None else round(p.se_cc, 1))
+            for s, p in sorted(estimate.pools.items())
+        },
         "tau_cc_by_sport": {
             s: round(math.sqrt(t), 2) for s, t in sorted(estimate.tau2_by_sport.items())
         },
