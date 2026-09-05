@@ -24,8 +24,9 @@ n/(n + n0), n0 = σ²/τ² (the same weight build A derived), the per-cell
 mean contract-weighted and its SE game-clustered — exactly as before,
 minus the z·SE term. A NEGATIVE cell (the record says we lose, e.g.
 mlb|rfi|rfi|all_no|cross at −20c/ct) keeps its whole measured shortfall
-as the floor: no rebate where the record says we lose. The fee is added
-in construct_quote (m_min), so floor_cc(cell) = fee + max(0, −shortfall).
+as the floor: no rebate BEYOND the measured loss (cap = margin − fee −
+|shortfall|, usually 0 on a 1–3c tier margin). The fee is added in
+construct_quote (m_min), so floor_cc(cell) = fee + max(0, −shortfall).
 
 It ALSO reproduces the build-A UPPER rule (today's live table) so the
 counterfactual can report bids under {fee-only, upper = live, point}.

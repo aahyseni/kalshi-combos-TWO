@@ -30,10 +30,17 @@ pool's POINT (max(0, −μ_sport)); a sport with no pool takes the LARGEST
 pool point (``pricing/retained_cell.floor_for_cell`` — the fail-closed
 DIRECTION, but a point). A NEGATIVE cell (the record says we lose: e.g.
 mlb|rfi|rfi|all_no|cross at −20c/ct) keeps its whole measured shortfall
-as the floor — that is the mechanism working: no rebate where the record
-says we lose. A cell at or above the model floors at 0: the fee alone.
-Nothing publishes until the settled record spans the pre-registered
-pooled-read minimum (``MIN_POOL_DAYS``).
+as the floor — that is the mechanism working: no rebate BEYOND the
+measured loss (the cap is max(0, margin − fee − |shortfall|), which on a
+1–3c tier margin is usually nothing). A cell at or above the model floors
+at 0: the fee alone. A populated cell whose |shrunk point| sits inside one
+posterior SE has an UNRESOLVED sign: its floor is a point on a coin-flip
+and can move with every sweep (live 2026-09-04: 61 of 206 populated cells,
+the ML×ML cross-game class at |post|/SE 0.29 among them) — ``summarize``
+counts them (``n_populated_sign_unresolved``) for the pre-registered
+>= 2-week read, and such a floor is not a "measured loss" until that read
+resolves it (review fix S2). Nothing publishes until the settled record
+spans the pre-registered pooled-read minimum (``MIN_POOL_DAYS``).
 
 WHY THE POINT (2026-09-04 build "floor-point-estimate"). Build A published
 ``max(0, t_{G−1}(Φ(−3))·SE − shortfall)`` — the policy z ladder's daily
@@ -305,6 +312,14 @@ def summarize(estimate: FloorEstimate) -> Mapping[str, object]:
         # room beyond margin − fee − loss) vs at/above the model (fee alone).
         "n_populated_losing": sum(1 for c in populated if c.floor_cc > 0),
         "n_populated_at_fee": sum(1 for c in populated if c.floor_cc == 0),
+        # Populated cells whose |shrunk point| is inside one posterior SE:
+        # the sign of their adverse selection is not resolved, so the floor
+        # (0 or a small positive) can flip with each sweep — the watch list
+        # for the pre-registered >= 2-week read (review fix S2), never a
+        # "measured loss".
+        "n_populated_sign_unresolved": sum(
+            1 for c in populated if c.post_se_cc is not None and abs(c.post_mean_cc) < c.post_se_cc
+        ),
         "floor_cc_min": floors[0] if floors else None,
         "floor_cc_median": floors[len(floors) // 2] if floors else None,
         "floor_cc_max": floors[-1] if floors else None,

@@ -144,7 +144,29 @@ def test_floor_is_the_shrunk_point_shortfall() -> None:
     assert summary["n_cells"] == 3 and summary["published"] is True
     assert summary["rule"] == "shrunk_point"
     assert summary["n_populated_losing"] == 2 and summary["n_populated_at_fee"] == 1
+    assert summary["n_populated_sign_unresolved"] == 0  # all three cells strongly signed
     assert "pool_quantile_by_sport" not in summary and "z" not in summary
+
+
+def test_a_cell_whose_sign_is_unresolved_is_counted_not_trusted() -> None:
+    """Review fix S2 (2026-09-04): a populated cell whose |shrunk point| is
+    inside one posterior SE still gets its point floor (the mechanism never
+    guesses a sign), but summarize() counts it so the log line carries the
+    watch list for the pre-registered >= 2-week read — live, 61 of 206
+    populated cells, the ML×ML cross-game class (|post|/SE 0.29, floor
+    171 cc) among them. Such a floor is not a measured loss."""
+    good = _cell(MLB_YES_ML, [5.0 + (i % 3) for i in range(120)])
+    bad = _cell(MLB_ALL_NO_RFI, [-30.0 + (i % 5) for i in range(120)])
+    coin: CellKey = ("mlb", "player_ks|player_ks", "all_yes", "cross")
+    noisy = _cell(coin, [-40.0, 38.0] * 30)  # mean −1, clustered SE ≈ 5: sign open
+    est = estimate_retained_floor(good + bad + noisy)
+    c = {x.cell: x for x in est.cells}[coin]
+    assert not c.thin and c.post_se_cc is not None
+    assert abs(c.post_mean_cc) < c.post_se_cc
+    assert c.floor_cc == point_floor_cc(c.post_mean_cc)  # still a point, never a bound
+    summary = summarize(est)
+    assert summary["n_populated_sign_unresolved"] == 1
+    assert summary["n_populated_losing"] + summary["n_populated_at_fee"] == 3
 
 
 def test_thin_cell_takes_the_sport_pools_point() -> None:
