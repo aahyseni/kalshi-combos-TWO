@@ -1,7 +1,7 @@
 # 2026-09-05 — BUILD: communications FAN-OUT SHARDING (the fills lever)
 
-Branch `build/ws-fanout-sharding` (worktree `C:/Users/aahys/kct-ws-shard`; bot LIVE on
-main `f55fa43` throughout — store read-only, logs grep/tail only, every heavy job at LOW
+Branch `build/ws-fanout-sharding` — build commit `806d97b`, merge of main `ad06212` (worktree
+`C:/Users/aahys/kct-ws-shard`; bot LIVE on main `f55fa43` throughout — store read-only, logs grep/tail only, every heavy job at LOW
 priority, no process touched). Blast radius: the communications TRANSPORT only.
 
 ## WRONG / FIXED / OPEN
@@ -76,6 +76,7 @@ retention period — N holds at 3 until the evidence says otherwise.
 | New `tests/test_ws_fanout.py` | **23/23** (fake sharded exchange: exactly-once across 3 shards + priority-first; N=1 wire bytes; single-shard 25 → that shard only, not forwarded; whole-channel 17 → forwarded once, on_disconnect coalesced; N=1 forwarded as today; socket death purges only its market frames; codes 19/20/21/22 → unsharded fallback; derivation floor/cap/bootstrap/override/refused; anchors pinned; rate histogram JSON; tape fold/prune/pool; meter lag/utilisation/snapshot; governor alarm → live growth → deferred shrink → next-boot derivation from the tape; governor never raises; retired-generation control frames dropped; single-manager subscribe-error hook; health aggregation) |
 | Full suite (LOW priority, worktree) | **4,212 passed / 0 failed / 3 deselected in 334 s** (`pytest -q` at LOW priority, `PYTHONPATH=<worktree>/src`; main's stated baseline 4,188 + 23 new here) |
 | Vitals fast tier (from the snapshot `vitals_snap2`, taken 21:54Z) | **8/8 GREEN (GATE PASS, 94.8 s)** — `VITALS_DATA_DIR=<scratch>/vitals_snap2 python -m tools.vitals.gate`, LOW priority, worktree PYTHONPATH |
+| **Post-merge re-run** (main advanced 3 commits while this built: `f750924` WholeBookBalanceSource fix touching `quote_app.py`; merged as `ad06212`, `quote_app.py` auto-merged, README index both rows) | full suite **4,215 passed / 0 failed / 3 deselected in 296 s (= main's 4,192 + 23 new)**; vitals fast **8/8 GREEN (GATE PASS, 90.1 s)**; ruff + mypy clean on the merged touched files; the merged `quote_app` imports with both wirings in place |
 | ruff check | clean on every touched/new file |
 | mypy (strict) | clean on `ws.py`, `ws_fanout.py`, `config.py`; `quote_app.py` reports only the 4 pre-existing `pricing/engine.py` errors (identical on main) |
 
