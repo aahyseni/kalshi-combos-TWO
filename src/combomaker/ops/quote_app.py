@@ -1051,20 +1051,28 @@ class WholeBookBalanceSource:
     are parts of a single book/balance — one total capital, one risk book;
     Kalshi's per-shard wallets are plumbing, never risk entities).
 
-    The exchange's ``balance`` field is already the cross-shard TOTAL, but
-    ``portfolio_value`` is scoped to one shard per call (live-verified:
-    idx0 pv $1,264.23 vs idx1 pv $4.06 on the same account). Without this
-    merge, every SHARD1 fill made the risk denominator SHRINK (cash left
-    the total; the position's value never entered it) — the exact
-    "deployed != lost" failure the deployed-aware denominator exists to
-    prevent, resurrected by sharding. This source sums PV across every
-    shard enumerated in ``balance_breakdown`` (dynamic — a new shard is
-    picked up on its first appearance) and returns the standard payload
-    shape, so ``BalanceTracker`` parses it unchanged. One extra GET per
-    additional shard per poll (~6/min at today's 2 shards — read-budget
-    noise). Any per-shard fetch failure raises, so a partial reading can
-    never masquerade as whole-book (the tracker's stale fail-closed then
-    governs)."""
+    The exchange's ``balance`` field is already the cross-shard TOTAL;
+    ``portfolio_value`` with an explicit ``exchange_index`` is scoped to
+    that shard (live-verified 2026-08-17: idx0 pv $1,264.23 vs idx1 pv
+    $4.06). Without this merge, every SHARD1 fill made the risk denominator
+    SHRINK (cash left the total; the position's value never entered it) —
+    the exact "deployed != lost" failure the deployed-aware denominator
+    exists to prevent, resurrected by sharding.
+
+    REPAIR 2026-09-05 (live-verified the same minute: base call pv
+    $1,550.55; idx0 $0.00; idx1 $1,551.38): the base call's
+    ``portfolio_value`` is NOT shard-0's — it already carried the whole
+    book — so the previous "base + every extra shard" sum DOUBLE-COUNTED
+    shard 1 (bot standing $6,665.82 vs exchange $5,061.34 at the same cash;
+    13:10 ET $7,308 vs $4,969). The merged PV is now the sum of the
+    PER-SHARD scoped reads over EVERY index in ``balance_breakdown``
+    (index 0 included); the base call's PV is never added — it is logged
+    beside the sum as telemetry (``whole_book_pv_merge``) so a future
+    semantics change on Kalshi's side shows up as a divergence, not a
+    silent denominator error. Unsharded account (empty breakdown) ⇒ the
+    base PV stands. Any per-shard fetch failure raises, so a partial
+    reading can never masquerade as whole-book (the tracker's stale
+    fail-closed then governs)."""
 
     def __init__(self, rest: KalshiRestClient) -> None:
         self._rest = rest
@@ -1072,17 +1080,22 @@ class WholeBookBalanceSource:
     async def get_balance(self) -> JsonDict:
         base = await self._rest.get_balance()
         breakdown = base.get("balance_breakdown") or []
-        extra_indices = sorted(
-            {
-                int(row.get("exchange_index", 0))
-                for row in breakdown
-                if int(row.get("exchange_index", 0)) != 0
-            }
-        )
-        total_pv = int(base.get("portfolio_value", 0))
-        for idx in extra_indices:
+        indices = sorted({int(row.get("exchange_index", 0)) for row in breakdown})
+        base_pv = int(base.get("portfolio_value", 0))
+        if not indices:
+            return dict(base)
+        per_shard: dict[int, int] = {}
+        for idx in indices:
             shard = await self._rest.get_balance(exchange_index=idx)
-            total_pv += int(shard.get("portfolio_value", 0))
+            per_shard[idx] = int(shard.get("portfolio_value", 0))
+        total_pv = sum(per_shard.values())
+        log.debug(
+            "whole_book_pv_merge",
+            base_pv_cents=base_pv,
+            per_shard_pv_cents={str(k): v for k, v in per_shard.items()},
+            total_pv_cents=total_pv,
+            base_minus_sum_cents=base_pv - total_pv,
+        )
         merged = dict(base)
         merged["portfolio_value"] = total_pv
         return merged
