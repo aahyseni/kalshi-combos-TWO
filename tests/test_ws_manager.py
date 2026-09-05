@@ -117,6 +117,18 @@ class _IterWs:
         self.closed = True
 
 
+async def _settled(m: WsManager, within_s: float = 1.0) -> None:
+    """Wait until the dispatcher has drained every lane AND finished the last
+    handler (it clears ``wake_pending`` only after observing all lanes empty
+    at the end of a drain — the lane analogue of ``Queue.join``)."""
+
+    async def _wait() -> None:
+        while any(m.lane_depths().values()) or m._lanes.wake_pending:  # noqa: ASYNC110
+            await asyncio.sleep(0.005)
+
+    await asyncio.wait_for(_wait(), timeout=within_s)
+
+
 async def test_read_loop_never_blocks_on_slow_handler() -> None:
     m = _manager()
     seen: list[int] = []
@@ -137,9 +149,9 @@ async def test_read_loop_never_blocks_on_slow_handler() -> None:
         # under the old inline design this would deadlock (read blocked on n=1).
         await asyncio.wait_for(m._read_loop(_IterWs(frames)), timeout=1.0)  # type: ignore[arg-type]
         await asyncio.wait_for(first_started.wait(), timeout=1.0)
-        assert m._msg_queue.qsize() == 2  # n=2, n=3 buffered, not blocking reads
+        assert len(m._lanes.control) == 2  # n=2, n=3 buffered, not blocking reads
         release.set()
-        await asyncio.wait_for(m._msg_queue.join(), timeout=1.0)
+        await _settled(m)
         assert seen == [1, 2, 3]  # FIFO order preserved (seq continuity)
     finally:
         release.set()
@@ -152,8 +164,8 @@ async def test_read_loop_never_blocks_on_slow_handler() -> None:
 
 async def test_read_loop_queue_overflow_fails_closed() -> None:
     m = _manager()
-    m._msg_queue = asyncio.Queue(maxsize=2)  # no dispatcher draining
+    m._lanes.capacity = 2  # no dispatcher draining
     ws = _IterWs([_Frame({"type": "t", "n": i}) for i in (1, 2, 3)])
     await m._read_loop(ws)  # type: ignore[arg-type]
     assert ws.close_calls == 1  # overflow ⇒ close ⇒ reconnect path (fail-closed)
-    assert m._msg_queue.qsize() == 2  # the two that fit; the third triggered close
+    assert len(m._lanes.control) == 2  # the two that fit; the third triggered close
