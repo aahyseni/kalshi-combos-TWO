@@ -42,13 +42,45 @@ module applies the SAME rule to the maintenance loop's inter-mark gaps:
   distribution by definition, so it yields with a logged timeout and the loop
   advances — with exactly one margin to spare before the supervisor's wall.
 
+The feedback path, and why loosening is GATED (review fix 2026-09-05)
+---------------------------------------------------------------------
+The bound is ``wall / MARGIN`` and the wall is ``MARGIN × Q(gaps)``, so a
+gap that is long BECAUSE a bounded store await ran to its bound feeds the
+bound back into the wall: any completed gap g in (wall/MARGIN, wall] makes
+the next derivation ``MARGIN × g`` — with MARGIN = 2 the wall DOUBLES at the
+next refresh, the bound doubles with it, and the next such gap can be twice
+as long. Under exactly the degraded state this module targets (a saturated
+store) the wall would ratchet, and the tape's retention (the oldest
+``live_*.log`` on disk — 45 days as of 2026-09-05) keeps a loosened wall for
+weeks. Two defences, both in code:
+
+1. TAINT. A gap that contained a ``store.await_timeout`` is not a
+   measurement of the healthy loop — it "completed" only because the await
+   gave up. ``QuoteLifecycle._bounded_store`` taints the ledger's current gap
+   on every timeout (``ProgressLedger.taint``) and the next mark skips it.
+   This closes the timeout branch of the loop exactly; it does NOT cover a
+   sub-step whose several sequential bounded ops each finish just UNDER the
+   bound (k ops ⇒ a completed gap up to k × bound with no timeout at all).
+2. MODE. ``supervisor.stall_wall_derived`` — ``"shadow"`` (DEFAULT): the
+   derivation runs and is logged (``stall_wall_derivation`` carries the
+   would-be ``wall_s``) but the bound APPLIED to the ledger and the store
+   awaits stays at the floor; ``"on"``: the derived wall is applied. Today's
+   measurement (max completed gap 3.544 s vs a 60.5 s floor) means the
+   loosening branch can only ever act under degradation, so whether the wall
+   may loosen at all is an OPERATOR RULING, owed before ``"on"`` — the
+   ``open_quote_capacity_derived`` shadow/on precedent.
+
 The tape
 --------
 ``GapTape`` persists one bucketed histogram per boot to
 ``<data_dir>/maintenance_gap_tape.json`` (atomic write, same helper as the
 heartbeat). Retention is the operator's EXISTING log retention: boots older
 than the oldest ``live_*.log`` still on disk are pruned — no new number.
-``derive_stall_wall`` pools the retained boots with the current one.
+(``oldest_live_log_mtime`` reads that log's mtime — its END, not its start —
+so the boot that owns the oldest log is pruned one boot early: strictly
+tighter, harmless.) ``derive_stall_wall`` pools the retained boots with the
+current one. ``refresh_stall_wall`` is pure file I/O + arithmetic on a COPY
+of the histogram; the caller (quote_app) runs it off the event loop.
 
 Blast radius: the supervisor's maintenance-loop bound and the maintenance
 loop's own store awaits. Pricing and quoting read nothing from here.
@@ -282,7 +314,10 @@ def derive_stall_wall(
 def oldest_live_log_mtime(data_dir: Path) -> float | None:
     """The operator's existing log retention, as a wall timestamp: boots whose
     log has already been rotated away are pruned from the tape. None when no
-    ``live_*.log`` exists (tests, fresh installs) ⇒ keep everything."""
+    ``live_*.log`` exists (tests, fresh installs) ⇒ keep everything. The
+    mtime is the log's LAST write (its end), so the boot that owns the oldest
+    log is pruned one boot early — tighter, never looser (should-fix #6).
+    Synchronous file I/O: call it off the event loop."""
     oldest: float | None = None
     try:
         for p in data_dir.glob("live_*.log"):
@@ -396,7 +431,11 @@ def refresh_stall_wall(
 ) -> StallWallDerivation:
     """One derivation cycle: load the tape, fold this boot's histogram, prune
     to the log retention, pool, derive, save. Pure function of its inputs plus
-    the tape file; the caller applies the result to the ledger and logs it."""
+    the tape file; the caller applies the result to the ledger and logs it.
+    Synchronous file I/O (glob + stat of every ``live_*.log``, a JSON read and
+    an atomic write on the store's disk): pass a COPY of the live histogram
+    and run this in a worker thread (``asyncio.to_thread``), never on the
+    event loop (review fix 2026-09-05, should-fix #1)."""
     tape = GapTape(tape_path)
     tape.load()
     if this_boot is not None and this_boot.n > 0:

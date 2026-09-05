@@ -102,6 +102,14 @@ class _LoopState:
     # RECOVERED from (a hang never completes a gap), so this histogram IS the
     # healthy distribution the wall is derived from — see risk/stall_wall.py.
     gaps: GapHistogram | None = None
+    # TAINT (review fix 2026-09-05, must-fix #1): the gap in progress is NOT
+    # healthy when a bounded store await inside it gave up at its bound — it
+    # "completed" only because ``_bounded_store`` timed out, and recording it
+    # would feed the bound back into the wall it was derived from (a gap in
+    # (wall/2, wall] doubles the wall at the next refresh). ``taint`` marks the
+    # current gap; the next ``mark`` advances the clock without observing it.
+    tainted: bool = False
+    tainted_n: int = 0
 
 
 @dataclass(slots=True)
@@ -155,8 +163,41 @@ class ProgressLedger:
         if state is not None:
             now_ns = self.clock.monotonic_ns()
             if state.gaps is not None:
-                state.gaps.observe((now_ns - state.last_ns) / 1e9)
+                if state.tainted:
+                    # A gap that contained a timed-out store await is not a
+                    # measurement of the healthy loop — skipped, counted.
+                    state.tainted = False
+                    state.tainted_n += 1
+                else:
+                    state.gaps.observe((now_ns - state.last_ns) / 1e9)
             state.last_ns = now_ns
+
+    def taint(self, name: str) -> None:
+        """Mark the gap IN PROGRESS for ``name`` as not-healthy: the next
+        ``mark`` will advance the loop's clock but NOT record the gap. Driven
+        by ``QuoteLifecycle._bounded_store`` when a store await gives up at
+        the derived bound — the one way a long gap can "complete" without the
+        loop having genuinely recovered inside it (review fix 2026-09-05,
+        must-fix #1: the ratchet). Unmeasured / unregistered names are ignored
+        (nothing to protect)."""
+        state = self._loops.get(name)
+        if state is not None and state.gaps is not None:
+            state.tainted = True
+
+    def tainted_gaps(self, name: str) -> int:
+        """How many gaps of ``name`` were skipped as tainted this boot (for the
+        derivation log line). 0 for unmeasured / unregistered loops."""
+        state = self._loops.get(name)
+        return 0 if state is None else state.tainted_n
+
+    def tainter(self, name: str) -> Callable[[], None]:
+        """A bound zero-arg ``taint`` for callbacks (the lifecycle's bounded
+        store await), the twin of ``marker``."""
+
+        def _taint() -> None:
+            self.taint(name)
+
+        return _taint
 
     def gap_histogram(self, name: str) -> GapHistogram | None:
         """The measured completed-gap histogram of a loop registered with

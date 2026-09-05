@@ -521,7 +521,7 @@ async def test_a_truly_hung_maintenance_loop_is_still_killed_at_the_derived_wall
         wedge_timeout_s=wedge_timeout_s,
         measure_gaps=True,
     )
-    app._refresh_stall_wall(reason="boot")  # noqa: SLF001
+    await app._refresh_stall_wall(reason="boot")  # noqa: SLF001
     derived = app._stall_wall  # noqa: SLF001
     assert derived is not None and derived.source == "floor"
     assert derived.wall_s == pytest.approx(wedge_timeout_s + MAINTENANCE_TICK_INTERVAL_S)
@@ -610,7 +610,7 @@ async def test_a_healthy_loop_with_a_bounded_store_is_not_killed(tmp_path: Path)
         wedge_timeout_s=wedge_timeout_s,
         measure_gaps=True,
     )
-    app._refresh_stall_wall(reason="boot")  # noqa: SLF001
+    await app._refresh_stall_wall(reason="boot")  # noqa: SLF001
     rig.lifecycle._sub_step_bound_s_cb = app._sub_step_bound_s  # noqa: SLF001
     assert rig.lifecycle._store_bound_s() == pytest.approx(  # noqa: SLF001
         (wedge_timeout_s + MAINTENANCE_TICK_INTERVAL_S) / STALL_WALL_MARGIN

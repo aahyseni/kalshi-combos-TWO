@@ -130,12 +130,31 @@ class SupervisorConfig(StrictModel):
     # realistic resting-quote count (max_open_quotes default 20).
     write_budget_capacity: int = 200
     write_budget_refill_s: float = 10.0
+    # DERIVED MAINTENANCE STALL WALL (2026-09-05, risk/stall_wall.py). The
+    # maintenance loop's kill bound is derived from its own measured completed
+    # inter-mark gaps: ``wall = max(floor, MARGIN x Q_Phi(5))`` with the floor
+    # = ``heartbeat_timeout_s`` + the loop's cadence (60.5 s live). Because the
+    # loosening branch can only act under degradation (today's max completed
+    # gap is 3.5 s vs the 60.5 s floor) and the bound feeds back into the wall
+    # (see the module doc), APPLYING a wall above the floor is an operator
+    # ruling. "shadow" (DEFAULT): derive + LOG ``stall_wall_derivation`` every
+    # refresh, the ledger keeps the floor; "on": the derived wall is applied
+    # to the ledger and the maintenance-path store bounds. Same shape as
+    # ``risk.open_quote_capacity_derived``.
+    stall_wall_derived: str = "shadow"
 
     @field_validator("heartbeat_timeout_s", "poll_interval_s", "write_budget_refill_s")
     @classmethod
     def _positive_seconds(cls, v: float) -> float:
         if v <= 0.0:
             raise ValueError(f"must be > 0, got {v}")
+        return v
+
+    @field_validator("stall_wall_derived")
+    @classmethod
+    def _stall_wall_mode(cls, v: str) -> str:
+        if v not in ("shadow", "on"):
+            raise ValueError(f"stall_wall_derived must be 'shadow' or 'on', got {v!r}")
         return v
 
     @field_validator("write_budget_capacity")

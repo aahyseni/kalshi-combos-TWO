@@ -121,6 +121,10 @@ from combomaker.rfq.models import Rfq, RfqLeg
 from combomaker.rfq.schedule import ScheduleCache
 from combomaker.risk.balance import BalanceTracker, StaleBalanceError
 from combomaker.risk.breakers import BreakerInputs, CircuitBreakers, RateLimitWindow
+from combomaker.risk.confirm_expired_rate import (
+    expired_tape_path,
+    refresh_expired_baseline,
+)
 from combomaker.risk.derived_cap_engine import DerivedCapEngine
 from combomaker.risk.exposure import ExposureBook, LegRef, OpenPosition
 from combomaker.risk.heartbeat import Heartbeat, ReconcileMarker, _atomic_write
@@ -142,6 +146,7 @@ from combomaker.risk.skew import SkewLimits, SkewParams, WidenPolicyParams
 from combomaker.risk.stall_wall import (
     StallWallDerivation,
     gap_tape_path,
+    oldest_live_log_mtime,
     refresh_stall_wall,
 )
 from combomaker.sim.book_model import WithinGameRhoProvider
@@ -2015,6 +2020,16 @@ class QuoteApp:
         self._boot_key = (
             os.environ.get(RUN_ID_ENV, "") or self._clock.now().isoformat()
         )
+        # The wall APPLIED to the ledger (review fix 2026-09-05, must-fix #1):
+        # ``supervisor.stall_wall_derived`` "shadow" keeps the floor and only
+        # LOGS the derived wall; "on" applies it. None until the first
+        # derivation.
+        self._stall_wall_applied_s: float | None = None
+        # EXPIRED-ACCEPT RATE baseline (review should-fix #5): pooled
+        # (expired, confirmed, boots) over the retained PRIOR boots, refreshed
+        # with the stall wall; None = no prior boot => the lifecycle's alarm
+        # stays unjudged.
+        self._expired_baseline: tuple[int, int, int] | None = None
         self._reconcile_marker = ReconcileMarker(config.data_dir / "needs_reconcile")
         # 429-burst window for the rate-limit circuit breaker (recorded from the
         # REST error paths in the polling loops).
@@ -2617,6 +2632,22 @@ class QuoteApp:
                 # stall wall (``wall / MARGIN``), so a saturated store yields
                 # a logged timeout, never a wedge.
                 sub_step_bound_s=self._sub_step_bound_s,
+                # TAINT (review fix 2026-09-05, must-fix #1): a store await
+                # that gives up at its bound taints the ledger's gap in
+                # progress, so the wall is never derived from a gap the bound
+                # itself produced (the ratchet: a gap in (wall/2, wall]
+                # doubles the wall).
+                taint_progress_gap=self._progress.tainter(LOOP_MAINTENANCE),
+                # The APPLIED wall — what the supervisor kills at — so a whole
+                # pass over it is counted (``maintenance.tick_over_wall``)
+                # even though progress is marked between sub-steps and the
+                # supervisor therefore no longer bounds the pass (should-fix
+                # #4).
+                stall_wall_s=self._applied_stall_wall_s,
+                # EXPIRED-ACCEPT RATE baseline (should-fix #5): the pooled
+                # (expired, confirmed, boots) of the retained prior boots for
+                # the ``confirm_expired_rate_anomalous`` alarm.
+                confirm_expired_baseline=self._confirm_expired_baseline,
                 # F2 MID-PIPELINE LIVENESS (throughput synthesis 2026-07-16):
                 # the intake's liveness view over its open-RFQ registry
                 # (populated on rfq_created, popped on rfq_deleted). The
@@ -3084,7 +3115,8 @@ class QuoteApp:
                 # above is the wall's FLOOR — it can only loosen by measurement.
                 measure_gaps=True,
             )
-            self._refresh_stall_wall(reason="boot")
+            await self._refresh_stall_wall(reason="boot")
+            await self._refresh_expired_baseline(reason="boot")
             # NOTE — the 15s status loop is deliberately NOT a kill signal. It
             # already tolerates a 10s exchange GET plus a 15s enforcement budget
             # inside one tick, so any bound loose enough to be safe for it is
@@ -4604,24 +4636,40 @@ class QuoteApp:
             self._stall_wall_ticks += 1
             if self._stall_wall_ticks >= 120:
                 self._stall_wall_ticks = 0
-                self._refresh_stall_wall(reason="refresh")
+                await self._refresh_stall_wall(reason="refresh")
+                await self._refresh_expired_baseline(reason="refresh")
 
-    def _refresh_stall_wall(self, *, reason: str) -> None:
+    async def _refresh_stall_wall(self, *, reason: str) -> None:
         """Derive the maintenance loop's stall wall from the MEASURED completed
         inter-mark gaps (this boot's histogram + the retained boots' tape) and
-        publish it through the progress ledger — the supervisor reads the
-        bound from ``loop_progress.json`` and needs no change.
+        publish the APPLIED bound through the progress ledger — the supervisor
+        reads it from ``loop_progress.json`` and needs no change.
 
         Rule (risk/stall_wall.py — the hang watchdog's rule, in the bot):
         ``wall = max(floor, MARGIN * Q_Φ(5)(gaps))`` with the floor being the
         register-time bound (``supervisor.heartbeat_timeout_s`` + the loop's
-        cadence, 60.5 s live). Logged as ``stall_wall_derivation`` at boot and
-        on every refresh, like the watchdog's own ``derivation`` line. Any
-        failure logs and keeps the current bound (the floor at worst)."""
+        cadence, 60.5 s live). MODE (review fix 2026-09-05, must-fix #1):
+        ``supervisor.stall_wall_derived`` "shadow" (default) derives and LOGS
+        but applies the floor — the loosening branch can only act under
+        degradation and whether the wall may loosen at all is an operator
+        ruling; "on" applies the derived wall. Gaps tainted by a timed-out
+        store await were never recorded (``ProgressLedger.taint``).
+
+        OFF-LOOP I/O (should-fix #1): the live histogram is COPIED here (it is
+        mutated by ``mark`` on this loop) and the glob + stat of every
+        ``live_*.log``, the tape read and the atomic write run in a worker
+        thread — the metadata flush precedent, so the store's disk can never
+        stall this loop. Logged as ``stall_wall_derivation`` at boot and on
+        every refresh. Any failure logs and keeps the current bound (the
+        floor at worst)."""
         floor_s = self._config.supervisor.heartbeat_timeout_s + MAINTENANCE_TICK_INTERVAL_S
+        mode = str(self._config.supervisor.stall_wall_derived)
         try:
-            hist = self._progress.gap_histogram(LOOP_MAINTENANCE)
-            derivation = refresh_stall_wall(
+            live = self._progress.gap_histogram(LOOP_MAINTENANCE)
+            hist = None if live is None else live.copy()
+            tainted = self._progress.tainted_gaps(LOOP_MAINTENANCE)
+            derivation = await asyncio.to_thread(
+                refresh_stall_wall,
                 tape_path=gap_tape_path(self._config.data_dir),
                 data_dir=self._config.data_dir,
                 boot_key=self._boot_key,
@@ -4630,8 +4678,10 @@ class QuoteApp:
                 bucket_s=MAINTENANCE_TICK_INTERVAL_S,
                 floor_s=floor_s,
             )
-            self._progress.set_stall_after(LOOP_MAINTENANCE, derivation.wall_s)
+            applied_s = derivation.wall_s if mode == "on" else derivation.floor_s
+            self._progress.set_stall_after(LOOP_MAINTENANCE, applied_s)
             self._stall_wall = derivation
+            self._stall_wall_applied_s = applied_s
             boot_fields: dict[str, object] = {}
             if hist is not None and hist.n > 0:
                 # This boot's own pass evidence, so the tape of log lines
@@ -4646,18 +4696,69 @@ class QuoteApp:
                 "stall_wall_derivation",
                 reason=reason,
                 loop=LOOP_MAINTENANCE,
+                mode=mode,
+                applied_wall_s=round(applied_s, 3),
+                applied_sub_step_bound_s=round(applied_s / derivation.margin, 3),
+                boot_tainted_gaps=tainted,
                 **derivation.as_log(),
                 **boot_fields,
             )
         except Exception:
             log.exception("stall_wall_derivation_failed", reason=reason, floor_s=floor_s)
 
+    async def _refresh_expired_baseline(self, *, reason: str) -> None:
+        """EXPIRED-ACCEPT RATE baseline (review should-fix #5,
+        risk/confirm_expired_rate.py): fold this boot's
+        ``confirm.expired_by_exchange`` / ``confirm.sent`` counters into the
+        per-boot tape (same retention as the gap tape: the oldest
+        ``live_*.log``), and hold the pooled counts of the OTHER retained
+        boots for the lifecycle's ``confirm_expired_rate_anomalous`` alarm.
+        File I/O off-loop; failures log and keep the current baseline."""
+        try:
+            expired = self._metrics.counter("confirm.expired_by_exchange")
+            confirmed = self._metrics.counter("confirm.sent")
+            retain = await asyncio.to_thread(oldest_live_log_mtime, self._config.data_dir)
+            baseline = await asyncio.to_thread(
+                refresh_expired_baseline,
+                tape_path=expired_tape_path(self._config.data_dir),
+                boot_key=self._boot_key,
+                boot_started_at_ts=self._boot_started_at_ts,
+                boot_expired=expired,
+                boot_confirmed=confirmed,
+                retain_since_ts=retain,
+            )
+            changed = baseline != self._expired_baseline
+            self._expired_baseline = baseline
+            if reason == "boot" or changed:
+                log.info(
+                    "confirm_expired_baseline",
+                    reason=reason,
+                    boot_expired=expired,
+                    boot_confirmed=confirmed,
+                    baseline_expired=None if baseline is None else baseline[0],
+                    baseline_confirmed=None if baseline is None else baseline[1],
+                    baseline_boots=None if baseline is None else baseline[2],
+                )
+        except Exception:
+            log.exception("confirm_expired_baseline_failed", reason=reason)
+
+    def _confirm_expired_baseline(self) -> tuple[int, int, int] | None:
+        return self._expired_baseline
+
+    def _applied_stall_wall_s(self) -> float | None:
+        """The wall the supervisor currently kills the maintenance loop at
+        (the ledger's bound — floor in shadow mode, derived when "on")."""
+        return self._progress.stall_after_s(LOOP_MAINTENANCE)
+
     def _sub_step_bound_s(self) -> float | None:
         """The maintenance loop's per-sub-step store bound from the latest
-        derivation (``wall / MARGIN`` — the measured healthy upper quantile,
-        floored at ``floor / MARGIN``). None before the first derivation ⇒ the
-        lifecycle falls back to ``STORE_OP_TIMEOUT_S``."""
-        return None if self._stall_wall is None else self._stall_wall.sub_step_bound_s
+        derivation: the APPLIED wall / MARGIN (``floor / MARGIN`` = 30.25 s
+        live in shadow mode; the measured healthy upper quantile when the
+        operator has ruled ``stall_wall_derived: on``). None before the first
+        derivation ⇒ the lifecycle falls back to ``STORE_OP_TIMEOUT_S``."""
+        if self._stall_wall is None or self._stall_wall_applied_s is None:
+            return None
+        return self._stall_wall_applied_s / self._stall_wall.margin
 
     def _derived_capacity_tick(self) -> None:
         """DERIVED OPEN-QUOTE CAPACITY (2026-07-31) — one ~60s derivation.

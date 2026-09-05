@@ -1,5 +1,11 @@
 # 2026-09-05 — BUILD: confirm-halt classifier + derived maintenance stall wall
 
+> **Review fixes applied** (see the *Review fixes* section at the end): the derived wall's positive-feedback
+> path is closed by TAINT and its loosening is GATED behind `supervisor.stall_wall_derived` (default `shadow`);
+> A's two loosenings and the alarm's halt are listed as **rulings OWED**; refresh I/O is off-loop; the WS
+> fill-booking path's share of the bounded ops is disclosed; a late-landing `record_fill` is adopted; a whole
+> pass over the wall is counted; the removed halt class has a derived replacement ALARM.
+
 Branch `build/confirm-halt-and-derived-wall` (worktree `C:/Users/aahys/kct-crash-fix`), built while the
 bot ran on `main`; store and data dir read-only throughout (sqlite `mode=ro`, logs by grep/tail only, no
 process started or stopped). Two builders: the first left A and B uncommitted; this pass verified every
@@ -19,7 +25,7 @@ done to fix it."*
 | W4b | The first builder's retraction: "all 27 stall receipts since 8/17 followed a `kill_switch_halt`; no healthy quoting bot has been killed by the wall" | Tail-checked every receipt's preceding log this pass (28 receipts since 8/17, table in B): in **15** the order is `supervisor_loop_wedged` → 1–4 s → `kill_switch_halt reason=halt_kill_file` — the bot halted on the SUPERVISOR's own KILL file. The process answered the file within seconds, so the event loop was alive and the MAINTENANCE LOOP ALONE had not marked progress for 61 s: a stuck await inside the tick, exactly the unbounded-store class F3/F4 bound. 8/17 ×3, 8/20 ×5, 8/26 ×6, 8/27 ×1. The other 13 are corpse stamps after another halt (kill-file/operator ×6, data_stale ×2, hard_trip, reconciliation_mismatch, confirm_timeouts ×3 incl. today's two). | CORRECTED — the task's premise (3) holds for 15/28; B (bounded sub-steps + progress between them) is the mechanism repair for exactly those |
 | F1 | Confirm-halt classifier | `classify_confirm_failure`: exactly `HTTP 400` + code `expired` ⇒ `expired_by_exchange` (metric `confirm.expired_by_exchange`, histogram `confirm.expired_by_exchange.accept_to_confirm_ms`, WARNING `confirm_expired_by_exchange` with `accept_to_confirm_ms` / `dispatch_delay_ms` / `confirm_rtt_ms` / `exchange_window_ms`, never counted). Timeouts, connection errors, HTTP 5xx, any other refusal (401/403/429/insufficient_balance — strict side, no such population ever taped) ⇒ ours, counted **consecutively**; success resets; expired neither counts nor resets. `confirm_failed` (ERROR) carries the same timing split plus `kind` and `consecutive`. Unknown-committed posture unchanged for every class (reservation held until the exchange reconcile proves it). Halt text: "N consecutive confirm failures of ours (timeouts / connection errors / HTTP 5xx / refusals; exchange-expired accepts are classified apart and never counted)". | FIXED — `rfq/lifecycle.py`, 26 tests |
 | F2 | Derived maintenance stall wall | `risk/stall_wall.py` + `ProgressLedger.measure_gaps`: the maintenance loop records every COMPLETED inter-mark gap (a hang never completes one, so the record is healthy by construction); `wall = max(floor, MARGIN × Q_Φ(5)(gaps))` with MARGIN = the hang watchdog's `_MARGIN` (2.0, pinned by a parity test that reads the tool) and z = the ladder's KILL rung; floor = today's register-time bound (`supervisor.heartbeat_timeout_s` + `MAINTENANCE_TICK_INTERVAL_S` = 60.5 s) — it can only LOOSEN by measurement. Per-boot histograms persist to `data/maintenance_gap_tape.json`, pruned to the operator's existing `live_*.log` retention, pooled at boot and every 120 ticks (the metadata-flush cadence). Logged as `stall_wall_derivation` at boot and on every refresh. The supervisor reads the bound from `loop_progress.json` — **no supervisor change**. | FIXED — 29 tests |
-| F3 | Un-bounded store awaits on the maintenance path | The deep dive's 12 direct `await self._store.*` sites (`mark_fill_verified` ×3, `has_fill`, `fill_ref_for_order_id`, `record_fill`, `void_phantom_fill` ×2, `has_fill_for_order_id`, `open_ledger_identities`, `fill_order_ids`, `fill_null_order_id_keys`) run through `_bounded_store(op, coro)` under `sub_step_bound = wall / MARGIN` (30.25 s at the floor; `STORE_OP_TIMEOUT_S` = 5 s before the first derivation). Expiry ⇒ `store.await_timeout.<op>` + WARNING, then the caller's EXISTING failure branch (audited this pass: `_record_executed_fill` is inside `fill_ledger.write_failed`'s try/except; the three stamps and two voids are try/except evidence-only; `_adopt_exchange_fill`'s single caller catches `TimeoutError` as a failed round; the two ledger sweeps run off-loop under their own `wait_for`). The remaining 6 direct awaits are decision/structural-fit record writes on the quote path (queued writes, out of scope). A regression guard asserts none of the 12 ops is awaited directly again. | FIXED |
+| F3 | Un-bounded store awaits on the maintenance path | The deep dive's 12 direct `await self._store.*` sites (`mark_fill_verified` ×3, `has_fill`, `fill_ref_for_order_id`, `record_fill`, `void_phantom_fill` ×2, `has_fill_for_order_id`, `open_ledger_identities`, `fill_order_ids`, `fill_null_order_id_keys`) run through `_bounded_store(op, coro)` under `sub_step_bound = wall / MARGIN` (30.25 s at the floor; `STORE_OP_TIMEOUT_S` = 5 s before the first derivation). **Review correction (should-fix #2): four of the twelve are NOT on the maintenance path** — `has_fill`, `fill_ref_for_order_id`, `record_fill` (`_record_executed_fill`) and the first `mark_fill_verified` (`_on_fill_row_written`) are reached from `on_quote_executed`, the WS executed-message handler; they now govern the WS fill-booking path with the same bound (a hung store no longer blocks the executed handler; a `record_fill` that times out and then lands is ADOPTED by the replay — should-fix #3 below). Expiry ⇒ `store.await_timeout.<op>` + WARNING, then the caller's EXISTING failure branch (audited this pass: `_record_executed_fill` is inside `fill_ledger.write_failed`'s try/except; the three stamps and two voids are try/except evidence-only; `_adopt_exchange_fill`'s single caller catches `TimeoutError` as a failed round; the two ledger sweeps run off-loop under their own `wait_for`). The remaining 6 direct awaits are decision/structural-fit record writes on the quote path (queued writes, out of scope). A regression guard asserts none of the 12 ops is awaited directly again. | FIXED |
 | F4 | Progress only marked at the top of a tick | `maintenance_tick` runs its body under `_TickLaps`: each sub-step (`prelude`, `unrecorded_fills`, `limits`, `withdraw_pending`, `reprice`) is timed into `maintenance.step_ms.<step>` and MARKS PROGRESS when it completes; the whole pass lands in `maintenance.tick_ms`; a pass over the measured bound logs `maintenance_tick_slow` with the step breakdown. This is the pass-duration tape that never existed (the 8/18 "29–31 s passes" that set the 60 s hand number were never recorded anywhere). | FIXED |
 | **O0** | **The stack is DOWN since 16:02 ET** | After the 20:00:56Z confirm halt the 1500 process exited; `hang_watchdog.log 16:02:01 STALL ESCALATION (process_exited): no bot process on 3 consecutive probes` → stragglers stopped → `relighting via the operator start path (-Auto)` → `live_20260905_1602.log` logs `quote_app_starting … adaptive_caps_slate_count_failed (HTTP 429) … joint_pool_started` at 20:02:08Z and **nothing after** (3,888 bytes; `worker_pids.txt` 0 bytes at 16:02:08; no `heartbeat.txt`, no `loop_progress.json`; no quote_app / START_BOT / hang_watchdog process at 16:11 ET). A boot death of the `build/watchdog-network-boot-death` class, not this build's scope; this build did not start or stop anything. | OPEN — operator / orchestrator relight decision (this branch is what to relight WITH) |
 | O1 | The shutdown wedge (the real producer of the stall receipts) | On a halt the teardown reaches `ws_stop` → `joint_pool_stopped` → the event loop blocks for the 60 s shutdown budget (the dedicated heartbeat goes stale — `supervisor_heartbeat_stale age=60.0s`), and the supervisor writes KILL + `needs_reconcile` on the corpse. Costs 60 s per halt, a false receipt and an unneeded reconcile. Suspect: the stage AFTER `joint_pool.shutdown` returns. | OPEN — separate build; the receipts now have a documented signature |
@@ -91,6 +97,25 @@ gap this loop completed in half an hour of live quoting on the 213 GB store. The
 today's wall and cannot tighten it. A loop that ever COMPLETES a 45 s gap gets wall = 90 s and a 45 s store bound
 (`test_a_measured_slow_pass_loosens_the_wall_by_the_margin_only`) — never a hand number.
 
+**Review correction (must-fix #1) — the loosening is a positive-feedback path, and it is now GATED.** The bound
+is `wall / MARGIN` and the wall is `MARGIN × Q(gaps)`, so a completed gap g ∈ (wall/2, wall] makes the next
+derivation `2g`: the wall DOUBLES at the next 60 s refresh, the bound doubles with it, and the next such gap can
+be twice as long. A store timeout at wall/2 plus any other work lands in that band; a sub-step with 2–4
+sequential bounded ops (`_record_executed_fill` 3 + `_on_fill_row_written` 1 per replayed quote;
+`_adopt_exchange_fill` + `_mark_execution_verified` per cancel-verification quote) reaches it with NO timeout at
+all. Retention is the oldest `live_*.log` on disk — `live_20260722_relight.log`, **45 days** — so a loosened
+wall would persist for weeks and never come back down. Under exactly the degraded state this build targets, the
+wall would have ratcheted. Two fixes, both in code: (1) **TAINT** — `_bounded_store`'s timeout branch calls
+`ProgressLedger.taint(LOOP_MAINTENANCE)` and the next mark advances the clock but does NOT record the gap
+(`boot_tainted_gaps` on the derivation line); this closes the timeout branch exactly and does NOT cover the
+no-timeout sequential-ops path. (2) **MODE** — `supervisor.stall_wall_derived` = `shadow` (DEFAULT: derive and
+log `wall_s`, apply the FLOOR to the ledger and the store bounds) / `on` (apply the derived wall). Today's
+measurement (3.544 s vs 60.5 s) means the loosening branch can only ever act under degradation, so whether the
+wall may loosen at all is an **operator ruling, owed** (NEXT STEPS). Pinned:
+`test_n_bounded_store_timeouts_leave_the_histogram_and_the_wall_at_the_floor` (three REAL timeouts through the
+lifecycle + ledger: histogram unchanged, source `floor`; the counterfactual without the taint derives 90 s),
+`test_shadow_mode_logs_the_derived_wall_but_applies_the_floor`, `test_on_mode_applies_the_derived_wall`.
+
 Rule provenance: `tools/ops/hang_watchdog.py::derive_threshold` = `max(_MARGIN × max_healthy_gap, floor)` (242 s
 live). Same rule, same margin (parity test reads `_MARGIN` from the tool), the quantile expressed at the policy
 KILL z (Φ(5) — the sample max below ~3.5 M gaps, the 5σ edge beyond). Floor = the anchor already in the config.
@@ -108,14 +133,21 @@ a store timeout inside cancel-verification is a failed round, never an ok read t
 | Surface | Change | Pricing / quoting |
 |---|---|---|
 | `rfq/lifecycle.py` confirm path | failure classification + counter reset + timing split on the two log lines; the confirm itself, the reservation hold, the record/audit are byte-identical | untouched (the confirm decision is made before this branch) |
-| `rfq/lifecycle.py` maintenance path | `_bounded_store` on 12 store awaits; `_TickLaps` timing + progress marks; `sub_step_bound_s` ctor param | untouched (no pricing input read or written) |
-| `risk/progress.py` | `measure_gaps` (maintenance only — the quote loop's `mark` stays one integer store), `gap_histogram`, `set_stall_after`, `stall_after_s` | untouched |
+| `rfq/lifecycle.py` maintenance path | `_bounded_store` on 8 of the 12 store awaits (`mark_fill_verified` ×2, `void_phantom_fill` ×2, `has_fill_for_order_id`, `open_ledger_identities`, `fill_order_ids`, `fill_null_order_id_keys`); a timeout TAINTS the ledger's gap in progress; `_TickLaps` timing + progress marks + `maintenance.tick_over_wall`; `sub_step_bound_s` / `taint_progress_gap` / `stall_wall_s` ctor params | untouched (no pricing input read or written) |
+| `rfq/lifecycle.py` WS fill-booking path (`on_quote_executed`) | `_bounded_store` on the other 4 (`has_fill`, `fill_ref_for_order_id`, `record_fill`, `mark_fill_verified` #1): a hung store yields a logged timeout instead of blocking the executed handler; a `record_fill` that times out then LANDS is adopted once by the replay (`fill_record_landed_late`) | untouched (after the confirm decision) |
+| `rfq/lifecycle.py` confirm path (alarm) | `_judge_confirm_expired_rate` on every exchange-expired accept: this boot's expired share vs the pooled baseline → `confirm_expired_rate_anomalous` WARNING + metric; never raises, never halts | untouched |
+| `risk/confirm_expired_rate.py` (new) | per-boot (expired, confirmed) tape `data/confirm_expired_tape.json`, Jeffreys-smoothed pooled rate, exact binomial tail at the ladder's daily z | none |
+| `ops/config.py` | `supervisor.stall_wall_derived: shadow \| on` (default `shadow`) | none |
+| `risk/progress.py` | `measure_gaps` (maintenance only — the quote loop's `mark` stays one integer store), `gap_histogram`, `set_stall_after`, `stall_after_s`, `taint` / `tainter` / `tainted_gaps` | untouched |
 | `risk/stall_wall.py` (new) | histogram, tape, derivation | none |
-| `ops/quote_app.py` | registers the maintenance loop measured; derives at boot + every 120 ticks; passes the bound callable; new file `data/maintenance_gap_tape.json` | untouched |
+| `ops/quote_app.py` | registers the maintenance loop measured; derives at boot + every 120 ticks with the file I/O (glob + stat of every `live_*.log`, tape read, atomic write) in `asyncio.to_thread` and the histogram COPIED on-loop; applies floor or derived wall per mode; refreshes the expired-rate baseline on the same cadence; new files `data/maintenance_gap_tape.json`, `data/confirm_expired_tape.json` | untouched |
 | `ops/supervisor.py` | **no change** — reads `stall_after_s` from the ledger as before | — |
 
 Throughput: nothing on the RFQ→quote path changed; `mark()` for the quote loop is unchanged (no histogram). The
-fill-record path gains one `asyncio.wait_for` wrapper per store op. Rule 8: no pricing change, no parity check owed.
+fill-record path gains one `asyncio.wait_for` wrapper per store op and one flag check on the replay; the confirm
+path's expired branch gains one O(n) binomial tail (n = this boot's accepts) AFTER the confirm has already
+failed. The slow-loop refreshes run their disk I/O in a worker thread (should-fix #1) — the slow loop's own
+cost, not the pricing path's. Rule 8: no pricing change, no parity check owed.
 
 ## Gates
 
@@ -123,13 +155,20 @@ fill-record path gains one `asyncio.wait_for` wrapper per store op. Rule 8: no p
 |---|---|
 | ruff check (4 src modules + 3 test files) | clean (`ruff format` is not a repo gate: 256 of 330 files on `main` would reformat) |
 | mypy strict (`stall_wall.py`, `progress.py`, `quote_app.py`, `lifecycle.py`) | `Success: no issues found in 4 source files` |
-| new tests (`test_confirm_halt_classifier.py` 26, `test_stall_wall.py` 29) + touched (`test_withdraw_resolution`, `test_liveness_progress`, `test_supervisor`) | 133 passed before this pass's edits; 26 + 53 re-run green after |
-| full suite (low priority, worktree, `pytest tests -q -x`) | **4,100 passed, 3 deselected, 0 failed** in 322 s (baseline 4,045 + 55 new) |
-| vitals fast (`VITALS_DATA_DIR` = a fresh read-only 2-table snapshot taken 20:10:48Z via `tools/vitals/snapshot.py`) | **8/8 GREEN** (GATE PASS, 90.7 s) |
+| new tests (`test_confirm_halt_classifier.py` 26, `test_stall_wall.py` 29); EDITED existing: `test_withdraw_resolution` (parses wrapper + body); RE-RUN unedited: `test_liveness_progress`, `test_supervisor` | 133 passed before this pass's edits; 26 + 53 re-run green after |
+| full suite at d4de422 (low priority, worktree, `pytest tests -q -x`) | **4,100 passed, 3 deselected, 0 failed** in 322 s (baseline 4,045 + 55 new) |
+| vitals fast at d4de422 (`VITALS_DATA_DIR` = a fresh read-only 2-table snapshot taken 20:10:48Z via `tools/vitals/snapshot.py`) | **8/8 GREEN** (GATE PASS, 90.7 s) |
+| **Review fixes** — ruff (6 src modules + 2 test files) / mypy strict (6 src modules) | clean / `Success: no issues found in 6 source files` |
+| **Review fixes** — new `tests/test_confirm_halt_and_wall_review_fixes.py` (21) + `test_stall_wall` (29, two calls now `await`ed) + `test_confirm_halt_classifier` (26) + `test_withdraw_resolution` + `test_liveness_progress` + `test_supervisor` | **156 passed** in 33.5 s |
+| **Review fixes** — full suite (low priority, worktree, `combomaker.__file__` verified inside it) | **4,121 passed, 3 deselected, 0 failed** in 278.6 s (baseline 4,045 + 55 at d4de422 + 21 review-fix tests) |
+| **Review fixes** — vitals fast (`VITALS_DATA_DIR` = a FRESH read-only snapshot rebuilt 21:38:36Z; same 2 tables / 4,112 + 2 rows, store unchanged since the 20:00:56Z halt) | **8/8 GREEN** (GATE PASS, 88.9 s) |
 
 No test was weakened: `test_repeated_confirm_failures_halt` (RuntimeError ×3 ⇒ halt) still passes as written;
 `test_confirm_failure_is_counted_not_raised` still counts a RuntimeError in `confirm.failed`;
 `test_the_reprice_sweep_is_no_longer_a_write_driver` now parses the tick wrapper AND the body (strictly more code).
+Review-fix pass: the only edit to an existing test is `await` on the two `_refresh_stall_wall(reason="boot")`
+calls in `test_stall_wall.py` (the method is now a coroutine); every assertion is unchanged; the 12-op regression
+guard still counts exactly 12 `_bounded_store` sites.
 
 ## NEXT STEPS
 
@@ -147,5 +186,50 @@ No test was weakened: `test_repeated_confirm_failures_halt` (RuntimeError ×3 �
    observable without halting.
 4. **O4 — store rotation** (`build/store-rotation-tool`): the 200k queue and 1.86M dropped writes are the load
    that starves the loop.
-5. Decisions owed by the operator: none for A (the ruling is the ask); B ships at the floor (no behavior change
-   today) and only ever loosens by measurement.
+5. **Rulings OWED by the operator — before relighting with this branch** (review must-fix #2; the earlier text
+   "none for A" was wrong — A is two loosenings of a halt rule, and the 7/31 report said exactly these need a ruling):
+   * **A1 — exonerate `HTTP 400 expired` from `halt_confirm_timeouts`.** Basis: 25/25 confirm failures today and
+     12/12 on 7/31 were this class; the reservation reconcile RELEASED the headroom every time (no position on
+     the exchange); the unknown-committed posture is unchanged for every class (held until the reconcile proves
+     absence). Limit of the evidence: the live `quote_accepted` frame carries NO exchange timestamp (msg keys:
+     side / tickers / bids / ids + our `_ws_recv_mono_ns`), so "the accept reached us late" is inferred, not
+     measured per event — `dispatch_delay_ms` covers only the part AFTER our stamp. Consequence of NOT ruling:
+     live `main` halts on the 3rd expired accept; every boot today reached it within 4–40 accepts (8 halts).
+   * **A2 — reset the counter on a successful confirm (consecutive in fact).** Basis: the counter was cumulative
+     per boot (0052: fail, 104 ok, fail, 1 ok, fail → HALT); the halt text said "consecutive".
+   * **A3 — should `confirm_expired_rate_anomalous` HALT?** Ships as WARNING + metric (should-fix #5): this
+     boot's expired share vs the pooled measured rate of the retained boots, exact binomial tail at the ladder's
+     daily z = 3 (boot 0905's 3-of-3 against the overnight 2.6 % is a 3σ event; 1 of 1 is not). It is the only
+     systemic trace of an own-side delivery failure once A1 removes the halt. Caveat: the baseline pools every
+     retained boot, so anomalous boots raise it once folded in (the per-boot tape keeps the rates readable).
+   * **B1 — may the maintenance stall wall LOOSEN from the measured tape at all?** Ships `supervisor.
+     stall_wall_derived: shadow` (derivation logged, FLOOR applied — no behaviour change vs `main`); `on` applies
+     the derived wall. Basis for caution: max completed gap 3.544 s vs the 60.5 s floor (the loosening can only
+     act under degradation); the taint closes the timeout branch of the feedback loop but NOT k sequential ops
+     each finishing just under the bound; retention keeps a loosened wall for weeks.
+6. Post-relight verification (in addition to item 1): `stall_wall_derivation` carries `mode=shadow`,
+   `applied_wall_s 60.5`, `boot_tainted_gaps`; `confirm_expired_baseline` at boot (`None` on the first boot with
+   the tape, then the prior boots' pooled counts); `confirm_expired_rate_anomalous` WARNINGs if the ~70 % rate
+   persists; `maintenance.tick_over_wall` = 0 in the first `quote_app_stopped` dump; `data/confirm_expired_tape.json`
+   growing one row per boot beside `data/maintenance_gap_tape.json`.
+
+## Review fixes (d4de422 → this commit)
+
+Review verdict on d4de422: **SHIP_WITH_FIXES** — 2 must-fixes, 7 should-fixes. All nine applied; none argued away.
+
+| # | Finding (review) | What was true | Fix | Status |
+|---|---|---|---|---|
+| M1 | Ratchet / circularity in the derived wall — fail-closed weakening in exactly the degraded state the build targets | `ProgressLedger.mark` recorded every completed gap, including gaps that only "completed" because `_bounded_store` gave up at `wall/MARGIN`; a completed gap in (wall/2, wall] doubles the wall at the next refresh; sub-steps with 2–4 sequential bounded ops reach that band with no timeout; retention = oldest `live_*.log` (45 days) so a loosened wall never comes down; the report's "can only LOOSEN" did not disclose it | (a) `ProgressLedger.taint` / `tainter` / `tainted_gaps`; `_bounded_store`'s timeout branch taints the maintenance loop's gap in progress (wired `taint_progress_gap=self._progress.tainter(LOOP_MAINTENANCE)`); the next mark advances the clock, skips the gap, counts it (`boot_tainted_gaps` on the derivation line). (b) `test_n_bounded_store_timeouts_leave_the_histogram_and_the_wall_at_the_floor` (three REAL `has_fill` timeouts through the lifecycle; histogram `n=1, max 0.5 s`, wall `floor`; counterfactual without the taint = 90 s) + `test_a_tainted_gap_is_skipped_and_counted`. (c) Doubling math + retention disclosed (B section, `stall_wall.py` module doc); **`supervisor.stall_wall_derived` = `shadow` (default) / `on`** — shadow derives + logs and applies the FLOOR; the loosening is ruling B1, owed. `_sub_step_bound_s` follows the APPLIED wall. | FIXED (taint + gate); RULING OWED (B1) |
+| M2 | Operator ruling for A misreported as not owed | Line 150 said "none for A"; A removes a halt class AND resets the counter — the two loosenings the 7/31 report said need a ruling; per-event "never ours" cannot be evidenced (no exchange timestamp on the accept frame); the code comment said FIVE halts | NEXT STEPS 5 lists A1 / A2 (+ A3 for the alarm) as OWED with the position-safety basis (25/25 released by the reconcile; unknown-committed posture unchanged) and the evidence limit; `lifecycle.py`'s CONFIRM-FAILURE CLASSES comment now says EIGHT (04:50Z … 20:00Z), 25/25, and notes the missing exchange timestamp | FIXED (report + comment); RULINGS OWED |
+| S1 | `_refresh_stall_wall` did synchronous file I/O on the event loop (glob + stat of 284 logs, JSON read, atomic write on D:, the saturated store's disk) | The metadata flush 40 lines above runs in `to_thread` for exactly this reason | `_refresh_stall_wall` is a coroutine: histogram COPIED on-loop, `refresh_stall_wall` in `asyncio.to_thread`, `set_stall_after` applied on-loop; the expired-rate refresh does the same (`oldest_live_log_mtime` + `refresh_expired_baseline` off-loop); `test_the_refresh_runs_its_file_io_off_the_event_loop` pins the thread ident and the copy | FIXED |
+| S2 | Blast radius understated — 4 of the 12 bounded ops are on the WS executed-message path, not the maintenance path | `_record_executed_fill` / `_on_fill_row_written` are called from `on_quote_executed` | F3 row, blast-radius table and this section corrected | FIXED |
+| S3 | Late-landing `record_fill`: a timed-out INSERT that then lands left `fill_recorded=False`; the replay hit `has_fill` → skip, so the fee / `fill.count` / markout tail and execution verification never ran | On `main` a slow write completed and continued | `OpenQuoteState.fill_record_timed_out` set in the timeout branch; a replay that finds the row present (via `has_fill`, `fill_ref_for_order_id` same-ref, or INSERT-if-absent returning False) ADOPTS it exactly once (`fill_record_landed_late` WARNING, `fill_ledger.late_landing_adopted`), runs the post-insert tail (`_post_insert_tail`, factored) and returns True so `_on_fill_row_written` arms verification; a completed INSERT clears the flag. `test_a_record_fill_that_lands_late_is_adopted_not_skipped`, `test_a_completed_record_fill_clears_the_late_landing_flag` | FIXED |
+| S4 | F4's five extra marks per tick mean the supervisor no longer bounds the whole pass (incl. the ENFORCED limits/halt check) | A 5 × 60 s tick with every sub-step under the wall reads healthy | `_TickLaps.finish(slow_after_s, wall_s)`: a pass over the APPLIED wall counts `maintenance.tick_over_wall` and `maintenance_tick_slow` carries `wall_s` / `over_wall`; wired `stall_wall_s=self._applied_stall_wall_s` (the ledger's bound); disclosed here and in the docstring. `test_a_pass_over_the_applied_wall_is_counted_as_over_wall` | FIXED (counted + disclosed; the halt-check cadence remains unbounded by the supervisor — by design of F4) |
+| S5 | No replacement alarm for the removed halt class | The only trace of a systemic own-side latency failure would be per-event WARNINGs | `risk/confirm_expired_rate.py`: per-boot (expired, confirmed) tape `data/confirm_expired_tape.json` (retention = the gap tape's rule), pooled baseline of the OTHER retained boots, Jeffreys-smoothed rate, EXACT binomial upper tail P(X ≥ k \| n, p̂) vs 1 − Φ(3) (the ladder's daily rung) → `confirm_expired_rate_anomalous` WARNING + `confirm.expired_rate_anomalous`; unjudged without a baseline; never raises into the confirm path; never halts (ruling A3). 11 tests incl. boot 0905's 3-of-3 vs the overnight 2.6 % (flags on the 3rd, not the 1st) and a 70 % world not flagging 3 of 3 | FIXED (alarm); HALT = RULING OWED (A3) |
+| S6 | `oldest_live_log_mtime` uses the oldest log's END, so the boot owning it is pruned one boot early | Tighter, harmless | Noted in the module doc and the function docstring | FIXED |
+| S7 | Report said `test_liveness_progress` / `test_supervisor` were "touched" | They were re-run, not edited | Gates table now says EDITED vs RE-RUN | FIXED |
+
+Not changed on purpose: the halt for OUR failures (3 genuinely consecutive) and every classifier class; the supervisor;
+pricing. New surface since d4de422: `risk/confirm_expired_rate.py`, `supervisor.stall_wall_derived`, three lifecycle
+ctor callables (`taint_progress_gap`, `stall_wall_s`, `confirm_expired_baseline`), one state flag
+(`fill_record_timed_out`), `data/confirm_expired_tape.json`.
