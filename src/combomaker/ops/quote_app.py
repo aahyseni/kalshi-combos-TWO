@@ -139,6 +139,11 @@ from combomaker.risk.reservation import (
 )
 from combomaker.risk.settlement import SettlementHandler, SettlementPoller
 from combomaker.risk.skew import SkewLimits, SkewParams, WidenPolicyParams
+from combomaker.risk.stall_wall import (
+    StallWallDerivation,
+    gap_tape_path,
+    refresh_stall_wall,
+)
 from combomaker.sim.book_model import WithinGameRhoProvider
 from combomaker.sim.structural_book import StructuralConfigView
 from combomaker.sim.within_game_rho import sgp_within_game_rho_provider
@@ -1996,6 +2001,20 @@ class QuoteApp:
         # wedge without blinding the supervisor to a real one — see
         # risk/progress.py.
         self._progress = ProgressLedger(self._clock, progress_path(config.data_dir))
+        # DERIVED MAINTENANCE STALL WALL (2026-09-05, item 6): the maintenance
+        # loop's kill bound is measured from its own completed inter-mark gaps
+        # (this boot + the retained boots' tape) and can only LOOSEN from the
+        # register-time bound by measurement. Derived at registration and
+        # refreshed on the metadata-flush cadence in ``_maintenance_loop``;
+        # ``_stall_wall`` is the latest derivation (None until registered).
+        # The boot key names this boot's row in the tape; the run id from the
+        # relighter is preferred so the tape row and the receipts agree.
+        self._stall_wall: StallWallDerivation | None = None
+        self._stall_wall_ticks = 0
+        self._boot_started_at_ts = self._clock.now().timestamp()
+        self._boot_key = (
+            os.environ.get(RUN_ID_ENV, "") or self._clock.now().isoformat()
+        )
         self._reconcile_marker = ReconcileMarker(config.data_dir / "needs_reconcile")
         # 429-burst window for the rate-limit circuit breaker (recorded from the
         # REST error paths in the polling loops).
@@ -2592,6 +2611,12 @@ class QuoteApp:
                 # sub-loop that stops iterating still ages this mark and still
                 # escalates.
                 beat=self._progress.marker(LOOP_MAINTENANCE),
+                # BOUNDED STORE AWAITS on the maintenance path (2026-09-05,
+                # item 6): each direct store await is wrapped in a wait
+                # derived from the same measured gap distribution as the
+                # stall wall (``wall / MARGIN``), so a saturated store yields
+                # a logged timeout, never a wedge.
+                sub_step_bound_s=self._sub_step_bound_s,
                 # F2 MID-PIPELINE LIVENESS (throughput synthesis 2026-07-16):
                 # the intake's liveness view over its open-RFQ registry
                 # (populated on rfq_created, popped on rfq_deleted). The
@@ -3054,7 +3079,12 @@ class QuoteApp:
                 LOOP_MAINTENANCE,
                 interval_s=MAINTENANCE_TICK_INTERVAL_S,
                 wedge_timeout_s=wedge_timeout_s,
+                # MEASURED: every completed inter-mark gap feeds the derived
+                # stall wall (risk/stall_wall.py). The register-time bound
+                # above is the wall's FLOOR — it can only loosen by measurement.
+                measure_gaps=True,
             )
+            self._refresh_stall_wall(reason="boot")
             # NOTE — the 15s status loop is deliberately NOT a kill signal. It
             # already tolerates a 10s exchange GET plus a 15s enforcement budget
             # inside one tick, so any bound loose enough to be safe for it is
@@ -4566,6 +4596,68 @@ class QuoteApp:
                     self._derived_capacity_tick()
                 except Exception:
                     log.exception("open_quote_capacity_tick_errored")
+            # DERIVED STALL WALL refresh (2026-09-05): same ~60s cadence (120
+            # ticks x 0.5s — the metadata-flush precedent). Folds this boot's
+            # measured gaps into the tape, re-derives, publishes the bound the
+            # supervisor reads. Errors log and keep the current bound (never
+            # tighter than the floor; never reaches the pricing path).
+            self._stall_wall_ticks += 1
+            if self._stall_wall_ticks >= 120:
+                self._stall_wall_ticks = 0
+                self._refresh_stall_wall(reason="refresh")
+
+    def _refresh_stall_wall(self, *, reason: str) -> None:
+        """Derive the maintenance loop's stall wall from the MEASURED completed
+        inter-mark gaps (this boot's histogram + the retained boots' tape) and
+        publish it through the progress ledger — the supervisor reads the
+        bound from ``loop_progress.json`` and needs no change.
+
+        Rule (risk/stall_wall.py — the hang watchdog's rule, in the bot):
+        ``wall = max(floor, MARGIN * Q_Φ(5)(gaps))`` with the floor being the
+        register-time bound (``supervisor.heartbeat_timeout_s`` + the loop's
+        cadence, 60.5 s live). Logged as ``stall_wall_derivation`` at boot and
+        on every refresh, like the watchdog's own ``derivation`` line. Any
+        failure logs and keeps the current bound (the floor at worst)."""
+        floor_s = self._config.supervisor.heartbeat_timeout_s + MAINTENANCE_TICK_INTERVAL_S
+        try:
+            hist = self._progress.gap_histogram(LOOP_MAINTENANCE)
+            derivation = refresh_stall_wall(
+                tape_path=gap_tape_path(self._config.data_dir),
+                data_dir=self._config.data_dir,
+                boot_key=self._boot_key,
+                boot_started_at_ts=self._boot_started_at_ts,
+                this_boot=hist,
+                bucket_s=MAINTENANCE_TICK_INTERVAL_S,
+                floor_s=floor_s,
+            )
+            self._progress.set_stall_after(LOOP_MAINTENANCE, derivation.wall_s)
+            self._stall_wall = derivation
+            boot_fields: dict[str, object] = {}
+            if hist is not None and hist.n > 0:
+                # This boot's own pass evidence, so the tape of log lines
+                # carries the distribution even if the JSON tape is lost.
+                boot_fields = {
+                    "boot_n_gaps": hist.n,
+                    "boot_p50_s": round(hist.quantile(0.50), 3),
+                    "boot_p99_s": round(hist.quantile(0.99), 3),
+                    "boot_max_gap_s": round(hist.max_s, 3),
+                }
+            log.info(
+                "stall_wall_derivation",
+                reason=reason,
+                loop=LOOP_MAINTENANCE,
+                **derivation.as_log(),
+                **boot_fields,
+            )
+        except Exception:
+            log.exception("stall_wall_derivation_failed", reason=reason, floor_s=floor_s)
+
+    def _sub_step_bound_s(self) -> float | None:
+        """The maintenance loop's per-sub-step store bound from the latest
+        derivation (``wall / MARGIN`` — the measured healthy upper quantile,
+        floored at ``floor / MARGIN``). None before the first derivation ⇒ the
+        lifecycle falls back to ``STORE_OP_TIMEOUT_S``."""
+        return None if self._stall_wall is None else self._stall_wall.sub_step_bound_s
 
     def _derived_capacity_tick(self) -> None:
         """DERIVED OPEN-QUOTE CAPACITY (2026-07-31) — one ~60s derivation.

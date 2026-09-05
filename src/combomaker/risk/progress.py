@@ -77,6 +77,7 @@ from pathlib import Path
 from combomaker.core.clock import Clock
 from combomaker.ops.logging import get_logger
 from combomaker.risk.heartbeat import _atomic_write
+from combomaker.risk.stall_wall import GapHistogram
 
 log = get_logger(__name__)
 
@@ -95,6 +96,12 @@ class _LoopState:
     stall_after_s: float
     last_ns: int
     idle: Callable[[], bool] | None = None
+    # MEASURED completed inter-mark gaps (2026-09-05 derived stall wall). Only
+    # loops registered with ``measure_gaps=True`` record; the quote path never
+    # pays for it. Every recorded gap is by construction one the loop
+    # RECOVERED from (a hang never completes a gap), so this histogram IS the
+    # healthy distribution the wall is derived from — see risk/stall_wall.py.
+    gaps: GapHistogram | None = None
 
 
 @dataclass(slots=True)
@@ -113,28 +120,67 @@ class ProgressLedger:
         interval_s: float,
         wedge_timeout_s: float,
         idle: Callable[[], bool] | None = None,
+        measure_gaps: bool = False,
     ) -> None:
         """Declare a loop and DERIVE its stall bound from the operator's single
         wedge-tolerance anchor plus the loop's own cadence. Registering seeds
-        the loop as progressing NOW, so a loop is never born stalled."""
+        the loop as progressing NOW, so a loop is never born stalled.
+
+        ``measure_gaps`` records every completed inter-mark gap into a
+        histogram bucketed at the loop's own cadence (the input of the DERIVED
+        stall wall, risk/stall_wall.py); it requires a positive cadence and is
+        meant for the maintenance loop only — the quote path is never measured
+        here (its marks stay one integer store)."""
         if interval_s < 0.0:
             raise ValueError(f"interval_s must be >= 0, got {interval_s}")
         if wedge_timeout_s <= 0.0:
             raise ValueError(f"wedge_timeout_s must be > 0, got {wedge_timeout_s}")
+        if measure_gaps and not interval_s > 0.0:
+            raise ValueError("measure_gaps needs a positive interval_s (the bucket width)")
         self._loops[name] = _LoopState(
             name=name,
             stall_after_s=wedge_timeout_s + interval_s,
             last_ns=self.clock.monotonic_ns(),
             idle=idle,
+            gaps=GapHistogram.empty(interval_s) if measure_gaps else None,
         )
 
     def mark(self, name: str) -> None:
         """"I completed an iteration." One dict lookup and one integer store —
         cheap enough to sit inside the reprice sweep. An unregistered name is
-        ignored (a mark is never worth raising from a worker loop)."""
+        ignored (a mark is never worth raising from a worker loop). A measured
+        loop additionally records the COMPLETED gap since its previous mark
+        (one floor-division + one dict increment)."""
         state = self._loops.get(name)
         if state is not None:
-            state.last_ns = self.clock.monotonic_ns()
+            now_ns = self.clock.monotonic_ns()
+            if state.gaps is not None:
+                state.gaps.observe((now_ns - state.last_ns) / 1e9)
+            state.last_ns = now_ns
+
+    def gap_histogram(self, name: str) -> GapHistogram | None:
+        """The measured completed-gap histogram of a loop registered with
+        ``measure_gaps=True`` (the live object — callers copy before folding
+        it into a tape). None for unmeasured / unregistered loops."""
+        state = self._loops.get(name)
+        return None if state is None else state.gaps
+
+    def stall_after_s(self, name: str) -> float | None:
+        state = self._loops.get(name)
+        return None if state is None else state.stall_after_s
+
+    def set_stall_after(self, name: str, stall_after_s: float) -> None:
+        """Apply a DERIVED stall bound (risk/stall_wall.py) to a registered
+        loop. The next ``publish`` carries it to the supervisor, which reads
+        the bound from the ledger and needs no change. Finite and positive
+        only; an unregistered name raises (a wall for a loop that does not
+        exist is a wiring bug, not a runtime condition)."""
+        if not (stall_after_s > 0.0) or stall_after_s == float("inf"):
+            raise ValueError(f"stall_after_s must be > 0 and finite, got {stall_after_s}")
+        state = self._loops.get(name)
+        if state is None:
+            raise KeyError(name)
+        state.stall_after_s = stall_after_s
 
     def marker(self, name: str) -> Callable[[], None]:
         """A bound zero-arg mark for callbacks (the lifecycle's mid-loop hook)."""
