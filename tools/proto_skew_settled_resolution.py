@@ -452,6 +452,7 @@ def part_b(tape: Path, db: Path, stride: int, ported: bool = False) -> None:
     fact_events: list[tuple[float, str, float]] = []
     skew_events: list[dict] = []
     n_seen = 0
+    n_sampled = 0  # parsed lines that carried ``sampled_1_in`` (loop was behind)
     boot_games: set[str] = set()
     for line in open(tape, encoding="utf-8", errors="replace"):
         if '"exposure_rehydrated"' in line and boot_ts is None:
@@ -466,10 +467,18 @@ def part_b(tape: Path, db: Path, stride: int, ported: bool = False) -> None:
             if (n_seen - 1) % stride:
                 continue
             d = json.loads(line[line.index("{"):])
+            # SAMPLED TAPE (2026-09-05): a kept line carries ``sampled_1_in``
+            # = N and stands for N priced RFQs. This replay is PER EVENT (a
+            # weight cannot re-create the missing RFQs), so the count is
+            # reported rather than re-weighted — read the totals accordingly.
+            weight = int(d.get("sampled_1_in") or 1)
+            if weight > 1:
+                n_sampled += 1
             skew_events.append(
                 {
                     "ts": _ts(d["ts"]),
                     "rfq_id": d["rfq_id"],
+                    "weight": weight,
                     "applied": d["applied_cc"],
                     "family": d["family_cc"],
                     "entity": d["entity_cc"],
@@ -482,6 +491,9 @@ def part_b(tape: Path, db: Path, stride: int, ported: bool = False) -> None:
     print(
         f"parsed tape in {time.time() - t_parse0:.0f}s: boot={datetime.utcfromtimestamp(boot_ts)}Z"
         f" skew_events={len(skew_events)} (of {n_seen}) facts={len(fact_events)}"
+        + (f" — {n_sampled} events carried sampled_1_in (loop behind): each stands for N"
+           f" priced RFQs; population ≈ {sum(e['weight'] for e in skew_events)}"
+           if n_sampled else "")
     )
 
     ledger = load_ledger(db)

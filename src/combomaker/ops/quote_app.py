@@ -2066,6 +2066,22 @@ class QuoteApp:
             recorder=self._slow_callbacks,
         )
         SHADOW_TELEMETRY_SAMPLER.bind(self._lag_probe.behind_ratio)
+        try:
+            await self._run_instrumented()
+        finally:
+            # OUTER safety net (review 2026-09-05): the inner finally around
+            # ``_stop.wait()`` unhooks before the shutdown stages, but a boot
+            # exception BEFORE that point would leave ``Handle._run`` patched
+            # process-wide and the sampler bound to a dead probe (harmless
+            # live, cross-test contamination in the suite). Both idempotent.
+            SHADOW_TELEMETRY_SAMPLER.unbind()
+            self._slow_callbacks.uninstall()
+
+    async def _run_instrumented(self) -> None:
+        """``run()`` proper — everything after logging and the loop
+        instrumentation are up. Split out so the recorder's install/uninstall
+        pair brackets the WHOLE boot, not only the steady-state wait."""
+        config = self._config
         conventions = self._conventions
         log.info(
             "quote_app_starting",

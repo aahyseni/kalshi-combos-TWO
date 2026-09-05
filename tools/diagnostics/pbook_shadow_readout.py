@@ -49,6 +49,7 @@ def main() -> None:
     declines: list[dict] = []
     overweight_sign: Counter[str] = Counter()
     n_skew = 0
+    n_sampled = 0  # kept lines that carried ``sampled_1_in`` (loop was behind)
 
     with open(a.log, encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -63,15 +64,21 @@ def main() -> None:
                 continue
             ev = d.get("event")
             if ev == "inventory_skew_shadow":
-                n_skew += 1
-                pbook_cc.append(int(d.get("pbook_cc", 0)))
+                # SAMPLED TAPE (2026-09-05): under loop lag these lines are
+                # kept 1-in-N with ``sampled_1_in`` = N; weight each kept
+                # line N times so counts/quantiles estimate the population.
+                w = int(d.get("sampled_1_in") or 1)
+                if w > 1:
+                    n_sampled += 1
+                n_skew += w
+                pbook_cc.extend([int(d.get("pbook_cc", 0))] * w)
                 for row in d.get("pbook_per_game") or []:
                     game, adder, factor, reason = row
-                    reasons[reason] += 1
-                    factors[reason].append(float(factor))
-                    adders[reason].append(int(adder))
+                    reasons[reason] += w
+                    factors[reason].extend([float(factor)] * w)
+                    adders[reason].extend([int(adder)] * w)
                     if reason in ("pbook_concentrating", "pbook_offsetting"):
-                        overweight_sign[reason] += 1
+                        overweight_sign[reason] += w
             elif ev == "candidate_gate_ev":
                 delta = d.get("delta_p_book")
                 if delta is not None:
@@ -93,7 +100,9 @@ def main() -> None:
                 )
 
     print(f"=== P(BOOK) SHADOW READ-OUT ({a.log}) ===")
-    print(f"skew events: {n_skew}")
+    print(f"skew events: {n_skew}"
+          + (f"  (population estimate: {n_sampled} kept lines carried sampled_1_in)"
+             if n_sampled else ""))
     nz = [v for v in pbook_cc if v != 0]
     print(f"\n1) pbook_cc (would-be steer, cc): nonzero {len(nz)}/{len(pbook_cc)}")
     if nz:

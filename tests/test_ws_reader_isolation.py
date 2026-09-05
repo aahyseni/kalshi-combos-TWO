@@ -20,6 +20,17 @@ and a synthetic main-loop stall (``time.sleep`` on the loop):
      NEW socket only.
   5. Code 25 is logged CRITICAL with reader diagnostics if it ever recurs.
   6. Clean stop: thread joined, no reader loop left behind.
+
+Review fixes (2026-09-05):
+
+  7. The reader thread writes NO log line while the main loop is stalled —
+     the hang watchdog's log axis must stay "main-loop work"; the shed
+     aggregate is written by the dispatcher once the loop runs again.
+  8. One subscribe per socket: a subscription declared between "socket up"
+     and the connect follow-up's snapshot is sent exactly once.
+  9. The health properties read the reader-written socket attribute once
+     (a double read can straddle a socket death → AttributeError on the
+     quoting path).
 """
 
 from __future__ import annotations
@@ -415,3 +426,161 @@ async def test_start_twice_is_refused() -> None:
             raise AssertionError("second start() must be refused")
     finally:
         await m.stop()
+
+
+# --------------------------------------------------------------------------- #
+# 7. The reader thread writes NO log line while the main loop is stalled
+# --------------------------------------------------------------------------- #
+
+
+async def test_reader_thread_writes_no_log_line_during_a_main_loop_stall() -> None:
+    """Review 2026-09-05 must-fix. ``tools/ops/hang_watchdog.py`` declares a
+    stall only when the live log AND the store are both quiet past its
+    threshold; a reader that logged its shed aggregate every ``max_silence_s``
+    while the market lane stayed full would keep the log axis alive through a
+    PERMANENT main-loop hang and the relighter would never fire.
+
+    Proof: a real reader thread, a full market lane, a continuous feed, the
+    main thread blocked in ``time.sleep``. When the sleep returns the capture
+    must hold ZERO lines (anything captured by then was written by another
+    thread — the main thread never returned to the loop), and the aggregated
+    ``ws_shed_market_frames`` line must appear once the DISPATCHER runs."""
+    sock = _ThreadSocket()
+    connector = _Connector([sock])
+    m, metrics = _manager(connector)
+    m.mark_sheddable("rfq_created")  # ageless: the survivors dispatch after the stall
+    m._lanes.capacity = 5
+    seen: list[int] = []
+
+    async def rec(msg: JsonDict) -> None:
+        seen.append(int(msg["n"]))
+
+    m.on_message("rfq_created", rec)
+    m.start()
+    try:
+        await _until(lambda: m.connected)
+        await asyncio.sleep(0.05)  # the connect follow-up settles (nothing to send)
+        n_frames = 200
+        with structlog.testing.capture_logs() as logs:
+
+            def feeder() -> None:
+                for i in range(n_frames):
+                    sock.feed({"type": "rfq_created", "n": i})
+                    time.sleep(0.001)
+
+            t = threading.Thread(target=feeder)
+            t.start()
+            time.sleep(0.3)  # noqa: ASYNC251 — THE STALL: nothing on the main loop runs
+            t.join()
+            # Still stalled (blocking waits only): let the reader take the
+            # last frame. The lane is full (capacity 5) the whole time.
+            deadline = time.monotonic() + 2.0
+            while m._frames_read < n_frames and time.monotonic() < deadline:
+                time.sleep(0.001)  # noqa: ASYNC251 — still the stall
+            assert m._frames_read == n_frames
+            assert m.lane_depths()["market"] == 5
+            # Zero lines from the reader thread during the stall.
+            assert logs == []
+            await _settled(m)
+        shed = [e for e in logs if e["event"] == "ws_shed_market_frames"]
+        assert len(shed) == 1
+        assert shed[0]["log_level"] == "warning"
+        assert shed[0]["shed"] == {"rfq_created": n_frames - 5}
+        assert metrics.counter("t.shed_market_frames") == n_frames - 5
+        assert metrics.counter("t.shed.rfq_created") == n_frames - 5
+        # The newest 5 frames survived and were dispatched in order.
+        assert seen == list(range(n_frames - 5, n_frames))
+    finally:
+        await m.stop()
+
+
+# --------------------------------------------------------------------------- #
+# 8. One subscribe per socket across the "socket up" → snapshot window
+# --------------------------------------------------------------------------- #
+
+
+async def test_subscription_added_before_the_snapshot_is_sent_exactly_once() -> None:
+    """Review 2026-09-05. The reader publishes ``_ws`` the moment a socket is
+    up; ``_after_connect`` snapshots the subscription list only after the
+    on_connect handlers. A subscription declared in between used to be sent
+    live AND by the snapshot (Kalshi code 6 "Already subscribed" or a second
+    sid, plus a leaked pending ack). The on_connect handler here holds that
+    window open deliberately."""
+    sock = _ThreadSocket()
+    m, _ = _manager(_Connector([sock]))
+    gate = asyncio.Event()
+
+    async def on_conn() -> None:
+        await gate.wait()
+
+    m.on_connect(on_conn)
+    m.start()
+    try:
+        await _until(lambda: m.connected)  # socket up; snapshot NOT yet taken
+        m.add_subscription(["communications"])
+        await asyncio.sleep(0.05)
+        assert sock.sent == []  # not sent live: this socket has no snapshot yet
+        gate.set()
+        await _until(lambda: len(sock.sent) == 1)
+        await asyncio.sleep(0.05)
+        assert [json.loads(s)["params"]["channels"] for s in sock.sent] == [["communications"]]
+        assert m._subscribed_ws is sock
+        # After the snapshot a live declaration is sent immediately — once.
+        m.add_subscription(["orderbook_delta"], market_tickers=["M1"])
+        await _until(lambda: len(sock.sent) == 2)
+        await asyncio.sleep(0.05)
+        assert len(sock.sent) == 2
+        assert json.loads(sock.sent[1])["params"]["channels"] == ["orderbook_delta"]
+    finally:
+        await m.stop()
+
+
+# --------------------------------------------------------------------------- #
+# 9. Health properties read the reader-written socket attribute exactly once
+# --------------------------------------------------------------------------- #
+
+
+class _CountingReads(WsManager):
+    """``_ws`` as a counting descriptor. The reader thread writes ``_ws``, so
+    a main-loop property that reads it twice can straddle a socket death
+    (``self._ws is not None and not self._ws.closed`` → AttributeError on
+    the quoting path: ``feed.watch`` → ``add_subscription``, the last look's
+    ``rx_age_s``). Pins the single-read form (review 2026-09-05 must-fix)."""
+
+    reads = 0
+
+    @property
+    def _ws(self) -> Any:  # type: ignore[override]
+        type(self).reads += 1
+        return self.__dict__.get("_ws_value")
+
+    @_ws.setter
+    def _ws(self, value: Any) -> None:
+        self.__dict__["_ws_value"] = value
+
+
+def test_health_properties_read_the_socket_attribute_once() -> None:
+    m = _CountingReads(
+        "wss://example/ws",
+        _Signer(),
+        SystemClock(),
+        Metrics(),
+        name="t",  # type: ignore[arg-type]
+    )
+    m._ws = _ThreadSocket()
+    m._last_rx_mono_ns = time.monotonic_ns()
+    _CountingReads.reads = 0
+    assert m.connected is True
+    assert _CountingReads.reads == 1
+    _CountingReads.reads = 0
+    assert m.last_rx_age_s is not None
+    assert _CountingReads.reads == 1  # via ``connected``, once
+    _CountingReads.reads = 0
+    m.add_subscription(["x"])  # no snapshot on this socket: one read, nothing sent
+    assert _CountingReads.reads == 1
+    # Socket gone: clean False / None, never AttributeError.
+    m._ws = None
+    _CountingReads.reads = 0
+    assert m.connected is False
+    assert m.last_rx_age_s is None
+    assert _CountingReads.reads == 2

@@ -11,7 +11,7 @@ processor in `ops/logging.py`) + the wiring in `ops/quote_app.py`. **Pricing, ri
 
 | | Item | State |
 |---|---|---|
-| WRONG | The socket reader was a coroutine on the main loop. Read+enqueue-only (2026-07-14) stopped handlers from blocking it, but any synchronous stretch of main-loop work still stopped it reading; TCP flow control then backed the exchange up until ITS per-subscription buffer overflowed — error **25 "Subscription buffer overflow"** — and every reconnect discarded the queued auctions. | FIXED — the socket lives on a dedicated thread + loop (`_ReaderThread`); frames cross into the main loop through `_Lanes`. A main-loop stall can no longer stop reading; code 25 from a stall is impossible by construction and is logged **CRITICAL** with reader diagnostics if it ever recurs. |
+| WRONG | The socket reader was a coroutine on the main loop. Read+enqueue-only (2026-07-14) stopped handlers from blocking it, but any synchronous stretch of main-loop work still stopped it reading; TCP flow control then backed the exchange up until ITS per-subscription buffer overflowed — error **25 "Subscription buffer overflow"** — and every reconnect discarded the queued auctions. | FIXED — the socket lives on a dedicated thread + loop (`_ReaderThread`); frames cross into the main loop through `_Lanes`. A main-loop stall can no longer stop reading; code 25 can no longer follow from a main-loop stall *while the reader thread gets the GIL* (Python code, SQLite and `time.sleep` release it; a C extension holding it for the stall's length would still starve the reader) and is logged **CRITICAL** with reader diagnostics if it ever recurs. |
 | WRONG | Nothing in the process could say WHICH callback held the loop; the tape only showed the consequences (code 25, `HTTP 400 expired` confirms, the 60.5 s maintenance wall). | FIXED — `LoopLagProbe` (`event_loop_lag` per 15 s window; bound = the probe's own period) + `SlowCallbackRecorder` (`slow_callback` / `slow_callbacks_window`: task name + `file:function:line` of the await that ended the blocking stretch; threshold = the measured p99 of callback durations, defined after 100 samples). Hook cost 0.1 µs/callback (measured). |
 | WRONG | 85.8% of log lines on the 14:46 boot were six measurement-only shadow read-outs (32 per quote sent), each JSON-rendered and flushed on the loop, paid exactly when the loop is behind. | FIXED — `ShadowTelemetrySampler` structlog processor: 1-in-N when the probe says the loop is behind, N = ceil(lag / period); kept lines carry `sampled_1_in`; `risk_audit` and every decision line bypass it by construction (pinned by tests). |
 | OPEN | Accepts are no longer LOST across a stall, but an accept that arrives DURING a stall is dispatched when the stall ends: replay latency = the stall length (5.0 s / 3.0 s / 1.0 s for accepts fed 1-5 s into a 6 s stall). The exchange window is 3.0 s. Isolation removes the overflow; it cannot make the main loop run during its own stall. | The stall itself is the remaining defect — the recorder now names it. Owners: `build/confirm-halt-and-derived-wall` (60 s wall + the never-reset `_confirm_failures` counter), `build/store-rotation-tool` (the 213 GB store behind the maintenance pass). |
@@ -118,9 +118,23 @@ aggregates are never raced.
 * **Code 25**: the intake's terminal handling (force reconnect — the subscription IS dead per the docs) is kept;
   `WsManager._note_server_error` adds `ws_subscription_buffer_overflow` at CRITICAL with `reader_thread_alive`,
   `frames_read`, `last_rx_age_s`, lane depths, and metric `ws.subscription_buffer_overflow`.
+* **The reader thread never logs periodically** (review must-fix 1): capacity sheds are COUNTED on the reader
+  (`<name>.shed.<type>` in the lanes' pending metrics) and the aggregated `ws_shed_market_frames` line is written by
+  the dispatcher in `_flush_reader_metrics` — on the main loop. `tools/ops/hang_watchdog.py` treats any advance of
+  the live log as main-loop work and declares a stall only when the log AND the store are both quiet past its
+  threshold (live: 242 s); a reader line every 30 s through a permanent main-loop hang would have kept the log axis
+  alive and nothing would have relit. The reader's remaining lines are one-shot per socket (connect / error /
+  runaway-close) or per malformed frame.
+* **One subscribe per socket** (review should-fix 1): `add_subscription` sends live only while the main-loop-owned
+  `_subscribed_ws` IS the current socket; `_after_connect` sets it in the same step as its `_subscriptions`
+  snapshot (after the on_connect handlers), `_after_disconnect` clears it. A subscription declared between "socket
+  up" and the snapshot rides the snapshot; one declared after it is sent live — never both (Kalshi code 6 / a second
+  sid / a leaked pending ack).
 * **Thread-safety**: no shared aiohttp objects between loops; `_Lanes` is the only shared structure (one
   `threading.Lock`, swap-free O(1) ops); `_last_rx_mono_ns` / `_ws` / `_frames_read` are single-writer attribute
-  stores; reader-side metrics accumulate in the lanes and are folded on the main loop. `stop()` cancels the
+  stores **read exactly once per property on the main loop** (`connected`, `last_rx_age_s`, `add_subscription` —
+  review must-fix 2: a double read can straddle a socket death and raise on the quoting path); reader-side metrics
+  accumulate in the lanes and are folded on the main loop. `stop()` cancels the
   socket-loop run task, joins the thread off-loop (`to_thread`), then drains ≤ 0.1 s and cancels the dispatcher.
 * **Transport seam**: `WsManager(connect=...)` — production binds aiohttp's `ws_connect` (the receive_timeout /
   heartbeat derivation moved verbatim into `_aiohttp_connect`); the replay harness and the suite bind a recorded /
@@ -182,12 +196,17 @@ budget with the live bot.
 
 ## Tests
 
-New (25): `tests/test_ws_reader_isolation.py` (7 — a REAL reader thread + a REAL `time.sleep` main-loop stall:
+New (28): `tests/test_ws_reader_isolation.py` (10 — a REAL reader thread + a REAL `time.sleep` main-loop stall:
 every frame pulled off the socket during the stall, all 3 priority frames dispatched, market frames shed 20 by
 capacity / 10 by age / 0 dispatched stale, fresh frames after the stall dispatch, 0 disconnects; ageless
 `rfq_deleted` never age-dropped; `force_reconnect` runs `on_disconnect` before the second connect and re-subscribes
 on the NEW socket only; `send_command` / live `add_subscription` marshalled to the socket loop; code 25 → CRITICAL
-with reader diagnostics, other codes not; clean `stop()` joins the thread; `start()` twice refused),
+with reader diagnostics, other codes not; clean `stop()` joins the thread; `start()` twice refused; **review
+fixes** — a real thread + a full market lane + a 200-frame feed under a real `time.sleep` stall: `capture_logs`
+holds ZERO lines when the sleep returns and exactly one `ws_shed_market_frames {rfq_created: 195}` after the
+dispatcher runs; a subscription declared while `on_connect` holds the snapshot open goes on the wire exactly once
+and a later live one exactly once; `connected` / `last_rx_age_s` / `add_subscription` read `_ws` once each via a
+counting descriptor),
 `tests/test_loop_lag.py` (8 — histogram edges; ratio = lag/period with the bound at exactly one period; a real
 stall measured and recovered; derived threshold + attribution `task:slow-task@test_loop_lag.py:blocker:`; install
 replaces / uninstall idempotent; `describe_handle` on task, done task, plain cb), `tests/test_telemetry_sampling.py`
@@ -208,12 +227,40 @@ cross-thread). The 2,000-frame mid-storm accept proof (`test_mid_storm_accept_ju
 
 | gate | result |
 |---|---|
-| unit suite (low priority) | **4,070 passed / 0 failed** in 301 s (baseline 4,045; +25 new) |
-| vitals fast tier, `VITALS_DATA_DIR=<snapshot 20:26Z>` | **8/8 GREEN** (99.3 s) |
-| ruff `src tests` | 18 findings on the branch = 18 on `main` (pre-existing; 3 of them in `tests/test_ws_manager.py` predate this build); repo-wide 419 = 419 |
+| unit suite (low priority) | build: **4,070 passed / 0 failed** in 301 s (baseline 4,045; +25 new); **fix pass: 4,073 passed / 0 failed / 3 deselected in 311 s** (+3 review proofs) |
+| vitals fast tier, `VITALS_DATA_DIR=<snapshot 20:26Z>` | build: **8/8 GREEN** (99.3 s); **fix pass: 8/8 GREEN (GATE PASS), 104.4 s** (same snapshot — taken after the 20:02Z process death, so it equals the live store's current content) |
+| ruff `src tests` | 18 findings on the branch = 18 on `main` (pre-existing; 3 of them in `tests/test_ws_manager.py` predate this build); repo-wide 419 = 419; fix pass: 18 = 18, the four re-weighted tape readers 19 = 19 (pre-existing), touched files clean |
 | ruff format | the 7 new/rewritten files formatted; ported test files left at their existing style |
-| mypy strict (package) | 6 errors, all pre-existing in `pricing/engine.py` (4) and `pricing/ising_amm.py` (2); **0 in any touched file** |
+| mypy strict (package) | 6 errors, all pre-existing in `pricing/engine.py` (4) and `pricing/ising_amm.py` (2); **0 in any touched file** (fix pass: unchanged, 6) |
 | throughput | not measurable here (rule: never start/stop the live bot). Mechanism argument: per-frame JSON parsing moved OFF the main loop, one uncontended lock op per frame added, 0.1 µs per callback for the hook; the replay dispatched 20k frames at wire rate with a 14 ms max dispatcher step. **Read the first-window sends/min at relight against the 300-460/min benchmark** (8/26: 655/min). |
+
+## Review fixes (2026-09-05 fix pass, after the SHIP_WITH_FIXES review)
+
+Every must-fix and every should-fix applied except one, declined with evidence (row 8). Blast radius unchanged:
+`git diff main` under `pricing/ risk/ sim/ rfq/` is still 0 lines; nothing was started, stopped or written under
+the data dir.
+
+| # | review item | what changed | proof |
+|---|---|---|---|
+| 1 | **MUST** — the reader thread logged `ws_shed_market_frames` every `max_silence_s` while the market lane stayed full, which would keep the hang watchdog's log axis alive through a permanent main-loop hang (`hang_watchdog.py poll_once`: stale only when `log_quiet > threshold AND store_quiet > threshold`) | `_record_shed` (reader) now only COUNTS (`<name>.shed_market_frames`, `<name>.shed.<type>` in the lanes' pending metrics); `_flush_reader_metrics` (dispatcher, main loop) folds the counts and writes the aggregated line with the same first-shed-immediate / at-most-once-per-`max_silence_s` policy. The reader's remaining lines are one-shot per socket or per malformed frame. | `test_reader_thread_writes_no_log_line_during_a_main_loop_stall`: real thread, capacity 5, 200 frames fed under a real `time.sleep` stall → `capture_logs == []` when the sleep returns (the main thread never ran, so anything captured would be the reader's), then exactly one `ws_shed_market_frames {rfq_created: 195}` after `_settled`, metrics 195/195, the newest 5 frames dispatched in order. The old code fails this test on its first shed. |
+| 2 | **MUST** — `connected` read `_ws` twice (`self._ws is not None and not self._ws.closed`); the reader thread writes `_ws`, so a socket death between the reads raises `AttributeError` on the quoting path (`feed.watch` → `add_subscription` leaves legs unwatched; the last look's `rx_age_s` drops the quote) | `connected`, `last_rx_age_s` and `add_subscription` snapshot the reader-written attributes to a local once (`_note_server_error` goes through the fixed property). | `test_health_properties_read_the_socket_attribute_once`: `_ws` as a counting descriptor — each property reads it exactly once, connected and disconnected, never raises. |
+| 3 | should — double-subscribe window between "socket up" (`_ws` set by the reader) and `_after_connect`'s snapshot | Main-loop-owned `_subscribed_ws`: set by `_after_connect` in the same synchronous step as the `list(self._subscriptions)` copy (after the on_connect handlers), cleared by `_after_disconnect`; `add_subscription` sends live only while `_subscribed_ws is self._ws`. | `test_subscription_added_before_the_snapshot_is_sent_exactly_once`: `on_connect` holds the window open; the sub declared inside it is NOT sent live, goes out exactly once with the snapshot; a later live one exactly once. `test_force_reconnect_…` still proves resubscribe on the NEW socket only. |
+| 4 | should — `QUANTILE = 0.99` and `report_top = 20` implied "derived" | Labelled: `q` is a DECLARED POLICY ANCHOR (stated like z 3/4/5; only the threshold value and `MIN_SAMPLES = ceil(1/(1-q))` derive from it); `report_top` is a display cap. Docstring + comments only; no behaviour change. | `tests/test_loop_lag.py` unchanged, passing. |
+| 5 | should — shadow-line consumers not re-weighted for `sampled_1_in` | `tools/diagnostics/conc_steer_shadow_readout.py` and `tools/diagnostics/pbook_shadow_readout.py` weight every kept line `sampled_1_in` times (absent = 1) so counts and quantiles estimate the population, and print how many kept lines carried the annotation; `docs/research/rfq_throughput/scripts/log_latency_anatomy.py` weights the `inventory_skew_shadow` per-second counter (it IS the priced-RFQ throughput read-out) and annotates the line; `tools/proto_skew_settled_resolution.py` is a PER-EVENT replay (a weight cannot re-create the missing RFQs), so it carries `weight` on each event and prints the annotated count + the implied population instead of re-weighting. | `py_compile` + ruff on the four files: 19 findings = 19 on HEAD (pre-existing). |
+| 6 | should — `SlowCallbackRecorder.install()` at the top of `run()` but `uninstall()` only in the inner finally around `_stop.wait()` | `run()` now installs, then `try: await self._run_instrumented() finally: unbind(); uninstall()` — the body after the bind moved verbatim into `_run_instrumented()`; the inner finally keeps its (idempotent) calls because its ORDER matters (unhook before the shutdown stages, whose lines must never be sampled). | `tests/test_quote_app_phase6.py` passing in the touched-set run; `uninstall()`/`unbind()` idempotency is by construction (`_installed is not self` guard; `unbind` resets state). |
+| 7 | should — `_ReaderThread.stop()` joins without a timeout | Comment added: the thread is a daemon and the await runs inside the `ws_stop` ShutdownStage's wall, which is the bound that applies. | — |
+| 8 | should — `_ReaderThread._main` closes the loop without `shutdown_default_executor()`, "worker threads leak" | **Declined, with evidence.** CPython 3.13 `BaseEventLoop.close()` (docstring: "shuts down the executor, but does not wait for the executor to finish") already calls `executor.shutdown(wait=False)`: idle getaddrinfo workers exit on the sentinel, a worker mid-call exits when the call returns — nothing lingers idle. What `shutdown_default_executor()` would add is a JOIN of that in-flight call, on the reader thread, inside `stop()`: a resolver wedged in `getaddrinfo` (the 8/27 wake-DNS failure class) would hold `stop()` for the resolver's own timeout inside the shutdown wall, for no liveness gain (at interpreter exit `concurrent.futures` joins the worker either way). Documented in the `finally`. | `asyncio/base_events.py` lines 731-751 on this box. |
+| 9 | should — "code 25 impossible by construction" over-promised | Qualified in `ws.py`, this report's WRONG/FIXED row and Mechanism 2, and the README index: impossible from a main-loop stall while the reader thread gets the GIL; a C extension holding the GIL for the stall's length still starves it — the CRITICAL line covers detection. | — |
+
+**Live-state fact carried from the review (verified again read-only at 21:17Z):** no `python.exe` on the box; the
+pointer log `live_20260905_1602.log` is 3,888 bytes, last written 16:02:08 ET; `heartbeat.txt` absent;
+`hang_watchdog.log` ends at 16:02:11 ET. The 16:02 ET relight died at boot and nothing relit it — the stack is
+DOWN and the watchdog itself appears not to be running. Not caused by this branch; "relight on this branch" in
+NEXT STEPS is now the operator's start, not a merge-and-wait.
+
+**Scratchpad hygiene note:** the session scratchpad is shared with the other fix-pass agents (a `fixpass/` patch
+script of this pass was overwritten by the store-rotation pass mid-flight); this pass's scripts moved to a
+task-unique directory and were marker-checked before every run. Nothing of theirs was run here.
 
 ## NEXT STEPS
 
@@ -229,6 +276,7 @@ cross-thread). The 2,000-frame mid-storm accept proof (`test_mid_storm_accept_ju
    for the main loop (the lifecycle's last-look/reservation would have to become thread-safe — a separate build).
 4. The intake's pre-parse stale gate is now downstream of the lane's age drop (0 hits in the replay); keep as
    defense in depth, revisit only if a measurement shows it costing.
-5. Tape readers that count shadow lines must weight by `sampled_1_in` (absent = 1).
+5. ~~Tape readers that count shadow lines must weight by `sampled_1_in` (absent = 1).~~ DONE in the fix pass
+   (four readers re-weighted, see Review fixes); any NEW reader of a shadow event must do the same.
 6. Pre-existing debt seen in passing, not touched: 6 mypy errors in `pricing/engine.py` / `pricing/ising_amm.py`;
    18 ruff findings in `src`+`tests`.

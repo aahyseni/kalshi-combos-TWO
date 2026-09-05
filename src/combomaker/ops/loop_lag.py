@@ -40,7 +40,10 @@ derived signal downstream (telemetry sampling under load).
     every callback duration seen so far (a log2-bucketed histogram, O(1) per
     observation), defined once the sample is large enough for a p99 to mean
     anything — ``ceil(1 / (1 - q))`` = 100 samples, a statistical fact, not a
-    knob. A callback past it logs ``slow_callback`` once per name per window
+    knob. The quantile itself, ``q = 0.99``, is a DECLARED POLICY ANCHOR
+    (stated like z 3/4/5 and the 1% per-combo anchor — chosen, not measured);
+    the threshold VALUE and the minimum sample are what derive from it. A
+    callback past it logs ``slow_callback`` once per name per window
     with the task name and the ``function:line`` it SUSPENDED at (the await
     that ended the blocking stretch), and each window logs
     ``slow_callbacks_window``: the names ranked by total blocked time. That
@@ -233,6 +236,9 @@ class SlowCallbackRecorder:
     runs its own loop through the same class and must not race these
     aggregates."""
 
+    # DECLARED POLICY ANCHOR (not derived): which tail of the process's own
+    # callback-duration distribution counts as "slow". Stated here the way
+    # the z 3/4/5 anchors are; the threshold value derives from it.
     QUANTILE = 0.99
     # ceil(1 / (1 - q)): the smallest sample in which the q-quantile is a
     # real observation rather than the maximum — a statistical fact.
@@ -247,6 +253,8 @@ class SlowCallbackRecorder:
         metrics: Metrics,
         *,
         name: str = "loop",
+        # Display cap for the ``slow_callbacks_window`` ranking — presentation
+        # only, bounds nothing that is measured or decided.
         report_top: int = 20,
     ) -> None:
         self._clock = clock

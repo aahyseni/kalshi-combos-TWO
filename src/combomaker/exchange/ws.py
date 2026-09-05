@@ -294,6 +294,10 @@ class WsManager:
         self._lifecycle_tasks: set[asyncio.Task[None]] = set()
         self._cmd_id = 0
         self._ws: aiohttp.ClientWebSocketResponse | None = None
+        # Main-loop-owned: the socket whose subscription snapshot has been
+        # taken (``_after_connect``). Live ``add_subscription`` sends only
+        # while this IS the current socket — see ``add_subscription``.
+        self._subscribed_ws: aiohttp.ClientWebSocketResponse | None = None
         self._last_rx_mono_ns: int | None = None
         self._frames_read = 0  # reader-thread writes, main-loop reads (diagnostics)
         self._stopping = False
@@ -325,9 +329,12 @@ class WsManager:
         # handed over through ``_Lanes``; the main loop can stall for a
         # minute and the socket is still drained, so an overflow — if any —
         # happens on OUR side, in the lane that can afford it (MARKET, oldest
-        # first), never at the exchange. Code 25 is therefore impossible by
-        # construction from a main-loop stall; it is logged CRITICAL if it
-        # ever recurs (``_dispatch``) so the next cause is visible at once.
+        # first), never at the exchange. Code 25 can therefore no longer
+        # follow from a main-loop stall WHILE THE READER THREAD GETS THE GIL
+        # (Python code, SQLite and time.sleep all release it; a C extension
+        # holding it for the stall's length would still starve the reader);
+        # it is logged CRITICAL if it ever recurs (``_note_server_error``) so
+        # the next cause is visible at once.
         self._lanes = _Lanes(self._QUEUE_MAX)
         self._wake = asyncio.Event()
         self._main_loop: asyncio.AbstractEventLoop | None = None
@@ -371,6 +378,8 @@ class WsManager:
         # auctions through parse + fan-out.
         self._sheddable_types: frozenset[str] = frozenset()
         self._stale_after_ns: dict[str, int] = {}
+        # Main-loop-only aggregation state for the shed / stale-drop lines
+        # (the reader thread never logs periodically — ``_flush_reader_metrics``).
         self._shed_pending: dict[str, int] = {}
         self._shed_last_log_mono_ns: int | None = None
         self._stale_pending: dict[str, int] = {}
@@ -440,7 +449,18 @@ class WsManager:
         """
         sub = _Subscription(list(channels), dict(params_extra), on_subscribed)
         self._subscriptions.append(sub)
-        if self.connected:
+        # LIVE-SEND ONLY ONCE THE CURRENT SOCKET HAS TAKEN ITS SNAPSHOT
+        # (review 2026-09-05). The reader publishes ``_ws`` the instant a
+        # socket is up, but ``_after_connect`` snapshots ``_subscriptions``
+        # one or more main-loop iterations later (after the on_connect
+        # handlers). A subscription added inside that window was sent live
+        # AND again by the snapshot (Kalshi code 6 "Already subscribed" or a
+        # second sid + a leaked pending ack). ``_subscribed_ws`` is set by
+        # ``_after_connect`` on the main loop in the same step as its
+        # snapshot: a sub added before it rides the snapshot, one added after
+        # it is sent live — exactly one subscribe per socket either way.
+        ws = self._ws  # reader-thread written: read once
+        if ws is not None and not ws.closed and self._subscribed_ws is ws:
             task = asyncio.create_task(
                 self._send_subscription_now(sub), name=f"{self._name}-live-subscribe"
             )
@@ -451,7 +471,13 @@ class WsManager:
 
     @property
     def connected(self) -> bool:
-        return self._ws is not None and not self._ws.closed
+        # ``_ws`` is written by the READER THREAD (socket up / socket died).
+        # Read it exactly once: two reads can straddle a socket death and
+        # raise AttributeError on the quoting path (``feed.watch`` →
+        # ``add_subscription``; the last look's ``rx_age_s``) — review
+        # 2026-09-05 must-fix; main's single-loop code had no such race.
+        ws = self._ws
+        return ws is not None and not ws.closed
 
     @property
     def healthy(self) -> bool:
@@ -464,9 +490,10 @@ class WsManager:
         """Seconds since ANY server traffic; the freshness proof for mirrored
         state (a live seq-continuous stream means books are current NOW even
         when quiet). None when disconnected."""
-        if not self.connected or self._last_rx_mono_ns is None:
+        last = self._last_rx_mono_ns  # reader-thread written: read once
+        if last is None or not self.connected:
             return None
-        return (self._clock.monotonic_ns() - self._last_rx_mono_ns) / 1e9
+        return (self._clock.monotonic_ns() - last) / 1e9
 
     def lane_depths(self) -> dict[str, int]:
         """Current handoff backlog per lane (diagnostics / the status line)."""
@@ -586,6 +613,11 @@ class WsManager:
                 await handler()
             except Exception:
                 log.exception("ws_connect_handler_failed", name=self._name)
+        # From here on live ``add_subscription`` calls send on THIS socket;
+        # everything declared before this step is in the snapshot below (the
+        # ``list(...)`` copy is taken synchronously in the same step, before
+        # the first await) — one subscribe per socket, never two.
+        self._subscribed_ws = ws
         try:
             await self._send_subscriptions(ws)
         except Exception as exc:
@@ -602,6 +634,7 @@ class WsManager:
             # 2026-07-14: 107-cycle overflow→reconnect loop). The new
             # connection re-snapshots everything, so nothing queued from the
             # old one is load-bearing.
+            self._subscribed_ws = None
             self._discard_queued()
             self._flush_reader_metrics()
             # Disconnect: notify (cancel-all etc.) BEFORE any reconnect.
@@ -617,9 +650,42 @@ class WsManager:
                 reader_loop.call_soon_threadsafe(_resolve_quietly, ack)
 
     def _flush_reader_metrics(self) -> None:
-        """Main loop only: fold the reader thread's counts into ``Metrics``."""
+        """Main loop only: fold the reader thread's counts into ``Metrics``
+        and write the aggregated ``ws_shed_market_frames`` line.
+
+        THE READER THREAD NEVER LOGS PERIODICALLY (review 2026-09-05
+        must-fix). ``tools/ops/hang_watchdog.py`` treats ANY advance of the
+        live log as main-loop work and declares a stall only when the log
+        AND the store are both quiet past its threshold (live: 242 s). A
+        reader that wrote a line every ``max_silence_s`` while the market
+        lane stayed full (~500 frames/s fills it in ~40 s) would keep the
+        log axis alive through a PERMANENT main-loop hang — the 45 h-outage
+        class the watchdog exists for — and nothing would relight. So shed
+        counts cross as metrics (``<name>.shed.<type>``) and the line is
+        written HERE by the dispatcher: a stalled loop writes nothing, which
+        is exactly what the watchdog must see. Aggregation is unchanged:
+        first shed of a burst logs on the first flush, further sheds
+        accumulate for at most ``max_silence_s`` (the existing liveness
+        window — no new number)."""
+        shed_prefix = f"{self._name}.shed."
         for name, by in self._lanes.take_metrics().items():
             self._metrics.inc(name, by)
+            if name.startswith(shed_prefix):
+                msg_type = name[len(shed_prefix) :]
+                self._shed_pending[msg_type] = self._shed_pending.get(msg_type, 0) + by
+        if not self._shed_pending:
+            return
+        now = self._clock.monotonic_ns()
+        last = self._shed_last_log_mono_ns
+        if last is None or (now - last) / 1e9 >= self._max_silence_s:
+            log.warning(
+                "ws_shed_market_frames",
+                name=self._name,
+                shed=dict(self._shed_pending),
+                depths=self._lanes.depths(),
+            )
+            self._shed_pending.clear()
+            self._shed_last_log_mono_ns = now
 
     # --- reader side (runs on the socket loop, i.e. the reader thread) ---
 
@@ -683,25 +749,16 @@ class WsManager:
                 return
 
     def _record_shed(self, msg_type: str) -> None:
-        """Count a capacity shed; log LOUDLY but aggregated (a surge sheds
-        hundreds/s — per-frame logging would melt the log). First shed of a
-        burst logs immediately; further sheds aggregate for at most
-        ``max_silence_s`` (the existing liveness window — no new number).
-        Reader-thread state only."""
+        """Reader side: COUNT a capacity shed, never log it. The counts cross
+        to the main loop with the other reader metrics and the dispatcher
+        writes one aggregated ``ws_shed_market_frames`` line per
+        ``max_silence_s`` (``_flush_reader_metrics``): a surge sheds
+        hundreds/s, and a line from THIS thread would keep the hang
+        watchdog's log axis alive through a main-loop hang. The reader's
+        remaining log lines are one-shot per socket (connect, error,
+        runaway-close) or per malformed frame — never periodic."""
         self._lanes.count(f"{self._name}.shed_market_frames")
         self._lanes.count(f"{self._name}.shed.{msg_type}")
-        self._shed_pending[msg_type] = self._shed_pending.get(msg_type, 0) + 1
-        now = self._clock.monotonic_ns()
-        last = self._shed_last_log_mono_ns
-        if last is None or (now - last) / 1e9 >= self._max_silence_s:
-            log.warning(
-                "ws_shed_market_frames",
-                name=self._name,
-                shed=dict(self._shed_pending),
-                depths=self._lanes.depths(),
-            )
-            self._shed_pending.clear()
-            self._shed_last_log_mono_ns = now
 
     # --- dispatcher side (main loop) ---
 
@@ -944,6 +1001,10 @@ class _ReaderThread:
             with contextlib.suppress(RuntimeError):
                 loop.call_soon_threadsafe(task.cancel)
         if self._thread.is_alive():
+            # No join timeout on purpose: the thread is a DAEMON (a wedged
+            # join cannot hold the interpreter's exit) and this await runs
+            # inside the ``ws_stop`` ShutdownStage's wall (BOUNDED SHUTDOWN
+            # 2026-07-27), which is the bound that applies.
             await asyncio.to_thread(self._thread.join)
 
     def _main(self) -> None:
@@ -961,6 +1022,15 @@ class _ReaderThread:
             try:
                 loop.run_until_complete(loop.shutdown_asyncgens())
             finally:
+                # ``loop.close()`` shuts the default executor down WITHOUT
+                # waiting (CPython 3.13 BaseEventLoop.close: "shuts down the
+                # executor, but does not wait for the executor to finish" →
+                # ``executor.shutdown(wait=False)``): aiohttp's getaddrinfo
+                # workers exit as soon as their current call returns. We
+                # deliberately do NOT ``shutdown_default_executor()`` (join)
+                # here: a resolver wedged in getaddrinfo (the 8/27 wake-DNS
+                # failure) would hold this thread — and ``stop()`` — for the
+                # resolver's own timeout, inside the shutdown wall.
                 loop.close()
                 self.loop = None
                 self._owner._ws = None
