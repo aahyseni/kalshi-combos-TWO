@@ -16,6 +16,7 @@ import inspect
 import json
 import sqlite3
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -26,7 +27,7 @@ import tools.ops.prune_tape as pt
 from combomaker.ops import acceptance_seed
 from combomaker.ops.acceptance_seed import SEED_WINDOW_S, seed_counts_from_store
 from combomaker.ops.config import ObserveConfig
-from combomaker.ops.persistence import STORE_OP_TIMEOUT_S, Store
+from combomaker.ops.persistence import BUSY_TIMEOUT_MS, STORE_OP_TIMEOUT_S, Store
 from combomaker.ops.quote_app import QuoteApp
 from tests.test_rotate_store import CONFLICT, LEDGERED, NOW, TAPE_ONLY, _build_store, _Clock
 
@@ -381,3 +382,160 @@ async def test_cli_apply_prunes_to_completion_when_the_bot_is_down(
     cutoff = result["passes"][0]["cutoff_iso"]
     assert _rows(store, "decisions") == [r for r in before if r[1] >= cutoff]
     assert result["checkpoint_passive"] is not None
+    # one PASSIVE checkpoint per pass: the prune connection never auto-
+    # checkpoints and with the bot down nobody else folds the WAL
+    assert len(result["checkpoints_passive"]) == len(result["passes"]) == 1
+    assert result["checkpoints_passive"][-1] == result["checkpoint_passive"]
+    assert result["checkpoints_passive"][-1][0] == 0  # busy 0
+
+
+# ------------------------------------------------ review fixes (2026-09-05 fix pass)
+
+
+def _big_table(path: Path, rows: int, width: int) -> None:
+    con = sqlite3.connect(path)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+    con.executemany("INSERT INTO t VALUES (?, ?)", ((i, "x" * width) for i in range(1, rows + 1)))
+    con.commit()
+    con.close()
+
+
+def test_connect_rw_never_auto_checkpoints(tmp_path: Path) -> None:
+    """Should-fix #2: the store's writer owns checkpoints. A default connection
+    PASSIVE-checkpoints after any commit that grows the WAL past 1000 pages
+    (every 25k-row batch does) — inside the measured batch time and against
+    the writer's cadence. The prune's connection must not."""
+    db = tmp_path / "s.sqlite3"
+    _big_table(db, rows=10, width=8)
+    con = tr.connect_rw(db)
+    try:
+        assert con.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 0
+        assert con.execute("PRAGMA busy_timeout").fetchone()[0] == BUSY_TIMEOUT_MS
+        page = int(con.execute("PRAGMA page_size").fetchone()[0])
+        # a commit well past the default 1000-page threshold stays in the WAL
+        con.execute("BEGIN IMMEDIATE")
+        con.executemany(
+            "INSERT INTO t VALUES (?, ?)", ((i, "y" * 200) for i in range(11, 60_011))
+        )
+        con.execute("COMMIT")
+        wal_bytes = Path(str(db) + "-wal").stat().st_size
+        assert wal_bytes > 1000 * page, wal_bytes
+    finally:
+        con.close()
+
+
+def test_batch_deadline_interrupts_a_running_delete_and_frees_the_lock(tmp_path: Path) -> None:
+    """Should-fix #1: the time bound holds WHILE the DELETE runs — SQLite's
+    progress handler aborts the statement once the clock passes the deadline,
+    the batch rolls back and the write lock is free at once (the writer's
+    synchronous confirm-path commit never waits past the bound)."""
+    db = tmp_path / "s.sqlite3"
+    _big_table(db, rows=200_000, width=40)
+    con = tr.connect_rw(db)
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        tr._arm_batch_deadline(con, time.monotonic() - 1.0)  # noqa: SLF001 — already past
+        t0 = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError) as ei:
+            tr._delete_range(con, "t", 1, 200_001, [])  # noqa: SLF001
+        assert tr._is_interrupt(ei.value)  # noqa: SLF001
+        tr._disarm_batch_deadline(con)  # noqa: SLF001
+        # SQLite rolled the ENTIRE transaction back itself (sqlite3_interrupt
+        # semantics for a DML statement inside an explicit transaction)
+        assert not con.in_transaction
+        took = time.monotonic() - t0
+        assert con.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 200_000
+        # another writer gets the lock immediately — nothing is held past the bound
+        other = sqlite3.connect(db, timeout=0.05)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+            other.execute("ROLLBACK")
+        finally:
+            other.close()
+        # disarmed: the same DELETE now runs to completion
+        con.execute("BEGIN IMMEDIATE")
+        assert tr._delete_range(con, "t", 1, 200_001, []) == 200_000  # noqa: SLF001
+        con.execute("ROLLBACK")
+        assert took < 30.0
+    finally:
+        con.close()
+
+
+async def test_pass_interrupts_a_slow_batch_at_the_bound_and_rolls_it_back(
+    synthetic: tuple[Path, dict[str, int]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Should-fix #1 through run_prune_pass: a batch that reaches the bound is
+    INTERRUPTED (a real SQLite interrupt, polled every VM op here so the tiny
+    synthetic batch reaches it), rolled back, counted as an attempt with zero
+    rows deleted, the pass stops naming the bound, and the lock is free."""
+    store, _ = synthetic
+    before_rfqs = _rows(store, "rfqs")
+    before_dec = _rows(store, "decisions")
+    monkeypatch.setattr(tr, "_DEADLINE_POLL_OPS", 1)
+    r = tr.run_prune_pass(store, now=NOW, batch_time_bound_s=-1.0)
+    assert r.batches == 1 and r.rows_deleted == 0 and not r.complete
+    assert r.stopped_reason and "interrupted" in r.stopped_reason
+    assert "STORE_OP_TIMEOUT_S" in r.stopped_reason and "rolled back" in r.stopped_reason
+    assert r.tables["rfqs"].batches == 1 and r.tables["rfqs"].rows_deleted == 0
+    assert _rows(store, "rfqs") == before_rfqs and _rows(store, "decisions") == before_dec
+    other = sqlite3.connect(store, timeout=0.05)
+    try:
+        other.execute("BEGIN IMMEDIATE")
+        other.execute("ROLLBACK")
+    finally:
+        other.close()
+    # with the real bound the same pass completes (the poll granularity is
+    # not a bound: nothing here is slow)
+    monkeypatch.undo()
+    r2 = tr.run_prune_pass(store, now=NOW)
+    assert r2.complete and r2.rows_deleted > 0 and r2.stopped_reason is None
+
+
+async def test_protected_set_mirrors_the_ledger_readers_empty_legs_json_predicate(
+    synthetic: tuple[Path, dict[str, int]], clock: _Clock
+) -> None:
+    """Should-fix #3: ``Store._ledger_legsets`` skips a ledger row whose
+    legs_json is '' and falls back to the tape — so a fills ticker whose only
+    ledger rows are empty is PROTECTED (its tape row survives every prune),
+    exactly as the rotation carries it."""
+    store, _ = synthetic
+    legacy = "KXMVE-LEGACYEMPTY"
+    con = sqlite3.connect(store)
+    con.execute("UPDATE rfqs SET market_ticker = ? WHERE rfq_id = 'rfq-0'", (legacy,))
+    con.execute(
+        "INSERT INTO position_ledger (position_id, opened_at, combo_ticker, collection_ticker,"
+        " subaccount, our_side, contracts_centi, entry_price_cc, cost_cc, fees_cc,"
+        " leg_set_hash, legs_json, status) VALUES ('pos-legacy', '2026-09-01T00:00:00+00:00',"
+        " ?, 'KXMVECROSSCATEGORY', '0', 'no', 300, 5000, 15000, 5, 'legacy-hash', '', 'open')",
+        (legacy,),
+    )
+    con.commit()
+    con.close()
+    s0 = await Store.open(store, clock)
+    try:
+        await s0.record_fill(
+            "fill:legacy", order_id="order-legacy", combo_ticker=legacy, our_side="no",
+            contracts_centi=300, price_cc=5000, fee_cc=5, expected_edge_cc=100, raw={},
+        )
+        held = await s0.held_positions([legacy])
+    finally:
+        await s0.close()
+    assert held and held[0]["legs_source"] == "rfqs_tape"  # the reader's predicate
+    ro = sqlite3.connect(f"file:{store.as_posix()}?mode=ro", uri=True)
+    try:
+        prot = tr.protected_rfq_ids(ro)
+    finally:
+        ro.close()
+    assert legacy in prot.tickers and 1 in prot.rfq_ids
+    assert legacy not in prot.conflicting and legacy not in prot.unresolvable
+    # LEDGERED has real legs in the ledger ⇒ not protected (unchanged)
+    assert LEDGERED not in prot.tickers
+    r = tr.run_prune_pass(store, now=NOW)
+    assert r.complete and r.rows_deleted > 0
+    assert [x for x in _rows(store, "rfqs") if x[0] == 1]  # row 1 survived the prune
+    s1 = await Store.open(store, clock)
+    try:
+        assert await s1.held_positions([legacy]) == held
+    finally:
+        await s1.close()

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import struct
 from datetime import UTC, datetime, timedelta
@@ -459,7 +460,7 @@ async def test_refuses_when_the_wal_cannot_be_checkpointed(
     holder.execute("BEGIN IMMEDIATE")
     holder.execute("INSERT INTO store_meta (key, value) VALUES ('x', 'y')")
     try:
-        with pytest.raises(SystemExit, match="checkpointed|ALIVE|REFUSED"):
+        with pytest.raises(SystemExit, match="could not be fully checkpointed"):
             rs.rotate(
                 store, now=NOW, window_s=SEED_WINDOW_S, manifest_dir=tmp_path / "b",
                 liveness_window_s_=60.0, skip_process_probe=True,
@@ -508,11 +509,15 @@ async def test_refuses_on_a_foreign_wal_at_another_hard_link(
     assert store.exists()
 
 
-async def test_failed_build_rolls_the_archive_back(
+async def test_failed_build_leaves_the_live_store_untouched_and_never_renamed(
     synthetic: tuple[Path, dict[str, int]], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Build FIRST, rename LAST (review must-fix #2): a build failure happens
+    while the live store still carries its live name — nothing to roll back,
+    and a hard kill in the same window would have left it equally intact."""
     store, counts = synthetic
     before = _rows(store, "fills")
+    mtime = store.stat().st_mtime_ns
 
     def boom(*a: object, **k: object) -> dict[str, object]:
         raise RuntimeError("simulated copy failure")
@@ -529,6 +534,11 @@ async def test_failed_build_rolls_the_archive_back(
     assert _rows(store, "fills") == before
     failed = list((tmp_path / "b").glob("*-FAILED.json"))
     assert len(failed) == 1
+    steps = _read_json(failed[0])["steps"]
+    assert any("build FAILED" in x and "never touched" in x for x in steps)
+    assert not any(x.startswith("renamed store") or "ROLLED BACK" in x for x in steps)
+    # the checkpoint TRUNCATE is the only write that happened before the build
+    assert store.stat().st_mtime_ns >= mtime
 
 
 async def test_refuses_an_existing_archive_name(
@@ -664,3 +674,240 @@ async def test_dry_run_reports_the_retention_alternative(
     text = capsys.readouterr().out
     assert "RETENTION ALTERNATIVE (dark" in text
     assert "protected rfqs rows (leg provenance): 4" in text
+
+
+# ------------------------------------------------ review fixes (2026-09-05 fix pass)
+
+
+async def test_refuses_any_other_hard_link_even_without_a_foreign_wal(
+    synthetic: tuple[Path, dict[str, int]], tmp_path: Path
+) -> None:
+    """Must-fix #1: after the rename every other name of the inode is a name
+    of the ARCHIVE (anything opened through it reads a stale ledger as live),
+    so --apply refuses on the hard-link COUNT — a foreign WAL is not required.
+    The dry-run names the same refusal."""
+    store, _ = synthetic
+    if not _hardlink_ok(tmp_path):
+        pytest.skip("hard links unsupported here")
+    other_dir = tmp_path / "kct-vdata"
+    other_dir.mkdir()
+    os.link(store, other_dir / store.name)  # no -wal beside it at all
+    files = rs.store_files(store)
+    assert files["hard_links"] == 2
+    assert rs.foreign_wal_refusals(files) == []
+    refusals = rs.hard_link_refusals(files)
+    assert len(refusals) == 1 and "2 hard link" in refusals[0] and "ARCHIVE" in refusals[0]
+    if files["other_names"]:  # enumerated (fsutil): the other name is spelled out
+        assert "kct-vdata" in refusals[0]
+    p = rs.plan(store, now=NOW, window_s=SEED_WINDOW_S, measure=False)
+    assert any("hard link" in r for r in p["refusals_now"])
+    with pytest.raises(SystemExit, match="hard link"):
+        rs.rotate(
+            store, now=NOW, window_s=SEED_WINDOW_S, manifest_dir=tmp_path / "b",
+            liveness_window_s_=60.0, skip_process_probe=True,
+        )
+    assert store.exists()
+    assert not list(store.parent.glob("*.archive-*"))
+    assert not list(store.parent.glob("*.rotating-*"))
+
+
+async def test_hard_link_refusal_never_fails_open_when_names_cannot_be_enumerated(
+    synthetic: tuple[Path, dict[str, int]], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Must-fix #1 (the fail-open): ``hard_link_names`` degrades to a NOTE with
+    ``other_names=[]`` when fsutil fails, which made the foreign-WAL check pass
+    on a 3-name inode. The count comes from os.stat and refuses regardless."""
+    store, _ = synthetic
+    monkeypatch.setattr(
+        rs, "hard_link_names", lambda path: (3, [], "fsutil rc=1: simulated failure")
+    )
+    files = rs.store_files(store)
+    assert files["hard_links"] == 3 and files["other_names"] == []
+    assert rs.foreign_wal_refusals(files) == []  # the old gate: silent pass
+    refusals = rs.hard_link_refusals(files)
+    assert len(refusals) == 1
+    assert "3 hard link" in refusals[0] and "not enumerated" in refusals[0]
+    assert "simulated failure" in refusals[0]
+    # stat failure (0) is unknown ⇒ refuse; exactly one name ⇒ no refusal
+    assert rs.hard_link_refusals({"hard_links": 0, "other_names": []})
+    assert rs.hard_link_refusals({"hard_links": 1, "other_names": []}) == []
+    with pytest.raises(SystemExit, match="3 hard link"):
+        rs.rotate(
+            store, now=NOW, window_s=SEED_WINDOW_S, manifest_dir=tmp_path / "b",
+            liveness_window_s_=60.0, skip_process_probe=True,
+        )
+    assert store.exists() and not list(store.parent.glob("*.archive-*"))
+
+
+async def test_build_reads_the_live_name_and_a_failed_swap_renames_the_archive_back(
+    synthetic: tuple[Path, dict[str, int]], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Must-fix #2: the fresh store is built from the LIVE name while it still
+    exists (no archive yet); the rename happens only at the swap; a failed
+    second rename puts the archive straight back under the live name; and a
+    successful run's manifest shows build BEFORE rename."""
+    store, counts = synthetic
+    before = _rows(store, "fills")
+    seen: dict[str, object] = {}
+    real_build = rs.build_fresh_store
+
+    def spy(source: Path, fresh: Path, *, plan_: dict) -> dict:
+        seen["source"] = source
+        seen["live_present"] = store.exists()
+        seen["archive_present"] = bool(list(store.parent.glob("*.archive-*")))
+        return real_build(source, fresh, plan_=plan_)
+
+    monkeypatch.setattr(rs, "build_fresh_store", spy)
+    real_replace = os.replace
+
+    def failing_swap(src: object, dst: object) -> None:
+        if ".rotating-" in Path(str(src)).name and Path(str(dst)) == store:
+            raise OSError("simulated swap failure")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", failing_swap)
+    with pytest.raises(OSError, match="simulated swap"):
+        rs.rotate(
+            store, now=NOW, window_s=SEED_WINDOW_S, manifest_dir=tmp_path / "b",
+            liveness_window_s_=60.0, skip_process_probe=True,
+        )
+    assert seen["source"] == store and seen["live_present"] is True
+    assert seen["archive_present"] is False
+    assert store.exists()
+    assert not list(store.parent.glob("*.archive-*"))
+    assert not list(store.parent.glob("*.rotating-*"))
+    assert _rows(store, "fills") == before
+    failed = list((tmp_path / "b").glob("*-FAILED.json"))
+    assert len(failed) == 1
+    steps = _read_json(failed[0])["steps"]
+    assert any("ROLLED BACK" in x for x in steps)
+    # the same store then rotates cleanly, build strictly before rename
+    monkeypatch.setattr(os, "replace", real_replace)
+    m = rs.rotate(
+        store, now=NOW, window_s=SEED_WINDOW_S, manifest_dir=tmp_path / "b2",
+        liveness_window_s_=60.0, skip_process_probe=True,
+    )
+    steps = m["steps"]
+    i_build = next(i for i, x in enumerate(steps) if x.startswith("fresh store built"))
+    i_rename = next(i for i, x in enumerate(steps) if x.startswith("renamed store"))
+    i_swap = next(i for i, x in enumerate(steps) if x.startswith("fresh store swapped"))
+    assert i_build < i_rename < i_swap
+    assert _rows(store, "fills") == before
+    assert _exists(Path(m["archive"])) and _exists(store)
+    archives = [
+        x for x in store.parent.glob("*.archive-*") if not x.name.endswith(("-wal", "-shm"))
+    ]
+    assert archives == [Path(m["archive"])]
+
+
+async def test_checkpoint_folds_a_hard_killed_wal_and_the_rotation_carries_its_rows(
+    synthetic: tuple[Path, dict[str, int]], tmp_path: Path
+) -> None:
+    """Should-fix #4 (positive path): a hard-killed bot leaves COMMITTED frames
+    in the -wal with no handle open. TRUNCATE folds every frame (busy 0), the
+    rotation proceeds, and the fresh store carries the row that lived only in
+    the WAL. Built by snapshotting db + wal while the writer is still open (the
+    main file is pre-commit, the WAL holds the commit — the hard-kill shape)."""
+    store, _ = synthetic
+    con = sqlite3.connect(store)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA wal_autocheckpoint=0")
+    con.execute("INSERT INTO store_meta (key, value) VALUES ('killed_hard', 'yes')")
+    con.commit()
+    wal = Path(str(store) + "-wal")
+    assert (rs.wal_header(wal) or {}).get("frames", 0) > 0
+    snap_dir = tmp_path / "snap"
+    snap_dir.mkdir()
+    snap = snap_dir / store.name
+    shutil.copy2(store, snap)
+    shutil.copy2(wal, Path(str(snap) + "-wal"))
+    con.close()  # the ORIGINAL folds its WAL on close; the snapshot is the hard-kill shape
+    frames = rs.wal_header(Path(str(snap) + "-wal"))["frames"]
+    assert frames > 0
+    m = rs.rotate(
+        snap, now=NOW, window_s=SEED_WINDOW_S, manifest_dir=tmp_path / "b",
+        liveness_window_s_=60.0, skip_process_probe=True,
+    )
+    ck = m["checkpoint"]
+    # a successful TRUNCATE resets the header BEFORE the pragma reads its
+    # counters, so wal_frames/checkpointed are (0, 0) on success; the frames
+    # it folded are the header read before, and the verdict is busy + size
+    assert ck["busy"] == 0 and ck["frames_before"] == frames and frames > 0
+    assert ck["wal_bytes_after"] == 0 and (ck["wal_frames"], ck["checkpointed"]) == (0, 0)
+    assert any(f"{frames} frame(s) folded" in x for x in m["steps"])
+    assert m["ok"] is True
+    assert dict(_rows(snap, "store_meta"))["killed_hard"] == "yes"
+    archive = Path(m["archive"])
+    assert dict(_rows(archive, "store_meta"))["killed_hard"] == "yes"
+
+
+async def test_ledger_row_with_empty_legs_json_keeps_tape_provenance_through_rotation(
+    synthetic: tuple[Path, dict[str, int]], tmp_path: Path, clock: _Clock
+) -> None:
+    """Should-fix #3: ``Store._ledger_legsets`` SKIPS a ledger row whose
+    legs_json is '' and consults the tape for that ticker, so the protected
+    set must include a fills ticker whose only ledger rows are empty — else
+    its tape rows are neither carried nor protected and the ticker degrades
+    to 'reserved from exchange figures' after the rotation."""
+    store, _ = synthetic
+    legacy = "KXMVE-LEGACYEMPTY"
+    con = sqlite3.connect(store)
+    # its ONLY tape row: rfq-0 (id 1, hour 0 — three days old, outside the seed window)
+    con.execute("UPDATE rfqs SET market_ticker = ? WHERE rfq_id = 'rfq-0'", (legacy,))
+    con.execute(
+        "INSERT INTO position_ledger (position_id, opened_at, combo_ticker, collection_ticker,"
+        " subaccount, our_side, contracts_centi, entry_price_cc, cost_cc, fees_cc,"
+        " leg_set_hash, legs_json, status) VALUES ('pos-legacy', '2026-09-01T00:00:00+00:00',"
+        " ?, 'KXMVECROSSCATEGORY', '0', 'no', 300, 5000, 15000, 5, 'legacy-hash', '', 'open')",
+        (legacy,),
+    )
+    con.commit()
+    con.close()
+    s0 = await Store.open(store, clock)
+    try:
+        await s0.record_fill(
+            "fill:legacy", order_id="order-legacy", combo_ticker=legacy, our_side="no",
+            contracts_centi=300, price_cc=5000, fee_cc=5, expected_edge_cc=100, raw={},
+        )
+        before = await s0.held_positions([legacy, LEDGERED, TAPE_ONLY, CONFLICT])
+    finally:
+        await s0.close()
+    row = next(r for r in before if r["combo_ticker"] == legacy)
+    assert row["legs_source"] == "rfqs_tape"  # the reader's own predicate: '' ⇒ tape
+    con = rs.connect_ro(store)
+    prov = rs.leg_provenance_plan(con, rs.user_tables(rs.schema_objects(con)))
+    con.close()
+    assert legacy in prov["tickers"] and 1 in prov["rfq_ids"]
+    assert legacy not in prov["conflicting"] and legacy not in prov["unresolvable"]
+    rs.rotate(
+        store, now=NOW, window_s=SEED_WINDOW_S, manifest_dir=tmp_path / "b",
+        liveness_window_s_=60.0, skip_process_probe=True,
+    )
+    assert any(r[0] == 1 for r in _rows(store, "rfqs"))  # the protected row, id preserved
+    s1 = await Store.open(store, clock)
+    try:
+        after = await s1.held_positions([legacy, LEDGERED, TAPE_ONLY, CONFLICT])
+    finally:
+        await s1.close()
+    assert after == before
+
+
+async def test_a_temp_left_by_a_killed_earlier_run_is_removed_before_building(
+    synthetic: tuple[Path, dict[str, int]], tmp_path: Path
+) -> None:
+    """Build-first means a hard kill mid-build leaves the live store intact plus
+    a stray .rotating-<old stamp> temp (+ siblings); the next --apply removes
+    every such leftover, names them in the manifest, and rotates normally."""
+    store, counts = synthetic
+    stale = store.with_name(f"{store.name}.rotating-20260901T000000Z")
+    _write_bytes(stale, b"half-built")
+    _write_bytes(Path(str(stale) + "-wal"), b"")
+    _write_bytes(Path(str(stale) + "-shm"), b"")
+    m = rs.rotate(
+        store, now=NOW, window_s=SEED_WINDOW_S, manifest_dir=tmp_path / "b",
+        liveness_window_s_=60.0, skip_process_probe=True,
+    )
+    assert m["ok"] is True
+    assert not list(store.parent.glob("*.rotating-*"))
+    assert any("removed stale temp" in x and stale.name in x for x in m["steps"])
+    assert len(_rows(store, "fills")) == counts["fills"]

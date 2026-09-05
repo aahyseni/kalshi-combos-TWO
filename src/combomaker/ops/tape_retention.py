@@ -39,10 +39,14 @@ distinct shape, so it stays ambiguous: fail-closed parity).
 THE PASS is bounded by primitives that already exist, never a fresh literal:
   * batch = ``acceptance_seed._CHUNK_IDS`` ids (the seed's own chunk, so a
     batch's lock hold is the size the store already tolerates from a reader);
-  * a batch that takes longer than ``STORE_OP_TIMEOUT_S`` (the writer's own
-    lock tolerance — a longer hold could fail the writer's commit) STOPS the
-    pass: this store is too slow to prune live, and the mechanism says so
-    instead of pressing on;
+  * a batch is INTERRUPTED at ``STORE_OP_TIMEOUT_S`` (the writer's own lock
+    tolerance — a longer hold could fail the writer's synchronous confirm-path
+    commit with 'database is locked': a confirmed fill without a ledger row)
+    and rolled back, and the pass STOPS: SQLite's progress handler consults
+    the clock while the DELETE runs, so the write lock is never held past the
+    bound — a post-hoc check alone would notice only after the damage. This
+    store is too slow to prune live, and the mechanism says so instead of
+    pressing on;
   * ``MAX_BATCHES_PER_PASS = PRUNE_CADENCE_S / STORE_OP_TIMEOUT_S``: a pass
     never outlasts its own period even if every batch waited its full lock
     timeout, so passes never overlap;
@@ -54,7 +58,10 @@ THE PASS is bounded by primitives that already exist, never a fresh literal:
 Each batch is its own transaction on a SECOND stdlib connection (never the
 shared aiosqlite writer thread — the 2026-07-26 stall), run in a worker thread
 by the app. The store's own writer keeps owning checkpoints; the prune never
-checkpoints in-process. ``DELETE`` returns pages to the freelist — the file
+checkpoints in-process — its connection sets ``wal_autocheckpoint=0``, because
+a default connection would PASSIVE-checkpoint after any commit that grows the
+WAL past 1000 pages (every 25k-row batch does), inside the measured batch time
+and against the writer's own checkpoint cadence. ``DELETE`` returns pages to the freelist — the file
 does not shrink (that is ``tools/ops/rotate_store.py``'s job, once) but stops
 growing past ~2 days of tape, and the B-trees the writer inserts into stay
 small forever.
@@ -231,6 +238,16 @@ class ProtectedRows:
 
 
 def protected_rfq_ids(con: sqlite3.Connection) -> ProtectedRows:
+    """PREDICATE PARITY with ``Store.held_positions``: the ledger resolves a
+    ticker only through rows whose ``legs_json`` is non-empty
+    (``Store._ledger_legsets`` skips ``not legs_json`` and then consults the
+    tape for that ticker), so a fills ticker whose ledger rows ALL carry an
+    empty ``legs_json`` still needs its tape rows — protected here too. (The
+    DDL says ``legs_json TEXT NOT NULL``, so only ``''`` can occur.) Per
+    ``(market_ticker, legs_json)`` the MIN(id) row is kept with ITS
+    ``collection_ticker``; ``held_positions`` reads ``MAX(collection_ticker)``
+    over the group — identical because a market_ticker belongs to exactly one
+    collection."""
     tables = {
         str(r[0])
         for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -241,7 +258,9 @@ def protected_rfq_ids(con: sqlite3.Connection) -> ProtectedRows:
         str(r[0])
         for r in con.execute(
             "SELECT DISTINCT combo_ticker FROM fills WHERE combo_ticker NOT IN"
-            " (SELECT combo_ticker FROM position_ledger) ORDER BY combo_ticker"
+            " (SELECT combo_ticker FROM position_ledger"
+            "  WHERE legs_json IS NOT NULL AND legs_json != '')"
+            " ORDER BY combo_ticker"
         )
     ]
     ids: list[int] = []
@@ -378,7 +397,10 @@ class PruneResult:
 def connect_rw(db_path: Path) -> sqlite3.Connection:
     """The prune's OWN connection (never the shared aiosqlite one): the
     store's busy wait, autocommit off (each batch is an explicit BEGIN
-    IMMEDIATE / COMMIT), no schema writes."""
+    IMMEDIATE / COMMIT), no schema writes, and NO auto-checkpoint — the
+    store's writer owns checkpoints (a default connection would PASSIVE-
+    checkpoint after every batch that grows the WAL past 1000 pages, inside
+    the measured batch time and against the writer's cadence)."""
     con = sqlite3.connect(
         f"file:{db_path.resolve().as_posix()}?mode=rw",
         uri=True,
@@ -386,7 +408,32 @@ def connect_rw(db_path: Path) -> sqlite3.Connection:
         isolation_level=None,
     )
     con.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_MS)}")
+    con.execute("PRAGMA wal_autocheckpoint=0")
     return con
+
+
+#: How often (in SQLite VM instructions) a running batch consults the clock for
+#: its time bound — a polling granularity, not a bound (the bound is
+#: ``STORE_OP_TIMEOUT_S``); a 25k-row DELETE crosses it hundreds of times.
+_DEADLINE_POLL_OPS = 10_000
+
+
+def _arm_batch_deadline(con: sqlite3.Connection, deadline_mono: float) -> None:
+    """Interrupt whatever statement runs on ``con`` once the monotonic clock
+    passes ``deadline_mono``: SQLite's progress handler aborts the statement
+    with ``OperationalError('interrupted')`` — the time bound holds WHILE the
+    batch runs, so the write lock is released at the bound, never after."""
+    con.set_progress_handler(
+        lambda: 1 if time.monotonic() > deadline_mono else 0, _DEADLINE_POLL_OPS
+    )
+
+
+def _disarm_batch_deadline(con: sqlite3.Connection) -> None:
+    con.set_progress_handler(None, 0)
+
+
+def _is_interrupt(exc: sqlite3.OperationalError) -> bool:
+    return "interrupt" in str(exc).lower()
 
 
 def run_prune_pass(
@@ -401,10 +448,11 @@ def run_prune_pass(
     """ONE bounded pass (module doc): plan read-only, then delete tape rows
     below each table's bound in id-range batches, each its own transaction,
     skipping the protected ``rfqs`` rows. Stops early (``complete=False``)
-    when ``should_continue()`` says no, a batch exceeded the writer's lock
-    tolerance, or the per-pass batch cap is reached. Never raises for an
-    empty/absent table; SQLite errors propagate to the caller (the app step
-    logs them and retries next cadence)."""
+    when ``should_continue()`` says no, a batch was INTERRUPTED at the
+    writer's lock tolerance (rolled back — ``batches`` counts the attempt,
+    ``rows_deleted`` does not), or the per-pass batch cap is reached. Never
+    raises for an empty/absent table; other SQLite errors propagate to the
+    caller (the app step logs them and retries next cadence)."""
     t0 = time.monotonic()
     con = connect_rw(db_path)
     try:
@@ -434,18 +482,47 @@ def run_prune_pass(
                 hi = min(lo + int(batch_ids), below)
                 tb = time.monotonic()
                 con.execute("BEGIN IMMEDIATE")
+                # The lock is held from here: the deadline counts from tb (the
+                # wait for the lock is part of the batch) and the DELETE is
+                # interrupted the moment the clock passes it.
+                _arm_batch_deadline(con, tb + float(batch_time_bound_s))
+                interrupted = False
+                deleted = 0
                 try:
                     deleted = _delete_range(con, t, lo, hi, protected if t == "rfqs" else [])
                     con.execute("COMMIT")
+                except sqlite3.OperationalError as exc:
+                    _disarm_batch_deadline(con)
+                    # An interrupted DELETE inside an explicit transaction makes
+                    # SQLite roll back the ENTIRE transaction itself (documented
+                    # sqlite3_interrupt semantics): no partial batch can survive,
+                    # and there may be nothing left to roll back here.
+                    if con.in_transaction:
+                        con.execute("ROLLBACK")
+                    if not _is_interrupt(exc):
+                        raise
+                    interrupted = True
+                    deleted = 0
                 except BaseException:
-                    con.execute("ROLLBACK")
+                    _disarm_batch_deadline(con)
+                    if con.in_transaction:
+                        con.execute("ROLLBACK")
                     raise
+                finally:
+                    _disarm_batch_deadline(con)
                 took = time.monotonic() - tb
                 res.slowest_batch_s = max(res.slowest_batch_s, took)
                 res.batches += 1
                 tp.batches += 1
                 tp.rows_deleted += deleted
                 res.rows_deleted += deleted
+                if interrupted:
+                    res.stopped_reason = (
+                        f"batch interrupted at STORE_OP_TIMEOUT_S {batch_time_bound_s}s"
+                        f" (the writer's lock tolerance) after {took:.2f}s and rolled back"
+                        " — store too slow to prune live"
+                    )
+                    break
                 lo = hi
                 if took > batch_time_bound_s:
                     res.stopped_reason = (

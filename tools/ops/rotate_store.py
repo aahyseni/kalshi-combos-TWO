@@ -20,25 +20,32 @@ THE ROTATION (operator-driven, bot DOWN — this tool never starts or stops it):
      evidence as ``tools/ops/repair_phantom_fills.py`` (``heartbeat.txt``,
      ``supervisor_heartbeat.txt``, ``loop_progress.json`` — the bot's own
      readers, the supervisor's own window), plus the launch-site process
-     predicate (``ours_predicate.ps1``) — and REFUSES while any OTHER hard
-     link of the store carries a non-empty WAL (SQLite never tolerates two
-     WALs on one inode; an open through that name would replay stale pages).
+     predicate (``ours_predicate.ps1``) — and REFUSES while the store inode
+     has ANY other name (``st_nlink != 1``): after the rename every other
+     hard link silently becomes a name of the ARCHIVE, so anything opened
+     through it reads a stale ledger/anchor as if live; and SQLite never
+     tolerates two WALs on one inode (a foreign ``-wal`` with frames is named
+     in the refusal). The count comes from ``os.stat`` — it refuses even when
+     ``fsutil`` cannot enumerate the other names (never fail-open).
   3. ``PRAGMA wal_checkpoint(TRUNCATE)`` on the live store; REFUSE unless it
      completes (busy=0, every frame folded, ``-wal`` at 0 bytes) — a WAL that
      cannot be checkpointed means a connection is still open.
-  4. RENAME the store to ``<name>.archive-YYYYMMDD`` (its ``-wal``/``-shm``
-     siblings follow it). A rename is atomic and fails outright while any
-     process holds the file — the natural backstop under the liveness checks.
-  5. CREATE the fresh store at a temporary name through the REAL
-     ``Store.open`` (the live DDL, every idempotent ADD COLUMN migration,
-     every index — never a hand-written or copied schema; the two vitals-
-     owned tables the bot's DDL does not know come from the archive's own
-     DDL), then ONE transaction copying BY COLUMN NAME (an archive column
-     the live code no longer creates is a refusal — data is never dropped):
-       * every LIVE table whole, ids preserved (``INSERT ... SELECT *`` over
-         an ATTACHed read-only archive): fills, position_ledger, ev_ledger,
-         markouts, structural_fits, store_meta, daily_ruin_anchors,
-         daily_realized_events, combo_trades (+ anything else not tape);
+  4. BUILD FIRST, RENAME LAST. CREATE the fresh store at a temporary name
+     through the REAL ``Store.open`` (the live DDL, every idempotent ADD
+     COLUMN migration, every index — never a hand-written or copied schema;
+     the two vitals-owned tables the bot's DDL does not know come from the
+     live store's own DDL), then ONE transaction copying BY COLUMN NAME from
+     the quiesced LIVE store over a read-only ATTACH (a column the live code
+     no longer creates is a refusal — data is never dropped). The live name
+     is NEVER absent while anything slow runs: a hard kill or power loss
+     during the build leaves the live store untouched and a stray
+     ``.rotating-*`` temp the next --apply removes (rename-first would have
+     let the next START_BOT create an EMPTY store at the live name and boot
+     with zero ledger — silent, and past every gate).
+       * every LIVE table whole, ids preserved (``INSERT ... SELECT``):
+         fills, position_ledger, ev_ledger, markouts, structural_fits,
+         store_meta, daily_ruin_anchors, daily_realized_events, combo_trades
+         (+ anything else not tape);
        * the TAPE the boot readers need: ``decisions`` rows in the seed
          window with kind IN ``SEED_KINDS``, ``rfqs`` rows in the seed
          window (the seed joins sizing terms by rfq_id), and one real
@@ -50,10 +57,14 @@ THE ROTATION (operator-driven, bot DOWN — this tool never starts or stops it):
          across the boundary (``fills.id > watermark`` keeps its meaning).
      Then ``journal_mode=WAL``, ``quick_check``, and a row-count VERIFY of
      every copied table against the copy's own rowcounts. Any failure ⇒ the
-     temp file is removed and the archive renamed back — nothing half-done
-     ever carries the live name.
-  6. ``os.replace`` the verified temp onto the live name; write the manifest
-     (``data/backups/<stamp>-rotate_store_manifest.json``).
+     temp file is removed; the live store was never touched.
+  5. SWAP: ``os.rename`` the live store to ``<name>.archive-YYYYMMDD`` (its
+     ``-wal``/``-shm`` siblings follow it) — atomic, and it fails outright
+     while any process holds the file (the mechanical backstop under the
+     liveness evidence) — then ``os.replace`` the verified temp onto the live
+     name. The live name is absent for those few syscalls only; if the second
+     rename fails the archive is renamed straight back.
+  6. Write the manifest (``data/backups/<stamp>-rotate_store_manifest.json``).
   7. START_BOT.bat. ``--verify --manifest <path>`` (read-only) then checks
      the live store against the manifest: LIVE-table counts ≥ the carried
      counts, the fills verification watermark unchanged, sequences ≥ carried.
@@ -237,6 +248,31 @@ def store_files(store: Path) -> JsonDict:
     }
 
 
+def hard_link_refusals(files: JsonDict) -> list[str]:
+    """REFUSE unless the store inode has exactly ONE name. After the rename
+    every other hard link becomes a name of the ARCHIVE — anything opened
+    through it (``D:/kct-vdata/...``, ``.../vitals_snapshot/...`` on 9/5)
+    would read a stale ledger/anchor as if live. ``st_nlink`` comes from
+    ``os.stat``, so this fires even when ``fsutil`` cannot enumerate the names
+    (0 = stat failed = unknown = refuse)."""
+    nlink = int(files.get("hard_links") or 0)
+    if nlink == 1:
+        return []
+    names = [o["name"] for o in files.get("other_names", [])]
+    note = files.get("hard_link_note")
+    where = (
+        f"other names {names}"
+        if names
+        else f"other names not enumerated ({note or 'unknown'})"
+    )
+    return [
+        f"store has {nlink} hard link(s) (expected exactly 1) — {where}; after the "
+        "rename every other name would silently point at the ARCHIVE; delete the extra "
+        "links (tools/vitals/snapshot.py makes a COPY; a hard link was never a snapshot) "
+        "before rotating"
+    ]
+
+
 def foreign_wal_refusals(files: JsonDict) -> list[str]:
     out: list[str] = []
     for other in files.get("other_names", []):
@@ -256,8 +292,11 @@ def foreign_wal_refusals(files: JsonDict) -> list[str]:
 # --------------------------------------------------------------- inspect
 
 
-def connect_ro(path: Path, *, timeout_s: float = 5.0) -> sqlite3.Connection:
-    return sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True, timeout=timeout_s)
+def connect_ro(path: Path, *, timeout_s: float | None = None) -> sqlite3.Connection:
+    """Read-only URI open; the lock wait is the store's own ``BUSY_TIMEOUT_MS``
+    (the bot's statement of how long a lock wait may legitimately take)."""
+    wait = busy_timeout_ms() / 1000.0 if timeout_s is None else timeout_s
+    return sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True, timeout=wait)
 
 
 def schema_objects(con: sqlite3.Connection) -> list[JsonDict]:
@@ -583,7 +622,7 @@ def plan(
         est["live_copy_s_measured_in_memory"] = m["live_s"]
     out["estimate"] = est
     out["readers"] = list(BOOT_READERS)
-    refusals = foreign_wal_refusals(out["files"])
+    refusals = foreign_wal_refusals(out["files"]) + hard_link_refusals(out["files"])
     wal = out["files"].get("wal")
     if wal and (wal.get("frames") or 0) > 0:
         refusals.append(
@@ -655,7 +694,17 @@ def process_evidence() -> list[str]:
 
 def checkpoint_truncate(store: Path, *, timeout_ms: int) -> JsonDict:
     """ONE TRUNCATE checkpoint on the (quiesced) store. Returns the pragma's
-    verdict; the caller refuses unless busy=0 and every frame folded."""
+    verdict plus ``frames_before`` (the WAL header read BEFORE the pragma);
+    the caller refuses unless busy=0 and the -wal is at 0 bytes.
+
+    Semantics worth stating (probed 2026-09-05 on SQLite 3.45): a SUCCESSFUL
+    TRUNCATE resets the WAL header before the pragma reads its counters, so
+    ``wal_frames``/``checkpointed`` come back (0, 0) however many frames were
+    folded — only ``busy`` and the file size after are verdicts; the header
+    read before is the only record of what was folded. With busy=1 the two
+    counters are the real (mxFrame, nBackfill) of the partial fold."""
+    wal = Path(str(store) + "-wal")
+    before = wal_header(wal)
     con = sqlite3.connect(str(store), timeout=timeout_ms / 1000.0)
     try:
         con.execute(f"PRAGMA busy_timeout={int(timeout_ms)}")
@@ -663,9 +712,9 @@ def checkpoint_truncate(store: Path, *, timeout_ms: int) -> JsonDict:
     finally:
         con.close()
     busy, log_frames, ckpt = (int(row[0]), row[1], row[2]) if row else (1, None, None)
-    wal = Path(str(store) + "-wal")
     return {
         "busy": busy,
+        "frames_before": 0 if not before else int(before.get("frames") or 0),
         "wal_frames": log_frames,
         "checkpointed": ckpt,
         "wal_bytes_after": wal.stat().st_size if wal.exists() else 0,
@@ -735,19 +784,21 @@ def _columns(con: sqlite3.Connection, schema: str, table: str) -> list[str]:
 
 
 def build_fresh_store(
-    archive: Path,
+    source: Path,
     fresh: Path,
     *,
     plan_: JsonDict,
 ) -> JsonDict:
     """Schema via the live ``Store.open`` (``create_fresh_schema``); tables the
     bot's DDL does not know (vitals-owned ``daily_ruin_anchors`` /
-    ``daily_realized_events``) come from the archive's own DDL; then ONE
+    ``daily_realized_events``) come from the source's own DDL; then ONE
     transaction copying, BY COLUMN NAME (a fresh-only column takes its DDL
-    default; an archive column the live code no longer has is a REFUSAL —
+    default; a source column the live code no longer has is a REFUSAL —
     data is never silently dropped): the LIVE tables whole with ids, the tape
     seed window, the leg-provenance rows and sqlite_sequence; quick_check;
-    row-count verify."""
+    row-count verify. ``source`` is the QUIESCED LIVE store under its live
+    name, read through a read-only ATTACH and closed before the caller
+    renames anything — the live name is never absent while this runs."""
     objects: list[JsonDict] = plan_["objects"]
     tables = user_tables(objects)
     seed = plan_["seed"]["tables"]
@@ -762,8 +813,8 @@ def build_fresh_store(
     dst = sqlite3.connect(f"file:{fresh.resolve().as_posix()}?mode=rw", uri=True)
     try:
         dst.execute("PRAGMA synchronous=OFF")  # bulk load; the bot sets NORMAL at open
-        dst.execute("ATTACH DATABASE ? AS src", (f"file:{archive.resolve().as_posix()}?mode=ro",))
-        # Tables the live DDL does not create: the archive's own DDL (+ its
+        dst.execute("ATTACH DATABASE ? AS src", (f"file:{source.resolve().as_posix()}?mode=ro",))
+        # Tables the live DDL does not create: the source's own DDL (+ its
         # indexes on them). Named in the manifest — the operator sees them.
         for o in objects:
             if o["type"] == "table" and ("table", o["name"]) not in fresh_names and o["sql"]:
@@ -773,7 +824,7 @@ def build_fresh_store(
             if o["type"] == "index" and ("index", o["name"]) not in fresh_names and o["sql"]:
                 dst.execute(o["sql"])
                 archive_only_indexes.append(o["name"])
-        # Column parity: every archive column must exist in the fresh table.
+        # Column parity: every source column must exist in the fresh table.
         missing: list[str] = []
         col_lists: dict[str, str] = {}
         for t in tables:
@@ -788,12 +839,12 @@ def build_fresh_store(
             col_lists[t] = ", ".join(f'"{c}"' for c in src_cols)
         if missing:
             raise RuntimeError(
-                "REFUSED: the archive holds columns the live Store DDL no longer creates "
+                "REFUSED: the store holds columns the live Store DDL no longer creates "
                 "(data would be dropped): " + "; ".join(missing)
             )
         dst.execute("BEGIN")
         # The live open stamped its own fills-verification watermark (0/now) into
-        # store_meta; the archive's rows REPLACE it — that watermark is the
+        # store_meta; the source's rows REPLACE it — that watermark is the
         # single most important carried row.
         for t in tables:
             if t not in TAPE_TABLES:
@@ -867,7 +918,7 @@ def build_fresh_store(
         for t, facts in plan_["tables"].items():
             if not facts["tape"] and copied.get(t) != facts["count"]:
                 mismatches.append(
-                    f"{t}: archive count {facts['count']} vs copied {copied.get(t)}"
+                    f"{t}: source count {facts['count']} vs copied {copied.get(t)}"
                 )
         if mismatches:
             raise RuntimeError("row-count verify failed: " + "; ".join(mismatches))
@@ -900,8 +951,10 @@ def rotate(
     skip_process_probe: bool = False,
     measure: bool = False,
 ) -> JsonDict:
-    """--apply. Refuse-first, rename-second, build-third, swap-last; any failure
-    after the rename puts the archive back under the live name."""
+    """--apply. Refuse-first, checkpoint, BUILD the fresh store at a temp name
+    from the quiesced live store, then SWAP (rename live -> archive, replace
+    temp -> live). The live name is absent only between those two renames; a
+    failed second rename puts the archive straight back."""
     now = now or datetime.now(UTC)
     stamp = now.strftime("%Y%m%dT%H%M%SZ")
     suffix = archive_suffix or f"archive-{now.strftime('%Y%m%d')}"
@@ -942,13 +995,15 @@ def rotate(
             + " — run STOP_BOT.bat (kills the watchdog first) before --apply"
         )
     manifest["steps"].append("liveness: no evidence of a live bot")
-    # (2) plan (read-only) + foreign-WAL refusal.
+    # (2) plan (read-only) + the file refusals: a foreign WAL on another hard
+    #     link, and ANY other hard link at all (count from os.stat — fires even
+    #     when the names cannot be enumerated; never fail-open).
     p = plan(store, now=now, window_s=window_s, measure=measure)
-    foreign = foreign_wal_refusals(p["files"])
-    if foreign:
-        raise SystemExit("REFUSED: " + " | ".join(foreign))
+    file_refusals = foreign_wal_refusals(p["files"]) + hard_link_refusals(p["files"])
+    if file_refusals:
+        raise SystemExit("REFUSED: " + " | ".join(file_refusals))
     manifest["plan"] = {k: v for k, v in p.items() if k not in ("readers", "objects")}
-    manifest["steps"].append("plan: computed read-only")
+    manifest["steps"].append("plan: computed read-only; store has exactly one hard link")
     # (3) checkpoint TRUNCATE — refuse unless complete.
     ck = checkpoint_truncate(store, timeout_ms=busy_timeout_ms())
     manifest["checkpoint"] = ck
@@ -959,18 +1014,51 @@ def rotate(
             f"REFUSED: WAL could not be fully checkpointed ({ck}) — a connection is "
             "still open on the store"
         )
-    manifest["steps"].append("checkpoint TRUNCATE: complete, WAL at 0 bytes")
-    # (4) rename — atomic; fails while any process holds the file.
-    os.rename(store, archive)
+    manifest["steps"].append(
+        f"checkpoint TRUNCATE: complete, {ck['frames_before']} frame(s) folded, WAL at 0 bytes"
+    )
+    # (4) BUILD + verify the fresh store at a temp name, reading the quiesced
+    #     live store through a read-only ATTACH. The live name is never absent
+    #     while this (unbounded on a saturated disk) step runs: a hard kill or
+    #     power loss here leaves the live store exactly as it was plus a stray
+    #     .rotating-* temp, which the next --apply removes.
+    # A temp left by an earlier run killed mid-build (any stamp) is never
+    # valid: a completed run swaps its temp away. Remove them all, named.
+    stale = sorted(
+        x for x in store.parent.glob(f"{store.name}.rotating-*")
+        if not x.name.endswith(("-wal", "-shm"))
+    )
+    for x in stale:
+        _remove_with_siblings(x)
+    if stale:
+        names = [x.name for x in stale]
+        manifest["steps"].append(f"removed stale temp(s) from an earlier run: {names}")
+    _remove_with_siblings(fresh_tmp)
+    try:
+        built = build_fresh_store(store, fresh_tmp, plan_=p)
+    except BaseException as exc:
+        _remove_with_siblings(fresh_tmp)
+        manifest["error"] = repr(exc)
+        manifest["steps"].append("build FAILED: temp removed; the live store was never touched")
+        _write_manifest(manifest, manifest_dir or store.parent / "backups", stamp, failed=True)
+        raise
+    manifest["built"] = built
+    manifest["steps"].append(f"fresh store built + verified in {built['build_s']} s")
+    # (5) SWAP — two renames. The first is atomic and fails outright while any
+    #     process holds the file (the mechanical backstop); the second puts the
+    #     verified temp under the live name. A failed second rename renames the
+    #     archive straight back.
+    try:
+        os.rename(store, archive)
+    except BaseException as exc:
+        _remove_with_siblings(fresh_tmp)
+        manifest["error"] = repr(exc)
+        manifest["steps"].append("rename live -> archive FAILED (a handle is open?): nothing moved")
+        _write_manifest(manifest, manifest_dir or store.parent / "backups", stamp, failed=True)
+        raise
     moved = _move_siblings(store, archive)
     manifest["steps"].append(f"renamed store -> {archive.name}; siblings {moved}")
     try:
-        # (5) build + verify the fresh store at a temp name.
-        _remove_with_siblings(fresh_tmp)
-        built = build_fresh_store(archive, fresh_tmp, plan_=p)
-        manifest["built"] = built
-        manifest["steps"].append(f"fresh store built + verified in {built['build_s']} s")
-        # (6) swap in.
         os.replace(fresh_tmp, store)
         _move_siblings(fresh_tmp, store)
         manifest["steps"].append("fresh store swapped onto the live name")
@@ -995,8 +1083,10 @@ def rotate(
 def next_steps(store: Path, archive: Path, manifest_path: Path) -> list[str]:
     """The exact operator sequence after a successful --apply."""
     return [
-        f"1. {REPO / 'START_BOT.bat'}  (repo root; supervisor + monitors + prober; "
-        "refuses if any combomaker process is already running)",
+        "1. START_BOT.bat at the root of the LIVE checkout — the repo whose .venv launched "
+        f"the bot (this tool ran from {REPO}; a worktree has no .venv and is NOT the live "
+        "checkout) — supervisor + monitors + prober; refuses if any combomaker process is "
+        "already running",
         "2. first window: sends/min in the 300-460 band; store_writer_stats queue near 0 / "
         "dropped_writes_delta 0; acceptance_tape_seed_result rows_scanned; no "
         "retained_floor_sweep_timeout",

@@ -1,8 +1,9 @@
 # 2026-09-05 — DESIGN + TOOLS: quiesced STORE ROTATION (item 7) + the dark TAPE-RETENTION prune — `tools/ops/rotate_store.py`, `tools/ops/prune_tape.py`, `ops/tape_retention.py`
 
-**Status: BUILT + GATED, DRY-RUN EXECUTED READ-ONLY against the live store, `--apply` NOT run.**
+**Status: BUILT + GATED + REVIEW FIXES APPLIED (see "Review fixes" below), DRY-RUN of the FINAL tool
+EXECUTED READ-ONLY against the live store with the bot DOWN, `--apply` NOT run.**
 Branch `build/store-rotation-tool` (worktree `C:/Users/aahys/kct-rotation`). Bot LIVE on `main`
-throughout; nothing under the data dir was written (every read `mode=ro`, every heavy step at LOW
+during the build (the fix pass ran with the bot DOWN since 16:02 ET — see the review-fixes section); nothing under the data dir was written (every read `mode=ro`, every heavy step at LOW
 priority). **Blast radius of this commit:** two tools (`tools/ops/rotate_store.py`,
 `tools/ops/prune_tape.py`), one new module (`src/combomaker/ops/tape_retention.py`), two test files,
 and three ADDITIVE live-module edits that are inert until a flag is set: `ops/config.py`
@@ -17,10 +18,10 @@ rfq or sim module touched (rule 8); default config = byte-identical behaviour.
 |---|---|---|
 | FINDING | The live store is **213.68 GB** (52,168,228 × 4 KB pages, WAL mode): `rfqs` 66.4M ids + `decisions` 134.3M ids + `would_quotes_inplay` 3.25M rows = the recorder TAPE; every table the bot actually needs to run is **≤ 22,636 rows** (fills 4,343 / position_ledger 4,110 / ev_ledger 4,338 / markouts 22,636 / structural_fits 763 / store_meta 2 / daily_ruin_anchors 2) | measured by a read-only probe (399 s at LOW priority — itself a symptom) |
 | FINDING | **Writer collapse per boot, measured from `store_writer_stats`:** 00:52 boot 1,862,536 dropped rows, queue 198–200k; 09:05 boot 31,354 dropped in 36 min; 09:42 boot 1,314,521 dropped in 2 h (queue 200,000 at its 15:40:52Z halt); 11:40 boot 0 dropped / queue 30,260 at 15:47Z (6 min in); **12:13 boot: last `store_writer_stats` at 16:19:02Z (queue 6,326) and last `decisions` row `at` = 16:18:16Z — no tape row landed for the following ~60 min** (0 `store_writer_batch_failed`, 0 lock errors: the writer starved, not crashed). The 12:13 boot's acceptance seed scanned only **7,426 quote_sent rows for 24 h** (`acceptance_tape_seed_result`, 12.5 s) vs the 8/13 live table of 238k — the seed is reading a tape that is 97% holes | evidence for the design; the fix IS the rotation |
-| FINDING | **HARD-LINK HAZARD:** the store inode has **3 names** — `D:\kalshi-combos-TWO-data\combomaker-prod-live-wc.sqlite3` (live), `D:\kct-vdata\combomaker-prod-live-wc.sqlite3` (the 8/1 frozen-tape snapshot dir, with its own `-wal` of 23,484,032 B dated Aug 1 + `-shm` Aug 6) and `D:\kalshi-combos-TWO-data\vitals_snapshot\combomaker-prod-live-wc.sqlite3` (dir created 9/4 20:36, **with its own `-wal` of 201,912 B written 08:22–09:04 ET TODAY and a 294,912 B `-shm`**). SQLite forbids two WALs on one file: frames committed through another name are invisible to the live connection, and any open through that name REPLAYS that WAL's pages onto the current file. The tool enumerates these (`fsutil hardlink list`), parses each stray WAL header, and **refuses `--apply` while a foreign WAL holds frames** | OPEN — operator: after STOP_BOT, inspect and move aside `vitals_snapshot\*-wal/-shm` and `kct-vdata\*-wal/-shm`, then delete the two extra links (`tools/vitals/snapshot.py` makes a 3.9 MB COPY; a hard link was never a snapshot) |
+| FINDING | **HARD-LINK HAZARD:** the store inode has **3 names** — `D:\kalshi-combos-TWO-data\combomaker-prod-live-wc.sqlite3` (live), `D:\kct-vdata\combomaker-prod-live-wc.sqlite3` (the 8/1 frozen-tape snapshot dir, with its own `-wal` of 23,484,032 B dated Aug 1 + `-shm` Aug 6) and `D:\kalshi-combos-TWO-data\vitals_snapshot\combomaker-prod-live-wc.sqlite3` (dir created 9/4 20:36, **with its own `-wal` of 201,912 B written 08:22–09:04 ET TODAY and a 294,912 B `-shm`**). SQLite forbids two WALs on one file: frames committed through another name are invisible to the live connection, and any open through that name REPLAYS that WAL's pages onto the current file. The tool enumerates these (`fsutil hardlink list`), parses each stray WAL header, and **refuses `--apply` while a foreign WAL holds frames — and (review must-fix #1) while the inode has ANY other name at all, from `os.stat().st_nlink`, so the refusal cannot fail open when `fsutil` cannot enumerate** | OPEN — operator: inspect and move aside `vitals_snapshot\*-wal/-shm` and `kct-vdata\*-wal/-shm`, then delete the two extra links (`tools/vitals/snapshot.py` makes a 3.9 MB COPY; a hard link was never a snapshot); the tool enforces both |
 | BUILT | `tools/ops/rotate_store.py` — `--dry-run` (default, read-only plan + boot-reader audit + measured throughput + the retention alternative's plan + refusals-now), `--apply` (refuse-first / checkpoint / rename / build at a temp name **through the real `Store.open`** / column-wise copy / verify / swap / manifest **with the exact START_BOT sequence**; rollback on any failure), `--verify --manifest` (post-relight read-only check) | 17 tests on a synthetic store built by the REAL `Store` (`tests/test_rotate_store.py`) |
 | BUILT (DARK) | **The ALTERNATIVE: `src/combomaker/ops/tape_retention.py`** — a nightly, bounded prune of `rfqs`/`decisions`/`would_quotes*` rows older than a **DERIVED** window (`SEED_WINDOW_S` + the pass cadence + the tape's MEASURED time disorder — no number of its own), never a protected leg-provenance row, only against an idle tape writer, off-loop on a second connection; wired into `quote_app`'s slow loop behind `observe.tape_retention_enabled` (**default False**); CLI face `tools/ops/prune_tape.py` (dry-run / refuse-if-alive apply) | 13 tests (`tests/test_tape_retention.py`): derivation pins, bisection plan, pass deletes only older rows and splits around protected ids, every bound, boot-reader parity (seed + `held_positions`) before/after, scheduler (due / single-flight / writer-idle / re-arm), dark-flag source pin, CLI refusals |
-| GATES | Suite **4,075/0** (baseline 4,045 + 30 new) at LOW priority; vitals fast **8/8 GREEN** from a rebuilt read-only snapshot (`tools.vitals.snapshot` 16:26 ET); `ruff check` clean on every touched file; `mypy --strict` clean on the four touched `src` modules (the full `mypy` run reports 6 PRE-EXISTING errors in `pricing/ising_amm.py` + `pricing/engine.py`, files this branch never touches — same on `main`) | at the commit |
+| GATES | Build commit: suite **4,075/0** (baseline 4,045 + 30 new) at LOW priority; vitals fast **8/8 GREEN** from a rebuilt read-only snapshot (`tools.vitals.snapshot` 16:26 ET); `ruff check` clean on every touched file; `mypy --strict` clean on the four touched `src` modules (the full `mypy` run reports 6 PRE-EXISTING errors in `pricing/ising_amm.py` + `pricing/engine.py`, files this branch never touches — same on `main`). **Fix pass (final tree): suite **4085/0** (3 deselected, 320.28 s, exit 0) = baseline 4,045 + 40 (30 build + 10 review-fix tests); vitals fast **8/8 GREEN (GATE PASS, 104.8 s)** from the same snapshot (current: its `position_ledger` 4,112 rows = the live count; the store has not changed since 16:01 ET); `ruff check` clean; `mypy --strict` clean on `ops/tape_retention.py`** | at each commit |
 | OPEN | `--apply` execution: operator-gated (STOP_BOT → move the two foreign WALs aside → apply → START_BOT), ~3–5 min of downtime by the measured estimate (the copy itself ≈ seconds; STOP/START/boot dominate); best window = a settled, quote-quiet hour | decision owed |
 | OPEN | Arming the prune: `observe.tape_retention_enabled: true` AFTER one rotation (on the 213 GB store the first batch would outlast the writer's lock tolerance and the pass would stop by design — measured below) | decision owed, after the rotation's first window |
 
@@ -49,19 +50,20 @@ archive). Nothing else on the box changes. The prune (section 6) then keeps it t
  STOP_BOT.bat  ───────►  (1) REFUSE if alive: heartbeat.txt / supervisor_heartbeat.txt /
                              loop_progress.json (repair_phantom_fills' readers + window)
                              + ours_predicate.ps1 process probe
-                         (2) plan() read-only; REFUSE if any other hard link has a WAL with frames
-                         (3) PRAGMA wal_checkpoint(TRUNCATE); REFUSE unless busy=0, all frames
-                             folded, -wal == 0 bytes                                 store + wal
-                         (4) os.rename(store -> store.archive-YYYYMMDD) (+ -wal/-shm)  ── atomic; fails
-                                                                                         if anyone holds it
-                         (5) build store.rotating-<stamp>:                            temp file
+                         (2) plan() read-only; REFUSE if the inode has ANY other name (st_nlink != 1,
+                             never fail-open) or any other hard link has a WAL with frames
+                         (3) PRAGMA wal_checkpoint(TRUNCATE); REFUSE unless busy=0 and -wal == 0 bytes
+                             (frames folded = the header read BEFORE the pragma: a successful
+                             TRUNCATE reports (0, 0) for its counters)                store + wal
+                         (4) BUILD FIRST — remove any stale .rotating-* leftovers, then
+                             build store.rotating-<stamp> from the LIVE name:         temp file
                                Store.open(temp) + close  = the LIVE DDL, every idempotent
                                  ADD COLUMN migration, every index, WAL mode (its own thread
                                  + event loop; never a hand-written or copied schema)
                                + archive DDL for tables the bot's DDL does not know
                                  (daily_ruin_anchors, daily_realized_events — vitals-owned)
                                column parity: archive cols ⊆ fresh cols, else REFUSE
-                               ATTACH archive ro; BEGIN;
+                               ATTACH the quiesced LIVE store ro; BEGIN;
                                INSERT INTO t (cols) SELECT cols  — every LIVE table whole
                                  (store_meta REPLACES the fresh open's 0/now watermark);
                                decisions WHERE kind IN (quote_sent,confirm,decline) AND id>=first_id;
@@ -69,9 +71,13 @@ archive). Nothing else on the box changes. The prune (section 6) then keeps it t
                                fills ticker the ledger cannot resolve);
                                sqlite_sequence := archive's; COMMIT;
                                quick_check; COUNT(*) == rowcount per table (+ archive count)
-                             any exception ⇒ delete temp, rename archive back      ── rollback
-                         (6) os.replace(temp -> live name); manifest ->
-                             data/backups/<stamp>-rotate_store_manifest.json  (+ next_steps)
+                             any exception ⇒ delete temp; the live store was never touched
+                         (5) SWAP: os.rename(store -> store.archive-YYYYMMDD) (+ -wal/-shm)  ── atomic;
+                                   fails outright if anyone holds the file (the mechanical backstop)
+                                   os.replace(temp -> live name) (+ -wal/-shm)
+                             the live name is absent for these few syscalls ONLY; a failed second
+                             rename puts the archive straight back                  ── rollback
+                         (6) manifest -> data/backups/<stamp>-rotate_store_manifest.json (+ next_steps)
  START_BOT.bat ───────►  bot opens the fresh store (Store.open: idempotent DDL/migrations)
  rotate_store.py --verify --manifest <json>   (read-only post-check)
 ```
@@ -82,6 +88,13 @@ Design choices worth stating:
   the rotation copies ~120k rows (≈ 21 MB of row text; 126 MB by the whole-store average) — measured
   below. A rename is atomic on NTFS and fails with a sharing violation while any process has the file
   open — a second, mechanical liveness guard under the evidence-based one.
+* **Build FIRST, rename LAST (review must-fix #2).** The fresh store is built and verified at a temp
+  name from the quiesced live store over a read-only ATTACH; only then are the two renames done. The
+  first cut renamed first, which left the live name ABSENT for the whole build (unbounded on a
+  saturated disk): a hard kill or power loss there would have let the next START_BOT create an EMPTY
+  store at the live name and boot with zero ledger — §4's "catastrophic for risk truth", silent, past
+  every gate. Now that window is two syscalls, and a kill during the build leaves the live store
+  untouched plus a stray `.rotating-*` temp the next `--apply` removes and names in its manifest.
 * **Schema = the live `Store.open`**, exactly as the next boot creates it (task requirement; the
   first cut copied the archive's `sqlite_master` DDL, which would have frozen the archive's column
   ORDER into the fresh store). Rows are copied BY COLUMN NAME: a fresh-only column (an archive that
@@ -165,7 +178,7 @@ and the next `record_fill` takes the next id above the archive's.
 ## 5. Dry-run against the live store (READ-ONLY, LOW priority, bot up)
 
 Command (worktree, `PYTHONPATH=src`, `start /LOW /B /WAIT`):
-`python tools/ops/rotate_store.py --dry-run --out <scratch>/plan_live2.json` — the first run, 13:37–13:52 ET (942 s at LOW priority, bot up), on the earlier cut of the tool — the dry-run's plan/estimate code is unchanged since; the FINAL tool's second run (adds the retention section) was launched 16:37 ET and had not finished at commit time (`plan_live2.json` owed).
+`python tools/ops/rotate_store.py --dry-run --out <scratch>/plan_live.json` — the first run, 13:37–13:52 ET (942 s at LOW priority, bot UP), on the earlier cut of the tool (its output below; the plan/estimate code is unchanged since). The second run launched 16:37 ET never produced output (its stdout file is 0 bytes — killed with the session). **The FINAL tool (after the review fixes) ran 17:23–17:28 ET with the bot DOWN: 256.5 s, its RETENTION section and refusals are in §5b below.**
 
 ```
 == STORE D:\kalshi-combos-TWO-data\combomaker-prod-live-wc.sqlite3
@@ -231,8 +244,8 @@ Reading the dry-run:
 * **The writer is crawling, quantified.** Read-only probe at ~17:15Z: `MAX(decisions.id)` =
   134,303,838, last `at` = 16:18:16Z. First dry-run at ~17:52Z: 134,304,442, last `at` = 16:18:24Z
   (**+604 rows in ~37 min ≈ 0.27 rows/s, enqueue stamps spanning 8 s** — draining a queue enqueued
-  at 16:18Z, an hour and a half behind, three orders of magnitude below intake). Second dry-run
-  (this section, ~20:30Z): the second dry-run (the FINAL tool, launched 16:37 ET at LOW priority) had not finished when this branch was committed — its `plan_live2.json` is the owed follow-up; the first run's numbers stand. The 12:13 boot's `store_writer_stats` went silent
+  at 16:18Z, an hour and a half behind, three orders of magnitude below intake). **Final-tool dry-run at
+  21:24Z (store quiesced since 20:01Z, three more boots at 18:07Z/19:00Z/20:02Z in between): `MAX(decisions.id)` = 134,355,540, last `at` = 19:06:46Z; `rfqs` 66,405,321, last `seen_at` 19:06:46Z — +51,098 decisions / +33,848 rfqs rows since the 17:52Z run, and the last row landed at 15:06 ET on the 15:00 ET boot: the following 55 min of that boot and the 16:02 boot (died 3 s in) left NO tape at all.** The 12:13 boot's `store_writer_stats` went silent
   because the emit rides the write count (5,000 writes per emit) — a starved writer cannot report
   starvation.
 * **The 24 h seed window** holds **8,663 `quote_sent` + 5 `confirm` + 0 `decline` rows** (of ~129,738 rows all kinds in the window; 75,604 `rfqs`) against ~400k real sends/day — the tape is ~98%
@@ -245,7 +258,7 @@ Reading the dry-run:
   seconds (read × 3)**; the index builds on ~120k rows are sub-second. The rotation's own wall time
   is seconds; the downtime is STOP_BOT + START_BOT + the bot's boot (~2–3 min per the 8/26 and 9/4
   relights). **≈ 3–5 min end to end.** Not carried: ~203.8M tape rows (the archive).
-* **The retention alternative on THIS store (read-only plan):** NOT YET MEASURED on the live store — the retention section was added to the dry-run after the first run, and the second run was still in flight at commit time. On the synthetic 3-day store the plan derives 172,800 s (+0 disorder) and the pass deletes exactly the oldest day (tests). The live numbers to read from `plan_live2.json` when it lands: `retention.disorder` per table, `retention.tables.*.rows_estimate` (expected: everything older than ~48 h of the 66.4M/134.3M ids), and `retention.protected.rfq_ids` (expected 134, the same set the rotation carries). The measured
+* **The retention alternative on THIS store (read-only plan, §5b):** window **172,812.056 s** = reader 86,400 + cadence 86,400 + **measured disorder 12.056 s** (the largest backward `seen_at` step over the newest 25,000 `rfqs` rows; `decisions` and `would_quotes_inplay` measure 0.000 s — their `at` is stamped at record time). Cutoff 2026-09-03T21:23:45Z. Rows older than the window: **`rfqs` 66,295,869 (ids 1..66,295,869), `decisions` 134,174,704, `would_quotes_inplay` 3,252,990**; `rfq_deletions`/`would_quotes` empty. **Protected: 134 `rfqs` rows for 166 fills tickers (0 conflicting, 32 unresolvable) — exactly the set the rotation carries** (one function). One pass: 25,000-id batches, ≤ 17,280 per pass, interrupted at 5.0 s. The measured
   disorder is the term that makes the window derived rather than set: `rfqs.seen_at` is stamped at
   worker pickup and recorded after dispatch, so consecutive ids can carry time stamps a few
   seconds out of order — the bisection's boundary error, measured on the newest 25k rows of each
@@ -259,6 +272,66 @@ Reading the dry-run:
   far past 1, so replaying them later would be wrong either way). Operator action before `--apply`:
   move both `-wal`/`-shm` pairs aside (keep them for forensics), delete the two extra hard links.
 * `would_quotes` and `rfq_deletions` are empty on the live store (the recorders are not wired).
+
+### 5b. Final-tool dry-run (READ-ONLY, LOW priority, bot DOWN) — 17:23–17:28 ET, 256.5 s
+
+```
+== STORE D:\kalshi-combos-TWO-data\combomaker-prod-live-wc.sqlite3
+   199.1 GiB  pages 52,201,741 x 4096  freelist 0  journal wal  hard links 3
+   WAL: 0 B / 0 frames   SHM: 32.0 KiB
+   OTHER NAME D:\kct-vdata\combomaker-prod-live-wc.sqlite3  wal=23484032 B / 5700 frames  shm=65536
+   OTHER NAME D:\kalshi-combos-TWO-data\vitals_snapshot\combomaker-prod-live-wc.sqlite3  wal=201912 B / 49 frames  shm=294912
+   LIVE fills 4,345 / position_ledger 4,112 / ev_ledger 4,340 / markouts 22,645 / structural_fits 959 / store_meta 2 / daily_ruin_anchors 2
+   TAPE decisions ids [1, 134355540] .. 2026-09-05T19:06:46Z   rfqs ids [1, 66405321] .. 19:06:46Z   would_quotes_inplay [1, 3253837]
+== SEED WINDOW 86400 s (cutoff 2026-09-04T21:23:57Z): decisions first_id 134174705 quote_sent 13,362 / confirm 5 / decline 0
+   (of ~180,836 all kinds); rfqs first_id 66295870 ~109,452 rows
+== LEG PROVENANCE: 166 fills tickers without a ledger row -> 134 rfqs rows carried; conflicting 0; unresolvable 32
+== MEASURED: live 36,405 rows in 0.341 s (106,903 rows/s); tape 25.3 MB/s, 249 B/row
+== ESTIMATE: live 36,405 + tape 122,953 rows; ~30.6 MB row text (167 MB by the whole-store average); copy ≈ 4 s (read x3)
+== RETENTION ALTERNATIVE (dark): window 172812 s = reader 86400 s + cadence 86400 s + measured disorder 12.056 s
+   (cutoff 2026-09-03T21:23:45Z; batch 25,000 ids, <= 17,280 batches/pass, batch bound 5.0 s)
+   rfqs                 prune_below_id 66295870   ~66,295,869 rows older than the window  (disorder 12.056 s)
+   decisions            prune_below_id 134174705  ~134,174,704 rows                        (disorder 0.000 s)
+   would_quotes_inplay  prune_below_id 3252991    ~3,252,990 rows                          (disorder 0.000 s)
+   protected rfqs rows (leg provenance): 134
+== REFUSALS THAT WOULD FIRE NOW
+   ! D:\kct-vdata\...: hard link of the store with its OWN WAL of 5700 frames (checkpoint_seq 8)
+   ! D:\kalshi-combos-TWO-data\vitals_snapshot\...: hard link of the store with its OWN WAL of 49 frames (checkpoint_seq 1)
+   ! store has 3 hard link(s) (expected exactly 1) — other names [kct-vdata, vitals_snapshot]; after the
+     rename every other name would silently point at the ARCHIVE; delete the extra links before rotating
+plan computed in 256.5 s          (liveness refusals: NONE — the bot is down; no heartbeat, no process)
+```
+
+Reading it: with the bot down the three liveness signals are absent and the process probe finds nothing,
+so **only the file refusals stand between the operator and the rename** — the hard-link COUNT refusal
+(must-fix #1) is the one that matters today, not the foreign-WAL one. The seed window now holds 13,362
+`quote_sent` rows (8,663 at 13:52 ET) — the 14:07/15:00 boots' tape — still ~97% holes against real sends.
+The live WAL is 0 bytes (clean close at 16:01 ET), so the TRUNCATE step would fold 0 frames.
+
+## Review fixes (2026-09-05 evening fix pass — verdict SHIP_WITH_FIXES, all applied)
+
+| # | Finding (reviewer) | Fix | Proof |
+|---|---|---|---|
+| must-fix 1 | `--apply` refused only on a foreign WAL with frames; `hard_link_names()` degrades to a NOTE with `other_names=[]` when `fsutil` fails, so a 3-name inode passed silently (fail-open). After the rename the other names become names of the ARCHIVE. | `hard_link_refusals()`: refuse unless `st_nlink == 1` (from `os.stat`, independent of `fsutil`; 0 = stat failed = refuse). Wired into `rotate()` step 2 AND the dry-run's `refusals_now` (the live run above prints it). | `test_refuses_any_other_hard_link_even_without_a_foreign_wal` (real `os.link`, no WAL), `test_hard_link_refusal_never_fails_open_when_names_cannot_be_enumerated` (fsutil failure simulated: the old gate passes, the new one refuses; 0 refuses; 1 passes) |
+| must-fix 2 | Rename-FIRST left the live name absent for the whole build; a hard kill there ⇒ the next START_BOT's `Store.open` creates an EMPTY store at the live name and boots with zero ledger — silent, past every gate. | Reordered: refuse → checkpoint → **build from the LIVE name over a read-only ATTACH at a temp name → verify → `os.rename(store, archive)` → `os.replace(temp, store)`**. The live name is absent for two syscalls; a failed first rename (open handle, WinError 32) moves nothing; a failed second rename renames the archive straight back; a build failure removes the temp and touches nothing. Stale `.rotating-*` temps from a killed run are removed and named in the manifest. | `test_build_reads_the_live_name_and_a_failed_swap_renames_the_archive_back` (spy: the build sees the live name present and no archive; `os.replace` failure ⇒ archive back, FAILED manifest with ROLLED BACK; then a clean run's manifest orders build < rename < swap), `test_failed_build_leaves_the_live_store_untouched_and_never_renamed`, `test_a_temp_left_by_a_killed_earlier_run_is_removed_before_building` |
+| should-fix 1 | The batch time bound was POST-HOC: a slow batch held the write lock for its whole duration before the check; the bot's synchronous confirm-path `record_fill`/`record_position_open` (BUSY_TIMEOUT 5 s) would fail 'database is locked' ⇒ a confirmed fill without a ledger row. | `_arm_batch_deadline()`: SQLite's progress handler (polled every 10,000 VM ops — a granularity, not a bound) interrupts the DELETE the moment the clock passes `tb + STORE_OP_TIMEOUT_S`; SQLite rolls the ENTIRE transaction back on an interrupted DML statement (documented; the guard is `con.in_transaction`), so an interrupted batch has no partial effect; the pass stops with `stopped_reason = "batch interrupted at STORE_OP_TIMEOUT_S …"`, `batches` counts the attempt, `rows_deleted` does not. The post-hoc check stays as a second line. | `test_batch_deadline_interrupts_a_running_delete_and_frees_the_lock` (200k-row DELETE with the deadline already past ⇒ `OperationalError: interrupted`, `not con.in_transaction`, another writer gets `BEGIN IMMEDIATE` at once, 200k rows intact), `test_pass_interrupts_a_slow_batch_at_the_bound_and_rolls_it_back` (a REAL interrupt through `run_prune_pass`, polled every op; nothing deleted; lock free; the same pass completes with the real bound) |
+| should-fix 2 | `connect_rw` auto-checkpointed (PASSIVE after any commit growing the WAL past 1000 pages — every 25k-row batch) inside the measured batch time and against the writer's cadence; the doc's "never checkpoints in-process" was false. | `PRAGMA wal_autocheckpoint=0` on the prune connection; docs corrected. Consequence handled: `prune_tape.py --apply` (bot DOWN, nobody else checkpoints) now checkpoints PASSIVE after EVERY pass, not once at the end — the WAL is bounded by one pass. | `test_connect_rw_never_auto_checkpoints` (a 60k-row commit leaves a WAL > 1000 pages), CLI test asserts one checkpoint per pass |
+| should-fix 3 | `protected_rfq_ids` excluded any ticker with ANY ledger row, but `Store._ledger_legsets` skips rows whose `legs_json` is empty and consults the tape — those tape rows were neither carried nor protected. | Predicate parity: `NOT IN (SELECT combo_ticker FROM position_ledger WHERE legs_json IS NOT NULL AND legs_json != '')` (the DDL is `NOT NULL`, so only `''` can occur). Docstring states the MIN(id)-row `collection_ticker` vs `MAX(collection_ticker)` equivalence (one collection per market_ticker). | `test_ledger_row_with_empty_legs_json_keeps_tape_provenance_through_rotation` (`held_positions` answers `rfqs_tape` before AND after, the 3-day-old row id 1 carried), `test_protected_set_mirrors_the_ledger_readers_empty_legs_json_predicate` (protected + survives a full prune) |
+| should-fix 4 | `match="checkpointed\|ALIVE\|REFUSED"` accepted any refusal; no positive-path test with frames in the WAL. | `match="could not be fully checkpointed"`; new hard-kill test: db + wal snapshotted while the writer is open (main file pre-commit, WAL holds the commit), rotated: busy 0, `frames_before` > 0, WAL 0 bytes after, the WAL-only row carried into the fresh store. **Found on the way:** a successful `wal_checkpoint(TRUNCATE)` reports `(0, 0, 0)` however many frames it folded (the counters are read after the header reset — the reviewer's "631 frames → log 0" probe and mine agree), so the tool's `checkpointed != wal_frames` clause was vacuous on success; `checkpoint_truncate` now records `frames_before` from the WAL header read before the pragma and the manifest step says how many frames were folded. | `test_checkpoint_folds_a_hard_killed_wal_and_the_rotation_carries_its_rows` |
+| should-fix 5 | `connect_ro(timeout_s=5.0)` literal; `next_steps` printed `REPO / 'START_BOT.bat'` = the checkout the TOOL ran from (a worktree has no `.venv`). | `connect_ro` waits `BUSY_TIMEOUT_MS / 1000` (the store's own tolerance); step 1 names "START_BOT.bat at the root of the LIVE checkout — the repo whose .venv launched the bot (this tool ran from …; a worktree is NOT the live checkout)". | existing next_steps test |
+| should-fix 6 | Live RETENTION numbers still "owed"; README claimed the dry-run printed the prune's plan. | The FINAL tool's dry-run executed (bot down, 256.5 s): §5b above, §5/§6 placeholders filled; README row corrected. Hard-link facts independently re-verified this pass by `ls -la`: link count 3; `kct-vdata` -wal 23,484,032 B (Aug 1); `vitals_snapshot` -wal 201,912 B (09:04 ET today); live -wal 0 B since 16:01 ET. | this section |
+
+Blast radius of the fix pass: `tools/ops/rotate_store.py`, `tools/ops/prune_tape.py`, `src/combomaker/ops/tape_retention.py`
+(dark module; no live caller without the flag), the two test files, this report + README. No pricing / risk / rfq / sim
+/ quote_app / persistence edit (rule 8 untouched). Gates on the final tree: suite **4085/0** (3 deselected, 320.28 s, exit 0); vitals fast **8/8 GREEN (GATE PASS, 104.8 s)**;
+`ruff check` clean on every touched file; `mypy --strict` clean on `ops/tape_retention.py`.
+
+Operational fact from the pass (not a branch defect): **the bot has been DOWN since 16:02 ET** — `live_20260905_1602.log`
+ends at 16:02:08 ET two lines after an `adaptive_caps_slate_count_failed` traceback (`rest.get_markets`), the watchdog's
+last line is 16:02:11, no combomaker / watchdog / prober process exists, the three liveness files are absent, the store's
+-wal has been 0 bytes since 16:01. Nothing is relighting. The relight decision is owed to the operator; with the bot
+already down, the rotation needs no STOP_BOT step — only the two foreign WAL/SHM pairs moved aside and the two extra
+hard links deleted (the tool refuses on both).
 
 ## 6. The ALTERNATIVE — BUILT DARK: cap the recorder tables by a DERIVED retention window + nightly prune
 
@@ -275,7 +348,8 @@ Reading the dry-run:
              + measured disorder     the largest BACKWARD step of the time column over the newest
                                      25k rows of each tape table (rfqs.seen_at is a pickup stamp
                                      recorded after dispatch) — the bisection's boundary error
-                                     = 172,800 s + the measured term (owed from the second dry-run) on the live store today
+                                     = 172,812.056 s on the live store today (17:23 ET run: rfqs 12.056 s,
+                                       decisions 0.000 s, would_quotes_inplay 0.000 s over 25k rows each)
 
  protected  = one real rfqs row per distinct (market_ticker, legs_json) for every fills ticker
               without a position_ledger row — Store.held_positions' tape fallback; the SAME
@@ -286,8 +360,11 @@ Reading the dry-run:
               time (acceptance_seed._CHUNK_IDS — the seed's own chunk), each batch its own
               BEGIN IMMEDIATE / COMMIT, split around protected ids; stop when
                 * should_continue() is false  (the app passes "writer queue empty"),
-                * a batch took > STORE_OP_TIMEOUT_S (5 s — the writer's own lock tolerance;
-                  a longer hold could fail the writer's commit ⇒ "store too slow to prune live"),
+                * a batch REACHES STORE_OP_TIMEOUT_S (5 s — the writer's own lock tolerance):
+                  SQLite's progress handler interrupts the DELETE at the bound, SQLite rolls the
+                  whole transaction back, the pass stops ⇒ "store too slow to prune live" — the
+                  lock is never held past the bound (review should-fix #1; the first cut checked
+                  the time only AFTER the batch had held the lock for its whole duration),
                 * PRUNE_CADENCE_S / STORE_OP_TIMEOUT_S = 17,280 batches (a pass never outlasts
                   its own period, so passes never overlap)
  scheduler  = TapeRetentionStep: DUE when no pass has COMPLETED within the cadence (an
@@ -305,8 +382,8 @@ Never `VACUUM` the live store (a rotation-sized outage with none of the rotation
 
 **Why it is the SECOND step, never the first (and why the mechanism enforces that):** on the
 213 GB store a 25k-id `DELETE` touches ~25k random leaf pages across four indexes on a saturated
-disk — far over the 5 s batch bound — so the first batch ends the pass with
-`stopped_reason = "batch took … > STORE_OP_TIMEOUT_S"` and the scheduler retries next minute (each
+disk — far over the 5 s batch bound — so the first batch is interrupted at the bound and ends the pass with
+`stopped_reason = "batch interrupted at STORE_OP_TIMEOUT_S 5.0s …"` (nothing deleted, nothing held) and the scheduler retries next minute (each
 retry one bounded batch, only while the writer is idle, which on the collapsed store it never is).
 Arming the flag today would therefore do (almost) nothing, by construction; after the rotation the
 same pass deletes a night's tape in ~150 batches of milliseconds. No knob changes between the two:
@@ -352,9 +429,11 @@ problem, one file over.
 
 ## NEXT STEPS
 
-* **Operator (decision owed):** approve the rotation window. Sequence: `STOP_BOT.bat` → move
+* **Operator (decision owed):** approve the rotation window — and the RELIGHT (the bot is DOWN since
+  16:02 ET). Sequence: (`STOP_BOT.bat` only if it was relit meanwhile) → move
   aside the two foreign `-wal/-shm` pairs (`D:\kalshi-combos-TWO-data\vitals_snapshot\`,
-  `D:\kct-vdata\`) and delete those two extra hard links → `PYTHONPATH=src python
+  `D:\kct-vdata\`) and delete those two extra hard links (the tool REFUSES on the link count and on
+  a foreign WAL — both must be gone) → `PYTHONPATH=src python
   tools/ops/rotate_store.py --apply` (main after merge) → follow the printed NEXT STEPS
   (`START_BOT.bat` → first-window verify: sends/min in the 300–460 band, `store_writer_stats` queue
   near 0 / dropped 0, `acceptance_tape_seed_result` rows_scanned in the hundreds of thousands,

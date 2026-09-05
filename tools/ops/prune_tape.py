@@ -16,8 +16,10 @@ bounded batch at a time, off the event loop. This tool is for the operator:
                        rotate_store.py's process probe — a live bot prunes
                        through its own step, never two writers), then runs
                        bounded passes until complete (each pass bounded exactly
-                       as the in-process one), then ONE PASSIVE checkpoint, and
-                       writes a JSON result.
+                       as the in-process one), a PASSIVE checkpoint after every
+                       pass (the prune connection never auto-checkpoints and
+                       with the bot down nobody else does), and writes a JSON
+                       result.
 
 ``DELETE`` returns pages to the freelist: the FILE does not shrink (that is
 ``rotate_store.py --apply``, once); it stops growing past the window and the
@@ -83,7 +85,7 @@ def apply(
     config_path: Path | None = None,
     skip_process_probe: bool = False,
 ) -> JsonDict:
-    """Refuse-first; then passes until complete; then a PASSIVE checkpoint."""
+    """Refuse-first; then passes until complete, a PASSIVE checkpoint after each."""
     now = now or datetime.now(UTC)
     if not store.exists():
         raise SystemExit(f"REFUSED: no store at {store}")
@@ -102,23 +104,29 @@ def apply(
         )
     t0 = time.monotonic()
     passes: list[PruneResult] = []
+    checkpoints: list[list[int]] = []
     while True:
         res = run_prune_pass(store, now=now)
         passes.append(res)
+        # The prune connection never auto-checkpoints (the live writer owns
+        # that); with the bot DOWN nobody else does, so fold the WAL after
+        # EVERY pass — the WAL is bounded by one pass, not by the whole run.
+        con = sqlite3.connect(str(store))
+        try:
+            ck = con.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        finally:
+            con.close()
+        checkpoints.append([int(x) for x in ck] if ck else [])
         if res.complete or res.rows_deleted == 0:
             break
-    con = sqlite3.connect(str(store))
-    try:
-        ck = con.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
-    finally:
-        con.close()
     return {
         "store": str(store),
         "started_at": now.isoformat(),
         "passes": [p.as_log_fields() for p in passes],
         "rows_deleted": sum(p.rows_deleted for p in passes),
         "complete": passes[-1].complete,
-        "checkpoint_passive": list(ck) if ck else None,
+        "checkpoint_passive": checkpoints[-1] if checkpoints else None,
+        "checkpoints_passive": checkpoints,
         "elapsed_s": round(time.monotonic() - t0, 3),
     }
 
