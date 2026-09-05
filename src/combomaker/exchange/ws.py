@@ -48,9 +48,23 @@ _WS_HANDSHAKE_PATH = "/trade-api/ws/v2"
 # "Subscription buffer overflow — the subscription's outbound buffer was
 # exceeded"; terminal, messages were LOST. A protocol fact, not a knob.
 SUBSCRIPTION_BUFFER_OVERFLOW_CODE = 25
+# Terminal channel errors (asyncapi-ws.md §3.6 table): the subscription is dead
+# and must be re-established — 10 "Channel error", 17 "Internal error", 25 the
+# slow-consumer overflow above. Protocol facts, not knobs.
+TERMINAL_CHANNEL_ERROR_CODES: frozenset[int] = frozenset({10, 17, 25})
+# Communications FAN-OUT SHARDING (asyncapi-ws.md §3.2 + error table 19-22,
+# communications-ws.md:57-67 "run one connection per shard_key"): subscribe
+# params ``shard_factor`` (1..SHARD_FACTOR_MAX) / ``shard_key`` (0..factor-1);
+# a malformed pair is refused with codes 19-22. The cap is the documented one.
+SHARD_FACTOR_MAX = 100
+SHARD_VALIDATION_ERROR_CODES: frozenset[int] = frozenset({19, 20, 21, 22})
 
 
 SubscribedHandler = Callable[[int], Awaitable[None]]  # receives the new sid
+SubscribeErrorHandler = Callable[[int, str], Awaitable[None]]  # (code, text) of a refusal
+# Reader-thread frame observer: ``(message, recv_mono_ns, handling_ns)`` —
+# called AFTER the lane push, on the reader thread; must never log or block.
+FrameObserver = Callable[[JsonDict, int, int], None]
 
 # Transport seam: ``(session, url, headers) -> async context manager yielding
 # a socket``. Production binds aiohttp's ``ws_connect``; the replay harness and
@@ -96,6 +110,7 @@ class _Subscription:
     channels: list[str]
     params_extra: dict[str, Any] = field(default_factory=dict)
     on_subscribed: SubscribedHandler | None = None
+    on_subscribe_error: SubscribeErrorHandler | None = None
 
 
 class Lane(enum.Enum):
@@ -184,30 +199,49 @@ class _Lanes:
             self.pending_metrics = {}
             return taken
 
-    def push(self, message: JsonDict, lane: Lane) -> tuple[_Verdict, str, bool]:
+    def push(self, message: JsonDict, lane: Lane) -> tuple[_Verdict, str, int | None, bool]:
         """Append ``message`` to ``lane``. Returns ``(verdict, shed_type,
-        wake_needed)``: ``shed_type`` names the dropped frame's type when the
+        shed_shard, wake_needed)``: ``shed_type`` names the dropped frame's
+        type and ``shed_shard`` its ``_shard`` stamp (None unsharded) when the
         verdict is SHED; ``wake_needed`` is True exactly once per burst (the
         caller schedules the main-loop wake)."""
         with self._lock:
             if lane is Lane.MARKET:
                 shed_type = ""
+                shed_shard: int | None = None
                 verdict = _Verdict.QUEUED
                 if len(self.market) >= self.capacity:
                     dropped = self.market.popleft()
                     shed_type = str(dropped.get("type", ""))
+                    tag = dropped.get("_shard")
+                    shed_shard = tag if isinstance(tag, int) else None
                     verdict = _Verdict.SHED
                 self.market.append(message)
             else:
                 target = self.priority if lane is Lane.PRIORITY else self.control
                 if len(target) >= self.capacity:
-                    return _Verdict.RUNAWAY, "", False
+                    return _Verdict.RUNAWAY, "", None, False
                 target.append(message)
                 shed_type = ""
+                shed_shard = None
                 verdict = _Verdict.QUEUED
             wake = not self.wake_pending
             self.wake_pending = True
-            return verdict, shed_type, wake
+            return verdict, shed_type, shed_shard, wake
+
+    def purge_market(self, shard: int) -> int:
+        """Drop every MARKET frame stamped ``_shard == shard``: a follower
+        socket died and its queued auctions are re-dumped by its own
+        resubscribe (the 2026-07-14 discard rule, scoped to ONE socket of a
+        shared lane set). Priority and control frames are kept — an accept is
+        an accept whichever socket carried it, and a stale ack self-drops at
+        the shard that owned the command id. O(n) under the lock, once per
+        disconnect."""
+        with self._lock:
+            kept = collections.deque(m for m in self.market if m.get("_shard") != shard)
+            dropped = len(self.market) - len(kept)
+            self.market = kept
+            return dropped
 
     def pop(self, lane: Lane) -> JsonDict | None:
         target = (
@@ -274,7 +308,33 @@ class WsManager:
         backoff_initial_s: float = 0.5,
         backoff_max_s: float = 30.0,
         connect: Connector = _aiohttp_connect,
+        lanes: _Lanes | None = None,
+        wake: Callable[[], None] | None = None,
+        dispatch: bool = True,
+        reader: bool = True,
+        shard_tag: int | None = None,
+        shard_gen: int = 0,
+        on_frame: FrameObserver | None = None,
     ) -> None:
+        """Every keyword after ``connect`` defaults to the single-socket manager
+        this class has always been. They exist for COMMUNICATIONS FAN-OUT
+        SHARDING (2026-09-05, ``exchange/ws_fanout.py``): one manager per
+        exchange shard, each with its OWN reader thread and socket, ALL pushing
+        into ONE shared ``_Lanes`` drained by ONE dispatcher — so the priority
+        lane is still drained first across every socket and the market lane's
+        capacity/age shedding is unchanged.
+
+        * ``lanes`` — share another manager's lanes instead of owning a set.
+        * ``wake`` — wake THAT manager's dispatcher (this one runs none).
+        * ``dispatch=False`` — FOLLOWER: reader thread only, no dispatch task,
+          no metric flush/log lines (the lanes' owner writes them).
+        * ``reader=False`` — HOST: dispatcher only, no socket of its own.
+        * ``shard_tag``/``shard_gen`` — stamped on every frame as ``_shard`` /
+          ``_gen`` so the host can route acks/errors to the socket that owns
+          the command id and purge a dead socket's market frames without
+          touching its siblings'. ``_gen`` retires frames of a replaced set.
+        * ``on_frame`` — reader-thread observer (rate / pipe-lag meter).
+        """
         self._url = url
         self._signer = signer
         self._clock = clock
@@ -284,6 +344,21 @@ class WsManager:
         self._backoff_initial_s = backoff_initial_s
         self._backoff_max_s = backoff_max_s
         self._connect = connect
+        self._wake_target = wake
+        self._dispatch_enabled = dispatch
+        self._reader_enabled = reader
+        self._shard_tag = shard_tag
+        self._shard_gen = shard_gen
+        self._on_frame = on_frame
+        # Shed metrics are a property of the LANE SET, so a follower counts
+        # them under its lanes' owner's name (identical to ``name`` when the
+        # manager owns its lanes — today's metric names, byte for byte).
+        self._lane_owner_name = name
+        self._started = False
+        # Reader-thread wall time from receive stamp to lane push, cumulative
+        # (parse + classify + push + any GIL wait inside that window). Main
+        # loop reads it as a delta per measurement window.
+        self._busy_ns = 0
 
         self._handlers: dict[str, list[MessageHandler]] = {}
         self._on_disconnect: list[LifecycleHandler] = []
@@ -335,7 +410,7 @@ class WsManager:
         # holding it for the stall's length would still starve the reader);
         # it is logged CRITICAL if it ever recurs (``_note_server_error``) so
         # the next cause is visible at once.
-        self._lanes = _Lanes(self._QUEUE_MAX)
+        self._lanes = lanes if lanes is not None else _Lanes(self._QUEUE_MAX)
         self._wake = asyncio.Event()
         self._main_loop: asyncio.AbstractEventLoop | None = None
         self._reader: _ReaderThread | None = None
@@ -439,6 +514,7 @@ class WsManager:
         channels: list[str],
         *,
         on_subscribed: SubscribedHandler | None = None,
+        on_subscribe_error: SubscribeErrorHandler | None = None,
         **params_extra: Any,
     ) -> None:
         """Declare a desired subscription; sent NOW if connected and re-sent
@@ -446,8 +522,11 @@ class WsManager:
 
         ``on_subscribed`` fires with the server-assigned sid on every (re)ack —
         sids change across reconnects, so consumers must re-key their state.
+        ``on_subscribe_error`` fires with ``(code, text)`` when the exchange
+        answers the subscribe command with an ``error`` frame echoing its id
+        (the fan-out's sharding fallback hangs off this; unset = today).
         """
-        sub = _Subscription(list(channels), dict(params_extra), on_subscribed)
+        sub = _Subscription(list(channels), dict(params_extra), on_subscribed, on_subscribe_error)
         self._subscriptions.append(sub)
         # LIVE-SEND ONLY ONCE THE CURRENT SOCKET HAS TAKEN ITS SNAPSHOT
         # (review 2026-09-05). The reader publishes ``_ws`` the instant a
@@ -502,15 +581,18 @@ class WsManager:
     # --- lifecycle ---
 
     def start(self) -> None:
-        if self._reader is not None or self._dispatch_task is not None:
+        if self._reader is not None or self._dispatch_task is not None or self._started:
             raise RuntimeError("already started")
+        self._started = True
         self._stopping = False
         self._main_loop = asyncio.get_running_loop()
-        self._dispatch_task = asyncio.create_task(
-            self._dispatch_loop(), name=f"{self._name}-dispatch"
-        )
-        self._reader = _ReaderThread(self)
-        self._reader.start()
+        if self._dispatch_enabled:
+            self._dispatch_task = asyncio.create_task(
+                self._dispatch_loop(), name=f"{self._name}-dispatch"
+            )
+        if self._reader_enabled:
+            self._reader = _ReaderThread(self)
+            self._reader.start()
 
     async def force_reconnect(self) -> None:
         """Close the socket; the reader reconnects and resubscribes.
@@ -554,6 +636,7 @@ class WsManager:
                 await self._dispatch_task
             self._dispatch_task = None
         self._flush_reader_metrics()
+        self._started = False
 
     async def _lanes_empty(self) -> None:
         """Resolve once the dispatcher has drained every lane (stop() only)."""
@@ -581,6 +664,9 @@ class WsManager:
 
     def _schedule_wake(self) -> None:
         """Reader side (any thread): wake the dispatcher exactly once per burst."""
+        if self._wake_target is not None:
+            self._wake_target()  # FOLLOWER: the lanes' owner runs the dispatcher
+            return
         main = self._main_loop
         if main is None:
             return  # no dispatcher yet — it checks the lanes on entry
@@ -666,7 +752,13 @@ class WsManager:
         is exactly what the watchdog must see. Aggregation is unchanged:
         first shed of a burst logs on the first flush, further sheds
         accumulate for at most ``max_silence_s`` (the existing liveness
-        window — no new number)."""
+        window — no new number).
+
+        A FOLLOWER (``dispatch=False``) never flushes: its counts land in the
+        shared lanes' pending metrics under the owner's name and the owner's
+        dispatcher folds and logs them."""
+        if not self._dispatch_enabled:
+            return
         shed_prefix = f"{self._name}.shed."
         for name, by in self._lanes.take_metrics().items():
             self._metrics.inc(name, by)
@@ -721,11 +813,19 @@ class WsManager:
                 # drop and the intake's pre-parse staleness gate. The stamp
                 # rides the envelope (server fields never start with "_") and
                 # reuses the monotonic read taken two lines up.
-                message["_recv_mono_ns"] = self._last_rx_mono_ns
+                recv_ns = self._last_rx_mono_ns
+                message["_recv_mono_ns"] = recv_ns
+                if self._shard_tag is not None:
+                    # FAN-OUT stamps (2026-09-05): the socket that carried the
+                    # frame and the shard-set generation, so the host routes
+                    # acks/errors to the owning socket and a frame queued by a
+                    # retired shard set never resolves a new shard's command.
+                    message["_shard"] = self._shard_tag
+                    message["_gen"] = self._shard_gen
                 lane = self._lane_for(str(message.get("type", "")))
                 if lane is Lane.PRIORITY:
                     self._lanes.count(f"{self._name}.priority_frame")
-                verdict, shed_type, wake = self._lanes.push(message, lane)
+                verdict, shed_type, shed_shard, wake = self._lanes.push(message, lane)
                 if verdict is _Verdict.RUNAWAY:
                     # A never-drop lane is full: the genuine-runaway signal
                     # (order events or control/book frames ``capacity`` deep).
@@ -741,14 +841,23 @@ class WsManager:
                     await ws.close()
                     return
                 if verdict is _Verdict.SHED:
-                    self._record_shed(shed_type)
+                    self._record_shed(shed_type, shed_shard)
                 if wake:
                     self._schedule_wake()
+                # HANDLING TIME (fan-out capacity evidence, 2026-09-05): wall
+                # time this thread spent from the receive stamp to the push —
+                # parse, classification, push and any GIL wait inside that
+                # window. One more monotonic read per frame; the observer (if
+                # any) counts on its own lock and never logs.
+                done_ns = self._clock.monotonic_ns()
+                self._busy_ns += done_ns - recv_ns
+                if self._on_frame is not None:
+                    self._on_frame(message, recv_ns, done_ns - recv_ns)
             elif frame.type == aiohttp.WSMsgType.ERROR:
                 log.warning("ws_frame_error", name=self._name)
                 return
 
-    def _record_shed(self, msg_type: str) -> None:
+    def _record_shed(self, msg_type: str, shard: int | None = None) -> None:
         """Reader side: COUNT a capacity shed, never log it. The counts cross
         to the main loop with the other reader metrics and the dispatcher
         writes one aggregated ``ws_shed_market_frames`` line per
@@ -756,9 +865,16 @@ class WsManager:
         hundreds/s, and a line from THIS thread would keep the hang
         watchdog's log axis alive through a main-loop hang. The reader's
         remaining log lines are one-shot per socket (connect, error,
-        runaway-close) or per malformed frame — never periodic."""
-        self._lanes.count(f"{self._name}.shed_market_frames")
-        self._lanes.count(f"{self._name}.shed.{msg_type}")
+        runaway-close) or per malformed frame — never periodic.
+
+        Counted under the LANE OWNER's name (== ``name`` unsharded); a
+        fan-out additionally attributes the loss to the socket whose frame
+        was dropped (``<owner>.s<k>.shed_lost``)."""
+        owner = self._lane_owner_name
+        self._lanes.count(f"{owner}.shed_market_frames")
+        self._lanes.count(f"{owner}.shed.{msg_type}")
+        if shard is not None:
+            self._lanes.count(f"{owner}.s{shard}.shed_lost")
 
     # --- dispatcher side (main loop) ---
 
@@ -793,8 +909,13 @@ class WsManager:
         return age_ns / 1e9 if age_ns > bound_ns else None
 
     def _discard_queued(self) -> None:
-        """Drop every queued-but-unprocessed message (dead-connection backlog)."""
-        dropped = self._lanes.clear()
+        """Drop every queued-but-unprocessed message (dead-connection backlog).
+        A fan-out FOLLOWER drops only ITS OWN market frames from the shared
+        lanes (``_Lanes.purge_market``): its siblings' backlog is live."""
+        if self._shard_tag is not None:
+            dropped = self._lanes.purge_market(self._shard_tag)
+        else:
+            dropped = self._lanes.clear()
         if dropped:
             self._metrics.inc(f"{self._name}.queue_discarded", dropped)
             log.info("ws_queue_discarded", name=self._name, dropped=dropped)
@@ -842,16 +963,57 @@ class WsManager:
     async def _dispatch(self, message: JsonDict) -> None:
         msg_type = str(message.get("type", ""))
         self._metrics.inc(f"{self._name}.msg.{msg_type}")
-        if msg_type == "error":
-            log.warning("ws_server_error", name=self._name, message=message)
-            self._note_server_error(message)
-        if msg_type == "subscribed":
-            await self._resolve_subscribed(message)
+        if not await self._dispatch_control(message, msg_type):
+            return
         for handler in self._handlers.get(msg_type, []) + self._handlers.get("*", []):
             try:
                 await handler(message)
             except Exception:
                 log.exception("ws_handler_failed", name=self._name, msg_type=msg_type)
+
+    async def _dispatch_control(self, message: JsonDict, msg_type: str) -> bool:
+        """Transport-level handling of control frames BEFORE the consumer
+        handlers run. Returns False to withhold the frame from the handlers —
+        the single-socket manager never does (byte-identical to the inline
+        code this replaced); the fan-out does for a per-shard channel loss it
+        recovers itself (``ws_fanout.CommsFanout._dispatch_control``)."""
+        if msg_type == "error":
+            log.warning("ws_server_error", name=self._name, message=message)
+            self._note_server_error(message)
+            await self._resolve_subscribe_error(message)
+        elif msg_type == "subscribed":
+            await self._resolve_subscribed(message)
+        return True
+
+    async def _resolve_subscribe_error(self, message: JsonDict) -> None:
+        """An ``error`` frame echoing a pending subscribe's command id IS that
+        subscribe's refusal (asyncapi-ws.md §3.6: ``id`` echoes the command).
+        The pending ack is released and the subscription's
+        ``on_subscribe_error`` (if any) is told the code — the fan-out's
+        sharding fallback hangs off this. A subscription without the hook
+        keeps exactly today's behaviour (the warning already logged)."""
+        try:
+            cmd_id = int(message.get("id", 0))
+        except (TypeError, ValueError):
+            return
+        if cmd_id < 1:
+            return
+        sub = self._pending_sub_acks.pop(cmd_id, None)
+        if sub is None or sub.on_subscribe_error is None:
+            return
+        msg = message.get("msg", {})
+        code = 0
+        text = ""
+        if isinstance(msg, dict):
+            try:
+                code = int(msg.get("code", 0))
+            except (TypeError, ValueError):
+                code = 0
+            text = str(msg.get("msg", ""))
+        try:
+            await sub.on_subscribe_error(code, text)
+        except Exception:
+            log.exception("ws_subscribe_error_handler_failed", name=self._name)
 
     def _note_server_error(self, message: JsonDict) -> None:
         """Code 25 is the exchange saying WE read too slowly. With the reader
@@ -893,16 +1055,32 @@ class WsManager:
         except Exception:
             log.exception("ws_subscribed_handler_failed", name=self._name)
 
+    def _reserve_sub_ack(self, sub: _Subscription) -> int:
+        """Register the pending ack BEFORE the subscribe leaves (review fix
+        2026-09-05, fan-out build). ``send_command`` takes its id
+        synchronously on entry, so the next id is known here without an
+        await in between; registering it after the send let an ack that
+        arrived within one loop hop (a fast exchange, a fake) be dispatched
+        before the registration and silently dropped — ``on_subscribed``
+        never fired. Live RTT hid it; correctness must not depend on RTT."""
+        cmd_id = self._cmd_id + 1
+        self._pending_sub_acks[cmd_id] = sub
+        return cmd_id
+
     async def _send_subscription_now(self, sub: _Subscription) -> None:
+        cmd_id = self._reserve_sub_ack(sub)
         try:
-            cmd_id = await self.send_command(
+            sent = await self.send_command(
                 "subscribe", {"channels": sub.channels, **sub.params_extra}
             )
-            self._pending_sub_acks[cmd_id] = sub
         except Exception as exc:
+            self._pending_sub_acks.pop(cmd_id, None)
             # Reconnect resends everything; downstream stays invalid until the
             # subscribe ack + snapshot arrive, so nothing quotes off this gap.
             log.warning("live_subscribe_failed", name=self._name, error=repr(exc))
+            return
+        if sent != cmd_id:  # pragma: no cover — defensive: ids are taken on entry
+            self._pending_sub_acks[sent] = self._pending_sub_acks.pop(cmd_id)
 
     async def _send_subscriptions(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         """Re-send every declared subscription on the SPECIFIC socket ``ws``
@@ -912,10 +1090,16 @@ class WsManager:
             return
         self._pending_sub_acks.clear()  # stale acks from a previous connection
         for sub in list(self._subscriptions):
-            cmd_id = await self.send_command(
-                "subscribe", {"channels": sub.channels, **sub.params_extra}, ws=ws
-            )
-            self._pending_sub_acks[cmd_id] = sub
+            cmd_id = self._reserve_sub_ack(sub)
+            try:
+                sent = await self.send_command(
+                    "subscribe", {"channels": sub.channels, **sub.params_extra}, ws=ws
+                )
+            except Exception:
+                self._pending_sub_acks.pop(cmd_id, None)
+                raise
+            if sent != cmd_id:  # pragma: no cover — defensive: ids are taken on entry
+                self._pending_sub_acks[sent] = self._pending_sub_acks.pop(cmd_id)
 
     async def send_command(
         self,

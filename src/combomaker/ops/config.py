@@ -65,6 +65,20 @@ class StrictModel(BaseModel):
 class EndpointsConfig(StrictModel):
     rest_base_url: str
     ws_url: str
+    # COMMUNICATIONS FAN-OUT SHARDING (2026-09-05, exchange/ws_fanout.py). The
+    # shard factor N is DERIVED per boot from the measured inbound frame rate
+    # and the measured per-connection ceiling (module doc) — there is no yaml
+    # number for it. This key exists only as an explicit OVERRIDE, applied and
+    # logged as ``ws_fanout_derivation source=override``; None (default) =
+    # derive. 1 forces today's single unsharded subscription.
+    comms_shard_factor_override: int | None = None
+
+    @field_validator("comms_shard_factor_override")
+    @classmethod
+    def _shard_factor_range(cls, v: int | None) -> int | None:
+        if v is not None and not (1 <= v <= 100):
+            raise ValueError(f"comms_shard_factor_override must be in [1, 100], got {v}")
+        return v
 
     @classmethod
     def for_env(cls, env: Env) -> Self:

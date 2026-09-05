@@ -66,6 +66,7 @@ from combomaker.exchange.rest import (
     observe_api_tier,
 )
 from combomaker.exchange.ws import WsManager
+from combomaker.exchange.ws_fanout import CommsFanout, FanoutGovernor, fanout_tape_path
 from combomaker.marketdata.feed import OrderbookFeed
 from combomaker.marketdata.grid import PriceGrid
 from combomaker.marketdata.metadata import (
@@ -2155,7 +2156,28 @@ class QuoteApp:
                 clock=self._clock,
                 writer_queue_depth=store.writer_queue_depth,
             )
-        ws = WsManager(config.endpoints.ws_url, signer, self._clock, self._metrics)
+        # COMMUNICATIONS FAN-OUT SHARDING (2026-09-05, the fills lever —
+        # derivation in exchange/ws_fanout.py). The comms transport is N
+        # exchange-sharded sockets (one reader thread each) feeding the ONE
+        # dispatcher below; N is derived from this boot's tape at
+        # ``_refresh_ws_fanout("boot")`` before ``ws.start()`` and re-derived
+        # on the slow cadence (growth applied live, shrink at the next boot).
+        # Everything registered on ``ws`` below (marks, intake, channel-lost)
+        # is unchanged: the fan-out presents the WsManager surface.
+        ws = CommsFanout(config.endpoints.ws_url, signer, self._clock, self._metrics)
+        self._fanout_governor = FanoutGovernor(
+            ws,
+            self._clock,
+            self._metrics,
+            tape_path=fanout_tape_path(config.data_dir),
+            data_dir=config.data_dir,
+            boot_key=self._boot_key,
+            boot_started_at_ts=self._boot_started_at_ts,
+            # The exchange confirm window — the protocol fact pipe lag is
+            # judged against (an accept later than this is already dead).
+            confirm_window_s=EXCHANGE_CONFIRM_WINDOW_S,
+            override=config.endpoints.comms_shard_factor_override,
+        )
         # CONFIRM PRIORITY (2026-07-31 double halt): accept/execute frames jump
         # the comms dispatch backlog, and while a confirm is in flight all NEW
         # quote work yields (gate derivation in AcceptPriorityGate). The book
@@ -3156,6 +3178,9 @@ class QuoteApp:
 
             intake.on_channel_lost(on_channel_lost)
 
+            # Derive the shard factor from the retained tape BEFORE any
+            # communications socket opens (empty tape ⇒ 1 = today's subscribe).
+            await self._refresh_ws_fanout(reason="boot")
             ws.start()
             book_ws.start()  # dedicated order-book socket (see construction note)
             # Register the loops the external supervisor judges. Each declares
@@ -4705,6 +4730,11 @@ class QuoteApp:
                 self._stall_wall_ticks = 0
                 await self._refresh_stall_wall(reason="refresh")
                 await self._refresh_expired_baseline(reason="refresh")
+                # WS FAN-OUT (2026-09-05): same slow cadence — fold the
+                # measurement window (per-shard inbound rate, pipe lag + its
+                # alarm), refresh the tape off-loop, re-derive N, apply
+                # growth live. Transport only; errors log inside.
+                await self._refresh_ws_fanout(reason="refresh")
             # TAPE RETENTION (2026-09-05, dark): on the same ~60s slow cadence,
             # ask the scheduler whether its nightly pass is due; it launches a
             # single-flight worker thread only against an idle tape writer.
@@ -4825,6 +4855,20 @@ class QuoteApp:
 
     def _confirm_expired_baseline(self) -> tuple[int, int, int] | None:
         return self._expired_baseline
+
+    async def _refresh_ws_fanout(self, *, reason: str) -> None:
+        """COMMUNICATIONS FAN-OUT governor tick (exchange/ws_fanout.py):
+        telemetry (``ws_inbound_rate`` / ``ws_pipe_lag`` /
+        ``pipe_lag_exceeds_confirm_window``), the per-boot tape (off-loop),
+        the derivation (``ws_fanout_derivation``) and the apply. The
+        governor never raises; this wrapper only guards the attribute."""
+        governor = getattr(self, "_fanout_governor", None)
+        if governor is None:
+            return
+        try:
+            await governor.tick(reason=reason)
+        except Exception:  # pragma: no cover - the governor already catches
+            log.exception("ws_fanout_refresh_failed", reason=reason)
 
     def _applied_stall_wall_s(self) -> float | None:
         """The wall the supervisor currently kills the maintenance loop at
