@@ -75,14 +75,16 @@ def floor_for_cell(
     table: Mapping[CellKey, int],
     pool_floor_cc: Mapping[str, int],
 ) -> int:
-    """The published retained-edge floor for a cell, FAIL-CLOSED (2026-09-04
-    review fix M2): a cell in the table takes its own measured floor; a cell
-    ABSENT from the table (no settled record at all — the never-sold shape)
-    takes its sport pool's upper bound, exactly like a thin cell; a sport
-    with no pool at all takes the LARGEST published pool floor (and, if no
-    pool was published, the largest cell floor). Absent never resolves to
-    the loosest cap in the system. One or two dict lookups on the quote
-    path. Shared by the engine and the replay tool (never reimplemented)."""
+    """The published retained-edge floor for a cell (2026-09-04 review fix
+    M2; POINT rule since build "floor-point-estimate"): a cell in the table
+    takes its own measured floor; a cell ABSENT from the table (no settled
+    record at all — the never-sold shape) takes its sport pool's POINT
+    (max(0, −pool mean shortfall)), exactly like a thin cell; a sport with
+    no pool at all takes the LARGEST published pool point — the fail-closed
+    DIRECTION, but a point, never a z·SE bound (and, if no pool was
+    published, the largest cell floor). Absent never resolves to None (the
+    unmeasured fallback). One or two dict lookups on the quote path. Shared
+    by the engine and the replay tool (never reimplemented)."""
     own = table.get(key)
     if own is not None:
         return own

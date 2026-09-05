@@ -9125,8 +9125,9 @@ class QuoteLifecycle:
         estimate = estimate_retained_floor(rows)
         self._metrics.inc("retained_floor.ran")
         if estimate.published:
-            # The pool upper bounds travel with the table: a cell with no
-            # settled record resolves to its sport pool (review fix M2).
+            # The pool points travel with the table: a cell with no settled
+            # record resolves to its sport pool's point (review fix M2; the
+            # point rule since build "floor-point-estimate").
             publish(dict(estimate.table), dict(estimate.pool_floor_cc))
             self._metrics.inc("retained_floor.published")
         else:

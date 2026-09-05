@@ -169,9 +169,17 @@ def construct_quote(
       (property-tested: every floor bid's confirm edge is ≥ 1 cc).
 
     ``retained_floor_cc`` (item 2 — risk/retained_edge_floor.py): the
-    combo's cell's MEASURED adverse-selection floor EXCLUDING the fee; the
-    fee at the bid is added here, so the minimum retained margin after the
-    rebate is ``fee + retained_floor_cc``. Only ever tightens the rebate.
+    combo's cell's MEASURED adverse-selection floor EXCLUDING the fee — the
+    empirical-Bayes shrunk POINT of the cell's settled shortfall, 0 on a
+    cell at or above the model (build "floor-point-estimate", 2026-09-04:
+    the earlier 3σ upper bound floored 15-59c against 1-3c margins and
+    muted the rebate on every quote); the fee at the bid is added here, so
+    the minimum retained margin after the rebate is
+    ``fee + retained_floor_cc`` and the rebate cap is
+    ``margin − m_min − retained_floor_cc`` — the measured cap REPLACES the
+    8/16 ``margin // 2`` hand fraction outright (a floor-0 cell may rebate
+    up to margin − fee; a losing cell nothing). Never touches the margin
+    itself or the widen direction.
     """
     if fee_mode not in ("floor", "width"):
         raise ValueError(f"fee_mode must be 'floor' or 'width', got {fee_mode!r}")
@@ -228,7 +236,13 @@ def construct_quote(
     # WIDEN direction is untouched — making a combo dearer is always safe —
     # and the free-money clamp still applies below.
     # In "floor" mode with a MEASURED cell floor supplied, that floor REPLACES
-    # the hand fraction below (item 2); every other path keeps it.
+    # the hand fraction below outright (item 2; the shrunk-point rule since
+    # build "floor-point-estimate"): the cap is margin − m_min − floor and
+    # nothing else. The fraction survives ONLY where nothing is measured —
+    # "width" mode (the pre-fee-seam arithmetic, kept byte-identical) and a
+    # floor-mode quote before the first table is published (cold boot /
+    # every sweep timed out) — the transitional fallback named in the
+    # build report as the last hand fraction on this path.
     if fee_mode == "width" or retained_floor_cc is None:
         if inventory_skew_cc > margin // 2:
             inventory_skew_cc = margin // 2

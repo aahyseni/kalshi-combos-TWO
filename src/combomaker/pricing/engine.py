@@ -221,8 +221,9 @@ class PricingEngine:
         # .py): cell -> adverse-selection floor cc, published by the slow
         # loop; the quote path does one dict lookup. None until published.
         self._retained_floor: Mapping[CellKey, int] | None = None
-        # The per-sport pool upper bounds published with the table: the
-        # floor of a cell with NO settled record (review fix M2, fail-closed).
+        # The per-sport pool POINTS published with the table: the floor of a
+        # cell with NO settled record (review fix M2; the point rule since
+        # build "floor-point-estimate" — never a z·SE bound).
         self._retained_pool_floor: Mapping[str, int] = {}
         self._sgp_params = SgpParams(
             pair_rho=dict(config.correlation.pair_rho),
@@ -596,10 +597,11 @@ class PricingEngine:
         pool_floor_cc: Mapping[str, int] | None = None,
     ) -> None:
         """Install the slow loop's measured per-cell retained-edge floor
-        table (cell key -> cc, EXCLUDING the fee) together with the per-
-        sport pool upper bounds (``FloorEstimate.pool_floor_cc``) that a cell
-        ABSENT from the table resolves to (review fix M2). None clears both
-        (the quote path then keeps the fee-only floor)."""
+        table (cell key -> cc, EXCLUDING the fee; the shrunk POINT shortfall
+        since build "floor-point-estimate") together with the per-sport pool
+        points (``FloorEstimate.pool_floor_cc``) that a cell ABSENT from the
+        table resolves to (review fix M2). None clears both (the quote path
+        then keeps the fee floor + the pre-measurement ``margin // 2``)."""
         self._retained_floor = table
         self._retained_pool_floor = dict(pool_floor_cc or {}) if table is not None else {}
 
@@ -610,8 +612,8 @@ class PricingEngine:
     def _retained_floor_for(self, rfq: Rfq) -> int | None:
         """One or two dict lookups on the quote path (O(legs) to build the
         key). While a table is published this NEVER returns None: an
-        unseen cell is fail-closed to its sport pool's upper bound
-        (``floor_for_cell``)."""
+        unseen cell resolves to its sport pool's point, an unknown sport to
+        the largest pool point (``floor_for_cell``)."""
         table = self._retained_floor
         if table is None:
             return None
