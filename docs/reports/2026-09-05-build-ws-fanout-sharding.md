@@ -1,6 +1,6 @@
 # 2026-09-05 — BUILD: communications FAN-OUT SHARDING (the fills lever)
 
-Branch `build/ws-fanout-sharding` — build commit `806d97b`, merge of main `ad06212`, **review-fix pass `@@FIXSHA@@`** (worktree
+Branch `build/ws-fanout-sharding` — build commit `806d97b`, merge of main `ad06212`, **review-fix pass `e1f6994`** (worktree
 `C:/Users/aahys/kct-ws-shard`; bot LIVE on main `f55fa43` throughout — store read-only, logs grep/tail only, every heavy job at LOW
 priority, no process touched). Blast radius: the communications TRANSPORT only.
 
@@ -79,9 +79,9 @@ retention period — N holds at 3 until the evidence says otherwise.
 | **Post-merge re-run** (main advanced 3 commits while this built: `f750924` WholeBookBalanceSource fix touching `quote_app.py`; merged as `ad06212`, `quote_app.py` auto-merged, README index both rows) | full suite **4,215 passed / 0 failed / 3 deselected in 296 s (= main's 4,192 + 23 new)**; vitals fast **8/8 GREEN (GATE PASS, 90.1 s)**; ruff + mypy clean on the merged touched files; the merged `quote_app` imports with both wirings in place |
 | ruff check | clean on every touched/new file |
 | mypy (strict) | clean on `ws.py`, `ws_fanout.py`, `config.py`; `quote_app.py` reports only the 4 pre-existing `pricing/engine.py` errors (identical on main) |
-| **Review-fix pass re-run** (`@@FIXSHA@@`, LOW priority, `PYTHONPATH=<worktree>/src`, `combomaker.__file__` verified in the worktree) | touched ws tests **58/58 unchanged**; `tests/test_ws_fanout.py` **33/33** (23 + 10: the refusal test now parametrised over 19/20/21/22/11/6/1 = +3 cases, and 7 new tests — terminal-17 exclusion, staggered-death epoch, re-shard purge, cross-shard dedupe + N=1 identity, shrink gate, apply gate, tape v2); full suite **4,225 passed / 0 failed / 3 deselected in 303.6 s (= the merged tree's 4,215 + the 10 new tests exactly)**; vitals fast tier from the snapshot `vitals_snap2` (taken 21:54Z; `position_ledger`/`daily_ruin_anchors` change on fills, ~none today — not rebuilt) **8/8 GREEN (GATE PASS, 89.5 s)**; ruff check clean on `ws.py`, `ws_fanout.py`, `quote_app.py`, `test_ws_fanout.py`; ruff format clean on the new/transport files (`quote_app.py` still carries main's pre-existing format debt, untouched); mypy `--strict` clean on `ws.py`, `ws_fanout.py`, `config.py`; `quote_app.py` mypy clean |
+| **Review-fix pass re-run** (`e1f6994`, LOW priority, `PYTHONPATH=<worktree>/src`, `combomaker.__file__` verified in the worktree) | touched ws tests **58/58 unchanged**; `tests/test_ws_fanout.py` **33/33** (23 + 10: the refusal test now parametrised over 19/20/21/22/11/6/1 = +3 cases, and 7 new tests — terminal-17 exclusion, staggered-death epoch, re-shard purge, cross-shard dedupe + N=1 identity, shrink gate, apply gate, tape v2); full suite **4,225 passed / 0 failed / 3 deselected in 303.6 s (= the merged tree's 4,215 + the 10 new tests exactly)**; vitals fast tier from the snapshot `vitals_snap2` (taken 21:54Z; `position_ledger`/`daily_ruin_anchors` change on fills, ~none today — not rebuilt) **8/8 GREEN (GATE PASS, 89.5 s)**; ruff check clean on `ws.py`, `ws_fanout.py`, `quote_app.py`, `test_ws_fanout.py`; ruff format clean on the new/transport files (`quote_app.py` still carries main's pre-existing format debt, untouched); mypy `--strict` clean on `ws.py`, `ws_fanout.py`, `config.py`; `quote_app.py` mypy clean |
 
-## Review fixes (same day — the SHIP_WITH_FIXES pass, `@@FIXSHA@@`)
+## Review fixes (same day — the SHIP_WITH_FIXES pass, `e1f6994`)
 
 The review (verdict SHIP_WITH_FIXES: 1 must-fix, 9 should-fix) ran three scratch probes over the real
 `CommsFanout`. Each probe is now a test in `tests/test_ws_fanout.py` that FAILED on `2983bd1` and passes
