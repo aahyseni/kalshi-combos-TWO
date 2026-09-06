@@ -19,10 +19,10 @@ import queue
 import sqlite3
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Self
+from typing import TYPE_CHECKING, Any, Final, Self, TypeVar
 
 import aiosqlite
 
@@ -237,8 +237,9 @@ CREATE TABLE IF NOT EXISTS store_meta (
 # 1000-statement batches ran there; its WAL TRUNCATE/PASSIVE checkpoints moved
 # to a DEDICATED second connection 2026-08-19, and the tape writer itself now
 # runs on its OWN thread + connection, so the shared connection carries only
-# the synchronous ledger paths and reads). That queueing is the actual
-# 2026-07-26 stall, and only an asyncio-level ``wait_for`` can bound it.
+# the synchronous ledger paths and reads — one statement lifecycle at a time
+# under ``Store._conn_lock``, see ``Store._ledger_txn``). That queueing is the
+# actual 2026-07-26 stall, and only an asyncio-level ``wait_for`` can bound it.
 BUSY_TIMEOUT_MS = 5000
 STORE_OP_TIMEOUT_S = BUSY_TIMEOUT_MS / 1000.0
 
@@ -263,6 +264,34 @@ class _WriterStop:
 _WRITER_STOP: Final = _WriterStop()
 
 _TapeRow = tuple[str, tuple[Any, ...]]
+
+_T = TypeVar("_T")
+
+#: SQLite PRIMARY result codes of the LOCK class — the only failures a retry
+#: can cure. ``SQLITE_BUSY`` (5) covers both the plain lock wait that ran past
+#: ``busy_timeout`` and the extended ``SQLITE_BUSY_SNAPSHOT`` (517 = 5 | 2<<8:
+#: a stale read snapshot under a write — cured only by a ROLLBACK first, see
+#: ``Store._ledger_txn``); ``SQLITE_LOCKED`` (6) is 'database table is locked'.
+#: Everything else (constraint, schema, I/O) is a real failure a retry repeats.
+_LOCK_ERROR_CODES: Final = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
+
+#: ``decision_reason_counts``: the whole count happens INSIDE SQLite —
+#: ``json_each`` unnests every reasons_json array, GROUP BY counts each reason
+#: once per row it appears in (a duplicate inside one row counts twice, exactly
+#: as the retired per-row ``json.loads`` loop did). The result is a few dozen
+#: rows however large ``decisions`` grows, so nothing pages any more.
+_DECISION_REASON_COUNTS_SQL: Final = (
+    "SELECT j.value, COUNT(*) FROM decisions AS d, json_each(d.reasons_json) AS j"
+    " GROUP BY j.value"
+)
+
+
+def _is_lock_error(exc: BaseException) -> bool:
+    """True iff ``exc`` is a sqlite3 error of the LOCK class.
+    ``sqlite_errorcode`` carries the EXTENDED code (BUSY_SNAPSHOT = 517), so
+    the primary code is its low byte (517 & 0xFF = 5 = SQLITE_BUSY)."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    return isinstance(code, int) and (code & 0xFF) in _LOCK_ERROR_CODES
 
 
 class Store:
@@ -350,6 +379,42 @@ class Store:
         # Cached fills verification watermark (2026-09-04 review fixes) —
         # read once from store_meta by ``fills_verification_watermark``.
         self._fills_verification_watermark: tuple[int, str] | None = None
+        # ONE STATEMENT LIFECYCLE AT A TIME ON THE SHARED CONNECTION
+        # (2026-09-05 review fix, must-fix #1). Since the tape writer commits
+        # on its OWN connection, the shared aiosqlite connection has a
+        # FOREIGN committer on its WAL — and a read cursor left active across
+        # a loop hop while another coroutine writes is SQLITE_BUSY_SNAPSHOT
+        # plus a WEDGED connection (see ``_ledger_txn`` for the proof). Every
+        # statement lifecycle on ``self._db`` after open holds this lock:
+        # ``_fetchall`` / ``_fetchone`` / ``_ledger_txn`` are the only ways
+        # this class touches the connection.
+        self._conn_lock = asyncio.Lock()
+        # Ledger-transaction ROLLBACKS performed by ``_ledger_txn`` (a body
+        # that raised with the connection inside a transaction) and the
+        # lock-class RETRIES that followed one. Public like the checkpoint
+        # counters: an ops surface reports them, and a non-zero count at
+        # relight says the residue path fired (a cancelled read that left
+        # its cursor active) — never silent.
+        self.ledger_txn_rollbacks = 0
+        self.ledger_txn_retries = 0
+        # Tape batches that hit a LOCK-class error and were RETRIED with
+        # their rows still in memory (2026-09-05 review should-fix) — only a
+        # non-lock error or the stop flag ever drops a batch now.
+        self.batch_lock_retries = 0
+        # LEDGER FIRST ON THE WAL WRITE LOCK (2026-09-05 review fix pass,
+        # measured): SQLite's busy handler has no fairness — with a tape
+        # backlog the writer thread re-takes the write lock the instant it
+        # commits, and a ``record_fill`` waiting in the handler's 25 ms
+        # backoff saw 178-1,483 ms (mean 457 ms) per fill in the regression
+        # test's backlog shape. This event is SET while no ledger transaction
+        # is in flight on the shared connection; ``_ledger_txn`` clears it
+        # for the body's duration and the tape thread waits on it before each
+        # batch — bounded by STORE_OP_TIMEOUT_S, the store's own statement of
+        # a legitimate block, so a stuck flag can never stall the tape.
+        self._ledger_txn_idle = threading.Event()
+        self._ledger_txn_idle.set()
+        # Batches the tape thread held back for a ledger transaction in flight.
+        self.batch_yields_to_ledger = 0
 
     @classmethod
     async def open(cls, path: Path, clock: Clock) -> Self:
@@ -486,8 +551,24 @@ class Store:
 
     @staticmethod
     def _open_checkpoint_connection(path: Path) -> sqlite3.Connection:
-        ckpt_db = sqlite3.connect(path, timeout=STORE_OP_TIMEOUT_S, check_same_thread=False)
-        ckpt_db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        """The dedicated checkpoint connection NEVER WAITS (2026-09-05 review
+        should-fix): ``busy_timeout`` 0 — the OFF position of SQLite's lock
+        wait, not a magnitude. A TRUNCATE checkpoint under a pinned reader
+        (the report's read-only scan, an operator's ``mode=ro`` diagnostic,
+        a settlement scan) otherwise sits in the busy handler for the whole
+        timeout on EVERY attempt, and since the checkpoint runs on the tape
+        writer THREAD that wait was the thread's only stall — measured in
+        review at the old 5 s wait: the thread throttled to ~100 rows/s (one
+        attempt per ``_CHECKPOINT_RETRY_WRITES`` = 500 rows) and ``close()``
+        left 13,401 rows undrained. With no wait the pragma returns its busy
+        VERDICT at once (probe: 0.000 s vs 1.155 s at a 1 s timeout) and the
+        cycle takes the counted failure path. Nothing is lost by not waiting:
+        ``_wal_checkpoint`` folds with PASSIVE FIRST, so the wait never bought
+        frames — only the WAL file shrink is deferred until the reader leaves
+        (the next writer reuses a fully-folded WAL from its start regardless).
+        This connection runs nothing but wal_checkpoint pragmas."""
+        ckpt_db = sqlite3.connect(path, timeout=0, check_same_thread=False)
+        ckpt_db.execute("PRAGMA busy_timeout=0")
         return ckpt_db
 
     @staticmethod
@@ -658,7 +739,18 @@ class Store:
         # resets the WAL. (The writer thread closed ITS connection on exit,
         # before the join above returned — same reason.)
         if self._ckpt_db is not None:
-            self._ckpt_db.close()
+            if thread is not None and thread.is_alive():
+                # The writer thread OWNS the checkpoint connection while it
+                # runs (2026-09-05 review should-fix): it may be inside a
+                # wal_checkpoint pragma on it this instant, and closing a
+                # stdlib connection under another thread's running statement
+                # is undefined. Leave it to the daemon (process exit reaps
+                # both) and say so — the main connection's close-time fold
+                # skips the truncate this once, as the join-timeout warning
+                # above already says.
+                log.warning("store_checkpoint_connection_left_to_writer_thread")
+            else:
+                self._ckpt_db.close()
         await self._db.close()
 
     async def flush_writer(self, wait_s: float) -> bool:
@@ -699,13 +791,160 @@ class Store:
         (``async`` kept for its callers' sake.)"""
         q = self._write_q
         if q is None:
-            await self._db.execute(sql, params)
-            await self._db.commit()
+
+            async def _txn() -> None:
+                await self._db.execute(sql, params)
+                await self._db.commit()
+
+            await self._ledger_txn(_txn)
             return
         try:
             q.put_nowait((sql, params))
         except queue.Full:
             self._dropped_writes += 1
+
+    # ------------------------------------------------------------------ #
+    # THE SHARED CONNECTION: one statement lifecycle at a time.            #
+    # ------------------------------------------------------------------ #
+
+    async def _fetchall(self, sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
+        """ONE materialized read on the shared connection with its whole
+        statement lifecycle (execute → fetchall → close) under the connection
+        lock — see ``_ledger_txn`` for why no statement here may be active
+        while another coroutine writes. Bounded reads only (the ledger tables
+        are a few thousand rows); the one unbounded count,
+        ``decision_reason_counts``, runs on its own read-only connection."""
+        async with self._conn_lock:
+            async with self._db.execute(sql, params) as cursor:
+                return list(await cursor.fetchall())
+
+    async def _fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> Any | None:
+        """ONE single-row read (LIMIT 1 / aggregate) under the connection
+        lock; the cursor is closed before the lock is released."""
+        async with self._conn_lock:
+            async with self._db.execute(sql, params) as cursor:
+                return await cursor.fetchone()
+
+    async def _ledger_txn(self, body: Callable[[], Awaitable[_T]]) -> _T:
+        """Run ``body`` — ONE ledger transaction on the shared connection:
+        its statements and its commit — under the connection lock, and never
+        leave the connection inside a transaction afterwards.
+
+        WHY (2026-09-05 review, must-fix #1 — PROVEN on the real Store): with
+        the tape writer committing on ITS OWN connection, the shared aiosqlite
+        connection has a FOREIGN committer on its WAL. Any ACTIVE read
+        statement here — a cursor between ``execute()`` and its terminal
+        fetch/close, one loop hop = 67-134 ms live — pins a read snapshot; a
+        foreign commit inside that window makes the NEXT write on this
+        connection fail INSTANTLY with SQLITE_BUSY_SNAPSHOT ('database is
+        locked'; busy_timeout is not consulted because waiting cannot help),
+        and because Python's implicit BEGIN had already run, the connection
+        STAYS in that stale transaction: every later write fails the same
+        way and every later read returns the stale snapshot for the rest of
+        the run (review probe: 40/40 ``record_fill`` raised while the report
+        pager was open; still raised after the pager closed its cursor;
+        ``count(decisions)`` read 300,000 while the file held 305,000). On
+        the one-connection design this could not fire — the tape committed
+        on the same connection — which is why main never saw it.
+
+        Two guards, both mechanisms:
+          (a) the connection LOCK — every statement lifecycle on the shared
+              connection (``_fetchall`` / ``_fetchone`` / this method) holds
+              it, so no coroutine's write can begin while another
+              coroutine's read statement is active;
+          (b) ROLLBACK on failure — a body that raises with the connection
+              inside a transaction is rolled back (nothing of it was ever
+              committed, so the caller sees exactly the exception it always
+              saw), and a LOCK-class failure (``_is_lock_error``: SQLITE_BUSY
+              incl. BUSY_SNAPSHOT, SQLITE_LOCKED — the only ones a retry can
+              cure) is retried ONCE after the rollback. The rollback is what
+              ends the WEDGE: without it the explicit transaction (Python's
+              BEGIN) keeps the stale snapshot for the rest of the run. It
+              does NOT cure the residue the lock cannot see — a cancelled
+              ``_bounded_store`` read whose cursor is still active outside
+              any lock keeps the connection's read snapshot pinned (SQLite
+              downgrades a rolled-back transaction to a read transaction
+              while another statement of the connection is active), so the
+              retry fails the same way and the caller sees its exception —
+              but the connection is left OUTSIDE any transaction, and the
+              moment that cursor closes (its coroutine's frame dies) the very
+              next write succeeds with no intervention. The wedge is bounded
+              by a leaked statement's lifetime, never the run's.
+        A body that RETURNS with the connection still in a transaction is a
+        bug (every body commits): committed here and logged at ERROR
+        (``store_ledger_txn_left_open``) — the wedge detector the relight
+        checklist watches, with ``ledger_txn_rollbacks``. A transaction
+        already open on ENTRY was left by something outside this class (a
+        direct ``_db.execute`` without a commit): joined, not rolled back —
+        rolling it back would discard rows that are not ours — but logged.
+        Cancellation (a ``wait_for`` bound expiring) is NOT caught: awaiting
+        a rollback inside a cancelled coroutine would make the bound wait on
+        the very connection that overran it; the next ``_ledger_txn`` finds
+        whatever the late-landing statement left and (b) resolves it."""
+        async with self._conn_lock:
+            if self._db.in_transaction:
+                log.warning("store_ledger_txn_inherited_open_transaction")
+            # Ledger first on the write lock: the tape thread holds its next
+            # batch while this is clear (see __init__). try/finally so a
+            # cancelled body (a wait_for bound) never leaves it clear.
+            self._ledger_txn_idle.clear()
+            try:
+                try:
+                    result = await body()
+                except Exception as exc:
+                    if not self._db.in_transaction:
+                        raise
+                    await self._rollback_failed_txn(exc)
+                    if not _is_lock_error(exc):
+                        raise
+                    self.ledger_txn_retries += 1
+                    log.warning(
+                        "store_ledger_txn_retry_after_rollback",
+                        error=str(exc),
+                        sqlite_errorname=getattr(exc, "sqlite_errorname", None),
+                        ledger_txn_retries=self.ledger_txn_retries,
+                    )
+                    try:
+                        result = await body()
+                    except Exception as retry_exc:
+                        # The retry failed too (a leaked statement still pins
+                        # the snapshot): its own implicit BEGIN must not
+                        # outlive it either — roll back, then let the caller
+                        # see the error.
+                        if self._db.in_transaction:
+                            await self._rollback_failed_txn(retry_exc)
+                        raise
+                if self._db.in_transaction:
+                    log.error(
+                        "store_ledger_txn_left_open", detail="body returned without commit"
+                    )
+                    await self._db.commit()
+            finally:
+                self._ledger_txn_idle.set()
+            return result
+
+    async def _rollback_failed_txn(self, exc: BaseException) -> None:
+        """Roll back the shared connection after ``exc`` left it inside a
+        transaction (``_ledger_txn`` (b)); counted + logged. A rollback that
+        itself fails is logged and swallowed — the original exception is the
+        one the caller must see."""
+        self.ledger_txn_rollbacks += 1
+        try:
+            await self._db.rollback()
+        except Exception:  # noqa: BLE001 - the caller's exception is the event
+            log.exception(
+                "store_ledger_txn_rollback_failed",
+                original_error=str(exc),
+                ledger_txn_rollbacks=self.ledger_txn_rollbacks,
+            )
+            return
+        log.warning(
+            "store_ledger_txn_rolled_back",
+            error=str(exc),
+            sqlite_errorname=getattr(exc, "sqlite_errorname", None),
+            lock_error=_is_lock_error(exc),
+            ledger_txn_rollbacks=self.ledger_txn_rollbacks,
+        )
 
     def _writer_thread_main(
         self, wdb: sqlite3.Connection, q: queue.Queue[_TapeRow | _WriterStop]
@@ -741,9 +980,14 @@ class Store:
         the sentinel into a full queue). Either way the current batch is
         committed first and the thread closes its connection on the way out
         (before ``close()`` closes the checkpoint + main connections — the
-        close-ordering rule). A thread that dies of anything else logs
-        ``store_writer_thread_died`` loudly; the hot path then fills the
-        queue and counts drops exactly as before."""
+        close-ordering rule). On the stop-FLAG path a sentinel that DID make
+        it into the queue (close() posted it, then the flag was read after
+        the batch) is left un-``task_done``'d along with every other queued
+        row: nobody joins the queue after ``close()`` (``flush_writer`` on a
+        closed store is a programming error), so that count is inert — noted
+        here so it is never mistaken for a leak. A thread that dies of
+        anything else logs ``store_writer_thread_died`` loudly; the hot path
+        then fills the queue and counts drops exactly as before."""
         writes_since_checkpoint = 0
         checkpoint_after = self._CHECKPOINT_EVERY_WRITES
         try:
@@ -763,22 +1007,15 @@ class Store:
                         stop_seen = True
                         break
                     batch.append(item)
-                try:
-                    self._commit_batch(wdb, batch)
-                except Exception as exc:  # noqa: BLE001 - the batch's failure IS the event
-                    try:
-                        wdb.rollback()
-                    except Exception:  # noqa: BLE001 - rollback is best-effort
-                        pass
-                    self._post_to_loop(
-                        functools.partial(
-                            log.exception,
-                            "store_writer_batch_failed",
-                            n=len(batch),
-                            exc_info=exc,
-                        )
-                    )
-                else:
+                if not self._ledger_txn_idle.is_set():
+                    # A ledger transaction is in flight on the shared
+                    # connection: it takes the write lock first (SQLite's
+                    # busy handler has no fairness — see __init__). Bounded
+                    # by the store's own legitimate-block statement, so a
+                    # stuck flag can never stall the tape.
+                    self.batch_yields_to_ledger += 1
+                    self._ledger_txn_idle.wait(STORE_OP_TIMEOUT_S)
+                if self._commit_batch_retrying(wdb, batch):
                     # Bounded manual checkpoint OFF the hot path
                     # (autocheckpoint=0): a TRUNCATE every ~5000 writes keeps
                     # the WAL small without an inline checkpoint stalling
@@ -819,19 +1056,111 @@ class Store:
             except Exception:  # noqa: BLE001 - best-effort on the way out
                 pass
 
+    def _commit_batch_retrying(self, wdb: sqlite3.Connection, batch: list[_TapeRow]) -> bool:
+        """Commit one batch; True iff it landed. A LOCK-class failure
+        (``_is_lock_error``: SQLITE_BUSY after this connection's own
+        busy_timeout wait — a ledger transaction spanning several loop hops
+        at p99 lag 1 s, a tape-retention DELETE batch at its own
+        STORE_OP_TIMEOUT_S bound (the SAME constant, so a boundary collision
+        is designed-in), an external TRUNCATE checkpoint pending — or
+        SQLITE_LOCKED) is RETRIED with the rows still in memory until it lands
+        or the stop flag is set (2026-09-05 review should-fix: before, those
+        1,000 rows were DISCARDED as a batch failure; on the one-connection
+        design they had only ever queued behind the ledger). Each attempt is
+        paced by SQLite's own busy wait (``busy_timeout``, 5 s) — this method
+        has no retry number of its own; an instant lock error cannot spin it,
+        because this connection never holds an active read statement, so
+        SQLite's busy handler retries a stale-snapshot upgrade internally.
+        Any other error (constraint, schema, I/O) is the batch's failure:
+        rolled back, loud ``store_writer_batch_failed`` with ``n`` and
+        ``exc_info`` (and how many lock retries preceded it), and the thread
+        proceeds to the next batch. Every emit is posted to the loop."""
+        attempt = 0
+        while True:
+            try:
+                self._commit_batch(wdb, batch)
+                return True
+            except Exception as exc:  # noqa: BLE001 - the batch's failure IS the event
+                try:
+                    wdb.rollback()
+                except Exception:  # noqa: BLE001 - rollback is best-effort
+                    pass
+                if _is_lock_error(exc) and not self._writer_stop.is_set():
+                    attempt += 1
+                    self.batch_lock_retries += 1
+                    self._post_to_loop(
+                        functools.partial(
+                            log.warning,
+                            "store_writer_batch_locked_retrying",
+                            n=len(batch),
+                            attempt=attempt,
+                            error=str(exc),
+                            sqlite_errorname=getattr(exc, "sqlite_errorname", None),
+                            batch_lock_retries=self.batch_lock_retries,
+                        )
+                    )
+                    continue
+                self._post_to_loop(
+                    functools.partial(
+                        log.exception,
+                        "store_writer_batch_failed",
+                        n=len(batch),
+                        lock_retries=attempt,
+                        exc_info=exc,
+                    )
+                )
+                return False
+
     @staticmethod
     def _commit_batch(wdb: sqlite3.Connection, batch: list[_TapeRow]) -> None:
         """One batch = ONE transaction: rows grouped by SQL text (insertion
         order of first appearance; within a text, enqueue order), each group
-        an ``executemany``, then a single commit. The connection's legacy
-        transaction control opens the transaction implicitly on the first
-        INSERT, so a failure anywhere leaves it open for the caller's
-        rollback — nothing of a failed batch is ever visible."""
+        written as MULTI-ROW ``INSERT … VALUES (…), (…), …`` statements — as
+        many rows per statement as the ENGINE's own bound-variable limit
+        allows (``SQLITE_LIMIT_VARIABLE_NUMBER``: 32,766 on the bundled
+        3.45.3 = 2,520 rows of the widest tape table, so a 1,000-row batch is
+        ONE statement per table) — then a single commit.
+
+        WHY NOT ``executemany`` (2026-09-05 review fix pass — measured, not
+        theorised): CPython releases the GIL around every ``sqlite3_step``
+        and must RE-ACQUIRE it after each one; ``executemany`` steps once
+        PER ROW. Against a CPU-bound event loop (the live shape:
+        ``json.loads`` on ~3,000 frames/s) every re-acquire waits up to the
+        interpreter's switch interval (5 ms), so a 1,000-row executemany ran
+        **2.8 s mean / 8.9 s max per batch at 362 rows/s** — slower than the
+        asyncio-task writer it replaced — while HOLDING THE WAL WRITE LOCK
+        the whole time, so a concurrent ``record_fill`` waited out its 5 s
+        busy_timeout and FAILED (SQLITE_BUSY; the regression test
+        ``test_ledger_writes_survive_shared_connection_reads_under_the_tape_
+        thread`` caught it). The same rows as multi-row statements bind under
+        ONE GIL hold and step ONCE: **13,399 rows/s, 109 ms max per batch**,
+        with the burning loop's own throughput unchanged (scratch
+        probe_gil_starvation.py, LOW priority; on an IDLE loop both shapes
+        run ~420k rows/s). The build's bench had missed this because its
+        "saturated loop" burner SLEPT — releasing the GIL — instead of
+        computing; it burns CPU now.
+
+        The connection's legacy transaction control opens the transaction
+        implicitly on the first INSERT, so a failure anywhere leaves it open
+        for the caller's rollback — nothing of a failed batch is ever
+        visible. A SQL text without a ``VALUES (?, …)`` tail, or whose tail
+        does not match the row width (none of the tape tables today), falls
+        back to ``executemany`` for that group."""
         groups: dict[str, list[tuple[Any, ...]]] = {}
         for sql, params in batch:
             groups.setdefault(sql, []).append(params)
+        limit = int(wdb.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
         for sql, rows in groups.items():
-            wdb.executemany(sql, rows)
+            head, sep, tail = sql.rpartition(" VALUES ")
+            width = len(rows[0])
+            if not sep or width == 0 or tail.count("?") != width:
+                wdb.executemany(sql, rows)
+                continue
+            per_stmt = max(1, limit // width)
+            for start in range(0, len(rows), per_stmt):
+                chunk = rows[start : start + per_stmt]
+                stmt = f"{head} VALUES {', '.join([tail] * len(chunk))}"
+                wdb.execute(stmt, [value for row in chunk for value in row])
         wdb.commit()
 
     def _post_to_loop(self, fn: Callable[[], Any]) -> None:
@@ -866,19 +1195,38 @@ class Store:
         attempt takes the failure path (counted + logged) — it never starts
         the writer, so this is diagnostics-only.
 
+        PASSIVE FIRST, THEN TRUNCATE (2026-09-05 review should-fix). PASSIVE
+        folds every frame no reader is pinning and never waits on anyone —
+        the fold is what bounds WAL growth, and it never needed a wait. Then
+        TRUNCATE (the WAL reset + file shrink) on the never-waiting checkpoint
+        connection (``_open_checkpoint_connection``: busy_timeout 0) returns
+        an instant VERDICT: busy=1 while ANY reader is still on the WAL —
+        even one at the head with every frame already folded (probe: a
+        fully-folded WAL under a head reader still reports (1, n, n)) — so
+        "PASSIVE folded everything" cannot gate the TRUNCATE; the
+        non-blocking connection is the lever. Before this, the thread sat in
+        the busy handler for the whole timeout on every attempt under a
+        pinned reader (~100 rows/s, review probe) — its only stall.
+
         A raised error ('database table is locked') AND a busy verdict (the
         pragma's first result column — TRUNCATE that could not finish reports
         busy=1 WITHOUT raising, which the old code silently counted as success)
         both take the failure path: count + log ``store_writer_checkpoint_failed``
-        (its own event — never confused with a batch failure), then attempt a
-        PASSIVE checkpoint before giving up the cycle. PASSIVE copies what it
-        can without blocking readers, so the WAL keeps getting folded even
-        while the TRUNCATE lock is starved by a long-lived cursor."""
+        (its own event — never confused with a batch failure) and the fast
+        retry cadence. ``checkpoint_passive_fallbacks`` / ``passive_fallback_ok``
+        keep their meaning — the cycle could not TRUNCATE but PASSIVE folded —
+        with PASSIVE now having run BEFORE the verdict rather than after."""
         db = self._ckpt_db
         failure: str
+        passive_ok = False
         if db is None:
             failure = "no checkpoint connection (legacy direct construction)"
         else:
+            try:
+                db.execute("PRAGMA wal_checkpoint(PASSIVE)").close()
+                passive_ok = True
+            except Exception:  # noqa: BLE001 - the TRUNCATE below is still attempted
+                passive_ok = False
             try:
                 cursor = db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 row = cursor.fetchone()
@@ -897,14 +1245,8 @@ class Store:
             except Exception as exc:  # noqa: BLE001 - the pragma's failure IS the signal
                 failure = repr(exc)
         self.checkpoint_failures += 1
-        passive_ok = False
-        if db is not None:
-            try:
-                db.execute("PRAGMA wal_checkpoint(PASSIVE)").close()
-                passive_ok = True
-                self.checkpoint_passive_fallbacks += 1
-            except Exception:  # noqa: BLE001 - fallback is best-effort
-                passive_ok = False
+        if passive_ok:
+            self.checkpoint_passive_fallbacks += 1
         self._post_to_loop(
             functools.partial(
                 log.warning,
@@ -1009,20 +1351,25 @@ class Store:
         leg_probs: tuple[float, ...],
         context: JsonDict,
     ) -> None:
-        await self._db.execute(
-            "INSERT INTO would_quotes (at, rfq_id, fair_prob, fair_cc, width_cc,"
-            " leg_probs_json, context_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                self._now(),
-                rfq_id,
-                fair_prob,
-                fair_cc,
-                width_cc,
-                json.dumps(list(leg_probs)),
-                json.dumps(context),
-            ),
+        params = (
+            self._now(),
+            rfq_id,
+            fair_prob,
+            fair_cc,
+            width_cc,
+            json.dumps(list(leg_probs)),
+            json.dumps(context),
         )
-        await self._db.commit()
+
+        async def _txn() -> None:
+            await self._db.execute(
+                "INSERT INTO would_quotes (at, rfq_id, fair_prob, fair_cc, width_cc,"
+                " leg_probs_json, context_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params,
+            )
+            await self._db.commit()
+
+        await self._ledger_txn(_txn)
 
     async def record_would_quote_inplay(
         self,
@@ -1148,32 +1495,37 @@ class Store:
         cost_cc = int(position.max_loss_cc)
         # UPSERT: on a replayed open, refresh mutable open-state (fees/legs) but
         # PRESERVE any settlement already recorded — never regress SETTLED→open.
-        await self._db.execute(
-            "INSERT INTO position_ledger (position_id, opened_at, combo_ticker,"
-            " collection_ticker, subaccount, our_side, contracts_centi,"
-            " entry_price_cc, cost_cc, fees_cc, leg_set_hash, legs_json, status,"
-            " settled_value, realized_pnl_cc, settlement_fee_cc, reconciled_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, NULL, NULL)"
-            " ON CONFLICT(position_id) DO UPDATE SET"
-            "   fees_cc=excluded.fees_cc,"
-            "   legs_json=excluded.legs_json,"
-            "   leg_set_hash=excluded.leg_set_hash",
-            (
-                position.position_id,
-                self._now(),
-                position.combo_ticker,
-                position.collection,
-                subaccount,
-                position.our_side.value,
-                int(position.contracts),
-                int(position.entry_price_cc),
-                cost_cc,
-                int(fees_cc),
-                lset_hash,
-                legs_json,
-            ),
+        params = (
+            position.position_id,
+            self._now(),
+            position.combo_ticker,
+            position.collection,
+            subaccount,
+            position.our_side.value,
+            int(position.contracts),
+            int(position.entry_price_cc),
+            cost_cc,
+            int(fees_cc),
+            lset_hash,
+            legs_json,
         )
-        await self._db.commit()
+
+        async def _txn() -> None:
+            await self._db.execute(
+                "INSERT INTO position_ledger (position_id, opened_at, combo_ticker,"
+                " collection_ticker, subaccount, our_side, contracts_centi,"
+                " entry_price_cc, cost_cc, fees_cc, leg_set_hash, legs_json, status,"
+                " settled_value, realized_pnl_cc, settlement_fee_cc, reconciled_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, NULL, NULL)"
+                " ON CONFLICT(position_id) DO UPDATE SET"
+                "   fees_cc=excluded.fees_cc,"
+                "   legs_json=excluded.legs_json,"
+                "   leg_set_hash=excluded.leg_set_hash",
+                params,
+            )
+            await self._db.commit()
+
+        await self._ledger_txn(_txn)
 
     async def ensure_open_position_row(
         self,
@@ -1203,13 +1555,12 @@ class Store:
         from combomaker.risk.exposure import leg_set_hash
 
         lset_hash = leg_set_hash(position.legs)
-        async with self._db.execute(
+        existing = await self._fetchone(
             "SELECT position_id FROM position_ledger"
             " WHERE status='open' AND leg_set_hash=? AND combo_ticker=?"
             " AND our_side=? LIMIT 1",
             (lset_hash, position.combo_ticker, position.our_side.value),
-        ) as cursor:
-            existing = await cursor.fetchone()
+        )
         if existing is not None:
             return False
         await self.record_position_open(
@@ -1239,7 +1590,11 @@ class Store:
         (2) is the restart fix: after ``_rehydrate_exposure_book`` re-mints
         ids, the in-memory ``position_id`` of a held position no longer equals
         the one its open row was written under, so a position_id-only UPDATE
-        could never match and EVERY settled write silently vanished."""
+        could never match and EVERY settled write silently vanished.
+
+        Runs INSIDE the caller's ``_ledger_txn`` body (``record_position_settled``)
+        — the caller holds the connection lock, so the read and the UPDATE that
+        follows it are one serialized lifecycle; never call this outside it."""
         clauses = ["position_id = ?"]
         params: list[object] = [position_id]
         if leg_set_hash and combo_ticker and our_side:
@@ -1294,31 +1649,36 @@ class Store:
         today for a combo that settled last night must carry LAST NIGHT's
         stamp or the seed mis-attributes the whole backlog to today. Default
         (None) keeps the live path's behaviour: reconciled now, settled now."""
-        target = await self._resolve_open_ledger_row(
-            position_id,
-            leg_set_hash=leg_set_hash,
-            combo_ticker=combo_ticker,
-            our_side=our_side,
-            contracts_centi=contracts_centi,
-        )
-        if target is None:
-            return None
-        await self._db.execute(
-            "UPDATE position_ledger SET status='settled', settled_value=?,"
-            " realized_pnl_cc=?, settlement_fee_cc=?,"
-            " fees_cc=fees_cc + ?, reconciled_at=?"
-            " WHERE position_id=? AND status='open'",
-            (
-                float(settled_value),
-                int(realized_pnl_cc),
-                int(settlement_fee_cc),
-                int(settlement_fee_cc),
-                reconciled_at or self._now(),
-                target,
-            ),
-        )
-        await self._db.commit()
-        return target
+        stamp = reconciled_at or self._now()
+
+        async def _txn() -> str | None:
+            target = await self._resolve_open_ledger_row(
+                position_id,
+                leg_set_hash=leg_set_hash,
+                combo_ticker=combo_ticker,
+                our_side=our_side,
+                contracts_centi=contracts_centi,
+            )
+            if target is None:
+                return None
+            await self._db.execute(
+                "UPDATE position_ledger SET status='settled', settled_value=?,"
+                " realized_pnl_cc=?, settlement_fee_cc=?,"
+                " fees_cc=fees_cc + ?, reconciled_at=?"
+                " WHERE position_id=? AND status='open'",
+                (
+                    float(settled_value),
+                    int(realized_pnl_cc),
+                    int(settlement_fee_cc),
+                    int(settlement_fee_cc),
+                    stamp,
+                    target,
+                ),
+            )
+            await self._db.commit()
+            return target
+
+        return await self._ledger_txn(_txn)
 
     async def open_ledger_rows_for_ticker(self, combo_ticker: str) -> list[JsonDict]:
         """Every OPEN ``position_ledger`` row on one combo ticker, oldest first.
@@ -1338,16 +1698,18 @@ class Store:
         # across await points on the shared connection held SQLite's read
         # lock open, which is exactly what made every WAL checkpoint raise
         # SQLITE_LOCKED. Every bounded read in this class follows this shape
-        # now (position_ledger and fills are a few thousand rows); the one
-        # UNBOUNDED read, ``decision_reason_counts``, pages with fetchmany.
-        async with self._db.execute(
+        # (position_ledger and fills are a few thousand rows) — since
+        # 2026-09-05 through ``_fetchall`` / ``_fetchone``, which also hold
+        # the connection lock across the lifecycle (the BUSY_SNAPSHOT wedge,
+        # see ``_ledger_txn``); the one UNBOUNDED read,
+        # ``decision_reason_counts``, runs on its own read-only connection.
+        rows = await self._fetchall(
             "SELECT position_id, combo_ticker, our_side, contracts_centi,"
             " entry_price_cc, opened_at FROM position_ledger"
             " WHERE status='open' AND combo_ticker=?"
             " ORDER BY opened_at ASC, position_id ASC",
             (combo_ticker,),
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         return [
             {
                 "position_id": str(r[0]),
@@ -1369,10 +1731,9 @@ class Store:
         30 s, and only the few hundred tickers in this set can possibly still
         have an open row. Without this the reconciliation would issue one DB
         round-trip per historical settlement, per process."""
-        async with self._db.execute(
+        rows = await self._fetchall(
             "SELECT DISTINCT combo_ticker FROM position_ledger WHERE status='open'"
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         return {str(r[0]) for r in rows}
 
     async def open_ledger_identities(self) -> list[tuple[str, str, str]]:
@@ -1380,24 +1741,22 @@ class Store:
         one batched read for the maintenance-tick DIVERGENCE INVARIANT (open
         exposure positions vs open ledger rows). Alarm-only diagnostics; never
         a risk input."""
-        async with self._db.execute(
+        rows = await self._fetchall(
             "SELECT leg_set_hash, combo_ticker, our_side FROM position_ledger"
             " WHERE status='open'"
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         return [(str(r[0]), str(r[1]), str(r[2])) for r in rows]
 
     async def ledger_position(self, position_id: str) -> JsonDict | None:
         """Read one ledger row by position_id (reports/tests). None if absent."""
-        async with self._db.execute(
+        row = await self._fetchone(
             "SELECT position_id, opened_at, combo_ticker, collection_ticker,"
             " subaccount, our_side, contracts_centi, entry_price_cc, cost_cc,"
             " fees_cc, leg_set_hash, legs_json, status, settled_value,"
             " realized_pnl_cc, settlement_fee_cc, reconciled_at"
             " FROM position_ledger WHERE position_id = ?",
             (position_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
+        )
         if row is None:
             return None
         return {
@@ -1425,10 +1784,10 @@ class Store:
         restart-safe idempotency read the lifecycle uses to skip a REPLAYED
         execution (WS replay, or the 2026-07-16 recovery sweep's REST poll
         racing the WS message) before it books fees/metrics twice."""
-        async with self._db.execute(
+        row = await self._fetchone(
             "SELECT 1 FROM fills WHERE fill_ref = ? LIMIT 1", (fill_ref,)
-        ) as cursor:
-            return await cursor.fetchone() is not None
+        )
+        return row is not None
 
     async def has_fill_for_order_id(self, order_id: str) -> bool:
         """True iff a fills row already records this exchange ``order_id`` —
@@ -1438,10 +1797,10 @@ class Store:
         tape holds same-ticker/same-side/same-exact-count fills hours apart
         (rows 59/61, both 4071 centi-ct NO on one combo), so a structural
         match alone can hit a HISTORICAL fill and double-count it."""
-        async with self._db.execute(
+        row = await self._fetchone(
             "SELECT 1 FROM fills WHERE order_id = ? LIMIT 1", (order_id,)
-        ) as cursor:
-            return await cursor.fetchone() is not None
+        )
+        return row is not None
 
     async def fill_ref_for_order_id(self, order_id: str) -> tuple[str, str] | None:
         """``(fill_ref, status)`` of the fills row recording this exchange
@@ -1451,11 +1810,10 @@ class Store:
         ``fill_order_id_already_in_ledger`` errors, every one a WS+poll race
         on one quote, zero cross-quote misattributions) is told apart from a
         genuine second quote claiming an already-booked order."""
-        async with self._db.execute(
+        row = await self._fetchone(
             "SELECT fill_ref, status FROM fills WHERE order_id = ? LIMIT 1",
             (order_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
+        )
         if row is None:
             return None
         return str(row[0]), str(row[1])
@@ -1463,10 +1821,9 @@ class Store:
     async def fill_status(self, fill_ref: str) -> str | None:
         """Verification state of one fills row (booked|verified|phantom), or
         None when no row exists."""
-        async with self._db.execute(
+        row = await self._fetchone(
             "SELECT status FROM fills WHERE fill_ref = ? LIMIT 1", (fill_ref,)
-        ) as cursor:
-            row = await cursor.fetchone()
+        )
         return None if row is None else str(row[0])
 
     async def mark_fill_verified(
@@ -1479,19 +1836,23 @@ class Store:
         no-op; a voided phantom is never resurrected here — a tape fill that
         appears AFTER a void is the fills-ledger sweep's alarm to raise).
         Returns True iff a row was stamped."""
-        cursor = await self._db.execute(
-            "UPDATE fills SET status = ?, verified_at = ?, exchange_fill_id = ?"
-            " WHERE fill_ref = ? AND status = ?",
-            (
-                self.FILL_STATUS_VERIFIED,
-                self._now(),
-                exchange_fill_id,
-                fill_ref,
-                self.FILL_STATUS_BOOKED,
-            ),
-        )
-        await self._db.commit()
-        return (cursor.rowcount or 0) > 0
+
+        async def _txn() -> bool:
+            cursor = await self._db.execute(
+                "UPDATE fills SET status = ?, verified_at = ?, exchange_fill_id = ?"
+                " WHERE fill_ref = ? AND status = ?",
+                (
+                    self.FILL_STATUS_VERIFIED,
+                    self._now(),
+                    exchange_fill_id,
+                    fill_ref,
+                    self.FILL_STATUS_BOOKED,
+                ),
+            )
+            await self._db.commit()
+            return (cursor.rowcount or 0) > 0
+
+        return await self._ledger_txn(_txn)
 
     async def void_phantom_fill(self, fill_ref: str, *, reason: str) -> dict[str, int]:
         """VOID a phantom execution across the three ledgers (2026-09-04
@@ -1514,36 +1875,41 @@ class Store:
         evidence, this method enforces the state machine. Synchronous +
         committed like every other risk-relevant write. Returns the rows
         touched per table (tests + the log line)."""
-        touched = {"fills": 0, "position_ledger": 0, "ev_ledger": 0}
-        cursor = await self._db.execute(
-            "UPDATE fills SET status = ?, verified_at = ?, exchange_fill_id = ?"
-            " WHERE fill_ref = ? AND status = ?",
-            (
-                self.FILL_STATUS_PHANTOM,
-                self._now(),
-                f"phantom:{reason}",
-                fill_ref,
-                self.FILL_STATUS_BOOKED,
-            ),
-        )
-        touched["fills"] = cursor.rowcount if cursor.rowcount > 0 else 0
-        if touched["fills"] == 0:
+
+
+        async def _txn() -> dict[str, int]:
+            touched = {"fills": 0, "position_ledger": 0, "ev_ledger": 0}
+            cursor = await self._db.execute(
+                "UPDATE fills SET status = ?, verified_at = ?, exchange_fill_id = ?"
+                " WHERE fill_ref = ? AND status = ?",
+                (
+                    self.FILL_STATUS_PHANTOM,
+                    self._now(),
+                    f"phantom:{reason}",
+                    fill_ref,
+                    self.FILL_STATUS_BOOKED,
+                ),
+            )
+            touched["fills"] = cursor.rowcount if cursor.rowcount > 0 else 0
+            if touched["fills"] == 0:
+                await self._db.commit()
+                return touched
+            cursor = await self._db.execute(
+                "UPDATE position_ledger SET status = ?, reconciled_at = ?"
+                " WHERE position_id = ? AND status = 'open'",
+                (self.POSITION_STATUS_PHANTOM, self._now(), fill_ref),
+            )
+            touched["position_ledger"] = cursor.rowcount if cursor.rowcount > 0 else 0
+            cursor = await self._db.execute(
+                "UPDATE ev_ledger SET expected_edge_cc = 0, realized_pnl_cc = 0"
+                " WHERE fill_ref = ?",
+                (fill_ref,),
+            )
+            touched["ev_ledger"] = cursor.rowcount if cursor.rowcount > 0 else 0
             await self._db.commit()
             return touched
-        cursor = await self._db.execute(
-            "UPDATE position_ledger SET status = ?, reconciled_at = ?"
-            " WHERE position_id = ? AND status = 'open'",
-            (self.POSITION_STATUS_PHANTOM, self._now(), fill_ref),
-        )
-        touched["position_ledger"] = cursor.rowcount if cursor.rowcount > 0 else 0
-        cursor = await self._db.execute(
-            "UPDATE ev_ledger SET expected_edge_cc = 0, realized_pnl_cc = 0"
-            " WHERE fill_ref = ?",
-            (fill_ref,),
-        )
-        touched["ev_ledger"] = cursor.rowcount if cursor.rowcount > 0 else 0
-        await self._db.commit()
-        return touched
+
+        return await self._ledger_txn(_txn)
 
     async def fills_verification_watermark(self) -> tuple[int, str] | None:
         """``(max_fills_id_at_migration, migrated_at_iso)`` — the once-written
@@ -1554,14 +1920,14 @@ class Store:
         cached = self._fills_verification_watermark
         if cached is not None:
             return cached
-        async with self._db.execute(
+        meta_rows = await self._fetchall(
             "SELECT key, value FROM store_meta WHERE key IN (?, ?)",
             (
                 self.META_FILLS_VERIFICATION_WATERMARK_ID,
                 self.META_FILLS_VERIFICATION_MIGRATED_AT,
             ),
-        ) as cursor:
-            rows = {str(row[0]): str(row[1]) for row in await cursor.fetchall()}
+        )
+        rows = {str(row[0]): str(row[1]) for row in meta_rows}
         wm_raw = rows.get(self.META_FILLS_VERIFICATION_WATERMARK_ID)
         at = rows.get(self.META_FILLS_VERIFICATION_MIGRATED_AT)
         if wm_raw is None or at is None:
@@ -1584,13 +1950,12 @@ class Store:
         the settlement-corroborated repair tool — an exact order_id lookup
         would wrongly void the three 2026-07-18 truncated-id rows). Ordered
         oldest-first; the caller bounds the work per tick."""
-        async with self._db.execute(
+        rows = await self._fetchall(
             "SELECT id, at, fill_ref, order_id, combo_ticker, our_side,"
             " contracts_centi, fee_cc FROM fills"
             " WHERE status = ? AND order_id IS NOT NULL AND id > ? ORDER BY id",
             (self.FILL_STATUS_BOOKED, int(after_id)),
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         return [
             {
                 "id": int(row[0]),
@@ -1619,14 +1984,13 @@ class Store:
         under the side of its FIRST row with the summed magnitude — the
         divergence alarm fires either way."""
         since = post_fix_since if post_fix_since is not None else ""
-        async with self._db.execute(
+        rows = await self._fetchall(
             "SELECT combo_ticker, our_side, SUM(contracts_centi), COUNT(*),"
             " SUM(CASE WHEN opened_at >= ? THEN 1 ELSE 0 END)"
             " FROM position_ledger WHERE status='open'"
             " GROUP BY combo_ticker, our_side ORDER BY combo_ticker, our_side",
             (since,),
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         out: dict[str, tuple[str, int, int, int]] = {}
         for row in rows:
             ticker = str(row[0])
@@ -1646,24 +2010,22 @@ class Store:
         one process: Σ settlement ``realized_pnl_cc`` reconciled in the window
         plus Σ(−fill fee) for fills in the window. ISO-UTC string bounds
         (lexicographic — the ledger stamps are tz-aware isoformat)."""
-        async with self._db.execute(
+        row = await self._fetchone(
             "SELECT COALESCE(SUM(realized_pnl_cc), 0) FROM position_ledger"
             " WHERE reconciled_at IS NOT NULL"
             " AND reconciled_at >= ? AND reconciled_at < ?",
             (start_iso, end_iso),
-        ) as cursor:
-            row = await cursor.fetchone()
-            settled = int(row[0]) if row and row[0] is not None else 0
+        )
+        settled = int(row[0]) if row and row[0] is not None else 0
         # A VOIDED phantom's fee never left the account (no fill happened) and
         # the in-process accumulator reversed it at void time — exclude it here
         # too so the restart-seeded figure matches (2026-09-04 build, item D).
-        async with self._db.execute(
+        row = await self._fetchone(
             "SELECT COALESCE(SUM(fee_cc), 0) FROM fills"
             " WHERE fee_cc IS NOT NULL AND at >= ? AND at < ? AND status != 'phantom'",
             (start_iso, end_iso),
-        ) as cursor:
-            row = await cursor.fetchone()
-            fees = int(row[0]) if row and row[0] is not None else 0
+        )
+        fees = int(row[0]) if row and row[0] is not None else 0
         return settled - fees
 
     async def fill_order_ids(self) -> set[str]:
@@ -1682,11 +2044,10 @@ class Store:
         # claim (one exchange order = one row) while this read keeps the miss
         # LOUD. Automatic un-void is not built; the alarm is the operator's cue
         # to un-void by hand (the row and its raw_json are intact).
-        async with self._db.execute(
+        rows = await self._fetchall(
             "SELECT DISTINCT order_id FROM fills WHERE order_id IS NOT NULL"
             " AND status != 'phantom'"
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         return {str(row[0]) for row in rows}
 
     async def fill_null_order_id_keys(self) -> set[tuple[str, int]]:
@@ -1695,11 +2056,10 @@ class Store:
         creator_order_id). The fills-ledger sweep matches a tape row against
         these BEFORE alarming, so a legitimately-recorded-but-unkeyed fill is
         a visible skip, not a permanent false alarm pinning the watermark."""
-        async with self._db.execute(
+        rows = await self._fetchall(
             "SELECT combo_ticker, contracts_centi FROM fills "
             "WHERE order_id IS NULL AND status != 'phantom'"
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         return {(str(row[0]), int(row[1])) for row in rows}
 
     async def settled_grade_rows(self) -> list[JsonDict]:
@@ -1722,12 +2082,10 @@ class Store:
             " SUM(COALESCE(fee_cc, 0)), SUM(expected_edge_cc IS NULL)"
             " FROM fills GROUP BY combo_ticker"
         )
-        async with self._db.execute(fills_q) as cursor:
-            fill_rows = await cursor.fetchall()
+        fill_rows = await self._fetchall(fills_q)
         fills = {str(r[0]): r for r in fill_rows}
         out: list[JsonDict] = []
-        async with self._db.execute(ledger_q) as cursor:
-            ledger_rows = await cursor.fetchall()
+        ledger_rows = await self._fetchall(ledger_q)
         for ticker, ctr, realized, settle_fee, opened_at, settled_at, legs_json in ledger_rows:
             f = fills.get(str(ticker))
             if f is None or f[2] is None or int(f[4] or 0) > 0 or not int(f[1] or 0):
@@ -1755,10 +2113,10 @@ class Store:
         local fill record exists distinguishes "our own fill fell out of the
         book" (the 2026-07-18 fill-recovery incidents) from "a manual/external
         trade we never saw"."""
-        async with self._db.execute(
+        row = await self._fetchone(
             "SELECT 1 FROM fills WHERE combo_ticker = ? LIMIT 1", (combo_ticker,)
-        ) as cursor:
-            return await cursor.fetchone() is not None
+        )
+        return row is not None
 
     async def record_fill(
         self,
@@ -1790,38 +2148,43 @@ class Store:
         writer's order-id pre-check and of the partial UNIQUE index, so a
         race that slips both pre-checks lands as a silent no-op (False),
         never an IntegrityError into the executed handler."""
-        cursor = await self._db.execute(
-            "INSERT INTO fills (at, fill_ref, order_id, combo_ticker, our_side,"
-            " contracts_centi, price_cc, fee_cc, expected_edge_cc, raw_json, status)"
-            " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
-            " WHERE NOT EXISTS (SELECT 1 FROM fills WHERE fill_ref = ?)"
-            " AND (? IS NULL OR NOT EXISTS (SELECT 1 FROM fills WHERE order_id = ?))",
-            (
-                self._now(),
-                fill_ref,
-                order_id,
-                combo_ticker,
-                our_side,
-                contracts_centi,
-                price_cc,
-                fee_cc,
-                expected_edge_cc,
-                json.dumps(raw),
-                self.FILL_STATUS_BOOKED,
-                fill_ref,
-                order_id,
-                order_id,
-            ),
-        )
-        inserted = (cursor.rowcount or 0) > 0
-        if inserted and expected_edge_cc is not None:
-            await self._db.execute(
-                "INSERT INTO ev_ledger (at, fill_ref, expected_edge_cc, realized_pnl_cc)"
-                " VALUES (?, ?, ?, NULL)",
-                (self._now(), fill_ref, expected_edge_cc),
+        raw_json = json.dumps(raw)
+
+        async def _txn() -> bool:
+            cursor = await self._db.execute(
+                "INSERT INTO fills (at, fill_ref, order_id, combo_ticker, our_side,"
+                " contracts_centi, price_cc, fee_cc, expected_edge_cc, raw_json, status)"
+                " SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+                " WHERE NOT EXISTS (SELECT 1 FROM fills WHERE fill_ref = ?)"
+                " AND (? IS NULL OR NOT EXISTS (SELECT 1 FROM fills WHERE order_id = ?))",
+                (
+                    self._now(),
+                    fill_ref,
+                    order_id,
+                    combo_ticker,
+                    our_side,
+                    contracts_centi,
+                    price_cc,
+                    fee_cc,
+                    expected_edge_cc,
+                    raw_json,
+                    self.FILL_STATUS_BOOKED,
+                    fill_ref,
+                    order_id,
+                    order_id,
+                ),
             )
-        await self._db.commit()
-        return inserted
+            inserted = (cursor.rowcount or 0) > 0
+            if inserted and expected_edge_cc is not None:
+                await self._db.execute(
+                    "INSERT INTO ev_ledger (at, fill_ref, expected_edge_cc, realized_pnl_cc)"
+                    " VALUES (?, ?, ?, NULL)",
+                    (self._now(), fill_ref, expected_edge_cc),
+                )
+            await self._db.commit()
+            return inserted
+
+        return await self._ledger_txn(_txn)
 
     async def record_markout(
         self,
@@ -1833,44 +2196,46 @@ class Store:
         raw_mid_at_fill_cc: int | None,
         raw_mid_now_cc: int | None,
     ) -> None:
-        await self._db.execute(
-            "INSERT INTO markouts (at, fill_ref, horizon_s, fair_at_fill_cc, fair_now_cc,"
-            " raw_mid_at_fill_cc, raw_mid_now_cc) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                self._now(),
-                fill_ref,
-                horizon_s,
-                fair_at_fill_cc,
-                fair_now_cc,
-                raw_mid_at_fill_cc,
-                raw_mid_now_cc,
-            ),
+        params = (
+            self._now(),
+            fill_ref,
+            horizon_s,
+            fair_at_fill_cc,
+            fair_now_cc,
+            raw_mid_at_fill_cc,
+            raw_mid_now_cc,
         )
-        await self._db.commit()
+
+        async def _txn() -> None:
+            await self._db.execute(
+                "INSERT INTO markouts (at, fill_ref, horizon_s, fair_at_fill_cc, fair_now_cc,"
+                " raw_mid_at_fill_cc, raw_mid_now_cc) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params,
+            )
+            await self._db.commit()
+
+        await self._ledger_txn(_txn)
 
     async def record_combo_trades(self, ticker: str, trades: list[JsonDict]) -> int:
         """Store public combo-market trades (deduped on trade_id). This is the
         implied-markup dataset: executed RFQ prices vs our shadow fairs."""
-        stored = 0
+        from combomaker.core.money import cc_from_dollars_str
+        from combomaker.core.quantity import qty_from_fp_str
+
+        rows: list[tuple[Any, ...]] = []
         for trade in trades:
             trade_id = str(trade.get("trade_id") or trade.get("fill_id") or "")
             if not trade_id:
                 continue
             price_raw = trade.get("yes_price_dollars") or trade.get("yes_price")
             try:
-                from combomaker.core.money import cc_from_dollars_str
-                from combomaker.core.quantity import qty_from_fp_str
-
                 price_cc = int(cc_from_dollars_str(str(price_raw))) if price_raw else None
                 count_raw = trade.get("count_fp") or trade.get("count")
                 count_centi = int(qty_from_fp_str(str(count_raw))) if count_raw else None
             except ValueError:
                 price_cc = None
                 count_centi = None
-            cursor = await self._db.execute(
-                "INSERT OR IGNORE INTO combo_trades (trade_id, seen_at, ticker,"
-                " created_time, yes_price_cc, count_centi, taker_side, raw_json)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            rows.append(
                 (
                     trade_id,
                     self._now(),
@@ -1880,18 +2245,33 @@ class Store:
                     count_centi,
                     trade.get("taker_side"),
                     json.dumps(trade),
-                ),
+                )
             )
-            stored += cursor.rowcount if cursor.rowcount > 0 else 0
-        await self._db.commit()
-        return stored
+
+        async def _txn() -> int:
+            stored = 0
+            for params in rows:
+                cursor = await self._db.execute(
+                    "INSERT OR IGNORE INTO combo_trades (trade_id, seen_at, ticker,"
+                    " created_time, yes_price_cc, count_centi, taker_side, raw_json)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    params,
+                )
+                stored += cursor.rowcount if cursor.rowcount > 0 else 0
+            await self._db.commit()
+            return stored
+
+        return await self._ledger_txn(_txn)
 
     async def settle_ev_entry(self, fill_ref: str, realized_pnl_cc: int) -> None:
-        await self._db.execute(
-            "UPDATE ev_ledger SET realized_pnl_cc = ? WHERE fill_ref = ?",
-            (realized_pnl_cc, fill_ref),
-        )
-        await self._db.commit()
+        async def _txn() -> None:
+            await self._db.execute(
+                "UPDATE ev_ledger SET realized_pnl_cc = ? WHERE fill_ref = ?",
+                (realized_pnl_cc, fill_ref),
+            )
+            await self._db.commit()
+
+        await self._ledger_txn(_txn)
 
     # --- simple readers for reports/tests ---
 
@@ -1909,8 +2289,7 @@ class Store:
             "position_ledger",
         }:
             raise ValueError(f"unknown table {table!r}")
-        async with self._db.execute(f"SELECT COUNT(*) FROM {table}") as cursor:  # noqa: S608
-            row = await cursor.fetchone()
+        row = await self._fetchone(f"SELECT COUNT(*) FROM {table}")  # noqa: S608
         return int(row[0]) if row else 0
 
     async def _ledger_legsets(
@@ -1932,14 +2311,13 @@ class Store:
         placeholders = ",".join("?" * len(tickers))
         legsets: dict[str, dict[str, Any]] = {}
         # leg_set_hash is the durable identity; legs_json/collection are payload.
-        async with self._db.execute(
+        rows = await self._fetchall(
             "SELECT combo_ticker, leg_set_hash, MAX(legs_json) AS legs_json,"
             " MAX(collection_ticker) AS collection_ticker"
             f" FROM position_ledger WHERE combo_ticker IN ({placeholders})"  # noqa: S608 - placeholders only
             " GROUP BY combo_ticker, leg_set_hash",
             tuple(tickers),
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         for combo_ticker, _hash, legs_json, collection in rows:
             if not legs_json:
                 continue
@@ -2010,16 +2388,14 @@ class Store:
                 f" FROM rfqs WHERE market_ticker IN ({tape_placeholders})"  # noqa: S608 - placeholders only
                 " GROUP BY market_ticker, legs_json"
             )
-            async with self._db.execute(legs_q, tuple(tape_needed)) as cursor:
-                legs_rows = await cursor.fetchall()
+            legs_rows = await self._fetchall(legs_q, tuple(tape_needed))
             for market_ticker, legs_json, collection in legs_rows:
                 if not legs_json:
                     continue
                 tape_legsets.setdefault(market_ticker, {})[legs_json] = collection
 
         out: list[JsonDict] = []
-        async with self._db.execute(fills_q, tuple(tickers)) as cursor:
-            fills_rows = await cursor.fetchall()
+        fills_rows = await self._fetchall(fills_q, tuple(tickers))
         for combo_ticker, our_side, ctr, loss_num in fills_rows:
             if not ctr:
                 continue
@@ -2060,31 +2436,54 @@ class Store:
         return out
 
     async def decision_reason_counts(self) -> dict[str, int]:
-        # The ONE unbounded read here (decisions grows without bound on the
-        # live DB), so it pages with fetchmany rather than materializing —
-        # a fetchall could hold the whole table in memory. The statement
-        # stays open between chunks, but each chunk's await is bounded and
-        # the checkpoint no longer shares this connection (2026-08-19).
-        counts: dict[str, int] = {}
-        cursor = await self._db.execute("SELECT reasons_json FROM decisions")
+        """``{reason: count}`` over EVERY decisions row — the ONE unbounded
+        read of this class (decisions grows ~10M rows/h at a Saturday-night
+        3,000 tape rows/s), called every 300 s by the live report loop
+        (ops/report.py ``build_report`` ← quote_app ``_report_loop``).
+
+        OFF THE SHARED CONNECTION (2026-09-05 review, must-fix #2). It used
+        to page ``SELECT reasons_json FROM decisions`` with fetchmany on the
+        shared aiosqlite connection: one ACTIVE statement across ~1,000
+        chunk awaits = MINUTES of pinned read snapshot every 5 min — with
+        the tape writer committing on its own connection, exactly the
+        SQLITE_BUSY_SNAPSHOT wedge trigger the review probe used (40/40
+        ``record_fill`` raised during the pager; see ``_ledger_txn``). Under
+        the connection lock it would instead have held the ledger lock for
+        those minutes. Now: a ``mode=ro`` stdlib connection of its own in a
+        worker thread (``asyncio.to_thread`` — the ops/acceptance_seed.py
+        pattern), and the counting happens INSIDE SQLite
+        (``_DECISION_REASON_COUNTS_SQL``: ``json_each`` + GROUP BY, C code
+        that releases the GIL while stepping) instead of ``json.loads`` per
+        row in Python — the result is a few dozen rows, so nothing pages and
+        the thread holds no Python loop against the event loop's GIL share.
+        That reader pins the WAL read-mark only for the checkpoint's
+        TRUNCATE, which no longer waits on it (``_open_checkpoint_connection``).
+        Legacy direct construction (no path): the same aggregate on the
+        shared connection under the lock — no writer thread can exist there."""
+        if self._path is None:
+            rows = await self._fetchall(_DECISION_REASON_COUNTS_SQL)
+            return {str(r[0]): int(r[1]) for r in rows}
+        return await asyncio.to_thread(self._decision_reason_counts_ro, self._path)
+
+    @staticmethod
+    def _decision_reason_counts_ro(path: Path) -> dict[str, int]:
+        """Worker-thread body of ``decision_reason_counts``: its OWN read-only
+        connection (``mode=ro`` URI), the store's existing lock tolerance
+        (``BUSY_TIMEOUT_MS`` — a WAL reader waits only through a WAL restart /
+        recovery instant), one aggregate statement, closed on the way out."""
+        con = sqlite3.connect(
+            f"file:{path.resolve().as_posix()}?mode=ro", uri=True, timeout=STORE_OP_TIMEOUT_S
+        )
         try:
-            while True:
-                rows = await cursor.fetchmany(10_000)
-                if not rows:
-                    break
-                for row in rows:
-                    for reason in json.loads(row[0]):
-                        counts[reason] = counts.get(reason, 0) + 1
+            con.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+            rows = con.execute(_DECISION_REASON_COUNTS_SQL).fetchall()
         finally:
-            await cursor.close()
-        return counts
+            con.close()
+        return {str(r[0]): int(r[1]) for r in rows}
 
     async def decision_kind_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
-        async with self._db.execute(
-            "SELECT kind, COUNT(*) FROM decisions GROUP BY kind"
-        ) as cursor:
-            rows = await cursor.fetchall()
+        rows = await self._fetchall("SELECT kind, COUNT(*) FROM decisions GROUP BY kind")
         for row in rows:
             counts[str(row[0])] = int(row[1])
         return counts
@@ -2094,13 +2493,12 @@ class Store:
         EXCLUDED (2026-09-04 review fixes): ``void_phantom_fill`` zeroes its
         expected/realized, but a 0/0 row still counted as n+1 in a row-based
         grade — a fill that never happened must not be graded at all."""
-        async with self._db.execute(
+        row = await self._fetchone(
             "SELECT COUNT(*), COALESCE(SUM(e.expected_edge_cc), 0),"
             " COUNT(e.realized_pnl_cc), COALESCE(SUM(e.realized_pnl_cc), 0)"
             " FROM ev_ledger e WHERE NOT EXISTS ("
             "SELECT 1 FROM fills f WHERE f.fill_ref = e.fill_ref AND f.status = 'phantom')"
-        ) as cursor:
-            row = await cursor.fetchone()
+        )
         assert row is not None
         return {
             "fills": int(row[0]),
@@ -2113,7 +2511,7 @@ class Store:
         """Mean fair/raw-mid drift per horizon WITH sample counts — markout
         stats without an n are noise dressed up as signal."""
         out: list[dict[str, object]] = []
-        async with self._db.execute(
+        rows = await self._fetchall(
             "SELECT horizon_s,"
             " COUNT(*),"
             " AVG(fair_now_cc - fair_at_fill_cc),"
@@ -2121,8 +2519,7 @@ class Store:
             " FROM markouts"
             " WHERE fair_now_cc IS NOT NULL AND fair_at_fill_cc IS NOT NULL"
             " GROUP BY horizon_s ORDER BY horizon_s"
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         for row in rows:
             out.append(
                 {

@@ -1,8 +1,11 @@
 import asyncio
 import contextlib
+import json
 import queue
+import re
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,8 +14,12 @@ import pytest
 
 import combomaker.ops.persistence as persistence
 from combomaker.core.clock import FakeClock
+from combomaker.core.conventions import Side
+from combomaker.core.money import CentiCents
+from combomaker.core.quantity import CentiContracts
 from combomaker.ops.persistence import Store
 from combomaker.rfq.models import Rfq
+from combomaker.risk.exposure import LegRef, OpenPosition
 
 RFQ = Rfq.from_ws(
     {
@@ -289,6 +296,9 @@ class _LogSpy:
 
     def warning(self, event: str, **kw: Any) -> None:
         self._record("warning", event, kw)
+
+    def error(self, event: str, **kw: Any) -> None:
+        self._record("error", event, kw)
 
     def exception(self, event: str, **kw: Any) -> None:
         self._record("exception", event, kw)
@@ -833,4 +843,799 @@ async def test_legacy_direct_construction_cannot_start_writer_and_checkpoint_is_
         assert len(failed) == 1
         assert failed[0][2]["passive_fallback_ok"] is False
     finally:
+        await store.close()
+
+
+# --------------------------------------------------------------------------- #
+# THE SHARED CONNECTION UNDER A FOREIGN COMMITTER (2026-09-05 review fixes).   #
+# With the tape writer committing on ITS OWN connection, the shared aiosqlite  #
+# connection has a foreign committer on its WAL: any read statement left       #
+# ACTIVE across a loop hop while another coroutine writes → SQLITE_BUSY_       #
+# SNAPSHOT ('database is locked', instantly) + a WEDGED connection (Python's   #
+# implicit BEGIN keeps the stale snapshot for the rest of the run). Review     #
+# probe on the real Store: 40/40 record_fill raised during the report pager;  #
+# main-connection count(decisions) 300,000 vs 305,000 truth. Fixes: ONE        #
+# connection lock around every statement lifecycle (_fetchall / _fetchone /   #
+# _ledger_txn), rollback + one retry on a lock-class failure, the report's     #
+# unbounded pager moved to its own read-only connection, and the checkpoint    #
+# connection that never waits.                                                 #
+# --------------------------------------------------------------------------- #
+
+
+def _position(ticker: str = "KXMVE-T1") -> OpenPosition:
+    return OpenPosition(
+        position_id=f"fill:{ticker}",
+        combo_ticker=ticker,
+        collection="KXMVESPORTS",
+        our_side=Side.NO,
+        contracts=CentiContracts(500),
+        entry_price_cc=CentiCents(6200),
+        legs=(LegRef("M1", "E1", "yes"), LegRef("M2", "E2", "no")),
+    )
+
+
+async def _fill(store: Store, k: str, *, ticker: str = "KXMVE-T1") -> bool:
+    return await store.record_fill(
+        f"fill:{k}",
+        order_id=f"o{k}",
+        combo_ticker=ticker,
+        our_side="no",
+        contracts_centi=100,
+        price_cc=5000,
+        fee_cc=1,
+        expected_edge_cc=10,
+        raw={},
+    )
+
+
+def _truth(path: Path, sql: str) -> int:
+    """A FRESH read-only connection's answer — the file's truth, immune to any
+    stale snapshot the shared connection might be pinned on."""
+    con = sqlite3.connect(f"file:{path.resolve().as_posix()}?mode=ro", uri=True)
+    try:
+        return int(con.execute(sql).fetchone()[0])
+    finally:
+        con.close()
+
+
+def _foreign_commit(path: Path) -> None:
+    """One committed row from ANOTHER connection — the tape thread's role:
+    advances the WAL past whatever snapshot the shared connection holds."""
+    other = sqlite3.connect(path)
+    try:
+        other.execute(
+            "INSERT INTO decisions (at, kind, rfq_id, reasons_json, context_json)"
+            " VALUES ('t', 'no_quote', 'foreign', '[]', '{}')"
+        )
+        other.commit()
+    finally:
+        other.close()
+
+
+class _LockWitnessDB:
+    """Delegating aiosqlite proxy over the SHARED connection recording, for
+    every execute / commit / rollback, whether the store's connection lock
+    was HELD at call time (all other traffic passes through untouched)."""
+
+    def __init__(self, db: Any, lock: asyncio.Lock) -> None:
+        self._db = db
+        self._lock = lock
+        self.calls: list[tuple[str, bool]] = []
+
+    def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+        self.calls.append((sql, self._lock.locked()))
+        return self._db.execute(sql, *args, **kwargs)
+
+    def commit(self) -> Any:
+        self.calls.append(("COMMIT", self._lock.locked()))
+        return self._db.commit()
+
+    def rollback(self) -> Any:
+        self.calls.append(("ROLLBACK", self._lock.locked()))
+        return self._db.rollback()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._db, name)
+
+
+async def test_ledger_writes_survive_shared_connection_reads_under_the_tape_thread(
+    tmp_path: Path,
+) -> None:
+    """THE REVIEW PROBE as a regression test (must-fix #1 (c)). The writer
+    thread commits tape on ITS connection (a foreign committer on the shared
+    connection's WAL) while, on the loop, a tape firehose, a reader task
+    issuing bounded shared-connection reads (count / has_fill /
+    open_ledger_tickers — each a multi-hop statement lifecycle), the report's
+    ``decision_reason_counts`` and 10 ``record_fill`` calls all interleave.
+    The firehose keeps the loop CPU-BOUND (a ``json.loads`` burn per turn, the
+    intake's own work) at roughly the live tape rate — the shape that also
+    caught the writer thread's GIL starvation (an ``executemany`` batch held
+    the write lock for seconds; ``record_fill`` failed SQLITE_BUSY). On the
+    unfixed branch: every fill raised 'database is locked' and the connection
+    stayed wedged. Now: every fill books, the connection is never left inside
+    a transaction, the lock alone prevents the snapshot collision (no rollback
+    was even needed), and main-connection reads equal a fresh connection's
+    truth."""
+    path = tmp_path / "t.sqlite3"
+    store = await Store.open(path, FakeClock())
+    try:
+        store.start_writer()
+        await _flood(store, 2000)  # rows for the report scan to count
+        stop = False
+        reads = 0
+        frame = '{"type": "rfq_created", "msg": {"id": "r1", "legs": [{"t": "M1", "s": "yes"}]}}'
+
+        async def firehose() -> None:
+            i = 0
+            while not stop:
+                for _ in range(10):
+                    await store.record_decision("no_quote", f"f{i}", ["skip_test", "a"], {})
+                    i += 1
+                for _ in range(400):  # ~2 ms of the intake's own CPU work per turn
+                    json.loads(frame)
+                await asyncio.sleep(0)
+
+        async def reader() -> None:
+            nonlocal reads
+            while not stop:
+                await store.count("decisions")
+                await store.open_ledger_tickers()
+                reads += 2
+                await asyncio.sleep(0)
+
+        tasks = [asyncio.create_task(firehose()), asyncio.create_task(reader())]
+        scan = asyncio.create_task(store.decision_reason_counts())
+        booked = 0
+        for k in range(10):
+            await asyncio.sleep(0.005)
+            booked += int(await _fill(store, str(k)))
+        stop = True
+        await asyncio.gather(*tasks)
+        counts = await scan
+        assert booked == 10
+        assert reads > 0
+        assert counts["skip_test"] >= 2000
+        assert store._db.in_transaction is False  # noqa: SLF001 — never wedged
+        assert store.ledger_txn_rollbacks == 0  # the LOCK prevented every collision
+        assert store.ledger_txn_retries == 0
+        assert await store.flush_writer(10.0)
+        assert await store.count("fills") == 10 == _truth(path, "SELECT COUNT(*) FROM fills")
+        # Main-connection reads are FRESH (a wedged connection would be pinned
+        # on the snapshot the first failure took).
+        assert await store.count("decisions") == _truth(path, "SELECT COUNT(*) FROM decisions")
+    finally:
+        await store.close()
+
+
+async def test_every_shared_connection_statement_runs_under_the_connection_lock(
+    tmp_path: Path,
+) -> None:
+    """STRUCTURAL: every execute / commit / rollback this class issues on the
+    shared connection after open happens with the connection lock HELD —
+    reads (``_fetchall`` / ``_fetchone``) and transactions (``_ledger_txn``)
+    alike — across the whole public surface. ``decision_reason_counts`` issues
+    NOTHING on the shared connection (its own read-only connection)."""
+    store = await Store.open(tmp_path / "t.sqlite3", FakeClock())
+    try:
+        witness = _LockWitnessDB(store._db, store._conn_lock)  # noqa: SLF001
+        store._db = witness  # type: ignore[assignment]  # noqa: SLF001
+        # Tape (sync mode) + shadow + fits-adjacent writes.
+        await store.record_rfq(RFQ, source="ws")
+        await store.record_rfq_deleted("rfq_1", {})
+        await store.record_decision("no_quote", "rfq_1", ["skip_test"], {})
+        await store.record_would_quote(
+            "rfq_1", fair_prob=0.5, fair_cc=5000, width_cc=100, leg_probs=(0.5,), context={}
+        )
+        await store.record_would_quote_inplay(
+            "rfq_1",
+            market_ticker="KXMVE-C1",
+            fair_cc=5000,
+            yes_bid_cc=4900,
+            no_bid_cc=4900,
+            target_cost_cc=None,
+            contracts_centi=100,
+            leg_time_to_start_s={"M1": -10.0},
+            context={},
+        )
+        # Ledger.
+        await store.record_position_open(_position(), subaccount="0")
+        assert await store.ensure_open_position_row(_position(), subaccount="0") is False
+        assert await store.ensure_open_position_row(_position("KXMVE-T2"), subaccount="0")
+        assert await _fill(store, "a") is True
+        assert await _fill(store, "b") is True
+        assert await store.has_fill("fill:a") is True
+        assert await store.has_fill_for_order_id("oa") is True
+        assert await store.fill_ref_for_order_id("oa") == ("fill:a", "booked")
+        assert await store.fill_status("fill:a") == "booked"
+        assert await store.has_fill_for_ticker("KXMVE-T1") is True
+        assert await store.mark_fill_verified("fill:a", exchange_fill_id="x") is True
+        assert (await store.void_phantom_fill("fill:b", reason="r"))["fills"] == 1
+        assert await store.fills_verification_watermark() is not None
+        assert await store.booked_unverified_fills(after_id=0) == []
+        assert await store.fill_order_ids() == {"oa"}
+        assert await store.fill_null_order_id_keys() == set()
+        await store.record_markout(
+            "fill:a",
+            horizon_s=60.0,
+            fair_at_fill_cc=5000,
+            fair_now_cc=5100,
+            raw_mid_at_fill_cc=None,
+            raw_mid_now_cc=None,
+        )
+        assert (await store.markout_summary())[0]["n"] == 1
+        assert await store.record_combo_trades("KXMVE-T1", [{"trade_id": "t1"}]) == 1
+        await store.settle_ev_entry("fill:a", 5)
+        assert (await store.ev_summary())["fills"] == 1
+        settled = await store.record_position_settled(
+            "fill:KXMVE-T1", settled_value=0.0, realized_pnl_cc=100, settlement_fee_cc=1
+        )
+        assert settled == "fill:KXMVE-T1"
+        assert await store.open_ledger_rows_for_ticker("KXMVE-T2")
+        assert await store.open_ledger_tickers() == {"KXMVE-T2"}
+        assert len(await store.open_ledger_identities()) == 1
+        assert (await store.ledger_position("fill:KXMVE-T1"))["status"] == "settled"
+        assert "KXMVE-T2" in await store.open_ledger_quantity_by_ticker()
+        assert await store.day_realized_pnl_cc("2000", "2100") == 100 - 1
+        assert await store.settled_grade_rows()
+        assert await store.held_positions(["KXMVE-T1"])
+        assert await store.count("fills") == 2
+        assert await store.decision_kind_counts() == {"no_quote": 1}
+        n_calls = len(witness.calls)
+        assert await store.decision_reason_counts() == {"skip_test": 1}
+        assert len(witness.calls) == n_calls  # not ONE statement on the shared connection
+
+        assert len(witness.calls) >= 50
+        unlocked = [sql for sql, held in witness.calls if not held]
+        assert unlocked == []
+        touched = " ".join(sql for sql, _ in witness.calls)
+        for table in (
+            "rfqs",
+            "rfq_deletions",
+            "decisions",
+            "would_quotes",
+            "would_quotes_inplay",
+            "position_ledger",
+            "fills",
+            "ev_ledger",
+            "markouts",
+            "combo_trades",
+            "store_meta",
+        ):
+            assert table in touched, table
+        assert ("COMMIT", True) in witness.calls
+        assert store._db.in_transaction is False  # noqa: SLF001
+    finally:
+        await store.close()
+
+
+async def test_ledger_txn_never_leaves_the_connection_wedged_by_a_leaked_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The residue the lock cannot see (must-fix #1 (b)): a read cursor left
+    ACTIVE on the shared connection OUTSIDE any lock (what a cancelled
+    ``_bounded_store`` read leaves behind), then a foreign commit. The next
+    ledger write hits SQLITE_BUSY_SNAPSHOT — instantly, busy_timeout not
+    consulted. Unfixed, Python's implicit BEGIN kept that stale snapshot for
+    the REST OF THE RUN: every later write failed, every later read was
+    stale (the review probe). Now ``_ledger_txn`` rolls back (counted +
+    logged with the sqlite error name) and retries once; while the leaked
+    cursor still lives the retry fails the same way — SQLite keeps the
+    connection's read snapshot pinned for an active statement — and the
+    caller sees the exception, but the connection is left OUTSIDE any
+    transaction, so the moment the cursor closes the very next write books
+    with no intervention and reads are fresh. The wedge is bounded by the
+    leaked statement's lifetime, never the run's."""
+    spy = _LogSpy()
+    monkeypatch.setattr(persistence, "log", spy)
+    path = tmp_path / "t.sqlite3"
+    store = await Store.open(path, FakeClock())
+    try:
+        for i in range(5):
+            await store.record_decision("no_quote", f"r{i}", ["skip_test"], {})
+        leaked = await store._db.execute(  # noqa: SLF001 — outside the lock, on purpose
+            "SELECT reasons_json FROM decisions"
+        )
+        assert await leaked.fetchone() is not None  # mid-iteration: snapshot pinned
+        _foreign_commit(path)
+        t0 = time.perf_counter()
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            await _fill(store, "a")
+        elapsed = time.perf_counter() - t0
+        assert elapsed < persistence.STORE_OP_TIMEOUT_S / 10  # instant: no busy wait
+        assert store._db.in_transaction is False  # noqa: SLF001 — NOT left in the stale transaction
+        assert store.ledger_txn_rollbacks == 2  # both attempts rolled back
+        assert store.ledger_txn_retries == 1
+        rolled = spy.of("store_ledger_txn_rolled_back")
+        assert len(rolled) == 2
+        assert all(e[0] == "warning" for e in rolled)
+        assert all(e[2]["lock_error"] is True for e in rolled)
+        assert all(e[2]["sqlite_errorname"] == "SQLITE_BUSY_SNAPSHOT" for e in rolled)
+        retried = spy.of("store_ledger_txn_retry_after_rollback")
+        assert len(retried) == 1
+        assert retried[0][2]["sqlite_errorname"] == "SQLITE_BUSY_SNAPSHOT"
+        # The leaked statement dies (its coroutine's frame would): the wedge ends with it.
+        await leaked.close()
+        assert await _fill(store, "a") is True  # the very next write books — no intervention
+        assert store.ledger_txn_rollbacks == 2  # no further rollback was needed
+        assert store._db.in_transaction is False  # noqa: SLF001
+        assert await store.count("fills") == 1 == _truth(path, "SELECT COUNT(*) FROM fills")
+        assert await store.count("decisions") == 6  # FRESH: sees the foreign row
+        assert spy.of("store_ledger_txn_left_open") == []
+    finally:
+        await store.close()
+
+
+class _StmtSpyConnection:
+    """Delegating proxy over the writer's stdlib connection: records every
+    execute / executemany (text, parameter count) and lets the test pin the
+    bound-variable limit the batch writer derives its chunking from."""
+
+    def __init__(self, con: sqlite3.Connection, *, variable_limit: int) -> None:
+        self._con = con
+        self._variable_limit = variable_limit
+        self.executes: list[tuple[str, int]] = []
+        self.executemanys: list[tuple[str, int]] = []
+
+    def getlimit(self, category: int) -> int:
+        assert category == sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER
+        return self._variable_limit
+
+    def execute(self, sql: str, params: Any = ()) -> Any:
+        self.executes.append((sql, len(params)))
+        return self._con.execute(sql, params)
+
+    def executemany(self, sql: str, rows: Any) -> Any:
+        rows = list(rows)
+        self.executemanys.append((sql, len(rows)))
+        return self._con.executemany(sql, rows)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._con, name)
+
+
+async def test_commit_batch_writes_multi_row_statements_within_the_engine_variable_limit(
+    tmp_path: Path,
+) -> None:
+    """GIL-starvation fix (review fix pass): a batch group is written as
+    multi-row ``INSERT … VALUES (…), (…)`` statements — ONE sqlite3_step per
+    chunk instead of one per row — chunked by the engine's own bound-variable
+    limit (here pinned to 12 → 2 rows of 5 parameters per statement: 5 rows →
+    3 statements of 2, 2, 1), rows land in enqueue order, the real limit fits
+    a whole 1,000-row batch in one statement, and a SQL text without a
+    ``VALUES (?, …)`` tail still goes through ``executemany``."""
+    path = tmp_path / "t.sqlite3"
+    store = await Store.open(path, FakeClock())
+    try:
+        wdb = Store._open_writer_connection(path)  # noqa: SLF001
+        try:
+            spy = _StmtSpyConnection(wdb, variable_limit=12)
+            Store._commit_batch(spy, [_row(f"r{i}") for i in range(5)])  # type: ignore[arg-type]  # noqa: SLF001
+            assert [n for _, n in spy.executes] == [10, 10, 5]  # 2 + 2 + 1 rows × 5 params
+            assert all(sql.count("(?, ?, ?, ?, ?)") == n // 5 for sql, n in spy.executes)
+            assert spy.executemanys == []
+            assert await store.count("decisions") == 5
+            async with store._db.execute("SELECT rfq_id FROM decisions ORDER BY id") as cur:  # noqa: SLF001
+                assert [r[0] async for r in cur] == [f"r{i}" for i in range(5)]
+            # The engine's real limit: a whole batch of the widest tape table is ONE statement.
+            real_limit = wdb.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+            widest = max(
+                sql.rpartition(" VALUES ")[2].count("?")
+                for sql in (_DECISION_SQL, _DELETION_SQL)
+            )
+            assert real_limit // 13 >= persistence.WRITER_BATCH_ROWS  # structural_fits: 13 columns
+            assert real_limit // widest >= persistence.WRITER_BATCH_ROWS
+            spy2 = _StmtSpyConnection(wdb, variable_limit=real_limit)
+            Store._commit_batch(  # type: ignore[arg-type]  # noqa: SLF001
+                spy2, [_row(f"s{i}") for i in range(persistence.WRITER_BATCH_ROWS)]
+            )
+            assert [n for _, n in spy2.executes] == [5 * persistence.WRITER_BATCH_ROWS]
+            assert await store.count("decisions") == 5 + persistence.WRITER_BATCH_ROWS
+            # No VALUES tail → executemany fallback (the group still commits).
+            spy3 = _StmtSpyConnection(wdb, variable_limit=real_limit)
+            odd = "INSERT INTO rfq_deletions (rfq_id, seen_at, raw_json) SELECT ?, ?, ?"
+            Store._commit_batch(spy3, [(odd, ("x", "t", "{}")), (odd, ("y", "t", "{}"))])  # type: ignore[arg-type]  # noqa: SLF001
+            assert spy3.executes == []
+            assert spy3.executemanys == [(odd, 2)]
+            assert await store.count("rfq_deletions") == 2
+        finally:
+            wdb.close()
+    finally:
+        await store.close()
+
+
+async def test_ledger_txn_rolls_back_any_failed_body_and_commits_a_left_open_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A body that raises a NON-lock error inside its transaction is rolled
+    back (nothing of it persists, the connection leaves the transaction) and
+    the exception is re-raised unchanged — no retry (counted 0). A body that
+    RETURNS without committing is a bug: committed, logged at ERROR
+    (``store_ledger_txn_left_open``), never a wedge."""
+    spy = _LogSpy()
+    monkeypatch.setattr(persistence, "log", spy)
+    store = await Store.open(tmp_path / "t.sqlite3", FakeClock())
+    try:
+        ins = "INSERT INTO rfq_deletions (rfq_id, seen_at, raw_json) VALUES (?, 't', '{}')"
+
+        async def bad() -> None:
+            await store._db.execute(ins, ("d",))  # noqa: SLF001
+            assert store._db.in_transaction is True  # noqa: SLF001
+            raise ValueError("boom")
+
+        with pytest.raises(ValueError, match="boom"):
+            await store._ledger_txn(bad)  # noqa: SLF001
+        assert store._db.in_transaction is False  # noqa: SLF001
+        assert await store.count("rfq_deletions") == 0
+        assert store.ledger_txn_rollbacks == 1
+        assert store.ledger_txn_retries == 0
+        rolled = spy.of("store_ledger_txn_rolled_back")
+        assert len(rolled) == 1
+        assert rolled[0][2]["lock_error"] is False
+        assert spy.of("store_ledger_txn_retry_after_rollback") == []
+
+        async def forgot() -> str:
+            await store._db.execute(ins, ("e",))  # noqa: SLF001
+            return "done"
+
+        assert await store._ledger_txn(forgot) == "done"  # noqa: SLF001
+        assert store._db.in_transaction is False  # noqa: SLF001
+        assert await store.count("rfq_deletions") == 1
+        left = spy.of("store_ledger_txn_left_open")
+        assert len(left) == 1
+        assert left[0][0] == "error"
+        assert store.ledger_txn_rollbacks == 1  # a left-open body is committed, not rolled back
+    finally:
+        await store.close()
+
+
+def _start_thread_body(
+    store: Store, path: Path, rows: list[Any], *, busy_timeout_ms: int
+) -> tuple[threading.Thread, queue.Queue[Any]]:
+    """Run the REAL thread body on a real thread over a pre-filled queue, with
+    the writer connection's OWN busy wait squeezed (the SAME mechanism, a
+    smaller number so each attempt costs milliseconds)."""
+    wdb = Store._open_writer_connection(path)  # noqa: SLF001
+    wdb.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    q: queue.Queue[Any] = queue.Queue()
+    for row in rows:
+        q.put_nowait(row)
+    thread = threading.Thread(
+        target=store._writer_thread_main,  # noqa: SLF001
+        args=(wdb, q),
+        daemon=True,
+    )
+    thread.start()
+    return thread, q
+
+
+async def _wait_until(pred: Any, bound_s: float) -> bool:
+    deadline = time.monotonic() + bound_s
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        await asyncio.sleep(0.01)
+    return bool(pred())
+
+
+async def test_tape_batch_hitting_a_lock_is_retried_with_its_rows_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch whose commit fails with a LOCK-class error (SQLITE_BUSY after
+    the connection's busy wait — a ledger transaction or a retention DELETE
+    holding the write lock past the bound) is RETRIED with its rows still in
+    memory, attempt after attempt, until it lands: nothing dropped, no
+    ``store_writer_batch_failed``, one ``store_writer_batch_locked_retrying``
+    WARNING per attempt carrying n / attempt / the sqlite error name. (Before:
+    the 1,000 rows were discarded as a batch failure.)"""
+    spy = _LogSpy()
+    monkeypatch.setattr(persistence, "log", spy)
+    path = tmp_path / "t.sqlite3"
+    store = await Store.open(path, FakeClock())
+    rows = [_row(f"r{i}") for i in range(7)]
+    blocker = sqlite3.connect(path, isolation_level=None)
+    thread: threading.Thread | None = None
+    try:
+        blocker.execute("BEGIN IMMEDIATE")  # hold the WAL write lock
+        thread, q = _start_thread_body(store, path, rows, busy_timeout_ms=50)
+        assert await _wait_until(
+            lambda: store.batch_lock_retries >= 2, persistence.STORE_OP_TIMEOUT_S
+        )
+        assert spy.of("store_writer_batch_failed") == []
+        assert await store.count("decisions") == 0
+        blocker.execute("ROLLBACK")  # the lock lifts
+        q.put_nowait(persistence._WRITER_STOP)  # noqa: SLF001
+        await asyncio.to_thread(thread.join, persistence.STORE_OP_TIMEOUT_S)
+        assert not thread.is_alive()
+        assert await store.count("decisions") == 7  # every row of the batch landed
+        locked = spy.of("store_writer_batch_locked_retrying")
+        assert len(locked) >= 2
+        assert all(e[0] == "warning" for e in locked)
+        assert all(e[2]["n"] == 7 for e in locked)
+        assert all(e[2]["sqlite_errorname"] == "SQLITE_BUSY" for e in locked)
+        assert [e[2]["attempt"] for e in locked] == list(range(1, len(locked) + 1))
+        assert store.batch_lock_retries == len(locked)
+        assert spy.of("store_writer_batch_failed") == []
+        assert spy.of("store_writer_thread_died") == []
+    finally:
+        with contextlib.suppress(sqlite3.Error):
+            blocker.execute("ROLLBACK")
+        blocker.close()
+        if thread is not None and thread.is_alive():
+            store._writer_stop.set()  # noqa: SLF001
+            await asyncio.to_thread(thread.join, persistence.STORE_OP_TIMEOUT_S)
+        await store.close()
+
+
+async def test_tape_batch_lock_retry_gives_up_loudly_on_the_stop_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retry has no number of its own: it ends when the batch lands or
+    when ``close()`` sets the stop flag — then the batch is dropped LOUDLY
+    (``store_writer_batch_failed`` with the lock retries it survived) and the
+    thread exits, closing its connection."""
+    spy = _LogSpy()
+    monkeypatch.setattr(persistence, "log", spy)
+    path = tmp_path / "t.sqlite3"
+    store = await Store.open(path, FakeClock())
+    rows = [_row(f"r{i}") for i in range(3)]
+    blocker = sqlite3.connect(path, isolation_level=None)
+    thread: threading.Thread | None = None
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
+        thread, _q = _start_thread_body(store, path, rows, busy_timeout_ms=50)
+        assert await _wait_until(
+            lambda: store.batch_lock_retries >= 1, persistence.STORE_OP_TIMEOUT_S
+        )
+        store._writer_stop.set()  # noqa: SLF001 — what close() does
+        await asyncio.to_thread(thread.join, persistence.STORE_OP_TIMEOUT_S)
+        assert not thread.is_alive()
+        failed = spy.of("store_writer_batch_failed")
+        assert len(failed) == 1
+        assert failed[0][2]["n"] == 3
+        assert failed[0][2]["lock_retries"] >= 1
+        assert isinstance(failed[0][2]["exc_info"], sqlite3.OperationalError)
+        assert spy.of("store_writer_thread_died") == []
+        blocker.execute("ROLLBACK")
+        assert _truth(path, "SELECT COUNT(*) FROM decisions") == 0
+    finally:
+        with contextlib.suppress(sqlite3.Error):
+            blocker.execute("ROLLBACK")
+        blocker.close()
+        if thread is not None and thread.is_alive():
+            store._writer_stop.set()  # noqa: SLF001
+            await asyncio.to_thread(thread.join, persistence.STORE_OP_TIMEOUT_S)
+        await store.close()
+
+
+async def test_checkpoint_connection_never_waits_and_folds_passive_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dedicated checkpoint connection carries busy_timeout 0 — under a
+    pinned reader the whole attempt returns its busy VERDICT at once (the
+    old connection sat in the busy handler for the full STORE_OP_TIMEOUT_S
+    per attempt, the thread's only stall), and PASSIVE runs BEFORE the
+    TRUNCATE so the frames no reader pins are folded regardless of the
+    verdict. Failure accounting unchanged: counted, ``passive_fallback_ok``
+    True, fast retry; once the reader closes the TRUNCATE completes."""
+    spy = _LogSpy()
+    monkeypatch.setattr(persistence, "log", spy)
+    path = tmp_path / "t.sqlite3"
+    store = await Store.open(path, FakeClock())
+    try:
+        assert store._ckpt_db is not None  # noqa: SLF001
+        assert store._ckpt_db.execute("PRAGMA busy_timeout").fetchone()[0] == 0  # noqa: SLF001
+        ckpt_spy = _PragmaSpyDB(store._ckpt_db)  # noqa: SLF001
+        store._ckpt_db = ckpt_spy  # type: ignore[assignment]  # noqa: SLF001
+        for i in range(10):
+            await store.record_decision("no_quote", f"r{i}", ["skip_test"], {})
+        cursor = await store._db.execute(  # noqa: SLF001 — the pinned reader
+            "SELECT reasons_json FROM decisions"
+        )
+        assert await cursor.fetchone() is not None  # mid-iteration: read-mark pinned
+        for _ in range(10):
+            _foreign_commit(path)  # frames PAST the reader's mark: unfoldable while it lives
+        t0 = time.perf_counter()
+        assert store._wal_checkpoint() is False  # noqa: SLF001
+        elapsed = time.perf_counter() - t0
+        assert elapsed < persistence.STORE_OP_TIMEOUT_S / 10  # no busy wait at all
+        assert ckpt_spy.checkpoint_sqls == [
+            "PRAGMA wal_checkpoint(PASSIVE)",
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+        ]
+        assert store.checkpoint_failures == 1
+        assert store.checkpoint_passive_fallbacks == 1
+        failed = spy.of("store_writer_checkpoint_failed")
+        assert len(failed) == 1
+        assert failed[0][2]["passive_fallback_ok"] is True
+        m = re.fullmatch(r"busy \(wal_frames=(\d+), checkpointed=(\d+)\)", failed[0][2]["error"])
+        assert m is not None
+        wal_frames, checkpointed = int(m.group(1)), int(m.group(2))
+        assert 0 < checkpointed < wal_frames  # PASSIVE folded up to the reader's mark, no further
+        await cursor.close()
+        assert store._wal_checkpoint() is True  # noqa: SLF001 — reader gone: WAL reset
+        assert ckpt_spy.checkpoint_sqls[-2:] == [
+            "PRAGMA wal_checkpoint(PASSIVE)",
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+        ]
+        assert store.checkpoint_failures == 1
+    finally:
+        await store.close()
+
+
+async def test_close_leaves_the_checkpoint_connection_to_a_still_running_writer_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the writer thread outlives close()'s bounded join (here: its one
+    batch is stuck in the busy wait behind a third connection's write lock),
+    close() must NOT close the checkpoint connection the thread owns — it
+    logs ``store_checkpoint_connection_left_to_writer_thread`` alongside the
+    join-timeout warning and leaves it to the daemon. Once the lock lifts the
+    thread commits its batch, reads the stop flag and exits on its own."""
+    spy = _LogSpy()
+    monkeypatch.setattr(persistence, "log", spy)
+    real_bound = persistence.STORE_OP_TIMEOUT_S
+    # Squeeze close()'s two waits (module globals read at call time) so the
+    # test costs milliseconds; the mechanism is unchanged.
+    monkeypatch.setattr(persistence, "WRITER_CLOSE_DRAIN_S", 0.05)
+    monkeypatch.setattr(persistence, "STORE_OP_TIMEOUT_S", 0.05)
+    path = tmp_path / "t.sqlite3"
+    store = await Store.open(path, FakeClock())
+    store.start_writer()
+    thread = store._writer_thread  # noqa: SLF001
+    ckpt = store._ckpt_db  # noqa: SLF001
+    assert thread is not None and ckpt is not None
+    blocker = sqlite3.connect(path, isolation_level=None)
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
+        await store.record_decision("no_quote", "r0", ["skip_test"], {})
+        # The thread took the row and is inside its busy wait on the commit.
+        assert await _wait_until(lambda: store.writer_queue_depth() == 0, real_bound)
+        await store.close()
+        assert thread.is_alive()
+        assert len(spy.of("store_writer_thread_join_timeout")) == 1
+        assert len(spy.of("store_checkpoint_connection_left_to_writer_thread")) == 1
+        ckpt.execute("SELECT 1")  # still open — never closed under the thread
+    finally:
+        with contextlib.suppress(sqlite3.Error):
+            blocker.execute("ROLLBACK")
+        blocker.close()
+    await asyncio.to_thread(thread.join, real_bound)
+    assert not thread.is_alive()
+    ckpt.close()
+    assert _truth(path, "SELECT COUNT(*) FROM decisions") == 1  # landed once the lock lifted
+    assert spy.of("store_writer_batch_failed") == []
+
+
+class _SqlSpyDB:
+    """Delegating aiosqlite proxy recording EVERY statement text it sees."""
+
+    def __init__(self, db: Any) -> None:
+        self._db = db
+        self.sqls: list[str] = []
+
+    def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+        self.sqls.append(sql)
+        return self._db.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._db, name)
+
+
+async def test_decision_reason_counts_runs_off_the_shared_connection_inside_sqlite(
+    tmp_path: Path,
+) -> None:
+    """Must-fix #2: the ONE unbounded read issues NO statement on the shared
+    connection (its own ``mode=ro`` connection in a worker thread) and counts
+    inside SQLite — same numbers as the retired per-row ``json.loads`` loop,
+    including a reason repeated inside one row counting twice. It sees rows
+    the tape THREAD committed. A legacy direct construction (no path) runs
+    the same aggregate on the shared connection."""
+    path = tmp_path / "t.sqlite3"
+    store = await Store.open(path, FakeClock())
+    try:
+        spy = _SqlSpyDB(store._db)  # noqa: SLF001
+        store._db = spy  # type: ignore[assignment]  # noqa: SLF001
+        seeded = (["a", "b"], ["a"], [], ["b", "b"], ["c"])
+        for reasons in seeded:
+            await store.record_decision("no_quote", "r", reasons, {})
+        expected: dict[str, int] = {}
+        for reasons in seeded:  # the retired loop's arithmetic
+            for reason in reasons:
+                expected[reason] = expected.get(reason, 0) + 1
+        n_before = len(spy.sqls)
+        counts = await store.decision_reason_counts()
+        assert counts == expected == {"a": 2, "b": 3, "c": 1}
+        assert len(spy.sqls) == n_before  # not ONE statement on the shared connection
+        db = await aiosqlite.connect(path)
+        legacy = Store(db, FakeClock())
+        try:
+            assert await legacy.decision_reason_counts() == counts
+        finally:
+            await legacy.close()
+        store.start_writer()
+        await _flood(store, 3)  # committed by the THREAD, on its connection
+        assert (await store.decision_reason_counts())["skip_test"] == 3
+    finally:
+        await store.close()
+
+
+async def test_tape_thread_yields_the_write_lock_to_a_ledger_transaction_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ledger first on the WAL write lock (review fix pass, measured: with a
+    tape backlog the thread re-took the lock the instant it committed and a
+    ``record_fill`` waited 178-1,483 ms in SQLite's unfair busy backoff).
+    While a ledger transaction is in flight (``_ledger_txn`` clears
+    ``_ledger_txn_idle``) the thread holds its next batch — counted in
+    ``batch_yields_to_ledger`` — and proceeds the moment the ledger is done.
+    The hold is bounded by STORE_OP_TIMEOUT_S: a flag left clear (a stuck
+    caller) never stalls the tape. ``_ledger_txn`` itself restores the flag
+    on success, failure and cancellation alike."""
+    path = tmp_path / "t.sqlite3"
+    store = await Store.open(path, FakeClock())
+    thread: threading.Thread | None = None
+    try:
+        # (1) In flight → the batch waits; released → it lands at once.
+        store._ledger_txn_idle.clear()  # noqa: SLF001 — what _ledger_txn does around its body
+        thread, q = _start_thread_body(
+            store, path, [_row(f"r{i}") for i in range(4)], busy_timeout_ms=50
+        )
+        assert await _wait_until(
+            lambda: store.batch_yields_to_ledger == 1, persistence.STORE_OP_TIMEOUT_S
+        )
+        await asyncio.sleep(0.05)
+        assert _truth(path, "SELECT COUNT(*) FROM decisions") == 0  # held back
+        store._ledger_txn_idle.set()  # noqa: SLF001
+        assert await _wait_until(
+            lambda: _truth(path, "SELECT COUNT(*) FROM decisions") == 4,
+            persistence.STORE_OP_TIMEOUT_S,
+        )
+        q.put_nowait(persistence._WRITER_STOP)  # noqa: SLF001
+        await asyncio.to_thread(thread.join, persistence.STORE_OP_TIMEOUT_S)
+        assert not thread.is_alive()
+        thread = None
+        # (2) A flag left clear is BOUNDED: the batch proceeds after STORE_OP_TIMEOUT_S.
+        monkeypatch.setattr(persistence, "STORE_OP_TIMEOUT_S", 0.05)
+        store._ledger_txn_idle.clear()  # noqa: SLF001
+        thread, q = _start_thread_body(store, path, [_row("late")], busy_timeout_ms=50)
+        assert await _wait_until(lambda: _truth(path, "SELECT COUNT(*) FROM decisions") == 5, 5.0)
+        assert store.batch_yields_to_ledger == 2
+        q.put_nowait(persistence._WRITER_STOP)  # noqa: SLF001
+        await asyncio.to_thread(thread.join, 5.0)
+        assert not thread.is_alive()
+        thread = None
+        store._ledger_txn_idle.set()  # noqa: SLF001
+        # (3) _ledger_txn clears the flag for its body and restores it every way out.
+        seen: list[bool] = []
+
+        async def body() -> None:
+            seen.append(store._ledger_txn_idle.is_set())  # noqa: SLF001
+
+        await store._ledger_txn(body)  # noqa: SLF001
+        assert seen == [False]
+        assert store._ledger_txn_idle.is_set()  # noqa: SLF001
+
+        async def failing() -> None:
+            raise ValueError("boom")
+
+        with pytest.raises(ValueError):
+            await store._ledger_txn(failing)  # noqa: SLF001
+        assert store._ledger_txn_idle.is_set()  # noqa: SLF001
+
+        async def hanging() -> None:
+            await asyncio.sleep(60)
+
+        task = asyncio.create_task(store._ledger_txn(hanging))  # noqa: SLF001
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not store._ledger_txn_idle.is_set()  # noqa: SLF001 — in flight
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert store._ledger_txn_idle.is_set()  # noqa: SLF001 — restored on cancellation
+    finally:
+        if thread is not None and thread.is_alive():
+            store._ledger_txn_idle.set()  # noqa: SLF001
+            store._writer_stop.set()  # noqa: SLF001
+            await asyncio.to_thread(thread.join, 5.0)
         await store.close()

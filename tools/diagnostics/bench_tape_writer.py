@@ -11,8 +11,9 @@ store, then ``dropped_writes_delta`` 126,492) and (b) competed with quoting
 for the loop the whole time the queue was non-empty (always).
 
 THE BENCH: two writers drain the same rows into a temp WAL store, once on an
-idle loop (the raw number) and once while a burner task blocks the loop in
-callbacks of the measured length (default 100 ms — the p50 shape):
+idle loop (the raw number) and once while a burner task COMPUTES on the loop
+in callbacks of the measured length (default 100 ms — the p50 shape; it burns
+CPU with ``json.loads``, never sleeps, so the GIL is contended as it is live):
 
   legacy-task  the pre-2026-09-05 writer, replicated here in exact shape
                (asyncio task, asyncio.Queue at the same 200k bound, batches
@@ -21,8 +22,10 @@ callbacks of the measured length (default 100 ms — the p50 shape):
                checkpoint cadence is omitted — it ran on a separate
                connection in both writers and adds no per-row hops).
   thread       the live ``Store.start_writer()``: a daemon thread with its
-               own sqlite3 connection, executemany per SQL text, ONE
-               transaction per batch, O(1) never-yielding ``_write``.
+               own sqlite3 connection, one multi-row INSERT per SQL text
+               (review fix pass: executemany starved on the GIL against a
+               computing loop), ONE transaction per batch, O(1)
+               never-yielding ``_write``.
 
 Per writer × loop state the bench reports rows committed / elapsed (rows/s)
 and the LOOP HOPS the writer consumed per 1,000 rows: for the legacy writer
@@ -137,12 +140,25 @@ class LegacyTaskWriter:
             pass
 
 
+_BURN_FRAME = json.dumps(
+    {"type": "rfq_created", "msg": {"id": "x" * 40, "legs": [{"t": "M1", "s": "yes"}] * 4}}
+)
+
+
 async def _burner(stop: asyncio.Event, burn_ms: float, stats: dict[str, int]) -> None:
-    """The saturated loop: a callback that BLOCKS for ``burn_ms`` then yields
-    once — every other ready callback gets exactly one turn per burn, i.e. a
-    loop lag of ~burn_ms per hop (the measured p50 shape)."""
+    """The saturated loop: a callback that COMPUTES for ``burn_ms`` (a
+    ``json.loads`` loop — the intake's own work) then yields once — every
+    other ready callback gets exactly one turn per burn, i.e. a loop lag of
+    ~burn_ms per hop (the measured p50 shape). It must BURN CPU, not sleep
+    (2026-09-05 review fix pass): a sleeping burner releases the GIL, which
+    hid the writer thread's GIL starvation — ``executemany`` re-acquires the
+    GIL after every row's step, and against a computing loop each re-acquire
+    waits up to the 5 ms switch interval (measured: 362 rows/s, 8.9 s max
+    per 1,000-row batch, the WAL write lock held throughout)."""
     while not stop.is_set():
-        time.sleep(burn_ms / 1000.0)  # noqa: ASYNC251 — the point IS to block the loop
+        deadline = time.perf_counter() + burn_ms / 1000.0
+        while time.perf_counter() < deadline:
+            json.loads(_BURN_FRAME)
         stats["callbacks"] += 1
         await asyncio.sleep(0)
 
