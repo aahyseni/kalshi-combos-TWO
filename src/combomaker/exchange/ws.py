@@ -244,14 +244,18 @@ class _Lanes:
             return dropped
 
     def pop(self, lane: Lane) -> JsonDict | None:
-        target = (
-            self.priority
-            if lane is Lane.PRIORITY
-            else self.control
-            if lane is Lane.CONTROL
-            else self.market
-        )
+        # Bind the deque UNDER the lock (review fix 2026-09-05, fan-out
+        # build): ``purge_market`` REBINDS ``self.market`` under it, so a
+        # deque bound outside would be the orphaned one after a concurrent
+        # purge and its frame would be dispatched twice.
         with self._lock:
+            target = (
+                self.priority
+                if lane is Lane.PRIORITY
+                else self.control
+                if lane is Lane.CONTROL
+                else self.market
+            )
             return target.popleft() if target else None
 
     def settle_idle(self) -> bool:

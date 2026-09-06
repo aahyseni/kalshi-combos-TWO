@@ -2178,6 +2178,12 @@ class QuoteApp:
         # Everything registered on ``ws`` below (marks, intake, channel-lost)
         # is unchanged: the fan-out presents the WsManager surface.
         ws = CommsFanout(config.endpoints.ws_url, signer, self._clock, self._metrics)
+        # The accept gate is built HERE (before the governor) because the
+        # governor's live re-shard is gated on it: a re-shard closes every
+        # comms socket for ~1 s, so it never runs while an accept's confirm
+        # is in flight (review fix 2026-09-05). Same object, same semantics
+        # as its former construction site below.
+        accept_gate = AcceptPriorityGate(self._clock, EXCHANGE_CONFIRM_WINDOW_S)
         self._fanout_governor = FanoutGovernor(
             ws,
             self._clock,
@@ -2190,6 +2196,8 @@ class QuoteApp:
             # judged against (an accept later than this is already dead).
             confirm_window_s=EXCHANGE_CONFIRM_WINDOW_S,
             override=config.endpoints.comms_shard_factor_override,
+            # APPLY GATE: no live re-shard while an accept is in flight.
+            apply_ok=lambda: not accept_gate.holding(),
         )
         # CONFIRM PRIORITY (2026-07-31 double halt): accept/execute frames jump
         # the comms dispatch backlog, and while a confirm is in flight all NEW
@@ -2218,7 +2226,7 @@ class QuoteApp:
         # consistency is cheap and a late delete is still a delete.
         ws.mark_sheddable("rfq_created", stale_after_s=RFQ_MAX_QUEUE_DWELL_S)
         ws.mark_sheddable("rfq_deleted")
-        accept_gate = AcceptPriorityGate(self._clock, EXCHANGE_CONFIRM_WINDOW_S)
+        # (``accept_gate`` is constructed above, before the fan-out governor.)
         # DEDICATED order-book socket (2026-07-14 fix). The communications firehose
         # (~650 msg/s exchange-wide RFQ stream on `ws`) and the orderbook_delta feed
         # MUST NOT share a connection: the firehose saturates the dispatcher and

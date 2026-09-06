@@ -53,12 +53,34 @@ Recovery rule (the exact rule, per the UPTIME #3 finding)
   With N = 1 this is always the case: byte-identical to today.
 * A shard's ordinary socket death (EOF, timeout) reconnects on its own reader
   as today. The consumer's ``on_disconnect`` (the intake's registry reset)
-  fires ONCE per loss epoch (coalesced until some shard re-connects) so a
-  simultaneous N-way reconnect cannot rotate the intake's two stale-liveness
-  generations N times and mislabel mid-pipeline RFQs as deleted.
-* Sharding-validation refusals (codes 19-22, and 11 "Invalid parameter" when
-  it answers a SHARDED subscribe) fall back LOUDLY to the single unsharded
-  subscription — fail-safe = today's behaviour — never to no subscription.
+  fires ONCE per loss epoch. The epoch stays open until EVERY shard whose
+  socket dropped has RE-ACKED its subscribe (review fix 2026-09-05: closing
+  it on the first re-CONNECT let an exchange-side rolling close that reached
+  the N sockets in sequence fire N times, rotating the intake's two
+  stale-liveness generations N times). A death that lands after every
+  casualty has re-acked is a new epoch — without shard-scoping the intake's
+  registry (out of this build's radius) there is nothing to tie it to.
+* Any non-ack answer to a SHARDED subscribe that is not a terminal channel
+  code (10/17/25 reconnect that shard on their own path) is a REFUSAL —
+  the documented sharding-validation codes 19-22, 11 "Invalid parameter",
+  and every unlisted one (6 "Already subscribed" is the open question of
+  whether N connections under one key may each hold a communications
+  subscription): it falls back LOUDLY to the single unsharded subscription
+  — fail-safe = today's behaviour — never to a shard left CONNECTED but
+  UNSUBSCRIBED with every health reading green (review must-fix 2026-09-05).
+* A live re-shard purges the retired generation's queued MARKET frames from
+  the shared lanes before the new set opens (the 2026-07-14 discard rule:
+  the new sockets re-dump every open RFQ, so nothing queued from the old
+  ones is load-bearing — up to 20,000 stale parses otherwise ran ahead of
+  the re-dump). Priority and control frames are kept.
+* Whether Kalshi PARTITIONS our own quote events (accept / execute) by the
+  RFQ's shard or BROADCASTS them to every subscription of ours is
+  undocumented. Under N > 1 the host admits each priority frame ONCE per
+  ``(type, quote_id)`` (``ws_fanout_duplicate_priority_frame`` WARNING +
+  metric on a duplicate): a duplicate accept would otherwise re-run the
+  confirm against a quote already confirmed and count a confirm failure of
+  ours toward ``HALT_CONFIRM_TIMEOUTS``. N = 1 admits everything (one
+  socket cannot duplicate; byte-identical to today).
 
 Deriving N (constitution: no hand-set numbers)
 -----------------------------------------------
@@ -106,14 +128,45 @@ disk, the gap tape's rule) plus this boot:
   window — by running each connection at half its measured ceiling.
 * Floor 1; cap 100 (the documented ``shard_factor`` maximum).
 
+SHRINK GATE (review fix 2026-09-05). The healthy-window estimate
+``fps / utilisation`` measures OUR reader's handling time, not the bound that
+actually bit (the server-side per-subscription buffer / TCP window): at N = 3
+a shard reading ~430 fps at ~2 % utilisation reports a ~20,000 fps "ceiling",
+a ~10× mismatch HEADROOM = 2 does not cover. N held at 3 only while the
+pooled unsharded VIOLATING windows (capacity = read rate ≈ 1,100) stayed in
+the tape; once pruned (retention = log rotation) Q_lo jumped, N derived 1,
+the next boot ran unsharded, violated, and re-grew — a 1→2→…→1 oscillation
+across boots. So a third evidence class is pooled: the SUSTAINED rate — a
+healthy window's per-connection read rate ``fps_k`` (the connection
+demonstrably kept up at that rate: a LOWER bound on its ceiling, never an
+extrapolation). A SHRINK from the current N is applied only down to
+
+    N_sustained = ceil( Q_hi(inbound) × HEADROOM / Q_hi(sustained) )
+
+i.e. only as far as some connection has demonstrably carried the load each
+would carry after the shrink, with the same headroom; no sustained evidence ⇒
+hold. Growth never consults it (at N shards each connection carries 1/N of the
+flow, so the demonstrated rate alone would always argue for 2N — a ratchet).
+
 Bootstrap: an empty tape derives N = 1 (source ``bootstrap`` — exactly
 today's unsharded subscribe, no params on the wire); the first two refresh
 windows measure (the first holds the snapshot); the derivation then applies.
 GROWTH is applied LIVE (fail-safe direction, and urgent — accepts are
-expiring); a SHRINK is deferred to the next boot (an optimisation, applied at
-the natural rebuild point; logged ``deferred_shrink``). An explicit override
+expiring) — but never while an accept is in flight (the app's
+``AcceptPriorityGate.holding``): a re-shard closes every comms socket for
+~1 s, and a ``quote_executed`` for a quote confirmed just before would be
+lost to that gap (recovered only by the sweep's REST poll); the apply defers
+to the next tick (``apply_deferred=accept_in_flight``). A SHRINK is deferred
+to the next boot (an optimisation, applied at the natural rebuild point,
+gated as above against the previous boot's factor; logged
+``deferred_shrink``). An explicit override
 (``endpoints.comms_shard_factor_override``) is applied and logged as
-``source=override`` — never a silent number.
+``source=override`` — never a silent number. A sharding refusal is sticky
+for the boot and RECORDED in the tape (``boots_refused`` in every
+derivation line); the next boot re-probes — at boot no quote stands and the
+registry is empty, so the fallback costs one ~1 s reconnect, while honouring
+a persisted refusal would let one transient exchange error park the fills
+lever until a human moved a knob.
 
 Known failure mode, disclosed: if pipe lag stays above the window at N shards
 for a cause sharding cannot fix, violating windows keep contributing
@@ -152,6 +205,7 @@ from combomaker.exchange.ws import (
 )
 from combomaker.ops.logging import get_logger
 from combomaker.ops.metrics import Metrics
+from combomaker.risk.confirm_expired_rate import EXPIRED_RATE_ALARM_Z
 from combomaker.risk.heartbeat import _atomic_write
 from combomaker.risk.stall_wall import (
     STALL_WALL_MARGIN,
@@ -168,13 +222,18 @@ JsonDict = dict[str, Any]
 FANOUT_HEADROOM = STALL_WALL_MARGIN
 # The policy z ladder's DAILY rung (daily 3 / weekly 4 / KILL 5): N is
 # re-derived per boot, an intra-day unit; an under-provisioned N is an alarm
-# condition, not a kill.
-FANOUT_Z = 3.0
+# condition, not a kill. IMPORTED, not duplicated, so the anchor cannot drift.
+FANOUT_Z = EXPIRED_RATE_ALARM_Z
 FANOUT_TAPE_FILENAME = "ws_fanout_tape.json"
-_SCHEMA_VERSION = 1
-# A SHARDED subscribe refused with one of these falls back to unsharded:
-# 19-22 are the documented sharding validation codes; 11 "Invalid parameter"
-# is included only when it answers a subscribe that carried shard params.
+# v2 (2026-09-05 review fixes): + ``sustained`` histogram, + ``refused`` per
+# boot. A v1 record loads with empty sustained evidence and refused = False.
+_SCHEMA_VERSION = 2
+# The DOCUMENTED sharding refusals — 19-22 (the validation table) and 11
+# "Invalid parameter" when it answers a subscribe that carried shard params.
+# The fallback rule is wider (module doc): ANY non-terminal answer to a
+# sharded subscribe is a refusal; this set only labels the log line
+# ``documented=True/False`` so an unlisted code (6 "Already subscribed") is
+# recognisable as the per-key open question rather than a docs error.
 SHARDING_REFUSED_CODES: frozenset[int] = SHARD_VALIDATION_ERROR_CODES | frozenset({11})
 COMMUNICATIONS_CHANNEL = "communications"
 _LAG_TYPES: frozenset[str] = frozenset({"rfq_created", "quote_created"})
@@ -516,6 +575,13 @@ class PooledEvidence:
     n_windows: int
     n_violating: int
     boots: int
+    # Healthy windows' per-connection read rates (the shrink gate's evidence).
+    sustained: RateHistogram = field(default_factory=RateHistogram)
+    # Retained boots whose sharded subscribe the exchange refused.
+    boots_refused: int = 0
+    # The factor the most recent retained boot (with any applied) ran at last
+    # — the shrink gate's ``current`` at the next boot.
+    last_shard_factor: int | None = None
 
 
 class FanoutTape:
@@ -554,15 +620,22 @@ class FanoutTape:
             capacity = RateHistogram.from_json(rec.get("capacity"))
             if inbound is None or capacity is None:
                 continue
+            # v1 records carry no ``sustained`` (⇒ no demonstrated rate: the
+            # shrink gate holds) and no ``refused`` (⇒ False).
+            sustained = RateHistogram.from_json(rec.get("sustained"))
+            if sustained is None:
+                sustained = RateHistogram()
             started = rec.get("started_at_ts")
             self.boots[str(key)] = {
                 "started_at_ts": float(started) if isinstance(started, int | float) else None,
                 "inbound": inbound,
                 "capacity": capacity,
+                "sustained": sustained,
                 "n_windows": int(rec.get("n_windows", 0) or 0),
                 "n_snapshot": int(rec.get("n_snapshot", 0) or 0),
                 "n_violating": int(rec.get("n_violating", 0) or 0),
                 "shard_factors": [int(x) for x in rec.get("shard_factors", []) or []],
+                "refused": bool(rec.get("refused", False)),
             }
 
     def fold(
@@ -576,16 +649,20 @@ class FanoutTape:
         n_snapshot: int,
         n_violating: int,
         shard_factors: list[int],
+        sustained: RateHistogram | None = None,
+        refused: bool = False,
     ) -> None:
         """Replace this boot's record with its CURRENT (cumulative) evidence."""
         self.boots[boot_key] = {
             "started_at_ts": started_at_ts,
             "inbound": inbound.copy(),
             "capacity": capacity.copy(),
+            "sustained": sustained.copy() if sustained is not None else RateHistogram(),
             "n_windows": n_windows,
             "n_snapshot": n_snapshot,
             "n_violating": n_violating,
             "shard_factors": list(shard_factors),
+            "refused": bool(refused),
         }
 
     def prune(self, *, retain_since_ts: float | None) -> int:
@@ -604,17 +681,40 @@ class FanoutTape:
     def pooled(self) -> PooledEvidence:
         inbound = RateHistogram()
         capacity = RateHistogram()
+        sustained = RateHistogram()
         n_windows = 0
         n_violating = 0
+        boots_refused = 0
+        last_factor: int | None = None
+        last_started = -math.inf
         for rec in self.boots.values():
             inb = rec.get("inbound")
             cap = rec.get("capacity")
             if isinstance(inb, RateHistogram) and isinstance(cap, RateHistogram):
                 inbound.merge(inb)
                 capacity.merge(cap)
+                sus = rec.get("sustained")
+                if isinstance(sus, RateHistogram):
+                    sustained.merge(sus)
                 n_windows += int(rec.get("n_windows", 0))
                 n_violating += int(rec.get("n_violating", 0))
-        return PooledEvidence(inbound, capacity, n_windows, n_violating, len(self.boots))
+                if rec.get("refused"):
+                    boots_refused += 1
+                factors = rec.get("shard_factors") or []
+                started = rec.get("started_at_ts")
+                if factors and isinstance(started, float) and started > last_started:
+                    last_started = started
+                    last_factor = int(factors[-1])
+        return PooledEvidence(
+            inbound,
+            capacity,
+            n_windows,
+            n_violating,
+            len(self.boots),
+            sustained=sustained,
+            boots_refused=boots_refused,
+            last_shard_factor=last_factor,
+        )
 
     def save(self) -> None:
         import json
@@ -626,10 +726,16 @@ class FanoutTape:
                     "started_at_ts": rec.get("started_at_ts"),
                     "inbound": rec["inbound"].to_json(),
                     "capacity": rec["capacity"].to_json(),
+                    "sustained": (
+                        rec["sustained"].to_json()
+                        if isinstance(rec.get("sustained"), RateHistogram)
+                        else RateHistogram().to_json()
+                    ),
                     "n_windows": rec.get("n_windows", 0),
                     "n_snapshot": rec.get("n_snapshot", 0),
                     "n_violating": rec.get("n_violating", 0),
                     "shard_factors": rec.get("shard_factors", []),
+                    "refused": bool(rec.get("refused", False)),
                 }
                 for key, rec in self.boots.items()
             },
@@ -653,6 +759,8 @@ def refresh_fanout_tape(
     boot_n_snapshot: int,
     boot_n_violating: int,
     boot_shard_factors: list[int],
+    boot_sustained: RateHistogram | None = None,
+    boot_refused: bool = False,
 ) -> PooledEvidence:
     """Synchronous file I/O + arithmetic on COPIES — call it off the loop."""
     tape = FanoutTape(tape_path)
@@ -666,6 +774,8 @@ def refresh_fanout_tape(
         n_snapshot=boot_n_snapshot,
         n_violating=boot_n_violating,
         shard_factors=boot_shard_factors,
+        sustained=boot_sustained,
+        refused=boot_refused,
     )
     tape.prune(retain_since_ts=oldest_live_log_mtime(data_dir))
     tape.save()
@@ -693,6 +803,14 @@ class ShardFactorDerivation:
     cap: int = SHARD_FACTOR_MAX
     override: int | None = None
     n_measured: int | None = None
+    # Shrink gate (module doc): the highest demonstrably sustained
+    # per-connection rate, the N it supports, the N the gate judged against,
+    # and whether it held a shrink back.
+    sustained_fps: float = 0.0
+    n_sustained: int | None = None
+    current: int | None = None
+    shrink_held: bool = False
+    boots_refused: int = 0
 
     def as_log(self) -> dict[str, object]:
         return {
@@ -702,9 +820,11 @@ class ShardFactorDerivation:
             "inbound_max_fps": round(self.inbound_max_fps, 1),
             "capacity_q_lo_fps": round(self.capacity_fps, 1),
             "capacity_min_fps": round(self.capacity_min_fps, 1),
+            "sustained_q_hi_fps": round(self.sustained_fps, 1),
             "n_windows": self.n_windows,
             "n_violating": self.n_violating,
             "boots_pooled": self.boots_pooled,
+            "boots_refused": self.boots_refused,
             "margin": self.margin,
             "z": self.z,
             "p_hi": self.p_hi,
@@ -713,6 +833,9 @@ class ShardFactorDerivation:
             "cap": self.cap,
             "override": self.override,
             "shard_factor_measured": self.n_measured,
+            "shard_factor_sustained": self.n_sustained,
+            "shrink_gate_current": self.current,
+            "shrink_held": self.shrink_held,
         }
 
 
@@ -727,10 +850,19 @@ def derive_shard_factor(
     refused: bool = False,
     margin: float = FANOUT_HEADROOM,
     z: float = FANOUT_Z,
+    sustained: RateHistogram | None = None,
+    current: int | None = None,
+    boots_refused: int = 0,
 ) -> ShardFactorDerivation:
     """``clamp(ceil(Q_hi(inbound) × margin / Q_lo(capacity)), 1, 100)`` —
     see the module doc. ``margin`` must be ≥ 1 (below one would size a
-    connection INSIDE its measured ceiling — the defect this removes)."""
+    connection INSIDE its measured ceiling — the defect this removes).
+
+    SHRINK GATE: when ``current`` is given and the measured N is below it,
+    the shrink is applied only down to ``N_sustained = ceil(Q_hi(inbound) ×
+    margin / Q_hi(sustained))`` — as far as a connection has demonstrably
+    carried the post-shrink load with the same headroom; no sustained
+    evidence ⇒ hold at ``current``. Growth never consults it."""
     if not (margin >= 1.0) or math.isinf(margin):
         raise ValueError(f"margin must be >= 1 and finite, got {margin}")
     p_hi = normal_upper_tail_p(z)
@@ -743,9 +875,14 @@ def derive_shard_factor(
         if capacity is not None and capacity.n and not math.isinf(capacity.min_fps)
         else 0.0
     )
+    sus_q = sustained.quantile_upper(p_hi) if sustained is not None and sustained.n else 0.0
     n_measured: int | None = None
     if inbound_q > 0.0 and cap_q > 0.0:
         n_measured = max(1, min(SHARD_FACTOR_MAX, math.ceil(inbound_q * margin / cap_q)))
+    n_sustained: int | None = None
+    if inbound_q > 0.0 and sus_q > 0.0:
+        n_sustained = max(1, min(SHARD_FACTOR_MAX, math.ceil(inbound_q * margin / sus_q)))
+    shrink_held = False
     if override is not None:
         n = max(1, min(SHARD_FACTOR_MAX, int(override)))
         source = "override"
@@ -758,6 +895,10 @@ def derive_shard_factor(
     else:
         n = n_measured
         source = "measured"
+        if current is not None and n_measured < current:
+            gate_floor = current if n_sustained is None else n_sustained
+            n = min(current, max(n_measured, gate_floor))
+            shrink_held = n > n_measured
     return ShardFactorDerivation(
         n=n,
         source=source,
@@ -774,6 +915,11 @@ def derive_shard_factor(
         p_lo=p_lo,
         override=override,
         n_measured=n_measured,
+        sustained_fps=sus_q,
+        n_sustained=n_sustained,
+        current=current,
+        shrink_held=shrink_held,
+        boots_refused=boots_refused,
     )
 
 
@@ -838,7 +984,15 @@ class CommsFanout(WsManager):
         self._base_subs: list[_BaseSub] = []
         self._user_on_disconnect: list[LifecycleHandler] = []
         self._user_on_connect: list[LifecycleHandler] = []
-        self._disconnect_fired_since_connect = False
+        # LOSS EPOCH (module doc): ``_epoch_open`` = the consumer's
+        # ``on_disconnect`` has fired and not every shard whose socket dropped
+        # since has re-ACKED its subscribe (``_reacking``). Closed by the ack.
+        self._epoch_open = False
+        self._reacking: set[int] = set()
+        # Priority frames admitted under N > 1, keyed (type, quote_id) →
+        # first shard; insertion-ordered, bounded by the lane capacity (an
+        # existing transport bound — tens of accepts a day never reach it).
+        self._priority_seen: dict[tuple[str, str], int | None] = {}
         self._reshard_lock = asyncio.Lock()
 
     # --- surface ---
@@ -937,7 +1091,7 @@ class CommsFanout(WsManager):
 
     def start(self) -> None:
         super().start()  # dispatcher only (reader=False)
-        self._build_shards(self._shard_factor)
+        self._build_shards(self._shard_factor, epoch_open=False)
 
     async def stop(self) -> None:
         self._stopping = True
@@ -965,9 +1119,13 @@ class CommsFanout(WsManager):
         """Rebuild the shard set at ``n`` (clamped to [1, 100]; forced to 1
         once sharding was refused). Before ``start()`` it only records the
         factor. Live: fires the consumer's ``on_disconnect`` ONCE (mirrored
-        state is invalid across the rebuild), stops the old sockets, builds
-        the new set — old first, then new, so no frame is ever delivered
-        twice (an overlap would double every RFQ and every accept)."""
+        state is invalid across the rebuild), stops the old sockets, PURGES
+        their queued market frames from the shared lanes (the new sockets
+        re-dump every open RFQ — review fix 2026-09-05: up to 20,000 stale
+        parses otherwise ran ahead of the re-dump), builds the new set — old
+        first, then new, so no frame is ever delivered twice (an overlap
+        would double every RFQ and every accept). The loss epoch stays open
+        until every new shard has acked."""
         n = max(1, min(SHARD_FACTOR_MAX, int(n)))
         if self._sharding_refused:
             n = 1
@@ -989,7 +1147,18 @@ class CommsFanout(WsManager):
             await self._fire_user_disconnect()
             shards, self._shards, self._meters = self._shards, [], []
             await self._stop_shards(shards)
-            self._build_shards(n)
+            # Every retired reader has exited (stop joins the thread), so a
+            # purge by shard tag is unambiguous here: no new set exists yet.
+            purged = sum(self._lanes.purge_market(k) for k in range(len(shards)))
+            if purged:
+                self._metrics.inc(f"{self._name}.reshard_purged", purged)
+                log.info(
+                    "ws_fanout_reshard_purged",
+                    name=self._name,
+                    dropped=purged,
+                    generation_retired=self._generation,
+                )
+            self._build_shards(n, epoch_open=True)
             return n
 
     # --- measurement ---
@@ -1003,7 +1172,11 @@ class CommsFanout(WsManager):
 
     # --- internals ---
 
-    def _build_shards(self, n: int) -> None:
+    def _build_shards(self, n: int, *, epoch_open: bool) -> None:
+        """``epoch_open``: True after a live re-shard (the consumer's
+        ``on_disconnect`` just fired; the epoch closes when every new shard
+        has acked), False on ``start()`` (nothing fired; a death before the
+        first ack opens an epoch as a plain manager would)."""
         self._generation += 1
         gen = self._generation
         shards: list[WsManager] = []
@@ -1040,7 +1213,8 @@ class CommsFanout(WsManager):
         self._meters = meters
         self._shard_factor = n
         self._lost = set()
-        self._disconnect_fired_since_connect = False
+        self._epoch_open = epoch_open
+        self._reacking = set(range(n)) if epoch_open else set()
         for k, shard in enumerate(shards):
             for base in self._base_subs:
                 self._materialize(shard, k, meters[k], base)
@@ -1085,6 +1259,7 @@ class CommsFanout(WsManager):
     def _ack_hook(self, k: int, meter: ShardMeter, base: _BaseSub) -> SubscribedHandler:
         async def hook(sid: int) -> None:
             self._lost.discard(k)
+            self._shard_reacked(k)
             meter.mark_subscribed()
             log.info(
                 "ws_shard_subscribed",
@@ -1103,7 +1278,16 @@ class CommsFanout(WsManager):
     ) -> SubscribeErrorHandler:
         async def hook(code: int, text: str) -> None:
             self._metrics.inc(f"{self._name}.shard_subscribe_error.{code}")
-            if sharded and code in SHARDING_REFUSED_CODES:
+            if sharded and code not in TERMINAL_CHANNEL_ERROR_CODES:
+                # REVIEW MUST-FIX 2026-09-05: EVERY non-ack answer to a
+                # sharded subscribe is a refusal — not only the documented
+                # validation codes. An unlisted code (6 "Already subscribed":
+                # the per-key open question, SUMMARY.md) used to leave this
+                # shard CONNECTED but UNSUBSCRIBED for the whole boot with
+                # ``connected``/``healthy`` True and 1/N of every RFQ and
+                # accept silently invisible. Terminal codes (10/17/25) are
+                # excluded: ``_dispatch_control`` reconnects that shard.
+                documented = code in SHARDING_REFUSED_CODES
                 self._sharding_refused = True
                 self._metrics.inc(f"{self._name}.sharding_refused")
                 log.warning(
@@ -1112,24 +1296,35 @@ class CommsFanout(WsManager):
                     shard=k,
                     code=code,
                     error=text,
+                    documented=documented,
                     shard_factor=self._shard_factor,
                     detail="the exchange refused a SHARDED communications subscribe "
-                    "(validation codes 19-22 / 11); falling back to the single "
-                    "UNSHARDED subscription for the rest of this boot — today's "
-                    "behaviour, never no subscription. Check the docs "
-                    "(asyncapi-ws.md §3.2) before re-arming.",
+                    + (
+                        "(a documented sharding validation code, 19-22 / 11 — the "
+                        "docs, asyncapi-ws.md §3.2, are wrong about something)"
+                        if documented
+                        else "(an UNLISTED code — 6 'Already subscribed' would mean "
+                        "one key cannot hold N communications subscriptions)"
+                    )
+                    + "; falling back to the single UNSHARDED subscription for the "
+                    "rest of this boot — today's behaviour, never a connected-but-"
+                    "unsubscribed shard. Investigate before re-arming.",
                 )
                 self._spawn_lifecycle(
                     self._fallback_unsharded(f"sharding_refused_code_{code}"),
                     f"{self._name}-fallback-unsharded",
                 )
             else:
+                # Unsharded (today's behaviour: the warning is the whole
+                # response) or a terminal code (that shard reconnects).
                 log.warning(
                     "ws_shard_subscribe_error",
                     name=self._name,
                     shard=k,
                     code=code,
                     error=text,
+                    sharded=sharded,
+                    terminal=code in TERMINAL_CHANNEL_ERROR_CODES,
                 )
             if base.on_subscribe_error is not None:
                 await base.on_subscribe_error(code, text)
@@ -1141,7 +1336,9 @@ class CommsFanout(WsManager):
 
     def _shard_connected_hook(self, k: int) -> LifecycleHandler:
         async def hook() -> None:
-            self._disconnect_fired_since_connect = False
+            if not any(b.shardable for b in self._base_subs):
+                # Nothing to ack on this socket: the connect is the re-ack.
+                self._shard_reacked(k)
             for handler in self._user_on_connect:
                 try:
                     await handler()
@@ -1153,17 +1350,26 @@ class CommsFanout(WsManager):
     def _shard_disconnected_hook(self, k: int) -> LifecycleHandler:
         async def hook() -> None:
             self._metrics.inc(f"{self._name}.shard_disconnect")
-            if self._disconnect_fired_since_connect:
-                # Same loss epoch (no shard has re-connected since the last
-                # fire): the consumer already invalidated its mirror.
+            self._reacking.add(k)
+            if self._epoch_open:
+                # Same loss epoch: some casualty has not re-acked yet, so the
+                # consumer's mirror is already invalidated — one rotation.
                 self._metrics.inc(f"{self._name}.shard_disconnect_coalesced")
                 return
             await self._fire_user_disconnect()
 
         return hook
 
+    def _shard_reacked(self, k: int) -> None:
+        """A shard's subscribe was (re-)acked: it is no longer a casualty. The
+        epoch closes when no casualty remains."""
+        self._reacking.discard(k)
+        if not self._reacking and self._epoch_open:
+            self._epoch_open = False
+            self._metrics.inc(f"{self._name}.loss_epoch_closed")
+
     async def _fire_user_disconnect(self) -> None:
-        self._disconnect_fired_since_connect = True
+        self._epoch_open = True
         for handler in self._user_on_disconnect:
             try:
                 await handler()
@@ -1186,6 +1392,8 @@ class CommsFanout(WsManager):
         shard set are dropped: they can neither resolve a live command nor
         report a live channel."""
         if msg_type not in ("subscribed", "error"):
+            if msg_type in self._priority_types and len(self._shards) > 1:
+                return self._admit_priority_once(message, msg_type)
             return True
         shard, k = self._shard_of(message)
         if shard is None and message.get("_gen") is not None:
@@ -1203,6 +1411,39 @@ class CommsFanout(WsManager):
             await shard._resolve_subscribe_error(message)
         if code in TERMINAL_CHANNEL_ERROR_CODES and shard is not None and k is not None:
             return self._shard_channel_lost(k, shard, code, message)
+        return True
+
+    def _admit_priority_once(self, message: JsonDict, msg_type: str) -> bool:
+        """N > 1 only (module doc): the same quote event carried by two shard
+        sockets is dispatched once. Frames without a ``quote_id`` are
+        admitted as-is (nothing to key on)."""
+        msg = message.get("msg")
+        quote_id = msg.get("quote_id") if isinstance(msg, dict) else None
+        if not isinstance(quote_id, str) or not quote_id:
+            return True
+        key = (msg_type, quote_id)
+        tag = message.get("_shard")
+        shard = tag if isinstance(tag, int) else None
+        if key in self._priority_seen:
+            self._metrics.inc(f"{self._name}.dup_priority_frame")
+            self._metrics.inc(f"{self._name}.dup_priority_frame.{msg_type}")
+            log.warning(
+                "ws_fanout_duplicate_priority_frame",
+                name=self._name,
+                msg_type=msg_type,
+                quote_id=quote_id,
+                shard=shard,
+                first_shard=self._priority_seen[key],
+                shard_factor=self._shard_factor,
+                detail="the exchange delivered the same quote event on more than one "
+                "shard socket (BROADCAST, not partition — the SUMMARY.md open "
+                "question, answered); dropped here so the confirm path runs once.",
+            )
+            return False
+        self._priority_seen[key] = shard
+        capacity = self._lanes.capacity
+        while len(self._priority_seen) > capacity:
+            self._priority_seen.pop(next(iter(self._priority_seen)))
         return True
 
     def _shard_channel_lost(self, k: int, shard: WsManager, code: int, message: JsonDict) -> bool:
@@ -1268,7 +1509,11 @@ class FanoutGovernor:
         confirm_window_s: float,
         override: int | None = None,
         io: Callable[..., Awaitable[PooledEvidence]] | None = None,
+        apply_ok: Callable[[], bool] | None = None,
     ) -> None:
+        """``apply_ok`` (module doc, the apply gate): a live re-shard is
+        applied only while it returns True — the app passes "no accept in
+        flight" (``not AcceptPriorityGate.holding()``). None = always."""
         if not (confirm_window_s > 0.0):
             raise ValueError(f"confirm_window_s must be > 0, got {confirm_window_s}")
         self._fanout = fanout
@@ -1281,8 +1526,10 @@ class FanoutGovernor:
         self._window_ms = confirm_window_s * 1e3
         self._override = override
         self._io = io
+        self._apply_ok = apply_ok
         self.inbound = RateHistogram()
         self.capacity = RateHistogram()
+        self.sustained = RateHistogram()
         self.n_windows = 0
         self.n_snapshot = 0
         self.n_violating = 0
@@ -1296,6 +1543,11 @@ class FanoutGovernor:
                 self._observe_windows(self._fanout.take_windows(self._clock.monotonic_ns()))
             pooled = await self._refresh_tape()
             self.last_pooled = pooled
+            current = self._fanout.shard_factor
+            # The shrink gate judges against the factor actually RUNNING: this
+            # boot's live set on a refresh, the previous boot's last applied
+            # factor at boot (nothing runs yet; ``shard_factor`` is the default).
+            gate_current = pooled.last_shard_factor if reason == "boot" else current
             derivation = derive_shard_factor(
                 pooled.inbound,
                 pooled.capacity,
@@ -1304,16 +1556,34 @@ class FanoutGovernor:
                 boots_pooled=pooled.boots,
                 override=self._override,
                 refused=self._fanout.sharding_refused,
+                sustained=pooled.sustained,
+                current=gate_current,
+                boots_refused=pooled.boots_refused,
             )
             self.last = derivation
-            current = self._fanout.shard_factor
             deferred_shrink = False
-            if (
+            apply_deferred: str | None = None
+            urgent = self._fanout.sharding_refused and current != 1
+            want_apply = (
                 reason == "boot"
                 or derivation.n > current
                 or (self._override is not None and derivation.n != current)
-                or (self._fanout.sharding_refused and current != 1)
+                or urgent
+            )
+            if (
+                want_apply
+                and reason != "boot"
+                and not urgent
+                and self._apply_ok is not None
+                and not self._apply_ok()
             ):
+                # APPLY GATE (module doc): an accept is in flight — a re-shard
+                # would blind the comms path for ~1 s exactly when its
+                # ``quote_executed`` is due. Next tick.
+                want_apply = False
+                apply_deferred = "accept_in_flight"
+                self._metrics.inc(f"{self._fanout._name}.apply_deferred")
+            if want_apply:
                 applied = await self._fanout.apply_shard_factor(
                     derivation.n, reason=f"{reason}:{derivation.source}"
                 )
@@ -1327,8 +1597,10 @@ class FanoutGovernor:
                 "ws_fanout_derivation",
                 reason=reason,
                 shard_factor_current=current,
+                shard_factor_previous_boot=pooled.last_shard_factor,
                 shard_factor_applied=applied,
                 deferred_shrink=deferred_shrink,
+                apply_deferred=apply_deferred,
                 boot_windows=self.n_windows,
                 boot_snapshot_windows=self.n_snapshot,
                 boot_violating_windows=self.n_violating,
@@ -1353,6 +1625,8 @@ class FanoutGovernor:
             "boot_n_snapshot": self.n_snapshot,
             "boot_n_violating": self.n_violating,
             "boot_shard_factors": list(self.shard_factors_used),
+            "boot_sustained": self.sustained.copy(),
+            "boot_refused": self._fanout.sharding_refused,
         }
         if self._io is not None:
             return await self._io(**kwargs)
@@ -1424,8 +1698,13 @@ class FanoutGovernor:
         self.n_windows += 1
         self.inbound.observe(total_fps)
         for w in windows:
-            if w.violating(self._window_ms):
+            violating = w.violating(self._window_ms)
+            if violating:
                 self.n_violating += 1
+            elif w.frames > 0 and w.elapsed_s > 0:
+                # SUSTAINED (the shrink gate's evidence): this connection kept
+                # up at this rate — a demonstrated lower bound on its ceiling.
+                self.sustained.observe(w.fps)
             cap = w.capacity_fps(self._window_ms)
             if cap is not None:
                 self.capacity.observe(cap)

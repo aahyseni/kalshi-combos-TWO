@@ -29,6 +29,23 @@ dispatcher (rule 8: drive the live module, never reimplement it):
      ``pipe_lag_exceeds_confirm_window`` alarm; the governor applies GROWTH
      live and defers a shrink to the next boot; the tape pools across boots.
   7. A follower's death purges only ITS market frames from the shared lanes.
+
+Review fixes (2026-09-05, same day), each with the probe that found it:
+  8. ANY non-terminal answer to a SHARDED subscribe (6 "Already subscribed",
+     an unlisted 1) is a refusal → the loud unsharded fallback; a shard is
+     never left connected-but-unsubscribed with health green. A terminal code
+     (17) answering a sharded subscribe reconnects THAT shard instead.
+  9. The loss epoch closes on the casualties' re-ACK, not the first
+     re-connect: a rolling close that reaches the sockets in sequence fires
+     the consumer's on_disconnect once.
+ 10. A live re-shard purges the retired generation's queued MARKET frames.
+ 11. Under N > 1 a quote event carried by two sockets is dispatched once
+     (broadcast dedupe); N = 1 admits everything as today.
+ 12. Shrink gate: with the violating evidence pruned, the healthy
+     extrapolation cannot shrink N below what a connection has demonstrably
+     sustained at the post-shrink load; the apply gate defers a live
+     re-shard while an accept is in flight; the tape (v2) pools the
+     sustained rate, the refusal flag and the previous boot's factor.
 """
 
 from __future__ import annotations
@@ -547,7 +564,12 @@ def test_purge_market_keeps_priority_control_and_other_shards() -> None:
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("code", sorted(SHARD_VALIDATION_ERROR_CODES))
+# 19-22 = the documented sharding validation codes; 11 = "Invalid parameter";
+# 6 = "Already subscribed" (the per-key open question, SUMMARY.md); 1 = an
+# unlisted general code. Review must-fix: EVERY non-terminal answer to a
+# sharded subscribe is a refusal — the probe with code 6 left the shard
+# connected, unsubscribed and green for the whole boot.
+@pytest.mark.parametrize("code", [*sorted(SHARD_VALIDATION_ERROR_CODES), 11, 6, 1])
 async def test_sharding_validation_error_falls_back_to_unsharded_loudly(code: int) -> None:
     exchange = _FakeExchange(refuse={2: code})
     f, metrics = _fanout(exchange)
@@ -572,7 +594,10 @@ async def test_sharding_validation_error_falls_back_to_unsharded_loudly(code: in
             assert len(refused) == 1
             assert refused[0]["log_level"] == "warning"
             assert refused[0]["code"] == code and refused[0]["shard"] == 2
+            assert refused[0]["documented"] is (code in SHARD_VALIDATION_ERROR_CODES | {11})
             assert metrics.counter("t.sharding_refused") == 1
+            # The refused socket never stays open: every live socket is acked.
+            assert all(sock.acked for sock in exchange.sockets if not sock.closed)
             # Fallback = today's subscribe, and it still delivers.
             assert exchange.subscribes[-1] == {"channels": ["communications"]}
             exchange.route(_rfq_created("r1"), "r1")
@@ -585,6 +610,184 @@ async def test_sharding_validation_error_falls_back_to_unsharded_loudly(code: in
             assert d.n == 1 and d.source == "fallback_unsharded"
         finally:
             await f.stop()
+
+
+async def test_terminal_code_answering_a_sharded_subscribe_reconnects_that_shard_not_fallback() -> (
+    None
+):
+    """The one exclusion from the refusal rule: a TERMINAL code (10/17/25)
+    echoing a sharded subscribe's id is a channel loss — that shard reconnects
+    on its own path (``_dispatch_control``); sharding is NOT abandoned."""
+    exchange = _FakeExchange(refuse={1: 17})
+    f, metrics = _fanout(exchange)
+    f.add_subscription(["communications"])
+    await f.apply_shard_factor(3, reason="test")
+    with structlog.testing.capture_logs() as logs:
+        f.start()
+        try:
+            await _until(lambda: metrics.counter("t.shard_channel_lost.17") >= 1)
+            exchange._refuse = {}  # the exchange recovers; the shard's own reconnect re-subscribes
+            await _until(lambda: exchange.live_keys() == {0, 1, 2} and not f._lost)
+            assert not f.sharding_refused and f.shard_factor == 3 and f.shard_count == 3
+            assert not [e for e in logs if e["event"] == "ws_fanout_sharding_refused"]
+            lost = [e for e in logs if e["event"] == "ws_shard_channel_lost"]
+            assert lost and all(e["shard"] == 1 for e in lost)
+            err = [e for e in logs if e["event"] == "ws_shard_subscribe_error"]
+            assert err and err[0]["terminal"] is True and err[0]["sharded"] is True
+            assert exchange.subscribes[-1] == {
+                "channels": ["communications"],
+                "shard_factor": 3,
+                "shard_key": 1,
+            }
+        finally:
+            await f.stop()
+
+
+async def test_staggered_shard_deaths_before_reack_share_one_loss_epoch() -> None:
+    """Review probe C: N = 2, shard 0 dies, its socket comes back, THEN shard 1
+    dies — the epoch used to close on shard 0's re-CONNECT, so the consumer's
+    on_disconnect fired twice (two intake liveness rotations for one rolling
+    close). It now closes only when every casualty has RE-ACKED."""
+    exchange = _FakeExchange()
+    f, metrics, _ = await _start_sharded(exchange, 2)
+    disconnects: list[int] = []
+
+    async def on_disc() -> None:
+        disconnects.append(1)
+
+    f.on_disconnect(on_disc)
+    try:
+        await asyncio.sleep(0.05)
+        s0, s1 = exchange.by_key[0], exchange.by_key[1]
+        exchange.hold_acks = True  # re-subscribes park: no casualty can re-ack yet
+        s0.closed = True  # shard 0's socket dies (EOF)
+        await _until(lambda: disconnects == [1])
+        await _until(lambda: exchange.connects == 3 and len(exchange._held) == 1)
+        assert f._reacking == {0} and f._epoch_open  # back up, subscribe un-acked
+        s1.closed = True  # the rolling close reaches shard 1
+        await _until(lambda: metrics.counter("t.shard_disconnect") == 2)
+        await _until(lambda: exchange.connects == 4 and len(exchange._held) == 2)
+        await asyncio.sleep(0.05)
+        assert disconnects == [1]  # coalesced into the open epoch
+        assert metrics.counter("t.shard_disconnect_coalesced") == 1
+        assert f._reacking == {0, 1}
+        exchange.release_acks()
+        await _until(lambda: not f._reacking)
+        assert not f._epoch_open and metrics.counter("t.loss_epoch_closed") == 1
+        # Every casualty re-acked: a later death is a NEW epoch (nothing ties
+        # it to the last one without shard-scoping the intake's registry).
+        exchange.hold_acks = False  # acks flow again: the new epoch can close
+        exchange.by_key[0].closed = True
+        await _until(lambda: disconnects == [1, 1])
+        await _until(lambda: not f._reacking)
+        assert metrics.counter("t.loss_epoch_closed") == 2
+    finally:
+        await f.stop()
+
+
+async def test_live_reshard_purges_the_retired_generations_market_frames() -> None:
+    """Review probe B: N = 1 → 2 with 29 old-generation rfq_created queued
+    behind a held dispatcher — all 29 used to reach the intake AFTER its
+    registry reset, ahead of the new shards' re-dump. They are purged now;
+    the epoch stays open until both new shards ack."""
+    exchange = _FakeExchange()
+    f, metrics, seen = await _start_sharded(exchange, 1)
+    release = asyncio.Event()
+    first_started = asyncio.Event()
+    disconnects: list[int] = []
+
+    async def slow(msg: JsonDict) -> None:  # holds the dispatcher on the FIRST market frame
+        first_started.set()
+        await release.wait()
+
+    async def on_disc() -> None:
+        disconnects.append(1)
+
+    f.on_message("rfq_created", slow)
+    f.on_disconnect(on_disc)
+    try:
+        await asyncio.sleep(0.05)
+        s0 = exchange.by_key[None]
+        ids = [f"r{i}" for i in range(30)]
+        s0.feed(_rfq_created(ids[0]))
+        await first_started.wait()
+        for rid in ids[1:]:
+            s0.feed(_rfq_created(rid))
+        await _until(lambda: f.lane_depths()["market"] == 29)
+        with structlog.testing.capture_logs() as logs:
+            assert await f.apply_shard_factor(2, reason="test") == 2
+        assert f.lane_depths()["market"] == 0
+        assert metrics.counter("t.reshard_purged") == 29
+        purged = [e for e in logs if e["event"] == "ws_fanout_reshard_purged"]
+        assert len(purged) == 1 and purged[0]["dropped"] == 29
+        assert disconnects == [1] and f._epoch_open and f._reacking == {0, 1}
+        release.set()
+        await _until(lambda: exchange.live_keys() == {0, 1})
+        await _until(lambda: not f._reacking)  # both new shards acked → epoch closed
+        assert not f._epoch_open
+        await _settled(f)
+        # Only the in-flight frame reached the consumer; none of the 29 retired ones.
+        assert [x.split(":")[1] for x in seen if x.startswith("rfq_created")] == [ids[0]]
+        exchange.route(_rfq_created("z1"), "z1")  # the new generation delivers
+        await _until(lambda: len([x for x in seen if x.startswith("rfq_created")]) == 2)
+        assert s0.closed
+    finally:
+        release.set()
+        await f.stop()
+
+
+async def test_duplicate_priority_frames_dispatch_once_sharded_and_all_at_factor_one() -> None:
+    """Whether Kalshi partitions or BROADCASTS our own quote events across the
+    N subscriptions is undocumented. A broadcast duplicate accept would re-run
+    the confirm against an already-confirmed quote and count a confirm failure
+    of ours toward HALT_CONFIRM_TIMEOUTS — so under N > 1 each (type,
+    quote_id) is admitted once. N = 1 admits everything (today's bytes)."""
+    exchange = _FakeExchange()
+    f, metrics, seen = await _start_sharded(exchange, 2)
+    executed: list[str] = []
+
+    async def on_exec(msg: JsonDict) -> None:
+        executed.append(str(msg["msg"]["quote_id"]))
+
+    f.on_message("quote_executed", on_exec)
+    try:
+        await asyncio.sleep(0.05)
+        s0, s1 = exchange.by_key[0], exchange.by_key[1]
+        with structlog.testing.capture_logs() as logs:
+            s0.feed(_accept("r1", "q1"))  # BROADCAST shape: the same events on both sockets
+            s1.feed(_accept("r1", "q1"))
+            s0.feed({"type": "quote_executed", "sid": 1, "msg": {"quote_id": "q1"}})
+            s1.feed({"type": "quote_executed", "sid": 1, "msg": {"quote_id": "q1"}})
+            s1.feed(_accept("r2", "q2"))  # a different quote: admitted
+            # No quote_id → nothing to key on → admitted as-is.
+            s0.feed({"type": "quote_accepted", "sid": 1, "msg": {"rfq_id": "r3"}})
+            await _until(lambda: metrics.counter("t.dup_priority_frame") == 2)
+            await _settled(f)
+        accepted = [x.split(":")[1] for x in seen if x.startswith("quote_accepted")]
+        assert sorted(accepted) == ["None", "q1", "q2"]
+        assert executed == ["q1"]
+        assert metrics.counter("t.msg.quote_accepted") == 4  # raw arrivals
+        assert metrics.counter("t.msg.quote_executed") == 2
+        assert metrics.counter("t.dup_priority_frame.quote_accepted") == 1
+        assert metrics.counter("t.dup_priority_frame.quote_executed") == 1
+        dups = [e for e in logs if e["event"] == "ws_fanout_duplicate_priority_frame"]
+        assert len(dups) == 2 and all(e["log_level"] == "warning" for e in dups)
+        assert all(e["quote_id"] == "q1" and e["shard"] != e["first_shard"] for e in dups)
+        assert {e["msg_type"] for e in dups} == {"quote_accepted", "quote_executed"}
+    finally:
+        await f.stop()
+    # N = 1: one socket cannot duplicate; nothing is deduped (byte-identical to today).
+    exchange1 = _FakeExchange()
+    f1, metrics1, seen1 = await _start_sharded(exchange1, 1)
+    try:
+        await asyncio.sleep(0.05)
+        sock = exchange1.by_key[None]
+        sock.feed(_accept("r1", "q1"))
+        sock.feed(_accept("r1", "q1"))
+        await _until(lambda: len([x for x in seen1 if x.startswith("quote_accepted")]) == 2)
+        assert metrics1.counter("t.dup_priority_frame") == 0
+    finally:
+        await f1.stop()
 
 
 # --------------------------------------------------------------------------- #
@@ -651,6 +854,79 @@ def test_anchors_are_the_existing_policy_constants() -> None:
     assert FANOUT_HEADROOM == STALL_WALL_MARGIN
     assert FANOUT_Z == EXPIRED_RATE_ALARM_Z == 3.0
     assert RateHistogram.RATIO == 1.0 + 1.0 / SHARD_FACTOR_MAX
+
+
+def test_shrink_gate_holds_without_demonstrated_sustained_rate() -> None:
+    """The oscillation the review found: once the violating unsharded windows
+    are pruned, the healthy extrapolation (fps / utilisation ≈ 20,000 at N = 3)
+    derives N = 1; the next boot would run unsharded, violate and re-grow. A
+    shrink is applied only as far as some connection has DEMONSTRABLY carried
+    the post-shrink load with the same headroom; growth never consults it."""
+    inbound = _hist([1200.0, 1300.0, 1340.0])
+    extrapolated = _hist([20000.0, 21500.0, 19000.0])  # healthy windows at N = 3
+    # No sustained evidence at all (a v1 tape) → hold at current.
+    d = derive_shard_factor(
+        inbound, extrapolated, n_windows=3, n_violating=0, boots_pooled=1, current=3
+    )
+    assert d.n_measured == 1 and d.n == 3 and d.shrink_held and d.n_sustained is None
+    assert d.source == "measured" and d.current == 3
+    # Demonstrated ~430-440 fps per connection (each shard's share at N = 3):
+    # N_sustained = ceil(1,340..1,353 × 2 / 440) = 7 > 3 → hold at 3.
+    d = derive_shard_factor(
+        inbound,
+        extrapolated,
+        n_windows=3,
+        n_violating=0,
+        boots_pooled=1,
+        sustained=_hist([430.0, 440.0]),
+        current=3,
+    )
+    assert d.sustained_fps == 440.0
+    assert d.n_sustained == math.ceil(d.inbound_fps * 2.0 / 440.0) == 7
+    assert d.n == 3 and d.shrink_held
+    # A connection demonstrably healthy at 1,400 fps → N_sustained = 2 → shrink to 2, not 1.
+    d = derive_shard_factor(
+        inbound,
+        extrapolated,
+        n_windows=3,
+        n_violating=0,
+        boots_pooled=1,
+        sustained=_hist([1400.0]),
+        current=3,
+    )
+    assert d.n_sustained == 2 and d.n == 2 and d.shrink_held
+    # Demonstrated 3,000 fps → N_sustained = 1 → the full measured shrink applies.
+    d = derive_shard_factor(
+        inbound,
+        extrapolated,
+        n_windows=3,
+        n_violating=0,
+        boots_pooled=1,
+        sustained=_hist([3000.0]),
+        current=3,
+    )
+    assert d.n_sustained == 1 and d.n == 1 and not d.shrink_held
+    # GROWTH never consults the gate: measured 3 from current 1 while the
+    # demonstrated rate alone would argue for 7 (the ratchet the gate must not be).
+    d = derive_shard_factor(
+        inbound,
+        _hist([1100.0]),
+        n_windows=1,
+        n_violating=1,
+        boots_pooled=1,
+        sustained=_hist([430.0]),
+        current=1,
+    )
+    assert d.n == 3 and not d.shrink_held and d.n_sustained == 7
+    # No current (a first boot, nothing ran before) → the measured N stands.
+    d = derive_shard_factor(
+        inbound, extrapolated, n_windows=3, n_violating=0, boots_pooled=1, sustained=_hist([430.0])
+    )
+    assert d.n == 1 and not d.shrink_held and d.current is None
+    log = d.as_log()
+    assert log["shard_factor_sustained"] == 7 and log["shrink_gate_current"] is None
+    assert log["shrink_held"] is False and log["boots_refused"] == 0
+    assert log["sustained_q_hi_fps"] == 430.0
 
 
 def test_rate_histogram_quantiles_and_json_roundtrip() -> None:
@@ -730,6 +1006,81 @@ def test_fanout_tape_folds_prunes_and_pools(tmp_path: Path) -> None:
     path.write_text("{not json")
     tape.load()
     assert tape.boots == {}
+
+
+def test_fanout_tape_v2_pools_sustained_refused_and_previous_boot_factor(tmp_path: Path) -> None:
+    path = fanout_tape_path(tmp_path)
+    # A v1 record (no ``sustained`` / ``refused``) loads with empty sustained
+    # evidence (⇒ the shrink gate holds) and refused = False.
+    v1 = {
+        "schema_version": 1,
+        "boots": {
+            "old": {
+                "started_at_ts": 1000.0,
+                "inbound": _hist([1200.0]).to_json(),
+                "capacity": _hist([1100.0]).to_json(),
+                "n_windows": 1,
+                "n_snapshot": 1,
+                "n_violating": 1,
+                "shard_factors": [1, 3],
+            }
+        },
+    }
+    path.write_text(json.dumps(v1))
+    tape = FanoutTape(path)
+    tape.load()
+    assert tape.boots["old"]["sustained"].n == 0 and tape.boots["old"]["refused"] is False
+    pooled = tape.pooled()
+    assert pooled.sustained.n == 0 and pooled.boots_refused == 0
+    assert pooled.last_shard_factor == 3  # the last factor the previous boot ran at
+    # This boot at its boot tick: nothing applied yet → the previous boot's factor stands.
+    pooled = refresh_fanout_tape(
+        tape_path=path,
+        data_dir=tmp_path,
+        boot_key="new",
+        boot_started_at_ts=2000.0,
+        boot_inbound=_hist([600.0]),
+        boot_capacity=_hist([3000.0]),
+        boot_n_windows=1,
+        boot_n_snapshot=0,
+        boot_n_violating=0,
+        boot_shard_factors=[],
+        boot_sustained=_hist([430.0, 440.0]),
+        boot_refused=True,
+    )
+    assert pooled.boots == 2 and pooled.boots_refused == 1
+    assert pooled.sustained.n == 2 and pooled.sustained.max_fps == 440.0
+    assert pooled.last_shard_factor == 3
+    # Once this boot applied factors, it is the most recent boot with any.
+    pooled = refresh_fanout_tape(
+        tape_path=path,
+        data_dir=tmp_path,
+        boot_key="new",
+        boot_started_at_ts=2000.0,
+        boot_inbound=_hist([600.0]),
+        boot_capacity=_hist([3000.0]),
+        boot_n_windows=1,
+        boot_n_snapshot=0,
+        boot_n_violating=0,
+        boot_shard_factors=[1, 2],
+        boot_sustained=_hist([430.0, 440.0]),
+        boot_refused=True,
+    )
+    assert pooled.last_shard_factor == 2
+    raw = json.loads(path.read_text())
+    assert raw["schema_version"] == 2
+    assert raw["boots"]["new"]["refused"] is True and raw["boots"]["new"]["sustained"]["n"] == 2
+    assert raw["boots"]["old"]["refused"] is False and raw["boots"]["old"]["sustained"]["n"] == 0
+    # The derivation carries the refusal count for the operator (surfaced, not honoured).
+    d = derive_shard_factor(
+        pooled.inbound,
+        pooled.capacity,
+        n_windows=pooled.n_windows,
+        n_violating=pooled.n_violating,
+        boots_pooled=pooled.boots,
+        boots_refused=pooled.boots_refused,
+    )
+    assert d.as_log()["boots_refused"] == 1 and d.source == "measured"
 
 
 # --------------------------------------------------------------------------- #
@@ -902,9 +1253,15 @@ async def test_governor_alarms_on_pipe_lag_grows_live_then_defers_shrink(tmp_pat
         # ≈ its rate), so the derived N cannot fall below the window's demand.
         assert deriv[0]["deferred_shrink"] == (d3.n < 2)
         assert not [e for e in logs if e["event"] == "pipe_lag_exceeds_confirm_window"]
+        # The healthy window at N = 2 fed the SUSTAINED evidence (one
+        # observation per shard) and the shrink gate judged against the live 2.
+        assert gov.sustained.n >= 2
+        assert deriv[0]["shard_factor_sustained"] is not None
+        assert deriv[0]["shrink_gate_current"] == 2 and deriv[0]["apply_deferred"] is None
         tape.load()
         assert tape.boots["boot-1"]["shard_factors"] == [1, 2]
         assert tape.boots["boot-1"]["n_windows"] == 2  # the violating window + one healthy
+        assert tape.boots["boot-1"]["sustained"].n >= 2 and tape.boots["boot-1"]["refused"] is False
     finally:
         await f.stop()
 
@@ -929,6 +1286,9 @@ async def test_governor_alarms_on_pipe_lag_grows_live_then_defers_shrink(tmp_pat
     assert f2.shard_factor == d.n >= 2 and f2.shard_count == 0  # recorded, not yet built
     deriv = [e for e in logs if e["event"] == "ws_fanout_derivation"]
     assert deriv[0]["reason"] == "boot" and deriv[0]["shard_factor_applied"] == d.n
+    # At boot the shrink gate judges against the PREVIOUS boot's last factor.
+    assert deriv[0]["shard_factor_previous_boot"] == 2 and deriv[0]["shrink_gate_current"] == 2
+    assert deriv[0]["boots_refused"] == 0
     f2.start()
     try:
         await _until(lambda: exchange2.live_keys() == set(range(d.n)))
@@ -985,6 +1345,62 @@ async def test_boot_tick_with_empty_tape_is_unsharded_bootstrap(tmp_path: Path) 
             boot_started_at_ts=1.0,
             confirm_window_s=0.0,
         )
+
+
+async def test_governor_defers_live_growth_while_an_accept_is_in_flight(tmp_path: Path) -> None:
+    """A live re-shard closes every comms socket for ~1 s; a quote_executed
+    for a quote confirmed just before would be lost to the gap. The app passes
+    ``apply_ok = not accept_gate.holding()``; growth waits for the next tick."""
+    exchange = _FakeExchange()
+    f, metrics, _ = await _start_sharded(exchange, 1)
+    holding = [True]
+    gov = FanoutGovernor(
+        f,
+        SystemClock(),
+        metrics,
+        tape_path=fanout_tape_path(tmp_path),
+        data_dir=tmp_path,
+        boot_key="b",
+        boot_started_at_ts=1.0,
+        confirm_window_s=WINDOW_S,
+        apply_ok=lambda: not holding[0],
+    )
+    try:
+        await asyncio.sleep(0.05)
+
+        async def flood(n: int, age_s: float) -> None:
+            before = sum(s._frames_read for s in f._shards)
+            for i in range(n):
+                exchange.route(_rfq_created(f"f{i}", age_s=age_s), f"f{i}")
+            await _until(lambda: sum(s._frames_read for s in f._shards) >= before + n)
+            await _settled(f)
+
+        for _ in range(2):  # the two snapshot windows
+            await flood(60, age_s=6.0)
+            await gov.tick(reason="refresh")
+        await flood(60, age_s=6.0)
+        with structlog.testing.capture_logs() as logs:
+            d = await gov.tick(reason="refresh")
+        # Growth derived (N = 2) but NOT applied: an accept is in flight.
+        assert d is not None and d.n == 2 and d.source == "measured" and f.shard_factor == 1
+        line = next(e for e in logs if e["event"] == "ws_fanout_derivation")
+        assert line["apply_deferred"] == "accept_in_flight" and line["shard_factor_applied"] == 1
+        assert line["deferred_shrink"] is False
+        assert metrics.counter("t.apply_deferred") == 1
+        assert not [e for e in logs if e["event"] == "ws_fanout_resharding"]
+        assert exchange.connects == 1
+        holding[0] = False  # the confirm resolved
+        await flood(60, age_s=6.0)
+        with structlog.testing.capture_logs() as logs:
+            d = await gov.tick(reason="refresh")
+        assert d is not None and d.n >= 2 and f.shard_factor == d.n
+        line = next(e for e in logs if e["event"] == "ws_fanout_derivation")
+        assert line["apply_deferred"] is None and line["shard_factor_applied"] == d.n
+        assert [e for e in logs if e["event"] == "ws_fanout_resharding"]
+        await _until(lambda: exchange.live_keys() == set(range(d.n)))
+        assert metrics.counter("t.apply_deferred") == 1
+    finally:
+        await f.stop()
 
 
 async def test_governor_never_raises_into_the_caller(tmp_path: Path) -> None:
