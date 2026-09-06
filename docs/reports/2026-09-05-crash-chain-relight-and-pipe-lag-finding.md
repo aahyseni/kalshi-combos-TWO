@@ -214,18 +214,67 @@ Still binding after the fix (the next levers, in order):
    reaction was correct tonight. A tick keyed on wall time rather than
    maintenance ticks would make it the designed 60 s.
 
-## NEXT STEPS
+## 00:29 ET (9/6) — ONE RESTART ON `171785b`: writer thread + raw pre-filter + wall-time governor, all three levers live
 
-- DONE: fleet build → review → fix → merge `022f083` → gates → rotation → relight
-  20:37 ET → verified (pipe lag p50 1.0 s, 0% > 3 s, 3/3 post-shard accepts filled).
-- NEXT BUILDS (fills): reader-side raw pre-filter (main-loop load), tape writer on
-  its own thread (stops the loop hops + tape loss), governor tick on wall time.
-- Store rotation DONE 20:31 ET (fresh 316 MB store; archive kept). `tape_retention`
-  may now be armed (operator ruling) — but the writer fix comes first.
-- Rulings owed: confirm-halt class removal (review flagged), derived stall wall
-  shadow → on, fee eat mode (only if the post-transport per-tier read demands).
-- Owed: ledger stale-row P1 (~394 open rows); bot standing equity $7,308 vs
-  exchange $4,969 (PV source); 70 tape-only fills + 7 partials; favorite-band
-  margin read; 9/1 pre-registered reads; p_ruin 0.78–1.0 reading; O1
-  shutdown wedge; 16:02 stack death; watchdog self-liveness.
+The 20:37 ET boot ran 3 h 50 min: 68 accepts (65 after the re-shard), 56 fills
+verified, 9 expired (6 after the re-shard — every one an OUR-side loop stall of
+2–3.7 s: rfq_worker steps, the 300 s report loop, retry_pending; the exchange
+pipe lag stayed at p50 1.0 s throughout), 0 halts, 0 socket drops, 0 refusals,
+0 stall kills. Exchange close of 9/5: **168 fills / $4,590 premium** (121 /
+$3,269 when sharding landed at 20:56 ET), settlements +$461 on 110, equity
+$5,145, 75 positions / $2,273 exposure = 44% of equity deployed.
+
+Second fleet (wf_7adaa7bb-7aa) beside the live bot at LOW priority — no
+measurable effect on pipe lag or accepts:
+
+| Build | Verdicts | What it does |
+|---|---|---|
+| **B** `build/raw-prefilter-governor-tick` → main `cf2b281` | SHIP_WITH_FIXES → fixed | Reader-thread raw-text pre-filter drops `rfq_created` frames with no allowlisted leg series before `json.loads` (decision-neutrality property over 600 real frames; layout-independent envelope type read; fail-open install). Governor tick on elapsed wall time (heartbeat_timeout 60 s + one tick) instead of 120 maintenance passes. |
+| **A** `build/tape-writer-thread` → main `171785b` | NO_SHIP (proven ledger wedge) → fix → second review SHIP_WITH_FIXES (proven cancellation residue) → fix #2 | Tape writer on its own thread + sqlite connection (bench: 0 rows/20 s → 104k rows/s on a saturated loop). One lock around every shared-connection statement; rollback discipline incl. cancelled bodies (probe E regression); report-loop tape scans moved to a read-only thread connection; writer-thread supervision; `record_fill` latency histogram + alarm at the store bound. Suite 4,274/0; vitals 8/8. |
+
+Main gates: 135 touched tests, vitals fast 8/8; pushed. Stop→start took **6 s**
+(`stop_all -NoPrompt` → WMI START_BOT), log `live_20260906_0029.log`.
+
+Relight checklist, read at 11 min:
+
+| Check | 20:37 boot | 00:29 boot |
+|---|---|---|
+| N at boot | bootstrap 1 → re-shard to 3 after 19 min | **3 from the tape at boot** (`source=measured`, boots_pooled 2), 3 shards acked |
+| Governor window | 3.5–6.5 min | **60.6 / 63.2 s** |
+| Exchange pipe lag (rfq p50 / share > 3 s) | 1.0 s / 0% | **1.04 s / 0%** |
+| Pre-filter | — | **25–26% of wire frames** removed before parsing (~1,380 fps at this hour; the 49% estimate was the evening mix) |
+| Tape writer | queue pinned 200,000, **4.34M** writes dropped | **queue 0–6, 0 dropped, thread alive** |
+| Ledger | `fill_ledger_write_failed` 11, `store_await_timeout` 11 in 3.8 h | **0 / 0**; `store_ledger_txn_*` 0; `fill_ledger_write_slow` 0 |
+| Slow callbacks > 1.5 s | rfq_worker 3.0 s, retry_pending 2.8–3.7 s, report loop 1.8–2.3 s, several per 10 min | **none** in 11 min (startup warmup only) |
+| Loop lag | p50 67–268 ms, p99 0.4–3.3 s | p50 134–268 ms, p99 0.4–0.9 s |
+| Accepts → outcome | 65 → 6 expired (9%) | **8 → 0 expired, 7 filled** |
+| Caps | per_combo 9,029 · entity 2,869 · size 3,360 · CVaR 304 (71% refused) | per_combo 8,028 · entity 6,603 · size 3,812 · CVaR 505 (**85% refused**; `risk_starvation_watchdog` 165× in 11 min) |
+
+The last row is the book being full, not a defect: 75 positions at 44% of
+equity, the entity and CVaR caps now bind on the concentrated overnight flow,
+and per-combo 2% ($103) plus the size wall refuse the large RFQs by design
+(caps are the refusal layer). The starvation alarm counts streaks of 20
+refusals, which an 85% refusal rate produces constantly — its threshold is
+worth deriving from the measured refusal share so it means something again.
+
+## NEXT STEPS (updated 00:45 ET 9/6)
+
+- Watch the 00:29 boot through the morning: `store_writer_stats` stays at 0
+  drops; `fill_ledger_write_failed` 0; expiries only exchange-side (pipe lag
+  p50 < 3 s); `ws_fanout_derivation` stays at N=3 (or grows with evidence);
+  fills/h vs 14–17/h.
+- NEXT BUILD (fills): the 3 s synchronous pricing steps (`rfq_worker`,
+  `retry_pending` re-pricing every pending RFQ back-to-back; `handle_rfq`
+  before its first await) — measure per-phase CPU, then offload or bound with
+  yields; pre-ship vitals tier (pricing/risk radius).
+- Derive the `risk_starvation_watchdog` threshold from the measured refusal
+  share; consider whether the 70% deployment goal needs the entity/CVaR
+  anchors re-examined (operator ruling — the caps are the constitution).
+- Operator rulings still owed: stall wall shadow → on; confirm-halt class
+  removal; fee eat mode (only if a per-tier read after tonight demands it);
+  arm `tape_retention` now that the writer keeps up (store grows ~20 GB/day
+  again).
+- Pre-existing: `tests/test_retained_edge_floor.py` nested-@given fails in
+  isolation only; ruff-format debt on `ops/quote_app.py` / `persistence.py`;
+  4 mypy errors in `pricing/engine.py`.
 - Parked by operator: NFL.
