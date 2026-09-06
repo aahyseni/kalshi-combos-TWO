@@ -106,10 +106,55 @@ vitals fast 8/8 from the snapshot. Rides the sharding relight (the live boot
 still runs the inflated denominator until then; fills ≈ 0 so the exposure to
 the loose caps is small — if the fleet runs long, relight earlier).
 
+## 20:20 ET — SHARDING MERGED (`022f083`), BUT THE STACK IS BEING KILLED FROM OUTSIDE THE BOT
+
+Fleet result: builder `806d97b` → adversarial review **SHIP_WITH_FIXES** (one
+must-fix: an unlisted error answering a sharded subscribe left a shard
+connected-but-unsubscribed with health green; five should-fixes) → fix pass
+`e1f6994` applied all of them (any non-terminal sharded-subscribe answer =
+loud sticky unsharded fallback; loss epoch closes only when every casualty
+re-acks; live re-shard purges the retired generation's queued frames;
+cross-shard dedupe of quote events; live growth gated on no accept in flight;
+shrink gated on demonstrated sustained throughput). Suite 4,225/0, vitals
+fast 8/8 from the snapshot, ruff/mypy clean; fast-forward merged to main and
+pushed; post-merge gates on main: 97 touched tests, vitals 8/8. Builder
+report: `2026-09-05-build-ws-fanout-sharding.md`.
+
+Then two whole-stack deaths that are NOT the bot:
+
+| Boot | Died | Lifetime | What the logs show |
+|---|---|---|---|
+| 17:59 ET (`f55fa43`) | **19:00:38 ET** | 61 min | Log stops mid-stream at full rate (11,716 lines in the prior minute); no halt receipt (the last one is 16:00 ET); no watchdog line after "armed 17:59:15"; bot + supervisor + watchdog + probers + monitor windows all gone. Fleet transcripts hold **no kill command** and the only running agent was between tool calls at that second. |
+| 20:15 ET (`022f083`) | **~20:15:40 ET** | ~20 s | Log stops after `joint_pool_warm` (store open in progress); watchdog "armed 20:15:35" is its last line; every process gone by 20:15:49. |
+
+Windows event log 20:10–20:17 ET: an Apple mobile device plugged in over
+USB (driver install 20:10:21), the machine's address on a phone hotspot
+(172.20.10.4), "hardware has changed" at 20:10:26 and 20:16:44, Universal
+Print token prompts — **someone is at the keyboard.** No crash, Defender,
+mitigation, or shutdown events at either death. The only mechanisms that
+remove the whole tree including the watchdog with no log are `STOP_BOT.bat`
+or closing the console windows by hand. Relaunching would fight whoever is
+there, so the bot is left DOWN pending the operator's word.
+
+Exchange 20:16 ET: cash $3,767.91 + PV $1,428.74 = **$5,196.65**, 48
+positions, 10 resting quotes lapsing on TTL, 9/5 fills 119 / $3,152,
+settlements 9/5 +$243.48.
+
+Relight when cleared: `START_BOT.bat` (or the WMI-detached form). Then the
+checklist: `ws_fanout_derivation` (bootstrap N=1 for two ~60 s windows →
+`ws_fanout_resharding` to the derived N, today's rates ⇒ 3), one
+`ws_shard_subscribed` per shard, no `ws_fanout_sharding_refused`,
+`ws_pipe_lag` rfq p50 < 3,000 ms (was 6,400), `ws_shed_market_frames` 0,
+buffer-overflow 0, `confirm_expired_by_exchange` back to ~2–5%,
+`accept_for_unknown_quote` 0, sends ≥ 295–398/min, fills/h vs overnight 14/h.
+Store rotation `--apply` remains the operator's `!` command (the classifier
+blocked it twice tonight).
+
 ## NEXT STEPS
 
-- Fleet: build → adversarial review → fix → merge → gates (suite, vitals fast
-  from the snapshot) → restart (WMI START_BOT) → verify the checklist above.
+- DONE: fleet build → review → fix → merge `022f083` → gates. **OWED: relight on
+  the operator's word** (two stacks were killed from outside the bot tonight;
+  a human is at the machine) → verify the checklist above.
 - **Operator, at the stop:** store rotation `--apply` (the auto-mode classifier
   blocks it): `.venv\Scripts\python.exe tools\ops\rotate_store.py --apply --store D:\kalshi-combos-TWO-data\combomaker-prod-live-wc.sqlite3 --out <scratchpad>\rotation_apply.json`
   (dry run clean; the stray hard links were removed). Arm `tape_retention`
