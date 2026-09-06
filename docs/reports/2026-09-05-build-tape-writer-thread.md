@@ -1,6 +1,6 @@
 # 2026-09-05 — BUILD: tape writer OFF the event loop (a thread with its own connection)
 
-Branch `build/tape-writer-thread` — build commit `467ffea`, **review-fix commit `<<FIXSHA>>`** (worktree
+Branch `build/tape-writer-thread` — build commit `467ffea`, **review-fix commit `b24c0db`** (worktree
 `C:/Users/aahys/kct-writer`; bot LIVE on main `08f342e` throughout — store read-only, logs grep/tail only, every heavy
 job at LOW priority, no process touched).
 **Blast radius: `ops/persistence.py` only** (the tape writer + the shared connection's statement discipline + its
@@ -118,7 +118,7 @@ pre-filled queue: 3 good + bad + 3 good → 0 rows, `n=7`, `exc_info` attached, 
    `STORE_OP_TIMEOUT_S / 10`; `batch_yields_to_ledger` counts how often the tape thread stood aside.
 5. Store growth returns (full tape captured) — retention / rotation own the size.
 
-## Review fixes (same day, commit `<<FIXSHA>>`)
+## Review fixes (same day, commit `b24c0db`)
 
 The adversarial review returned **NO_SHIP** with three must-fixes and seven should-fixes. Every must-fix is applied;
 every should-fix is applied. The fix pass also found and fixed **one defect the review did not name** (GIL starvation
