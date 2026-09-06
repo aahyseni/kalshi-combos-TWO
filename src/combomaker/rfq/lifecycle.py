@@ -7263,6 +7263,8 @@ class QuoteLifecycle:
             collection=state.rfq.mve_collection_ticker,
             fee_cc=fill_fee_cc,
         )
+        started_ns = self._clock.monotonic_ns()
+        outcome = "raised"
         try:
             inserted = await self._bounded_store(
                 "record_fill",
@@ -7278,14 +7280,21 @@ class QuoteLifecycle:
                     raw=msg,
                 ),
             )
+            outcome = "landed"
         except TimeoutError:
             # LATE LANDING (review fix 2026-09-05, should-fix #3): the bound
             # expired but the INSERT may still land on the connection thread.
             # Remember it so the recovery replay that finds the row present
             # adopts it as ours (post-insert tail + verification) instead of
-            # skipping it as an already-completed write.
+            # skipping it as an already-completed write. (Since the tape-
+            # writer review #2 fix pass the store rolls a late-landing
+            # partial body back under its connection lock, so a row the
+            # replay finds present is always a COMMITTED one.)
+            outcome = "timed_out"
             state.fill_record_timed_out = True
             raise
+        finally:
+            self._observe_record_fill_latency(quote_id, fill_ref, started_ns, outcome)
         state.fill_recorded = True
         if not inserted:
             if state.fill_record_timed_out:
@@ -7327,6 +7336,42 @@ class QuoteLifecycle:
         if isinstance(exchange_fee, int) and not isinstance(exchange_fee, bool):
             fill_fee_cc = int(exchange_fee)
         return fill_fee_cc
+
+    def _observe_record_fill_latency(
+        self, quote_id: str, fill_ref: str, started_ns: int, outcome: str
+    ) -> None:
+        """``record_fill`` wall latency (tape-writer review #2, should-fix 5 —
+        the build report promised this read): histogram
+        ``fill_ledger.record_fill_ms`` (p50 / p95 / max in the metrics
+        snapshot; the reviewer's saturated-loop rig measured the thread-writer
+        branch at p50 308 / p95 819 / max 1,385 ms vs main's 177 / 579 / 643,
+        the +130 ms p50 = one write-lock wait behind a tape batch commit) and
+        a DERIVED alarm anchored on an EXISTING bound: a fill that outlives
+        ``STORE_OP_TIMEOUT_S`` — the store's ``busy_timeout``, its own
+        statement of how long an operation there may legitimately block
+        before something is wrong (ops/persistence.py) — is outside the
+        store's legitimate-block envelope even when it lands inside the
+        maintenance wall (``_bounded_store``, 30.25 s live): WARNING
+        ``fill_ledger_write_slow`` + counter ``fill_ledger.record_fill_slow``.
+        No new number. ``outcome`` names the row's fate (landed / timed_out /
+        raised) so a slow line is never read as a lost fill."""
+        elapsed_ms = (self._clock.monotonic_ns() - started_ns) / 1e6
+        self._metrics.observe_ms("fill_ledger.record_fill_ms", elapsed_ms)
+        bound_ms = STORE_OP_TIMEOUT_S * 1000.0
+        if elapsed_ms > bound_ms:
+            self._metrics.inc("fill_ledger.record_fill_slow")
+            log.warning(
+                "fill_ledger_write_slow",
+                quote_id=quote_id,
+                fill_ref=fill_ref,
+                elapsed_ms=round(elapsed_ms, 1),
+                bound_ms=bound_ms,
+                outcome=outcome,
+                detail="record_fill outlived the store's own legitimate-block bound "
+                "(busy_timeout) — a saturated shared connection or a WAL write-lock hold "
+                "(tape batch / prune batch); the row's fate is `outcome`, never inferred "
+                "from this line",
+            )
 
     def _adopt_late_landed_fill(
         self,

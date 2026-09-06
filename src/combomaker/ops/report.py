@@ -35,13 +35,14 @@ async def build_report(
             if env == "demo"
             else "graded on cumulative expected edge vs realized P&L, ±2σ MC bands"
         ),
-        "rfqs_seen": await store.count("rfqs"),
-        "decisions_by_kind": await store.decision_kind_counts(),
-        "skip_reasons": await store.decision_reason_counts(),
-        "would_quotes": await store.count("would_quotes"),
-        "ev": await store.ev_summary(),
-        "markouts": await store.markout_summary(),
     }
+    # The four TAPE reads (rfqs_seen / decisions_by_kind / skip_reasons /
+    # would_quotes) on ONE read-only connection in ONE worker-thread hop — a
+    # tape-table scan never holds the store's connection lock against a fill
+    # (2026-09-05 review #2, should-fix 1). Key order unchanged.
+    report.update(await store.report_tape_counts())
+    report["ev"] = await store.ev_summary()
+    report["markouts"] = await store.markout_summary()
     if exposure is not None and marginals is not None:
         report["portfolio_mc"] = _portfolio_mc(
             exposure,

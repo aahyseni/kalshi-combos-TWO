@@ -38,7 +38,7 @@ import structlog
 
 from combomaker.core.clock import FakeClock, SystemClock
 from combomaker.ops.config import SupervisorConfig
-from combomaker.ops.persistence import Store
+from combomaker.ops.persistence import STORE_OP_TIMEOUT_S, Store
 from combomaker.ops.quote_app import LOOP_MAINTENANCE, MAINTENANCE_TICK_INTERVAL_S, QuoteApp
 from combomaker.risk.confirm_expired_rate import (
     EXPIRED_RATE_ALARM_Z,
@@ -655,3 +655,78 @@ async def test_a_broken_baseline_provider_never_reaches_the_confirm_path(tmp_pat
     assert rig.metrics.counter("confirm.expired_by_exchange") == 1
     assert rig.metrics.counter("confirm.expired_rate_judged") == 0
     assert not rig.killswitch.halted
+
+
+# =========================================================================
+# 6. TAPE-WRITER REVIEW #2 SHOULD-FIX 5: record_fill latency observed + alarmed
+# =========================================================================
+
+
+class _SlowStore:
+    """The real store with ``record_fill`` taking ``advance_s`` of FAKE clock
+    time (the store's wall latency as the lifecycle's clock sees it), then
+    delegating — the row lands."""
+
+    def __init__(self, inner: Store, clock: FakeClock, advance_s: float) -> None:
+        self._inner = inner
+        self._clock = clock
+        self._advance_s = advance_s
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "record_fill":
+
+            async def _slow(*a: Any, **k: Any) -> Any:
+                self._clock.advance(self._advance_s)
+                return await self._inner.record_fill(*a, **k)
+
+            return _slow
+        return getattr(self._inner, name)
+
+
+async def test_record_fill_latency_is_observed_and_alarmed_past_the_store_bound(
+    tmp_path: Path,
+) -> None:
+    """Every ``record_fill`` lands in the ``fill_ledger.record_fill_ms``
+    histogram (p50/p95/max in the metrics snapshot — the relight read); one
+    that outlives ``STORE_OP_TIMEOUT_S`` (the store's own busy_timeout bound,
+    no new number) raises the DERIVED alarm ``fill_ledger_write_slow`` +
+    ``fill_ledger.record_fill_slow`` with the row's fate named (landed) — the
+    fill itself is booked exactly as before."""
+    rig = await _rig(tmp_path)
+    clock: FakeClock = rig.h.clock
+    inner = rig.lifecycle._store  # noqa: SLF001
+    rig.lifecycle._store = _SlowStore(inner, clock, STORE_OP_TIMEOUT_S + 1.0)  # type: ignore[assignment]  # noqa: SLF001
+    await rig.lifecycle.handle_rfq(combo(CROSS_EVENT_LEGS, id="rfq_0"))
+    quote_id = rig.sender.created[-1]["id"]
+    await rig.lifecycle.on_quote_accepted(accepted_msg(quote_id, "yes"))
+    with structlog.testing.capture_logs() as cap:
+        await rig.lifecycle.on_quote_executed({"quote_id": quote_id, "order_id": "o1"})
+    assert rig.metrics.counter("fill.count") == 1
+    assert rig.metrics.counter("fill_ledger.write_failed") == 0
+    assert await inner.has_fill(f"fill:{quote_id}")
+    p50 = rig.metrics.quantile_ms("fill_ledger.record_fill_ms", 0.5)
+    assert p50 is not None
+    hist_max = rig.metrics.histogram_max_ms("fill_ledger.record_fill_ms")
+    assert hist_max is not None and hist_max >= (STORE_OP_TIMEOUT_S + 1.0) * 1000.0
+    assert rig.metrics.counter("fill_ledger.record_fill_slow") == 1
+    slow = [c for c in cap if c.get("event") == "fill_ledger_write_slow"]
+    assert len(slow) == 1
+    assert slow[0]["bound_ms"] == STORE_OP_TIMEOUT_S * 1000.0
+    assert slow[0]["outcome"] == "landed"
+    assert slow[0]["elapsed_ms"] > slow[0]["bound_ms"]
+    snapshot = rig.metrics.snapshot()
+    latencies = snapshot["latencies_ms"]
+    assert isinstance(latencies, dict)
+    assert latencies["fill_ledger.record_fill_ms"]["count"] == 1
+    # A fill inside the bound: observed, never alarmed.
+    rig.lifecycle._store = _SlowStore(inner, clock, STORE_OP_TIMEOUT_S / 10)  # type: ignore[assignment]  # noqa: SLF001
+    await rig.lifecycle.handle_rfq(combo(CROSS_EVENT_LEGS, id="rfq_1"))
+    quote_id_2 = rig.sender.created[-1]["id"]
+    assert quote_id_2 != quote_id
+    await rig.lifecycle.on_quote_accepted(accepted_msg(quote_id_2, "yes"))
+    with structlog.testing.capture_logs() as cap2:
+        await rig.lifecycle.on_quote_executed({"quote_id": quote_id_2, "order_id": "o2"})
+    assert rig.metrics.counter("fill.count") == 2
+    assert rig.metrics.counter("fill_ledger.record_fill_slow") == 1
+    assert [c for c in cap2 if c.get("event") == "fill_ledger_write_slow"] == []
+    assert rig.metrics.snapshot()["latencies_ms"]["fill_ledger.record_fill_ms"]["count"] == 2  # type: ignore[index]

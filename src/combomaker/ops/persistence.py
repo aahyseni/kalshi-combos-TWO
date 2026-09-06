@@ -13,6 +13,7 @@ DDL statements here; the schema is append-only by convention.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
 import queue
@@ -284,6 +285,20 @@ _DECISION_REASON_COUNTS_SQL: Final = (
     "SELECT j.value, COUNT(*) FROM decisions AS d, json_each(d.reasons_json) AS j"
     " GROUP BY j.value"
 )
+_DECISION_KIND_COUNTS_SQL: Final = "SELECT kind, COUNT(*) FROM decisions GROUP BY kind"
+
+#: The recorder TAPE tables — unbounded rows (66.4M rfqs / 134.3M decisions on
+#: the 213 GB store the rotation retired). A COUNT(*) or GROUP BY over one is a
+#: full scan (seconds warm, longer cold), so since the 2026-09-05 review #2 fix
+#: pass NO statement over them ever runs on the shared connection under
+#: ``Store._conn_lock``: ``count`` / ``decision_kind_counts`` /
+#: ``decision_reason_counts`` / ``report_tape_counts`` all go to a ``mode=ro``
+#: connection of their own in a worker thread (main logged 11
+#: ``store_await_timeout op=has_fill`` + 11 ``fill_ledger_write_failed`` in
+#: 2.7 h with the report's tape COUNT(*)s holding the shared connection).
+_TAPE_TABLES: Final = frozenset(
+    {"rfqs", "rfq_deletions", "decisions", "would_quotes", "would_quotes_inplay"}
+)
 
 
 def _is_lock_error(exc: BaseException) -> bool:
@@ -415,6 +430,39 @@ class Store:
         self._ledger_txn_idle.set()
         # Batches the tape thread held back for a ledger transaction in flight.
         self.batch_yields_to_ledger = 0
+        # CANCELLATION RESIDUE (2026-09-05 review #2, must-fix #1 — PROVEN by
+        # the reviewer's probe E on the real Store). A body cancelled by
+        # ``asyncio.wait_for`` while its statement is queued or busy-waiting
+        # on the aiosqlite worker LANDS LATE: the worker still runs it and
+        # drops the result into the cancelled future. ``_ledger_txn`` /
+        # ``_fetchall`` / ``_fetchone`` therefore HAND the connection lock to
+        # a residue task (``_clear_cancel_residue``) that runs FIFO behind
+        # the late statement and rolls back whatever it opened. Counters are
+        # the relight surface: ``ledger_txn_cancellations`` = hand-offs;
+        # ``ledger_txn_cancel_rollbacks`` = late statements that had opened a
+        # transaction (a partial body discarded — the caller's replay
+        # re-books it through the normal path).
+        self.ledger_txn_cancellations = 0
+        self.ledger_txn_cancel_rollbacks = 0
+        self._residue_tasks: set[asyncio.Task[None]] = set()
+        # WRITER THREAD SUPERVISION (2026-09-05 review #2, should-fix 2). A
+        # loop-side task on the STORE_OP_TIMEOUT_S cadence restarts a dead
+        # writer thread on a fresh connection — bounded by PROGRESS, not a
+        # count: a restarted thread that dies again without landing ONE
+        # batch is abandoned and its queue purged into the drop counter (so
+        # ``writer_queue_depth`` stays truthful for tape_retention's idle
+        # gate) — and emits ``store_writer_stats`` from the loop whenever
+        # tape was dropped since the last emit, so drops can never again be
+        # silent with the thread gone (the 2026-08-19 lesson: the emit was
+        # posted only by the thread).
+        self._writer_supervisor: asyncio.Task[None] | None = None
+        self.writer_thread_deaths = 0
+        self.writer_thread_restarts = 0
+        self.writer_abandoned = False
+        self._writer_batches_committed = 0
+        self._writer_batches_at_restart = 0
+        self._writer_rows_lost = 0
+        self._writer_stats_emits = 0
 
     @classmethod
     async def open(cls, path: Path, clock: Clock) -> Self:
@@ -693,8 +741,20 @@ class Store:
         )
         self._writer_thread = thread
         thread.start()
+        self._writer_batches_at_restart = self._writer_batches_committed
+        self._writer_supervisor = loop.create_task(
+            self._supervise_writer(), name="store-writer-supervisor"
+        )
 
     async def close(self) -> None:
+        supervisor = self._writer_supervisor
+        if supervisor is not None:
+            # Before the stop flag: a supervisor tick between the flag and the
+            # join must not restart the thread we are stopping.
+            self._writer_supervisor = None
+            supervisor.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await supervisor
         thread = self._writer_thread
         q = self._write_q
         if thread is not None and q is not None:
@@ -751,6 +811,13 @@ class Store:
                 log.warning("store_checkpoint_connection_left_to_writer_thread")
             else:
                 self._ckpt_db.close()
+        if self._residue_tasks:
+            # A cancelled body's residue task may still own the connection
+            # lock (its rollback queued behind the late statement): let it
+            # finish — bounded by the store's own legitimate-block statement
+            # — so the close below never races the rollback. The connection
+            # close rolls back any orphan a timed-out residue leaves.
+            await asyncio.wait(list(self._residue_tasks), timeout=STORE_OP_TIMEOUT_S)
         await self._db.close()
 
     async def flush_writer(self, wait_s: float) -> bool:
@@ -798,6 +865,11 @@ class Store:
 
             await self._ledger_txn(_txn)
             return
+        if self.writer_abandoned:
+            # No consumer will ever drain the queue again (``_abandon_writer``):
+            # the drop is counted here, never queued; the supervisor reports it.
+            self._dropped_writes += 1
+            return
         try:
             q.put_nowait((sql, params))
         except queue.Full:
@@ -812,18 +884,40 @@ class Store:
         statement lifecycle (execute → fetchall → close) under the connection
         lock — see ``_ledger_txn`` for why no statement here may be active
         while another coroutine writes. Bounded reads only (the ledger tables
-        are a few thousand rows); the one unbounded count,
-        ``decision_reason_counts``, runs on its own read-only connection."""
-        async with self._conn_lock:
+        are a few thousand rows); every TAPE-table scan (``_TAPE_TABLES``)
+        runs on its own read-only connection. A read cancelled by a
+        ``wait_for`` bound mid-statement hands the lock to the residue task
+        (``_ledger_txn`` (c)) so the next write never collides with the
+        statement still stepping on the worker."""
+        await self._conn_lock.acquire()
+        handed_off = False
+        try:
             async with self._db.execute(sql, params) as cursor:
                 return list(await cursor.fetchall())
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                handed_off = self._hand_off_lock_after_cancel(exc, ledger=False)
+            raise
+        finally:
+            if not handed_off:
+                self._conn_lock.release()
 
     async def _fetchone(self, sql: str, params: tuple[Any, ...] = ()) -> Any | None:
         """ONE single-row read (LIMIT 1 / aggregate) under the connection
-        lock; the cursor is closed before the lock is released."""
-        async with self._conn_lock:
+        lock; the cursor is closed before the lock is released (cancellation:
+        as ``_fetchall``)."""
+        await self._conn_lock.acquire()
+        handed_off = False
+        try:
             async with self._db.execute(sql, params) as cursor:
                 return await cursor.fetchone()
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                handed_off = self._hand_off_lock_after_cancel(exc, ledger=False)
+            raise
+        finally:
+            if not handed_off:
+                self._conn_lock.release()
 
     async def _ledger_txn(self, body: Callable[[], Awaitable[_T]]) -> _T:
         """Run ``body`` — ONE ledger transaction on the shared connection:
@@ -847,7 +941,7 @@ class Store:
         the one-connection design this could not fire — the tape committed
         on the same connection — which is why main never saw it.
 
-        Two guards, both mechanisms:
+        Three guards, all mechanisms:
           (a) the connection LOCK — every statement lifecycle on the shared
               connection (``_fetchall`` / ``_fetchone`` / this method) holds
               it, so no coroutine's write can begin while another
@@ -859,69 +953,204 @@ class Store:
               incl. BUSY_SNAPSHOT, SQLITE_LOCKED — the only ones a retry can
               cure) is retried ONCE after the rollback. The rollback is what
               ends the WEDGE: without it the explicit transaction (Python's
-              BEGIN) keeps the stale snapshot for the rest of the run. It
-              does NOT cure the residue the lock cannot see — a cancelled
-              ``_bounded_store`` read whose cursor is still active outside
-              any lock keeps the connection's read snapshot pinned (SQLite
-              downgrades a rolled-back transaction to a read transaction
-              while another statement of the connection is active), so the
-              retry fails the same way and the caller sees its exception —
-              but the connection is left OUTSIDE any transaction, and the
-              moment that cursor closes (its coroutine's frame dies) the very
-              next write succeeds with no intervention. The wedge is bounded
-              by a leaked statement's lifetime, never the run's.
+              BEGIN) keeps the stale snapshot for the rest of the run. A
+              read cursor another coroutine's cancelled call left behind is
+              NOT a lasting residue in the real shape (review #2, should-fix
+              4 — the first fix pass's docstring said the retry "cannot
+              succeed while that cursor lives"; measured false): aiosqlite
+              0.22.1 holds a cancelled statement's cursor only in the
+              worker's result until the loop runs the dropped ``set_result``
+              handle — ONE LOOP HOP, not a coroutine frame — so the retry
+              lands once that hop has run (the reviewer measured the first
+              attempt landing 50/50 in probe B; with (c) the write never
+              even collides with it).
+          (c) CANCELLATION HAND-OFF (review #2, must-fix #1 — PROVEN by the
+              reviewer's probe E on the real Store; regression test
+              ``test_probe_e_…``): a body cancelled by a ``wait_for`` bound
+              while its statement is queued / busy-waiting on the aiosqlite
+              worker is NOT gone — the worker still runs it and drops the
+              result into the cancelled future. When that late statement is
+              a write that SUCCEEDS, the connection is left inside an open
+              write transaction holding the WAL write lock: the fills row is
+              visible on this connection but NOT durable, the tape thread
+              cannot commit (queue pinned at its bound, rows dropped), and
+              the next transaction here JOINED and committed the PARTIAL
+              body (fills row without its ev_ledger row) — ``close()`` then
+              rolled the orphan back, the fill silently un-booked. Awaiting
+              a rollback inside the cancelled coroutine is not an option
+              (the bound would wait on the very connection that overran
+              it), so the cancelled call HANDS THE CONNECTION LOCK to a
+              residue task (``_hand_off_lock_after_cancel`` →
+              ``_clear_cancel_residue``, ``loop.create_task`` — its probe
+              statement queues FIFO behind the late statement on the
+              worker) that learns whether the late statement opened a
+              transaction and ROLLS IT BACK, then releases the lock. No
+              other statement of this class can run in between (the lock is
+              held throughout), so nothing partial is ever visible to a
+              later transaction. The caller's replay re-books the body
+              through the normal path: ``has_fill`` reads False after the
+              rollback → ``record_fill`` inserts; a body whose COMMIT hop
+              was the cancelled one has landed WHOLE and the replay adopts
+              the committed row — the only kind of row
+              ``_adopt_late_landed_fill`` (rfq/lifecycle.py) can ever see.
+              RESIDUE BOUND: the lock stays handed off for the late
+              statement's own remaining runtime — a write busy-waits at most
+              ``busy_timeout`` (STORE_OP_TIMEOUT_S) for the WAL write lock,
+              a read runs to the end of its scan — plus two worker hops.
+              Ledger callers queue behind it under their own ``wait_for``
+              bounds; the tape thread yields at most STORE_OP_TIMEOUT_S and
+              proceeds (the late statement holds the write lock only between
+              its landing and the rollback — microseconds).
         A body that RETURNS with the connection still in a transaction is a
         bug (every body commits): committed here and logged at ERROR
         (``store_ledger_txn_left_open``) — the wedge detector the relight
         checklist watches, with ``ledger_txn_rollbacks``. A transaction
-        already open on ENTRY was left by something outside this class (a
-        direct ``_db.execute`` without a commit): joined, not rolled back —
-        rolling it back would discard rows that are not ours — but logged.
-        Cancellation (a ``wait_for`` bound expiring) is NOT caught: awaiting
-        a rollback inside a cancelled coroutine would make the bound wait on
-        the very connection that overran it; the next ``_ledger_txn`` finds
-        whatever the late-landing statement left and (b) resolves it."""
-        async with self._conn_lock:
+        already open on ENTRY is ROLLED BACK and logged at ERROR
+        (``store_ledger_txn_inherited_open_transaction``; review #2 — it
+        used to be joined and committed): this class never legitimately
+        leaves one open — with (c) even a cancelled body is rolled back
+        under the lock — so an inherited transaction is foreign residue
+        whose partial content must never be committed by a body that did
+        not write it."""
+        await self._conn_lock.acquire()
+        handed_off = False
+        try:
             if self._db.in_transaction:
-                log.warning("store_ledger_txn_inherited_open_transaction")
+                await self._rollback_inherited_txn()
             # Ledger first on the write lock: the tape thread holds its next
-            # batch while this is clear (see __init__). try/finally so a
-            # cancelled body (a wait_for bound) never leaves it clear.
+            # batch while this is clear (see __init__); restored on every way
+            # out — by the residue task when the lock is handed off.
             self._ledger_txn_idle.clear()
             try:
+                result = await body()
+            except Exception as exc:
+                if not self._db.in_transaction:
+                    raise
+                await self._rollback_failed_txn(exc)
+                if not _is_lock_error(exc):
+                    raise
+                self.ledger_txn_retries += 1
+                log.warning(
+                    "store_ledger_txn_retry_after_rollback",
+                    error=str(exc),
+                    sqlite_errorname=getattr(exc, "sqlite_errorname", None),
+                    ledger_txn_retries=self.ledger_txn_retries,
+                )
                 try:
                     result = await body()
-                except Exception as exc:
-                    if not self._db.in_transaction:
-                        raise
-                    await self._rollback_failed_txn(exc)
-                    if not _is_lock_error(exc):
-                        raise
-                    self.ledger_txn_retries += 1
-                    log.warning(
-                        "store_ledger_txn_retry_after_rollback",
-                        error=str(exc),
-                        sqlite_errorname=getattr(exc, "sqlite_errorname", None),
-                        ledger_txn_retries=self.ledger_txn_retries,
-                    )
-                    try:
-                        result = await body()
-                    except Exception as retry_exc:
-                        # The retry failed too (a leaked statement still pins
-                        # the snapshot): its own implicit BEGIN must not
-                        # outlive it either — roll back, then let the caller
-                        # see the error.
-                        if self._db.in_transaction:
-                            await self._rollback_failed_txn(retry_exc)
-                        raise
-                if self._db.in_transaction:
-                    log.error(
-                        "store_ledger_txn_left_open", detail="body returned without commit"
-                    )
-                    await self._db.commit()
-            finally:
-                self._ledger_txn_idle.set()
+                except Exception as retry_exc:
+                    # The retry failed too: its own implicit BEGIN must not
+                    # outlive it either — roll back, then let the caller see
+                    # the error.
+                    if self._db.in_transaction:
+                        await self._rollback_failed_txn(retry_exc)
+                    raise
+            if self._db.in_transaction:
+                log.error("store_ledger_txn_left_open", detail="body returned without commit")
+                await self._db.commit()
             return result
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                handed_off = self._hand_off_lock_after_cancel(exc, ledger=True)
+            raise
+        finally:
+            if not handed_off:
+                self._ledger_txn_idle.set()
+                self._conn_lock.release()
+
+    def _hand_off_lock_after_cancel(self, exc: BaseException, *, ledger: bool) -> bool:
+        """The cancelled call's LAST act, synchronous (a cancelled coroutine
+        must not await): hand the connection lock — and the ledger-idle flag
+        — to ``_clear_cancel_residue``. True iff the task was scheduled (it
+        owns both from here); False when no running loop can take it (the
+        loop is closing: ``close()``'s connection close rolls any orphan
+        back) — the caller then releases as usual."""
+        self.ledger_txn_cancellations += 1
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(
+                self._clear_cancel_residue(ledger=ledger), name="store-cancel-residue"
+            )
+        except RuntimeError:
+            log.error(
+                "store_cancel_residue_not_scheduled",
+                cancelled_by=type(exc).__name__,
+                ledger=ledger,
+                detail="no running loop to hand the connection lock to — the connection "
+                "close rolls back whatever the late statement opened",
+            )
+            return False
+        self._residue_tasks.add(task)
+        task.add_done_callback(self._residue_tasks.discard)
+        return True
+
+    async def _clear_cancel_residue(self, *, ledger: bool) -> None:
+        """OWNS the connection lock (handed off by a cancelled call) until the
+        late statement has landed and its residue is gone. ``SELECT 1`` is
+        queued FIFO behind the late statement on the aiosqlite worker and
+        touches no table (no read snapshot of its own); when it returns the
+        late statement has run — and its dropped cursor has been released by
+        the loop (the ``set_result`` handle ran before ours) — and
+        ``in_transaction`` says whether it opened a transaction: if so
+        ROLLBACK (the partial body is discarded; the caller's replay
+        re-books it). Counted + logged either way (WARNING when something
+        was rolled back — a fill's first write was discarded — INFO for a
+        clean residue); a failure here (the connection closed under it) is
+        logged; the lock and the idle flag are released on every path."""
+        landed = False
+        rolled_back = False
+        try:
+            async with self._db.execute("SELECT 1") as cursor:
+                await cursor.fetchall()
+            landed = bool(self._db.in_transaction)
+            if landed:
+                await self._db.rollback()
+                rolled_back = True
+                self.ledger_txn_cancel_rollbacks += 1
+            emit = log.warning if landed else log.info
+            emit(
+                "store_ledger_txn_cancelled",
+                ledger=ledger,
+                late_statement_landed=landed,
+                rolled_back=rolled_back,
+                ledger_txn_cancellations=self.ledger_txn_cancellations,
+                ledger_txn_cancel_rollbacks=self.ledger_txn_cancel_rollbacks,
+                detail=(
+                    "a cancelled body's late statement had opened a transaction — ROLLED "
+                    "BACK under the connection lock; nothing of the body persists and the "
+                    "caller's replay re-books it through the normal path"
+                    if landed
+                    else "a cancelled statement left no open transaction (a read, a failed "
+                    "statement, or a body whose commit landed whole)"
+                ),
+            )
+        except Exception:  # noqa: BLE001 - the lock must be released whatever happened
+            log.exception(
+                "store_cancel_residue_failed",
+                ledger=ledger,
+                late_statement_landed=landed,
+                rolled_back=rolled_back,
+                detail="could not probe / roll back after a cancelled statement — if the "
+                "connection is closing, its close rolls the orphan back",
+            )
+        finally:
+            self._ledger_txn_idle.set()
+            self._conn_lock.release()
+
+    async def _rollback_inherited_txn(self) -> None:
+        """A transaction open on ENTRY to ``_ledger_txn`` (review #2): never
+        legitimate — rolled back, counted, ERROR. Joining it (the first fix
+        pass's behaviour) committed a partial body written by someone else."""
+        self.ledger_txn_rollbacks += 1
+        log.error(
+            "store_ledger_txn_inherited_open_transaction",
+            ledger_txn_rollbacks=self.ledger_txn_rollbacks,
+            detail="the shared connection was inside a transaction on entry — this class "
+            "never leaves one open (a cancelled body is rolled back under the lock), so "
+            "this is foreign residue; ROLLED BACK, never joined: a partial body must never "
+            "be committed",
+        )
+        await self._db.rollback()
 
     async def _rollback_failed_txn(self, exc: BaseException) -> None:
         """Roll back the shared connection after ``exc`` left it inside a
@@ -990,13 +1219,14 @@ class Store:
         then fills the queue and counts drops exactly as before."""
         writes_since_checkpoint = 0
         checkpoint_after = self._CHECKPOINT_EVERY_WRITES
+        batch: list[_TapeRow] = []
         try:
             while True:
                 first = q.get()
                 if isinstance(first, _WriterStop):
                     q.task_done()
                     break
-                batch: list[_TapeRow] = [first]
+                batch = [first]
                 stop_seen = False
                 while len(batch) < WRITER_BATCH_ROWS:
                     try:
@@ -1016,6 +1246,7 @@ class Store:
                     self.batch_yields_to_ledger += 1
                     self._ledger_txn_idle.wait(STORE_OP_TIMEOUT_S)
                 if self._commit_batch_retrying(wdb, batch):
+                    self._writer_batches_committed += 1  # the supervisor's progress read
                     # Bounded manual checkpoint OFF the hot path
                     # (autocheckpoint=0): a TRUNCATE every ~5000 writes keeps
                     # the WAL small without an inline checkpoint stalling
@@ -1041,14 +1272,31 @@ class Store:
                         self._post_to_loop(self._emit_writer_stats)
                 for _ in batch:
                     q.task_done()
+                batch = []
                 if stop_seen:
                     q.task_done()  # the sentinel
                     break
                 if self._writer_stop.is_set():
                     break
         except BaseException as exc:  # noqa: BLE001 - a dead writer must be LOUD
+            # The in-flight batch is LOST with the thread (its rows were
+            # already dequeued): count them, release their queue slots so a
+            # bounded join / flush can still complete, and leave the restart
+            # decision to the loop-side supervisor (``_supervise_writer``).
+            lost = len(batch)
+            self._writer_rows_lost += lost
+            for _ in batch:
+                q.task_done()
+            self.writer_thread_deaths += 1
             self._post_to_loop(
-                functools.partial(log.exception, "store_writer_thread_died", exc_info=exc)
+                functools.partial(
+                    log.exception,
+                    "store_writer_thread_died",
+                    exc_info=exc,
+                    rows_lost=lost,
+                    writer_thread_deaths=self.writer_thread_deaths,
+                    queue_depth=q.qsize(),
+                )
             )
         finally:
             try:
@@ -1261,29 +1509,156 @@ class Store:
 
     def writer_queue_depth(self) -> int:
         """Rows waiting for the background tape writer (0 when the writer is
-        not running or idle). A plain length read — safe from a worker thread
-        (``ops/tape_retention.py`` gates each prune batch on it)."""
+        not running or idle — and 0 once the writer is ABANDONED: its queue
+        is purged, nothing waits for a writer that will not come). A plain
+        length read — safe from a worker thread (``ops/tape_retention.py``
+        gates each prune batch on it)."""
         q = self._write_q
         return 0 if q is None else q.qsize()
 
+    async def _supervise_writer(self) -> None:
+        """LOOP-SIDE WRITER SUPERVISION (2026-09-05 review #2, should-fix 2)
+        on the STORE_OP_TIMEOUT_S cadence — the store's own statement of how
+        long anything here may legitimately block, reused as "how long a
+        drop or a dead thread may go unreported"; no cadence of its own.
+        Each tick: (1) a dead thread is restarted on a fresh writer
+        connection — bounded by PROGRESS, not by a count: a restarted thread
+        that dies again without landing ONE batch is abandoned
+        (``_restart_writer_thread`` / ``_abandon_writer``); (2)
+        ``store_writer_stats`` is emitted from HERE whenever tape was dropped
+        since the last emit, the thread is dead, or a full batch
+        (WRITER_BATCH_ROWS) has been waiting with the thread silent for a
+        whole tick — so the 2026-08-19 silence (drops counted, nothing
+        reading the counter) cannot recur even with the thread gone. The
+        thread's own checkpoint-cadence emit is unchanged and carries the
+        healthy-path INFO lines. Cancelled by ``close()``."""
+        emits_seen = self._writer_stats_emits
+        while True:
+            await asyncio.sleep(STORE_OP_TIMEOUT_S)
+            if self._writer_stop.is_set():
+                return
+            thread = self._writer_thread
+            dead = thread is None or not thread.is_alive()
+            q = self._write_q
+            depth = 0 if q is None else q.qsize()
+            silent = self._writer_stats_emits == emits_seen
+            dropped = self._dropped_writes - self._dropped_writes_reported
+            if dropped > 0 or dead or (silent and depth >= WRITER_BATCH_ROWS):
+                # Before any restart, so the line records the DEAD state.
+                self._emit_writer_stats()
+            if dead and not self.writer_abandoned:
+                self._restart_writer_thread()
+            emits_seen = self._writer_stats_emits
+
+    def _restart_writer_thread(self) -> None:
+        """Restart a dead writer thread on a fresh connection — or ABANDON
+        the writer when the previous restart landed nothing
+        (``_writer_batches_committed`` unchanged since it): the failure is
+        deterministic and another restart would only re-run it every tick.
+        A connection that cannot be opened counts as a restart that landed
+        nothing, so the next tick abandons."""
+        if (
+            self.writer_thread_restarts > 0
+            and self._writer_batches_committed == self._writer_batches_at_restart
+        ):
+            self._abandon_writer()
+            return
+        q = self._write_q
+        if q is None or self._path is None:  # pragma: no cover - start_writer guarantees both
+            return
+        self.writer_thread_restarts += 1
+        self._writer_batches_at_restart = self._writer_batches_committed
+        try:
+            wdb = self._open_writer_connection(self._path)
+        except Exception:  # noqa: BLE001 - loud; the next tick abandons (no progress)
+            log.exception(
+                "store_writer_thread_restart_failed",
+                writer_thread_restarts=self.writer_thread_restarts,
+                writer_thread_deaths=self.writer_thread_deaths,
+                queue_depth=q.qsize(),
+            )
+            return
+        self._writer_db = wdb
+        thread = threading.Thread(
+            target=self._writer_thread_main,
+            args=(wdb, q),
+            name="store-writer",
+            daemon=True,
+        )
+        self._writer_thread = thread
+        thread.start()
+        log.warning(
+            "store_writer_thread_restarted",
+            writer_thread_restarts=self.writer_thread_restarts,
+            writer_thread_deaths=self.writer_thread_deaths,
+            rows_lost_with_thread=self._writer_rows_lost,
+            queue_depth=q.qsize(),
+            detail="the tape writer thread died and was restarted on a fresh connection; "
+            "queued rows resume; a second death without a landed batch abandons the writer",
+        )
+
+    def _abandon_writer(self) -> None:
+        """Two deaths without a landed batch: stop restarting. The queue is
+        PURGED into the drop counter — its rows have no consumer, a bounded
+        join / flush must not wait on them, and ``writer_queue_depth`` must
+        read 0 (truthful: nothing is waiting for a writer) — and ``_write``
+        drops directly from here on. ERROR once; ``store_writer_stats`` keeps
+        counting the drops on the supervisor cadence. Ledger paths (their
+        own connection lifecycle on the shared connection) are unaffected."""
+        self.writer_abandoned = True
+        q = self._write_q
+        purged = 0
+        if q is not None:
+            while True:
+                try:
+                    item = q.get_nowait()
+                except queue.Empty:
+                    break
+                if not isinstance(item, _WriterStop):
+                    purged += 1
+                q.task_done()
+        self._dropped_writes += purged
+        log.error(
+            "store_writer_abandoned",
+            purged_rows=purged,
+            writer_thread_deaths=self.writer_thread_deaths,
+            writer_thread_restarts=self.writer_thread_restarts,
+            rows_lost_with_thread=self._writer_rows_lost,
+            detail="the tape writer thread died twice without landing a batch — no further "
+            "restarts; tape rows are DROPPED (counted in store_writer_stats) until the "
+            "process restarts; the ledger paths are unaffected",
+        )
+
     def _emit_writer_stats(self) -> None:
-        """Writer observability on the checkpoint cadence (2026-08-19):
-        cumulative dropped tape writes, the delta since the last emit, and
-        the live queue depth. WARNING whenever tape was dropped since the
-        last emit — drop-on-overflow is the DESIGNED hot-path behaviour, but
-        it must never again be invisible (~75-80% of a day's tape rows gone
-        with nothing reading the counter). Runs on the event loop (posted
-        there by the writer thread) — the counter it reads is the hot path's."""
+        """Writer observability (2026-08-19): cumulative dropped tape writes,
+        the delta since the last emit, the live queue depth — and since the
+        review #2 fix pass the thread's liveness, deaths, restarts, the rows
+        lost with a dead thread and the abandoned flag. WARNING whenever tape
+        was dropped since the last emit or the thread is dead —
+        drop-on-overflow is the DESIGNED hot-path behaviour, but it must
+        never again be invisible (~75-80% of a day's tape rows gone with
+        nothing reading the counter). Runs on the event loop (posted there by
+        the writer thread, or called by the loop-side supervisor) — the
+        counter it reads is the hot path's."""
         dropped = self._dropped_writes
         delta = dropped - self._dropped_writes_reported
         self._dropped_writes_reported = dropped
+        self._writer_stats_emits += 1
         q = self._write_q
-        emit = log.warning if delta > 0 else log.info
+        thread = self._writer_thread
+        alive = thread is not None and thread.is_alive()
+        dead = thread is not None and not alive
+        emit = log.warning if (delta > 0 or dead) else log.info
         emit(
             "store_writer_stats",
             dropped_writes_total=dropped,
             dropped_writes_delta=delta,
             queue_depth=0 if q is None else q.qsize(),
+            writer_thread_alive=alive,
+            writer_thread_deaths=self.writer_thread_deaths,
+            writer_thread_restarts=self.writer_thread_restarts,
+            writer_abandoned=self.writer_abandoned,
+            rows_lost_with_thread=self._writer_rows_lost,
         )
 
     def _now(self) -> str:
@@ -2289,7 +2664,13 @@ class Store:
             "position_ledger",
         }:
             raise ValueError(f"unknown table {table!r}")
-        row = await self._fetchone(f"SELECT COUNT(*) FROM {table}")  # noqa: S608
+        sql = f"SELECT COUNT(*) FROM {table}"  # noqa: S608 - table validated above
+        if table in _TAPE_TABLES and self._path is not None:
+            # A TAPE-table scan never holds the connection lock (review #2,
+            # should-fix 1): its own read-only connection, off the loop.
+            rows = await asyncio.to_thread(self._fetchall_ro, self._path, sql)
+            return int(rows[0][0]) if rows else 0
+        row = await self._fetchone(sql)
         return int(row[0]) if row else 0
 
     async def _ledger_legsets(
@@ -2462,31 +2843,88 @@ class Store:
         shared connection under the lock — no writer thread can exist there."""
         if self._path is None:
             rows = await self._fetchall(_DECISION_REASON_COUNTS_SQL)
-            return {str(r[0]): int(r[1]) for r in rows}
-        return await asyncio.to_thread(self._decision_reason_counts_ro, self._path)
+        else:
+            rows = await asyncio.to_thread(
+                self._fetchall_ro, self._path, _DECISION_REASON_COUNTS_SQL
+            )
+        return {str(r[0]): int(r[1]) for r in rows}
 
     @staticmethod
-    def _decision_reason_counts_ro(path: Path) -> dict[str, int]:
-        """Worker-thread body of ``decision_reason_counts``: its OWN read-only
-        connection (``mode=ro`` URI), the store's existing lock tolerance
-        (``BUSY_TIMEOUT_MS`` — a WAL reader waits only through a WAL restart /
-        recovery instant), one aggregate statement, closed on the way out."""
+    def _open_ro(path: Path) -> sqlite3.Connection:
+        """A read-only (``mode=ro`` URI) stdlib connection of its own for a
+        worker thread — the ``ops/acceptance_seed.py`` pattern — with the
+        store's existing lock tolerance (``BUSY_TIMEOUT_MS``: a WAL reader
+        waits only through a WAL restart / recovery instant). Such a reader
+        pins the WAL read-mark only for the checkpoint's TRUNCATE, which no
+        longer waits on it (``_open_checkpoint_connection``)."""
         con = sqlite3.connect(
             f"file:{path.resolve().as_posix()}?mode=ro", uri=True, timeout=STORE_OP_TIMEOUT_S
         )
+        con.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        return con
+
+    @staticmethod
+    def _fetchall_ro(path: Path, sql: str) -> list[Any]:
+        """Worker-thread body: ONE statement on its own read-only connection,
+        materialized, connection closed on the way out."""
+        con = Store._open_ro(path)
         try:
-            con.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-            rows = con.execute(_DECISION_REASON_COUNTS_SQL).fetchall()
+            return list(con.execute(sql).fetchall())
         finally:
             con.close()
-        return {str(r[0]): int(r[1]) for r in rows}
 
     async def decision_kind_counts(self) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        rows = await self._fetchall("SELECT kind, COUNT(*) FROM decisions GROUP BY kind")
-        for row in rows:
-            counts[str(row[0])] = int(row[1])
-        return counts
+        """``{kind: count}`` over every decisions row — a full tape scan, so
+        off the shared connection like ``decision_reason_counts`` (review
+        #2, should-fix 1). Legacy direct construction (no path): the shared
+        connection under the lock."""
+        if self._path is None:
+            rows = await self._fetchall(_DECISION_KIND_COUNTS_SQL)
+        else:
+            rows = await asyncio.to_thread(self._fetchall_ro, self._path, _DECISION_KIND_COUNTS_SQL)
+        return {str(r[0]): int(r[1]) for r in rows}
+
+    async def report_tape_counts(self) -> dict[str, Any]:
+        """The live report's four TAPE reads — ``rfqs_seen``,
+        ``decisions_by_kind``, ``skip_reasons``, ``would_quotes`` (ops/report.py
+        ``build_report`` ← quote_app ``_report_loop``, every 300 s) — on ONE
+        ``mode=ro`` connection in ONE worker-thread hop (review #2, should-fix
+        1). None of them ever holds the connection lock, so the ledger paths
+        never queue behind a tape scan again: main logged 11
+        ``store_await_timeout op=has_fill`` (bound 30.25 s) + 11
+        ``fill_ledger_write_failed`` + 6 ``fill_ledger_write_stalled`` in
+        2.7 h while the report's COUNT(*)s held the shared connection. Four
+        autocommit statements (no shared snapshot needed across them: the
+        report's counts are independent read-outs). Legacy direct
+        construction (no path): the same statements on the shared connection
+        under the lock, one at a time."""
+        if self._path is None:
+            return {
+                "rfqs_seen": await self.count("rfqs"),
+                "decisions_by_kind": await self.decision_kind_counts(),
+                "skip_reasons": await self.decision_reason_counts(),
+                "would_quotes": await self.count("would_quotes"),
+            }
+        return await asyncio.to_thread(self._report_tape_counts_ro, self._path)
+
+    @staticmethod
+    def _report_tape_counts_ro(path: Path) -> dict[str, Any]:
+        """Worker-thread body of ``report_tape_counts``: one connection, four
+        statements, closed on the way out."""
+        con = Store._open_ro(path)
+        try:
+            rfqs = con.execute("SELECT COUNT(*) FROM rfqs").fetchone()
+            kinds = con.execute(_DECISION_KIND_COUNTS_SQL).fetchall()
+            reasons = con.execute(_DECISION_REASON_COUNTS_SQL).fetchall()
+            would = con.execute("SELECT COUNT(*) FROM would_quotes").fetchone()
+        finally:
+            con.close()
+        return {
+            "rfqs_seen": int(rfqs[0]) if rfqs else 0,
+            "decisions_by_kind": {str(r[0]): int(r[1]) for r in kinds},
+            "skip_reasons": {str(r[0]): int(r[1]) for r in reasons},
+            "would_quotes": int(would[0]) if would else 0,
+        }
 
     async def ev_summary(self) -> dict[str, object]:
         """Aggregate EV grading over the ev_ledger. A VOIDED phantom's row is

@@ -382,7 +382,10 @@ async def test_sweep_publishes_a_floor_table_from_the_settled_grade(tmp_path: Pa
                     pnl, 0, f"2026-08-{2 + i % 20:02d}T03:00:00+00:00",
                 ),
             )
-    await store._db.commit()  # noqa: SLF001
+            # Commit each direct seed before the next store call: since the
+            # tape-writer review #2 fix pass a transaction found open on entry
+            # to a ledger write is ROLLED BACK (foreign residue), never joined.
+            await store._db.commit()  # noqa: SLF001
     rows = await store.settled_grade_rows()
     assert len(rows) == 80
     await _tick(rig)

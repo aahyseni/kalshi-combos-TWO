@@ -18,6 +18,8 @@ from combomaker.core.conventions import Side
 from combomaker.core.money import CentiCents
 from combomaker.core.quantity import CentiContracts
 from combomaker.ops.persistence import Store
+from combomaker.ops.report import build_report
+from combomaker.pricing.fit_challenge import FitChallenge, FitVerdict
 from combomaker.rfq.models import Rfq
 from combomaker.risk.exposure import LegRef, OpenPosition
 
@@ -978,7 +980,7 @@ async def test_ledger_writes_survive_shared_connection_reads_under_the_tape_thre
         async def reader() -> None:
             nonlocal reads
             while not stop:
-                await store.count("decisions")
+                await store.count("fills")  # a LEDGER table: stays on the shared connection
                 await store.open_ledger_tickers()
                 reads += 2
                 await asyncio.sleep(0)
@@ -1037,6 +1039,21 @@ async def test_every_shared_connection_statement_runs_under_the_connection_lock(
             leg_time_to_start_s={"M1": -10.0},
             context={},
         )
+        await store.record_structural_fit(
+            rfq_id="rfq_1",
+            model="mutex",
+            n_legs=2,
+            tickers=("M1", "M2"),
+            challenge=FitChallenge(
+                verdict=FitVerdict.ACCEPT,
+                residual=0.001,
+                exactly_identified=True,
+                reject_bar=0.05,
+                challenge_bar=0.01,
+            ),
+            family="ml_parlay",
+            route="structural",
+        )
         # Ledger.
         await store.record_position_open(_position(), subaccount="0")
         assert await store.ensure_open_position_row(_position(), subaccount="0") is False
@@ -1079,10 +1096,16 @@ async def test_every_shared_connection_statement_runs_under_the_connection_lock(
         assert await store.settled_grade_rows()
         assert await store.held_positions(["KXMVE-T1"])
         assert await store.count("fills") == 2
-        assert await store.decision_kind_counts() == {"no_quote": 1}
+        assert await store.count("structural_fits") == 1
         n_calls = len(witness.calls)
+        # Every TAPE read runs on its own read-only connection (review #2,
+        # should-fix 1): not ONE statement on the shared connection.
+        assert await store.decision_kind_counts() == {"no_quote": 1}
         assert await store.decision_reason_counts() == {"skip_test": 1}
-        assert len(witness.calls) == n_calls  # not ONE statement on the shared connection
+        assert await store.count("decisions") == 1
+        assert await store.count("rfqs") == 1
+        assert (await store.report_tape_counts())["would_quotes"] == 1
+        assert len(witness.calls) == n_calls
 
         assert len(witness.calls) >= 50
         unlocked = [sql for sql, held in witness.calls if not held]
@@ -1100,6 +1123,7 @@ async def test_every_shared_connection_statement_runs_under_the_connection_lock(
             "markouts",
             "combo_trades",
             "store_meta",
+            "structural_fits",
         ):
             assert table in touched, table
         assert ("COMMIT", True) in witness.calls
@@ -1570,7 +1594,9 @@ async def test_tape_thread_yields_the_write_lock_to_a_ledger_transaction_in_flig
     ``batch_yields_to_ledger`` — and proceeds the moment the ledger is done.
     The hold is bounded by STORE_OP_TIMEOUT_S: a flag left clear (a stuck
     caller) never stalls the tape. ``_ledger_txn`` itself restores the flag
-    on success, failure and cancellation alike."""
+    on success and failure; on cancellation the RESIDUE task it hands the
+    connection lock to restores it once the late statement has landed
+    (review #2 fix pass)."""
     path = tmp_path / "t.sqlite3"
     store = await Store.open(path, FakeClock())
     thread: threading.Thread | None = None
@@ -1632,10 +1658,406 @@ async def test_tape_thread_yields_the_write_lock_to_a_ledger_transaction_in_flig
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert store._ledger_txn_idle.is_set()  # noqa: SLF001 — restored on cancellation
+        # Restored by the residue task the cancelled body handed the lock to.
+        assert await _wait_until(lambda: store._ledger_txn_idle.is_set(), 5.0)  # noqa: SLF001
+        assert store.ledger_txn_cancellations == 1
+        assert not store._conn_lock.locked()  # noqa: SLF001
     finally:
         if thread is not None and thread.is_alive():
             store._ledger_txn_idle.set()  # noqa: SLF001
             store._writer_stop.set()  # noqa: SLF001
             await asyncio.to_thread(thread.join, 5.0)
+        await store.close()
+
+
+# --------------------------------------------------------------------------- #
+# REVIEW #2 FIX PASS (2026-09-05): CANCELLATION RESIDUE ON THE SHARED           #
+# CONNECTION. A body cancelled by ``asyncio.wait_for`` while its statement is  #
+# queued / busy-waiting on the aiosqlite worker LANDS LATE. Probe E (the       #
+# reviewer's, on the real Store) proved the shape: the late INSERT succeeds,   #
+# the connection is left INSIDE an open write transaction holding the WAL      #
+# write lock, the tape thread cannot commit, and the next ``_ledger_txn``      #
+# joined + committed the PARTIAL body. Probes B and C are the read and the     #
+# writer-less write shapes.                                                    #
+# --------------------------------------------------------------------------- #
+
+
+def _hold_write_lock(path: Path, hold_s: float) -> threading.Thread:
+    """A THIRD connection takes the WAL write lock (``BEGIN IMMEDIATE``) for
+    ``hold_s`` seconds, then commits — the foreign write-lock hold a tape
+    batch commit or a retention prune batch is (returns once the lock is
+    held)."""
+    held = threading.Event()
+
+    def body() -> None:
+        con = sqlite3.connect(path, isolation_level=None)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            held.set()
+            time.sleep(hold_s)
+            con.execute("COMMIT")
+        finally:
+            con.close()
+
+    thread = threading.Thread(target=body, name="foreign-write-lock", daemon=True)
+    thread.start()
+    assert held.wait(persistence.STORE_OP_TIMEOUT_S)
+    return thread
+
+
+async def _settle_after_cancel(store: Store, holder: threading.Thread) -> None:
+    """Let the foreign hold lift, the late statement land and any residue task
+    finish: the connection lock free again, then one SQLite busy-handler
+    step (<= 100 ms) for the late statement's own landing."""
+    await asyncio.to_thread(holder.join, persistence.STORE_OP_TIMEOUT_S)
+    assert not holder.is_alive()
+    assert await _wait_until(
+        lambda: not store._conn_lock.locked(),  # noqa: SLF001
+        persistence.STORE_OP_TIMEOUT_S,
+    )
+    await asyncio.sleep(0.2)
+
+
+async def test_probe_e_cancelled_ledger_body_landing_late_is_rolled_back_under_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PROBE E (review #2 must-fix #1) as a regression test — FAILS on
+    ``b24c0db``. Real Store + ``start_writer()`` + a tape firehose; a
+    ``record_fill`` body is cancelled by ``wait_for`` (bound 0.4 s) while its
+    INSERT busy-waits behind a foreign write-lock hold (0.7 s). The INSERT
+    then LANDS. Unfixed: the shared connection stays inside an open write
+    transaction (WAL write lock held), the tape thread cannot commit, and the
+    next ledger transaction joins + commits the partial body (fills 1,
+    ev_ledger 0). Fixed: the cancelled ``_ledger_txn`` hands the connection
+    lock to a residue task that runs FIFO behind the late statement and
+    rolls it back; nothing partial is ever committed; the tape lands within
+    its cadence; the normal replay re-books the fill exactly once."""
+    spy = _LogSpy()
+    monkeypatch.setattr(persistence, "log", spy)
+    path = tmp_path / "t.sqlite3"
+    store = await Store.open(path, FakeClock())
+    try:
+        store.start_writer()
+        stop = False
+        enqueued = 0
+
+        async def firehose() -> None:
+            nonlocal enqueued
+            while not stop:
+                for _ in range(10):
+                    await store.record_decision("no_quote", f"f{enqueued}", ["skip_test"], {})
+                    enqueued += 1
+                await asyncio.sleep(0.001)
+
+        fh = asyncio.create_task(firehose())
+        holder = _hold_write_lock(path, 0.7)
+        t0 = time.perf_counter()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(_fill(store, "late"), 0.4)
+        assert time.perf_counter() - t0 < 0.7  # the bound returned BEFORE the hold lifted
+        await _settle_after_cancel(store, holder)
+        # (1) never left inside a transaction once the residue is cleared
+        assert store._db.in_transaction is False  # noqa: SLF001
+        # (2) the NEXT unrelated ledger transaction must not commit a partial body
+        await store.record_position_open(_position(), subaccount="0")
+        stop = True
+        await fh
+        # (3) the tape thread commits within its cadence (the write lock was never pinned)
+        assert await store.flush_writer(persistence.STORE_OP_TIMEOUT_S)
+        assert store._dropped_writes == 0  # noqa: SLF001
+        assert _truth(path, "SELECT COUNT(*) FROM decisions") == enqueued
+        # (4) a fresh read-only connection sees exactly the committed fills: NONE
+        assert _truth(path, "SELECT COUNT(*) FROM fills") == 0
+        assert _truth(path, "SELECT COUNT(*) FROM ev_ledger") == 0
+        assert _truth(path, "SELECT COUNT(*) FROM position_ledger") == 1
+        assert spy.of("store_ledger_txn_inherited_open_transaction") == []
+        assert spy.of("store_ledger_txn_left_open") == []
+        cancelled = spy.of("store_ledger_txn_cancelled")
+        assert len(cancelled) == 1
+        assert cancelled[0][0] == "warning"
+        assert cancelled[0][2]["late_statement_landed"] is True
+        assert cancelled[0][2]["rolled_back"] is True
+        assert store.ledger_txn_cancellations == 1
+        assert store.ledger_txn_cancel_rollbacks == 1
+        # (5) THE REPLAY PATH: the normal record_fill re-books — inserted True, ONE row
+        # (lifecycle: has_fill False -> record_fill -> inserted -> no late-landing adoption)
+        assert await store.has_fill("fill:late") is False
+        assert await _fill(store, "late") is True
+        assert _truth(path, "SELECT COUNT(*) FROM fills") == 1
+        assert _truth(path, "SELECT COUNT(*) FROM ev_ledger") == 1
+        assert await store.count("fills") == 1
+        assert store._db.in_transaction is False  # noqa: SLF001
+    finally:
+        await store.close()
+
+
+async def test_probe_c_cancelled_write_landing_late_is_rolled_back_not_half_committed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PROBE C: no writer thread (sync mode). A ``record_fill`` cancelled by a
+    real ``wait_for`` while its INSERT busy-waits behind a foreign write-lock
+    hold lands late -> rolled back (fills 0 / ev_ledger 0, connection outside
+    any transaction), never half-committed by the next transaction; the
+    replay books it once. A cancellation whose body had already COMMITTED
+    (the bound expired during the commit hop) is a clean residue: nothing to
+    roll back, the committed row stands for the replay to adopt."""
+    spy = _LogSpy()
+    monkeypatch.setattr(persistence, "log", spy)
+    path = tmp_path / "t.sqlite3"
+    store = await Store.open(path, FakeClock())
+    try:
+        holder = _hold_write_lock(path, 0.5)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(_fill(store, "c"), 0.2)
+        await _settle_after_cancel(store, holder)
+        assert store._db.in_transaction is False  # noqa: SLF001
+        assert await store.record_combo_trades("KXMVE-T1", [{"trade_id": "t1"}]) == 1
+        assert _truth(path, "SELECT COUNT(*) FROM fills") == 0
+        assert _truth(path, "SELECT COUNT(*) FROM ev_ledger") == 0
+        assert _truth(path, "SELECT COUNT(*) FROM combo_trades") == 1
+        assert spy.of("store_ledger_txn_inherited_open_transaction") == []
+        assert store.ledger_txn_cancellations == 1
+        assert store.ledger_txn_cancel_rollbacks == 1
+        assert await _fill(store, "c") is True
+        assert _truth(path, "SELECT COUNT(*) FROM fills") == 1
+        assert _truth(path, "SELECT COUNT(*) FROM ev_ledger") == 1
+        # A body cancelled AFTER its commit hop was queued: the commit lands,
+        # the residue task finds nothing to roll back (clean), the row stands.
+        real_commit = store._db.commit  # noqa: SLF001
+
+        async def slow_commit() -> None:
+            await real_commit()
+            await asyncio.sleep(0.2)
+
+        monkeypatch.setattr(store._db, "commit", slow_commit)  # noqa: SLF001
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(_fill(store, "d"), 0.1)
+        monkeypatch.setattr(store._db, "commit", real_commit)  # noqa: SLF001
+        assert await _wait_until(
+            lambda: store.ledger_txn_cancellations == 2
+            and not store._conn_lock.locked(),  # noqa: SLF001
+            persistence.STORE_OP_TIMEOUT_S,
+        )
+        assert store.ledger_txn_cancel_rollbacks == 1  # nothing to roll back this time
+        assert _truth(path, "SELECT COUNT(*) FROM fills") == 2
+        assert await store.has_fill("fill:d") is True  # the replay ADOPTS a committed row
+        assert await _fill(store, "d") is False
+        cancelled = spy.of("store_ledger_txn_cancelled")
+        assert [e[2]["late_statement_landed"] for e in cancelled] == [True, False]
+        assert [e[0] for e in cancelled] == ["warning", "info"]
+    finally:
+        await store.close()
+
+
+async def test_probe_b_cancelled_read_mid_statement_then_record_fill_is_booked(
+    tmp_path: Path,
+) -> None:
+    """PROBE B: a READ cancelled by a real ``wait_for`` while its statement is
+    still stepping on the aiosqlite worker (a table-reading scan), a foreign
+    commit under it (the tape thread's role — the read snapshot is now
+    stale), then ``record_fill``. Booked, exactly once; the connection ends
+    outside any transaction; the lock is free. (The reviewer measured this
+    landing 50/50 through the rollback+retry path; the lock hand-off now
+    waits out the residue statement, so the write never collides with it.)"""
+    path = tmp_path / "t.sqlite3"
+    store = await Store.open(path, FakeClock())
+    try:
+        for i in range(120):
+            await store.record_decision("no_quote", f"r{i}", ["skip_test"], {})
+        slow_scan = (  # per-row string work: a COUNT(*) alone ran the cross join in 15 ms
+            "SELECT SUM(LENGTH(a.reasons_json || b.kind || c.rfq_id))"
+            " FROM decisions a, decisions b, decisions c"
+        )
+        t0 = time.perf_counter()
+        n_scan = (await store._fetchone(slow_scan))[0]  # noqa: SLF001
+        scan_s = time.perf_counter() - t0
+        assert n_scan > 0
+        assert scan_s > 0.05, scan_s  # slow enough to be cancelled mid-statement
+        for k in range(3):
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(store._fetchone(slow_scan), 0.01)  # noqa: SLF001
+            _foreign_commit(path)
+            assert await _fill(store, f"b{k}") is True
+            assert store._db.in_transaction is False  # noqa: SLF001
+        assert await _wait_until(
+            lambda: not store._conn_lock.locked(),  # noqa: SLF001
+            persistence.STORE_OP_TIMEOUT_S,
+        )
+        assert store.ledger_txn_cancellations == 3
+        assert store.ledger_txn_cancel_rollbacks == 0  # reads open no transaction
+        assert store.ledger_txn_rollbacks == 0  # no snapshot collision: the residue was waited out
+        assert _truth(path, "SELECT COUNT(*) FROM fills") == 3
+        assert await store.count("decisions") == 123
+    finally:
+        await store.close()
+
+
+async def test_ledger_txn_rolls_back_an_inherited_open_transaction_never_joins_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review #2: a transaction already open on ENTRY (foreign residue — a
+    DML statement issued outside the class and never committed) is ROLLED
+    BACK and logged at ERROR, never joined: the first fix pass joined it and
+    committed a partial body along with our own. Our body still lands."""
+    spy = _LogSpy()
+    monkeypatch.setattr(persistence, "log", spy)
+    path = tmp_path / "t.sqlite3"
+    store = await Store.open(path, FakeClock())
+    try:
+        await store._db.execute(  # noqa: SLF001 — outside the class, no commit: the residue
+            "INSERT INTO rfq_deletions (rfq_id, seen_at, raw_json) VALUES ('x', 't', '{}')"
+        )
+        assert store._db.in_transaction is True  # noqa: SLF001
+        assert await _fill(store, "a") is True
+        assert store._db.in_transaction is False  # noqa: SLF001
+        assert _truth(path, "SELECT COUNT(*) FROM rfq_deletions") == 0  # never committed
+        assert _truth(path, "SELECT COUNT(*) FROM fills") == 1
+        inherited = spy.of("store_ledger_txn_inherited_open_transaction")
+        assert len(inherited) == 1
+        assert inherited[0][0] == "error"
+        assert store.ledger_txn_rollbacks == 1
+        assert store.ledger_txn_retries == 0
+    finally:
+        await store.close()
+
+
+async def test_dead_writer_thread_is_restarted_then_abandoned_without_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review #2 should-fix 2. (1) The writer thread dies (a bug raised past
+    the batch handler): the in-flight batch is lost — counted, its queue
+    slots released — and the LOOP-SIDE supervisor restarts the thread on a
+    fresh connection within its cadence (STORE_OP_TIMEOUT_S); rows queued
+    while it was dead land. (2) It dies again after landing a batch: another
+    restart (progress since the last one). (3) It dies again WITHOUT landing
+    a batch: ABANDONED — the queue is purged into the drop counter,
+    ``writer_queue_depth`` reads 0 (tape_retention's idle gate stays
+    truthful), ``_write`` drops directly, and ``store_writer_stats`` is
+    emitted from the loop with the drops even though no thread lives to post
+    it. ``close()`` returns promptly."""
+    spy = _LogSpy()
+    monkeypatch.setattr(persistence, "log", spy)
+    monkeypatch.setattr(persistence, "STORE_OP_TIMEOUT_S", 0.05)
+    path = tmp_path / "t.sqlite3"
+    store = await Store.open(path, FakeClock())
+    try:
+        real = store._commit_batch_retrying  # noqa: SLF001
+        deaths_left = {"n": 1}
+
+        def flaky(wdb: sqlite3.Connection, batch: list[Any]) -> bool:
+            if deaths_left["n"] > 0:
+                deaths_left["n"] -= 1
+                raise RuntimeError("writer bug")
+            return bool(real(wdb, batch))
+
+        monkeypatch.setattr(store, "_commit_batch_retrying", flaky)
+        store.start_writer()
+        # (1) first death → restart
+        await _flood(store, 5)
+        assert await _wait_until(lambda: store.writer_thread_deaths == 1, 2.0)
+        await _flood(store, 3)  # queued while dead
+        assert await _wait_until(lambda: store.writer_thread_restarts == 1, 2.0)
+        assert await store.flush_writer(2.0)
+        thread = store._writer_thread  # noqa: SLF001
+        assert thread is not None and thread.is_alive()
+        lost = store._writer_rows_lost  # noqa: SLF001
+        assert 1 <= lost <= 5
+        assert _truth(path, "SELECT COUNT(*) FROM decisions") + lost == 8
+        died = spy.of("store_writer_thread_died")
+        assert len(died) == 1 and died[0][2]["rows_lost"] == lost
+        assert len(spy.of("store_writer_thread_restarted")) == 1
+        assert any(e[2]["writer_thread_alive"] is False for e in spy.of("store_writer_stats"))
+        assert not store.writer_abandoned
+        # (2) dies again after progress → restarted again
+        deaths_left["n"] = 1
+        await _flood(store, 2)
+        assert await _wait_until(lambda: store.writer_thread_restarts == 2, 2.0)
+        assert not store.writer_abandoned
+        # (3) dies again with NO landed batch since that restart → abandoned
+        deaths_left["n"] = 10**6
+        await _flood(store, 4)
+        assert await _wait_until(lambda: store.writer_thread_deaths == 3, 2.0)
+        assert await _wait_until(lambda: store.writer_abandoned, 2.0)
+        assert store.writer_thread_restarts == 2  # no third restart
+        assert store.writer_queue_depth() == 0  # purged: truthful for the idle gate
+        abandoned = spy.of("store_writer_abandoned")
+        assert len(abandoned) == 1 and abandoned[0][0] == "error"
+        # _write drops directly now, and the loop-side cadence REPORTS the drops
+        before = store._dropped_writes  # noqa: SLF001
+        n_stats = len(spy.of("store_writer_stats"))
+        await _flood(store, 7)
+        assert store._dropped_writes == before + 7  # noqa: SLF001
+        assert store.writer_queue_depth() == 0
+        assert await _wait_until(lambda: len(spy.of("store_writer_stats")) > n_stats, 2.0)
+        last = spy.of("store_writer_stats")[-1]
+        assert last[0] == "warning"
+        assert last[2]["dropped_writes_delta"] >= 7
+        assert last[2]["writer_abandoned"] is True
+        assert last[2]["writer_thread_alive"] is False
+        assert last[2]["writer_thread_restarts"] == 2
+        t0 = time.perf_counter()
+    finally:
+        await store.close()
+    assert time.perf_counter() - t0 < 2.0  # nothing to drain, nothing to join
+
+
+async def test_report_tape_reads_run_on_one_read_only_connection_in_one_hop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review #2 should-fix 1: the report's FOUR tape reads issue no statement
+    on the shared connection and cost ONE worker-thread hop on ONE read-only
+    connection; the individual methods agree and are off-connection too;
+    ``build_report`` carries the same keys in place and touches the shared
+    connection only for the ledger summaries. Legacy direct construction
+    (no path) runs them on the shared connection."""
+    path = tmp_path / "t.sqlite3"
+    store = await Store.open(path, FakeClock())
+    try:
+        await store.record_rfq(RFQ, source="ws")
+        await store.record_decision("no_quote", "rfq_1", ["skip_test", "a"], {})
+        await store.record_decision("quote", "rfq_2", [], {})
+        await store.record_would_quote(
+            "rfq_1", fair_prob=0.5, fair_cc=5000, width_cc=100, leg_probs=(0.5,), context={}
+        )
+        spy = _SqlSpyDB(store._db)  # noqa: SLF001
+        store._db = spy  # type: ignore[assignment]  # noqa: SLF001
+        hops: list[str] = []
+        real_to_thread = asyncio.to_thread
+
+        async def counting_to_thread(fn: Any, *args: Any, **kwargs: Any) -> Any:
+            hops.append(getattr(fn, "__name__", repr(fn)))
+            return await real_to_thread(fn, *args, **kwargs)
+
+        monkeypatch.setattr(persistence.asyncio, "to_thread", counting_to_thread)
+        expected = {
+            "rfqs_seen": 1,
+            "decisions_by_kind": {"no_quote": 1, "quote": 1},
+            "skip_reasons": {"skip_test": 1, "a": 1},
+            "would_quotes": 1,
+        }
+        n = len(spy.sqls)
+        assert await store.report_tape_counts() == expected
+        assert hops == ["_report_tape_counts_ro"]  # ONE hop
+        assert len(spy.sqls) == n  # not ONE statement on the shared connection
+        assert await store.count("rfqs") == 1
+        assert await store.count("decisions") == 2
+        assert await store.count("would_quotes") == 1
+        assert await store.decision_kind_counts() == expected["decisions_by_kind"]
+        assert await store.decision_reason_counts() == expected["skip_reasons"]
+        assert len(spy.sqls) == n
+        assert len(hops) == 6
+        report = await build_report(store, env="demo")
+        assert {k: report[k] for k in expected} == expected
+        assert list(report)[:6] == ["env", "note", *expected]  # key order kept
+        shared = spy.sqls[n:]
+        assert shared  # the ledger summaries (ev_ledger / markouts) still read here
+        tape = ("rfqs", "decisions", "would_quotes")
+        assert [s for s in shared if any(t in s for t in tape)] == []
+        db = await aiosqlite.connect(path)
+        legacy = Store(db, FakeClock())
+        try:
+            assert await legacy.report_tape_counts() == expected
+        finally:
+            await legacy.close()
+    finally:
         await store.close()
