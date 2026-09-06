@@ -13,10 +13,16 @@ DDL statements here; the schema is append-only by convention.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
+import queue
+import sqlite3
+import threading
+import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, Final, Self
 
 import aiosqlite
 
@@ -227,12 +233,36 @@ CREATE TABLE IF NOT EXISTS store_meta (
 #
 # IMPORTANT: busy_timeout only bounds SQLite's own LOCK waits. It does NOT bound
 # the time a statement spends QUEUED behind other work on the single aiosqlite
-# connection thread (the background tape writer's 1000-statement batches run
-# there; its WAL TRUNCATE/PASSIVE checkpoints moved to a DEDICATED second
-# connection, 2026-08-19). That queueing is the actual 2026-07-26 stall, and
-# only an asyncio-level ``wait_for`` can bound it.
+# connection thread (until 2026-09-05 the background tape writer's
+# 1000-statement batches ran there; its WAL TRUNCATE/PASSIVE checkpoints moved
+# to a DEDICATED second connection 2026-08-19, and the tape writer itself now
+# runs on its OWN thread + connection, so the shared connection carries only
+# the synchronous ledger paths and reads). That queueing is the actual
+# 2026-07-26 stall, and only an asyncio-level ``wait_for`` can bound it.
 BUSY_TIMEOUT_MS = 5000
 STORE_OP_TIMEOUT_S = BUSY_TIMEOUT_MS / 1000.0
+
+# TAPE WRITER BOUNDS — the EXISTING numbers, named (2026-09-05 thread-writer
+# build; nothing here is new). ``WRITER_QUEUE_MAXSIZE`` is the 200,000-row
+# bound the asyncio.Queue carried since the 2026-07-14 writer; the hot path
+# drops on overflow rather than block (``store_writer_stats.dropped_writes``
+# counts the drops). ``WRITER_BATCH_ROWS`` is the 1,000-row batch the writer
+# loop always committed per transaction. ``WRITER_CLOSE_DRAIN_S`` is the 2.0 s
+# ``close()`` has always allowed the queue to drain before shutdown.
+WRITER_QUEUE_MAXSIZE: Final = 200000
+WRITER_BATCH_ROWS: Final = 1000
+WRITER_CLOSE_DRAIN_S: Final = 2.0
+
+
+class _WriterStop:
+    """Queue sentinel: ``close()`` posts one so a writer thread blocked in
+    ``queue.get()`` wakes and exits (no idle-poll timeout needed — the loop
+    has no timing number of its own)."""
+
+
+_WRITER_STOP: Final = _WriterStop()
+
+_TapeRow = tuple[str, tuple[Any, ...]]
 
 
 class Store:
@@ -250,10 +280,15 @@ class Store:
         db: aiosqlite.Connection,
         clock: Clock,
         *,
-        ckpt_db: aiosqlite.Connection | None = None,
+        ckpt_db: sqlite3.Connection | None = None,
+        path: Path | None = None,
     ) -> None:
         self._db = db
         self._clock = clock
+        # The store FILE — the writer thread opens its own connection to it
+        # (``start_writer``). None only for legacy direct constructions
+        # (read-only diagnostics that never start the writer).
+        self._path = path
         # DEDICATED CHECKPOINT CONNECTION (2026-08-19 self-lock fix). WAL
         # checkpoints run here, NEVER on the shared connection: a read cursor
         # held open across an await on the SAME connection (maintenance tick /
@@ -265,17 +300,42 @@ class Store:
         # pages up to the read-mark. None only for legacy direct
         # constructions (read-only diagnostics that never start the writer);
         # ``Store.open`` always provides it.
+        # Since 2026-09-05 this is a STDLIB ``sqlite3`` connection (opened
+        # with ``check_same_thread=False``): the checkpoint runs on the writer
+        # THREAD, which has no event loop to await an aiosqlite connection on.
+        # Exactly one thread uses it at a time — the writer thread while the
+        # writer runs, otherwise the caller of ``_wal_checkpoint`` (tests).
         self._ckpt_db = ckpt_db
         # Optional background writer for NON-critical tape (rfqs, decisions,
         # deletions). OFF by default → writes are SYNCHRONOUS (tests + read-after-
-        # write stay correct, no leaked task). The app calls start_writer() so the
-        # hot RFQ path ENQUEUES instead of awaiting a commit — otherwise a WAL
+        # write stay correct, no leaked thread). The app calls start_writer() so
+        # the hot RFQ path ENQUEUES instead of awaiting a commit — otherwise a WAL
         # auto-checkpoint on the ~2GB DB runs INLINE on the awaited commit and
         # freezes the WHOLE event loop (34s+ intake stalls; 2026-07-14 audit).
         # Fills/markouts/settlement stay synchronous & durable. Bounded queue:
         # drop tape on overflow, never block the loop.
-        self._write_q: asyncio.Queue[tuple[str, tuple[Any, ...]]] | None = None
-        self._writer_task: asyncio.Task[None] | None = None
+        #
+        # A REAL THREAD, NOT AN ASYNCIO TASK (2026-09-05). The writer was an
+        # asyncio task issuing ONE ``await self._db.execute`` PER ROW on the
+        # shared aiosqlite connection — 1,000 loop hops per batch, each hop
+        # queued behind every other ready callback. Measured that night with
+        # the loop at p50 lag 67-134 ms / p99 0.4-1.0 s (``event_loop_lag``)
+        # and ~3,000 inbound frames/s (``ws_inbound_rate``, N=3 shards): the
+        # queue pinned at its 200k bound within 10 min of a FRESH 316 MB store
+        # and ``store_writer_stats`` reported ``dropped_writes_delta`` 126,492
+        # — the collapse was never store size, it was loop hops. And every hop
+        # COMPETED with quoting for the loop the whole time the queue was
+        # non-empty (always). Now: a thread-safe bounded ``queue.Queue`` fed
+        # by an O(1) ``put_nowait`` (no await, no hop), drained by a daemon
+        # thread with its OWN stdlib sqlite3 connection that commits each
+        # batch with ``executemany`` grouped by SQL text in ONE transaction —
+        # zero loop iterations per row. Logging from the thread is posted back
+        # to the loop (``_post_to_loop``) so every event still renders there.
+        self._write_q: queue.Queue[_TapeRow | _WriterStop] | None = None
+        self._writer_thread: threading.Thread | None = None
+        self._writer_db: sqlite3.Connection | None = None
+        self._writer_stop = threading.Event()
+        self._writer_loop_ref: asyncio.AbstractEventLoop | None = None
         self._dropped_writes = 0
         # Cumulative _dropped_writes as of the last ``store_writer_stats``
         # emit — the delta between emits is the alarm signal (2026-08-19:
@@ -415,10 +475,40 @@ class Store:
         # __init__). Only busy_timeout carries over: journal_mode=WAL is a
         # property of the DB FILE (already set above), and this connection
         # runs nothing but wal_checkpoint pragmas, so the writer-path pragmas
-        # (synchronous, wal_autocheckpoint) are irrelevant here.
-        ckpt_db = await aiosqlite.connect(path)
-        await ckpt_db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-        return cls(db, clock, ckpt_db=ckpt_db)
+        # (synchronous, wal_autocheckpoint) are irrelevant here. Stdlib
+        # sqlite3 (2026-09-05): the checkpoint runs on the writer THREAD.
+        # ``check_same_thread=False`` because it is opened here (so it exists
+        # for close ordering and direct checkpoint calls even when the writer
+        # never starts) and used from the writer thread; access is serialized
+        # by construction — one user at a time, see __init__.
+        ckpt_db = cls._open_checkpoint_connection(path)
+        return cls(db, clock, ckpt_db=ckpt_db, path=path)
+
+    @staticmethod
+    def _open_checkpoint_connection(path: Path) -> sqlite3.Connection:
+        ckpt_db = sqlite3.connect(path, timeout=STORE_OP_TIMEOUT_S, check_same_thread=False)
+        ckpt_db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        return ckpt_db
+
+    @staticmethod
+    def _open_writer_connection(path: Path) -> sqlite3.Connection:
+        """The tape writer thread's OWN connection (2026-09-05): the SAME
+        writer-path pragmas the main connection carries (``Store.open``) —
+        busy_timeout absorbs the brief lock a concurrent ledger commit or
+        checkpoint holds; synchronous=NORMAL fsyncs at checkpoint, not per
+        commit; wal_autocheckpoint=0 keeps the bounded MANUAL checkpoint the
+        only one (2026-07-14: an inline autocheckpoint on every commit that
+        crossed the threshold dropped ~96% of the tape). journal_mode=WAL is
+        a property of the FILE, already set by ``Store.open``. Opened on the
+        caller's thread so a failure is LOUD at boot (a thread dying on its
+        own connect would leave the queue filling silently — the 2026-08-19
+        lesson); ``check_same_thread=False`` hands it to the writer thread,
+        which is its only user from then on and closes it on exit."""
+        wdb = sqlite3.connect(path, timeout=STORE_OP_TIMEOUT_S, check_same_thread=False)
+        wdb.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        wdb.execute("PRAGMA synchronous=NORMAL")
+        wdb.execute("PRAGMA wal_autocheckpoint=0")
+        return wdb
 
     #: fills-ledger verification states (2026-09-04 build, item D).
     FILL_STATUS_BOOKED = "booked"
@@ -493,40 +583,120 @@ class Store:
 
     def start_writer(self) -> None:
         """Enable the off-hot-path background writer (the app calls this; tests
-        don't, so their tape writes stay synchronous & immediately readable)."""
-        if self._writer_task is not None:
+        don't, so their tape writes stay synchronous & immediately readable).
+
+        Since 2026-09-05 the writer is a daemon THREAD with its own sqlite3
+        connection (see __init__ for the measured defect). The connection is
+        opened HERE, on the caller's thread, so a failure raises into the
+        boot — loud — rather than dying inside the thread with the queue
+        filling silently. Requires the store path (``Store.open`` provides
+        it); a legacy direct construction has no path and cannot start it."""
+        if self._writer_thread is not None:
             return
-        self._write_q = asyncio.Queue(maxsize=200000)
-        self._writer_task = asyncio.create_task(
-            self._writer_loop(), name="store-writer"
+        if self._path is None:
+            raise RuntimeError(
+                "Store.start_writer needs the store path — construct via Store.open"
+            )
+        loop = asyncio.get_running_loop()
+        wdb = self._open_writer_connection(self._path)
+        q: queue.Queue[_TapeRow | _WriterStop] = queue.Queue(maxsize=WRITER_QUEUE_MAXSIZE)
+        self._writer_db = wdb
+        self._writer_loop_ref = loop
+        self._writer_stop = threading.Event()
+        self._write_q = q
+        thread = threading.Thread(
+            target=self._writer_thread_main,
+            args=(wdb, q),
+            name="store-writer",
+            daemon=True,
         )
+        self._writer_thread = thread
+        thread.start()
 
     async def close(self) -> None:
-        if self._writer_task is not None:
-            q = self._write_q
-            try:  # drain queued tape before shutdown (bounded)
-                if q is not None:
-                    await asyncio.wait_for(q.join(), timeout=2.0)
-            except TimeoutError:
-                pass
-            self._writer_task.cancel()
+        thread = self._writer_thread
+        q = self._write_q
+        if thread is not None and q is not None:
+            # Drain queued tape before shutdown — the EXISTING 2 s bound
+            # (WRITER_CLOSE_DRAIN_S). The bounded join waits on the queue's
+            # own condition in a worker thread so the loop is never blocked.
+            drained = await asyncio.to_thread(self._join_bounded, q, WRITER_CLOSE_DRAIN_S)
+            # Stop: flag first (a thread mid-batch with a FULL queue reads it
+            # after its commit), then the sentinel (a thread blocked in get()
+            # wakes on it). QueueFull means the flag path will stop it.
+            self._writer_stop.set()
             try:
-                await self._writer_task
-            except asyncio.CancelledError:
+                q.put_nowait(_WRITER_STOP)
+            except queue.Full:
                 pass
+            # Join bounded by the store's own statement of "how long an
+            # operation here may legitimately block" (STORE_OP_TIMEOUT_S =
+            # busy_timeout): the thread is at most one batch commit + one
+            # checkpoint attempt from exiting, and each of those is bounded
+            # by that same busy_timeout.
+            await asyncio.to_thread(thread.join, STORE_OP_TIMEOUT_S)
+            if thread.is_alive():
+                # Its connection stays open → the main connection's close-time
+                # WAL fold below will skip the truncate this once. Daemon
+                # thread: process exit still reaps it.
+                log.warning(
+                    "store_writer_thread_join_timeout",
+                    timeout_s=STORE_OP_TIMEOUT_S,
+                    queue_depth=q.qsize(),
+                )
+            elif not drained:
+                log.warning(
+                    "store_writer_close_drain_timeout",
+                    drain_s=WRITER_CLOSE_DRAIN_S,
+                    undrained_rows=q.qsize(),
+                )
+            self._writer_thread = None
         # Checkpoint connection FIRST: were it still open when the main
         # connection closed, the main close's implicit final WAL fold would
         # see a second live connection and skip the truncate. Closed first,
         # the main connection is the LAST one and its close-time checkpoint
-        # resets the WAL.
+        # resets the WAL. (The writer thread closed ITS connection on exit,
+        # before the join above returned — same reason.)
         if self._ckpt_db is not None:
-            await self._ckpt_db.close()
+            self._ckpt_db.close()
         await self._db.close()
+
+    async def flush_writer(self, wait_s: float) -> bool:
+        """Wait at most ``wait_s`` until every row enqueued so far has been
+        committed by the writer thread — and any checkpoint that batch made
+        due has been attempted (``task_done`` runs after the checkpoint).
+        Returns False when the bound elapsed first. True immediately when the
+        writer is not running (sync mode writes are already durable).
+        Off-loop wait: the queue's own condition, in a worker thread."""
+        q = self._write_q
+        if q is None:
+            return True
+        return await asyncio.to_thread(self._join_bounded, q, wait_s)
+
+    @staticmethod
+    def _join_bounded(q: queue.Queue[Any], timeout: float) -> bool:
+        """``queue.Queue.join()`` with a deadline (the stdlib join has none):
+        waits on the queue's ``all_tasks_done`` condition until
+        ``unfinished_tasks`` reaches 0 or ``timeout`` elapses."""
+        deadline = time.monotonic() + timeout
+        with q.all_tasks_done:
+            while q.unfinished_tasks:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                q.all_tasks_done.wait(remaining)
+        return True
 
     async def _write(self, sql: str, params: tuple[Any, ...]) -> None:
         """A NON-critical tape write. Async mode (writer running) → enqueue,
         NEVER blocks the hot path (drops on overflow). Sync mode (tests) → write
-        immediately so read-after-write is correct."""
+        immediately so read-after-write is correct.
+
+        HOT PATH IS O(1) AND NEVER YIELDS (2026-09-05): in async mode this
+        coroutine runs to completion without suspending — one thread-safe
+        ``put_nowait`` and nothing else — so the 3,000 tape rows/s of a
+        Saturday-night firehose cost the event loop zero iterations here.
+        (``async`` kept for its callers' sake.)"""
         q = self._write_q
         if q is None:
             await self._db.execute(sql, params)
@@ -534,12 +704,24 @@ class Store:
             return
         try:
             q.put_nowait((sql, params))
-        except asyncio.QueueFull:
+        except queue.Full:
             self._dropped_writes += 1
 
-    async def _writer_loop(self) -> None:
-        """Drain the tape queue and commit in BATCHES off the hot path — a WAL
-        checkpoint here stalls only THIS task, never the intake/worker loop.
+    def _writer_thread_main(
+        self, wdb: sqlite3.Connection, q: queue.Queue[_TapeRow | _WriterStop]
+    ) -> None:
+        """THE WRITER THREAD. Drain the tape queue and commit in BATCHES off
+        the event loop — a batch commit or a WAL checkpoint here stalls only
+        THIS thread, never the intake/worker loop, and no row costs the loop
+        an iteration (the old asyncio-task writer paid one loop hop per row
+        on the shared aiosqlite connection — see __init__).
+
+        BATCH = up to WRITER_BATCH_ROWS rows, committed ATOMICALLY as one
+        transaction: rows are grouped by SQL text (every tape table has
+        exactly one INSERT text; rows of one table keep their enqueue
+        order) and written with ``executemany``. A failing row fails its
+        WHOLE batch — rollback, loud ``store_writer_batch_failed`` — and the
+        next batch proceeds.
 
         CHECKPOINT RESILIENCE (2026-07-18): the manual checkpoint has its OWN
         failure path, no longer sharing the batch try/except — the live run's
@@ -552,59 +734,137 @@ class Store:
         while a long-lived cursor pins the lock), and (c) retries after
         ``_CHECKPOINT_RETRY_WRITES`` (~500) writes instead of the full cadence.
         Batch failures keep the existing loud ``store_writer_batch_failed``
-        path, which now ALWAYS means the tape writes themselves failed."""
-        assert self._write_q is not None
-        q = self._write_q
+        path, which ALWAYS means the tape writes themselves failed.
+
+        EXIT: the ``_WRITER_STOP`` sentinel (a thread blocked in ``get()``)
+        or the stop flag read after a batch (``close()`` could not enqueue
+        the sentinel into a full queue). Either way the current batch is
+        committed first and the thread closes its connection on the way out
+        (before ``close()`` closes the checkpoint + main connections — the
+        close-ordering rule). A thread that dies of anything else logs
+        ``store_writer_thread_died`` loudly; the hot path then fills the
+        queue and counts drops exactly as before."""
         writes_since_checkpoint = 0
         checkpoint_after = self._CHECKPOINT_EVERY_WRITES
-        while True:
-            first = await q.get()
-            batch = [first]
-            while len(batch) < 1000:
-                try:
-                    batch.append(q.get_nowait())
-                except asyncio.QueueEmpty:
+        try:
+            while True:
+                first = q.get()
+                if isinstance(first, _WriterStop):
+                    q.task_done()
                     break
-            try:
-                for sql, params in batch:
-                    await self._db.execute(sql, params)
-                await self._db.commit()
-            except Exception:
-                log.exception("store_writer_batch_failed", n=len(batch))
-            else:
-                # Bounded manual checkpoint OFF the hot path (autocheckpoint=0):
-                # a TRUNCATE every ~5000 writes keeps the WAL small without an
-                # inline checkpoint stalling every commit (which starved the
-                # writer and dropped 96% of the tape during bursts). It runs on
-                # the writer task, never the intake/worker loop, so a brief
-                # stall only delays tape, not quotes. Committed data is durable
-                # BEFORE the pragma — a checkpoint failure never loses tape.
-                writes_since_checkpoint += len(batch)
-                if writes_since_checkpoint >= checkpoint_after:
-                    writes_since_checkpoint = 0
-                    checkpoint_after = (
-                        self._CHECKPOINT_EVERY_WRITES
-                        if await self._wal_checkpoint()
-                        else self._CHECKPOINT_RETRY_WRITES
+                batch: list[_TapeRow] = [first]
+                stop_seen = False
+                while len(batch) < WRITER_BATCH_ROWS:
+                    try:
+                        item = q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if isinstance(item, _WriterStop):
+                        stop_seen = True
+                        break
+                    batch.append(item)
+                try:
+                    self._commit_batch(wdb, batch)
+                except Exception as exc:  # noqa: BLE001 - the batch's failure IS the event
+                    try:
+                        wdb.rollback()
+                    except Exception:  # noqa: BLE001 - rollback is best-effort
+                        pass
+                    self._post_to_loop(
+                        functools.partial(
+                            log.exception,
+                            "store_writer_batch_failed",
+                            n=len(batch),
+                            exc_info=exc,
+                        )
                     )
-                    # Dropped-tape visibility rides the checkpoint cadence
-                    # (2026-08-19): _dropped_writes had NO reader anywhere
-                    # while ~75-80% of a day's tape silently vanished.
-                    self._emit_writer_stats()
-            for _ in batch:
-                q.task_done()
+                else:
+                    # Bounded manual checkpoint OFF the hot path
+                    # (autocheckpoint=0): a TRUNCATE every ~5000 writes keeps
+                    # the WAL small without an inline checkpoint stalling
+                    # every commit (which starved the writer and dropped 96%
+                    # of the tape during bursts). It runs on the writer
+                    # thread, never the intake/worker loop, so a brief stall
+                    # only delays tape, not quotes. Committed data is durable
+                    # BEFORE the pragma — a checkpoint failure never loses
+                    # tape.
+                    writes_since_checkpoint += len(batch)
+                    if writes_since_checkpoint >= checkpoint_after:
+                        writes_since_checkpoint = 0
+                        checkpoint_after = (
+                            self._CHECKPOINT_EVERY_WRITES
+                            if self._wal_checkpoint()
+                            else self._CHECKPOINT_RETRY_WRITES
+                        )
+                        # Dropped-tape visibility rides the checkpoint cadence
+                        # (2026-08-19): _dropped_writes had NO reader anywhere
+                        # while ~75-80% of a day's tape silently vanished.
+                        # Emitted ON THE LOOP: the drop counter is the hot
+                        # path's, so the read and the write share a thread.
+                        self._post_to_loop(self._emit_writer_stats)
+                for _ in batch:
+                    q.task_done()
+                if stop_seen:
+                    q.task_done()  # the sentinel
+                    break
+                if self._writer_stop.is_set():
+                    break
+        except BaseException as exc:  # noqa: BLE001 - a dead writer must be LOUD
+            self._post_to_loop(
+                functools.partial(log.exception, "store_writer_thread_died", exc_info=exc)
+            )
+        finally:
+            try:
+                wdb.close()
+            except Exception:  # noqa: BLE001 - best-effort on the way out
+                pass
 
-    async def _wal_checkpoint(self) -> bool:
-        """ONE bounded manual checkpoint attempt (writer task only). Returns
-        True iff the TRUNCATE fully completed (the WAL was reset).
+    @staticmethod
+    def _commit_batch(wdb: sqlite3.Connection, batch: list[_TapeRow]) -> None:
+        """One batch = ONE transaction: rows grouped by SQL text (insertion
+        order of first appearance; within a text, enqueue order), each group
+        an ``executemany``, then a single commit. The connection's legacy
+        transaction control opens the transaction implicitly on the first
+        INSERT, so a failure anywhere leaves it open for the caller's
+        rollback — nothing of a failed batch is ever visible."""
+        groups: dict[str, list[tuple[Any, ...]]] = {}
+        for sql, params in batch:
+            groups.setdefault(sql, []).append(params)
+        for sql, rows in groups.items():
+            wdb.executemany(sql, rows)
+        wdb.commit()
+
+    def _post_to_loop(self, fn: Callable[[], Any]) -> None:
+        """Run ``fn`` (a log emit / the stats emit) ON THE EVENT LOOP from the
+        writer thread — logging stays where it always was, and the emit that
+        reads the hot path's drop counter shares the hot path's thread. With
+        no loop recorded (the writer never started: a direct checkpoint call)
+        or a loop already closed (a test's leaked store at teardown) the
+        function runs right here rather than being lost."""
+        loop = self._writer_loop_ref
+        if loop is None or loop.is_closed():
+            fn()
+            return
+        try:
+            loop.call_soon_threadsafe(fn)
+        except RuntimeError:  # closed between the check and the call
+            fn()
+
+    def _wal_checkpoint(self) -> bool:
+        """ONE bounded manual checkpoint attempt (writer thread only while the
+        writer runs). Returns True iff the TRUNCATE fully completed (the WAL
+        was reset). Synchronous stdlib sqlite3 since 2026-09-05 — it runs on
+        the writer thread, which has no loop to await on; its log events are
+        posted back to the loop (``_post_to_loop``).
 
         RUNS ON THE DEDICATED CHECKPOINT CONNECTION (2026-08-19 self-lock
         fix): on the SHARED connection, any read cursor open across an await
         made BOTH pragmas raise SQLITE_LOCKED, so the checkpoint could never
         run at all. Cross-connection, a live reader is a busy=1 verdict
         (handled below) and PASSIVE still folds pages up to the read-mark.
-        A legacy direct construction without a checkpoint connection falls
-        back to the shared one (it never starts the writer).
+        A legacy direct construction has no checkpoint connection: the
+        attempt takes the failure path (counted + logged) — it never starts
+        the writer, so this is diagnostics-only.
 
         A raised error ('database table is locked') AND a busy verdict (the
         pragma's first result column — TRUNCATE that could not finish reports
@@ -614,37 +874,46 @@ class Store:
         PASSIVE checkpoint before giving up the cycle. PASSIVE copies what it
         can without blocking readers, so the WAL keeps getting folded even
         while the TRUNCATE lock is starved by a long-lived cursor."""
-        db = self._ckpt_db if self._ckpt_db is not None else self._db
+        db = self._ckpt_db
         failure: str
-        try:
-            cursor = await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            row = await cursor.fetchone()
-            await cursor.close()
-            if row is None or not row[0]:
-                log.info(
-                    "store_writer_checkpoint_ok",
-                    wal_frames=None if row is None else row[1],
-                    checkpointed=None if row is None else row[2],
-                )
-                return True
-            failure = f"busy (wal_frames={row[1]}, checkpointed={row[2]})"
-        except Exception as exc:  # noqa: BLE001 - the pragma's failure IS the signal
-            failure = repr(exc)
+        if db is None:
+            failure = "no checkpoint connection (legacy direct construction)"
+        else:
+            try:
+                cursor = db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                row = cursor.fetchone()
+                cursor.close()
+                if row is None or not row[0]:
+                    self._post_to_loop(
+                        functools.partial(
+                            log.info,
+                            "store_writer_checkpoint_ok",
+                            wal_frames=None if row is None else row[1],
+                            checkpointed=None if row is None else row[2],
+                        )
+                    )
+                    return True
+                failure = f"busy (wal_frames={row[1]}, checkpointed={row[2]})"
+            except Exception as exc:  # noqa: BLE001 - the pragma's failure IS the signal
+                failure = repr(exc)
         self.checkpoint_failures += 1
         passive_ok = False
-        try:
-            passive_cursor = await db.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            await passive_cursor.close()
-            passive_ok = True
-            self.checkpoint_passive_fallbacks += 1
-        except Exception:  # noqa: BLE001 - fallback is best-effort
-            passive_ok = False
-        log.warning(
-            "store_writer_checkpoint_failed",
-            error=failure,
-            passive_fallback_ok=passive_ok,
-            checkpoint_failures=self.checkpoint_failures,
-            retry_after_writes=self._CHECKPOINT_RETRY_WRITES,
+        if db is not None:
+            try:
+                db.execute("PRAGMA wal_checkpoint(PASSIVE)").close()
+                passive_ok = True
+                self.checkpoint_passive_fallbacks += 1
+            except Exception:  # noqa: BLE001 - fallback is best-effort
+                passive_ok = False
+        self._post_to_loop(
+            functools.partial(
+                log.warning,
+                "store_writer_checkpoint_failed",
+                error=failure,
+                passive_fallback_ok=passive_ok,
+                checkpoint_failures=self.checkpoint_failures,
+                retry_after_writes=self._CHECKPOINT_RETRY_WRITES,
+            )
         )
         return False
 
@@ -661,7 +930,8 @@ class Store:
         the live queue depth. WARNING whenever tape was dropped since the
         last emit — drop-on-overflow is the DESIGNED hot-path behaviour, but
         it must never again be invisible (~75-80% of a day's tape rows gone
-        with nothing reading the counter)."""
+        with nothing reading the counter). Runs on the event loop (posted
+        there by the writer thread) — the counter it reads is the hot path's."""
         dropped = self._dropped_writes
         delta = dropped - self._dropped_writes_reported
         self._dropped_writes_reported = dropped
