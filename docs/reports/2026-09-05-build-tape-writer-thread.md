@@ -1,7 +1,7 @@
 # 2026-09-05 — BUILD: tape writer OFF the event loop (a thread with its own connection)
 
 Branch `build/tape-writer-thread` — build commit `467ffea`, **review-fix commit `b24c0db`**, **review-fix #2
-commit FIXPASS2_SHA (merged with main `cf2b281`)** (worktree
+commit `abd451a` (merged with main `cf2b281`)** (worktree
 `C:/Users/aahys/kct-writer`; bot LIVE on main `08f342e` throughout — store read-only, logs grep/tail only, every heavy
 job at LOW priority, no process touched).
 **Blast radius: `ops/persistence.py` only** (the tape writer + the shared connection's statement discipline + its
@@ -183,7 +183,7 @@ armed; the live bot ran main `08f342e` throughout.
 - *"PASSIVE on the cadence, TRUNCATE only when PASSIVE reports wal_frames == checkpointed"*: measured false as a gate — a fully-folded WAL under a head reader still yields a busy TRUNCATE (`(1, 1, 1)`), so the gate would only skip the attempt; the stall is removed by `busy_timeout=0` on the checkpoint connection, PASSIVE-first kept for the fold.
 - The review's evidence bullet *"the saturated-loop burner … is a fair stand-in for the measured p50 lag"* was not: a sleeping burner releases the GIL. The bench now computes.
 
-## Review fixes #2 (2026-09-06, commit FIXPASS2_SHA — on the tree merged with main `cf2b281`)
+## Review fixes #2 (2026-09-06, commit `abd451a` — on the tree merged with main `cf2b281`)
 
 The SECOND adversarial review (on `b24c0db`) returned **2 must-fixes + 5 should-fixes**. Every one is applied. The
 must-fix is the class of defect the first fix pass's docstring explicitly declined to handle ("cancellation is NOT
