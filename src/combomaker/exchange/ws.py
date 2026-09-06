@@ -33,6 +33,7 @@ import aiohttp
 
 from combomaker.core.clock import Clock
 from combomaker.exchange.auth import RequestSigner
+from combomaker.exchange.ws_prefilter import RawSeriesPrefilter, Verdict, raw_created_ts
 from combomaker.ops.logging import get_logger
 from combomaker.ops.metrics import Metrics
 
@@ -65,6 +66,11 @@ SubscribeErrorHandler = Callable[[int, str], Awaitable[None]]  # (code, text) of
 # Reader-thread frame observer: ``(message, recv_mono_ns, handling_ns)`` —
 # called AFTER the lane push, on the reader thread; must never log or block.
 FrameObserver = Callable[[JsonDict, int, int], None]
+# Reader-thread observer for a frame the RAW PRE-FILTER dropped before the
+# parse: ``(msg_type, created_ts_or_None, recv_mono_ns, handling_ns)``. The
+# frame was read (it counts toward inbound rate and the reader's service
+# time) but never parsed, queued or dispatched. Same rules: never log/block.
+PrefilteredObserver = Callable[[str, str | None, int, int], None]
 
 # Transport seam: ``(session, url, headers) -> async context manager yielding
 # a socket``. Production binds aiohttp's ``ws_connect``; the replay harness and
@@ -319,6 +325,7 @@ class WsManager:
         shard_tag: int | None = None,
         shard_gen: int = 0,
         on_frame: FrameObserver | None = None,
+        on_prefiltered: PrefilteredObserver | None = None,
     ) -> None:
         """Every keyword after ``connect`` defaults to the single-socket manager
         this class has always been. They exist for COMMUNICATIONS FAN-OUT
@@ -338,6 +345,8 @@ class WsManager:
           the command id and purge a dead socket's market frames without
           touching its siblings'. ``_gen`` retires frames of a replaced set.
         * ``on_frame`` — reader-thread observer (rate / pipe-lag meter).
+        * ``on_prefiltered`` — reader-thread observer for frames the raw
+          pre-filter (``set_raw_prefilter``) dropped before the parse.
         """
         self._url = url
         self._signer = signer
@@ -354,6 +363,11 @@ class WsManager:
         self._shard_tag = shard_tag
         self._shard_gen = shard_gen
         self._on_frame = on_frame
+        self._on_prefiltered = on_prefiltered
+        # RAW PRE-FILTER (2026-09-05, ``exchange/ws_prefilter.py``): judged on
+        # the raw text BEFORE ``json.loads``; None = every frame is parsed
+        # (today's path, byte-identical). Registered via ``set_raw_prefilter``.
+        self._raw_prefilter: RawSeriesPrefilter | None = None
         # Shed metrics are a property of the LANE SET, so a follower counts
         # them under its lanes' owner's name (identical to ``name`` when the
         # manager owns its lanes — today's metric names, byte for byte).
@@ -506,6 +520,19 @@ class WsManager:
             else:
                 self._stale_after_ns[msg_type] = int(stale_after_s * 1e9)
 
+    def set_raw_prefilter(self, prefilter: RawSeriesPrefilter | None) -> None:
+        """Install (or clear) the READER-SIDE RAW PRE-FILTER: frames whose raw
+        text identifies as ``prefilter.msg_type`` and carry NO allowlisted
+        leg series are counted and discarded BEFORE ``json.loads`` — never
+        parsed, queued or dispatched (derivation + the decision-neutrality
+        proof in ``exchange/ws_prefilter.py``). Every other frame, and every
+        frame whose type cannot be read from the raw text, takes today's path
+        unchanged. Register before ``start()``; the target type must be a
+        ``mark_sheddable`` MARKET-DATA type (checked at ``start()``): the
+        pre-filter is a cheaper form of the shed the lane already applies to
+        that class, and must never touch a never-drop lane."""
+        self._raw_prefilter = prefilter
+
     def on_disconnect(self, handler: LifecycleHandler) -> None:
         self._on_disconnect.append(handler)
 
@@ -587,6 +614,16 @@ class WsManager:
     def start(self) -> None:
         if self._reader is not None or self._dispatch_task is not None or self._started:
             raise RuntimeError("already started")
+        prefilter = self._raw_prefilter
+        if prefilter is not None and (
+            prefilter.msg_type not in self._sheddable_types
+            or prefilter.msg_type in self._priority_types
+        ):
+            raise ValueError(
+                f"raw pre-filter targets {prefilter.msg_type!r}, which is not a "
+                "mark_sheddable market-data type — a pre-filter may only remove work "
+                "from the shed class, never touch a never-drop lane"
+            )
         self._started = True
         self._stopping = False
         self._main_loop = asyncio.get_running_loop()
@@ -798,14 +835,48 @@ class WsManager:
         # promptly (autoping replies during receive()); awaiting slow handlers
         # inline starved the Pongs and got us server-closed every ~90-150s.
         # Runs on the socket loop: a main-loop stall cannot reach this loop.
+        prefilter = self._raw_prefilter  # registered before start(); read once
+        owner = self._lane_owner_name
         async for frame in ws:
-            self._last_rx_mono_ns = self._clock.monotonic_ns()
+            recv_ns = self._clock.monotonic_ns()
+            self._last_rx_mono_ns = recv_ns
             self._frames_read += 1
             if frame.type == aiohttp.WSMsgType.TEXT:
+                raw = frame.data
+                if prefilter is not None:
+                    # RAW PRE-FILTER (2026-09-05, exchange/ws_prefilter.py):
+                    # judged on the text BEFORE the parse. A DROP is an
+                    # ``rfq_created`` with no allowlisted leg series — the
+                    # intake would discard it after the parse, the lane round
+                    # trip and the dispatch (proof in the module doc), so it
+                    # ends here: counted (the counts fold into ``Metrics`` on
+                    # the dispatcher's next pass or at stop — a pre-filtered
+                    # frame never wakes the main loop; the per-window numbers
+                    # in ``ws_inbound_rate`` come from the meter and are
+                    # exact), fed to the rate/lag meter (it WAS read — inbound
+                    # fps and the reader's service time include it), never
+                    # parsed, never queued. PASS / OTHER / FAIL_OPEN all take
+                    # the unchanged path below; priority and control frames
+                    # are OTHER by type before any ticker test runs.
+                    judgement = prefilter.judge(raw)
+                    if judgement is Verdict.DROP:
+                        self._lanes.count(f"{owner}.prefiltered")
+                        self._lanes.count(f"{owner}.prefiltered.{prefilter.msg_type}")
+                        done_ns = self._clock.monotonic_ns()
+                        self._busy_ns += done_ns - recv_ns
+                        if self._on_prefiltered is not None:
+                            self._on_prefiltered(
+                                prefilter.msg_type, raw_created_ts(raw), recv_ns, done_ns - recv_ns
+                            )
+                        continue
+                    if judgement is Verdict.PASS:
+                        self._lanes.count(f"{owner}.prefilter_passed")
+                    elif judgement is Verdict.FAIL_OPEN:
+                        self._lanes.count(f"{owner}.prefilter_fail_open")
                 try:
-                    message: JsonDict = json.loads(frame.data)
+                    message: JsonDict = json.loads(raw)
                 except ValueError:
-                    log.warning("ws_bad_json", name=self._name, data=frame.data[:200])
+                    log.warning("ws_bad_json", name=self._name, data=raw[:200])
                     continue
                 # WIRE-RECEIVE STAMP — every frame (2026-08-01, was
                 # priority-only since 2026-07-31). The exchange's clock starts
@@ -816,8 +887,7 @@ class WsManager:
                 # confirm budget; market frames feed the dispatcher's stale
                 # drop and the intake's pre-parse staleness gate. The stamp
                 # rides the envelope (server fields never start with "_") and
-                # reuses the monotonic read taken two lines up.
-                recv_ns = self._last_rx_mono_ns
+                # reuses the monotonic read taken at the top of the loop.
                 message["_recv_mono_ns"] = recv_ns
                 if self._shard_tag is not None:
                     # FAN-OUT stamps (2026-09-05): the socket that carried the
