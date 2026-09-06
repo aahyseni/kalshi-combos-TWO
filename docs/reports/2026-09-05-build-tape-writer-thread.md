@@ -1,6 +1,6 @@
 # 2026-09-05 — BUILD: tape writer OFF the event loop (a thread with its own connection)
 
-Branch `build/tape-writer-thread` — build commit `{{COMMIT}}` (worktree `C:/Users/aahys/kct-writer`; bot LIVE on main
+Branch `build/tape-writer-thread` — build commit `467ffea` (worktree `C:/Users/aahys/kct-writer`; bot LIVE on main
 `08f342e` throughout — store read-only, logs grep/tail only, every heavy job at LOW priority, no process touched).
 **Blast radius: the persistence TAPE path only** (`ops/persistence.py` writer + its tests + one bench tool). Pricing,
 risk, quote construction, the synchronous ledger paths (fills / position_ledger / markouts / settlement / ev_ledger),
