@@ -530,7 +530,19 @@ class WsManager:
         unchanged. Register before ``start()``; the target type must be a
         ``mark_sheddable`` MARKET-DATA type (checked at ``start()``): the
         pre-filter is a cheaper form of the shed the lane already applies to
-        that class, and must never touch a never-drop lane."""
+        that class, and must never touch a never-drop lane.
+
+        Refused after ``start()`` (review fix 2026-09-05): the reader binds
+        the pre-filter ONCE per connection (``_read_loop`` entry) and the
+        never-drop validation runs only in ``start()``, so a late install
+        would silently no-op until the next reconnect and then run
+        unvalidated. Loud beats latent."""
+        if self._started:
+            raise RuntimeError(
+                f"{self._name}: set_raw_prefilter after start() — the reader binds the "
+                "pre-filter once per connection and start() validates its target; "
+                "install it before start()"
+            )
         self._raw_prefilter = prefilter
 
     def on_disconnect(self, handler: LifecycleHandler) -> None:

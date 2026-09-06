@@ -34,10 +34,13 @@ On the READER THREAD, before ``json.loads`` (``exchange/ws.py`` ``_read_loop``
 happens and the frame never enters the lanes), the raw frame text is judged:
 
   * the envelope's ``type`` is read from the raw text (``raw_frame_type``):
-    the ``"type"`` key must occur BEFORE the first nested ``{`` (so it is the
-    envelope's own key, never one inside ``msg``) and be followed by ``:`` and
-    a quoted string. Anything else is UNIDENTIFIABLE → the frame passes to the
-    full parser untouched (fail-open).
+    the ``"type"`` key must be one of the ENVELOPE's own keys — before the
+    first nested container or after the last one closes (so never a key
+    inside ``msg``), whatever the serializer's key order (type-first,
+    sid-first, msg-first: review fix 2026-09-05 — the wire's order is
+    unverifiable from this box) — and be followed by ``:`` and a quoted
+    string. Anything else is UNIDENTIFIABLE → the frame passes to the full
+    parser untouched (fail-open).
   * a frame identified as the target type (``rfq_created``) is DROPPED iff NO
     ``"market_ticker"`` string value anywhere in the raw text starts with an
     allowlisted series prefix — the SAME tuple the intake filters on, passed
@@ -163,39 +166,78 @@ def _quoted_value_after(raw: str, pos: int) -> str | None:
     return raw[j + 1 : k]
 
 
+def _type_key_value_in(raw: str, start: int, end: int) -> str | None:
+    """The string value of a ``"type"`` KEY whose occurrence starts in
+    ``raw[start:end]`` — an occurrence that is a VALUE (``"sid": "type"``)
+    is followed by ``,`` / ``}`` and skipped; a key with a non-string value
+    is skipped too."""
+    pos = raw.find(TYPE_KEY, start, end)
+    while pos >= 0:
+        value = _quoted_value_after(raw, pos + len(TYPE_KEY))
+        if value is not None:
+            return value
+        pos = raw.find(TYPE_KEY, pos + len(TYPE_KEY), end)
+    return None
+
+
 def raw_frame_type(raw: str) -> str | None:
     """The envelope's ``type`` value read from the raw text, or None when it
     cannot be identified (the caller must then treat the frame as unknown
     and hand it to the full parser).
 
-    Sound for backslash-free text: the ``"type"`` key must appear BEFORE the
-    first nested ``{`` — i.e. among the envelope's own keys, whatever their
-    order (the documented envelope is ``{"type", "sid", "msg"}``,
-    asyncapi-ws.md §3, communications-ws.md:131) — and be followed by ``:``
-    and a quoted string. An occurrence that is a VALUE (``"sid": "type"``)
-    is followed by ``,`` or ``}`` and is skipped; an occurrence inside
-    ``msg`` is past the nested brace and is never consulted."""
+    Sound for backslash-free text (a quote then always delimits a string, so
+    ``"type"`` in the text is always a whole string token). The key is read
+    from either of the two regions that hold ONLY the envelope's own keys:
+
+      * BEFORE the first nested container opens (``{`` — type-first and
+        sid-first layouts, the docs' examples: asyncapi-ws.md §3,
+        communications-ws.md:131), or
+      * AFTER the last nested container closes (the last ``}`` / ``]``
+        before the envelope's own closing brace — msg-first layouts, review
+        fix 2026-09-05: the wire's key order is unverifiable from this box,
+        so the identifier must not depend on it).
+
+    Every key order of the documented envelope (``type``, ``sid``, ``seq``,
+    ``id`` scalars + the ONE nested ``msg`` object) falls in one of the two.
+    A brace inside a string value can only SHRINK a region (a ``}`` in a
+    ``msg`` string moves the tail's start later; one in a tail string ends
+    the region there), never grow it — so a misread is impossible and the
+    only failure mode is fail-open. A ``"type"`` key lying BETWEEN two nested
+    containers (a shape the envelope never has) is not read → fail-open.
+    Measured on the real corpus (msg-first, 902 B median): 0.85 µs vs
+    ``json.loads`` 4.2 µs; the full quote-aware depth walk that would also
+    read the between-containers shape costs 8.6 µs — MORE than the parse it
+    exists to save — and was rejected for that reason."""
     if not raw.startswith("{"):
         return None
     nested = raw.find("{", 1)
-    limit = len(raw) if nested < 0 else nested
-    pos = raw.find(TYPE_KEY, 1, limit)
-    while pos >= 0:
-        value = _quoted_value_after(raw, pos + len(TYPE_KEY))
-        if value is not None:
-            return value
-        pos = raw.find(TYPE_KEY, pos + len(TYPE_KEY), limit)
-    return None
+    if nested < 0:
+        return _type_key_value_in(raw, 1, len(raw))
+    value = _type_key_value_in(raw, 1, nested)
+    if value is not None:
+        return value
+    end = len(raw.rstrip(_WHITESPACE)) - 1
+    if end <= nested or raw[end] != "}":
+        return None
+    last_close = max(raw.rfind("}", nested, end), raw.rfind("]", nested, end))
+    if last_close < 0:
+        return None  # a container opened and never closed: not JSON
+    return _type_key_value_in(raw, last_close + 1, end)
 
 
 def raw_created_ts(raw: str) -> str | None:
-    """The first ``"created_ts"`` string value in the raw text (an
+    """The first ``"created_ts"`` KEY's string value in the raw text (an
     ``rfq_created`` carries exactly one, on ``msg``; legs carry none) — so a
-    frame dropped before parsing still feeds the pipe-lag meter."""
+    frame dropped before parsing still feeds the pipe-lag meter. An
+    occurrence that is a VALUE, or a key with a non-string value, is skipped
+    for the next (parity with ``raw_frame_type``; review fix 2026-09-05)."""
     pos = raw.find(CREATED_TS_KEY)
-    if pos < 0:
-        return None
-    return _quoted_value_after(raw, pos + len(CREATED_TS_KEY))
+    while pos >= 0:
+        value = _quoted_value_after(raw, pos + len(CREATED_TS_KEY))
+        if value is not None:
+            return value
+        pos = raw.find(CREATED_TS_KEY, pos + len(CREATED_TS_KEY))
+    return None
 
 
 class RawSeriesPrefilter:

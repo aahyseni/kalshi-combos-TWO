@@ -1646,6 +1646,15 @@ class FanoutGovernor:
 
     async def tick(self, *, reason: str) -> ShardFactorDerivation | None:
         try:
+            # Fold the readers' pending Metrics counts (pre-filter, shed) on
+            # this cadence too (review fix 2026-09-05): a pre-filtered frame
+            # never wakes the dispatcher, so on a quiet dispatcher the
+            # ``<name>.prefiltered*`` counters lagged the exact meter by a
+            # whole idle period. Same main-loop fold the dispatcher runs
+            # (``WsManager._flush_reader_metrics``: this task IS main-loop
+            # work, so the hang-watchdog's log axis stays honest); the window
+            # telemetry below is the meter's own and never needed it.
+            self._fanout._flush_reader_metrics()
             if reason != "boot":
                 self._observe_windows(self._fanout.take_windows(self._clock.monotonic_ns()))
             pooled = await self._refresh_tape()

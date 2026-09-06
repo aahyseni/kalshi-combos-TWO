@@ -2277,7 +2277,9 @@ class QuoteApp:
             # only the work to reach it moves. An EMPTY allowlist installs no
             # pre-filter: the intake then drops every RFQ itself (startswith
             # of an empty tuple is always False) and there is nothing to save.
-            ws.set_raw_prefilter(RawSeriesPrefilter(series_prefixes))
+            # Fail-open at install (``_install_raw_prefilter``): a refused
+            # allowlist entry logs and runs today's path — never a boot death.
+            self._install_raw_prefilter(ws, series_prefixes)
         intake = RfqIntake(
             ws,
             self._metrics,
@@ -4939,6 +4941,37 @@ class QuoteApp:
             # refresh alike): the meters were reset inside the tick, so the
             # cadence and the measurement windows share one origin.
             self._fanout_cadence.stamp()
+
+    def _install_raw_prefilter(self, ws: WsManager, series_prefixes: tuple[str, ...]) -> bool:
+        """Install the reader-side raw pre-filter on the comms transport, or
+        run WITHOUT it — never die (review fix 2026-09-05).
+
+        ``RawSeriesPrefilter`` refuses an allowlist entry JSON could escape
+        (empty, non-ASCII, non-printable, a quote or a backslash) because
+        its raw-text ``startswith`` could then disagree with the intake's
+        DECODED ``startswith``; the intake (``rfq/intake.py``) and the config
+        (``ops/config.py`` checks only for a non-empty list) accept every
+        such entry. A refusal is therefore a CONFIG SHAPE the bot already
+        quotes on, and it must never brick the boot: an exception here would
+        die inside ``_run_instrumented`` before the transport starts and the
+        watchdog would relight into the same death forever (the fail-closed-
+        boot class the 2026-07-23 MLB bootstrap taught). So: log it, count it
+        (``ws.prefilter_not_installed``), and run today's path — the intake
+        filters exactly as before; only the saving is lost. Returns True when
+        the pre-filter is installed."""
+        try:
+            prefilter = RawSeriesPrefilter(series_prefixes)
+        except ValueError as exc:
+            self._metrics.inc("ws.prefilter_not_installed")
+            log.warning(
+                "ws_prefilter_not_installed",
+                reason=str(exc),
+                prefixes=len(series_prefixes),
+                effect="transport runs without the raw pre-filter; intake filtering unchanged",
+            )
+            return False
+        ws.set_raw_prefilter(prefilter)
+        return True
 
     def _stall_wall_floor_s(self) -> float:
         """TODAY's derived maintenance-loop bound — the stall wall's FLOOR

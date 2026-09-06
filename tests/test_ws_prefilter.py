@@ -125,14 +125,28 @@ def _foreign_variant(msg: JsonDict, rng: random.Random, *, legs_to_swap: int | N
     return out
 
 
+def _msg_first(payload: dict[str, Any]) -> dict[str, Any]:
+    """The same envelope with ``type`` serialized LAST — after ``msg`` (the
+    wire's key order is unverifiable from this box; review fix 2026-09-05)."""
+    reordered = {k: v for k, v in payload.items() if k != "type"}
+    reordered["type"] = payload["type"]
+    return reordered
+
+
 def _layouts(env: JsonDict) -> list[str]:
     """The same envelope in every serialization the identifier must handle:
-    compact, spaced, pretty-printed, sid-first (type still before msg)."""
+    compact, spaced, pretty-printed, sid-first (type before msg), msg-first
+    (type AFTER msg) spaced and compact."""
     compact = json.dumps(env, separators=(",", ":"))
     spaced = json.dumps(env)
     pretty = json.dumps(env, indent=2)
     sid_first = json.dumps({"sid": env["sid"], "type": env["type"], "msg": env["msg"]})
-    return [compact, spaced, pretty, sid_first]
+    msg_first = json.dumps(_msg_first(env))
+    msg_first_compact = json.dumps(_msg_first(env), separators=(",", ":"))
+    return [compact, spaced, pretty, sid_first, msg_first, msg_first_compact]
+
+
+N_LAYOUTS = len(_layouts(_envelope({"id": "probe"})))
 
 
 async def _intake_reached(
@@ -235,20 +249,49 @@ def test_raw_frame_type_reads_the_envelope_type_in_every_layout() -> None:
     for kind, payload in DOCS_FRAMES.items():
         assert raw_frame_type(_raw(payload)) == kind
         assert raw_frame_type(json.dumps(payload, separators=(",", ":"))) == kind
+        # msg-first serializations of the same documented frames.
+        assert raw_frame_type(_raw(_msg_first(payload))) == kind
+        assert raw_frame_type(json.dumps(_msg_first(payload), separators=(",", ":"))) == kind
+        assert raw_frame_type(json.dumps(_msg_first(payload), indent=2)) == kind
 
 
-def test_raw_frame_type_fails_open_when_the_type_is_not_structurally_certain() -> None:
-    # msg BEFORE type: the key sits past the first nested brace → unknown.
-    assert raw_frame_type('{"sid": 1, "msg": {"id": "x"}, "type": "rfq_created"}') is None
-    # "type" as a VALUE is skipped, the real key after it is read.
+def test_raw_frame_type_reads_msg_first_and_fails_open_only_when_uncertain() -> None:
+    # msg BEFORE type (review fix 2026-09-05): the key sits AFTER the last
+    # nested container closes — the envelope's own region — and is read.
+    assert raw_frame_type('{"sid": 1, "msg": {"id": "x"}, "type": "rfq_created"}') == "rfq_created"
+    assert raw_frame_type('{"sid":1,"msg":{"id":"x"},"type":"rfq_created"}') == "rfq_created"
+    assert raw_frame_type('{"sid": 1, "msg": {"id": "x"}, "type": "rfq_created", "seq": 7}') == (
+        "rfq_created"
+    )
+    # A nested object's own "type" key is never consulted: the envelope's wins.
+    assert raw_frame_type('{"msg": {"type": "rfq_created"}, "type": "error"}') == "error"
+    assert raw_frame_type('{"type": "error", "msg": {"type": "rfq_created"}}') == "error"
+    # Braces inside msg strings can only SHRINK the tail region, never let a
+    # nested key through.
+    brace_in_msg = '{"sid": 1, "msg": {"note": "}", "type": "rfq_created"}, "type": "error"}'
+    assert raw_frame_type(brace_in_msg) == "error"
+    close_in_msg = '{"sid": 1, "msg": {"type": "rfq_created", "n": "]}"}, "type": "error"}'
+    assert raw_frame_type(close_in_msg) == "error"
+    # A brace inside a TAIL string ends the region early → fail-open, never a misread.
+    assert raw_frame_type('{"sid": 1, "msg": {"a": 1}, "type": "error", "note": "}"}') is None
+    # "type" as a VALUE is skipped (before or after msg), the real key is read.
     assert raw_frame_type('{"sid": "type", "type": "rfq_created", "msg": {}}') == "rfq_created"
-    # No type key at all; a non-object; truncated text.
+    assert raw_frame_type('{"sid": 1, "msg": {}, "note": "type", "type": "rfq_created"}') == (
+        "rfq_created"
+    )
+    # Arrays are containers too (the tail starts after the LAST close of either kind).
+    assert raw_frame_type('{"a": [{"type": "rfq_created"}], "type": "error"}') == "error"
+    assert raw_frame_type('{"a": ["type", 5], "type": "error"}') == "error"
+    # No envelope type key at all; a non-object; truncated / unclosed text.
     assert raw_frame_type('{"sid": 1, "msg": {"type": "rfq_created"}}') is None
     assert raw_frame_type('["type", "rfq_created"]') is None
     assert raw_frame_type('{"type": "rfq_cre') is None
+    assert raw_frame_type('{"sid": 1, "msg": {"id": "x", "type": "rfq_created"') is None
     assert raw_frame_type("") is None
-    # A nested object's own "type" key is never consulted.
-    assert raw_frame_type('{"msg": {"type": "rfq_created"}, "type": "error"}') is None
+    # A type key BETWEEN two nested containers (a shape the envelope never
+    # has) is not read: fail-open, by design — the full depth walk that would
+    # read it costs more than the parse it exists to save (module doc).
+    assert raw_frame_type('{"a": {"x": 1}, "type": "error", "b": {"type": "rfq_created"}}') is None
 
 
 def test_raw_created_ts_reads_the_first_created_ts() -> None:
@@ -257,6 +300,12 @@ def test_raw_created_ts_reads_the_first_created_ts() -> None:
     for raw in _layouts(env):
         assert raw_created_ts(raw) == stamp
     assert raw_created_ts(_raw(DOCS_FRAMES["rfq_deleted"])) is None
+    # The first occurrence is a VALUE (an id that reads "created_ts"): skipped
+    # for the key that follows (review fix 2026-09-05).
+    value_first = _raw(_envelope({"id": "created_ts", "market_ticker": "KXX", "created_ts": stamp}))
+    assert value_first.index('"created_ts"') < value_first.index('"created_ts": "')
+    assert raw_created_ts(value_first) == stamp
+    assert raw_created_ts(_raw(_envelope({"id": "created_ts"}))) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -278,9 +327,12 @@ async def test_prefilter_drop_set_is_a_subset_of_the_intakes_drop_set_on_real_fr
         for raw in _layouts(_envelope(msg)):
             frames.append(raw)
             classes[rec["era"]] += 1
-        # Every leg foreign (the firehose's dominant shape): must DROP.
-        frames.append(json.dumps(_envelope(_foreign_variant(msg, rng, legs_to_swap=None))))
-        classes["foreign"] += 1
+        # Every leg foreign (the firehose's dominant shape): must DROP — in
+        # the type-first AND the msg-first serialization (review fix).
+        foreign = _envelope(_foreign_variant(msg, rng, legs_to_swap=None))
+        frames.append(json.dumps(foreign))
+        frames.append(json.dumps(_msg_first(foreign)))
+        classes["foreign"] += 2
         # ONE leg foreign, the rest allowlisted: PASSES here, intake drops it.
         legs = msg.get("mve_selected_legs") or []
         if len(legs) >= 2:
@@ -295,8 +347,8 @@ async def test_prefilter_drop_set_is_a_subset_of_the_intakes_drop_set_on_real_fr
 
     verdicts = collections.Counter(prefilter.judge(raw) for raw in frames)
     assert verdicts[Verdict.OTHER] == 0  # every frame is an rfq_created
-    assert verdicts[Verdict.DROP] >= classes["foreign"] + 4 * 200  # foreign + July frames
-    assert verdicts[Verdict.PASS] >= 4 * 400  # today's allowlisted frames, every layout
+    assert verdicts[Verdict.DROP] >= classes["foreign"] + N_LAYOUTS * 200  # foreign + July
+    assert verdicts[Verdict.PASS] >= N_LAYOUTS * 400  # today's allowlisted frames, every layout
     assert verdicts[Verdict.FAIL_OPEN] >= 1  # the escaped frame
 
     with_filter, _, dropped = await _intake_reached(frames, prefilter=prefilter)
@@ -305,7 +357,7 @@ async def test_prefilter_drop_set_is_a_subset_of_the_intakes_drop_set_on_real_fr
     assert dropped == verdicts[Verdict.DROP] > 0
     # The intake fanned out exactly today's allowlisted frames (each layout is
     # a separate delivery; the registry dedupes nothing at this layer).
-    assert len(without_filter) == 4 * 400
+    assert len(without_filter) == N_LAYOUTS * 400
 
     # And every frame the pre-filter dropped satisfies the INTAKE's own drop
     # rule (proof step 3 → the intake's ``any(not startswith)``), and a
@@ -336,6 +388,7 @@ def test_prefilter_never_drops_priority_or_control_frames() -> None:
     for payload in DOCS_FRAMES.values():
         assert prefilter.judge(_raw(payload)) is Verdict.OTHER, payload
         assert prefilter.judge(json.dumps(payload, separators=(",", ":"))) is Verdict.OTHER
+        assert prefilter.judge(_raw(_msg_first(payload))) is Verdict.OTHER, payload
     # An error whose free text mentions an rfq_created envelope — escaped
     # quotes ⇒ fail-open, and even unescaped it is inside msg ⇒ OTHER.
     hostile = _raw(
@@ -352,12 +405,19 @@ def test_prefilter_never_drops_priority_or_control_frames() -> None:
     assert prefilter.judge(hostile2) is Verdict.OTHER
 
 
-def test_prefilter_fails_open_on_unidentifiable_or_shapeless_text() -> None:
+def test_prefilter_judges_msg_first_frames_and_fails_open_on_shapeless_text() -> None:
     prefilter = RawSeriesPrefilter(LIVE_ALLOWLIST)
+    # msg BEFORE type (review fix 2026-09-05): identified and judged like any
+    # other layout — a foreign rfq_created DROPs, an allowlisted one PASSes.
     msg_first = _raw(
         {"sid": 1, "msg": {"id": "x", "market_ticker": "KXNFLGAME-1"}, "type": "rfq_created"}
     )
-    assert prefilter.judge(msg_first) is Verdict.FAIL_OPEN
+    assert prefilter.judge(msg_first) is Verdict.DROP
+    assert prefilter.judge(_raw(_msg_first(json.loads(_created(["KXNFLGAME-1"]))))) is Verdict.DROP
+    assert (
+        prefilter.judge(_raw(_msg_first(json.loads(_created(["KXMLBGAME-26SEP05-NYY"])))))
+        is Verdict.PASS
+    )
     assert prefilter.judge("not json at all") is Verdict.FAIL_OPEN
     # Truncated inside the only ticker value: not JSON at all. The fast path
     # DROPs it (no allowlisted value opens), the parser would reject it as
@@ -607,6 +667,26 @@ async def test_start_refuses_a_prefilter_that_targets_a_never_drop_type() -> Non
     await m3.stop()
 
 
+async def test_set_raw_prefilter_after_start_is_refused() -> None:
+    """The reader binds the pre-filter once per connection and ``start()``
+    validates its target, so a late install would silently no-op until the
+    next reconnect and then run unvalidated (review fix 2026-09-05): loud."""
+    metrics = Metrics()
+    m, _ = _manager([], metrics)
+    m.start()
+    try:
+        with pytest.raises(RuntimeError, match="after start"):
+            m.set_raw_prefilter(RawSeriesPrefilter(LIVE_ALLOWLIST))
+        with pytest.raises(RuntimeError, match="after start"):
+            m.set_raw_prefilter(None)
+        assert m._raw_prefilter is None
+    finally:
+        await m.stop()
+    # After stop() the manager may be re-armed before a restart.
+    m.set_raw_prefilter(RawSeriesPrefilter(LIVE_ALLOWLIST))
+    assert m._raw_prefilter is not None
+
+
 # --------------------------------------------------------------------------- #
 # 4. Fan-out: every shard's reader pre-filters; the meter keeps its coverage
 # --------------------------------------------------------------------------- #
@@ -689,15 +769,19 @@ async def test_fanout_prefilters_on_every_shard_and_reports_it_per_window(tmp_pa
         await _settled(f)
         assert len([s for s in seen if s.startswith("rfq_created:")]) == n_allow
         # A pre-filtered frame never wakes the dispatcher, so its Metrics
-        # counts fold on the next dispatched frame or at stop — fold now (the
-        # host's own fold) before reading them. The window telemetry below
-        # comes from the meter and needs no fold.
-        f._flush_reader_metrics()
-        assert metrics.counter("t.prefiltered") == n_foreign
-        assert metrics.counter("t.prefilter_passed") == n_allow
+        # counts fold on the next dispatched frame, at stop — and on the
+        # governor tick (review fix 2026-09-05), so the relight checklist's
+        # counters agree with ``ws_inbound_rate`` within a window even on a
+        # quiet dispatcher. Plant a pending count and let the TICK fold it.
+        f._lanes.count("t.prefilter_probe")
+        assert f._lanes.pending_metrics.get("t.prefilter_probe") == 1
+        assert metrics.counter("t.prefilter_probe") == 0
         with structlog.testing.capture_logs() as logs:
             d = await gov.tick(reason="refresh")
         assert d is not None
+        assert metrics.counter("t.prefilter_probe") == 1 and not f._lanes.pending_metrics
+        assert metrics.counter("t.prefiltered") == n_foreign
+        assert metrics.counter("t.prefilter_passed") == n_allow
         rate = [e for e in logs if e["event"] == "ws_inbound_rate"]
         assert len(rate) == 1
         line = rate[0]
@@ -780,21 +864,48 @@ def test_wall_time_cadence_vs_tick_counter_under_slow_passes() -> None:
 
 
 class _StubLifecycle:
-    """Each maintenance pass advances the FAKE clock by ``pass_s`` — the
-    pass's own duration, controlled by the test."""
+    """Each maintenance pass advances the FAKE clock by the pass's own
+    duration, controlled by the test: ``pass_s[i]`` for pass ``i`` (the last
+    entry repeats)."""
 
-    def __init__(self, clock: FakeClock, pass_s: float) -> None:
+    def __init__(self, clock: FakeClock, pass_s: list[float]) -> None:
         self._clock = clock
         self._pass_s = pass_s
         self.passes = 0
 
     async def maintenance_tick(self) -> None:
-        self._clock.advance(self._pass_s)
+        self._clock.advance(self._pass_s[min(self.passes, len(self._pass_s) - 1)])
         self.passes += 1
 
 
+class _StubGovernor:
+    """Stands in for ``FanoutGovernor`` under the PRODUCTION
+    ``_refresh_ws_fanout`` (so its ``finally: stamp()`` runs): records the
+    reason and takes ``tick_s`` of fake time (a slow tape refresh)."""
+
+    def __init__(self, clock: FakeClock, tick_s: float) -> None:
+        self._clock = clock
+        self._tick_s = tick_s
+        self.reasons: list[str] = []
+
+    async def tick(self, *, reason: str) -> None:
+        self.reasons.append(reason)
+        self._clock.advance(self._tick_s)
+
+
+def _floor_s(tmp_path: Path) -> float:
+    """The cadence anchor as the app derives it — ``_demo_app`` builds a
+    default ``AppConfig`` (heartbeat 15 s ⇒ 15.5 s), NOT the live 60.5 s."""
+    from tests.test_quote_app_phase6 import _demo_app
+
+    app = _demo_app(tmp_path / "probe")
+    floor = app._stall_wall_floor_s()  # noqa: SLF001
+    assert floor == float(app._config.supervisor.heartbeat_timeout_s) + MAINTENANCE_TICK_INTERVAL_S  # noqa: SLF001
+    return floor
+
+
 async def _drive_maintenance(
-    tmp_path: Path, *, pass_s: float, passes: int
+    tmp_path: Path, *, pass_s: list[float], passes: int, tick_s: float = 0.0
 ) -> tuple[int, list[str]]:
     from tests.test_quote_app_phase6 import _demo_app
 
@@ -804,12 +915,8 @@ async def _drive_maintenance(
     app._progress = ProgressLedger(clock, progress_path(tmp_path))  # noqa: SLF001
     app._fanout_cadence = WallTimeCadence(clock, app._stall_wall_floor_s())  # noqa: SLF001
     app._fanout_cadence.stamp()  # noqa: SLF001 — the boot derivation stamps
-    reasons: list[str] = []
-
-    async def record(*, reason: str) -> None:
-        reasons.append(reason)
-
-    app._refresh_ws_fanout = record  # type: ignore[method-assign]  # noqa: SLF001
+    governor = _StubGovernor(clock, tick_s)
+    app._fanout_governor = governor  # type: ignore[assignment]  # noqa: SLF001
     lifecycle = _StubLifecycle(clock, pass_s)
     task = asyncio.create_task(app._maintenance_loop(lifecycle))  # type: ignore[arg-type]  # noqa: SLF001
     try:
@@ -818,26 +925,46 @@ async def _drive_maintenance(
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-    return lifecycle.passes, reasons
+    return lifecycle.passes, governor.reasons
 
 
 async def test_maintenance_loop_refreshes_the_fanout_on_elapsed_time_once_per_pass(
     tmp_path: Path,
 ) -> None:
-    """The REAL ``_maintenance_loop``: a pass that takes longer than the
-    interval fires the governor exactly once per pass; passes shorter than
-    the interval do not fire it at all — whatever the tick counter says."""
-    floor_s = 60.5
+    """The REAL ``_maintenance_loop`` + the REAL ``_refresh_ws_fanout``: a
+    pass that takes longer than the interval fires the governor exactly once
+    per pass; passes shorter than the interval do not fire it at all —
+    whatever the tick counter says. The interval is the app's OWN derived
+    floor (review fix 2026-09-05: it was mislabelled 60.5 s here; the demo
+    config's is 15.5 s)."""
+    floor_s = _floor_s(tmp_path)
     slow_passes, slow_reasons = await _drive_maintenance(
-        tmp_path / "slow", pass_s=floor_s + 1.0, passes=4
+        tmp_path / "slow", pass_s=[floor_s + 1.0], passes=4
     )
     assert slow_passes >= 4
     assert set(slow_reasons) == {"refresh"}
     # One refresh per completed pass (the check runs once per pass; the loop
     # may have completed one more pass than we waited for).
     assert slow_passes - 1 <= len(slow_reasons) <= slow_passes + 1
-    fast_passes, fast_reasons = await _drive_maintenance(tmp_path / "fast", pass_s=1.0, passes=4)
+    fast_passes, fast_reasons = await _drive_maintenance(tmp_path / "fast", pass_s=[1.0], passes=4)
     assert fast_passes >= 4 and fast_reasons == []
+
+
+async def test_refresh_restamps_the_cadence_after_the_governor_tick(tmp_path: Path) -> None:
+    """``_refresh_ws_fanout``'s ``finally: stamp()`` (production code) starts
+    the next window when the derivation is DONE: a first slow pass fires the
+    governor, whose tick itself takes longer than the interval; the fast
+    passes after it must NOT fire again (elapsed since the re-stamp is one
+    fast pass). Without the re-stamp every following pass would fire."""
+    floor_s = _floor_s(tmp_path)
+    passes, reasons = await _drive_maintenance(
+        tmp_path / "restamp",
+        pass_s=[floor_s + 1.0, 1.0],
+        passes=5,
+        tick_s=floor_s + 1.0,
+    )
+    assert passes >= 5
+    assert reasons == ["refresh"]
 
 
 def test_stall_wall_floor_is_the_wedge_anchor_plus_the_loop_cadence(tmp_path: Path) -> None:
@@ -847,3 +974,51 @@ def test_stall_wall_floor_is_the_wedge_anchor_plus_the_loop_cadence(tmp_path: Pa
     expected = float(app._config.supervisor.heartbeat_timeout_s) + MAINTENANCE_TICK_INTERVAL_S  # noqa: SLF001
     assert app._stall_wall_floor_s() == expected  # noqa: SLF001
     assert app._fanout_cadence.interval_s == pytest.approx(expected)  # noqa: SLF001
+
+
+# --------------------------------------------------------------------------- #
+# 6. App wiring: install fail-open — a refused allowlist entry never bricks a boot
+# --------------------------------------------------------------------------- #
+
+
+async def test_app_runs_without_the_prefilter_when_an_allowlist_entry_could_be_escaped(
+    tmp_path: Path,
+) -> None:
+    """``RawSeriesPrefilter`` refuses an entry JSON could escape; the intake
+    and the config accept it. The app must log + count and run today's path
+    (review fix 2026-09-05), never die inside the run path."""
+    from tests.test_quote_app_phase6 import _demo_app
+
+    app = _demo_app(tmp_path)
+    prefixes = ("KXMLBGAME", "KXMLBé")  # non-ASCII: JSON may escape it
+    with pytest.raises(ValueError):
+        RawSeriesPrefilter(prefixes)
+    m, _ = _manager([], Metrics())
+    with structlog.testing.capture_logs() as logs:
+        assert app._install_raw_prefilter(m, prefixes) is False  # noqa: SLF001
+    assert m._raw_prefilter is None
+    assert app._metrics.counter("ws.prefilter_not_installed") == 1  # noqa: SLF001
+    assert [e["event"] for e in logs] == ["ws_prefilter_not_installed"]
+    assert "not plain JSON text" in logs[0]["reason"]
+    m.start()  # today's transport, no pre-filter
+    await m.stop()
+    # The intake filters on the SAME tuple exactly as before.
+    ws = FakeWs()
+    metrics = Metrics()
+    intake = RfqIntake(ws, metrics, series_prefixes=prefixes)
+    seen: list[str] = []
+
+    async def on_rfq(rfq: Rfq) -> None:
+        seen.append(rfq.rfq_id)
+
+    intake.on_rfq(on_rfq)
+    allow = _load_corpus()[0]["msg"]
+    assert all(leg["market_ticker"].startswith("KXMLBGAME") for leg in allow["mve_selected_legs"])
+    await ws.deliver(_envelope(allow))
+    await ws.deliver(_envelope(_foreign_variant(allow, random.Random(1), legs_to_swap=None)))
+    assert seen == [allow["id"]] and metrics.counter("rfq.dropped_series_fastpath") == 1
+    # A plain-ASCII allowlist installs.
+    m2, _ = _manager([], Metrics())
+    assert app._install_raw_prefilter(m2, LIVE_ALLOWLIST) is True  # noqa: SLF001
+    assert m2._raw_prefilter is not None and m2._raw_prefilter.prefixes == LIVE_ALLOWLIST
+    assert app._metrics.counter("ws.prefilter_not_installed") == 1  # noqa: SLF001
