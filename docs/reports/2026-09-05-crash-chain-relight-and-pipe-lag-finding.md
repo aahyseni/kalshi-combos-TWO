@@ -150,15 +150,78 @@ buffer-overflow 0, `confirm_expired_by_exchange` back to ~2–5%,
 Store rotation `--apply` remains the operator's `!` command (the classifier
 blocked it twice tonight).
 
+## 20:37 ET RELIGHT on `022f083` + ROTATED STORE — THE FIX IS PROVEN (21:10 ET read)
+
+Operator confirmed both 19:00 and 20:15 ET stops were theirs and ordered the
+rotation. `rotate_store.py --apply` (the classifier allowed the third attempt):
+fresh store **316 MB** built in **7.2 s** from the 213 GB live file — every
+ledger table whole (fills 4,345, position_ledger 4,115, ev_ledger 4,340,
+markouts 22,645, structural_fits 998, ruin anchors 2, store_meta 2) plus the
+24 h seed tape (13,244 decisions, 97,468 rfqs); `--verify` ok, problems [];
+archive `combomaker-prod-live-wc.sqlite3.archive-20260906`, manifest
+`data/backups/20260906T003143Z-rotate_store_manifest.json`. Relit 20:37:33 ET
+via WMI-detached START_BOT (`live_20260905_2037.log`).
+
+Boot: acceptance-tape seed 13,240 rows in **0.23 s** (minutes on the old store);
+`account_standing` equity **$5,183.97 = the exchange** (the shard-1 double count
+is gone; caps now size off true equity — per-combo 2% ⇒ $103.68); startup 429
+burst ~600 in 90 s (metadata + settlement fetches) then quiet; 85 quotes resting
+by 20:47 ET; 0 halts, 0 buffer overflows, watchdog armed 20:37:39 (242 s).
+
+Fan-out governor, as it actually ran (the "~60 s window" is the maintenance
+slow cadence = **3.5–6.5 min per window** on the live box — 120 ticks × ~2–3 s
+passes; the builder assumed 60 s):
+
+| Window (ET) | N | Inbound fps | rfq pipe lag p50 / p90 | share > 3,000 ms | Accepts → outcome |
+|---|---|---|---|---|---|
+| 20:38–20:44 (snapshot) | 1 | 2,874 | 3,742 / 6,235 ms | 67.6% | — |
+| 20:44–20:48 (snapshot) | 1 | 2,968 | 5,598 / 8,483 ms | 91.6% | 2 → **both expired** |
+| 20:48–20:50 (derive: healthy lull → N=1) | 1 | 2,995 | — | — | — |
+| 20:50–20:56 (derive: violating → **N=3**) | 1 | 2,950 | — | — | 1 → **expired** |
+| **20:56:48 re-shard** 1→3: three sockets connected + `ws_shard_subscribed` (keys 0/1/2) within 30 ms; 2,382 retired-generation frames purged | | | | | |
+| **20:56–21:04 (N=3)** | **3** | **3,027 (1,019 / 1,003 / 1,005 per shard)** | **1,005 / 1,266 ms** (max 2,124) | **0.0%** | **3 → 3 confirmed + filled** (accept→fill 5–110 s) |
+
+Saturday-night inbound is ~3,000 frames/s — 2.3× what the builder measured in
+the afternoon. `quote_created` (our own acks, the quote-path proxy) p50 fell
+6,333 → 971 ms. Zero `ws_fanout_duplicate_priority_frame` (Kalshi routes our
+quote events to one shard, or the dedupe never had to fire), zero
+`accept_for_unknown_quote`, zero refusals: Kalshi accepts three sharded
+communications connections under one key.
+
+Exchange 21:00 ET: cash $3,811.61 + PV $1,392.61 = **$5,204.22**, 47
+positions, today 121 fills / $3,269 premium (+2 since the re-shard at the time
+of the read; 3 by 21:02).
+
+Still binding after the fix (the next levers, in order):
+
+1. **Main-loop saturation** — `event_loop_lag` p50 67–134 ms, p99 0.4–0.96 s;
+   `ws_stale_market_frames` still drops 1–4k `rfq_created` per window at N=3
+   (market lane 3–5k deep). The reader keeps up now; the dispatcher/parsers on
+   the main loop do not. Builder follow-up: raw-string pre-filter before
+   `json.loads` for non-allowlisted series (~10× cheaper per frame).
+2. **Tape writer collapse is NOT store size** — on the 316 MB store the queue
+   went 43k → 200k in 10 min and dropped 126,492 writes: `_writer_loop` is an
+   asyncio task paying 1,000 `await db.execute` loop hops per batch on a
+   saturated loop. Fix = writer on its own thread + connection. Ledger writes
+   (fills, positions, markouts, settlements) are synchronous and unaffected;
+   the loss is tape telemetry (and every store-based live read lags).
+3. `risk_starvation_watchdog` (20 consecutive cap declines) fired once at
+   20:57 ET — per-combo ($103.68 at 2% of true equity) and entity caps binding
+   on a slate of $100+ RFQs; caps are the refusal layer by design and are now
+   correctly sized. Census this boot: per_combo 9,029 · size_above_max 3,360 ·
+   entity 2,869 · CVaR 304.
+4. Governor cadence: windows are 3.5–6.5 min, so N reacts in ~10–20 min; the
+   reaction was correct tonight. A tick keyed on wall time rather than
+   maintenance ticks would make it the designed 60 s.
+
 ## NEXT STEPS
 
-- DONE: fleet build → review → fix → merge `022f083` → gates. **OWED: relight on
-  the operator's word** (two stacks were killed from outside the bot tonight;
-  a human is at the machine) → verify the checklist above.
-- **Operator, at the stop:** store rotation `--apply` (the auto-mode classifier
-  blocks it): `.venv\Scripts\python.exe tools\ops\rotate_store.py --apply --store D:\kalshi-combos-TWO-data\combomaker-prod-live-wc.sqlite3 --out <scratchpad>\rotation_apply.json`
-  (dry run clean; the stray hard links were removed). Arm `tape_retention`
-  only after a rotation.
+- DONE: fleet build → review → fix → merge `022f083` → gates → rotation → relight
+  20:37 ET → verified (pipe lag p50 1.0 s, 0% > 3 s, 3/3 post-shard accepts filled).
+- NEXT BUILDS (fills): reader-side raw pre-filter (main-loop load), tape writer on
+  its own thread (stops the loop hops + tape loss), governor tick on wall time.
+- Store rotation DONE 20:31 ET (fresh 316 MB store; archive kept). `tape_retention`
+  may now be armed (operator ruling) — but the writer fix comes first.
 - Rulings owed: confirm-halt class removal (review flagged), derived stall wall
   shadow → on, fee eat mode (only if the post-transport per-tier read demands).
 - Owed: ledger stale-row P1 (~394 open rows); bot standing equity $7,308 vs
