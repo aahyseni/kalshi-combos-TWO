@@ -66,7 +66,13 @@ from combomaker.exchange.rest import (
     observe_api_tier,
 )
 from combomaker.exchange.ws import WsManager
-from combomaker.exchange.ws_fanout import CommsFanout, FanoutGovernor, fanout_tape_path
+from combomaker.exchange.ws_fanout import (
+    CommsFanout,
+    FanoutGovernor,
+    WallTimeCadence,
+    fanout_tape_path,
+)
+from combomaker.exchange.ws_prefilter import RawSeriesPrefilter
 from combomaker.marketdata.feed import OrderbookFeed
 from combomaker.marketdata.grid import PriceGrid
 from combomaker.marketdata.metadata import (
@@ -2038,6 +2044,19 @@ class QuoteApp:
         # relighter is preferred so the tape row and the receipts agree.
         self._stall_wall: StallWallDerivation | None = None
         self._stall_wall_ticks = 0
+        # WS FAN-OUT governor cadence (2026-09-05): WALL TIME, not ticks —
+        # ``exchange/ws_fanout.py`` ``WallTimeCadence``. The interval is the
+        # maintenance loop's stall-wall FLOOR (``_stall_wall_floor_s``): the
+        # loop's own guaranteed-progress horizon — the longest a pass may take
+        # before the supervisor treats the loop as wedged — so one governor
+        # window is by construction at least one complete pass, and the
+        # cadence tracks the operator's single wedge-tolerance anchor
+        # (``supervisor.heartbeat_timeout_s``, the same anchor the stall wall
+        # and the fan-out's HEADROOM hang off) instead of a count of passes
+        # whose length varies 0.5-3 s with the store. 60.5 s live = the
+        # module's designed "~60 s" window, now anchored. Constructed here
+        # (config is bound above); stamped at the boot derivation.
+        self._fanout_cadence = WallTimeCadence(self._clock, self._stall_wall_floor_s())
         self._boot_started_at_ts = self._clock.now().timestamp()
         self._boot_key = (
             os.environ.get(RUN_ID_ENV, "") or self._clock.now().isoformat()
@@ -2198,6 +2217,9 @@ class QuoteApp:
             override=config.endpoints.comms_shard_factor_override,
             # APPLY GATE: no live re-shard while an accept is in flight.
             apply_ok=lambda: not accept_gate.holding(),
+            # The designed refresh cadence, logged beside the ACTUAL window
+            # elapsed on every derivation (the wall-time cadence above).
+            refresh_interval_s=self._fanout_cadence.interval_s,
         )
         # CONFIRM PRIORITY (2026-07-31 double halt): accept/execute frames jump
         # the comms dispatch backlog, and while a confirm is in flight all NEW
@@ -2244,10 +2266,24 @@ class QuoteApp:
         # allowlist (intake docstring has the measured numbers). Observe mode
         # (app.py) passes no prefixes and keeps recording everything.
         allowed = config.filters.allowed_leg_series_prefixes
+        series_prefixes = tuple(allowed) if allowed is not None else None
+        if series_prefixes:
+            # READER-SIDE RAW PRE-FILTER (2026-09-05, exchange/ws_prefilter.py):
+            # the SAME tuple the intake below filters on, read from the same
+            # config object — an ``rfq_created`` whose raw text carries no
+            # allowlisted leg series is dropped on each shard's reader thread
+            # BEFORE json.loads, the lanes and the dispatch. The intake's
+            # decision set is provably unchanged (proof in the module doc);
+            # only the work to reach it moves. An EMPTY allowlist installs no
+            # pre-filter: the intake then drops every RFQ itself (startswith
+            # of an empty tuple is always False) and there is nothing to save.
+            # Fail-open at install (``_install_raw_prefilter``): a refused
+            # allowlist entry logs and runs today's path — never a boot death.
+            self._install_raw_prefilter(ws, series_prefixes)
         intake = RfqIntake(
             ws,
             self._metrics,
-            series_prefixes=tuple(allowed) if allowed is not None else None,
+            series_prefixes=series_prefixes,
             # Confirm-priority intake hold — see AcceptPriorityGate + the
             # intake docstring. Self-bounding (exchange confirm window).
             hold_probe=accept_gate.holding,
@@ -4751,10 +4787,20 @@ class QuoteApp:
                 self._stall_wall_ticks = 0
                 await self._refresh_stall_wall(reason="refresh")
                 await self._refresh_expired_baseline(reason="refresh")
-                # WS FAN-OUT (2026-09-05): same slow cadence — fold the
-                # measurement window (per-shard inbound rate, pipe lag + its
-                # alarm), refresh the tape off-loop, re-derive N, apply
-                # growth live. Transport only; errors log inside.
+            # WS FAN-OUT governor (2026-09-05): on WALL TIME, not the tick
+            # counter above — a pass takes 0.5-3 s here, so 120 ticks ran
+            # 1.2-7.6 min live against the designed ~60 s and N reacted in
+            # 10-20 min (derivation at ``WallTimeCadence``). ``due()`` is
+            # True at most once per call and this is the loop's ONE call per
+            # pass, so the governor never runs twice in a pass. It folds the
+            # measurement window (per-shard inbound rate, pre-filtered count,
+            # pipe lag + its alarm), refreshes the tape off-loop, re-derives
+            # N and applies growth live. Transport only; errors log inside.
+            # The stall-wall / expired-baseline refreshes above keep their
+            # tick cadence deliberately: both FOLD cumulative counters and
+            # gap histograms (no rate denominator depends on the window), so
+            # the same slow cadence costs them nothing but freshness.
+            if self._fanout_cadence.due():
                 await self._refresh_ws_fanout(reason="refresh")
             # TAPE RETENTION (2026-09-05, dark): on the same ~60s slow cadence,
             # ask the scheduler whether its nightly pass is due; it launches a
@@ -4794,7 +4840,7 @@ class QuoteApp:
         stall this loop. Logged as ``stall_wall_derivation`` at boot and on
         every refresh. Any failure logs and keeps the current bound (the
         floor at worst)."""
-        floor_s = self._config.supervisor.heartbeat_timeout_s + MAINTENANCE_TICK_INTERVAL_S
+        floor_s = self._stall_wall_floor_s()
         mode = str(self._config.supervisor.stall_wall_derived)
         try:
             live = self._progress.gap_histogram(LOOP_MAINTENANCE)
@@ -4890,6 +4936,50 @@ class QuoteApp:
             await governor.tick(reason=reason)
         except Exception:  # pragma: no cover - the governor already catches
             log.exception("ws_fanout_refresh_failed", reason=reason)
+        finally:
+            # The next window starts when THIS derivation is done (boot and
+            # refresh alike): the meters were reset inside the tick, so the
+            # cadence and the measurement windows share one origin.
+            self._fanout_cadence.stamp()
+
+    def _install_raw_prefilter(self, ws: WsManager, series_prefixes: tuple[str, ...]) -> bool:
+        """Install the reader-side raw pre-filter on the comms transport, or
+        run WITHOUT it — never die (review fix 2026-09-05).
+
+        ``RawSeriesPrefilter`` refuses an allowlist entry JSON could escape
+        (empty, non-ASCII, non-printable, a quote or a backslash) because
+        its raw-text ``startswith`` could then disagree with the intake's
+        DECODED ``startswith``; the intake (``rfq/intake.py``) and the config
+        (``ops/config.py`` checks only for a non-empty list) accept every
+        such entry. A refusal is therefore a CONFIG SHAPE the bot already
+        quotes on, and it must never brick the boot: an exception here would
+        die inside ``_run_instrumented`` before the transport starts and the
+        watchdog would relight into the same death forever (the fail-closed-
+        boot class the 2026-07-23 MLB bootstrap taught). So: log it, count it
+        (``ws.prefilter_not_installed``), and run today's path — the intake
+        filters exactly as before; only the saving is lost. Returns True when
+        the pre-filter is installed."""
+        try:
+            prefilter = RawSeriesPrefilter(series_prefixes)
+        except ValueError as exc:
+            self._metrics.inc("ws.prefilter_not_installed")
+            log.warning(
+                "ws_prefilter_not_installed",
+                reason=str(exc),
+                prefixes=len(series_prefixes),
+                effect="transport runs without the raw pre-filter; intake filtering unchanged",
+            )
+            return False
+        ws.set_raw_prefilter(prefilter)
+        return True
+
+    def _stall_wall_floor_s(self) -> float:
+        """TODAY's derived maintenance-loop bound — the stall wall's FLOOR
+        (``risk/stall_wall.py``): the operator's wedge-tolerance anchor
+        ``supervisor.heartbeat_timeout_s`` plus this loop's own cadence
+        (60.5 s live). A policy anchor already in the config, not a new
+        number; the wall can only LOOSEN from it by measurement."""
+        return float(self._config.supervisor.heartbeat_timeout_s) + MAINTENANCE_TICK_INTERVAL_S
 
     def _applied_stall_wall_s(self) -> float | None:
         """The wall the supervisor currently kills the maintenance loop at

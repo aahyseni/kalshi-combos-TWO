@@ -203,6 +203,7 @@ from combomaker.exchange.ws import (
     WsManager,
     _aiohttp_connect,
 )
+from combomaker.exchange.ws_prefilter import RawSeriesPrefilter
 from combomaker.ops.logging import get_logger
 from combomaker.ops.metrics import Metrics
 from combomaker.risk.confirm_expired_rate import EXPIRED_RATE_ALARM_Z
@@ -353,6 +354,13 @@ class ShardWindow:
     lag_quote: LagHistogram
     snapshot: bool
     shed_lost: int
+    # Frames the raw pre-filter dropped before the parse (2026-09-05). They
+    # are INCLUDED in ``frames`` and ``busy_ns``: the connection read them and
+    # the reader serviced them (the raw judgement IS its service time), so
+    # ``fps`` remains the connection's demonstrated read rate and
+    # ``fps / utilization`` its extrapolated ceiling — a cheaper per-frame
+    # service correctly reads as more capacity per connection.
+    prefiltered: int = 0
 
     @property
     def fps(self) -> float:
@@ -392,6 +400,7 @@ class ShardMeter:
         self._lock = threading.Lock()
         self._frames = 0
         self._busy_ns = 0
+        self._prefiltered = 0
         self._lag: dict[str, LagHistogram] = {t: LagHistogram() for t in _LAG_TYPES}
         self._subscribed_current = False
         self._subscribed_prev = False
@@ -401,23 +410,42 @@ class ShardMeter:
     def seed_shed_lost(self, total: int) -> None:
         self._shed_lost_seen = total
 
+    def _lag_ms(self, msg_type: str, created: object) -> float | None:
+        if msg_type not in _LAG_TYPES or not isinstance(created, str):
+            return None
+        created_s = _parse_rfc3339_epoch(created)
+        if created_s is None:
+            return None
+        # The receive stamp is monotonic; wall time is read here,
+        # microseconds after it, on the same thread.
+        return (self._clock.now().timestamp() - created_s) * 1e3
+
     def observe(self, message: JsonDict, recv_mono_ns: int, handling_ns: int) -> None:
         """Reader thread. ``rfq_created`` / ``quote_created`` frames carry a
         server ``created_ts``; its distance to the receive instant is the
         pipe lag. Everything else only counts toward rate and busy time."""
         msg_type = str(message.get("type", ""))
-        lag_ms: float | None = None
-        if msg_type in _LAG_TYPES:
-            msg = message.get("msg")
-            created = msg.get("created_ts") if isinstance(msg, dict) else None
-            if isinstance(created, str):
-                created_s = _parse_rfc3339_epoch(created)
-                if created_s is not None:
-                    # The receive stamp is monotonic; wall time is read here,
-                    # microseconds after it, on the same thread.
-                    lag_ms = (self._clock.now().timestamp() - created_s) * 1e3
+        msg = message.get("msg")
+        created = msg.get("created_ts") if isinstance(msg, dict) else None
+        lag_ms = self._lag_ms(msg_type, created)
         with self._lock:
             self._frames += 1
+            self._busy_ns += handling_ns
+            if lag_ms is not None:
+                self._lag[msg_type].observe(lag_ms)
+
+    def observe_prefiltered(
+        self, msg_type: str, created_ts: str | None, recv_mono_ns: int, handling_ns: int
+    ) -> None:
+        """Reader thread: a frame the raw pre-filter dropped before the parse.
+        Counted as a frame (rate) with its raw-judgement time (service time)
+        and — ``created_ts`` is read from the raw text — its pipe lag, so the
+        lag histogram keeps covering EVERY ``rfq_created`` exactly as before
+        the pre-filter existed (``ShardWindow.prefiltered`` derivation)."""
+        lag_ms = self._lag_ms(msg_type, created_ts)
+        with self._lock:
+            self._frames += 1
+            self._prefiltered += 1
             self._busy_ns += handling_ns
             if lag_ms is not None:
                 self._lag[msg_type].observe(lag_ms)
@@ -440,11 +468,13 @@ class ShardMeter:
                 lag_quote=self._lag["quote_created"],
                 snapshot=self._subscribed_current or self._subscribed_prev,
                 shed_lost=max(0, shed_lost_total - self._shed_lost_seen),
+                prefiltered=self._prefiltered,
             )
             self._subscribed_prev = self._subscribed_current
             self._subscribed_current = False
             self._frames = 0
             self._busy_ns = 0
+            self._prefiltered = 0
             self._lag = {t: LagHistogram() for t in _LAG_TYPES}
             self._window_start_ns = now_mono_ns
             self._shed_lost_seen = shed_lost_total
@@ -1065,6 +1095,13 @@ class CommsFanout(WsManager):
             s._sheddable_types = self._sheddable_types
             s._stale_after_ns = dict(self._stale_after_ns)
 
+    def set_raw_prefilter(self, prefilter: RawSeriesPrefilter | None) -> None:
+        """The pre-filter runs on EVERY shard's reader thread (each socket
+        carries 1/N of the firehose); the object is immutable and shared."""
+        super().set_raw_prefilter(prefilter)
+        for s in self._shards:
+            s._raw_prefilter = self._raw_prefilter
+
     def add_subscription(
         self,
         channels: list[str],
@@ -1090,7 +1127,7 @@ class CommsFanout(WsManager):
     # --- lifecycle ---
 
     def start(self) -> None:
-        super().start()  # dispatcher only (reader=False)
+        super().start()  # dispatcher only (reader=False); validates the pre-filter's type
         self._build_shards(self._shard_factor, epoch_open=False)
 
     async def stop(self) -> None:
@@ -1200,10 +1237,12 @@ class CommsFanout(WsManager):
                 shard_tag=k,
                 shard_gen=gen,
                 on_frame=meter.observe,
+                on_prefiltered=meter.observe_prefiltered,
             )
             shard._priority_types = self._priority_types
             shard._sheddable_types = self._sheddable_types
             shard._stale_after_ns = dict(self._stale_after_ns)
+            shard._raw_prefilter = self._raw_prefilter
             shard._lane_owner_name = self._name
             shard.on_connect(self._shard_connected_hook(k))
             shard.on_disconnect(self._shard_disconnected_hook(k))
@@ -1482,8 +1521,63 @@ class CommsFanout(WsManager):
 
 
 # --------------------------------------------------------------------------- #
-# The governor: telemetry, tape, derivation, apply
+# The governor: cadence, telemetry, tape, derivation, apply
 # --------------------------------------------------------------------------- #
+
+
+class WallTimeCadence:
+    """Fires when ``interval_s`` of MONOTONIC time has elapsed since the last
+    fire — never by a count of loop iterations.
+
+    What was wrong (2026-09-05): the governor's refresh rode the maintenance
+    loop's ``_stall_wall_ticks >= 120`` counter, "~60 s at 0.5 s ticks". A
+    tick is one PASS, and a pass takes 2-3 s on the live box (store sweeps,
+    telemetry), so 120 passes took 1.2-7.6 MINUTES (``ws_fanout_derivation``
+    timestamps 00:38:20 → 00:44:23 → 00:48:55 → 00:50:09 → 00:56:48 →
+    01:04:26 → 01:10:30 → 01:16:16 → 01:20:11 Z; ``ws_inbound_rate``
+    ``elapsed_s`` 346-456). N reacted in 10-20 min instead of the designed
+    ~60 s. Counting ticks measures the loop's speed, not time.
+
+    ``due()`` returns True AT MOST ONCE PER CALL and re-stamps when it does, so
+    a caller that checks once per pass can never fire twice in a pass, and a
+    pass that overran the interval fires once on the next check (the window
+    it folds is the real elapsed time — the meters carry their own stamps).
+    The first call only stamps (``stamp()`` sets the baseline explicitly —
+    the app stamps at its boot derivation)."""
+
+    __slots__ = ("_clock", "_interval_ns", "_last_ns")
+
+    def __init__(self, clock: Clock, interval_s: float) -> None:
+        if not (interval_s > 0.0) or math.isinf(interval_s):
+            raise ValueError(f"interval_s must be > 0 and finite, got {interval_s}")
+        self._clock = clock
+        self._interval_ns = int(interval_s * 1e9)
+        self._last_ns: int | None = None
+
+    @property
+    def interval_s(self) -> float:
+        return self._interval_ns / 1e9
+
+    def stamp(self) -> None:
+        """Start (or restart) the interval now."""
+        self._last_ns = self._clock.monotonic_ns()
+
+    def elapsed_s(self) -> float | None:
+        """Seconds since the last stamp/fire; None before the first stamp."""
+        if self._last_ns is None:
+            return None
+        return (self._clock.monotonic_ns() - self._last_ns) / 1e9
+
+    def due(self) -> bool:
+        now = self._clock.monotonic_ns()
+        last = self._last_ns
+        if last is None:
+            self._last_ns = now
+            return False
+        if now - last >= self._interval_ns:
+            self._last_ns = now
+            return True
+        return False
 
 
 class FanoutGovernor:
@@ -1510,12 +1604,21 @@ class FanoutGovernor:
         override: int | None = None,
         io: Callable[..., Awaitable[PooledEvidence]] | None = None,
         apply_ok: Callable[[], bool] | None = None,
+        refresh_interval_s: float | None = None,
     ) -> None:
         """``apply_ok`` (module doc, the apply gate): a live re-shard is
         applied only while it returns True — the app passes "no accept in
-        flight" (``not AcceptPriorityGate.holding()``). None = always."""
+        flight" (``not AcceptPriorityGate.holding()``). None = always.
+
+        ``refresh_interval_s``: the caller's DESIGNED refresh cadence (the
+        app's ``WallTimeCadence`` interval), logged beside the ACTUAL window
+        elapsed on every derivation so a cadence defect is visible in the
+        tape (2026-09-05: the tick-counted refresh fired every 1.2-7.6 min
+        against a designed 60 s). Informational; never used to derive N."""
         if not (confirm_window_s > 0.0):
             raise ValueError(f"confirm_window_s must be > 0, got {confirm_window_s}")
+        if refresh_interval_s is not None and not (refresh_interval_s > 0.0):
+            raise ValueError(f"refresh_interval_s must be > 0, got {refresh_interval_s}")
         self._fanout = fanout
         self._clock = clock
         self._metrics = metrics
@@ -1527,6 +1630,7 @@ class FanoutGovernor:
         self._override = override
         self._io = io
         self._apply_ok = apply_ok
+        self._refresh_interval_s = refresh_interval_s
         self.inbound = RateHistogram()
         self.capacity = RateHistogram()
         self.sustained = RateHistogram()
@@ -1536,9 +1640,21 @@ class FanoutGovernor:
         self.shard_factors_used: list[int] = []
         self.last: ShardFactorDerivation | None = None
         self.last_pooled: PooledEvidence | None = None
+        # The ACTUAL elapsed time of the most recent measurement window (the
+        # longest shard window's ``elapsed_s``; None before the first refresh).
+        self.last_window_elapsed_s: float | None = None
 
     async def tick(self, *, reason: str) -> ShardFactorDerivation | None:
         try:
+            # Fold the readers' pending Metrics counts (pre-filter, shed) on
+            # this cadence too (review fix 2026-09-05): a pre-filtered frame
+            # never wakes the dispatcher, so on a quiet dispatcher the
+            # ``<name>.prefiltered*`` counters lagged the exact meter by a
+            # whole idle period. Same main-loop fold the dispatcher runs
+            # (``WsManager._flush_reader_metrics``: this task IS main-loop
+            # work, so the hang-watchdog's log axis stays honest); the window
+            # telemetry below is the meter's own and never needed it.
+            self._fanout._flush_reader_metrics()
             if reason != "boot":
                 self._observe_windows(self._fanout.take_windows(self._clock.monotonic_ns()))
             pooled = await self._refresh_tape()
@@ -1605,6 +1721,14 @@ class FanoutGovernor:
                 boot_snapshot_windows=self.n_snapshot,
                 boot_violating_windows=self.n_violating,
                 window_ms=self._window_ms,
+                # The window this derivation folded, as it ACTUALLY elapsed,
+                # beside the cadence it was designed to run at.
+                window_elapsed_s=(
+                    None
+                    if self.last_window_elapsed_s is None
+                    else round(self.last_window_elapsed_s, 1)
+                ),
+                refresh_interval_s=self._refresh_interval_s,
                 shards=self._fanout.shard_states(),
                 **derivation.as_log(),
             )
@@ -1636,8 +1760,10 @@ class FanoutGovernor:
         if not windows:
             return
         elapsed = max(w.elapsed_s for w in windows)
+        self.last_window_elapsed_s = elapsed
         total_frames = sum(w.frames for w in windows)
         total_fps = total_frames / elapsed if elapsed > 0 else 0.0
+        total_prefiltered = sum(w.prefiltered for w in windows)
         snapshot = any(w.snapshot for w in windows)
         rfq = LagHistogram()
         quote = LagHistogram()
@@ -1654,8 +1780,14 @@ class FanoutGovernor:
             per_shard_fps=[round(w.fps, 1) for w in windows],
             per_shard_utilization=[round(w.utilization, 4) for w in windows],
             per_shard_shed_lost=[w.shed_lost for w in windows],
+            # RAW PRE-FILTER (2026-09-05): frames dropped before the parse this
+            # window — read (in ``total_fps``) but never queued or dispatched.
+            per_shard_prefiltered=[w.prefiltered for w in windows],
+            prefiltered=total_prefiltered,
+            prefiltered_share=(round(total_prefiltered / total_frames, 4) if total_frames else 0.0),
             shard_factor=self._fanout.shard_factor,
             elapsed_s=round(elapsed, 1),
+            refresh_interval_s=self._refresh_interval_s,
             snapshot_window=snapshot,
             depths=self._fanout.lane_depths(),
         )
